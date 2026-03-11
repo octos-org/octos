@@ -28,3 +28,40 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  security:
+    runs-on: macos-14
+    needs: check
+    # Only run when security-related files change
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.title, 'security') ||
+      contains(github.event.pull_request.title, 'sandbox')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check for security-related changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          else
+            FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
+          fi
+          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|profiles)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Security sandbox tests (macOS kernel enforcement)
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
+          cargo test -p crew-agent --test security_sandbox -- --nocapture
