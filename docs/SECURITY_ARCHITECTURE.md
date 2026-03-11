@@ -137,25 +137,32 @@ Three sandbox backends in `crew-agent/src/sandbox.rs`, selectable via `SandboxCo
 - Path injection prevention: rejects paths containing control chars (`< 0x20`, `0x7F`), parentheses, backslash, and double-quote -- all SBPL metacharacters. Fails closed (error, not unsandboxed execution).
 
 **Docker**:
+- Default image: `ubuntu:24.04` (configurable via `docker.image` in sandbox config).
+- Per-user bind mount: each user's workspace directory is mounted as `/workspace` in the container. The container **only sees that user's files** — no other user's data or host filesystem is mounted.
+- All users share the **same Docker image** (stored once, ~80MB). No per-user image duplication. Storage cost is only the user's workspace files on the host.
 - `--security-opt no-new-privileges`, `--cap-drop ALL`.
 - Configurable resource limits: `--cpus`, `--memory`, `--pids-limit`.
 - `--network none` when `allow_network` is false.
 - Mount mode: `none` (no host access), `ro` (read-only), `rw` (read-write).
 - Path injection prevention: rejects paths containing `:`, `\0`, `\n`, `\r` (prevents volume mount injection).
+- Blocked bind sources: `/var/run/docker.sock`, `/etc`, `/proc`, `/sys`, `/dev` rejected as cwd or extra bind mounts (prevents container escape).
 
 **Sandbox backend comparison**:
 
 | Feature | SBPL (macOS) | Bubblewrap (Linux) | Docker |
 |---------|-------------|-------------------|--------|
 | Startup overhead | ~6ms | ~10ms | **130-700ms** |
-| Write restriction | Yes (`subpath`) | Yes (bind mount) | Yes (volume mount) |
-| Read restriction | Configurable (`read_allow_paths`) | Yes (`--ro-bind`) | Yes (mount modes) |
+| Per-user isolation | SBPL `subpath` (kernel) | Bind mount (namespace) | Bind mount (container) |
+| Write restriction | Yes (`subpath`) | Yes (bind mount) | Yes (only `/workspace` mounted) |
+| Read restriction | Configurable (`read_allow_paths`) | Yes (`--ro-bind`) | **Strongest** — host FS not visible |
+| Cross-user visibility | Reads allowed (same host FS) | Reads allowed (same host FS) | **No** — other users not mounted |
 | Network isolation | Yes (`deny network*`) | Yes (`--unshare-net`) | Yes (`--network none`) |
 | PID isolation | No | Yes (`--unshare-pid`) | Yes |
 | CPU/memory limits | No | No | Yes (`--cpus`, `--memory`) |
 | Process visibility | No | Yes (PID namespace) | Yes |
 | Disk quota | No | No | Yes (storage driver) |
 | Root required | No | No | No (but Docker daemon) |
+| Image storage | N/A | N/A | Shared (one image, all users) |
 | Persistent state | N/A (wraps single cmd) | N/A (wraps single cmd) | **No** — `--rm` per command |
 
 **Measured performance** (Apple M-series, Colima/Docker on macOS, 2026-03-11):
