@@ -1,720 +1,424 @@
 # Session Actor Architecture
 
-RFC for migrating the gateway from a monolithic shared-agent model to a per-session actor model.
+Reference architecture for crew-rs gateway processing model, user isolation, and data protection. Reflects the current implementation.
 
-**Status**: Phase 1-3 implemented, Phase 4-5 pending
-**Author**: yuechen + Claude
-**Date**: 2026-03-05
-
----
-
-## 1. Problem Statement
-
-### 1.1 Current Architecture
-
-The gateway runs a single dispatch loop that receives all inbound messages and spawns a `tokio::spawn` task per message:
-
-```
-Channels (Telegram, Feishu, CLI, ...)
-        │
-        ▼
-  ┌──────────────┐
-  │  AgentHandle  │  single mpsc receiver
-  │  (main loop)  │
-  └──────┬───────┘
-         │ tokio::spawn per message
-    ┌────┼────┐
-    ▼    ▼    ▼
-  task  task  task    (one per inbound message)
-    │    │    │
-    ▼    ▼    ▼
-  Arc<Agent>          (single shared agent)
-  Arc<Mutex<SessionManager>>  (single shared session store)
-  Arc<MessageTool>    (single shared tool, set_context() race)
-  Arc<SendFileTool>   (same race)
-  Arc<SpawnTool>      (same race)
-```
-
-### 1.2 Problems
-
-**P1: Tool context race condition** (existing TODO in gateway.rs:1704)
-
-`MessageTool`, `SendFileTool`, `SpawnTool`, and `CronTool` each hold a `Mutex<String>` for `default_channel` and `default_chat_id`. Before processing a message, the gateway calls `set_context()` on these shared tools. If two sessions run concurrently, their `set_context()` calls interleave, causing tool outputs to be routed to the **wrong chat**.
-
-```
-Session A: set_context("telegram", "alice")
-Session B: set_context("telegram", "bob")    ← overwrites A's context
-Session A: agent calls MessageTool            ← sends to "bob" instead of "alice"
-```
-
-**P2: Agent hook context race**
-
-`Agent.hook_context` is a `std::sync::Mutex<Option<HookContext>>` — shared across all concurrent sessions. `set_session_id()` before processing can be overwritten by another session.
-
-**P3: Serial processing within sessions, no queuing feedback**
-
-Messages to the same session are serialized via a per-session lock (`session_locks: HashMap<String, Arc<Mutex<()>>>`). While one message is being processed, subsequent messages from the same user block silently — no "still working..." feedback, no queue depth visibility.
-
-**P4: No cancellation**
-
-If a user wants to cancel a long-running session (e.g., a pipeline that takes 10 minutes), there is no mechanism. The `shutdown: AtomicBool` is global — it stops all sessions.
-
-**P5: Session lock map grows unbounded**
-
-`session_locks: HashMap<String, Arc<Mutex<()>>>` is pruned periodically, but the pruning logic runs inside each spawned task and is racy. Stale entries accumulate.
-
-**P6: Stateless spawned tasks**
-
-Each `tokio::spawn` creates a fresh execution context. There is no continuity between consecutive messages to the same session — each task independently fetches history from `SessionManager`, sets up tools, creates a `TokenTracker`, etc. This repeated setup is wasteful and prevents stateful optimizations (e.g., keeping a warm LLM connection, caching tool specs).
+**Status**: Fully implemented (Phases 1-5)
+**Last updated**: 2026-03-10
 
 ---
 
-## 2. Proposed Architecture: Session Actors
+## 1. Processing Model
 
-### 2.1 Overview
-
-Replace the spawn-per-message model with long-lived **session actors**. Each actor is a `tokio::spawn` task that owns its session state, tools, and an `mpsc` inbox. The dispatcher routes messages to actors by session key.
+### 1.1 Runtime Hierarchy
 
 ```
-Channels (Telegram, Feishu, CLI, ...)
-        │
-        ▼
-  ┌──────────────┐
-  │  Dispatcher   │   routes by SessionKey
-  └──┬───┬───┬───┘
-     │   │   │
-     ▼   ▼   ▼
-  ┌─────┐ ┌─────┐ ┌─────┐
-  │Actor│ │Actor│ │Actor│   long-lived tokio tasks
-  │  A  │ │  B  │ │  C  │   each owns: tools, history, inbox
-  └──┬──┘ └──┬──┘ └──┬──┘
-     │       │       │
-     ▼       ▼       ▼
-  shared: Arc<dyn LlmProvider>    (stateless, thread-safe)
-  shared: Arc<EpisodeStore>       (stateless, thread-safe)
-  shared: out_tx                  (mpsc sender, cloneable)
+crew serve (control plane, OS process)
+│
+├── Profile "work-bot" ──→ Gateway (OS process 1)
+│   │
+│   │  Tokio Runtime (multi-threaded, 1 OS thread per CPU core)
+│   │  ├── Worker Thread 0 ─── runs ready tasks
+│   │  ├── Worker Thread 1 ─── runs ready tasks
+│   │  ├── Worker Thread 2 ─── runs ready tasks
+│   │  └── Worker Thread 3 ─── runs ready tasks
+│   │
+│   │  Tasks (green threads, ~2KB each, work-stolen across workers):
+│   │  ├── SessionActor: telegram:alice         ← tokio::spawn
+│   │  ├── SessionActor: telegram:bob           ← tokio::spawn
+│   │  ├── SessionActor: whatsapp:charlie       ← tokio::spawn
+│   │  ├── overflow task (alice, msg2)           ← tokio::spawn
+│   │  ├── stream forwarder (alice)             ← tokio::spawn
+│   │  ├── outbound forwarder (bob)             ← tokio::spawn
+│   │  └── ... hundreds more
+│   │
+│   └── Shared (read-only / thread-safe):
+│       ├── Arc<Agent> (LLM provider, system prompt)
+│       ├── Arc<EpisodeStore> (redb, per-profile memory)
+│       └── Arc<ToolRegistryFactory> (cloned per actor)
+│
+├── Profile "personal-bot" ──→ Gateway (OS process 2)
+│   └── ... independent runtime, memory, files
+│
+└── Profile "sub-account" ──→ Gateway (OS process 3)
+    └── ... inherits parent config, but fully isolated at runtime
 ```
 
-### 2.2 Core Types
+### 1.2 Isolation Levels
 
-#### SessionActor
+| Level | Mechanism | Boundary | What's isolated |
+|-------|-----------|----------|-----------------|
+| Profile ↔ Profile | OS process | Kernel | Memory, files, API keys, crashes, env vars |
+| User ↔ User | SessionActor + SessionHandle | Per-user directory | Session history, active topic, tool context |
+| Session ↔ Session | SessionHandle (per-JSONL file) | File | Message history, compaction state |
+| Overflow ↔ Overflow | tokio::spawn + Arc<Mutex<SessionHandle>> | Per-actor mutex | Concurrent agent calls within one session |
+
+### 1.3 Why Tokio Tasks, Not OS Processes Per User
+
+| | OS Process per user | Tokio task per user |
+|---|---|---|
+| Context switch | ~1-10μs | ~50ns |
+| Memory per unit | ~10MB | ~2KB (+ ~100KB session data) |
+| Max practical count | ~1K | ~100K+ |
+| CPU utilization | 1 core per process | All cores via work-stealing |
+| Isolation | Full kernel isolation | Shared memory (Arc), data isolation via SessionHandle |
+| Failure blast radius | Process crash = 1 user | Panic in task = 1 user (caught by tokio::spawn) |
+
+Tokio's multi-threaded runtime spawns one OS thread per CPU core. Tasks are automatically work-stolen across all cores. When a SessionActor awaits I/O (LLM HTTP response, disk write), the worker thread immediately picks up another task. CPU-bound work (JSON serialization, token counting) runs on the same pool.
+
+**Blocking I/O caveat**: `std::fs::read` blocks the OS thread. SessionHandle uses `tokio::task::spawn_blocking()` for all disk I/O, which runs on a separate expandable thread pool so main workers stay free.
+
+---
+
+## 2. SessionActor
+
+### 2.1 Structure
 
 ```rust
-/// A long-lived task that processes all messages for one session.
-pub struct SessionActor {
-    // --- Identity ---
-    session_key: SessionKey,
-    channel: String,        // e.g. "telegram"
-    chat_id: String,        // e.g. "12345"
-
-    // --- Inbox ---
+struct SessionActor {
+    session_key: SessionKey,        // e.g., "telegram:12345#research"
+    channel: String,                // e.g., "telegram"
+    chat_id: String,                // e.g., "12345"
     inbox: mpsc::Receiver<ActorMessage>,
 
-    // --- Owned tools (no set_context race) ---
-    message_tool: MessageTool,
-    send_file_tool: SendFileTool,
-    spawn_tool: Option<SpawnTool>,
-    cron_tool: Option<CronTool>,
-    pipeline_tool: Option<crew_pipeline::RunPipelineTool>,
+    agent: Arc<Agent>,              // shared LLM provider, system prompt
+    session_handle: Arc<Mutex<SessionHandle>>,  // per-actor, NOT shared
+    llm_for_compaction: Arc<dyn LlmProvider>,
 
-    // --- Session state ---
-    history: Vec<Message>,
-    session_mgr: Arc<Mutex<SessionManager>>,
-
-    // --- Shared (stateless) ---
-    agent_config: AgentConfig,
-    llm: Arc<dyn LlmProvider>,
-    memory: Arc<EpisodeStore>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
-    system_prompt: Arc<RwLock<String>>,
-    hooks: Option<Arc<HookExecutor>>,
-
-    // --- Output ---
     out_tx: mpsc::Sender<OutboundMessage>,
-
-    // --- Status ---
-    status_indicator: Option<Arc<StatusIndicator>>,
-
-    // --- Lifecycle ---
-    idle_timeout: Duration,
-    shutdown: Arc<AtomicBool>,
+    semaphore: Arc<Semaphore>,      // global concurrency limit
+    idle_timeout: Duration,         // 30 min default
+    session_timeout: Duration,      // per-message processing timeout
+    queue_mode: QueueMode,          // Followup | Collect | Steer | Speculative
+    active_overflow_tasks: Arc<AtomicU32>,  // per-session overflow counter
+    // ...
 }
 ```
 
-#### ActorMessage
-
-```rust
-/// Messages sent to a session actor's inbox.
-pub enum ActorMessage {
-    /// A user message to process.
-    Inbound(InboundMessage),
-    /// Cancel the current operation.
-    Cancel,
-    /// Update configuration (hot-reload).
-    ConfigUpdate(ActorConfigUpdate),
-}
-```
-
-#### ActorRegistry
-
-```rust
-/// Manages the lifecycle of session actors.
-pub struct ActorRegistry {
-    /// Active actors: session_key → sender handle.
-    actors: HashMap<String, ActorHandle>,
-    /// Factory for creating new actors.
-    factory: ActorFactory,
-    /// Global concurrency semaphore.
-    semaphore: Arc<Semaphore>,
-}
-
-pub struct ActorHandle {
-    /// Send messages to this actor.
-    tx: mpsc::Sender<ActorMessage>,
-    /// When the actor started.
-    created_at: Instant,
-    /// JoinHandle for awaiting shutdown.
-    join_handle: JoinHandle<()>,
-}
-```
-
-#### ActorFactory
-
-```rust
-/// Creates SessionActors with the correct shared resources and per-session tools.
-pub struct ActorFactory {
-    llm: Arc<dyn LlmProvider>,
-    memory: Arc<EpisodeStore>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
-    system_prompt: Arc<RwLock<String>>,
-    hooks: Option<Arc<HookExecutor>>,
-    agent_config: AgentConfig,
-    session_mgr: Arc<Mutex<SessionManager>>,
-    out_tx: mpsc::Sender<OutboundMessage>,
-    spawn_inbound_tx: mpsc::Sender<InboundMessage>,
-    cron_service: Option<Arc<CronService>>,
-    pipeline_config: Option<PipelineConfig>,
-    status_indicators: HashMap<String, Arc<StatusIndicator>>,
-    idle_timeout: Duration,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl ActorFactory {
-    /// Create a new SessionActor with per-session tool instances.
-    fn create(&self, session_key: &SessionKey, channel: &str, chat_id: &str)
-        -> (mpsc::Sender<ActorMessage>, JoinHandle<()>)
-    {
-        let (tx, rx) = mpsc::channel(32);  // bounded inbox
-
-        // Per-session tools — no set_context() needed
-        let message_tool = MessageTool::with_context(
-            self.out_tx.clone(), channel, chat_id);
-        let send_file_tool = SendFileTool::with_context(
-            self.out_tx.clone(), channel, chat_id);
-        // ... other tools ...
-
-        let actor = SessionActor { /* ... */ };
-        let handle = tokio::spawn(actor.run());
-        (tx, handle)
-    }
-}
-```
-
-### 2.3 Actor Lifecycle
+### 2.2 Lifecycle
 
 ```
-                     create()
-                        │
-                        ▼
-  ┌─────────────────────────────────────────┐
-  │              RUNNING                     │
-  │                                          │
-  │  loop {                                  │
-  │    select! {                             │
-  │      msg = inbox.recv() => process(msg)  │
-  │      _ = sleep(idle_timeout) => break    │
-  │    }                                     │
-  │  }                                       │
-  └─────────────────┬───────────────────────┘
-                    │
-                    ▼
-  ┌─────────────────────────────────────────┐
-  │              SHUTDOWN                    │
-  │                                          │
-  │  1. Flush pending history to disk        │
-  │  2. Remove self from ActorRegistry       │
-  │  3. Task completes                       │
-  └─────────────────────────────────────────┘
-```
+ActorRegistry::dispatch(inbound, session_key)
+    │
+    ├── Actor exists? ──→ send to inbox
+    │
+    └── Create new actor:
+        1. ActorFactory::spawn(session_key, channel, chat_id)
+        2. Create SessionHandle::open(data_dir, &session_key)
+           └── Loads from disk or creates empty session
+        3. Clone ToolRegistry (per-actor tools)
+        4. Create per-session MessageTool, SendFileTool, SpawnTool
+        5. tokio::spawn(actor.run())
 
-#### Run Loop
-
-```rust
-impl SessionActor {
-    async fn run(mut self) {
-        // Load history from disk on start
-        self.load_history().await;
-
-        loop {
-            tokio::select! {
-                msg = self.inbox.recv() => {
-                    match msg {
-                        Some(ActorMessage::Inbound(inbound)) => {
-                            self.process_inbound(inbound).await;
-                        }
-                        Some(ActorMessage::Cancel) => {
-                            self.cancel_current().await;
-                        }
-                        Some(ActorMessage::ConfigUpdate(update)) => {
-                            self.apply_config(update);
-                        }
-                        None => break,  // all senders dropped
-                    }
-                }
-                _ = tokio::time::sleep(self.idle_timeout) => {
-                    tracing::debug!(session = %self.session_key, "idle timeout, shutting down actor");
-                    break;
+Actor run loop:
+    loop {
+        select! {
+            msg = inbox.recv() => {
+                match msg {
+                    Inbound { message, media } => process(message, media),
+                    BackgroundResult { label, content } => inject_to_history(),
+                    Cancel => set cancelled flag,
+                    None => break,  // all senders dropped
                 }
             }
-        }
-
-        // Cleanup: persist any unsaved state
-        self.flush().await;
-    }
-}
-```
-
-#### Message Processing
-
-```rust
-impl SessionActor {
-    async fn process_inbound(&mut self, inbound: InboundMessage) {
-        // 1. Start status indicator
-        let token_tracker = Arc::new(TokenTracker::new());
-        let status_handle = self.start_status(&inbound, &token_tracker);
-
-        // 2. Build Agent for this turn
-        //    (lightweight — reuses shared LLM, just builds message list)
-        let agent = self.build_agent();
-
-        // 3. Process through agent (long LLM call, but only this actor blocks)
-        let response = agent
-            .process_message_tracked(
-                &inbound.content,
-                &self.history,
-                self.extract_media(&inbound),
-                &token_tracker,
-            )
-            .await;
-
-        // 4. Stop status indicator
-        if let Some(handle) = status_handle {
-            handle.stop().await;
-        }
-
-        // 5. Update history and persist
-        match response {
-            Ok(conv_response) => {
-                self.append_user_message(&inbound);
-                if !conv_response.content.is_empty() {
-                    self.append_assistant_message(&conv_response);
-                    // Send reply — always goes to this actor's chat
-                    let _ = self.out_tx.send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content: conv_response.content,
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    }).await;
-                }
-                // Maybe compact
-                self.maybe_compact().await;
-            }
-            Err(e) => {
-                tracing::error!(session = %self.session_key, error = %e, "processing failed");
-                let _ = self.out_tx.send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: format!("Error: {e}"),
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                }).await;
-            }
+            _ = sleep(idle_timeout) => break,  // 30 min idle → shutdown
         }
     }
-}
 ```
 
-### 2.4 Dispatcher (replaces main loop)
+### 2.3 Message Processing Modes
 
-```rust
-impl ActorRegistry {
-    /// Route an inbound message to the correct actor, creating one if needed.
-    async fn dispatch(&mut self, inbound: InboundMessage, session_key: SessionKey) {
-        let key_str = session_key.to_string();
+#### Followup (default)
+Sequential processing. Each message waits for the previous to complete.
 
-        // Get or create actor
-        let handle = if let Some(h) = self.actors.get(&key_str) {
-            h
-        } else {
-            let channel = session_key.channel().to_string();
-            let chat_id = session_key.chat_id().to_string();
-            let (tx, join_handle) = self.factory.create(
-                &session_key, &channel, &chat_id);
-            self.actors.insert(key_str.clone(), ActorHandle {
-                tx,
-                created_at: Instant::now(),
-                join_handle,
-            });
-            self.actors.get(&key_str).unwrap()
-        };
+#### Collect
+Batch queued messages into one combined prompt when the current LLM call finishes.
 
-        // Send to actor (backpressure via bounded channel)
-        match handle.tx.try_send(ActorMessage::Inbound(inbound)) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Actor is busy — send "still working" feedback
-                let _ = self.factory.out_tx.send(OutboundMessage {
-                    channel: session_key.channel().to_string(),
-                    chat_id: session_key.chat_id().to_string(),
-                    content: "⏳ Still processing your previous message, \
-                              yours is queued...".to_string(),
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                }).await;
-                // Block until space available (or use try_send + drop)
-                let handle = self.actors.get(&key_str).unwrap();
-                let _ = handle.tx.send(ActorMessage::Inbound(inbound)).await;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Actor died — remove and retry
-                self.actors.remove(&key_str);
-                // Recursive retry (will create new actor)
-                // In practice, use a loop instead of recursion
-            }
-        }
-    }
+#### Steer
+Keep only the newest queued message, discard older ones (user changed their mind).
 
-    /// Periodically clean up completed actor handles.
-    fn reap_dead_actors(&mut self) {
-        self.actors.retain(|key, handle| {
-            if handle.join_handle.is_finished() {
-                tracing::debug!(session = %key, "reaping completed actor");
-                false
-            } else {
-                true
-            }
-        });
-    }
-}
-```
-
-### 2.5 Session Switching & Notifications
-
-When a user switches sessions (e.g., via topic commands), the old actor **keeps running**:
+#### Speculative
+Concurrent processing. When the primary LLM call exceeds the patience threshold (2× baseline latency, min 10s), overflow messages spawn independent agent tasks:
 
 ```
-Time 0: User sends "research quantum computing" → Actor A starts (long pipeline)
-Time 1: User switches to topic "code" → Actor B created for new topic
-Time 2: User sends "fix this bug" → routed to Actor B, processed immediately
-Time 3: Actor A finishes → sends OutboundMessage to Actor A's chat_id
-         → User gets Telegram notification: "Research complete! Here are the findings..."
-Time 4: User switches back to topic "research" → Actor A may have shut down (idle),
-         but history is persisted; new Actor A loads from disk
+SessionActor: telegram:alice
+│
+│  Processing msg1 (slow LLM call)...
+│  │
+│  ├── msg2 arrives, patience exceeded
+│  │   └── tokio::spawn(serve_overflow)    ← new task, MAX 5 per session
+│  │       ├── Own status indicator ("✦ Thinking...")
+│  │       ├── Own stream reporter (separate chat bubble)
+│  │       ├── Shares Arc<Mutex<SessionHandle>>
+│  │       └── Saves ONLY final reply (avoids tool_call ID collisions)
+│  │
+│  └── msg1 finishes
+│       ├── Saves all messages (user, tool_calls, tool_results, reply)
+│       ├── sort_by_timestamp() to restore chronological order
+│       └── rewrite() to persist sorted state
 ```
 
-Key properties:
+**Why only save final reply from overflow**: LLM providers generate sequential tool_call IDs (e.g., `deep_search_0`). Concurrent overflow tasks produce duplicate IDs that corrupt session history. Saving only the final assistant reply avoids this.
 
-- **Long-running sessions don't block other sessions**: Actor A runs independently
-- **User gets notified when done**: `out_tx.send()` delivers to the correct chat regardless of which session the user is "viewing"
-- **Queue feedback**: If Actor A's inbox is full when user sends another message, the dispatcher immediately replies "still working..."
-- **Cancellation**: Dispatcher can send `ActorMessage::Cancel` to Actor A, which sets a per-actor shutdown flag checked at each LLM iteration
+---
 
-### 2.6 Concurrency Control
+## 3. Data Architecture
+
+### 3.1 Per-User Directory Layout
 
 ```
-Global semaphore (max_concurrent_sessions)
+{data_dir}/                              ← per-profile (one OS process)
+├── users/
+│   ├── telegram%3A12345/                ← alice (per-user directory)
+│   │   ├── sessions/
+│   │   │   ├── default.jsonl            ← default session
+│   │   │   ├── research.jsonl           ← /new research
+│   │   │   └── code.jsonl              ← /new code
+│   │   └── (future: preferences, quotas)
+│   │
+│   ├── telegram%3A67890/                ← bob
+│   │   └── sessions/
+│   │       └── default.jsonl
+│   │
+│   └── whatsapp%3A99999/                ← charlie
+│       └── sessions/
+│           └── default.jsonl
+│
+├── episodes.redb                        ← per-profile (shared agent memory)
+├── memory/                              ← per-profile (knowledge bank)
+├── active_sessions.json                 ← per-profile (topic tracking)
+└── skills/                              ← per-profile (installed plugins)
+```
+
+**Why per-user directories**: Enables future filesystem-level isolation (quotas, chroot, sandboxing per user). Each user's data is in one directory that can be independently:
+- Quota-limited (filesystem quotas per directory)
+- Sandboxed (chroot, bind mount)
+- Backed up / migrated / deleted
+
+**Backward compatibility**: `SessionHandle::open()` tries the new per-user path first, falls back to legacy flat layout (`{data_dir}/sessions/{encoded_key}.jsonl`), and migrates automatically (loads from old path, deletes old file, writes to new path on next save).
+
+### 3.2 Session File Format (JSONL)
+
+```
+Line 1: {"schema_version":1,"session_key":"telegram:12345","topic":null,"summary":"Hello...","created_at":"...","updated_at":"..."}
+Line 2: {"role":"user","content":"hello","media":[],"timestamp":"..."}
+Line 3: {"role":"assistant","content":"Hi!","tool_calls":null,"timestamp":"..."}
+Line 4: {"role":"user","content":"search for X","timestamp":"..."}
+Line 5: {"role":"assistant","content":"","tool_calls":[{"id":"search_0","name":"web_search","arguments":{"query":"X"}}],"timestamp":"..."}
+Line 6: {"role":"tool","content":"Results...","tool_call_id":"search_0","timestamp":"..."}
+Line 7: {"role":"assistant","content":"I found...","timestamp":"..."}
+```
+
+Properties:
+- **Append-only** for normal writes (O(1) per message)
+- **Atomic rewrite** via write-then-rename for compaction/sort (crash-safe)
+- **10 MB size limit** per file (prevents OOM)
+- **Schema versioning** for forward compatibility (rejects unknown versions)
+
+### 3.3 Data Ownership
+
+| Data | Scope | Owner | Shared? |
+|------|-------|-------|---------|
+| Session JSONL files | Per-session | SessionHandle (per-actor mutex) | Only with own overflow tasks |
+| User directory | Per-user | SessionActor | No cross-user access |
+| EpisodeStore (redb) | Per-profile | All actors (read), agent loop (write) | Yes — thread-safe via redb |
+| MemoryStore | Per-profile | All actors | Yes — agent knowledge shared |
+| System prompt | Per-profile | Shared via RwLock | Yes — read by all actors |
+| ToolRegistry | Per-actor | Cloned at actor creation | No — each actor owns its copy |
+| MessageTool / SendFileTool | Per-actor | Wired to specific channel:chat_id | No |
+| API keys / env vars | Per-profile | OS process environment | No cross-profile access |
+
+### 3.4 Why EpisodeStore Is Per-Profile (Not Per-User)
+
+EpisodeStore is the agent's **long-term memory** — summaries of completed tasks. It's cross-user by design:
+- Agent learns from all interactions within a profile (bot gets smarter)
+- User A: "research quantum computing" → stored as episode
+- User B: "what do you know about quantum computing?" → agent recalls User A's research
+
+Per-user episodes would silo knowledge and defeat the purpose. Per-profile is the correct boundary — each bot profile is a separate "agent identity" with its own accumulated experience.
+
+---
+
+## 4. Concurrency Control
+
+### 4.1 No Shared Session Mutex
+
+**Before (old design)**:
+```
+All SessionActors → Arc<Mutex<SessionManager>> → one LRU cache, one lock
+    13 lock sites, all competing across users
+    5-second timeout, degraded fallbacks on contention
+    One user's compaction blocks all other users' reads/writes
+```
+
+**After (current design)**:
+```
+Each SessionActor → own Arc<Mutex<SessionHandle>> → own data, own file
+    Per-actor mutex only contested by own overflow tasks
+    No timeout needed (instant lock acquisition)
+    Zero cross-user contention
+```
+
+The shared `SessionManager` still exists for admin operations (`/sessions`, `/new`, `/delete`, `/s preview`) in the gateway main loop. These are infrequent, single-threaded, and don't affect actor performance.
+
+### 4.2 Concurrency Limits
+
+| Constant | Default | Scope | Purpose |
+|----------|---------|-------|---------|
+| `max_concurrent_sessions` | 10 | Per-profile (Semaphore) | Bounds total active LLM calls |
+| `MAX_OVERFLOW_TASKS` | 5 | Per-session (AtomicU32) | Limits concurrent overflow agent tasks |
+| `ACTOR_INBOX_SIZE` | 32 | Per-actor (mpsc channel) | Backpressure — full inbox triggers "queued..." |
+| `MAX_PENDING_PER_SESSION` | 50 | Per-session (buffer) | Limits buffered messages for inactive sessions |
+
+### 4.3 Backpressure Flow
+
+```
+User sends message
     │
-    ├── Actor A acquires permit on first inbound message
-    │   └── releases when idle-timeout or shutdown
+    ├── Actor inbox has space → delivered immediately
     │
-    ├── Actor B acquires permit
-    │   └── ...
+    ├── Actor inbox full (32 messages) →
+    │   ├── Send "⏳ Still processing, your message is queued..." immediately
+    │   └── Block until space available (actor finishes current message)
     │
-    └── Actor C blocks on acquire (at capacity)
-        └── dispatcher sends "server busy, please wait" feedback
+    ├── Overflow limit reached (5 concurrent) →
+    │   └── Send "I'm currently handling several tasks. Please wait."
+    │
+    └── Actor died (panic/OOM) →
+        ├── Remove from registry
+        ├── Create new actor (loads history from disk)
+        └── Deliver message to new actor
 ```
 
-The semaphore permit is acquired when the actor **starts processing** (not when created). An idle actor holding no permit doesn't count toward the limit.
-
-### 2.7 Memory Budget
-
-| Component | Per-actor cost | Shared cost |
-|---|---|---|
-| `mpsc::Receiver` | ~64 bytes + buffer (32 msgs × ~1KB) | — |
-| `MessageTool` | ~128 bytes (two Strings + Sender clone) | — |
-| `SendFileTool` | ~128 bytes | — |
-| `SpawnTool` | ~256 bytes (includes LLM Arc clone) | — |
-| `CronTool` | ~128 bytes | — |
-| `history: Vec<Message>` | Varies (typically 10-50 messages, ~50KB) | — |
-| `TokenTracker` | ~8 bytes (two AtomicU32) | — |
-| `LlmProvider` | — | ~1KB (shared via Arc) |
-| `EpisodeStore` | — | ~10KB (shared via Arc) |
-| `SessionManager` | — | ~1MB LRU cache (shared via Arc<Mutex>) |
-
-**Per-actor total**: ~100KB typical (dominated by message history)
-**1000 actors**: ~100MB — well within budget for a server process
-
 ---
 
-## 3. Implementation Plan
+## 5. Profile & Sub-Account Isolation
 
-### Phase 1: Tool Context Extraction (No behavior change)
+### 5.1 Profile Hierarchy
 
-**Goal**: Eliminate `set_context()` by giving tools their context at construction time.
-
-**Files changed**:
-- `crew-agent/src/tools/message.rs` — add `with_context()` constructor
-- `crew-agent/src/tools/send_file.rs` — add `with_context()` constructor
-- `crew-agent/src/tools/spawn.rs` — add `with_context()` constructor
-- `crew-cli/src/cron_tool.rs` — add `with_context()` constructor
-
-**Changes**:
-1. Add `MessageTool::with_context(out_tx, channel, chat_id) -> Self` that sets defaults at construction. Keep `set_context()` for backward compatibility during migration.
-2. Same for `SendFileTool`, `SpawnTool`, `CronTool`.
-3. Add `ToolRegistry::new_for_session(channel, chat_id, ...)` factory method that builds a complete per-session registry.
-
-**Tests**:
-- Existing tool tests pass unchanged
-- New test: `with_context()` tools route to correct chat without `set_context()`
-- New test: two tool instances with different contexts don't interfere
-
-**Verification**: Gateway still works with old `set_context()` path. No behavior change.
-
-### Phase 2: SessionActor + ActorFactory (New code, not yet wired)
-
-**Goal**: Implement `SessionActor`, `ActorFactory`, `ActorRegistry` as new types. Not yet used by gateway.
-
-**Files added**:
-- `crew-cli/src/actor.rs` — `SessionActor`, `ActorMessage`, `ActorHandle`
-- `crew-cli/src/actor_registry.rs` — `ActorRegistry`, `ActorFactory`
-
-**Key decisions**:
-- Inbox channel buffer size: **32** (enough for burst, provides backpressure)
-- Idle timeout: **30 minutes** (configurable via `GatewayConfig`)
-- Actor reuses `Agent::process_message_tracked()` internally — no changes to Agent
-- History loaded from `SessionManager` on actor start, appended on each turn
-- Compaction triggered after each turn if threshold exceeded
-
-**Tests**:
-- Unit test: `SessionActor` processes a message and sends reply to `out_tx`
-- Unit test: `SessionActor` shuts down after idle timeout
-- Unit test: `ActorRegistry` creates actor on first message, reuses on second
-- Unit test: `ActorRegistry` reaps dead actors
-- Unit test: inbox backpressure — full inbox triggers "still working" feedback
-- Unit test: `ActorMessage::Cancel` stops processing at next iteration boundary
-
-### Phase 3: Wire Dispatcher (Replace gateway main loop) ✅
-
-**Status**: Implemented
-
-**Goal**: Replace the `tokio::spawn`-per-message dispatch in `gateway.rs` with `ActorRegistry::dispatch()`.
-
-**Files changed**:
-- `crew-cli/src/commands/gateway.rs` — replace dispatch section (~lines 1530-1630)
-
-**Before** (current):
-```rust
-while let Some(inbound) = agent_handle.recv_inbound().await {
-    // ... resolve session key ...
-    let handle = tokio::spawn(async move {
-        let _permit = semaphore.acquire().await;
-        let _session_guard = session_lock.lock().await;
-        process_session_message(&agent, &session_mgr, ...).await;
-    });
-}
+```
+crew serve
+├── Profile "main" (parent)                  ← OS process 1
+│   ├── data_dir: ~/.crew/profiles/main/
+│   ├── provider: kimi-2.5 (KIMI_API_KEY)
+│   ├── channels: [telegram:bot-A, feishu:app-X]
+│   └── users: alice, bob, charlie
+│
+├── Profile "sub-1" (child of main)          ← OS process 2
+│   ├── data_dir: ~/.crew/profiles/sub-1/
+│   ├── provider: inherits from parent (or overrides)
+│   ├── channels: [telegram:bot-B]
+│   └── users: dave, eve
+│
+└── Profile "sub-2" (child of main)          ← OS process 3
+    ├── data_dir: ~/.crew/profiles/sub-2/
+    └── channels: [whatsapp:bot-C]
 ```
 
-**After**:
-```rust
-let mut registry = ActorRegistry::new(factory, semaphore);
+### 5.2 What `parent_id` Controls
 
-while let Some(inbound) = agent_handle.recv_inbound().await {
-    // ... resolve session key ...
-    registry.dispatch(inbound, session_key).await;
+The `parent_id` field on a sub-account profile controls **config inheritance only**:
+- Provider, model, base_url fall back to parent if not set
+- API key env var falls back to parent
+- Fallback models inherited
 
-    // Periodic cleanup
-    if cleanup_interval.tick() {
-        registry.reap_dead_actors();
-    }
-}
+At runtime, sub-accounts are **fully independent**:
+- Separate OS process (crash in sub-1 doesn't affect sub-2)
+- Separate data_dir (no shared files)
+- Separate EpisodeStore (independent memory)
+- Separate session history (independent users)
+- Managed by launchd (auto-restart on crash)
 
-// Shutdown: cancel all actors
-registry.shutdown_all().await;
+### 5.3 User Identity
+
+A "user" is identified by `channel:chat_id`:
+
+```
+Profile "work-bot"
+├── users/
+│   ├── telegram%3A12345/      ← Alice on Telegram
+│   ├── whatsapp%3A8613800/    ← Alice on WhatsApp (same person, different user)
+│   ├── telegram%3A67890/      ← Bob on Telegram
+│   └── feishu%3Aoc_abc123/    ← A Feishu group chat
 ```
 
-**Removed**:
-- `session_locks: HashMap<String, Arc<Mutex<()>>>` — replaced by actor inbox serialization
-- `concurrency_semaphore` usage in spawned tasks — moved to actor lifecycle
-- All `set_context()` calls — tools are constructed with context
-- `process_session_message()` function — logic moves into `SessionActor::process_inbound()`
-
-**Tests**:
-- Integration test: two concurrent sessions don't interfere (tool output goes to correct chat)
-- Integration test: messages to same session are processed in order
-- Integration test: full inbox triggers queued feedback message
-- Integration test: actor shuts down after idle, new message creates fresh actor, history preserved
-
-### Phase 4: Cancellation Support
-
-**Goal**: Allow per-session cancellation.
-
-**Files changed**:
-- `crew-agent/src/agent.rs` — accept per-call `CancellationToken` (or `Arc<AtomicBool>`)
-- `crew-cli/src/actor.rs` — `Cancel` message sets actor's shutdown flag
-- `crew-cli/src/commands/gateway.rs` — `/cancel` command sends `ActorMessage::Cancel`
-
-**Changes**:
-1. `SessionActor` holds a per-actor `Arc<AtomicBool>` shutdown flag
-2. This flag is passed to `Agent` via a new `process_message_with_cancel()` method
-3. Agent checks the flag in `check_budget()` (already checked each iteration)
-4. When cancel is received, agent finishes current LLM call, then exits loop
-5. Actor sends "Cancelled." reply and returns to inbox recv
-
-**Tests**:
-- Unit test: cancel stops processing after current iteration
-- Unit test: cancel during tool execution waits for tool to finish, then stops
-
-### Phase 5: Hot Reload & Observability
-
-**Goal**: Leverage actor model for config hot-reload and monitoring.
-
-**Changes**:
-1. `ActorMessage::ConfigUpdate` — push new system prompt, max_history, etc. to live actors
-2. `ActorRegistry::status()` — returns per-actor status (idle/processing, queue depth, uptime, token usage)
-3. Expose via admin API endpoint: `GET /admin/actors`
-4. `ConfigWatcher` sends updates to all actors via broadcast channel
-
-**Tests**:
-- Config update propagates to running actors
-- Admin endpoint returns accurate actor status
+There is no cross-channel identity linking. `telegram:12345` and `whatsapp:8613800` are treated as independent users even if they're the same person. Future enhancement: `/link` command to bind accounts under a unified identity.
 
 ---
 
-## 4. Migration Strategy
+## 6. Data Protection
 
-### Incremental, backward-compatible
+### 6.1 Session Data Safety
 
-Each phase is independently shippable and testable:
+| Property | Mechanism |
+|----------|-----------|
+| Crash safety | Atomic write-then-rename for rewrite/compaction |
+| Append safety | JSONL append (fsync on close) |
+| Size limit | 10 MB per file, reject on load and append |
+| Encoding safety | Percent-encoded filenames, FNV-1a hash suffix on truncation |
+| Schema versioning | Rejects files with unknown future schema versions |
+| User isolation | Per-user directory, no cross-user file access |
 
-| Phase | Ships as | Risk | Rollback |
-|---|---|---|---|
-| 1: Tool with_context | Additive API | None — old code still works | Delete new constructors |
-| 2: Actor types | New files, unused | None — no runtime change | Delete files |
-| 3: Wire dispatcher | **Breaking change** to gateway loop | Medium — new dispatch path | Revert gateway.rs to pre-actor version |
-| 4: Cancellation | Additive API on Agent | Low | Remove cancel flag checks |
-| 5: Hot reload | Additive | Low | Remove config update handling |
+### 6.2 Memory Safety (Rust Guarantees)
 
-### Feature flag (optional)
+| Threat | Protection |
+|--------|-----------|
+| Buffer overflow | Rust ownership model, bounds checking |
+| Use-after-free | Borrow checker, Arc reference counting |
+| Data race | No shared mutable state without Mutex/RwLock |
+| Lock poisoning | `unwrap_or_else(\|e\| e.into_inner())` — recover inner value |
 
-Phase 3 can be gated behind a config flag during testing:
+### 6.3 Secrets Protection
 
-```json
-{
-  "gateway": {
-    "actor_mode": true
-  }
-}
-```
+| Secret | Storage | Isolation |
+|--------|---------|-----------|
+| API keys | OS environment variables | Per-profile process (not inherited by children unless configured) |
+| Auth tokens | `~/.crew/auth.json` | Per-host (shared) |
+| Session content | JSONL files | Per-user directory |
+| `BLOCKED_ENV_VARS` (18) | Stripped from: sandbox, MCP, hooks, plugins, browser | All child processes |
 
-When `false`, falls back to the current `tokio::spawn`-per-message path. Remove the flag after validation.
+### 6.4 Future Filesystem Isolation
 
----
+The per-user directory structure enables progressive hardening:
 
-## 5. Testing Plan
+**Phase 1** (current): Directory-based isolation. SessionHandle scopes all I/O to the user's directory. No kernel enforcement.
 
-### 5.1 Unit Tests
+**Phase 2** (planned): Filesystem quotas per user directory. Prevents a single user from filling disk.
 
-| Test | Location | What it verifies |
-|---|---|---|
-| `tool_with_context_routes_correctly` | `crew-agent/src/tools/message.rs` | `with_context()` sets routing without `set_context()` |
-| `two_tools_different_context` | `crew-agent/src/tools/message.rs` | Two MessageTool instances don't interfere |
-| `actor_processes_message` | `crew-cli/src/actor.rs` | Single message → reply appears on `out_tx` |
-| `actor_idle_shutdown` | `crew-cli/src/actor.rs` | Actor exits after `idle_timeout` with no messages |
-| `actor_cancel` | `crew-cli/src/actor.rs` | `ActorMessage::Cancel` stops current processing |
-| `actor_queue_serialization` | `crew-cli/src/actor.rs` | Two messages to same actor processed in order |
-| `registry_creates_actor` | `crew-cli/src/actor_registry.rs` | First message creates actor |
-| `registry_reuses_actor` | `crew-cli/src/actor_registry.rs` | Second message reuses existing actor |
-| `registry_reaps_dead` | `crew-cli/src/actor_registry.rs` | Completed actors removed from map |
-| `registry_backpressure` | `crew-cli/src/actor_registry.rs` | Full inbox → "still working" feedback sent |
+**Phase 3** (future): Chroot/bind-mount per user. Shell tool sees only the user's directory + system read-only paths.
 
-### 5.2 Integration Tests
-
-| Test | What it verifies |
-|---|---|
-| `concurrent_sessions_no_crosstalk` | Two sessions running simultaneously: each tool call routes to the correct chat. This is the **primary regression test** for P1 (set_context race). |
-| `session_switch_long_running` | User starts long session A, switches to session B, sends message. B responds immediately. A finishes later and delivers notification to A's chat. |
-| `actor_lifecycle_persist` | Actor processes messages → idles out → new message arrives → new actor loads history from disk → continues conversation. |
-| `cancel_mid_processing` | Send cancel while agent is in tool-use loop. Agent finishes current tool, then stops. User gets "Cancelled." response. |
-| `backpressure_feedback` | Fill actor inbox to capacity, send another message. Verify "still working..." response is sent immediately. |
-| `graceful_shutdown` | Send shutdown signal. All actors finish current work, flush to disk, exit. No data loss. |
-| `config_hot_reload` | Change system prompt while actors are running. Verify next message uses updated prompt. |
-
-### 5.3 Stress Tests
-
-| Test | Setup | Expected |
-|---|---|---|
-| `100_concurrent_sessions` | 100 sessions, each sending 5 messages. `max_concurrent_sessions = 20`. | All 500 messages processed. No crosstalk. Semaphore correctly bounds concurrency. |
-| `rapid_fire_same_session` | 50 messages sent to one session in <1 second. | All queued, processed in order. Backpressure feedback after inbox fills. |
-| `actor_churn` | Create 1000 actors, let them idle-timeout, verify memory returns to baseline. | No leaks. `ActorRegistry` map empty after all actors exit. |
-
-### 5.4 Regression Tests
-
-The existing gateway integration tests must continue to pass:
-- `test_concurrent_sessions` (crew-bus session.rs)
-- `test_concurrent_session_processing` (crew-bus session.rs)
-- `test_evicted_session_reloads_from_disk` (crew-bus session.rs)
-- All tool tests (`message.rs`, `send_file.rs`, `spawn.rs`)
-
-### 5.5 Manual Testing Checklist
-
-- [ ] Telegram: send message, get reply in correct chat
-- [ ] Telegram: send two messages rapidly, both processed in order
-- [ ] Telegram: start long pipeline in chat A, send quick question in chat B, get B's reply immediately
-- [ ] Telegram: long pipeline finishes, notification appears in chat A
-- [ ] Feishu: same as above
-- [ ] CLI: `crew chat` still works (single-session mode)
-- [ ] Gateway admin UI shows active actors and their status
-- [ ] Shutdown gateway while sessions are active — no data loss, clean exit
-- [ ] Hot-reload system prompt — next message uses new prompt
+**Phase 4** (future): Per-profile UID. Each gateway process runs as a separate Unix user. Kernel-enforced tenant isolation.
 
 ---
 
-## 6. Risks and Mitigations
+## 7. QoS Configuration
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Actor leaks (never shuts down) | Memory growth | Idle timeout + periodic reaping + monitoring endpoint |
-| Inbox overflow under load | Messages dropped | Bounded channel with explicit backpressure feedback; log warnings |
-| Agent panics inside actor | Actor dies silently | `tokio::spawn` catches panics; registry reaps; next message creates new actor |
-| Tool construction cost per actor | Startup latency | Tools are lightweight (~100 bytes each); benchmark to confirm |
-| Config hot-reload races | Stale config | Use `tokio::sync::watch` for config broadcast; actors check on each turn |
-| History divergence (actor cache vs disk) | Data inconsistency | Actor appends to SessionManager on each turn; flush on shutdown |
+### 7.1 Current Defaults
 
----
+| Constant | Value | Location |
+|----------|-------|----------|
+| `DEFAULT_TOOL_TIMEOUT_SECS` | 600 (10 min) | `crew-agent/src/agent/mod.rs` |
+| `MAX_TOOL_TIMEOUT_SECS` | 1800 (30 min) | `crew-agent/src/agent/mod.rs` |
+| `DEFAULT_SESSION_TIMEOUT_SECS` | 1800 (30 min) | `crew-agent/src/agent/mod.rs` |
+| `DEFAULT_LLM_TIMEOUT_SECS` | 120 (2 min) | `crew-llm/src/provider.rs` |
+| `MAX_OVERFLOW_TASKS` | 5 | `crew-cli/src/session_actor.rs` |
+| `ACTOR_INBOX_SIZE` | 32 | `crew-cli/src/session_actor.rs` |
+| `DEFAULT_IDLE_TIMEOUT_SECS` | 1800 (30 min) | `crew-cli/src/session_actor.rs` |
+| `MAX_PENDING_PER_SESSION` | 50 | `crew-cli/src/session_actor.rs` |
+| Plugin timeout (default) | 600s | `crew-agent/src/plugins/tool.rs` |
+| MCP timeout | 60s | `crew-agent/src/mcp.rs` |
 
-## 7. Future Extensions
+### 7.2 Adaptive QoS
 
-Once the actor model is in place, several features become trivial:
+The `ResponsivenessObserver` tracks LLM response latencies per session and detects sustained degradation:
 
-| Feature | How |
-|---|---|
-| Per-session token budgets | Actor tracks cumulative usage, enforces limit |
-| Session priority queues | Dispatcher sorts inbox by priority before sending |
-| Multi-turn streaming | Actor holds SSE connection, streams tokens directly |
-| Session transfer | Send actor's history to a different chat_id |
-| Actor supervision | Registry restarts crashed actors with last-known state |
-| Distributed gateway | Actors communicate via Redis pub/sub instead of in-process channels |
+1. **Baseline established** from first 5 responses (exponential moving average)
+2. **Degradation detected** when 3+ consecutive responses exceed 3× baseline
+3. **Auto-escalation**: Switch to `QueueMode::Speculative` + `AdaptiveMode::Hedge` (race multiple providers)
+4. **Recovery**: When latencies return to normal, revert to `QueueMode::Followup` + `AdaptiveMode::Off`
+
+User commands for manual control:
+- `/adaptive` — view status
+- `/adaptive circuit on|off` — toggle circuit breaker
+- `/adaptive lane on|off` — toggle lane changing
+- `/adaptive qos on|off` — toggle QoS ranking
+- `/queue followup|collect|steer|speculative` — set queue mode
