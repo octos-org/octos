@@ -98,7 +98,7 @@ impl Default for SandboxConfig {
 /// Docker sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DockerConfig {
-    /// Docker image to use (default: "alpine:3.21").
+    /// Docker image to use (default: "ubuntu:24.04").
     #[serde(default = "default_docker_image")]
     pub image: String,
 
@@ -158,7 +158,7 @@ impl Default for DockerConfig {
 }
 
 fn default_docker_image() -> String {
-    "alpine:3.21".to_string()
+    "ubuntu:24.04".to_string()
 }
 
 /// Workspace mount mode for Docker sandbox.
@@ -608,7 +608,7 @@ mod tests {
         assert!(args.contains(&"none".to_string())); // --network none
         assert!(args.contains(&"no-new-privileges".to_string()));
         assert!(args.contains(&"ALL".to_string())); // --cap-drop ALL
-        assert!(args.contains(&"alpine:3.21".to_string()));
+        assert!(args.contains(&"ubuntu:24.04".to_string()));
         assert!(args.contains(&"echo hi".to_string()));
     }
 
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn test_docker_config_default() {
         let config = DockerConfig::default();
-        assert_eq!(config.image, "alpine:3.21");
+        assert_eq!(config.image, "ubuntu:24.04");
         assert!(config.cpu_limit.is_none());
         assert!(config.memory_limit.is_none());
         assert!(config.pids_limit.is_none());
@@ -906,7 +906,7 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.mode, SandboxMode::Auto);
         assert!(!config.allow_network);
-        assert_eq!(config.docker.image, "alpine:3.21");
+        assert_eq!(config.docker.image, "ubuntu:24.04");
     }
 
     // --- create_sandbox with SandboxMode::None ---
