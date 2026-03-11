@@ -120,6 +120,8 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "whatsapp" => true,
         #[cfg(feature = "feishu")]
         "feishu" | "lark" => true,
+        #[cfg(feature = "wecom-bot")]
+        "wecom-bot" => true,
         _ => false,
     }
 }

@@ -68,6 +68,7 @@ email = ["crew-bus/email"]
 feishu = ["crew-bus/feishu"]
 twilio = ["crew-bus/twilio"]
 wecom = ["crew-bus/wecom"]
+wecom-bot = ["crew-bus/wecom-bot"]
 git = ["crew-agent/git"]
 ast = ["crew-agent/ast"]
 

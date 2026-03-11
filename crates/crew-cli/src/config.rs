@@ -744,7 +744,16 @@ impl Config {
         // Check gateway config
         if let Some(ref gw) = self.gateway {
             const VALID_CHANNELS: &[&str] = &[
-                "cli", "telegram", "discord", "slack", "whatsapp", "email", "feishu",
+                "cli",
+                "telegram",
+                "discord",
+                "slack",
+                "whatsapp",
+                "email",
+                "feishu",
+                "twilio",
+                "wecom",
+                "wecom-bot",
             ];
             for ch in &gw.channels {
                 if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {

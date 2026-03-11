@@ -25,52 +25,52 @@ export default function Sidebar() {
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-        {isProfileMode ? (
+        {/* Admin global links — always visible for admins */}
+        {isAdmin && (
           <>
-            {/* Back to dashboard (admin only) */}
-            {isAdmin && adminProfileMatch && (
-              <Link
-                to="/"
-                className="flex items-center gap-2 px-3 py-2 mb-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
-              >
-                <ChevronLeftIcon />
-                All Profiles
-              </Link>
+            <SidebarLink to="/" end icon={<GridIcon />} label="Dashboard" />
+            <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
+            {/* My Profile sub-nav — nested tree view */}
+            {myProfileMatch && (
+              <div className="ml-4 pl-3 border-l border-gray-700/40 space-y-0.5">
+                <SidebarLink to="/my" end icon={<HomeIcon />} label="Home" />
+                <SidebarLink to="/my/llm" icon={<CpuIcon />} label="LLM Providers" />
+                <SidebarLink to="/my/messaging" icon={<MessageIcon />} label="Messaging" />
+                <SidebarLink to="/my/tools" icon={<WrenchIcon />} label="Tools" />
+                <SidebarLink to="/my/system" icon={<CogIcon />} label="System" />
+              </div>
             )}
-
-            {/* Profile category navigation */}
-            <SidebarLink to={profileBase} end icon={<HomeIcon />} label="Home" />
-            <SidebarLink to={`${profileBase}/llm`} icon={<CpuIcon />} label="LLM Providers" />
-            <SidebarLink to={`${profileBase}/messaging`} icon={<MessageIcon />} label="Messaging" />
-            <SidebarLink to={`${profileBase}/tools`} icon={<WrenchIcon />} label="Tools" />
-            <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
-
-            {/* Admin links (separator + bottom section) */}
-            {isAdmin && (
-              <>
-                <div className="border-t border-gray-700/30 my-3" />
-                <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
-                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
-                <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
-                <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
-              </>
-            )}
+            <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+            <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
+            <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
           </>
-        ) : (
+        )}
+
+        {/* Non-admin: flat profile nav */}
+        {!isAdmin && (
           <>
-            {/* Global navigation */}
-            {isAdmin && (
-              <>
-                <SidebarLink to="/" end icon={<GridIcon />} label="Dashboard" />
-                <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
-                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
-                <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
-                <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
-              </>
-            )}
-            {!isAdmin && (
-              <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
-            )}
+            <SidebarLink to="/my" end icon={<HomeIcon />} label="Home" />
+            <SidebarLink to="/my/llm" icon={<CpuIcon />} label="LLM Providers" />
+            <SidebarLink to="/my/messaging" icon={<MessageIcon />} label="Messaging" />
+            <SidebarLink to="/my/tools" icon={<WrenchIcon />} label="Tools" />
+            <SidebarLink to="/my/system" icon={<CogIcon />} label="System" />
+          </>
+        )}
+
+        {/* Admin viewing another profile — tree nested under separator */}
+        {isAdmin && adminProfileMatch && (
+          <>
+            <div className="border-t border-gray-700/30 my-3" />
+            <p className="px-3 py-1 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
+              {adminProfileMatch.params.id}
+            </p>
+            <div className="ml-1 space-y-0.5">
+              <SidebarLink to={profileBase} end icon={<HomeIcon />} label="Home" />
+              <SidebarLink to={`${profileBase}/llm`} icon={<CpuIcon />} label="LLM Providers" />
+              <SidebarLink to={`${profileBase}/messaging`} icon={<MessageIcon />} label="Messaging" />
+              <SidebarLink to={`${profileBase}/tools`} icon={<WrenchIcon />} label="Tools" />
+              <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
+            </div>
           </>
         )}
       </nav>

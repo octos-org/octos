@@ -2288,6 +2288,7 @@ pub async fn config_check(
             crate::profiles::ChannelCredentials::Email { .. } => "email",
             crate::profiles::ChannelCredentials::Twilio { .. } => "twilio",
             crate::profiles::ChannelCredentials::Api { .. } => "api",
+            crate::profiles::ChannelCredentials::WeComBot { .. } => "wecom-bot",
         })
         .collect();
 

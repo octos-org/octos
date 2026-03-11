@@ -255,6 +255,13 @@ pub enum ChannelCredentials {
         #[serde(default)]
         auth_token: Option<String>,
     },
+    #[serde(rename = "wecom-bot")]
+    WeComBot {
+        #[serde(default)]
+        bot_id: String,
+        #[serde(default = "default_wecom_bot_secret_env")]
+        secret_env: String,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -301,6 +308,9 @@ fn default_twilio_webhook_port() -> u16 {
 }
 fn default_api_port() -> u16 {
     8091
+}
+fn default_wecom_bot_secret_env() -> String {
+    "WECOM_BOT_SECRET".into()
 }
 
 /// Gateway-specific settings.
@@ -828,6 +838,13 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "settings": settings
             })
         }
+        ChannelCredentials::WeComBot { bot_id, secret_env } => serde_json::json!({
+            "type": "wecom-bot",
+            "settings": {
+                "bot_id": bot_id,
+                "secret_env": secret_env,
+            }
+        }),
     }
 }
 

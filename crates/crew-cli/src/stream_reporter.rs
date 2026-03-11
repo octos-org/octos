@@ -117,6 +117,9 @@ pub async fn run_stream_forwarder(
     let mut message_id: Option<String> = None;
     let mut last_edit = Instant::now() - EDIT_THROTTLE; // allow immediate first edit
     let mut first_chunk = true;
+    // When true, the channel doesn't support send_with_id (returned None),
+    // so we stop streaming edits and let the final reply go through out_tx.
+    let mut no_edit_support = false;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -139,42 +142,70 @@ pub async fn run_stream_forwarder(
                 buffer.push_str(&text);
 
                 // Throttled edit — strip <think> blocks before showing to user
-                if last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
+                if !no_edit_support && last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
-                        flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &visible,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
                         last_edit = Instant::now();
                     }
                 }
             }
             StreamProgressEvent::StreamDone { .. } => {
                 // Flush remaining buffer — strip think tags
-                if !buffer.is_empty() {
+                if !no_edit_support && !buffer.is_empty() {
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
-                        flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &visible,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
                     }
                 }
             }
             StreamProgressEvent::ToolStarted { name } => {
                 // Flush text before tool status
-                if !buffer.is_empty() {
+                if !no_edit_support && !buffer.is_empty() {
                     buffer.push_str(&format!("\n\n⚙ `{name}`..."));
-                    flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+                    flush_to_channel(
+                        &channel,
+                        &chat_id,
+                        &buffer,
+                        &mut message_id,
+                        &mut no_edit_support,
+                    )
+                    .await;
                     last_edit = Instant::now();
                 }
             }
             StreamProgressEvent::ToolCompleted { name, success } => {
                 let icon = if success { "✓" } else { "✗" };
                 // Update tool status in the existing message
-                if !buffer.is_empty() {
+                if !no_edit_support && !buffer.is_empty() {
                     // Replace the "⚙ `tool`..." with the result
                     let pending = format!("⚙ `{name}`...");
                     let completed = format!("{icon} `{name}`");
                     if buffer.contains(&pending) {
                         buffer = buffer.replace(&pending, &completed);
                     }
-                    flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+                    flush_to_channel(
+                        &channel,
+                        &chat_id,
+                        &buffer,
+                        &mut message_id,
+                        &mut no_edit_support,
+                    )
+                    .await;
                     last_edit = Instant::now();
                 }
             }
@@ -196,7 +227,7 @@ pub async fn run_stream_forwarder(
                         }
                     }
                     if last_edit.elapsed() >= EDIT_THROTTLE {
-                        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+                        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id, &mut no_edit_support).await;
                         last_edit = Instant::now();
                     }
                 }
@@ -204,17 +235,24 @@ pub async fn run_stream_forwarder(
             StreamProgressEvent::LlmStatus { message } => {
                 // Show retry/failover status as a temporary message
                 let status_text = format!("⟳ {message}");
-                flush_to_channel(&channel, &chat_id, &status_text, &mut message_id).await;
+                flush_to_channel(&channel, &chat_id, &status_text, &mut message_id, &mut no_edit_support).await;
                 last_edit = Instant::now();
             }
         }
     }
 
-    // Final flush
-    if !buffer.is_empty() && message_id.is_none() {
+    // Final flush — only if we have an active streamed message to update
+    if !no_edit_support && !buffer.is_empty() && message_id.is_none() {
         let visible = strip_think_from_buffer(&buffer);
         if !visible.is_empty() {
-            flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+            flush_to_channel(
+                &channel,
+                &chat_id,
+                &visible,
+                &mut message_id,
+                &mut no_edit_support,
+            )
+            .await;
         }
     }
 
@@ -225,11 +263,16 @@ pub async fn run_stream_forwarder(
 }
 
 /// Send or edit the streaming message on the channel.
+///
+/// If `send_with_id` returns `None` (channel doesn't support message editing),
+/// sets `no_edit_support` to true so the caller stops attempting to stream.
+/// The final reply will go through the normal `out_tx` path instead.
 async fn flush_to_channel(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
     text: &str,
     message_id: &mut Option<String>,
+    no_edit_support: &mut bool,
 ) {
     if let Some(mid) = message_id.as_ref() {
         // Edit existing message
@@ -251,7 +294,9 @@ async fn flush_to_channel(
                 *message_id = Some(mid);
             }
             Ok(None) => {
-                // Channel doesn't support edit — won't stream further
+                // Channel doesn't support edit — stop streaming to avoid
+                // sending duplicate messages. The final reply goes via out_tx.
+                *no_edit_support = true;
             }
             Err(e) => {
                 warn!("stream send failed: {e}");

@@ -248,6 +248,10 @@ impl Channel for TelegramChannel {
         4000
     }
 
+    fn supports_edit(&self) -> bool {
+        true
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         use futures::StreamExt;
         use teloxide::update_listeners::{AsUpdateStream, polling_default};

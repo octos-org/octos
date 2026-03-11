@@ -124,7 +124,7 @@ export const CHANNEL_LABELS: Record<ChannelType, string> = {
 }
 
 export const PROVIDERS = [
-  'anthropic', 'openai', 'gemini', 'openrouter', 'deepseek',
+  'anthropic', 'openai', 'gemini', 'r9s', 'openrouter', 'deepseek',
   'groq', 'moonshot', 'dashscope', 'minimax', 'zhipu', 'zai',
   'nvidia', 'ollama', 'vllm',
 ] as const

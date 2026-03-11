@@ -1090,18 +1090,23 @@ impl SessionActor {
         ));
         self.agent.set_reporter(reporter);
 
-        // Spawn stream forwarder task
+        // Spawn stream forwarder task (only for channels that support editing)
         let stream_forwarder = if let Some(ref si) = self.status_indicator {
             let channel = Arc::clone(si.channel());
-            let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
-            let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
-            Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
-                stream_rx,
-                channel,
-                self.chat_id.clone(),
-                cancel_status,
-                status_msg_id,
-            )))
+            if channel.supports_edit() {
+                let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+                let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                    stream_rx,
+                    channel,
+                    self.chat_id.clone(),
+                    cancel_status,
+                    status_msg_id,
+                )))
+            } else {
+                drop(stream_rx);
+                None
+            }
         } else {
             drop(stream_rx);
             None
@@ -1250,10 +1255,7 @@ impl SessionActor {
 
         // Wait for stream forwarder
         let stream_result = if let Some(handle) = stream_forwarder {
-            match handle.await {
-                Ok(sr) => Some(sr),
-                Err(_) => None,
-            }
+            (handle.await).ok()
         } else {
             None
         };
@@ -1629,18 +1631,26 @@ impl SessionActor {
         ));
         self.agent.set_reporter(reporter);
 
-        // Spawn stream forwarder task — edits a channel message as text arrives
+        // Spawn stream forwarder task — edits a channel message as text arrives.
+        // Only for channels that support message editing (Discord, Telegram, Feishu).
+        // Channels without edit support (WeCom bot, Slack, etc.) skip streaming
+        // to avoid sending duplicate messages.
         let stream_forwarder = if let Some(ref si) = self.status_indicator {
             let channel = Arc::clone(si.channel());
-            let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
-            let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
-            Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
-                stream_rx,
-                channel,
-                self.chat_id.clone(),
-                cancel_status,
-                status_msg_id,
-            )))
+            if channel.supports_edit() {
+                let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
+                let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
+                    stream_rx,
+                    channel,
+                    self.chat_id.clone(),
+                    cancel_status,
+                    status_msg_id,
+                )))
+            } else {
+                drop(stream_rx);
+                None
+            }
         } else {
             // No channel available — drop the receiver so events are discarded
             drop(stream_rx);
@@ -1700,10 +1710,7 @@ impl SessionActor {
 
         // Wait for stream forwarder to complete and get its result
         let stream_result = if let Some(handle) = stream_forwarder {
-            match handle.await {
-                Ok(sr) => Some(sr),
-                Err(_) => None,
-            }
+            (handle.await).ok()
         } else {
             None
         };

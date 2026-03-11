@@ -206,15 +206,18 @@ async fn run_status_loop(
         metadata: serde_json::json!({}),
     };
 
-    match channel.send_with_id(&msg).await {
-        Ok(Some(mid)) => {
-            *status_msg_id.lock().await = Some(mid);
-        }
-        Ok(None) => {
-            // Channel doesn't support send_with_id; can't edit later
-        }
-        Err(e) => {
-            warn!("failed to send status message: {e}");
+    // Only send the status message on channels that support editing.
+    // Channels without edit support (WeCom bot, etc.) can't delete or update it,
+    // so it would remain as a stale "Thinking..." message.
+    if channel.supports_edit() {
+        match channel.send_with_id(&msg).await {
+            Ok(Some(mid)) => {
+                *status_msg_id.lock().await = Some(mid);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("failed to send status message: {e}");
+            }
         }
     }
 

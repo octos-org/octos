@@ -23,6 +23,7 @@ mod nvidia;
 mod ollama;
 mod openai;
 mod openrouter;
+mod r9s;
 mod vllm;
 mod zai;
 mod zhipu;
@@ -89,6 +90,7 @@ static ALL: &[ProviderEntry] = &[
     anthropic::ENTRY,
     openai::ENTRY,
     gemini::ENTRY,
+    r9s::ENTRY,
     openrouter::ENTRY,
     deepseek::ENTRY,
     groq::ENTRY,
@@ -179,6 +181,12 @@ mod tests {
 
         let e = lookup("nim").unwrap();
         assert_eq!(e.name, "nvidia");
+
+        let e = lookup("r9s").unwrap();
+        assert_eq!(e.name, "r9s");
+
+        let e = lookup("r9s.ai").unwrap();
+        assert_eq!(e.name, "r9s");
     }
 
     #[test]
@@ -195,7 +203,7 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 14);
+        assert_eq!(all_entries().len(), 15);
     }
 
     #[test]

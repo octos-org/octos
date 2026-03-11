@@ -1,12 +1,5 @@
 //! Session UI helpers: inline keyboards, session list text.
 
-/// Escape HTML special characters for Telegram's HTML parse mode.
-pub fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 /// Truncate a string to `max` chars, appending "…" if truncated.
 pub fn truncate_button_text(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -56,14 +49,16 @@ pub fn build_session_keyboard(
     serde_json::json!({ "inline_keyboard": rows })
 }
 
-/// Build an HTML-formatted text listing sessions.
+/// Build a markdown-formatted listing of sessions.
+/// Uses markdown syntax so `markdown_to_telegram_html` converts it properly for Telegram,
+/// while other channels display it as readable plain text.
 pub fn build_session_text(entries: &[crew_bus::SessionListEntry], active_topic: &str) -> String {
     if entries.is_empty() {
         return "No sessions yet. Send a message to start one.".to_string();
     }
 
     let mut lines = Vec::new();
-    lines.push("<b>Sessions</b>".to_string());
+    lines.push("**Sessions**".to_string());
     lines.push(String::new());
 
     for entry in entries {
@@ -72,11 +67,8 @@ pub fn build_session_text(entries: &[crew_bus::SessionListEntry], active_topic: 
         let marker = if topic == active_topic { " ✦" } else { "" };
         let summary = entry.summary.as_deref().unwrap_or("(no summary)");
         let count = entry.message_count;
-        // HTML-escape user content to prevent parse errors
-        let safe_name = html_escape(display_name);
-        let safe_summary = html_escape(summary);
         lines.push(format!(
-            "• <b>{safe_name}</b>{marker} — {count} msgs\n  <i>{safe_summary}</i>",
+            "▸ **{display_name}**{marker} — {count} msgs\n  _{summary}_",
         ));
     }
 

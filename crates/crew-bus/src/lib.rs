@@ -26,8 +26,12 @@ pub mod slack_channel;
 pub mod telegram_channel;
 #[cfg(feature = "twilio")]
 pub mod twilio_channel;
+#[cfg(feature = "wecom-bot")]
+pub mod wecom_bot_channel;
 #[cfg(feature = "wecom")]
 pub mod wecom_channel;
+#[cfg(feature = "wecom")]
+pub(crate) mod wecom_crypto;
 #[cfg(feature = "whatsapp")]
 pub mod whatsapp_channel;
 
@@ -56,6 +60,8 @@ pub use slack_channel::SlackChannel;
 pub use telegram_channel::TelegramChannel;
 #[cfg(feature = "twilio")]
 pub use twilio_channel::TwilioChannel;
+#[cfg(feature = "wecom-bot")]
+pub use wecom_bot_channel::WeComBotChannel;
 #[cfg(feature = "wecom")]
 pub use wecom_channel::WeComChannel;
 #[cfg(feature = "whatsapp")]

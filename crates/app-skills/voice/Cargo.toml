@@ -1,0 +1,15 @@
+[package]
+name = "voice-skill"
+version = "1.0.0"
+edition = "2021"
+description = "Voice skill binary (ASR/TTS) using ominix-api"
+authors = ["hagency"]
+
+[[bin]]
+name = "voice-skill"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }

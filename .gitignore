@@ -19,6 +19,9 @@ Thumbs.db
 # Node
 node_modules/
 
+# Dashboard build output
+crates/crew-cli/static/admin/
+
 # Environment
 .env
 .env.local

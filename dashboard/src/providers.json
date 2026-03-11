@@ -42,6 +42,33 @@
       { "id": "gemini-2.0-flash-001", "input": 0.1, "output": 0.4 }
     ]
   },
+  "r9s": {
+    "env": "R9S_API_KEY",
+    "models": [
+      { "id": "claude-sonnet-4-6", "input": 3.0, "output": 15.0 },
+      { "id": "claude-opus-4-6", "input": 5.0, "output": 25.0 },
+      { "id": "claude-opus-4-5", "input": 5.0, "output": 25.0 },
+      { "id": "claude-haiku-4-5", "input": 1.0, "output": 5.0 },
+      { "id": "claude-sonnet-4-5", "input": 3.0, "output": 15.0 },
+      { "id": "claude-sonnet-4-20250514", "input": 3.0, "output": 15.0 },
+      { "id": "claude-opus-4", "input": 15.0, "output": 75.0 },
+      { "id": "gpt-5.3-codex", "input": 1.75, "output": 14.0 },
+      { "id": "gpt-5.2-codex", "input": 1.75, "output": 14.0 },
+      { "id": "gpt-5.2", "input": 1.75, "output": 14.0 },
+      { "id": "gpt-5.1-codex", "input": 1.25, "output": 10.0 },
+      { "id": "gpt-5.1-codex-mini", "input": 0.5, "output": 4.0 },
+      { "id": "gpt-5.1", "input": 1.25, "output": 10.0 },
+      { "id": "gpt-5", "input": 1.25, "output": 10.0 },
+      { "id": "gpt-4.1", "input": 2.0, "output": 8.0 },
+      { "id": "gemini-3.1-pro-preview", "input": 2.0, "output": 12.0 },
+      { "id": "gemini-3-pro-preview", "input": 2.0, "output": 12.0 },
+      { "id": "gemini-2.5-pro", "input": 1.25, "output": 10.0 },
+      { "id": "glm-5", "input": 0.5, "output": 2.0 },
+      { "id": "qwen3-coder-plus", "input": 1.0, "output": 5.0 },
+      { "id": "qwen3-max", "input": 0.3, "output": 1.2 },
+      { "id": "minimax-m2.1", "input": 0.5, "output": 2.0 }
+    ]
+  },
   "openrouter": {
     "env": "OPENROUTER_API_KEY",
     "models": [

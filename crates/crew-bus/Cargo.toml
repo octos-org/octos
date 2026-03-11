@@ -16,6 +16,7 @@ whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum"]
 twilio = ["axum"]
 wecom = ["axum"]
+wecom-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
 email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 [dependencies]
@@ -40,10 +41,11 @@ serenity = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
-# Optional: email channel
+# Optional: email / wecom-bot TLS
 async-imap = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 lettre = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }

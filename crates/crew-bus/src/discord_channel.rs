@@ -12,8 +12,10 @@ use eyre::{Result, WrapErr};
 use reqwest::Client as HttpClient;
 use serenity::Client;
 use serenity::all::{
-    Context, EventHandler, GatewayIntents, Http, Message as DiscordMessage, Ready,
+    Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage, MessageId,
+    Ready,
 };
+use serenity::builder::{CreateAttachment, CreateMessage};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -101,7 +103,7 @@ impl EventHandler for Handler {
                 "message_id": msg.id.to_string(),
                 "guild_id": msg.guild_id.map(|g| g.to_string()),
             }),
-            message_id: None,
+            message_id: Some(msg.id.to_string()),
         };
 
         if let Err(e) = self.inbound_tx.send(inbound).await {
@@ -122,6 +124,10 @@ impl Channel for DiscordChannel {
 
     fn max_message_length(&self) -> usize {
         1900
+    }
+
+    fn supports_edit(&self) -> bool {
+        true
     }
 
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
@@ -150,6 +156,11 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        self.send_with_id(msg).await?;
+        Ok(())
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
         let channel_id: u64 = msg
             .chat_id
             .parse()
@@ -157,10 +168,63 @@ impl Channel for DiscordChannel {
 
         let channel = serenity::model::id::ChannelId::new(channel_id);
 
+        let sent = if !msg.media.is_empty() {
+            let mut attachments = Vec::new();
+            for path in &msg.media {
+                let attachment = CreateAttachment::path(path)
+                    .await
+                    .wrap_err_with(|| format!("failed to create Discord attachment: {path}"))?;
+                attachments.push(attachment);
+            }
+            let builder = CreateMessage::new().content(&msg.content);
+            channel
+                .send_files(&*self.http, attachments, builder)
+                .await
+                .wrap_err("failed to send Discord message with files")?
+        } else {
+            channel
+                .say(&*self.http, &msg.content)
+                .await
+                .wrap_err("failed to send Discord message")?
+        };
+
+        Ok(Some(sent.id.to_string()))
+    }
+
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
         channel
-            .say(&*self.http, &msg.content)
+            .edit_message(
+                &*self.http,
+                MessageId::new(msg_id),
+                EditMessage::new().content(new_content),
+            )
             .await
-            .wrap_err("failed to send Discord message")?;
+            .wrap_err("failed to edit Discord message")?;
+
+        Ok(())
+    }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
+        channel
+            .delete_message(&*self.http, MessageId::new(msg_id))
+            .await
+            .wrap_err("failed to delete Discord message")?;
 
         Ok(())
     }

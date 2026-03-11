@@ -446,7 +446,7 @@ fn do_search(input: &Input) -> Result<ToolResult> {
                 "\n  Install: manage_skills(action=\"install\", repo=\"{repo}\")"
             ));
         } else {
-            block.push_str(&format!("\n  Skills (install individually):"));
+            block.push_str("\n  Skills (install individually):");
             for skill in &skills {
                 block.push_str(&format!(
                     "\n    - {skill}: manage_skills(action=\"install\", repo=\"{repo}/{skill}\")"

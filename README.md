@@ -126,7 +126,11 @@ npm install -g pptxgenjs react-icons react react-dom sharp
 git clone https://github.com/hagency-org/crew-rs.git
 cd crew-rs
 
-# Basic install (CLI + chat only)
+# Quick local deploy (builds, installs, sets up service)
+./scripts/local-deploy.sh --full    # All features + dashboard + skills
+./scripts/local-deploy.sh --minimal # CLI + chat only
+
+# Or install manually:
 cargo install --path crates/crew-cli
 
 # Install with all messaging channels + dashboard
@@ -142,6 +146,8 @@ cargo install --path crates/crew-cli --features browser
 cargo build --release
 ./target/release/crew --help
 ```
+
+See **[Local Deployment Guide](docs/LOCAL_DEPLOYMENT.md)** for platform-specific instructions (macOS, Linux, Windows/WSL2), background service setup, and troubleshooting.
 
 ### Feature Flags
 

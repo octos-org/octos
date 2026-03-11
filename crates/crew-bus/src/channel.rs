@@ -51,6 +51,13 @@ pub trait Channel: Send + Sync {
         self.send_typing(chat_id).await
     }
 
+    /// Whether this channel supports message editing (for progressive streaming).
+    /// Channels that return `false` will not receive intermediate stream updates;
+    /// only the final reply is sent.
+    fn supports_edit(&self) -> bool {
+        false
+    }
+
     /// Send a message and return its platform message ID (for later editing/deletion).
     /// Default: delegates to `send()` and returns None.
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {

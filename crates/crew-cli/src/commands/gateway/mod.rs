@@ -46,7 +46,8 @@ pub(crate) use prompt::build_system_prompt;
     feature = "email",
     feature = "feishu",
     feature = "twilio",
-    feature = "wecom"
+    feature = "wecom",
+    feature = "wecom-bot"
 ))]
 use prompt::settings_str;
 
@@ -375,8 +376,7 @@ impl GatewayCommand {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         });
-        let asr_binary = if voice_binary_path.exists() && ominix_url.is_some() {
-            let url = ominix_url.unwrap();
+        let asr_binary = if let Some(url) = ominix_url.filter(|_| voice_binary_path.exists()) {
             println!("{}: voice platform skill ({})", "Transcriber".green(), url);
             println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
             // Export so the voice binary can find the server
@@ -1071,6 +1071,23 @@ impl GatewayCommand {
                     channel_mgr.register(Arc::new(crew_bus::ApiChannel::new(
                         port,
                         auth_token,
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "wecom-bot")]
+                "wecom-bot" => {
+                    let bot_id = settings_str(&entry.settings, "bot_id", "");
+                    let secret_env =
+                        settings_str(&entry.settings, "secret_env", "WECOM_BOT_SECRET");
+                    let secret = std::env::var(&secret_env)
+                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
+                    if bot_id.is_empty() {
+                        eyre::bail!("wecom-bot channel requires settings.bot_id");
+                    }
+                    channel_mgr.register(Arc::new(crew_bus::WeComBotChannel::new(
+                        &bot_id,
+                        &secret,
+                        entry.allowed_senders.clone(),
                         shutdown.clone(),
                     )));
                 }
