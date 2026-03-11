@@ -60,9 +60,7 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolProgress { name, message, .. } => {
                 StreamProgressEvent::ToolProgress { name, message }
             }
-            ProgressEvent::LlmStatus { message, .. } => {
-                StreamProgressEvent::LlmStatus { message }
-            }
+            ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -220,9 +218,7 @@ pub async fn run_stream_forwarder(
                         // Replace previous progress line for this tool
                         let prev_prefix = format!("⚙ `{name}`:");
                         if let Some(pos) = buffer.rfind(&prev_prefix) {
-                            let end = buffer[pos..]
-                                .find('\n')
-                                .map_or(buffer.len(), |i| pos + i);
+                            let end = buffer[pos..].find('\n').map_or(buffer.len(), |i| pos + i);
                             buffer.replace_range(pos..end, &progress);
                         }
                     }

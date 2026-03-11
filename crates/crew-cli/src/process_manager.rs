@@ -288,8 +288,7 @@ impl ProcessManager {
         // Pass env vars from profile config, resolving keychain markers and
         // filtering out dangerous ones.
         tracing::debug!(profile = %profile.id, "start: resolving env vars");
-        let resolved_env_vars =
-            crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+        let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
         for (key, value) in &resolved_env_vars {
             if BLOCKED_ENV_VARS
                 .iter()

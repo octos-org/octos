@@ -53,8 +53,6 @@ fn default_session_hours() -> u64 {
 
 struct PendingOtp {
     code: String,
-    #[allow(dead_code)]
-    email: String,
     created_at: DateTime<Utc>,
     attempts: u32,
 }
@@ -140,7 +138,6 @@ impl AuthManager {
                 email_lower.clone(),
                 PendingOtp {
                     code: code.clone(),
-                    email: email_lower.clone(),
                     created_at: now,
                     attempts: 0,
                 },

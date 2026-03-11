@@ -349,11 +349,7 @@ impl ProgressReporter for ConsoleReporter {
                 );
             }
             ProgressEvent::LlmStatus { message, .. } => {
-                print!(
-                    "\r{} {}",
-                    self.yellow("⟳"),
-                    self.dim(&message)
-                );
+                print!("\r{} {}", self.yellow("⟳"), self.dim(&message));
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }

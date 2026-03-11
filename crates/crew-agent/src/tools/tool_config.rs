@@ -343,12 +343,6 @@ impl ToolConfigStore {
         self.get(tool, key).await.and_then(|v| v.as_bool())
     }
 
-    /// Get an f64 setting.
-    #[allow(dead_code)]
-    pub async fn get_f64(&self, tool: &str, key: &str) -> Option<f64> {
-        self.get(tool, key).await.and_then(|v| v.as_f64())
-    }
-
     /// Persist configs to disk atomically (write-to-tmp + rename).
     async fn persist(&self) -> Result<()> {
         let configs = self.configs.read().await;

@@ -1559,8 +1559,7 @@ mod tests {
 
         let masked = mask_secrets(&profile);
         assert_eq!(
-            masked.config.env_vars["KC_KEY"],
-            "\u{1f511} (keychain)",
+            masked.config.env_vars["KC_KEY"], "\u{1f511} (keychain)",
             "keychain marker should display as key emoji"
         );
         assert_eq!(masked.config.env_vars["PLAIN_KEY"], "sk-1***def");
@@ -1607,13 +1606,11 @@ mod tests {
 
         let loaded = store.get("kc-merge").unwrap().unwrap();
         assert_eq!(
-            loaded.config.env_vars["API_KEY"],
-            "keychain:",
+            loaded.config.env_vars["API_KEY"], "keychain:",
             "keychain marker must be preserved when dashboard sends masked form"
         );
         assert_eq!(
-            loaded.config.env_vars["OTHER"],
-            "plaintext-value",
+            loaded.config.env_vars["OTHER"], "plaintext-value",
             "masked plaintext value must be restored from existing"
         );
     }
@@ -1649,8 +1646,7 @@ mod tests {
 
         let loaded = store.get("kc-set").unwrap().unwrap();
         assert_eq!(
-            loaded.config.env_vars["API_KEY"],
-            "keychain:",
+            loaded.config.env_vars["API_KEY"], "keychain:",
             "explicit keychain: marker must be stored, not reverted to old value"
         );
     }
@@ -1685,8 +1681,7 @@ mod tests {
 
         let loaded = store.get("kc-empty").unwrap().unwrap();
         assert_eq!(
-            loaded.config.env_vars["API_KEY"],
-            "keychain:",
+            loaded.config.env_vars["API_KEY"], "keychain:",
             "empty value must not overwrite keychain marker"
         );
     }
