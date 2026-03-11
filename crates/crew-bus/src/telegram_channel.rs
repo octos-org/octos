@@ -576,17 +576,16 @@ impl Channel for TelegramChannel {
 
             // Check for inline keyboard in metadata
             if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-                let mut req = self.bot
-                    .send_message(ChatId(chat_id), &html);
-                req = req.parse_mode(ParseMode::Html)
-                    .reply_markup(markup);
+                let mut req = self.bot.send_message(ChatId(chat_id), &html);
+                req = req.parse_mode(ParseMode::Html).reply_markup(markup);
                 if let Some(mid) = reply_to {
                     req = req.reply_parameters(ReplyParameters::new(mid));
                 }
                 req.await
                     .wrap_err("failed to send Telegram message with keyboard")?;
             } else {
-                self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?;
+                self.send_html_with_fallback(ChatId(chat_id), &html, reply_to)
+                    .await?;
             }
         }
 
@@ -639,17 +638,16 @@ impl Channel for TelegramChannel {
         let html = markdown_to_telegram_html(&msg.content);
 
         let sent = if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-            let mut req = self.bot
-                .send_message(ChatId(chat_id), &html);
-            req = req.parse_mode(ParseMode::Html)
-                .reply_markup(markup);
+            let mut req = self.bot.send_message(ChatId(chat_id), &html);
+            req = req.parse_mode(ParseMode::Html).reply_markup(markup);
             if let Some(mid) = reply_to {
                 req = req.reply_parameters(ReplyParameters::new(mid));
             }
             req.await
                 .wrap_err("failed to send Telegram message with keyboard")?
         } else {
-            self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?
+            self.send_html_with_fallback(ChatId(chat_id), &html, reply_to)
+                .await?
         };
 
         Ok(Some(sent.id.0.to_string()))
