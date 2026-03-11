@@ -788,6 +788,7 @@ impl GatewayCommand {
             system_prompt: system_prompt.clone(),
             hooks,
             hook_context_template,
+            data_dir: data_dir.clone(),
             session_mgr: session_mgr.clone(),
             out_tx: out_tx.clone(),
             spawn_inbound_tx,
@@ -799,6 +800,7 @@ impl GatewayCommand {
             session_timeout: Duration::from_secs(session_timeout_secs),
             shutdown: shutdown.clone(),
             cwd: cwd.clone(),
+            sandbox_config: config.sandbox.clone(),
             provider_policy: provider_policy_for_factory,
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
@@ -1054,15 +1056,13 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "api")]
                 "api" => {
-                    let port: u16 = self
-                        .api_port
-                        .unwrap_or_else(|| {
-                            entry
-                                .settings
-                                .get("port")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(8091) as u16
-                        });
+                    let port: u16 = self.api_port.unwrap_or_else(|| {
+                        entry
+                            .settings
+                            .get("port")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(8091) as u16
+                    });
                     let auth_token = entry
                         .settings
                         .get("auth_token")

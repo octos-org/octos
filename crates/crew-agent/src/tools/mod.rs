@@ -555,6 +555,46 @@ impl ToolRegistry {
         registry
     }
 
+    /// Tool names that are bound to a working directory (cwd / base_dir).
+    /// Used by `rebind_cwd()` to re-register these tools with a new workspace path.
+    pub const CWD_BOUND_TOOLS: &'static [&'static str] = &[
+        "shell",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "diff_edit",
+        "glob",
+        "grep",
+        "list_dir",
+        #[cfg(feature = "git")]
+        "git",
+        #[cfg(feature = "ast")]
+        "code_structure",
+    ];
+
+    /// Create a copy of this registry with all cwd-bound tools re-registered
+    /// to use a new working directory and sandbox. Non-cwd tools (web_search,
+    /// web_fetch, browser, MCP, plugins, etc.) are preserved via Arc cloning.
+    pub fn rebind_cwd(&self, cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
+        let cwd = cwd.as_ref();
+        // Clone everything except cwd-bound tools
+        let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        // Re-register cwd-bound tools with the new workspace
+        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
+        registry.register(ReadFileTool::new(cwd));
+        registry.register(DiffEditTool::new(cwd));
+        registry.register(EditFileTool::new(cwd));
+        registry.register(WriteFileTool::new(cwd));
+        registry.register(GlobTool::new(cwd));
+        registry.register(GrepTool::new(cwd));
+        registry.register(ListDirTool::new(cwd));
+        #[cfg(feature = "git")]
+        registry.register(GitTool::new(cwd));
+        #[cfg(feature = "ast")]
+        registry.register(CodeStructureTool::new(cwd));
+        registry
+    }
+
     /// Re-register builtin configurable tools with a ToolConfigStore.
     ///
     /// Tools already registered by `with_builtins_and_sandbox()` are replaced
