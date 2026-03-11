@@ -147,9 +147,9 @@ Three sandbox backends in `crew-agent/src/sandbox.rs`, selectable via `SandboxCo
 
 | Feature | SBPL (macOS) | Bubblewrap (Linux) | Docker |
 |---------|-------------|-------------------|--------|
-| Startup overhead | ~5ms | ~10ms | **200-500ms** |
+| Startup overhead | ~6ms | ~10ms | **130-700ms** |
 | Write restriction | Yes (`subpath`) | Yes (bind mount) | Yes (volume mount) |
-| Read restriction | No (global `file-read*`) | Yes (`--ro-bind`) | Yes (mount modes) |
+| Read restriction | Configurable (`read_allow_paths`) | Yes (`--ro-bind`) | Yes (mount modes) |
 | Network isolation | Yes (`deny network*`) | Yes (`--unshare-net`) | Yes (`--network none`) |
 | PID isolation | No | Yes (`--unshare-pid`) | Yes |
 | CPU/memory limits | No | No | Yes (`--cpus`, `--memory`) |
@@ -158,9 +158,23 @@ Three sandbox backends in `crew-agent/src/sandbox.rs`, selectable via `SandboxCo
 | Root required | No | No | No (but Docker daemon) |
 | Persistent state | N/A (wraps single cmd) | N/A (wraps single cmd) | **No** — `--rm` per command |
 
-**Docker overhead**: Currently crew-rs creates and destroys a container per shell command (`docker run --rm`). A typical agent loop executes 5-20 shell commands per turn, adding 1-6 seconds of pure container lifecycle overhead. Additionally, each command starts with a clean filesystem — if the LLM runs `npm install` then `npm test`, the second command won't see `node_modules` because the first container was destroyed.
+**Measured performance** (Apple M-series, Colima/Docker on macOS, 2026-03-11):
 
-**Mitigation** (planned): Adopt persistent container model — one container per session with `docker exec` for subsequent commands, auto-pruned after idle timeout. This amortizes startup cost (~300ms first command, ~5ms subsequent) and preserves filesystem state across commands within a session. See §4.6 for details.
+| Workload | Bare (no sandbox) | macOS sandbox-exec | Docker (`--rm`) |
+|----------|------------------|--------------------|-----------------|
+| `echo` + `cat` | 7.0ms | 12.8ms (1.8×) | 134.8ms (19×) |
+| Python JSON write | 29.4ms | 63.8ms (2.2×) | 707.0ms (24×) |
+
+Key observations:
+- **macOS sandbox-exec adds ~6ms** per command — nearly free. Kernel SBPL enforcement with no process/namespace creation overhead.
+- **Docker adds 130-680ms** per command. Each invocation creates a full container (image layer mount → namespace creation → start → run → destroy).
+- For an agent doing 5-10 tool calls per turn: sandbox-exec adds **30-60ms** total, Docker adds **0.7-7 seconds**.
+- `mode: "auto"` correctly picks sandbox-exec on macOS, avoiding Docker overhead.
+- Docker overhead is dominated by container lifecycle, not the actual command — heavier workloads see a lower *relative* overhead ratio.
+
+**Recommendation**: Use `"mode": "auto"` (default) which selects macOS sandbox-exec on macOS and Docker on Linux. Only force `"mode": "docker"` when you need full OS-level isolation (different filesystem namespace, PID isolation, CPU/memory limits).
+
+**Mitigation for Docker overhead** (planned): Adopt persistent container model — one container per session with `docker exec` for subsequent commands, auto-pruned after idle timeout. This amortizes startup cost (~130ms first command, ~5ms subsequent) and preserves filesystem state across commands within a session. See §4.6 for details.
 
 **BLOCKED_ENV_VARS** (18 variables, shared across all backends + MCP + hooks + browser):
 ```
