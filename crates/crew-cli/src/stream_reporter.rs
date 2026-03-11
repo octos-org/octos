@@ -223,7 +223,14 @@ pub async fn run_stream_forwarder(
                         }
                     }
                     if last_edit.elapsed() >= EDIT_THROTTLE {
-                        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id, &mut no_edit_support).await;
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &buffer,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
                         last_edit = Instant::now();
                     }
                 }
@@ -231,7 +238,14 @@ pub async fn run_stream_forwarder(
             StreamProgressEvent::LlmStatus { message } => {
                 // Show retry/failover status as a temporary message
                 let status_text = format!("⟳ {message}");
-                flush_to_channel(&channel, &chat_id, &status_text, &mut message_id, &mut no_edit_support).await;
+                flush_to_channel(
+                    &channel,
+                    &chat_id,
+                    &status_text,
+                    &mut message_id,
+                    &mut no_edit_support,
+                )
+                .await;
                 last_edit = Instant::now();
             }
         }

@@ -112,12 +112,7 @@ pub trait Channel: Send + Sync {
     }
 
     /// Remove an emoji reaction from a message. Default: no-op.
-    async fn remove_reaction(
-        &self,
-        _chat_id: &str,
-        _message_id: &str,
-        _emoji: &str,
-    ) -> Result<()> {
+    async fn remove_reaction(&self, _chat_id: &str, _message_id: &str, _emoji: &str) -> Result<()> {
         Ok(())
     }
 

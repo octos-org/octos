@@ -130,7 +130,9 @@ fn timestamp() -> u64 {
 /// Per-profile voice profiles directory: `$CREW_DATA_DIR/voice_profiles/`.
 /// Each saved profile is a raw audio file named `{name}.wav`.
 fn voice_profiles_dir() -> Option<PathBuf> {
-    std::env::var("CREW_DATA_DIR").ok().map(|d| Path::new(&d).join("voice_profiles"))
+    std::env::var("CREW_DATA_DIR")
+        .ok()
+        .map(|d| Path::new(&d).join("voice_profiles"))
 }
 
 /// Resolve a speaker name: if a saved voice profile exists, return its path.
@@ -152,7 +154,13 @@ fn sanitize_profile_name(name: &str) -> String {
     name.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -339,7 +347,10 @@ fn handle_synthesize(input_json: &str) {
         let status = resp.status();
         if !status.is_success() {
             let resp_text = resp.text().unwrap_or_default();
-            fail(&format!("TTS (clone) error (HTTP {status}): {}", truncate(&resp_text, 200)));
+            fail(&format!(
+                "TTS (clone) error (HTTP {status}): {}",
+                truncate(&resp_text, 200)
+            ));
         }
 
         let wav_bytes = match resp.bytes() {
@@ -585,13 +596,8 @@ fn handle_list_profiles(_input_json: &str) {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?");
-        let size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("?");
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         profiles.push(format!("- **{name}** ({ext}, {size} bytes)"));
     }
 

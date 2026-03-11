@@ -69,7 +69,6 @@ pub trait LlmProvider: Send + Sync {
     /// The adaptive router uses this to update failure metrics so subsequent calls
     /// may failover to a different provider.
     fn report_late_failure(&self) {}
-
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.

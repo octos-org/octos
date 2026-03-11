@@ -80,6 +80,9 @@ pub struct ProfileConfig {
     /// (no shell, file, web, browser tools). Used for the admin bot profile.
     #[serde(default)]
     pub admin_mode: bool,
+    /// Sandbox configuration for tool isolation.
+    #[serde(default)]
+    pub sandbox: crew_agent::SandboxConfig,
 }
 
 /// Email sending tool configuration for a profile.
@@ -696,7 +699,7 @@ pub(crate) fn config_from_profile(
         version: None,
         model_hints: None,
         mcp_servers: vec![],
-        sandbox: Default::default(),
+        sandbox: profile.config.sandbox.clone(),
         tool_policy: None,
         tool_policy_by_provider: Default::default(),
         embedding: None,

@@ -270,7 +270,11 @@ fn handle_synthesize(input_json: &str) {
     // 24kHz 16-bit mono = 48000 bytes/sec
     let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
 
-    let mode = if input.reference_audio.is_some() { "cloned voice" } else { "preset voice" };
+    let mode = if input.reference_audio.is_some() {
+        "cloned voice"
+    } else {
+        "preset voice"
+    };
     succeed(&format!(
         "Generated audio: {output_path} ({duration_secs:.1}s, {mode}, {} bytes). Use send_file to deliver it to the user.",
         wav_bytes.len()

@@ -76,9 +76,7 @@ impl DiscordChannel {
             if parts.len() == 3 {
                 let animated = parts[0] == "a";
                 let name = parts[1].to_string();
-                let id: u64 = parts[2]
-                    .parse()
-                    .wrap_err("invalid custom emoji ID")?;
+                let id: u64 = parts[2].parse().wrap_err("invalid custom emoji ID")?;
                 return Ok(ReactionType::Custom {
                     animated,
                     id: serenity::model::id::EmojiId::new(id),
@@ -341,9 +339,7 @@ impl Channel for DiscordChannel {
 
         let channel = serenity::model::id::ChannelId::new(channel_id);
 
-        let mut embed = CreateEmbed::new()
-            .title(title)
-            .description(description);
+        let mut embed = CreateEmbed::new().title(title).description(description);
 
         if let Some(c) = color {
             embed = embed.color(c);
