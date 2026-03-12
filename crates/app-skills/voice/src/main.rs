@@ -212,8 +212,8 @@ fn handle_synthesize(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
-    let body = if let Some(ref ref_audio) = input.reference_audio {
-        // Voice cloning mode: use reference_audio for x-vector speaker embedding (requires Base model)
+    let (endpoint, body) = if let Some(ref ref_audio) = input.reference_audio {
+        // Voice cloning mode: use /v1/audio/speech/clone (routes to Base model with ECAPA-TDNN)
         let ref_path = Path::new(ref_audio);
         if !ref_path.exists() {
             fail(&format!("Reference audio not found: {ref_audio}"));
@@ -221,23 +221,29 @@ fn handle_synthesize(input_json: &str) {
         if !ref_path.is_file() {
             fail(&format!("Not a file: {ref_audio}"));
         }
-        json!({
-            "input": input.text,
-            "reference_audio": ref_audio,
-            "language": language
-        })
+        (
+            format!("{base_url}/v1/audio/speech/clone"),
+            json!({
+                "input": input.text,
+                "reference_audio": ref_audio,
+                "language": language
+            }),
+        )
     } else {
-        // Preset voice mode
+        // Preset voice mode: use /v1/audio/speech (routes to CustomVoice model)
         let speaker = input.speaker.unwrap_or_else(|| "vivian".to_string());
-        json!({
-            "input": input.text,
-            "voice": speaker,
-            "language": language
-        })
+        (
+            format!("{base_url}/v1/audio/speech"),
+            json!({
+                "input": input.text,
+                "voice": speaker,
+                "language": language
+            }),
+        )
     };
 
     let resp = match client
-        .post(format!("{base_url}/v1/audio/speech"))
+        .post(&endpoint)
         .json(&body)
         .send()
     {

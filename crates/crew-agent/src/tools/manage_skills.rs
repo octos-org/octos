@@ -374,7 +374,7 @@ fn do_remove(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult> 
 }
 
 fn do_search(input: &Input) -> Result<ToolResult> {
-    let url = "https://raw.githubusercontent.com/humanagency-org/skill-registry/main/registry.json";
+    let url = "https://raw.githubusercontent.com/hagency-org/skill-registry/main/registry.json";
 
     let entries: Vec<serde_json::Value> = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -625,7 +625,7 @@ struct RegistryEntry {
 fn lookup_registry_binaries(
     package_name: &str,
 ) -> Option<std::collections::HashMap<String, RegistryBinaryInfo>> {
-    let url = "https://raw.githubusercontent.com/humanagency-org/skill-registry/main/registry.json";
+    let url = "https://raw.githubusercontent.com/hagency-org/skill-registry/main/registry.json";
     let entries: Vec<RegistryEntry> = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
