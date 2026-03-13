@@ -240,6 +240,21 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
+                // Cancel the status indicator before showing retry/failover info,
+                // so we don't have two messages ("✦ Thinking..." + "⟳ Retrying...")
+                // visible simultaneously.
+                if first_chunk {
+                    first_chunk = false;
+                    if let Some(ref cancel) = cancel_status {
+                        cancel.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if let Some(ref msg_id_lock) = status_msg_id {
+                        let mid = msg_id_lock.lock().await.take();
+                        if let Some(ref mid) = mid {
+                            let _ = channel.delete_message(&chat_id, mid).await;
+                        }
+                    }
+                }
                 // Show retry/failover status as a temporary message
                 let status_text = format!("⟳ {message}");
                 flush_to_channel(

@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
-use crate::status_indicator::StatusIndicator;
+use crate::status_layers::{StatusComposer, UserStatusConfig};
 
 /// Default actor inbox capacity.
 const ACTOR_INBOX_SIZE: usize = 32;
@@ -115,7 +115,7 @@ impl ActorRegistry {
         session_key: SessionKey,
         reply_channel: &str,
         reply_chat_id: &str,
-        status_indicator: Option<Arc<StatusIndicator>>,
+        status_indicator: Option<Arc<StatusComposer>>,
     ) {
         let key_str = session_key.to_string();
 
@@ -367,7 +367,7 @@ impl ActorFactory {
         channel: &str,
         chat_id: &str,
         semaphore: Arc<Semaphore>,
-        status_indicator: Option<Arc<StatusIndicator>>,
+        status_indicator: Option<Arc<StatusComposer>>,
     ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
 
@@ -489,6 +489,10 @@ impl ActorFactory {
             &session_key,
         )));
 
+        // Load per-user status configuration
+        let user_status_config =
+            UserStatusConfig::load(&self.data_dir, &session_key.base_key());
+
         let actor = SessionActor {
             session_key: session_key.clone(),
             channel: channel.to_string(),
@@ -499,6 +503,8 @@ impl ActorFactory {
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
             status_indicator,
+            user_status_config,
+            data_dir: self.data_dir.clone(),
             max_history: self.max_history.clone(),
             idle_timeout: self.idle_timeout,
             session_timeout: self.session_timeout,
@@ -612,7 +618,11 @@ struct SessionActor {
 
     out_tx: mpsc::Sender<OutboundMessage>,
 
-    status_indicator: Option<Arc<StatusIndicator>>,
+    status_indicator: Option<Arc<StatusComposer>>,
+    /// Per-user status configuration (greeting, visibility toggles, custom layers).
+    user_status_config: UserStatusConfig,
+    /// Data directory for persisting user configs.
+    data_dir: std::path::PathBuf,
     max_history: Arc<std::sync::atomic::AtomicUsize>,
 
     idle_timeout: Duration,
@@ -722,6 +732,10 @@ impl SessionActor {
             }
             "/queue" => {
                 self.handle_queue_command(&parts[1..]).await;
+                true
+            }
+            "/status" => {
+                self.handle_status_command(&parts[1..]).await;
                 true
             }
             _ => false, // Unknown slash command — pass through to LLM
@@ -875,6 +889,185 @@ impl SessionActor {
         self.queue_mode = mode;
         self.send_reply(&format!("Queue mode set to: {:?}", mode))
             .await;
+    }
+
+    /// `/status` — view or configure per-user status layers.
+    ///
+    /// Usage:
+    ///   /status                        — show current config
+    ///   /status greeting <text>        — set greeting template
+    ///   /status provider on|off        — toggle provider layer
+    ///   /status metrics on|off         — toggle metrics layer
+    ///   /status words <w1,w2,...>       — set custom status words
+    ///   /status add <id> <priority> <text> — add custom layer
+    ///   /status remove <id>            — remove custom layer
+    ///   /status reset                  — reset to defaults
+    async fn handle_status_command(&mut self, args: &[&str]) {
+        use crate::status_layers::{CustomLayerDef, LayerPolicy};
+
+        if args.is_empty() {
+            let cfg = &self.user_status_config;
+            let mut lines = vec![
+                "**Status Config**".to_string(),
+                format!("Greeting: {}", cfg.greeting_template.as_deref().unwrap_or("(none)")),
+                format!("Provider visible: {}", cfg.provider_visible),
+                format!("Metrics visible: {}", cfg.metrics_visible),
+                format!("Greeting duration: {}s", cfg.greeting_duration_secs),
+            ];
+            if let Some(ref words) = cfg.status_words {
+                lines.push(format!("Words: {}", words.join(", ")));
+            }
+            if let Some(ref locale) = cfg.locale {
+                lines.push(format!("Locale: {locale}"));
+            }
+            for custom in &cfg.custom_layers {
+                lines.push(format!("Custom layer `{}` (p={}): {}", custom.id, custom.priority, custom.content));
+            }
+            self.send_reply(&lines.join("\n")).await;
+            return;
+        }
+
+        match args[0] {
+            "greeting" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status greeting <text>  (or /status greeting off)")
+                        .await;
+                    return;
+                }
+                let text = args[1..].join(" ");
+                if text == "off" || text == "none" {
+                    self.user_status_config.greeting_template = None;
+                    self.send_reply("Greeting disabled.").await;
+                } else {
+                    self.user_status_config.greeting_template = Some(text.clone());
+                    self.send_reply(&format!("Greeting set: {text}")).await;
+                }
+            }
+            "provider" => {
+                let on = match args.get(1).copied() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => {
+                        self.send_reply("Usage: /status provider on|off").await;
+                        return;
+                    }
+                };
+                self.user_status_config.provider_visible = on;
+                self.send_reply(&format!("Provider layer: {}", if on { "visible" } else { "hidden" }))
+                    .await;
+            }
+            "metrics" => {
+                let on = match args.get(1).copied() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => {
+                        self.send_reply("Usage: /status metrics on|off").await;
+                        return;
+                    }
+                };
+                self.user_status_config.metrics_visible = on;
+                self.send_reply(&format!("Metrics layer: {}", if on { "visible" } else { "hidden" }))
+                    .await;
+            }
+            "words" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status words word1,word2,...").await;
+                    return;
+                }
+                let words: Vec<String> = args[1..].join(" ")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if words.is_empty() {
+                    self.user_status_config.status_words = None;
+                    self.send_reply("Status words reset to default.").await;
+                } else {
+                    let preview = words.join(", ");
+                    self.user_status_config.status_words = Some(words);
+                    self.send_reply(&format!("Status words: {preview}")).await;
+                }
+            }
+            "add" => {
+                // /status add <id> <priority> <text>
+                if args.len() < 4 {
+                    self.send_reply("Usage: /status add <id> <priority> <text>").await;
+                    return;
+                }
+                let id = args[1].to_string();
+                let priority: u8 = match args[2].parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.send_reply("Priority must be a number 0-255.").await;
+                        return;
+                    }
+                };
+                let content = args[3..].join(" ");
+                // Remove existing layer with same ID
+                self.user_status_config.custom_layers.retain(|l| l.id != id);
+                self.user_status_config.custom_layers.push(CustomLayerDef {
+                    id: id.clone(),
+                    priority,
+                    policy: LayerPolicy::Fixed,
+                    content: content.clone(),
+                });
+                self.send_reply(&format!("Added layer `{id}` (p={priority}): {content}")).await;
+            }
+            "remove" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status remove <id>").await;
+                    return;
+                }
+                let id = args[1];
+                let before = self.user_status_config.custom_layers.len();
+                self.user_status_config.custom_layers.retain(|l| l.id != id);
+                if self.user_status_config.custom_layers.len() < before {
+                    self.send_reply(&format!("Removed layer `{id}`.")).await;
+                } else {
+                    self.send_reply(&format!("No custom layer `{id}` found.")).await;
+                }
+            }
+            "duration" => {
+                if let Some(secs) = args.get(1).and_then(|s| s.parse::<u64>().ok()) {
+                    self.user_status_config.greeting_duration_secs = secs;
+                    self.send_reply(&format!("Greeting duration: {secs}s")).await;
+                } else {
+                    self.send_reply("Usage: /status duration <seconds>").await;
+                    return;
+                }
+            }
+            "locale" => {
+                if let Some(loc) = args.get(1) {
+                    if *loc == "auto" || *loc == "off" {
+                        self.user_status_config.locale = None;
+                        self.send_reply("Locale: auto-detect").await;
+                    } else {
+                        self.user_status_config.locale = Some(loc.to_string());
+                        self.send_reply(&format!("Locale: {loc}")).await;
+                    }
+                } else {
+                    self.send_reply("Usage: /status locale <en|zh|auto>").await;
+                    return;
+                }
+            }
+            "reset" => {
+                self.user_status_config = UserStatusConfig::default();
+                self.send_reply("Status config reset to defaults.").await;
+            }
+            other => {
+                self.send_reply(&format!(
+                    "Unknown status subcommand: {other}\n\
+                    Usage: /status [greeting|provider|metrics|words|add|remove|duration|locale|reset]"
+                )).await;
+                return;
+            }
+        }
+
+        // Persist changes
+        let base_key = self.session_key.base_key();
+        if let Err(e) = self.user_status_config.save(&self.data_dir, &base_key) {
+            warn!(error = %e, "failed to save user status config");
+        }
     }
 
     /// Send a short reply to the user (for command responses).
@@ -1148,15 +1341,32 @@ impl SessionActor {
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
+                &self.user_status_config,
             )
         });
 
         // Set up progressive streaming reporter
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
         let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx,
+            stream_tx.clone(),
         ));
         self.agent.set_reporter(reporter);
+
+        // Wire adaptive router status callback to forward through the stream channel.
+        // This lets failover events inside chat_stream() surface as LlmStatus messages.
+        if let Some(ref router) = self.adaptive_router {
+            let status_tx = stream_tx.clone();
+            router.set_status_callback(Some(Arc::new(move |message: String| {
+                let _ = status_tx.send(crate::stream_reporter::StreamProgressEvent::LlmStatus {
+                    message,
+                });
+            })));
+        }
+
+        // Set provider layer on the status composer
+        if let Some(ref handle) = status_handle {
+            handle.set_provider(self.agent.provider_name(), self.agent.model_id());
+        }
 
         // Spawn stream forwarder task (only for channels that support editing)
         let stream_forwarder = if let Some(ref si) = self.status_indicator {
@@ -1235,8 +1445,11 @@ impl SessionActor {
                         Err(e) => {
                             warn!(session = %self.session_key, error = %e, "agent task panicked");
                             self.send_reply("Internal error during processing.").await;
-                            // Clean up reporter + status
+                            // Clean up reporter + status + callback
                             self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(ref router) = self.adaptive_router {
+                                router.set_status_callback(None);
+                            }
                             if let Some(handle) = status_handle {
                                 handle.stop().await;
                             }
@@ -1280,6 +1493,9 @@ impl SessionActor {
                         None => {
                             // All senders dropped — actor shutting down
                             self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(ref router) = self.adaptive_router {
+                                router.set_status_callback(None);
+                            }
                             if let Some(handle) = status_handle {
                                 handle.stop().await;
                             }
@@ -1336,6 +1552,11 @@ impl SessionActor {
         // Reset reporter to silent (drops stream_tx → forwarder finishes)
         self.agent
             .set_reporter(Arc::new(crew_agent::SilentReporter));
+
+        // Clear adaptive router status callback (stream_tx is being dropped)
+        if let Some(ref router) = self.adaptive_router {
+            router.set_status_callback(None);
+        }
 
         // Wait for stream forwarder
         let stream_result = if let Some(handle) = stream_forwarder {
@@ -1549,6 +1770,7 @@ impl SessionActor {
         let overflow_reply_to = msg.message_id.clone();
         let session_timeout = self.session_timeout;
         let status_indicator = self.status_indicator.clone();
+        let user_status_config = self.user_status_config.clone();
         let history = pre_primary_history.to_vec();
 
         tokio::spawn(async move {
@@ -1571,9 +1793,15 @@ impl SessionActor {
             let tracker = Arc::new(TokenTracker::new());
 
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
-            let status_handle = status_indicator
-                .as_ref()
-                .map(|si| si.start(chat_id.clone(), &content, Arc::clone(&tracker), None));
+            let status_handle = status_indicator.as_ref().map(|si| {
+                si.start(
+                    chat_id.clone(),
+                    &content,
+                    Arc::clone(&tracker),
+                    None,
+                    &user_status_config,
+                )
+            });
 
             // ── Per-overflow stream reporter (own chat bubble) ──────────────
             let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1733,15 +1961,31 @@ impl SessionActor {
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
+                &self.user_status_config,
             )
         });
 
         // Set up progressive streaming reporter if we have a channel
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
         let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx,
+            stream_tx.clone(),
         ));
         self.agent.set_reporter(reporter);
+
+        // Wire adaptive router status callback for failover notifications
+        if let Some(ref router) = self.adaptive_router {
+            let status_tx = stream_tx.clone();
+            router.set_status_callback(Some(Arc::new(move |message: String| {
+                let _ = status_tx.send(crate::stream_reporter::StreamProgressEvent::LlmStatus {
+                    message,
+                });
+            })));
+        }
+
+        // Set provider layer on the status composer
+        if let Some(ref handle) = status_handle {
+            handle.set_provider(self.agent.provider_name(), self.agent.model_id());
+        }
 
         // Spawn stream forwarder task — edits a channel message as text arrives.
         // Only for channels that support message editing (Discord, Telegram, Feishu).
@@ -1819,6 +2063,11 @@ impl SessionActor {
         // Reset reporter to silent (drop the stream sender → forwarder will finish)
         self.agent
             .set_reporter(Arc::new(crew_agent::SilentReporter));
+
+        // Clear adaptive router status callback
+        if let Some(ref router) = self.adaptive_router {
+            router.set_status_callback(None);
+        }
 
         // Wait for stream forwarder to complete and get its result
         let stream_result = if let Some(handle) = stream_forwarder {
@@ -2144,6 +2393,8 @@ mod tests {
             )),
             out_tx,
             status_indicator: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -2224,6 +2475,8 @@ mod tests {
             )),
             out_tx,
             status_indicator: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),

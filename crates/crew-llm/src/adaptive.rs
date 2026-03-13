@@ -4,7 +4,7 @@
 //! per-provider latency (EMA + p95), error rates, and circuit breaker state.
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -314,6 +314,11 @@ pub struct AdaptiveStatus {
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
 /// per provider, scores them dynamically, and routes to the best performer.
 /// Probes stale providers to keep metrics fresh.
+/// Callback for status updates (e.g. failover notifications).
+/// The adaptive router calls this to inform the UI layer about provider
+/// switches that happen inside `chat_stream()` failover.
+pub type StatusCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct AdaptiveRouter {
     slots: Vec<AdaptiveSlot>,
     config: AdaptiveConfig,
@@ -325,6 +330,8 @@ pub struct AdaptiveRouter {
     qos_ranking: AtomicBool,
     /// Last provider index selected (for detecting switches).
     last_selected: AtomicU32,
+    /// Optional callback for status updates (failover, provider switching).
+    status_callback: Mutex<Option<StatusCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -357,6 +364,7 @@ impl AdaptiveRouter {
             mode: AtomicU8::new(AdaptiveMode::Off as u8),
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
+            status_callback: Mutex::new(None),
         }
     }
 
@@ -377,6 +385,19 @@ impl AdaptiveRouter {
     pub fn set_mode(&self, mode: AdaptiveMode) {
         self.mode.store(mode as u8, Ordering::Relaxed);
         info!(%mode, "adaptive mode changed");
+    }
+
+    /// Set a callback for status updates (failover notifications).
+    /// Called from `chat_stream()` failover so the UI can inform the user.
+    pub fn set_status_callback(&self, cb: Option<StatusCallback>) {
+        *self.status_callback.lock().unwrap() = cb;
+    }
+
+    /// Emit a status message through the callback (if set).
+    fn emit_status(&self, message: String) {
+        if let Some(cb) = self.status_callback.lock().unwrap().as_ref() {
+            cb(message);
+        }
     }
 
     /// Toggle QoS quality ranking at runtime (orthogonal to mode).
@@ -806,6 +827,10 @@ impl LlmProvider for AdaptiveRouter {
 
                 let mut last_error = e;
                 for (idx, _) in scored {
+                    self.emit_status(format!(
+                        "Switching to {}...",
+                        self.slots[idx].provider.provider_name()
+                    ));
                     match self.try_chat(idx, messages, tools, config).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -860,6 +885,10 @@ impl LlmProvider for AdaptiveRouter {
 
                 let mut last_error = e;
                 for (idx, _) in scored {
+                    self.emit_status(format!(
+                        "Switching to {}...",
+                        self.slots[idx].provider.provider_name()
+                    ));
                     match self.try_chat_stream(idx, messages, tools, config).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {

@@ -197,6 +197,10 @@ impl TelegramChannel {
                 "queue",
                 "View/change queue mode (followup|collect|steer|interrupt|spec)",
             ),
+            BotCommand::new(
+                "status",
+                "Configure status layers (greeting|provider|metrics|words|add|remove)",
+            ),
         ];
         match self.bot.set_my_commands(commands).await {
             Ok(_) => info!("Telegram bot commands registered"),
