@@ -295,7 +295,7 @@ impl Channel for TelegramChannel {
                 };
 
                 // Dedup: skip updates already processed before reconnection.
-                let uid = update.id as i32;
+                let uid = update.id.0 as i32;
                 if uid <= last_update_id {
                     tracing::debug!(update_id = uid, "skipping already-processed Telegram update");
                     continue;
