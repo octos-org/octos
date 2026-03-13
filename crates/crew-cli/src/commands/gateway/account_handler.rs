@@ -60,8 +60,13 @@ pub async fn handle_account_command(
                             crate::profiles::ChannelCredentials::WeComBot { .. } => "wecom-bot",
                         })
                         .collect();
+                    let sb = if s.config.sandbox.enabled {
+                        " | sandbox: ON"
+                    } else {
+                        ""
+                    };
                     lines.push(format!(
-                        "  {} — {} ({}) [{}]",
+                        "  {} — {} ({}) [{}]{sb}",
                         s.id,
                         s.name,
                         status,
@@ -192,8 +197,9 @@ fn handle_account_update(
     if sub_id.is_empty() || kv_str.is_empty() {
         return "Usage: /account update <sub-id> key=value [key=value ...]\n\
             Keys: telegram-token, telegram-senders, whatsapp, \
-            feishu-app-id, feishu-app-secret, system-prompt, enabled\n\
-            Example: /account update my--bot telegram-token=123:ABC enabled=true"
+            feishu-app-id, feishu-app-secret, system-prompt, enabled, \
+            sandbox, sandbox-mode, sandbox-network\n\
+            Example: /account update my--bot sandbox=true sandbox-mode=auto"
             .to_string();
     }
     let mut profile = match verify_sub_account(store, sub_id, parent_id) {
@@ -316,9 +322,41 @@ fn handle_account_update(
                 profile.enabled = en;
                 changed.push(if en { "enabled" } else { "disabled" });
             }
+            "sandbox" => {
+                let on = val == "true" || val == "1" || val == "on";
+                profile.config.sandbox.enabled = on;
+                changed.push(if on {
+                    "sandbox enabled"
+                } else {
+                    "sandbox disabled"
+                });
+            }
+            "sandbox-mode" => {
+                profile.config.sandbox.mode = match val {
+                    "auto" => crew_agent::SandboxMode::Auto,
+                    "macos" => crew_agent::SandboxMode::Macos,
+                    "docker" => crew_agent::SandboxMode::Docker,
+                    "bwrap" => crew_agent::SandboxMode::Bwrap,
+                    _ => {
+                        return format!(
+                            "Invalid sandbox mode: {val}\nValid modes: auto, macos, docker, bwrap"
+                        );
+                    }
+                };
+                changed.push("sandbox mode");
+            }
+            "sandbox-network" => {
+                let net = val == "true" || val == "1";
+                profile.config.sandbox.allow_network = net;
+                changed.push(if net {
+                    "sandbox network allowed"
+                } else {
+                    "sandbox network blocked"
+                });
+            }
             _ => {
                 return format!(
-                    "Unknown key: {key}\nValid keys: telegram-token, telegram-senders, whatsapp, feishu-app-id, feishu-app-secret, system-prompt, enabled"
+                    "Unknown key: {key}\nValid keys: telegram-token, telegram-senders, whatsapp, feishu-app-id, feishu-app-secret, system-prompt, enabled, sandbox, sandbox-mode, sandbox-network"
                 );
             }
         }

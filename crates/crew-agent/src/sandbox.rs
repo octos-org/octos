@@ -337,7 +337,13 @@ impl Sandbox for MacosSandbox {
 (deny default)
 (allow process-exec)
 (allow process-fork)
+(allow process-info*)
 (allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix*)
+(allow signal)
+(allow file-ioctl)
 {read_rules}
 (allow file-write* (subpath "{cwd}"))
 {network_rule}
