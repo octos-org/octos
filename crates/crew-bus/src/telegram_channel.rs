@@ -262,6 +262,9 @@ impl Channel for TelegramChannel {
         self.set_commands().await;
 
         let mut consecutive_failures: u32 = 0;
+        // Track the last processed update ID across reconnections to prevent
+        // duplicate processing when `polling_default` resets its offset.
+        let mut last_update_id: i32 = 0;
 
         // Outer reconnection loop — restarts polling when the stream ends.
         loop {
@@ -275,7 +278,7 @@ impl Channel for TelegramChannel {
 
             // Reset failure counter on successful stream creation
             consecutive_failures = 0;
-            info!("Telegram polling stream connected");
+            info!(last_update_id, "Telegram polling stream connected");
 
             while let Some(result) = stream.next().await {
                 if self.shutdown.load(Ordering::Acquire) {
@@ -290,6 +293,14 @@ impl Channel for TelegramChannel {
                         continue;
                     }
                 };
+
+                // Dedup: skip updates already processed before reconnection.
+                let uid = update.id as i32;
+                if uid <= last_update_id {
+                    tracing::debug!(update_id = uid, "skipping already-processed Telegram update");
+                    continue;
+                }
+                last_update_id = uid;
 
                 match update.kind {
                     UpdateKind::Message(msg) => {

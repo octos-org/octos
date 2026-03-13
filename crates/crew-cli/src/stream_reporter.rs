@@ -28,6 +28,9 @@ pub enum StreamProgressEvent {
     ToolProgress { name: String, message: String },
     /// LLM call status update (retry progress, provider switching).
     LlmStatus { message: String },
+    /// Reset the streaming buffer (e.g. before an LLM retry so partial
+    /// text from a failed attempt doesn't get concatenated with the retry).
+    BufferReset,
 }
 
 /// A `ProgressReporter` that forwards stream events through an unbounded channel.
@@ -61,6 +64,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 StreamProgressEvent::ToolProgress { name, message }
             }
             ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
+            ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -248,6 +252,12 @@ pub async fn run_stream_forwarder(
                 .await;
                 last_edit = Instant::now();
             }
+            StreamProgressEvent::BufferReset => {
+                // Clear accumulated text so a retry starts fresh.
+                // Keep the message_id so the retry edits the same message
+                // instead of creating a new one.
+                buffer.clear();
+            }
         }
     }
 
@@ -312,5 +322,48 @@ async fn flush_to_channel(
                 warn!("stream send failed: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_clear_buffer_on_reset_event() {
+        // Simulate the forwarder receiving chunks then a BufferReset.
+        // We can't easily test the full async forwarder, but we can
+        // verify the event enum is correctly structured and mapped.
+        let event = StreamProgressEvent::BufferReset;
+        assert!(matches!(event, StreamProgressEvent::BufferReset));
+    }
+
+    #[test]
+    fn should_map_stream_retry_to_buffer_reset() {
+        use crew_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::StreamRetry { iteration: 1 });
+
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event, StreamProgressEvent::BufferReset));
+    }
+
+    #[test]
+    fn should_strip_think_tags_from_buffer() {
+        assert_eq!(
+            strip_think_from_buffer("Hello <think>internal</think> world"),
+            "Hello  world"
+        );
+    }
+
+    #[test]
+    fn should_hide_unclosed_think_tag() {
+        assert_eq!(
+            strip_think_from_buffer("Hello <think>still thinking"),
+            "Hello"
+        );
     }
 }

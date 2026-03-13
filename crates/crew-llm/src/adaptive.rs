@@ -597,13 +597,18 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Option<Result<ChatResponse>> {
-        // Pick the best alternate provider (not the primary, not circuit-broken)
+        // Pick the best alternate provider (not the primary, not the same provider
+        // name, not circuit-broken). Racing the same provider against itself wastes
+        // API calls with no failover benefit.
+        let primary_name = self.slots[primary_idx].provider.provider_name();
         let alternate_idx = self
             .slots
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                *i != primary_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
+                *i != primary_idx
+                    && s.provider.provider_name() != primary_name
+                    && !s.metrics.is_circuit_open(self.config.failure_threshold)
             })
             .map(|(i, s)| (i, self.score(s)))
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -1635,5 +1640,81 @@ mod tests {
         // Next call should skip circuit-broken primary and go to fallback
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+    }
+
+    /// Hedge mode should NOT race the same provider against itself.
+    /// When all slots share the same provider_name, hedged_chat returns None
+    /// and the single-provider path is used instead.
+    #[tokio::test]
+    async fn should_skip_hedge_when_all_providers_same_name() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5-alt",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        // Should succeed via single-provider path (hedged_chat skips same-name)
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-moonshot"));
+    }
+
+    /// Hedge mode picks a different-named provider as alternate.
+    #[tokio::test]
+    async fn should_hedge_with_different_provider_names() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5",
+                    latency_ms: 200, // slow
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-alt",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-chat",
+                    latency_ms: 10, // fast, different provider
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        // Should race moonshot vs deepseek (skipping moonshot[1] same name)
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        // deepseek is faster, so it wins the race
+        assert_eq!(resp.content.as_deref(), Some("from-deepseek"));
     }
 }

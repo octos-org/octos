@@ -73,6 +73,10 @@ pub enum ProgressEvent {
     /// Streaming completed.
     StreamDone { iteration: u32 },
 
+    /// LLM call is being retried — signals stream forwarder to clear its buffer
+    /// so partial text from the failed attempt isn't concatenated with the retry.
+    StreamRetry { iteration: u32 },
+
     /// Cost update after a response.
     CostUpdate {
         session_input_tokens: u32,
@@ -369,6 +373,10 @@ impl ProgressReporter for ConsoleReporter {
                     let _ = writeln!(buf);
                     let _ = buf.flush();
                 }
+            }
+            ProgressEvent::StreamRetry { .. } => {
+                // Console doesn't need to do anything special on retry
+                // (the LlmStatus message already shows retry info).
             }
             ProgressEvent::CostUpdate {
                 session_input_tokens,
