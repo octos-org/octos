@@ -735,7 +735,11 @@ fn format_metrics(elapsed_secs: u64, input_tokens: u32, output_tokens: u32) -> S
     };
 
     let token_part = if has_tokens {
-        format!("{}↑ {}↓", fmt_tokens(input_tokens), fmt_tokens(output_tokens))
+        format!(
+            "{}↑ {}↓",
+            fmt_tokens(input_tokens),
+            fmt_tokens(output_tokens)
+        )
     } else {
         String::new()
     };

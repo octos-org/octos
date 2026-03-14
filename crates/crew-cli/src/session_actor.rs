@@ -490,8 +490,7 @@ impl ActorFactory {
         )));
 
         // Load per-user status configuration
-        let user_status_config =
-            UserStatusConfig::load(&self.data_dir, &session_key.base_key());
+        let user_status_config = UserStatusConfig::load(&self.data_dir, &session_key.base_key());
 
         let actor = SessionActor {
             session_key: session_key.clone(),
@@ -909,7 +908,10 @@ impl SessionActor {
             let cfg = &self.user_status_config;
             let mut lines = vec![
                 "**Status Config**".to_string(),
-                format!("Greeting: {}", cfg.greeting_template.as_deref().unwrap_or("(none)")),
+                format!(
+                    "Greeting: {}",
+                    cfg.greeting_template.as_deref().unwrap_or("(none)")
+                ),
                 format!("Provider visible: {}", cfg.provider_visible),
                 format!("Metrics visible: {}", cfg.metrics_visible),
                 format!("Greeting duration: {}s", cfg.greeting_duration_secs),
@@ -921,7 +923,10 @@ impl SessionActor {
                 lines.push(format!("Locale: {locale}"));
             }
             for custom in &cfg.custom_layers {
-                lines.push(format!("Custom layer `{}` (p={}): {}", custom.id, custom.priority, custom.content));
+                lines.push(format!(
+                    "Custom layer `{}` (p={}): {}",
+                    custom.id, custom.priority, custom.content
+                ));
             }
             self.send_reply(&lines.join("\n")).await;
             return;
@@ -953,8 +958,11 @@ impl SessionActor {
                     }
                 };
                 self.user_status_config.provider_visible = on;
-                self.send_reply(&format!("Provider layer: {}", if on { "visible" } else { "hidden" }))
-                    .await;
+                self.send_reply(&format!(
+                    "Provider layer: {}",
+                    if on { "visible" } else { "hidden" }
+                ))
+                .await;
             }
             "metrics" => {
                 let on = match args.get(1).copied() {
@@ -966,15 +974,20 @@ impl SessionActor {
                     }
                 };
                 self.user_status_config.metrics_visible = on;
-                self.send_reply(&format!("Metrics layer: {}", if on { "visible" } else { "hidden" }))
-                    .await;
+                self.send_reply(&format!(
+                    "Metrics layer: {}",
+                    if on { "visible" } else { "hidden" }
+                ))
+                .await;
             }
             "words" => {
                 if args.len() < 2 {
-                    self.send_reply("Usage: /status words word1,word2,...").await;
+                    self.send_reply("Usage: /status words word1,word2,...")
+                        .await;
                     return;
                 }
-                let words: Vec<String> = args[1..].join(" ")
+                let words: Vec<String> = args[1..]
+                    .join(" ")
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -991,7 +1004,8 @@ impl SessionActor {
             "add" => {
                 // /status add <id> <priority> <text>
                 if args.len() < 4 {
-                    self.send_reply("Usage: /status add <id> <priority> <text>").await;
+                    self.send_reply("Usage: /status add <id> <priority> <text>")
+                        .await;
                     return;
                 }
                 let id = args[1].to_string();
@@ -1011,7 +1025,8 @@ impl SessionActor {
                     policy: LayerPolicy::Fixed,
                     content: content.clone(),
                 });
-                self.send_reply(&format!("Added layer `{id}` (p={priority}): {content}")).await;
+                self.send_reply(&format!("Added layer `{id}` (p={priority}): {content}"))
+                    .await;
             }
             "remove" => {
                 if args.len() < 2 {
@@ -1024,13 +1039,15 @@ impl SessionActor {
                 if self.user_status_config.custom_layers.len() < before {
                     self.send_reply(&format!("Removed layer `{id}`.")).await;
                 } else {
-                    self.send_reply(&format!("No custom layer `{id}` found.")).await;
+                    self.send_reply(&format!("No custom layer `{id}` found."))
+                        .await;
                 }
             }
             "duration" => {
                 if let Some(secs) = args.get(1).and_then(|s| s.parse::<u64>().ok()) {
                     self.user_status_config.greeting_duration_secs = secs;
-                    self.send_reply(&format!("Greeting duration: {secs}s")).await;
+                    self.send_reply(&format!("Greeting duration: {secs}s"))
+                        .await;
                 } else {
                     self.send_reply("Usage: /status duration <seconds>").await;
                     return;
@@ -1357,9 +1374,8 @@ impl SessionActor {
         if let Some(ref router) = self.adaptive_router {
             let status_tx = stream_tx.clone();
             router.set_status_callback(Some(Arc::new(move |message: String| {
-                let _ = status_tx.send(crate::stream_reporter::StreamProgressEvent::LlmStatus {
-                    message,
-                });
+                let _ = status_tx
+                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
             })));
         }
 
@@ -1976,9 +1992,8 @@ impl SessionActor {
         if let Some(ref router) = self.adaptive_router {
             let status_tx = stream_tx.clone();
             router.set_status_callback(Some(Arc::new(move |message: String| {
-                let _ = status_tx.send(crate::stream_reporter::StreamProgressEvent::LlmStatus {
-                    message,
-                });
+                let _ = status_tx
+                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
             })));
         }
 

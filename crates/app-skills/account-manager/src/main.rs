@@ -208,7 +208,13 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
             .get("sandbox")
             .and_then(|sb| sb.get("enabled"))
             .and_then(|e| e.as_bool())
-            .map(|on| if on { " | sandbox: ON" } else { " | sandbox: OFF" })
+            .map(|on| {
+                if on {
+                    " | sandbox: ON"
+                } else {
+                    " | sandbox: OFF"
+                }
+            })
             .unwrap_or("");
         lines.push(format!(
             "  - {id} ({name}, {status}) [{channels}]{prompt_preview}{sandbox_status}",
@@ -451,14 +457,8 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
         .extra
         .get("sandbox")
         .map(|sb| {
-            let enabled = sb
-                .get("enabled")
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
-            let mode = sb
-                .get("mode")
-                .and_then(|m| m.as_str())
-                .unwrap_or("auto");
+            let enabled = sb.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+            let mode = sb.get("mode").and_then(|m| m.as_str()).unwrap_or("auto");
             let net = sb
                 .get("allow_network")
                 .and_then(|n| n.as_bool())

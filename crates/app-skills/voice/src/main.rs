@@ -250,11 +250,7 @@ fn handle_synthesize(input_json: &str) {
         )
     };
 
-    let resp = match client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-    {
+    let resp = match client.post(&endpoint).json(&body).send() {
         Ok(r) => r,
         Err(e) => fail(&format!("TTS request failed: {e}")),
     };
