@@ -86,16 +86,67 @@ fn entry_matches(entry: &str, tool_name: &str) -> bool {
     entry == tool_name
 }
 
+/// Metadata about a tool group, used by the `activate_tools` tool to present
+/// available deferred groups to the LLM.
+#[derive(Debug, Clone)]
+pub struct ToolGroupInfo {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub tools: &'static [&'static str],
+}
+
+/// All known tool groups with metadata.
+pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
+    ToolGroupInfo {
+        name: "group:fs",
+        description: "File operations: read, write, edit, and diff-edit files",
+        tools: &["read_file", "write_file", "edit_file", "diff_edit"],
+    },
+    ToolGroupInfo {
+        name: "group:runtime",
+        description: "Shell command execution",
+        tools: &["shell"],
+    },
+    ToolGroupInfo {
+        name: "group:web",
+        description: "Web search, page fetching, and headless browser",
+        tools: &["web_search", "web_fetch", "browser"],
+    },
+    ToolGroupInfo {
+        name: "group:search",
+        description: "File and content search: glob patterns, grep, directory listing",
+        tools: &["glob", "grep", "list_dir"],
+    },
+    ToolGroupInfo {
+        name: "group:sessions",
+        description: "Spawn background subagents for parallel tasks",
+        tools: &["spawn"],
+    },
+    ToolGroupInfo {
+        name: "group:memory",
+        description: "Long-term memory: save and recall knowledge across sessions",
+        tools: &["recall_memory", "save_memory"],
+    },
+    ToolGroupInfo {
+        name: "group:research",
+        description: "Deep multi-round web research and synthesis",
+        tools: &["deep_search", "synthesize_research", "deep_crawl"],
+    },
+    ToolGroupInfo {
+        name: "group:admin",
+        description: "Skill management, tool configuration, and model switching",
+        tools: &["manage_skills", "configure_tool", "switch_model"],
+    },
+];
+
+/// Look up group info by name.
+pub fn tool_group_info(name: &str) -> Option<&'static ToolGroupInfo> {
+    TOOL_GROUPS.iter().find(|g| g.name == name)
+}
+
 /// Expand a group name to its tool names. Returns None if not a group.
 fn expand_group(name: &str) -> Option<&'static [&'static str]> {
-    match name {
-        "group:fs" => Some(&["read_file", "write_file", "edit_file", "diff_edit"]),
-        "group:runtime" => Some(&["shell"]),
-        "group:web" => Some(&["web_search", "web_fetch", "browser"]),
-        "group:search" => Some(&["glob", "grep", "list_dir"]),
-        "group:sessions" => Some(&["spawn"]),
-        _ => None,
-    }
+    tool_group_info(name).map(|g| g.tools)
 }
 
 #[cfg(test)]

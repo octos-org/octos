@@ -4,7 +4,7 @@ description: Recursively crawl websites using headless Chrome. Triggers: crawl, 
 version: 1.0.0
 author: hagency
 requires_bins: google-chrome
-always: true
+always: false
 ---
 
 # deep_crawl

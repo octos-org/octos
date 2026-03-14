@@ -758,6 +758,24 @@ impl GatewayCommand {
             None
         };
 
+        // Auto-defer non-core tool groups when tool count is high to prevent
+        // overwhelming LLMs that struggle with many tool specs.
+        let visible = tools.specs().len();
+        if visible > 25 {
+            for group in &["group:research", "group:memory", "group:admin"] {
+                tools.defer_group(group);
+            }
+            let after = tools.specs().len();
+            info!(
+                before = visible,
+                after, "auto-deferred tool groups to reduce tool count"
+            );
+        }
+        // Register activate_tools (wired per-session in session_actor)
+        if tools.has_deferred() {
+            tools.register(crew_agent::ActivateToolsTool::new());
+        }
+
         // Create the base tool registry snapshot (excludes session-specific tools)
         let tool_registry_factory = Arc::new(SnapshotToolRegistryFactory::new(tools));
 

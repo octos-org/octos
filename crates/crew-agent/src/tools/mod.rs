@@ -1,6 +1,6 @@
 //! Tool framework for agent tool execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -69,6 +69,12 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given arguments.
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult>;
+
+    /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: no downcasting. Override in tools that need it.
+        &()
+    }
 }
 
 /// Registry of available tools.
@@ -81,6 +87,9 @@ pub struct ToolRegistry {
     context_filter: Option<Vec<String>>,
     /// Cached specs output, invalidated on registry mutations.
     cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
+    /// Deferred tools: registered but hidden from specs() until activated.
+    /// Uses interior mutability so activate() can work through Arc<ToolRegistry>.
+    deferred: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Default for ToolRegistry {
@@ -97,6 +106,7 @@ impl ToolRegistry {
             provider_policy: None,
             context_filter: None,
             cached_specs: std::sync::Mutex::new(None),
+            deferred: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -120,9 +130,11 @@ impl ToolRegistry {
             return specs.clone();
         }
 
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let specs: Vec<ToolSpec> = self
             .tools
             .values()
+            .filter(|t| !deferred.contains(t.name()))
             .filter(|t| {
                 self.provider_policy
                     .as_ref()
@@ -145,6 +157,11 @@ impl ToolRegistry {
 
         *cache = Some(specs.clone());
         specs
+    }
+
+    /// Get a tool by name.
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
     }
 
     /// Number of registered tools.
@@ -210,21 +227,121 @@ impl ToolRegistry {
             .filter(|(name, _)| !exclude.contains(&name.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let deferred = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Self {
             tools,
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             cached_specs: std::sync::Mutex::new(None),
+            deferred: std::sync::Mutex::new(deferred),
         }
     }
 
-    /// Clear the cached specs (called by mutation methods).
+    // ── Deferred tool activation ──────────────────────────────────────
+
+    /// Mark tools as deferred (hidden from specs until activated).
+    /// Call during setup before wrapping in Arc.
+    pub fn defer(&mut self, names: impl IntoIterator<Item = String>) {
+        let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
+        for name in names {
+            if self.tools.contains_key(&name) {
+                deferred.insert(name);
+            }
+        }
+        self.invalidate_cache();
+    }
+
+    /// Defer all tools in a named group (e.g. "group:web").
+    pub fn defer_group(&mut self, group: &str) {
+        if let Some(info) = policy::tool_group_info(group) {
+            let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
+            for &tool in info.tools {
+                if self.tools.contains_key(tool) {
+                    deferred.insert(tool.to_string());
+                }
+            }
+            self.invalidate_cache();
+        }
+    }
+
+    /// Activate a deferred tool group or individual tool. Works through `&self`
+    /// (interior mutability) so it can be called during the agent loop via Arc.
+    /// Returns the names of tools that were activated.
+    pub fn activate(&self, group_or_name: &str) -> Vec<String> {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let mut activated = Vec::new();
+
+        if let Some(info) = policy::tool_group_info(group_or_name) {
+            for &tool in info.tools {
+                if deferred.remove(tool) {
+                    activated.push(tool.to_string());
+                }
+            }
+        } else if deferred.remove(group_or_name) {
+            activated.push(group_or_name.to_string());
+        }
+
+        if !activated.is_empty() {
+            self.invalidate_cache_shared();
+        }
+        activated
+    }
+
+    /// Returns info about currently deferred tool groups for the activate_tools tool.
+    pub fn deferred_groups(&self) -> Vec<(String, String, usize)> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if deferred.is_empty() {
+            return Vec::new();
+        }
+
+        let mut groups = Vec::new();
+        for info in policy::TOOL_GROUPS {
+            let count = info.tools.iter().filter(|&&t| deferred.contains(t)).count();
+            if count > 0 {
+                groups.push((info.name.to_string(), info.description.to_string(), count));
+            }
+        }
+
+        // Also list individually deferred tools not in any group
+        let grouped: HashSet<&str> = policy::TOOL_GROUPS
+            .iter()
+            .flat_map(|g| g.tools.iter().copied())
+            .collect();
+        for name in deferred.iter() {
+            if !grouped.contains(name.as_str()) {
+                groups.push((name.clone(), "Plugin tool".to_string(), 1));
+            }
+        }
+        groups
+    }
+
+    /// Whether any tools are currently deferred.
+    pub fn has_deferred(&self) -> bool {
+        !self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    // ── Cache management ────────────────────────────────────────────
+
+    /// Clear the cached specs (called by mutation methods with &mut self).
     fn invalidate_cache(&mut self) {
         // &mut self guarantees exclusive access, so get_mut() bypasses the mutex.
         *self
             .cached_specs
             .get_mut()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Clear the cached specs through &self (for interior-mutability callers).
+    fn invalidate_cache_shared(&self) {
+        *self.cached_specs.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Execute a tool by name.
@@ -237,6 +354,18 @@ impl ToolRegistry {
             if !policy.is_allowed(name) {
                 eyre::bail!("tool '{}' denied by provider policy", name);
             }
+        }
+
+        if self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+        {
+            eyre::bail!(
+                "tool '{}' is deferred; call activate_tools to activate it first",
+                name
+            );
         }
 
         // Reject oversized arguments (1 MB limit).
@@ -291,6 +420,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
+pub mod activate_tools;
 pub mod admin;
 pub mod browser;
 pub mod tool_config;
@@ -321,6 +451,7 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
+pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 

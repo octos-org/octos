@@ -187,6 +187,17 @@ impl Agent {
         }
     }
 
+    /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
+    /// Must be called after construction if `ActivateToolsTool` was registered.
+    pub fn wire_activate_tools(&self) {
+        use crate::tools::activate_tools::ActivateToolsTool;
+        if let Some(tool) = self.tools.get("activate_tools") {
+            if let Some(at) = tool.as_any().downcast_ref::<ActivateToolsTool>() {
+                at.set_registry(Arc::downgrade(&self.tools));
+            }
+        }
+    }
+
     /// Set the agent configuration.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         // Apply worker_prompt override if provided.

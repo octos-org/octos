@@ -407,11 +407,19 @@ impl ActorFactory {
 
         // Build per-session Agent
         let agent_id = AgentId::new(format!("session-{}", session_key));
-        let system_prompt = self
+        let has_deferred = tools.has_deferred();
+        let mut system_prompt = self
             .system_prompt
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        if has_deferred {
+            system_prompt.push_str(
+                "\n\nSome tools are available on demand. Call `activate_tools` \
+                 with no arguments to see available tool groups, then activate \
+                 the ones you need.",
+            );
+        }
 
         let mut agent = Agent::new(agent_id, self.llm.clone(), tools, self.memory.clone())
             .with_config(self.agent_config.clone())
@@ -431,6 +439,9 @@ impl ActorFactory {
                 profile_id: ctx.profile_id.clone(),
             });
         }
+
+        // Wire the activate_tools back-reference now that tools are in Arc
+        agent.wire_activate_tools();
 
         let actor = SessionActor {
             session_key: session_key.clone(),
