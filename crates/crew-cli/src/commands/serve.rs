@@ -170,7 +170,8 @@ impl ServeCommand {
                     "no dashboard_auth.smtp configured — OTP codes will be logged to console only"
                 );
             }
-            let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone());
+            let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
+                .with_sessions_path(data_dir.join("auth_sessions.json"));
 
             // Resolve SMTP password from profile env_vars as fallback
             // (covers nohup startup where LaunchAgent env vars aren't available)
