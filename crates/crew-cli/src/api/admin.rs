@@ -2013,7 +2013,37 @@ pub async fn list_sessions(
     let data_dir = ps.resolve_data_dir(&profile);
     let sessions_dir = data_dir.join("sessions");
 
-    let mut sessions = Vec::new();
+    // Helper to build a session JSON entry from a path and decoded key.
+    let build_session_entry =
+        |path: &std::path::Path, decoded_key: String, file_name: String| {
+            let meta = std::fs::metadata(path).ok();
+            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
+                let dt: chrono::DateTime<Utc> = t.into();
+                dt.to_rfc3339()
+            });
+            // Count lines (messages = lines - 1 for metadata line)
+            let line_count = std::fs::File::open(path)
+                .ok()
+                .map(|f| {
+                    use std::io::BufRead;
+                    std::io::BufReader::new(f).lines().count()
+                })
+                .unwrap_or(0);
+            let msg_count = line_count.saturating_sub(1);
+            serde_json::json!({
+                "key": decoded_key,
+                "file": file_name,
+                "messages": msg_count,
+                "size_bytes": size_bytes,
+                "modified": modified,
+            })
+        };
+
+    // Use a map keyed by decoded_key so per-user entries take precedence.
+    let mut session_map = std::collections::HashMap::<String, serde_json::Value>::new();
+
+    // 1. Scan legacy flat sessions/ directory.
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2026,31 +2056,54 @@ pub async fn list_sessions(
                 .unwrap_or("")
                 .to_string();
             let decoded_key = crew_bus::SessionManager::decode_filename(&file_name);
-            let meta = std::fs::metadata(&path).ok();
-            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
-                let dt: chrono::DateTime<Utc> = t.into();
-                dt.to_rfc3339()
-            });
-            // Count lines (messages = lines - 1 for metadata line)
-            let line_count = std::fs::File::open(&path)
-                .ok()
-                .map(|f| {
-                    use std::io::BufRead;
-                    std::io::BufReader::new(f).lines().count()
-                })
-                .unwrap_or(0);
-            let msg_count = line_count.saturating_sub(1);
-
-            sessions.push(serde_json::json!({
-                "key": decoded_key,
-                "file": file_name,
-                "messages": msg_count,
-                "size_bytes": size_bytes,
-                "modified": modified,
-            }));
+            let entry_val = build_session_entry(&path, decoded_key.clone(), file_name);
+            session_map.insert(decoded_key, entry_val);
         }
     }
+
+    // 2. Scan per-user layout: data_dir/users/*/sessions/*.jsonl
+    let users_dir = data_dir.join("users");
+    if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
+        for user_entry in user_entries.flatten() {
+            let user_path = user_entry.path();
+            if !user_path.is_dir() {
+                continue;
+            }
+            let encoded_base_key = match user_path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let base_key =
+                crew_bus::SessionManager::decode_filename(&encoded_base_key);
+
+            let user_sessions_dir = user_path.join("sessions");
+            if let Ok(sess_entries) = std::fs::read_dir(&user_sessions_dir) {
+                for sess_entry in sess_entries.flatten() {
+                    let path = sess_entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let topic = path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("default")
+                        .to_string();
+                    let decoded_key = if topic == "default" {
+                        base_key.clone()
+                    } else {
+                        format!("{}#{}", base_key, topic)
+                    };
+                    let file_label = format!("{}/{}", encoded_base_key, topic);
+                    let entry_val =
+                        build_session_entry(&path, decoded_key.clone(), file_label);
+                    // Per-user takes precedence over legacy.
+                    session_map.insert(decoded_key, entry_val);
+                }
+            }
+        }
+    }
+
+    let mut sessions: Vec<serde_json::Value> = session_map.into_values().collect();
     // Sort by modified descending (most recent first)
     sessions.sort_by(|a, b| {
         let ma = a.get("modified").and_then(|v| v.as_str()).unwrap_or("");

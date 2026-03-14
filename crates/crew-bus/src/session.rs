@@ -876,10 +876,11 @@ impl SessionManager {
         self.rewrite(key).await
     }
 
-    /// List sessions for a chat from the per-user directory layout.
+    /// List sessions for a chat, merging per-user and legacy flat layouts.
     ///
-    /// Scans `{data_dir}/users/{base_key}/sessions/` for JSONL files.
-    /// Falls back to the legacy flat scan if the user directory doesn't exist.
+    /// Scans `{data_dir}/users/{base_key}/sessions/` for JSONL files and
+    /// also includes any sessions from the legacy flat `{data_dir}/sessions/`
+    /// directory that aren't already present in the per-user layout.
     pub fn list_user_sessions(&self, base_key: &str) -> Vec<SessionListEntry> {
         let encoded_base = SessionHandle::encode_path_component(base_key);
         let user_sessions_dir = self
@@ -890,12 +891,24 @@ impl SessionManager {
             .join(&encoded_base)
             .join("sessions");
 
-        if user_sessions_dir.is_dir() {
+        let mut entries = if user_sessions_dir.is_dir() {
             Self::scan_sessions_dir(&user_sessions_dir)
         } else {
-            // Fall back to legacy flat layout
-            self.list_sessions_for_chat(base_key)
+            Vec::new()
+        };
+
+        // Merge legacy flat layout sessions that don't exist in per-user dir
+        let legacy = self.list_sessions_for_chat(base_key);
+        let existing_topics: std::collections::HashSet<Option<String>> =
+            entries.iter().map(|e| e.topic.clone()).collect();
+        for entry in legacy {
+            if !existing_topics.contains(&entry.topic) {
+                entries.push(entry);
+            }
         }
+
+        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries
     }
 
     /// Scan a sessions directory and return entries sorted by updated_at descending.
@@ -1740,5 +1753,127 @@ mod tests {
 
         // File should be gone
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_list_user_sessions_merges_both_layouts() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        let now = Utc::now();
+        let older = now - chrono::Duration::hours(2);
+        let old = now - chrono::Duration::hours(1);
+
+        // --- Legacy flat layout ---
+        // Default session (older timestamp — should be superseded by per-user default)
+        let legacy_default_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "telegram:12345",
+            "created_at": older,
+            "updated_at": older
+        });
+        let legacy_default_path = tmp.path().join("sessions/telegram%3A12345.jsonl");
+        std::fs::write(
+            &legacy_default_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&legacy_default_meta).unwrap(),
+                serde_json::to_string(&make_message(MessageRole::User, "legacy default")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // "research" topic — only exists in legacy
+        let legacy_research_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "telegram:12345#research",
+            "topic": "research",
+            "created_at": old,
+            "updated_at": old
+        });
+        let legacy_research_path =
+            tmp.path().join("sessions/telegram%3A12345%23research.jsonl");
+        std::fs::write(
+            &legacy_research_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&legacy_research_meta).unwrap(),
+                serde_json::to_string(&make_message(MessageRole::User, "legacy research")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // --- Per-user layout ---
+        let user_sessions_dir = tmp
+            .path()
+            .join("users/telegram%3A12345/sessions");
+        std::fs::create_dir_all(&user_sessions_dir).unwrap();
+
+        // Default session (newer — should win over legacy default)
+        let peruser_default_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "telegram:12345",
+            "created_at": old,
+            "updated_at": now
+        });
+        std::fs::write(
+            user_sessions_dir.join("default.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&peruser_default_meta).unwrap(),
+                serde_json::to_string(&make_message(MessageRole::User, "peruser default")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // "coding" topic — only exists in per-user
+        let peruser_coding_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "telegram:12345#coding",
+            "topic": "coding",
+            "created_at": old,
+            "updated_at": old
+        });
+        std::fs::write(
+            user_sessions_dir.join("coding.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&peruser_coding_meta).unwrap(),
+                serde_json::to_string(&make_message(MessageRole::User, "peruser coding")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // --- Call list_user_sessions and assert ---
+        let entries = mgr.list_user_sessions("telegram:12345");
+
+        // Should have 3 entries: default (per-user), research (legacy), coding (per-user)
+        assert_eq!(entries.len(), 3, "expected 3 entries, got: {entries:?}");
+
+        // Sorted by updated_at descending: default(now) > research(old) >= coding(old)
+        let topics: Vec<Option<&str>> =
+            entries.iter().map(|e| e.topic.as_deref()).collect();
+
+        // Default session (from per-user, not legacy) should be first (newest)
+        assert_eq!(entries[0].topic, None, "first entry should be default session");
+        assert_eq!(
+            entries[0].updated_at, now,
+            "default session should come from per-user layout (newer timestamp)"
+        );
+
+        // "research" and "coding" should both be present
+        assert!(
+            topics.contains(&Some("research")),
+            "research topic should be included from legacy"
+        );
+        assert!(
+            topics.contains(&Some("coding")),
+            "coding topic should be included from per-user"
+        );
+
+        // Each entry should have 1 message
+        for e in &entries {
+            assert_eq!(e.message_count, 1, "each session should have 1 message");
+        }
     }
 }

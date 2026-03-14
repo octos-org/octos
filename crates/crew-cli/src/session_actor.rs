@@ -425,18 +425,20 @@ impl ActorFactory {
             spawn_tool = spawn_tool.with_provider_router(router.clone());
         }
 
-        // Wire direct background result injection (bypasses InboundMessage relay)
+        // Wire direct background result injection (bypasses InboundMessage relay).
+        // Returns true if the actor accepted the result, false if the actor
+        // has exited (idle timeout) so the caller can fall back to the legacy relay.
         let bg_tx = tx.clone();
         spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
             move |task_label: String, content: String| {
                 let tx = bg_tx.clone();
                 Box::pin(async move {
-                    let _ = tx
-                        .send(ActorMessage::BackgroundResult {
-                            task_label,
-                            content,
-                        })
-                        .await;
+                    tx.send(ActorMessage::BackgroundResult {
+                        task_label,
+                        content,
+                    })
+                    .await
+                    .is_ok()
                 })
             },
         ));
@@ -526,6 +528,7 @@ impl ActorFactory {
             adaptive_router: self.adaptive_router.clone(),
             memory_store: self.memory_store.clone(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_sessions: self.active_sessions.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -652,9 +655,19 @@ struct SessionActor {
     memory_store: Option<Arc<MemoryStore>>,
     /// Active overflow task counter for concurrency limiting.
     active_overflow_tasks: Arc<std::sync::atomic::AtomicU32>,
+    /// Active session store — used to check if this session is the user's current session.
+    active_sessions: Arc<Mutex<ActiveSessionStore>>,
 }
 
 impl SessionActor {
+    /// Check if this session is the user's currently active session.
+    async fn is_active_session(&self) -> bool {
+        let my_topic = self.session_key.topic().unwrap_or("");
+        let base_key = self.session_key.base_key();
+        let active_topic = self.active_sessions.lock().await.get_active_topic(base_key).to_string();
+        my_topic == active_topic
+    }
+
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -1666,15 +1679,29 @@ impl SessionActor {
                         display_content
                     };
 
+                    // If streaming happened and this session is still active,
+                    // do a final edit on the streamed message. Otherwise, send
+                    // through out_tx so the outbound_forwarder can buffer it
+                    // and notify the user if they switched sessions.
                     let streamed = if let Some(ref sr) = stream_result {
                         if let Some(ref mid) = sr.message_id {
-                            if let Some(ref si) = self.status_indicator {
-                                let _ = si
-                                    .channel()
-                                    .edit_message(&self.chat_id, mid, &display_content)
-                                    .await;
+                            if self.is_active_session().await {
+                                if let Some(ref si) = self.status_indicator {
+                                    let _ = si
+                                        .channel()
+                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .await;
+                                }
+                                true
+                            } else {
+                                // Session is inactive — delete the stale streamed
+                                // message and fall through to out_tx path so the
+                                // forwarder can buffer and notify.
+                                if let Some(ref si) = self.status_indicator {
+                                    let _ = si.channel().delete_message(&self.chat_id, mid).await;
+                                }
+                                false
                             }
-                            true
                         } else {
                             false
                         }
@@ -1799,6 +1826,7 @@ impl SessionActor {
         let status_indicator = self.status_indicator.clone();
         let user_status_config = self.user_status_config.clone();
         let history = pre_primary_history.to_vec();
+        let active_sessions = self.active_sessions.clone();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -1901,11 +1929,33 @@ impl SessionActor {
                     }
 
                     let reply = strip_think_tags(&conv_response.content);
-                    // If streaming already delivered the reply (edited into
-                    // the stream message), skip the duplicate out_tx send.
-                    let already_streamed = stream_result
-                        .as_ref()
-                        .is_some_and(|sr| sr.message_id.is_some());
+
+                    // Check if this session is still active before using
+                    // the streamed message. If the user switched away, send
+                    // through out_tx so the forwarder can buffer + notify.
+                    let my_topic = session_key.topic().unwrap_or("");
+                    let base_key = session_key.base_key();
+                    let is_active = {
+                        let active_topic = active_sessions.lock().await
+                            .get_active_topic(base_key).to_string();
+                        my_topic == active_topic
+                    };
+
+                    let already_streamed = if is_active {
+                        stream_result
+                            .as_ref()
+                            .is_some_and(|sr| sr.message_id.is_some())
+                    } else {
+                        // Delete stale streamed message if any
+                        if let Some(ref sr) = stream_result {
+                            if let Some(ref mid) = sr.message_id {
+                                if let Some(ref si) = status_indicator {
+                                    let _ = si.channel().delete_message(&chat_id, mid).await;
+                                }
+                            }
+                        }
+                        false
+                    };
 
                     if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx
@@ -2158,18 +2208,25 @@ impl SessionActor {
                             .to_string()
                     };
 
-                    // If stream forwarder already sent a message, do a final edit
-                    // with the clean content instead of sending a new message.
+                    // If stream forwarder already sent a message AND this
+                    // session is still active, do a final edit. Otherwise send
+                    // through out_tx so the forwarder can buffer + notify.
                     let streamed = if let Some(ref sr) = stream_result {
                         if let Some(ref mid) = sr.message_id {
-                            if let Some(ref si) = self.status_indicator {
-                                // Strip tool status lines from final content
-                                let _ = si
-                                    .channel()
-                                    .edit_message(&self.chat_id, mid, &display_content)
-                                    .await;
+                            if self.is_active_session().await {
+                                if let Some(ref si) = self.status_indicator {
+                                    let _ = si
+                                        .channel()
+                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .await;
+                                }
+                                true
+                            } else {
+                                if let Some(ref si) = self.status_indicator {
+                                    let _ = si.channel().delete_message(&self.chat_id, mid).await;
+                                }
+                                false
                             }
-                            true
                         } else {
                             false
                         }
@@ -2400,6 +2457,10 @@ mod tests {
             }
         }
 
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(dir.path()).unwrap(),
+        ));
+
         let actor = SessionActor {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
@@ -2429,6 +2490,7 @@ mod tests {
             adaptive_router,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_sessions,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2482,6 +2544,10 @@ mod tests {
         // to establish baseline=2s → patience=max(4s, 10s)=10s.
         // For the test, the slow call takes 15s, so 15s > 10s triggers overflow.
 
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(dir.path()).unwrap(),
+        ));
+
         let actor = SessionActor {
             session_key: SessionKey::new("cli", "test"),
             channel: "cli".to_string(),
@@ -2511,6 +2577,7 @@ mod tests {
             adaptive_router: Some(router),
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_sessions,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -3194,6 +3261,316 @@ mod tests {
         );
 
         drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // ── Inactive session routing tests ───────────────────────────────────
+
+    /// When a session is no longer active (user switched away), responses
+    /// must go through out_tx (→ outbound_forwarder) instead of direct
+    /// channel.edit_message(), so the forwarder can buffer and notify.
+    #[tokio::test]
+    async fn should_route_through_out_tx_when_session_inactive() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Use topic-based session key (simulates /new 0011)
+        let session_key = SessionKey::with_topic("telegram", "12345", "0011");
+
+        // Set active topic to "0022" (user switched away from 0011)
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(dir.path()).unwrap(),
+        ));
+        active_sessions
+            .lock()
+            .await
+            .switch_to("telegram:12345", "0022")
+            .unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::ZERO, make_response("deep search result"))],
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = crew_agent::ToolRegistry::with_builtins(dir.path());
+        let agent = Agent::new(AgentId::new("test-inactive"), agent_llm, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: "telegram".to_string(),
+            chat_id: "12345".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &session_key,
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None, // no streaming in this test
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_sessions: active_sessions.clone(),
+        };
+
+        let handle = tokio::spawn(actor.run());
+
+        // Send a message to session 0011 (which is inactive)
+        inbox_tx
+            .send(ActorMessage::Inbound {
+                message: InboundMessage {
+                    channel: "telegram".to_string(),
+                    chat_id: "12345".to_string(),
+                    sender_id: "user".to_string(),
+                    content: "search for something".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                    message_id: None,
+                },
+                image_media: vec![],
+            })
+            .await
+            .unwrap();
+
+        // The response should arrive via out_tx (not direct channel edit)
+        let msg = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("should receive response via out_tx")
+            .expect("channel should not be closed");
+
+        assert!(
+            msg.content.contains("deep search result"),
+            "expected agent response via out_tx, got: {}",
+            msg.content
+        );
+
+        // Verify the is_active_session check works
+        assert_eq!(
+            active_sessions
+                .lock()
+                .await
+                .get_active_topic("telegram:12345"),
+            "0022",
+            "active topic should still be 0022"
+        );
+
+        drop(inbox_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// When streaming is active (status_indicator with an edit-capable channel)
+    /// and the user switches sessions mid-processing, the actor should:
+    /// 1. Delete the streamed message (stale partial text in the old session)
+    /// 2. Route the final response through out_tx (so the forwarder can buffer it)
+    ///
+    /// This test creates a mock channel that tracks send_with_id/delete_message
+    /// calls, wires it into a StatusIndicator, and uses a delayed LLM provider
+    /// to give us time to switch the active session.
+    #[tokio::test]
+    async fn should_delete_streamed_msg_and_use_out_tx_when_session_switches() {
+        use std::sync::atomic::AtomicU32;
+
+        /// Mock channel that supports editing and tracks operations.
+        struct TrackingChannel {
+            send_count: AtomicU32,
+            edit_count: AtomicU32,
+            delete_count: AtomicU32,
+        }
+
+        impl TrackingChannel {
+            fn new() -> Self {
+                Self {
+                    send_count: AtomicU32::new(0),
+                    edit_count: AtomicU32::new(0),
+                    delete_count: AtomicU32::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl crew_bus::Channel for TrackingChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+            async fn start(
+                &self,
+                _tx: mpsc::Sender<InboundMessage>,
+            ) -> eyre::Result<()> {
+                Ok(())
+            }
+            async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+                Ok(())
+            }
+            fn supports_edit(&self) -> bool {
+                true
+            }
+            async fn send_with_id(
+                &self,
+                _msg: &OutboundMessage,
+            ) -> eyre::Result<Option<String>> {
+                let n = self.send_count.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(format!("streamed-msg-{n}")))
+            }
+            async fn edit_message(
+                &self,
+                _chat_id: &str,
+                _message_id: &str,
+                _new_content: &str,
+            ) -> eyre::Result<()> {
+                self.edit_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            async fn delete_message(
+                &self,
+                _chat_id: &str,
+                _message_id: &str,
+            ) -> eyre::Result<()> {
+                self.delete_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let session_key = SessionKey::with_topic("telegram", "12345", "topic-a");
+
+        // Start with topic-a active
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(dir.path()).unwrap(),
+        ));
+        active_sessions
+            .lock()
+            .await
+            .switch_to("telegram:12345", "topic-a")
+            .unwrap();
+
+        // LLM provider with 500ms delay to simulate processing time
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(500), make_response("streamed result"))],
+        ));
+
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = crew_agent::ToolRegistry::with_builtins(dir.path());
+        let agent = Agent::new(AgentId::new("test-stream-switch"), agent_llm, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let tracking_channel = Arc::new(TrackingChannel::new());
+        let status_indicator = Arc::new(StatusIndicator::new(
+            tracking_channel.clone() as Arc<dyn crew_bus::Channel>,
+            vec!["Thinking".to_string()],
+        ));
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: "telegram".to_string(),
+            chat_id: "12345".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &session_key,
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: Some(status_indicator),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_sessions: active_sessions.clone(),
+        };
+
+        let handle = tokio::spawn(actor.run());
+
+        // Send a message while topic-a is still active
+        inbox_tx
+            .send(ActorMessage::Inbound {
+                message: InboundMessage {
+                    channel: "telegram".to_string(),
+                    chat_id: "12345".to_string(),
+                    sender_id: "user".to_string(),
+                    content: "do something".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                    message_id: None,
+                },
+                image_media: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Wait briefly for the actor to start processing (LLM has 500ms delay),
+        // then switch the active session to topic-b.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        active_sessions
+            .lock()
+            .await
+            .switch_to("telegram:12345", "topic-b")
+            .unwrap();
+
+        // The response should arrive via out_tx (not direct channel edit),
+        // because the session became inactive during processing.
+        let msg = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("should receive response via out_tx")
+            .expect("channel should not be closed");
+
+        assert!(
+            msg.content.contains("streamed result"),
+            "expected agent response via out_tx, got: {}",
+            msg.content
+        );
+
+        // Verify delete_message was called (to clean up the stale streamed message).
+        // The stream forwarder calls send_with_id (which returns a message_id),
+        // and when is_active_session() returns false, the actor deletes that message.
+        let deletes = tracking_channel.delete_count.load(Ordering::Relaxed);
+        assert!(
+            deletes >= 1,
+            "expected delete_message to be called at least once (for the stale \
+             streamed message), but got {deletes} calls"
+        );
+
+        drop(inbox_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 }

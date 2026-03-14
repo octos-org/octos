@@ -1411,7 +1411,7 @@ impl GatewayCommand {
                     let entries = session_mgr
                         .lock()
                         .await
-                        .list_sessions_for_chat(&base_key_str);
+                        .list_user_sessions(&base_key_str);
                     let keyboard = session_ui::build_session_keyboard(&entries, topic);
                     let text = session_ui::build_session_text(&entries, topic);
 
@@ -1429,6 +1429,14 @@ impl GatewayCommand {
 
                     let label = if topic.is_empty() { "(default)" } else { topic };
                     info!(session = %label, "session switched via inline keyboard");
+
+                    // Flush any buffered messages from the target session
+                    let target_key = SessionKey::with_topic(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        topic,
+                    );
+                    actor_registry.flush_pending(&target_key.to_string()).await;
                     continue;
                 }
 
@@ -1561,7 +1569,7 @@ impl GatewayCommand {
                 let entries = session_mgr
                     .lock()
                     .await
-                    .list_sessions_for_chat(&base_key_str);
+                    .list_user_sessions(&base_key_str);
                 let active_topic = active_sessions
                     .lock()
                     .await
@@ -1586,8 +1594,8 @@ impl GatewayCommand {
                 continue;
             }
 
-            // Handle /back command — switch to previous session
-            if cmd == "/back" {
+            // Handle /back (or /b) command — switch to previous session
+            if cmd == "/back" || cmd == "/b" {
                 let result = active_sessions.lock().await.go_back(&base_key_str);
                 match result {
                     Ok(Some(topic)) => {

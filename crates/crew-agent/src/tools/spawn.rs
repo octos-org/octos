@@ -16,9 +16,10 @@ use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::Agent;
 
 /// Callback for delivering background task results directly to the session actor.
-/// When set, bypasses the InboundMessage relay (avoids an extra LLM call).
+/// Returns `true` if the result was delivered, `false` if the actor is dead
+/// (caller should fall back to the InboundMessage relay path).
 pub type BackgroundResultSender =
-    Arc<dyn Fn(String, String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(String, String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
@@ -414,10 +415,14 @@ impl Tool for SpawnTool {
                     Err(e) => format!("Status: FAILED\nError: {e}"),
                 };
 
-                // Direct injection path: inject as system message, no extra LLM call
+                // Direct injection path: inject as system message, no extra LLM call.
+                // If the actor has exited (idle timeout), the send fails and we
+                // fall through to the legacy InboundMessage relay path.
                 if let Some(sender) = bg_sender {
-                    sender(task_label, content).await;
-                    return;
+                    if sender(task_label, content.clone()).await {
+                        return;
+                    }
+                    warn!("background result sender failed (actor dead?), falling back to relay");
                 }
 
                 // Legacy path: relay via InboundMessage (triggers extra LLM call)

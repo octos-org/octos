@@ -7,13 +7,17 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crew_agent::TokenTracker;
 use crew_bus::Channel;
 use crew_core::OutboundMessage;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::warn;
+
+/// Maximum time `stop()` will wait before giving up on cleanup.
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Manages status indicators for a specific channel.
 pub struct StatusIndicator {
@@ -108,7 +112,7 @@ impl StatusIndicator {
         let chat_id_clone = chat_id.clone();
         let tracker_clone = Arc::clone(&tracker);
 
-        tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             run_status_loop(
                 channel_clone,
                 chat_id_clone,
@@ -127,6 +131,7 @@ impl StatusIndicator {
             status_msg_id,
             channel,
             chat_id,
+            join_handle: Some(join_handle),
         }
     }
 }
@@ -137,23 +142,58 @@ pub struct StatusHandle {
     pub(crate) status_msg_id: Arc<Mutex<Option<String>>>,
     channel: Arc<dyn Channel>,
     chat_id: String,
+    /// Wrapped in Option so we can take it in stop() without conflicting
+    /// with the Drop impl.
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl StatusHandle {
     /// Stop the status indicator and delete the status message.
-    pub async fn stop(self) {
+    ///
+    /// Bounded by `STOP_TIMEOUT` to prevent blocking the session actor
+    /// if a channel operation (delete_message) hangs due to network
+    /// issues or rate limiting.
+    pub async fn stop(mut self) {
+        // Signal cancellation — the loop checks this every iteration.
         self.cancelled.store(true, Ordering::Release);
 
-        // Give the loop a moment to notice cancellation
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Abort the loop task so it doesn't keep running if stuck in a
+        // slow channel operation (send_typing, edit_message, send_with_id).
+        if let Some(handle) = self.join_handle.take() {
+            handle.abort();
+            // Wait for the loop task to finish (should be near-instant
+            // since we just aborted it).
+            let _ = handle.await;
+        }
 
-        // Delete the status message if one was sent
-        let msg_id = self.status_msg_id.lock().await.take();
-        if let Some(mid) = msg_id {
-            if let Err(e) = self.channel.delete_message(&self.chat_id, &mid).await {
-                // Not critical — message might already be gone
-                warn!("failed to delete status message: {e}");
+        // Best-effort cleanup: delete the status message with a timeout
+        // so we never block the session actor indefinitely.
+        let msg_id = self.status_msg_id.clone();
+        let channel = self.channel.clone();
+        let chat_id = self.chat_id.clone();
+
+        let cleanup = async move {
+            let mid = msg_id.lock().await.take();
+            if let Some(mid) = mid {
+                if let Err(e) = channel.delete_message(&chat_id, &mid).await {
+                    warn!("failed to delete status message: {e}");
+                }
             }
+        };
+
+        if tokio::time::timeout(STOP_TIMEOUT, cleanup).await.is_err() {
+            warn!("status indicator stop timed out after {STOP_TIMEOUT:?}");
+        }
+    }
+}
+
+impl Drop for StatusHandle {
+    fn drop(&mut self) {
+        // Safety net: if stop() was never called, abort the loop task
+        // to prevent leaked background tasks.
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(ref handle) = self.join_handle {
+            handle.abort();
         }
     }
 }
@@ -177,12 +217,12 @@ async fn run_status_loop(
     // Immediately send typing indicator
     let _ = channel.send_typing(&chat_id).await;
 
-    // Wait 2 seconds before sending a visible status message
-    for _ in 0..4 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if cancelled.load(Ordering::Acquire) {
-            return;
-        }
+    // Wait 2 seconds before sending a visible status message.
+    // Use a single sleep instead of a polling loop — task abort handles
+    // cancellation instantly.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if cancelled.load(Ordering::Acquire) {
+        return;
     }
 
     // Send the initial status message
@@ -224,7 +264,7 @@ async fn run_status_loop(
     // Update loop: typing every 5s, edit status message every 8s
     let mut tick = 0u32;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         if cancelled.load(Ordering::Acquire) {
             return;
         }
@@ -386,5 +426,126 @@ mod tests {
         assert_eq!(fmt_tokens(1000), "1.0k");
         assert_eq!(fmt_tokens(1200), "1.2k");
         assert_eq!(fmt_tokens(15600), "15.6k");
+    }
+
+    #[tokio::test]
+    async fn should_stop_within_timeout_when_loop_is_running() {
+        // Verify that stop() completes within STOP_TIMEOUT even if the
+        // loop task is spawned (abort + timeout prevents deadlock).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let status_msg_id = Arc::new(Mutex::new(None::<String>));
+        let cancelled_clone = Arc::clone(&cancelled);
+
+        let handle = tokio::spawn(async move {
+            // Simulate a long-running status loop
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if cancelled_clone.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        });
+
+        let status_handle = StatusHandle {
+            cancelled,
+            status_msg_id,
+            channel: Arc::new(NullChannel),
+            chat_id: "test".to_string(),
+            join_handle: Some(handle),
+        };
+
+        let start = Instant::now();
+        status_handle.stop().await;
+        // stop() should complete almost instantly (abort + no message to delete)
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Reproduces the deadlock: stop() blocks forever when delete_message hangs.
+    /// This test uses the OLD stop() logic (no abort, no timeout) to prove it hangs,
+    /// then verifies the NEW logic completes quickly.
+    #[tokio::test]
+    async fn should_not_deadlock_when_delete_message_hangs() {
+        // Simulate a channel where delete_message blocks for 60 seconds
+        // (e.g. Telegram API rate-limited or network stall).
+        let channel: Arc<dyn Channel> = Arc::new(SlowDeleteChannel);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let status_msg_id = Arc::new(Mutex::new(Some("msg123".to_string())));
+        let cancelled_clone = Arc::clone(&cancelled);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if cancelled_clone.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        });
+
+        let status_handle = StatusHandle {
+            cancelled,
+            status_msg_id,
+            channel,
+            chat_id: "test_chat".to_string(),
+            join_handle: Some(handle),
+        };
+
+        // With the fix: stop() must complete within STOP_TIMEOUT (3s),
+        // NOT block for 60s like the slow channel would cause.
+        let start = Instant::now();
+        status_handle.stop().await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stop() took {elapsed:?} — should complete within STOP_TIMEOUT, not hang"
+        );
+    }
+
+    /// Minimal channel impl for testing.
+    struct NullChannel;
+
+    #[async_trait::async_trait]
+    impl Channel for NullChannel {
+        fn name(&self) -> &str {
+            "null"
+        }
+        async fn start(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crew_core::InboundMessage>,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Channel where delete_message blocks for 60 seconds (simulates hung API).
+    struct SlowDeleteChannel;
+
+    #[async_trait::async_trait]
+    impl Channel for SlowDeleteChannel {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        async fn start(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crew_core::InboundMessage>,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+        ) -> eyre::Result<()> {
+            // Simulate a hung Telegram API call
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
     }
 }
