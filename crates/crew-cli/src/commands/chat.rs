@@ -228,7 +228,7 @@ impl ChatCommand {
         // Load plugins (includes app-skills from .crew/skills/)
         let plugin_dirs = Config::plugin_dirs(&cwd);
         if !plugin_dirs.is_empty() {
-            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]) {
                 eprintln!("Warning: plugin loading failed: {e}");
             }
         }

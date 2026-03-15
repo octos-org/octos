@@ -582,7 +582,7 @@ impl ServeCommand {
             plugin_dirs.push(platform_dir);
         }
         if !plugin_dirs.is_empty() {
-            let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
+            let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]);
         }
 
         let reporter: Arc<dyn crew_agent::ProgressReporter> =
