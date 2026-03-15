@@ -129,9 +129,11 @@ impl Tool for PluginTool {
             cmd.env(key, val);
         }
 
-        // Expose a work directory for plugin output files, but do NOT change
-        // cwd — plugins resolve style/config files relative to their executable
-        // location, so changing cwd breaks those lookups.
+        // Expose a work directory for plugin output files via CREW_WORK_DIR.
+        // Plugins find style/config files relative to their executable location
+        // (via std::env::current_exe()), not cwd.  The OS cwd is inherited from
+        // the gateway subprocess which is already narrowed to data_dir by
+        // process_manager.rs (.current_dir(&data_dir)).
         if let Some(ref dir) = self.work_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!(

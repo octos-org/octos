@@ -3,34 +3,76 @@
 //! Provides hostname and IP validation to block requests to private/internal
 //! network addresses. Used by both `web_fetch` and `browser` tools.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+
+/// Result of a successful SSRF check: the URL is safe, and we optionally have
+/// the resolved addresses for DNS pinning (prevents DNS rebinding / TOCTOU).
+#[derive(Debug)]
+pub(crate) struct SsrfCheckResult {
+    /// Resolved socket addresses (empty if host was a literal IP).
+    pub resolved_addrs: Vec<SocketAddr>,
+}
+
+/// Validate a URL against SSRF protections: checks scheme, hostname, and DNS resolution.
+/// Returns `Ok(SsrfCheckResult)` if the URL is safe, `Err(error_message)` if blocked.
+///
+/// Fails closed: DNS lookup failures are treated as blocked (prevents bypass
+/// by causing DNS resolution to fail at check time but succeed at fetch time).
+pub(crate) async fn check_ssrf_with_addrs(url: &str) -> Result<SsrfCheckResult, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
+    if is_private_host(host) {
+        return Err("Requests to private/internal hosts are not allowed".to_string());
+    }
+
+    // Literal IPs were already checked by is_private_host — no DNS needed.
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(SsrfCheckResult {
+            resolved_addrs: vec![],
+        });
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    match tokio::net::lookup_host(format!("{host}:{port}")).await {
+        Ok(addrs) => {
+            let mut safe_addrs = Vec::new();
+            for addr in addrs {
+                if is_private_ip(&addr.ip()) {
+                    return Err(
+                        "Requests to private/internal hosts are not allowed (DNS resolved to private IP)"
+                            .to_string(),
+                    );
+                }
+                safe_addrs.push(addr);
+            }
+            Ok(SsrfCheckResult {
+                resolved_addrs: safe_addrs,
+            })
+        }
+        Err(e) => {
+            // Fail closed: if DNS fails, block the request. An attacker could
+            // trigger DNS failure at check time, then succeed at fetch time
+            // (DNS rebinding variant).
+            Err(format!(
+                "DNS resolution failed for host '{host}' — blocking request (fail closed): {e}"
+            ))
+        }
+    }
+}
 
 /// Validate a URL against SSRF protections: checks scheme, hostname, and DNS resolution.
 /// Returns `Some(error_message)` if the URL should be blocked, `None` if it's safe.
+///
+/// This is the simple API for callers that don't need resolved addresses (e.g.
+/// browser/crawl tools where a separate process handles the actual connection).
 pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
-    let parsed = match reqwest::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return Some("Invalid URL".to_string()),
-    };
-    let host = match parsed.host_str() {
-        Some(h) => h,
-        None => return Some("URL has no host".to_string()),
-    };
-    if is_private_host(host) {
-        return Some("Requests to private/internal hosts are not allowed".to_string());
+    match check_ssrf_with_addrs(url).await {
+        Ok(_) => None,
+        Err(msg) => Some(msg),
     }
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-        for addr in addrs {
-            if is_private_ip(&addr.ip()) {
-                return Some(
-                    "Requests to private/internal hosts are not allowed (DNS resolved to private IP)"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    None
 }
 
 /// Check if a hostname is private/internal (string check + IP parse).
@@ -186,5 +228,68 @@ mod tests {
         assert!(is_private_ip(&"::1".parse().unwrap()));
         assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
         assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
+    }
+
+    // --- check_ssrf_with_addrs tests ---
+
+    #[tokio::test]
+    async fn test_with_addrs_blocks_private_host() {
+        let result = check_ssrf_with_addrs("http://127.0.0.1/secret").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn test_with_addrs_returns_resolved_for_public_ip() {
+        // Literal public IP — no DNS needed, resolved_addrs should be empty
+        let result = check_ssrf_with_addrs("https://8.8.8.8/").await;
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().resolved_addrs.is_empty(),
+            "literal IP should not trigger DNS, resolved_addrs empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_addrs_fails_closed_on_nonexistent_domain() {
+        // This domain should fail DNS resolution → must be blocked (fail closed)
+        let result =
+            check_ssrf_with_addrs("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
+        assert!(result.is_err(), "DNS failure should block request (fail closed)");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("DNS resolution failed") || err.contains("fail closed"),
+            "error message should indicate DNS failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_nonexistent_domain() {
+        // The simple API should also fail closed
+        let result =
+            check_ssrf("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
+        assert!(
+            result.is_some(),
+            "DNS failure should block via simple API too"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_ipv4_mapped_ipv6_url() {
+        // IPv4-mapped IPv6 pointing to loopback
+        let result = check_ssrf("http://[::ffff:127.0.0.1]/secret").await;
+        assert!(
+            result.is_some(),
+            "IPv4-mapped IPv6 loopback should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_ipv4_mapped_ipv6_private() {
+        let result = check_ssrf("http://[::ffff:192.168.1.1]/internal").await;
+        assert!(
+            result.is_some(),
+            "IPv4-mapped IPv6 private should be blocked"
+        );
     }
 }

@@ -299,8 +299,19 @@ impl Sandbox for MacosSandbox {
                 "(allow file-read* (subpath \"{cwd}\"))",
                 cwd = cwd_escaped
             ));
-            // Add configured read paths
+            // Add configured read paths — validate each for SBPL metacharacters
+            // to prevent sandbox profile injection (same check as cwd above).
             for path in &self.read_allow_paths {
+                if path
+                    .bytes()
+                    .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+                {
+                    tracing::error!(
+                        path = %path,
+                        "read_allow_paths entry contains SBPL metacharacters, skipping"
+                    );
+                    continue;
+                }
                 rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
             }
             // Add default system paths
@@ -1190,6 +1201,196 @@ mod tests {
         assert!(
             profile.contains(r#"(allow file-read* (subpath "/custom/path"))"#),
             "should allow reading custom path"
+        );
+    }
+
+    #[test]
+    fn should_reject_read_allow_paths_with_sbpl_metacharacters() {
+        // A malicious read_allow_path containing SBPL injection
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![
+                "/safe/path".to_string(),
+                "/evil\")\n(allow file-write* (subpath \"/\"))".to_string(), // injection attempt
+                "/another/safe".to_string(),
+            ],
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        // Safe paths should be present
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/safe/path"))"#),
+            "safe path should be allowed"
+        );
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/another/safe"))"#),
+            "second safe path should be allowed"
+        );
+        // Injection path must NOT appear (it contains " which is rejected).
+        // Note: profile legitimately has `(allow file-write* (subpath "/tmp/test"))`
+        // for the cwd, so we check for the specific injected root-write pattern.
+        assert!(
+            !profile.contains(r#"(allow file-write* (subpath "/"))"#),
+            "injected file-write* root rule must not appear in profile"
+        );
+        // The evil path itself should not appear at all
+        assert!(
+            !profile.contains("/evil"),
+            "evil path should be completely excluded"
+        );
+    }
+
+    #[test]
+    fn should_reject_read_allow_paths_with_parens() {
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![
+                "/path/with(parens)".to_string(),
+            ],
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains("with(parens)"),
+            "path with parens should be rejected from SBPL profile"
+        );
+    }
+
+    #[test]
+    fn should_reject_read_allow_paths_with_control_chars() {
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![
+                "/path/with\x01control".to_string(),
+                "/path/with\x7Fdel".to_string(),
+                "/valid/path".to_string(),
+            ],
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains("control"),
+            "path with control char should be rejected"
+        );
+        assert!(
+            !profile.contains("del"),
+            "path with DEL char should be rejected"
+        );
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/valid/path"))"#),
+            "valid path should be present"
+        );
+    }
+
+    // --- Sandbox execution tests (platform-specific) ---
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_macos_sandbox_blocks_write_outside_cwd() {
+        // Create a temp dir as the sandbox cwd
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+        };
+        let mut cmd = sb.wrap_command(
+            "touch /tmp/sandbox_escape_test_file 2>&1; echo exit=$?",
+            cwd,
+        );
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The touch should fail because /tmp is outside the cwd write scope
+        // (sandbox allows writes only under cwd).
+        // The test passes if: exit code != 0, OR stderr mentions "denied", OR
+        // the file was not created.
+        let escaped = std::path::Path::new("/tmp/sandbox_escape_test_file").exists();
+        if escaped {
+            // Clean up and fail
+            let _ = std::fs::remove_file("/tmp/sandbox_escape_test_file");
+            panic!(
+                "sandbox failed to block write outside cwd! stdout={stdout}, stderr={stderr}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_macos_sandbox_allows_write_inside_cwd() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+        };
+        let mut cmd = sb.wrap_command("touch test_file && echo ok", cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("ok"),
+            "write inside cwd should succeed, got stdout={stdout}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            cwd.join("test_file").exists(),
+            "file should be created inside cwd"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_macos_sandbox_restricts_read_paths() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+
+        // Create a file outside cwd that should be unreadable
+        let outside = tempfile::tempdir().expect("create outside dir");
+        let secret_file = outside.path().join("secret.txt");
+        std::fs::write(&secret_file, "top-secret-data").expect("write secret");
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            // Only allow reads from cwd + system paths — NOT outside dir
+            read_allow_paths: vec!["/nonexistent/path".to_string()],
+        };
+        let cmd_str = format!(
+            "cat {} 2>&1; echo exit=$?",
+            secret_file.display()
+        );
+        let mut cmd = sb.wrap_command(&cmd_str, cwd);
+        let output = cmd.output().await.expect("sandbox-exec should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The cat should fail — the secret file is outside allowed read paths
+        assert!(
+            !stdout.contains("top-secret-data"),
+            "sandbox should block reading files outside allowed paths, got: {stdout}"
         );
     }
 }

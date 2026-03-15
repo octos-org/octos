@@ -216,6 +216,7 @@ impl ProcessManager {
             .arg(&data_dir)
             .arg("--cwd")
             .arg(&data_dir)
+            .current_dir(&data_dir) // OS-level cwd matches logical --cwd for consistent path resolution
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);

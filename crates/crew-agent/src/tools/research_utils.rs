@@ -209,10 +209,13 @@ pub async fn merge_findings(
 }
 
 /// Resolve research directory from whatever the LLM provides.
-/// Tries: exact path, relative to cwd, relative to data_dir, and just the slug under research/.
+///
+/// All candidates are resolved relative to `data_dir` — never uses
+/// `std::env::current_dir()` (which may differ from the logical working
+/// directory in multi-profile gateway mode).  The resolved path is
+/// validated to stay within `data_dir` to prevent cross-profile reads.
 pub fn resolve_research_dir(data_dir: &Path, input: &str) -> Option<PathBuf> {
     let stripped = input.trim().trim_start_matches("./");
-    let cwd = std::env::current_dir().unwrap_or_default();
 
     // Extract the slug (last path component) for fuzzy matching
     let slug = std::path::Path::new(stripped)
@@ -220,22 +223,32 @@ pub fn resolve_research_dir(data_dir: &Path, input: &str) -> Option<PathBuf> {
         .and_then(|n| n.to_str())
         .unwrap_or(stripped);
 
-    // Candidate directories to try, in priority order
+    // Candidate directories to try, in priority order.
+    // All resolved relative to data_dir (the profile's isolated directory).
     let candidates: Vec<PathBuf> = vec![
-        // 1. Exact absolute path
-        PathBuf::from(input),
-        // 2. Relative to cwd (deep_search uses ./research/<slug>)
-        cwd.join(stripped),
-        // 3. Just slug under cwd/research/
-        cwd.join("research").join(slug),
-        // 4. Relative to data_dir
+        // 1. Relative to data_dir (e.g. "research/topic-slug" or "skill-output/...")
         data_dir.join(stripped),
-        // 5. Just slug under data_dir/research/
+        // 2. Just slug under data_dir/research/
         data_dir.join("research").join(slug),
+        // 3. Exact absolute path (validated below)
+        PathBuf::from(input),
     ];
+
+    let canonical_base = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
 
     for candidate in candidates {
         if candidate.is_dir() {
+            // Validate the resolved path stays within data_dir
+            let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            if !canonical.starts_with(&canonical_base) {
+                warn!(
+                    input = %input,
+                    resolved = %canonical.display(),
+                    data_dir = %data_dir.display(),
+                    "research directory resolved outside data_dir, rejecting"
+                );
+                continue;
+            }
             info!(resolved = %candidate.display(), input = %input, "resolved research directory");
             return Some(candidate);
         }
@@ -397,5 +410,45 @@ mod tests {
         // Under limit — should pass through unchanged
         let result = truncate_to_limit(files.clone());
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_research_dir_inside_data_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let research = data_dir.path().join("research").join("ai-agents");
+        std::fs::create_dir_all(&research).unwrap();
+
+        // Slug-based resolution
+        let result = resolve_research_dir(data_dir.path(), "ai-agents");
+        assert_eq!(result.unwrap(), research);
+
+        // Relative path resolution
+        let result = resolve_research_dir(data_dir.path(), "research/ai-agents");
+        assert_eq!(result.unwrap(), research);
+    }
+
+    #[test]
+    fn test_resolve_research_dir_rejects_outside_path() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_research = outside.path().join("research").join("secret");
+        std::fs::create_dir_all(&outside_research).unwrap();
+
+        // Absolute path outside data_dir — should be rejected
+        let result = resolve_research_dir(
+            data_dir.path(),
+            &outside_research.to_string_lossy(),
+        );
+        assert!(result.is_none(), "should reject path outside data_dir");
+    }
+
+    #[test]
+    fn test_resolve_research_dir_no_cwd_fallback() {
+        // Ensure we don't resolve against OS cwd
+        let data_dir = tempfile::tempdir().unwrap();
+        // Even if a research dir exists under OS cwd, we should NOT find it
+        // because we only search under data_dir.
+        let result = resolve_research_dir(data_dir.path(), "nonexistent-slug");
+        assert!(result.is_none());
     }
 }

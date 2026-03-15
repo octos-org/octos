@@ -419,13 +419,29 @@ impl McpClient {
             .ok_or_else(|| eyre::eyre!("MCP HTTP server requires 'url' field"))?;
 
         // Validate URL against SSRF before connecting to prevent reaching
-        // internal endpoints through MCP config.
-        if let Some(msg) = crate::tools::ssrf::check_ssrf(url).await {
-            eyre::bail!("MCP HTTP server URL blocked by SSRF policy: {msg}");
+        // internal endpoints through MCP config.  Use check_ssrf_with_addrs
+        // so we can pin the resolved DNS addresses on the reqwest client,
+        // preventing DNS rebinding (TOCTOU) between check and actual connection.
+        let ssrf_result = crate::tools::ssrf::check_ssrf_with_addrs(url)
+            .await
+            .map_err(|msg| eyre::eyre!("MCP HTTP server URL blocked by SSRF policy: {msg}"))?;
+
+        // Build client with DNS pinning — the TLS/HTTP connection uses the
+        // exact IPs we validated, not a fresh DNS lookup.
+        let parsed_url =
+            reqwest::Url::parse(url).map_err(|e| eyre::eyre!("invalid MCP URL: {e}"))?;
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| eyre::eyre!("MCP URL has no host"))?
+            .to_string();
+        let mut builder = reqwest::Client::builder();
+        for addr in &ssrf_result.resolved_addrs {
+            builder = builder.resolve(&host, *addr);
         }
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
 
         let conn = McpConnection::Http(HttpMcpConnection {
-            client: reqwest::Client::new(),
+            client,
             url: url.to_string(),
             headers: config.headers.clone(),
             next_id: 1,

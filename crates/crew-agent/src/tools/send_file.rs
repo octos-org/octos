@@ -120,12 +120,24 @@ impl Tool for SendFileTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid send_file tool input")?;
 
+        // Resolve file path: if base_dir is set, resolve relative paths against
+        // it (the OS process cwd may differ from the logical working directory).
+        let raw_path = Path::new(&input.file_path);
+        let path = if let Some(ref base_dir) = self.base_dir {
+            if raw_path.is_relative() {
+                base_dir.join(raw_path)
+            } else {
+                raw_path.to_path_buf()
+            }
+        } else {
+            raw_path.to_path_buf()
+        };
+
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
-        let path = Path::new(&input.file_path);
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base = std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
-            match std::fs::canonicalize(path) {
+            match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     if !canonical_path.starts_with(&canonical_base) {
                         return Ok(ToolResult {
@@ -192,7 +204,7 @@ impl Tool for SendFileTool {
             chat_id: chat_id.clone(),
             content: input.caption.unwrap_or_default(),
             reply_to: None,
-            media: vec![input.file_path.clone()],
+            media: vec![path.to_string_lossy().into_owned()],
             metadata: serde_json::json!({}),
         };
 
@@ -371,6 +383,42 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("Cannot resolve file path"));
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_resolves_relative_path() {
+        // Relative paths should be resolved against base_dir, not OS cwd
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("skill-output");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("deck.pptx");
+        std::fs::write(&file, "pptx data").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345")
+            .with_base_dir(base.path());
+
+        // Pass relative path — should resolve to base_dir/skill-output/deck.pptx
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": "skill-output/deck.pptx"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "relative path inside base_dir should succeed: {}",
+            result.output
+        );
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.media.len(), 1);
+        // The media path should be the resolved absolute path
+        assert!(
+            msg.media[0].contains("skill-output/deck.pptx"),
+            "media path should contain resolved path: {}",
+            msg.media[0]
+        );
     }
 
     #[tokio::test]

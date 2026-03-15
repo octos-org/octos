@@ -1008,3 +1008,145 @@ mod path_tests {
         }
     }
 }
+
+/// Integration test: verifies that `rebind_cwd` produces a registry where
+/// file tools reject paths outside the new working directory.
+#[cfg(test)]
+mod cwd_isolation_tests {
+    use super::*;
+    use crate::sandbox::NoSandbox;
+
+    #[tokio::test]
+    async fn test_rebind_cwd_file_tools_reject_outside_paths() {
+        // Create initial registry with a broad cwd
+        let broad_cwd = std::path::Path::new("/tmp");
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            broad_cwd,
+            Box::new(NoSandbox),
+        );
+
+        // Now rebind to a narrow cwd (simulating per-profile isolation)
+        let narrow_cwd = tempfile::tempdir().expect("create temp dir");
+        let narrow = narrow_cwd.path();
+        let rebound = registry.rebind_cwd(narrow, Box::new(NoSandbox));
+
+        // Create a file inside the narrow cwd so we can test reads
+        let inside_file = narrow.join("allowed.txt");
+        std::fs::write(&inside_file, "hello").expect("write test file");
+
+        // read_file inside cwd should succeed
+        let result = rebound
+            .execute(
+                "read_file",
+                &serde_json::json!({"path": "allowed.txt"}),
+            )
+            .await;
+        assert!(result.is_ok(), "read inside narrow cwd should work");
+        let tr = result.unwrap();
+        assert!(tr.success, "read_file should succeed: {}", tr.output);
+
+        // read_file with traversal outside cwd should fail
+        let result = rebound
+            .execute(
+                "read_file",
+                &serde_json::json!({"path": "../../etc/passwd"}),
+            )
+            .await;
+        assert!(result.is_ok(), "should not return transport error");
+        let tr = result.unwrap();
+        assert!(
+            !tr.success,
+            "read_file with traversal should be rejected: {}",
+            tr.output
+        );
+
+        // write_file outside cwd should fail
+        let result = rebound
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": "../escape.txt",
+                    "content": "pwned"
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+        let tr = result.unwrap();
+        assert!(
+            !tr.success,
+            "write_file outside narrow cwd should be rejected: {}",
+            tr.output
+        );
+
+        // glob inside cwd should work
+        let result = rebound
+            .execute("glob", &serde_json::json!({"pattern": "*.txt"}))
+            .await;
+        assert!(result.is_ok());
+        let tr = result.unwrap();
+        assert!(tr.success, "glob inside cwd should work: {}", tr.output);
+
+        // list_dir inside cwd should work
+        let result = rebound
+            .execute("list_dir", &serde_json::json!({"path": "."}))
+            .await;
+        assert!(result.is_ok());
+        let tr = result.unwrap();
+        assert!(
+            tr.success,
+            "list_dir inside cwd should work: {}",
+            tr.output
+        );
+
+        // list_dir with traversal should fail
+        let result = rebound
+            .execute(
+                "list_dir",
+                &serde_json::json!({"path": "../../"}),
+            )
+            .await;
+        assert!(result.is_ok());
+        let tr = result.unwrap();
+        assert!(
+            !tr.success,
+            "list_dir with traversal should be rejected: {}",
+            tr.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebind_cwd_preserves_non_cwd_tools() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let registry = ToolRegistry::with_builtins_and_sandbox(
+            initial_cwd.path(),
+            Box::new(NoSandbox),
+        );
+
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+
+        // Non-cwd tools should still be present
+        assert!(
+            rebound.get("web_fetch").is_some(),
+            "web_fetch should survive rebind"
+        );
+        assert!(
+            rebound.get("web_search").is_some(),
+            "web_search should survive rebind"
+        );
+
+        // CWD-bound tools should also be present (re-registered)
+        assert!(
+            rebound.get("read_file").is_some(),
+            "read_file should be re-registered"
+        );
+        assert!(
+            rebound.get("shell").is_some(),
+            "shell should be re-registered"
+        );
+        assert!(
+            rebound.get("write_file").is_some(),
+            "write_file should be re-registered"
+        );
+    }
+}
