@@ -148,6 +148,50 @@ inactive. This is acceptable because:
 - The final reply overwrites them via the proxy path
 - The important thing is that the **final content** reaches the pending buffer
 
+## Tool Output Buffering During Session Switch
+
+### How Tool Calls Are Protected
+
+All agent tools (`send_file`, `message_tool`, etc.) are created per-session with
+fixed `channel` + `chat_id` via `with_context()` at actor spawn time. These values
+are stored in `Mutex`-wrapped state and **never mutated** during the actor's lifetime.
+
+Critically, tools write to `proxy_tx` (the per-session proxy channel), not the
+gateway's real output channel. This means all tool output — including `send_file`
+attachments — flows through the outbound forwarder and respects session activity.
+
+### `send_file` During a Session Switch
+
+When an agent calls `send_file` while the user has switched away:
+
+```
+t=0   Session "default" active, agent starts processing message
+t=50  Agent calls send_file → file message goes to proxy_tx
+t=51  User runs /s research (switches to "research")
+t=52  outbound_forwarder reads from proxy_rx
+t=53  Checks: is "default" active? NO → buffers the file message
+t=54  User sees: "📌 (default) finished. /s to view."
+t=55  User runs /s → flush_pending delivers the buffered file
+```
+
+The file is **never lost and never delivered to the wrong session**. It waits
+in the pending buffer until the user switches back.
+
+### Design Guarantees
+
+| Property | Mechanism |
+|----------|-----------|
+| Fixed routing | `with_context()` bakes channel/chat_id at spawn time |
+| No cross-session leaks | Tools write to per-session proxy, not shared output |
+| Buffered delivery | Forwarder checks `ActiveSessionStore` on every message |
+| FIFO ordering | Pending buffer is a `Vec<OutboundMessage>`, delivered in order |
+| Bounded memory | `MAX_PENDING_PER_SESSION = 50`, overflow dropped with warning |
+| No race conditions | No `set_context()` mutation; context is immutable per actor |
+
+This pattern applies to **all tool output**, not just `send_file` — any tool
+that sends outbound messages (code execution results, media, etc.) gets the
+same buffering protection.
+
 ## Message Flow Summary
 
 ### Active Session
