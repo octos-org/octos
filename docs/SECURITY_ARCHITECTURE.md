@@ -1,6 +1,6 @@
 # Security Architecture
 
-crew-rs multi-tenant AI agent gateway security reference. Last updated: 2026-03-10.
+crew-rs multi-tenant AI agent gateway security reference. Last updated: 2026-03-15.
 
 ---
 
@@ -297,6 +297,47 @@ All backends remove these from the child process environment before execution.
 **Deny semantics**: Before-hooks (before_tool_call, before_llm_call) can deny operations by exiting with code 1. Exit code 0 = allow, exit code >= 2 = error (logged, does not block).
 
 **Payload**: JSON on stdin with event type, tool name, arguments, session context. Tool arguments are included in before_tool_call payloads (allows audit hooks to inspect commands before execution).
+
+### 2.10 Per-Profile CWD Isolation
+
+When `crew serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.crew/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
+
+#### CWD scoping
+
+The gateway `--cwd` flag sets the process working directory before any tool initialization. Since builtin file tools (`read_file`, `write_file`, `edit_file`, `diff_edit`, `glob`, `grep`, `list_dir`, `git`) resolve user-supplied paths via `resolve_path(cwd, user_path)`, setting `cwd = ~/.crew/profiles/{id}/data/` means these tools can only access files within that profile's data directory. Cross-profile file access is blocked because `resolve_path()` verifies the resolved path `starts_with(base_dir)`, and `base_dir` is now the profile's own directory.
+
+#### Shell sandbox read restriction
+
+On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `crew serve` populates `read_allow_paths` with `project_dir` (the `--crew-home` path, typically `~/.crew/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
+
+```scheme
+;; Instead of (allow file-read*), generate:
+(allow file-read* (subpath "{data_dir}"))        ;; profile's own data
+(allow file-read* (subpath "{crew_home}"))        ;; shared skills, configs
+(allow file-read* (subpath "/usr"))               ;; system paths
+(allow file-read* (subpath "/bin"))
+;; ... other system paths
+```
+
+This restricts shell command reads at the kernel level to the profile's data, shared crew resources, and system paths. A shell command in profile A cannot `cat` files from profile B's data directory.
+
+#### SendFileTool base_dir validation
+
+`SendFileTool` validates file paths against `data_dir` using `canonicalize()` before sending files via chat channels. The canonical (symlink-resolved, absolute) path must start with `data_dir`. This prevents data exfiltration where an LLM is tricked into sending files from outside the profile's directory via a chat response.
+
+#### Plugin symlink rejection
+
+`is_executable()` in plugin loading now uses `symlink_metadata()` instead of `metadata()` to check the executable bit. `symlink_metadata()` inspects the symlink itself rather than following it to the target. If the plugin executable is a symlink, it is rejected. This is defense-in-depth against an attacker who places a symlink in the plugin directory pointing to an arbitrary binary.
+
+#### project_dir decoupled from cwd
+
+Shared resources -- installed skills (`~/.crew/skills/`), global config (`~/.crew/config.json`), bundled app-skills -- are loaded from `--crew-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
+
+#### Remaining gaps
+
+- **SpawnTool and PipelineTool sub-agents**: These use `with_builtins()` without sandbox configuration. `resolve_path()` still enforces path containment, but the shell tool in sub-agents runs unsandboxed.
+- **bwrap `read_allow_paths`**: The Bubblewrap (Linux) sandbox backend does not yet implement `read_allow_paths`. Only macOS SBPL applies read restrictions when `read_allow_paths` is populated.
+- **SBPL read restriction is conditional**: The blanket `(allow file-read*)` is only replaced with per-path rules when `read_allow_paths` is non-empty. If the list is not populated (e.g., standalone `crew chat` without `crew serve`), the old permissive behavior remains.
 
 ---
 

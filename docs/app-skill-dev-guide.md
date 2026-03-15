@@ -385,6 +385,288 @@ fn get_smtp_config() -> SmtpConfig {
 
 ---
 
+## Manifest Extensions: MCP Servers, Hooks, and Prompt Fragments
+
+Skills can declare more than just tools in `manifest.json`. Three additional extension points let a skill provide MCP servers, lifecycle hooks, and system prompt content. These are collectively called **extras**.
+
+### MCP Servers
+
+A skill can declare MCP (Model Context Protocol) servers that the gateway auto-starts when the skill loads. This lets a skill expose tools via the MCP protocol instead of (or in addition to) the stdin/stdout binary protocol.
+
+Add an `mcp_servers` array to `manifest.json`:
+
+```json
+{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "tools": [],
+  "mcp_servers": [
+    {
+      "command": "node",
+      "args": ["mcp-server/index.js"],
+      "env": ["API_KEY", "API_SECRET"]
+    }
+  ]
+}
+```
+
+**MCP server fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `command` | No* | Command to spawn the MCP server process |
+| `args` | No | Arguments passed to the command |
+| `env` | No | List of environment variable **names** (not values) to forward |
+| `url` | No* | HTTP transport: URL of a remote MCP server endpoint |
+| `headers` | No | HTTP transport: additional headers (key-value object) |
+
+\* Exactly one of `command` or `url` should be set. Use `command` for local (stdio) MCP servers and `url` for remote (HTTP) MCP servers.
+
+**Path resolution:** If `command` starts with `./` or `../`, it is resolved relative to the skill directory. Bare commands (e.g. `"node"`, `"python3"`) are looked up on `PATH` as usual.
+
+**Environment forwarding:** The `env` array contains environment variable *names*, not values. At load time, each name is looked up in the process environment. Only variables that are actually set are forwarded to the MCP server process. Variables that are missing are silently omitted.
+
+**Example: local stdio MCP server**
+
+```json
+{
+  "mcp_servers": [
+    {
+      "command": "./bin/mcp-server",
+      "args": ["--port", "0"],
+      "env": ["DATABASE_URL"]
+    }
+  ]
+}
+```
+
+**Example: remote HTTP MCP server**
+
+```json
+{
+  "mcp_servers": [
+    {
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer ${API_KEY}"
+      }
+    }
+  ]
+}
+```
+
+---
+
+### Lifecycle Hooks
+
+A skill can declare lifecycle hooks that run shell commands when specific agent events occur. This is useful for auditing, policy enforcement, or side effects.
+
+Add a `hooks` array to `manifest.json`:
+
+```json
+{
+  "name": "my-audit-skill",
+  "version": "1.0.0",
+  "tools": [],
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/audit.sh"],
+      "timeout_ms": 5000,
+      "tool_filter": ["shell"]
+    }
+  ]
+}
+```
+
+**Hook fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `event` | Yes | -- | Lifecycle event name (see table below) |
+| `command` | Yes | -- | Command as an argv array (no shell interpretation) |
+| `timeout_ms` | No | 5000 | Maximum execution time in milliseconds |
+| `tool_filter` | No | `[]` (all tools) | Only trigger for these tool names (tool events only) |
+
+**Supported events:**
+
+| Event | Can Deny? | When it fires |
+|-------|-----------|---------------|
+| `before_tool_call` | Yes | Before a tool is executed. Exit code 1 = deny. |
+| `after_tool_call` | No | After a tool finishes (success or failure). |
+| `before_llm_call` | Yes | Before sending a request to the LLM. Exit code 1 = deny. |
+| `after_llm_call` | No | After the LLM response is received. |
+
+**Path resolution:** The first element of the `command` array (`command[0]`) follows the same rules as MCP servers -- paths starting with `./` or `../` are resolved against the skill directory. Other elements are passed as-is.
+
+**Hook payload:** The gateway sends a JSON payload on stdin to the hook process. For tool events, the payload includes `tool_name`, `arguments`, and session context. For LLM events, it includes `model`, `message_count`, etc.
+
+**Deny behavior:** `before_*` hooks can deny the operation by exiting with code 1. The hook's stdout is included as the denial reason.
+
+**Example: audit all shell tool calls**
+
+```json
+{
+  "hooks": [
+    {
+      "event": "before_tool_call",
+      "command": ["./hooks/policy-check.sh"],
+      "timeout_ms": 3000,
+      "tool_filter": ["shell", "bash"]
+    },
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/audit-log.sh"],
+      "timeout_ms": 5000,
+      "tool_filter": ["shell", "bash"]
+    }
+  ]
+}
+```
+
+---
+
+### Prompt Fragments
+
+A skill can inject content into the system prompt by declaring prompt fragment files. This is useful for teaching the agent domain-specific knowledge, rules, or behavior without writing any code.
+
+Add a `prompts` object to `manifest.json`:
+
+```json
+{
+  "name": "my-style-guide",
+  "version": "1.0.0",
+  "tools": [],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+```
+
+**Prompt fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `include` | Yes | Array of glob patterns for files to include |
+
+**Path resolution:** Glob patterns are resolved relative to the skill directory. For example, `"prompts/*.md"` matches all `.md` files in the `prompts/` subdirectory of the skill.
+
+**Behavior:** Matched files are read at load time and their content is appended to the system prompt. Files are processed in glob expansion order.
+
+**Example: skill directory layout**
+
+```
+~/.crew/skills/my-style-guide/
+├── manifest.json
+├── SKILL.md
+└── prompts/
+    ├── coding-rules.md
+    └── review-checklist.md
+```
+
+With manifest:
+
+```json
+{
+  "name": "my-style-guide",
+  "version": "1.0.0",
+  "tools": [],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+```
+
+Both `coding-rules.md` and `review-checklist.md` are injected into the system prompt whenever this skill is active.
+
+---
+
+### Extras-Only Skills
+
+A skill does not need to provide any tool executables. If `manifest.json` has an empty `tools` array (or omits it entirely) but declares `mcp_servers`, `hooks`, or `prompts`, the gateway loads the extras without looking for a binary. This is useful for:
+
+- **Pure prompt injection skills** -- a collection of `.md` files that teach the agent a domain
+- **Configuration skills** -- hooks that enforce policies across all tool calls
+- **Remote MCP skills** -- MCP servers that run elsewhere, declared via `url`
+
+**Example: prompt-only skill**
+
+```json
+{
+  "name": "company-policy",
+  "version": "1.0.0",
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+```
+
+No `tools`, no binary, no `mcp_servers`, no `hooks` -- just prompt content.
+
+**Example: hooks-only skill**
+
+```json
+{
+  "name": "audit-logger",
+  "version": "1.0.0",
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/log-to-siem.sh"],
+      "timeout_ms": 5000
+    }
+  ]
+}
+```
+
+No tools -- the skill only provides an audit hook.
+
+**Example: combined extras**
+
+A single skill can declare all three extras alongside regular tools:
+
+```json
+{
+  "name": "advanced-skill",
+  "version": "1.0.0",
+  "tools": [
+    { "name": "analyze", "description": "Run analysis", "input_schema": { "type": "object" } }
+  ],
+  "mcp_servers": [
+    { "command": "node", "args": ["mcp/server.js"], "env": ["API_KEY"] }
+  ],
+  "hooks": [
+    { "event": "after_tool_call", "command": ["./hooks/audit.sh"], "tool_filter": ["analyze"] }
+  ],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+```
+
+---
+
+### Updated Manifest Field Reference
+
+The complete set of top-level `manifest.json` fields, including extensions:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `name` | Yes | -- | Skill identifier |
+| `version` | Yes | -- | Semantic version |
+| `author` | No | -- | Author name |
+| `description` | No | -- | Human-readable description |
+| `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
+| `requires_network` | No | false | Informational flag |
+| `sha256` | No | -- | Binary integrity check (hex hash) |
+| `tools` | No | `[]` | Array of tool definitions |
+| `mcp_servers` | No | `[]` | Array of MCP server declarations |
+| `hooks` | No | `[]` | Array of lifecycle hook definitions |
+| `prompts` | No | -- | Prompt fragment configuration object |
+| `binaries` | No | `{}` | Pre-built binaries keyed by `{os}-{arch}` |
+
+---
+
 ## Advanced Topics
 
 ### Multiple Tools in One Skill
@@ -440,17 +722,27 @@ Set appropriate timeouts in `manifest.json`:
 
 ### Security
 
-The gateway automatically sanitizes these env vars before spawning skill processes:
+**Binary integrity:**
+
+- **Symlinks rejected:** Plugin binaries must be regular files. Symlinks are rejected at load time as a defense against link-swap attacks. The loader uses `symlink_metadata()` (not `metadata()`) to detect this.
+- **SHA-256 verification:** If `sha256` is present in `manifest.json`, the loader computes the hash of the binary and rejects it if the hash does not match. The verified bytes are written to a separate file that the gateway actually executes, closing the TOCTOU (time-of-check to time-of-use) gap.
+- **Size limit:** Plugin executables must be under 100 MB. Larger binaries are rejected before being read.
+
+**Environment sanitization:**
+
+The gateway automatically strips these env vars before spawning skill processes:
 
 - `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`
 - `NODE_OPTIONS`, `PYTHONPATH`, `PERL5LIB`
 - `RUSTFLAGS`, `RUST_LOG`
 - And 10+ others (see `BLOCKED_ENV_VARS` in `sandbox.rs`)
 
-Skills should also:
+**Best practices for skill authors:**
+
 - Validate all input (never trust `city`, `path`, etc.)
 - Use timeouts on HTTP requests
 - Avoid shell injection (don't pass user input to shell commands)
+- Set `sha256` in `manifest.json` for release builds to enable integrity verification
 
 ### Platform Skills vs App Skills
 
@@ -482,6 +774,8 @@ Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `crew` b
 
 ## Checklist
 
+### For tool skills (binary + tools)
+
 - [ ] Create `crates/app-skills/<name>/` with Cargo.toml, manifest.json, SKILL.md, src/main.rs
 - [ ] `[[bin]] name` in Cargo.toml matches `binary_name` in bundled_app_skills.rs
 - [ ] manifest.json has valid JSON Schema for all tool inputs
@@ -494,3 +788,14 @@ Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `crew` b
 - [ ] `cargo build --workspace` succeeds
 - [ ] Standalone test: `echo '{"param": "value"}' | ./target/debug/my_skill my_tool`
 - [ ] Gateway test: skill appears in `~/.crew/skills/` and agent can use it
+
+### For extras (MCP servers, hooks, prompt fragments)
+
+- [ ] `mcp_servers`: `command` or `url` is set; `env` lists only variable names, not values
+- [ ] `mcp_servers`: relative command paths (`./bin/server`) exist in the skill directory
+- [ ] `hooks`: `event` is one of `before_tool_call`, `after_tool_call`, `before_llm_call`, `after_llm_call`
+- [ ] `hooks`: `command` is an argv array (not a shell string); `command[0]` relative paths resolve correctly
+- [ ] `hooks`: `tool_filter` is set when the hook should only apply to specific tools
+- [ ] `prompts`: glob patterns in `include` match the intended `.md` files in the skill directory
+- [ ] Extras-only skills: `tools` array is empty or omitted; no binary needed
+- [ ] Gateway test: extras appear in loader logs (`loaded skill extras`)
