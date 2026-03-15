@@ -26,6 +26,20 @@ fn fnv1a_64(data: &[u8]) -> u64 {
     hash
 }
 
+/// Encode a string for safe use as a directory/file name component.
+/// Alphanumerics, `-`, `_` pass through; everything else is percent-encoded.
+pub fn encode_path_component(s: &str) -> String {
+    let mut encoded = String::new();
+    for byte in s.as_bytes() {
+        if byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_' {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
 }
@@ -206,6 +220,11 @@ impl SessionManager {
     /// Truncates encoded name to 200 chars to stay within the 255-byte
     /// filesystem filename limit (reserving space for ".jsonl" suffix).
     fn session_path(&self, key: &SessionKey) -> PathBuf {
+        Self::session_path_static(&self.sessions_dir, key)
+    }
+
+    /// Static version of `session_path` — used by `SessionHandle` too.
+    pub(crate) fn session_path_static(sessions_dir: &Path, key: &SessionKey) -> PathBuf {
         // Max encoded name length: 200 chars + ".jsonl" (6) = 206, well within 255.
         // When truncation occurs, append a hash suffix to avoid collisions between
         // keys that differ only past the truncation point.
@@ -232,7 +251,7 @@ impl SessionManager {
             let hash = fnv1a_64(key.0.as_bytes());
             safe_name.push_str(&format!("_{hash:016X}"));
         }
-        self.sessions_dir.join(format!("{safe_name}.jsonl"))
+        sessions_dir.join(format!("{safe_name}.jsonl"))
     }
 
     /// Decode a percent-encoded session filename back to the original session key.
@@ -518,6 +537,260 @@ impl SessionManager {
     }
 }
 
+// ── SessionHandle ──────────────────────────────────────────────────────────
+
+/// Per-session file handle — owns one session's in-memory state and I/O.
+///
+/// Used by `SessionActor` to eliminate the shared `SessionManager` mutex.
+/// Each actor gets its own `SessionHandle`, so there is zero cross-session
+/// lock contention.
+///
+/// File layout (per-user directory structure):
+/// ```text
+/// {data_dir}/users/{encoded_base_key}/sessions/{topic_or_default}.jsonl
+/// ```
+/// This enables future filesystem-level isolation (quotas, chroot, sandboxing).
+pub struct SessionHandle {
+    sessions_dir: PathBuf,
+    session: Session,
+}
+
+impl SessionHandle {
+    /// Open or create a session handle for the given key.
+    ///
+    /// Uses per-user directory layout: `{data_dir}/users/{base_key}/sessions/{topic}.jsonl`.
+    /// Falls back to the legacy flat layout for migration.
+    pub fn open(data_dir: &Path, key: &SessionKey) -> Self {
+        let base_key = key.base_key();
+        let encoded_base = Self::encode_path_component(base_key);
+        let user_sessions_dir = data_dir.join("users").join(&encoded_base).join("sessions");
+        let _ = std::fs::create_dir_all(&user_sessions_dir);
+
+        // Try loading from new per-user path first
+        let topic_filename = Self::topic_filename(key);
+        let new_path = user_sessions_dir.join(&topic_filename);
+
+        let session = if new_path.exists() {
+            Self::load_from_file(&new_path, key)
+        } else {
+            // Fall back to legacy flat path for migration
+            let legacy_dir = data_dir.join("sessions");
+            let legacy_path = SessionManager::session_path_static(&legacy_dir, key);
+            if legacy_path.exists() {
+                debug!(key = %key, "migrating session from legacy flat layout");
+                let session = Self::load_from_file(&legacy_path, key);
+                // Migration: if loaded from legacy, we'll write to new path on next save
+                if session.is_some() {
+                    // Remove legacy file after successful load
+                    let _ = std::fs::remove_file(&legacy_path);
+                }
+                session
+            } else {
+                None
+            }
+        }
+        .unwrap_or_else(|| Session::new(key.clone()));
+
+        Self {
+            sessions_dir: user_sessions_dir,
+            session,
+        }
+    }
+
+    /// Encode a path component (base key) for safe directory names.
+    fn encode_path_component(s: &str) -> String {
+        encode_path_component(s)
+    }
+
+    /// Get the JSONL filename for a session key's topic.
+    /// Default session → `default.jsonl`, topic → `{topic}.jsonl`.
+    fn topic_filename(key: &SessionKey) -> String {
+        let topic = key.topic().unwrap_or("default");
+        let encoded = Self::encode_path_component(topic);
+        format!("{encoded}.jsonl")
+    }
+
+    /// The session key.
+    pub fn key(&self) -> &SessionKey {
+        &self.session.key
+    }
+
+    /// Immutable access to the session.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Mutable access to the session.
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Get the most recent N messages from history.
+    pub fn get_history(&self, max: usize) -> &[Message] {
+        self.session.get_history(max)
+    }
+
+    /// Get or initialize the session (always returns a reference).
+    pub fn get_or_create(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Add a message to the session and persist it.
+    pub async fn add_message(&mut self, message: Message) -> Result<()> {
+        self.session.messages.push(message.clone());
+        self.session.updated_at = Utc::now();
+        self.append_to_disk(&message).await?;
+        Ok(())
+    }
+
+    /// Sort messages by timestamp (for speculative overflow ordering).
+    pub fn sort_by_timestamp(&mut self) {
+        self.session.sort_by_timestamp();
+    }
+
+    /// Rewrite the session to disk (atomic write-then-rename).
+    pub async fn rewrite(&self) -> Result<()> {
+        let meta = SessionMeta {
+            schema_version: CURRENT_SESSION_SCHEMA,
+            session_key: self.session.key.0.clone(),
+            parent_key: self.session.parent_key.as_ref().map(|k| k.0.clone()),
+            topic: self.session.topic.clone(),
+            summary: self.session.summary.clone(),
+            created_at: self.session.created_at,
+            updated_at: self.session.updated_at,
+        };
+        let mut content = serde_json::to_string(&meta)?;
+        content.push('\n');
+        for msg in &self.session.messages {
+            content.push_str(&serde_json::to_string(msg)?);
+            content.push('\n');
+        }
+
+        let msg_count = self.session.messages.len();
+        let path = self.session_path();
+        let key_display = self.session.key.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let tmp_path = path.with_extension("jsonl.tmp");
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.flush()?;
+            std::fs::rename(&tmp_path, &path)?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+
+        debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
+        Ok(())
+    }
+
+    /// Clear the session (in-memory and on disk).
+    pub async fn clear(&mut self) -> Result<()> {
+        self.session = Session::new(self.session.key.clone());
+        let path = self.session_path();
+        if path.exists() {
+            tokio::fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
+
+    fn session_path(&self) -> PathBuf {
+        self.sessions_dir
+            .join(Self::topic_filename(&self.session.key))
+    }
+
+    /// Append a single message to the JSONL file.
+    async fn append_to_disk(&self, message: &Message) -> Result<()> {
+        let path = self.session_path();
+        let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
+        let topic = self.session.topic.clone();
+        let summary = self.session.summary.clone();
+        let key_str = self.session.key.0.clone();
+        let msg_json = serde_json::to_string(message)?;
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+
+            let file_len = file.metadata()?.len();
+            let is_new = file_len == 0;
+
+            if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
+                warn!(
+                    key = key_str,
+                    size = file_len,
+                    limit = MAX_SESSION_FILE_SIZE,
+                    "session file at size limit, skipping append"
+                );
+                return Ok(());
+            }
+
+            if is_new {
+                let meta = SessionMeta {
+                    schema_version: CURRENT_SESSION_SCHEMA,
+                    session_key: key_str,
+                    parent_key,
+                    topic,
+                    summary,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+                writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            }
+
+            writeln!(file, "{}", msg_json)?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+
+        Ok(())
+    }
+
+    /// Load a session from a specific file path.
+    fn load_from_file(path: &Path, key: &SessionKey) -> Option<Session> {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_SESSION_FILE_SIZE {
+                warn!(key = %key, size = meta.len(), "session file too large, skipping");
+                return None;
+            }
+        }
+
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut lines = content.lines();
+
+        let meta_line = lines.next()?;
+        let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
+
+        if meta.schema_version > CURRENT_SESSION_SCHEMA {
+            warn!(key = %key, file_version = meta.schema_version, "newer schema, skipping");
+            return None;
+        }
+
+        let messages: Vec<Message> = lines
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        debug!(key = %key, messages = messages.len(), "Loaded session from disk");
+
+        Some(Session {
+            key: key.clone(),
+            parent_key: meta.parent_key.map(SessionKey),
+            topic: meta.topic,
+            summary: meta.summary,
+            messages,
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+        })
+    }
+}
+
 /// Entry describing a session for listing purposes.
 #[derive(Debug, Clone)]
 pub struct SessionListEntry {
@@ -601,6 +874,83 @@ impl SessionManager {
         let session = self.get_or_create(key);
         session.summary = Some(summary);
         self.rewrite(key).await
+    }
+
+    /// List sessions for a chat from the per-user directory layout.
+    ///
+    /// Scans `{data_dir}/users/{base_key}/sessions/` for JSONL files.
+    /// Falls back to the legacy flat scan if the user directory doesn't exist.
+    pub fn list_user_sessions(&self, base_key: &str) -> Vec<SessionListEntry> {
+        let encoded_base = SessionHandle::encode_path_component(base_key);
+        let user_sessions_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+
+        if user_sessions_dir.is_dir() {
+            Self::scan_sessions_dir(&user_sessions_dir)
+        } else {
+            // Fall back to legacy flat layout
+            self.list_sessions_for_chat(base_key)
+        }
+    }
+
+    /// Scan a sessions directory and return entries sorted by updated_at descending.
+    fn scan_sessions_dir(dir: &Path) -> Vec<SessionListEntry> {
+        let mut entries = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return entries;
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if path
+                .metadata()
+                .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = content.lines();
+            let Some(meta_line) = lines.next() else {
+                continue;
+            };
+            let meta: SessionMeta = match serde_json::from_str(meta_line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let message_count = lines.filter(|l| !l.trim().is_empty()).count();
+            let topic = if name == "default" {
+                None
+            } else {
+                Some(Self::decode_filename(name))
+            };
+
+            entries.push(SessionListEntry {
+                topic,
+                message_count,
+                updated_at: meta.updated_at,
+                summary: meta.summary,
+            });
+        }
+
+        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries
     }
 }
 

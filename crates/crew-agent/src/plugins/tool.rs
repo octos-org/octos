@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::progress::ProgressEvent;
-use crate::tools::{Tool, ToolContext, ToolResult, TOOL_CTX};
+use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
 
 use super::manifest::PluginToolDef;
 
@@ -30,7 +30,7 @@ pub struct PluginTool {
 
 impl PluginTool {
     /// Default timeout for plugin execution.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
     pub fn new(plugin_name: String, tool_def: PluginToolDef, executable: PathBuf) -> Self {
         Self {
@@ -70,10 +70,7 @@ impl Tool for PluginTool {
         // Inject `timeout_secs` so the LLM can request longer timeouts for
         // complex tasks.  Only added when the schema is an object with
         // "properties" and doesn't already define the field.
-        if let Some(props) = schema
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
+        if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
             if !props.contains_key("timeout_secs") {
                 props.insert(
                     "timeout_secs".to_string(),
@@ -171,39 +168,38 @@ impl Tool for PluginTool {
         });
 
         // Wait for process exit with timeout
-        let exit_status =
-            match tokio::time::timeout(self.timeout, child.wait()).await {
-                Ok(Ok(status)) => status,
-                Ok(Err(e)) => {
-                    stderr_task.abort();
-                    stdout_task.abort();
-                    return Err(eyre::eyre!(
-                        "plugin '{}' tool '{}' execution failed: {e}",
-                        self.plugin_name,
-                        self.tool_def.name
-                    ));
+        let exit_status = match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                stderr_task.abort();
+                stdout_task.abort();
+                return Err(eyre::eyre!(
+                    "plugin '{}' tool '{}' execution failed: {e}",
+                    self.plugin_name,
+                    self.tool_def.name
+                ));
+            }
+            Err(_) => {
+                // Timeout — kill the child process and abort reader tasks
+                stderr_task.abort();
+                stdout_task.abort();
+                #[cfg(unix)]
+                if child_pid > 0 {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &format!("-{child_pid}")])
+                        .status();
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &child_pid.to_string()])
+                        .status();
                 }
-                Err(_) => {
-                    // Timeout — kill the child process and abort reader tasks
-                    stderr_task.abort();
-                    stdout_task.abort();
-                    #[cfg(unix)]
-                    if child_pid > 0 {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{child_pid}")])
-                            .status();
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &child_pid.to_string()])
-                            .status();
-                    }
-                    return Err(eyre::eyre!(
-                        "plugin '{}' tool '{}' timed out after {}s",
-                        self.plugin_name,
-                        self.tool_def.name,
-                        self.timeout.as_secs()
-                    ));
-                }
-            };
+                return Err(eyre::eyre!(
+                    "plugin '{}' tool '{}' timed out after {}s",
+                    self.plugin_name,
+                    self.tool_def.name,
+                    self.timeout.as_secs()
+                ));
+            }
+        };
 
         // Collect stdout and stderr from reader tasks
         let stdout_bytes = stdout_task.await.unwrap_or_default();
@@ -277,7 +273,7 @@ mod tests {
 
         assert_eq!(tool.plugin_name, "my-plugin");
         assert_eq!(tool.timeout, PluginTool::DEFAULT_TIMEOUT);
-        assert_eq!(tool.timeout, Duration::from_secs(30));
+        assert_eq!(tool.timeout, Duration::from_secs(600));
         assert!(tool.blocked_env.is_empty());
     }
 

@@ -39,7 +39,13 @@ fn crew_sbpl(workspace: &str, allow_network: bool) -> String {
 (deny default)
 (allow process-exec)
 (allow process-fork)
+(allow process-info*)
 (allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix*)
+(allow signal)
+(allow file-ioctl)
 (allow file-read*)
 (allow file-write* (subpath "{workspace}"))
 {network}

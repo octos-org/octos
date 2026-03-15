@@ -4,8 +4,8 @@
 //! per-provider latency (EMA + p95), error rates, and circuit breaker state.
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -314,6 +314,11 @@ pub struct AdaptiveStatus {
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
 /// per provider, scores them dynamically, and routes to the best performer.
 /// Probes stale providers to keep metrics fresh.
+/// Callback for status updates (e.g. failover notifications).
+/// The adaptive router calls this to inform the UI layer about provider
+/// switches that happen inside `chat_stream()` failover.
+pub type StatusCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 pub struct AdaptiveRouter {
     slots: Vec<AdaptiveSlot>,
     config: AdaptiveConfig,
@@ -325,6 +330,8 @@ pub struct AdaptiveRouter {
     qos_ranking: AtomicBool,
     /// Last provider index selected (for detecting switches).
     last_selected: AtomicU32,
+    /// Optional callback for status updates (failover, provider switching).
+    status_callback: Mutex<Option<StatusCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -357,6 +364,7 @@ impl AdaptiveRouter {
             mode: AtomicU8::new(AdaptiveMode::Off as u8),
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
+            status_callback: Mutex::new(None),
         }
     }
 
@@ -377,6 +385,19 @@ impl AdaptiveRouter {
     pub fn set_mode(&self, mode: AdaptiveMode) {
         self.mode.store(mode as u8, Ordering::Relaxed);
         info!(%mode, "adaptive mode changed");
+    }
+
+    /// Set a callback for status updates (failover notifications).
+    /// Called from `chat_stream()` failover so the UI can inform the user.
+    pub fn set_status_callback(&self, cb: Option<StatusCallback>) {
+        *self.status_callback.lock().unwrap() = cb;
+    }
+
+    /// Emit a status message through the callback (if set).
+    fn emit_status(&self, message: String) {
+        if let Some(cb) = self.status_callback.lock().unwrap().as_ref() {
+            cb(message);
+        }
     }
 
     /// Toggle QoS quality ranking at runtime (orthogonal to mode).
@@ -597,13 +618,18 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Option<Result<ChatResponse>> {
-        // Pick the best alternate provider (not the primary, not circuit-broken)
+        // Pick the best alternate provider (not the primary, not the same provider
+        // name, not circuit-broken). Racing the same provider against itself wastes
+        // API calls with no failover benefit.
+        let primary_name = self.slots[primary_idx].provider.provider_name();
         let alternate_idx = self
             .slots
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                *i != primary_idx && !s.metrics.is_circuit_open(self.config.failure_threshold)
+                *i != primary_idx
+                    && s.provider.provider_name() != primary_name
+                    && !s.metrics.is_circuit_open(self.config.failure_threshold)
             })
             .map(|(i, s)| (i, self.score(s)))
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -801,6 +827,10 @@ impl LlmProvider for AdaptiveRouter {
 
                 let mut last_error = e;
                 for (idx, _) in scored {
+                    self.emit_status(format!(
+                        "Switching to {}...",
+                        self.slots[idx].provider.provider_name()
+                    ));
                     match self.try_chat(idx, messages, tools, config).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -855,6 +885,10 @@ impl LlmProvider for AdaptiveRouter {
 
                 let mut last_error = e;
                 for (idx, _) in scored {
+                    self.emit_status(format!(
+                        "Switching to {}...",
+                        self.slots[idx].provider.provider_name()
+                    ));
                     match self.try_chat_stream(idx, messages, tools, config).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {
@@ -1635,5 +1669,81 @@ mod tests {
         // Next call should skip circuit-broken primary and go to fallback
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+    }
+
+    /// Hedge mode should NOT race the same provider against itself.
+    /// When all slots share the same provider_name, hedged_chat returns None
+    /// and the single-provider path is used instead.
+    #[tokio::test]
+    async fn should_skip_hedge_when_all_providers_same_name() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5-alt",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        // Should succeed via single-provider path (hedged_chat skips same-name)
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-moonshot"));
+    }
+
+    /// Hedge mode picks a different-named provider as alternate.
+    #[tokio::test]
+    async fn should_hedge_with_different_provider_names() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-k2.5",
+                    latency_ms: 200, // slow
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "moonshot",
+                    model: "kimi-alt",
+                    latency_ms: 5,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "deepseek",
+                    model: "deepseek-chat",
+                    latency_ms: 10, // fast, different provider
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            config,
+        );
+        router.set_mode(AdaptiveMode::Hedge);
+
+        // Should race moonshot vs deepseek (skipping moonshot[1] same name)
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        // deepseek is faster, so it wins the race
+        assert_eq!(resp.content.as_deref(), Some("from-deepseek"));
     }
 }

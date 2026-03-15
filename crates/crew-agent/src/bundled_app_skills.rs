@@ -48,6 +48,12 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/weather/SKILL.md"),
         include_str!("../../app-skills/weather/manifest.json"),
     ),
+    (
+        "voice-skill",
+        "voice-skill",
+        include_str!("../../app-skills/voice/SKILL.md"),
+        include_str!("../../app-skills/voice/manifest.json"),
+    ),
 ];
 
 /// Platform skills: bootstrapped once by `crew serve` (admin bot) at startup,

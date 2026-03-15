@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crew_plugin::manifest::{PluginManifest, PluginType};
 use crew_plugin::gating;
+use crew_plugin::manifest::{PluginManifest, PluginType};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
             // Not a plugin directory — check if it has SKILL.md (skill-only).
             let skill_md = dir.join("SKILL.md");
             if skill_md.exists() {
-                println!("⚠  {name}: SKILL.md present but no manifest.json (skill-only, no tools)", );
+                println!("⚠  {name}: SKILL.md present but no manifest.json (skill-only, no tools)",);
                 warnings += 1;
             }
             continue;
@@ -156,7 +156,10 @@ fn main() -> ExitCode {
 
         // Report.
         if issues.is_empty() {
-            println!("OK ({})", format_summary(&manifest, &etype, dot_files.len()));
+            println!(
+                "OK ({})",
+                format_summary(&manifest, &etype, dot_files.len())
+            );
             passed += 1;
         } else {
             println!("FAIL");
@@ -180,9 +183,7 @@ fn main() -> ExitCode {
 
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!(
-        "Total: {total}  Passed: {passed}  Failed: {failed}  Warnings: {warnings}"
-    );
+    println!("Total: {total}  Passed: {passed}  Failed: {failed}  Warnings: {warnings}");
 
     if failed > 0 {
         ExitCode::FAILURE
@@ -192,10 +193,7 @@ fn main() -> ExitCode {
 }
 
 fn format_summary(m: &PluginManifest, etype: &PluginType, dot_count: usize) -> String {
-    let mut parts = vec![
-        format!("v{}", m.version),
-        format!("{etype:?}"),
-    ];
+    let mut parts = vec![format!("v{}", m.version), format!("{etype:?}")];
     if !m.tools.is_empty() {
         parts.push(format!("{} tool(s)", m.tools.len()));
     }

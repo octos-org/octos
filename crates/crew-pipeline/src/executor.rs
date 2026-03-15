@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crew_agent::TokenTracker;
 use crew_agent::progress::ProgressEvent;
 use crew_agent::tools::TOOL_CTX;
-use crew_agent::TokenTracker;
 use crew_core::{Message, MessageRole, TokenUsage};
 use crew_llm::{ChatConfig, LlmProvider, ProviderRouter};
 use crew_memory::EpisodeStore;
@@ -524,7 +524,10 @@ impl PipelineExecutor {
                     let handler = handler.clone();
                     let max_retries = target_with_prompt.max_retries;
                     let tid = target_id.clone();
-                    let par_label = target_with_prompt.label.clone().unwrap_or_else(|| tid.clone());
+                    let par_label = target_with_prompt
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| tid.clone());
                     let par_done = par_completed.clone();
                     let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 

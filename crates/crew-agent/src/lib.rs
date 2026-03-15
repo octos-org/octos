@@ -44,7 +44,7 @@ pub use plugins::PluginLoader;
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
-pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};

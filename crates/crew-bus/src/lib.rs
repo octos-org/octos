@@ -43,7 +43,8 @@ pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;
 pub use session::{
-    ActiveSessionStore, Session, SessionListEntry, SessionManager, validate_topic_name,
+    ActiveSessionStore, Session, SessionHandle, SessionListEntry, SessionManager,
+    validate_topic_name,
 };
 
 #[cfg(feature = "api")]

@@ -46,6 +46,20 @@ export interface HookConfig {
   tool_filter?: string[]
 }
 
+export interface DockerConfig {
+  image?: string | null
+  cpu_limit?: string | null
+  memory_limit?: string | null
+  pids_limit?: number | null
+}
+
+export interface SandboxConfig {
+  enabled?: boolean
+  mode?: 'auto' | 'macos' | 'docker' | 'bwrap'
+  allow_network?: boolean
+  docker?: DockerConfig
+}
+
 export interface ProfileConfig {
   provider?: string | null
   model?: string | null
@@ -59,6 +73,7 @@ export interface ProfileConfig {
   env_vars: Record<string, string>
   hooks?: HookConfig[]
   admin_mode?: boolean
+  sandbox?: SandboxConfig
 }
 
 export interface UserProfile {

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crew_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
 use crew_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
-use crew_bus::{ActiveSessionStore, SessionManager};
+use crew_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use crew_core::AgentId;
 use crew_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
 use crew_llm::{
@@ -25,13 +25,16 @@ use tracing::{debug, info, warn};
 
 use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
-use crate::status_indicator::StatusIndicator;
+use crate::status_layers::{StatusComposer, UserStatusConfig};
 
 /// Default actor inbox capacity.
 const ACTOR_INBOX_SIZE: usize = 32;
 
 /// Default idle timeout before an actor shuts down (30 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
+
+/// Maximum concurrent overflow tasks per session.
+const MAX_OVERFLOW_TASKS: u32 = 5;
 
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
@@ -112,7 +115,7 @@ impl ActorRegistry {
         session_key: SessionKey,
         reply_channel: &str,
         reply_chat_id: &str,
-        status_indicator: Option<Arc<StatusIndicator>>,
+        status_indicator: Option<Arc<StatusComposer>>,
     ) {
         let key_str = session_key.to_string();
 
@@ -264,6 +267,10 @@ pub struct ActorFactory {
     pub system_prompt: Arc<std::sync::RwLock<String>>,
     pub hooks: Option<Arc<HookExecutor>>,
     pub hook_context_template: Option<HookContext>,
+    /// Data directory for creating per-actor SessionHandle instances.
+    pub data_dir: std::path::PathBuf,
+    /// Shared SessionManager for admin operations (/sessions, /new, /delete).
+    /// NOT used by actors — only by the gateway main loop.
     pub session_mgr: Arc<Mutex<SessionManager>>,
     pub out_tx: mpsc::Sender<OutboundMessage>,
     pub spawn_inbound_tx: mpsc::Sender<InboundMessage>,
@@ -274,8 +281,10 @@ pub struct ActorFactory {
     pub idle_timeout: Duration,
     pub session_timeout: Duration,
     pub shutdown: Arc<AtomicBool>,
-    /// Working directory for SpawnTool.
+    /// Working directory for SpawnTool (shared profile-level cwd).
     pub cwd: std::path::PathBuf,
+    /// Sandbox config — used to create per-user sandbox instances.
+    pub sandbox_config: crew_agent::SandboxConfig,
     /// Provider policy for SpawnTool and PipelineTool.
     pub provider_policy: Option<ToolPolicy>,
     /// Worker system prompt for SpawnTool subagents.
@@ -306,6 +315,15 @@ pub trait ToolRegistryFactory: Send + Sync {
     /// Create a base ToolRegistry with all non-session-specific tools registered.
     /// The caller will add session-specific tools (MessageTool, SendFileTool, etc.)
     fn create_base_registry(&self) -> ToolRegistry;
+
+    /// Create a base ToolRegistry with cwd-bound tools re-bound to a per-user
+    /// workspace directory. Non-cwd tools (web, MCP, plugins) are preserved.
+    /// The sandbox is created fresh for the per-user workspace path.
+    fn create_registry_for_workspace(
+        &self,
+        workspace: &std::path::Path,
+        sandbox: Box<dyn crew_agent::Sandbox>,
+    ) -> ToolRegistry;
 }
 
 /// Trait for creating per-session pipeline tool instances.
@@ -329,6 +347,16 @@ impl ToolRegistryFactory for SnapshotToolRegistryFactory {
         // Clone all tools (Arc refcount bumps, cheap)
         self.base.snapshot_excluding(&[])
     }
+
+    fn create_registry_for_workspace(
+        &self,
+        workspace: &std::path::Path,
+        sandbox: Box<dyn crew_agent::Sandbox>,
+    ) -> ToolRegistry {
+        // Re-bind cwd-bound tools to the per-user workspace while
+        // preserving non-cwd tools (web_search, browser, MCP, plugins, etc.)
+        self.base.rebind_cwd(workspace, sandbox)
+    }
 }
 
 impl ActorFactory {
@@ -339,7 +367,7 @@ impl ActorFactory {
         channel: &str,
         chat_id: &str,
         semaphore: Arc<Semaphore>,
-        status_indicator: Option<Arc<StatusIndicator>>,
+        status_indicator: Option<Arc<StatusComposer>>,
     ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
 
@@ -353,8 +381,30 @@ impl ActorFactory {
         let message_tool = MessageTool::with_context(proxy_tx.clone(), channel, chat_id);
         let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id);
 
-        // Build tool registry with session-specific tools
-        let mut tools = self.tool_registry_factory.create_base_registry();
+        // Build per-user workspace directory for file isolation.
+        // Each user's tools are restricted to their own workspace via
+        // resolve_path() (application-level) and sandbox-exec SBPL (kernel-level on macOS).
+        let encoded_base = crew_bus::session::encode_path_component(&session_key.base_key());
+        let user_workspace = self
+            .data_dir
+            .join("users")
+            .join(&encoded_base)
+            .join("workspace");
+        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
+            warn!(
+                session = %session_key,
+                path = %user_workspace.display(),
+                "failed to create per-user workspace: {e}, falling back to shared cwd"
+            );
+        }
+
+        // Create tool registry with cwd-bound tools pointing to the per-user workspace.
+        // A fresh sandbox is created per user so the SBPL profile restricts writes
+        // to this user's workspace directory (kernel-enforced on macOS).
+        let user_sandbox = crew_agent::create_sandbox(&self.sandbox_config);
+        let mut tools = self
+            .tool_registry_factory
+            .create_registry_for_workspace(&user_workspace, user_sandbox);
         tools.register(message_tool);
         tools.register(send_file_tool);
 
@@ -443,16 +493,28 @@ impl ActorFactory {
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
 
+        // Create a per-actor SessionHandle — each actor owns its session data.
+        // No shared mutex, no cross-session contention.
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(
+            &self.data_dir,
+            &session_key,
+        )));
+
+        // Load per-user status configuration
+        let user_status_config = UserStatusConfig::load(&self.data_dir, &session_key.base_key());
+
         let actor = SessionActor {
             session_key: session_key.clone(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             inbox: rx,
             agent: Arc::new(agent),
-            session_mgr: self.session_mgr.clone(),
+            session_handle,
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
             status_indicator,
+            user_status_config,
+            data_dir: self.data_dir.clone(),
             max_history: self.max_history.clone(),
             idle_timeout: self.idle_timeout,
             session_timeout: self.session_timeout,
@@ -463,6 +525,7 @@ impl ActorFactory {
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: self.adaptive_router.clone(),
             memory_store: self.memory_store.clone(),
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -559,12 +622,17 @@ struct SessionActor {
 
     agent: Arc<Agent>,
 
-    session_mgr: Arc<Mutex<SessionManager>>,
+    /// Per-actor session handle — owns this session's data, no shared mutex.
+    session_handle: Arc<Mutex<SessionHandle>>,
     llm_for_compaction: Arc<dyn LlmProvider>,
 
     out_tx: mpsc::Sender<OutboundMessage>,
 
-    status_indicator: Option<Arc<StatusIndicator>>,
+    status_indicator: Option<Arc<StatusComposer>>,
+    /// Per-user status configuration (greeting, visibility toggles, custom layers).
+    user_status_config: UserStatusConfig,
+    /// Data directory for persisting user configs.
+    data_dir: std::path::PathBuf,
     max_history: Arc<std::sync::atomic::AtomicUsize>,
 
     idle_timeout: Duration,
@@ -582,6 +650,8 @@ struct SessionActor {
     adaptive_router: Option<Arc<AdaptiveRouter>>,
     /// Memory store for saving long research reports out-of-band.
     memory_store: Option<Arc<MemoryStore>>,
+    /// Active overflow task counter for concurrency limiting.
+    active_overflow_tasks: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SessionActor {
@@ -672,6 +742,10 @@ impl SessionActor {
             }
             "/queue" => {
                 self.handle_queue_command(&parts[1..]).await;
+                true
+            }
+            "/status" => {
+                self.handle_status_command(&parts[1..]).await;
                 true
             }
             _ => false, // Unknown slash command — pass through to LLM
@@ -827,6 +901,203 @@ impl SessionActor {
             .await;
     }
 
+    /// `/status` — view or configure per-user status layers.
+    ///
+    /// Usage:
+    ///   /status                        — show current config
+    ///   /status greeting <text>        — set greeting template
+    ///   /status provider on|off        — toggle provider layer
+    ///   /status metrics on|off         — toggle metrics layer
+    ///   /status words <w1,w2,...>       — set custom status words
+    ///   /status add <id> <priority> <text> — add custom layer
+    ///   /status remove <id>            — remove custom layer
+    ///   /status reset                  — reset to defaults
+    async fn handle_status_command(&mut self, args: &[&str]) {
+        use crate::status_layers::{CustomLayerDef, LayerPolicy};
+
+        if args.is_empty() {
+            let cfg = &self.user_status_config;
+            let mut lines = vec![
+                "**Status Config**".to_string(),
+                format!(
+                    "Greeting: {}",
+                    cfg.greeting_template.as_deref().unwrap_or("(none)")
+                ),
+                format!("Provider visible: {}", cfg.provider_visible),
+                format!("Metrics visible: {}", cfg.metrics_visible),
+                format!("Greeting duration: {}s", cfg.greeting_duration_secs),
+            ];
+            if let Some(ref words) = cfg.status_words {
+                lines.push(format!("Words: {}", words.join(", ")));
+            }
+            if let Some(ref locale) = cfg.locale {
+                lines.push(format!("Locale: {locale}"));
+            }
+            for custom in &cfg.custom_layers {
+                lines.push(format!(
+                    "Custom layer `{}` (p={}): {}",
+                    custom.id, custom.priority, custom.content
+                ));
+            }
+            self.send_reply(&lines.join("\n")).await;
+            return;
+        }
+
+        match args[0] {
+            "greeting" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status greeting <text>  (or /status greeting off)")
+                        .await;
+                    return;
+                }
+                let text = args[1..].join(" ");
+                if text == "off" || text == "none" {
+                    self.user_status_config.greeting_template = None;
+                    self.send_reply("Greeting disabled.").await;
+                } else {
+                    self.user_status_config.greeting_template = Some(text.clone());
+                    self.send_reply(&format!("Greeting set: {text}")).await;
+                }
+            }
+            "provider" => {
+                let on = match args.get(1).copied() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => {
+                        self.send_reply("Usage: /status provider on|off").await;
+                        return;
+                    }
+                };
+                self.user_status_config.provider_visible = on;
+                self.send_reply(&format!(
+                    "Provider layer: {}",
+                    if on { "visible" } else { "hidden" }
+                ))
+                .await;
+            }
+            "metrics" => {
+                let on = match args.get(1).copied() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    _ => {
+                        self.send_reply("Usage: /status metrics on|off").await;
+                        return;
+                    }
+                };
+                self.user_status_config.metrics_visible = on;
+                self.send_reply(&format!(
+                    "Metrics layer: {}",
+                    if on { "visible" } else { "hidden" }
+                ))
+                .await;
+            }
+            "words" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status words word1,word2,...")
+                        .await;
+                    return;
+                }
+                let words: Vec<String> = args[1..]
+                    .join(" ")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if words.is_empty() {
+                    self.user_status_config.status_words = None;
+                    self.send_reply("Status words reset to default.").await;
+                } else {
+                    let preview = words.join(", ");
+                    self.user_status_config.status_words = Some(words);
+                    self.send_reply(&format!("Status words: {preview}")).await;
+                }
+            }
+            "add" => {
+                // /status add <id> <priority> <text>
+                if args.len() < 4 {
+                    self.send_reply("Usage: /status add <id> <priority> <text>")
+                        .await;
+                    return;
+                }
+                let id = args[1].to_string();
+                let priority: u8 = match args[2].parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.send_reply("Priority must be a number 0-255.").await;
+                        return;
+                    }
+                };
+                let content = args[3..].join(" ");
+                // Remove existing layer with same ID
+                self.user_status_config.custom_layers.retain(|l| l.id != id);
+                self.user_status_config.custom_layers.push(CustomLayerDef {
+                    id: id.clone(),
+                    priority,
+                    policy: LayerPolicy::Fixed,
+                    content: content.clone(),
+                });
+                self.send_reply(&format!("Added layer `{id}` (p={priority}): {content}"))
+                    .await;
+            }
+            "remove" => {
+                if args.len() < 2 {
+                    self.send_reply("Usage: /status remove <id>").await;
+                    return;
+                }
+                let id = args[1];
+                let before = self.user_status_config.custom_layers.len();
+                self.user_status_config.custom_layers.retain(|l| l.id != id);
+                if self.user_status_config.custom_layers.len() < before {
+                    self.send_reply(&format!("Removed layer `{id}`.")).await;
+                } else {
+                    self.send_reply(&format!("No custom layer `{id}` found."))
+                        .await;
+                }
+            }
+            "duration" => {
+                if let Some(secs) = args.get(1).and_then(|s| s.parse::<u64>().ok()) {
+                    self.user_status_config.greeting_duration_secs = secs;
+                    self.send_reply(&format!("Greeting duration: {secs}s"))
+                        .await;
+                } else {
+                    self.send_reply("Usage: /status duration <seconds>").await;
+                    return;
+                }
+            }
+            "locale" => {
+                if let Some(loc) = args.get(1) {
+                    if *loc == "auto" || *loc == "off" {
+                        self.user_status_config.locale = None;
+                        self.send_reply("Locale: auto-detect").await;
+                    } else {
+                        self.user_status_config.locale = Some(loc.to_string());
+                        self.send_reply(&format!("Locale: {loc}")).await;
+                    }
+                } else {
+                    self.send_reply("Usage: /status locale <en|zh|auto>").await;
+                    return;
+                }
+            }
+            "reset" => {
+                self.user_status_config = UserStatusConfig::default();
+                self.send_reply("Status config reset to defaults.").await;
+            }
+            other => {
+                self.send_reply(&format!(
+                    "Unknown status subcommand: {other}\n\
+                    Usage: /status [greeting|provider|metrics|words|add|remove|duration|locale|reset]"
+                )).await;
+                return;
+            }
+        }
+
+        // Persist changes
+        let base_key = self.session_key.base_key();
+        if let Err(e) = self.user_status_config.save(&self.data_dir, &base_key) {
+            warn!(error = %e, "failed to save user status config");
+        }
+    }
+
     /// Send a short reply to the user (for command responses).
     async fn send_reply(&self, content: &str) {
         let _ = self
@@ -946,7 +1217,13 @@ impl SessionActor {
             // Save full report to memory bank
             let slug = task_label
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect::<String>()
                 .to_lowercase();
             let slug = slug.trim_matches('-').to_string();
@@ -987,9 +1264,11 @@ impl SessionActor {
         };
 
         let system_msg = Message::system(context_content);
-        let mut mgr = self.session_mgr.lock().await;
-        if let Err(e) = mgr.add_message(&self.session_key, system_msg).await {
-            warn!(session = %self.session_key, error = %e, "failed to inject background result");
+        {
+            let mut handle = self.session_handle.lock().await;
+            if let Err(e) = handle.add_message(system_msg).await {
+                warn!(session = %self.session_key, error = %e, "failed to inject background result");
+            }
         }
 
         // Notify user with preview
@@ -1057,23 +1336,22 @@ impl SessionActor {
             timestamp: chrono::Utc::now(),
         };
         {
-            let mut mgr = self.session_mgr.lock().await;
+            let mut handle = self.session_handle.lock().await;
             // Auto-generate summary from first user message
             {
-                let session = mgr.get_or_create(&self.session_key);
+                let session = handle.get_or_create();
                 if session.summary.is_none() && !inbound.content.trim().is_empty() {
                     let summary: String = inbound.content.chars().take(100).collect();
                     session.summary = Some(summary);
                 }
             }
-            let _ = mgr.add_message(&self.session_key, user_msg).await;
+            let _ = handle.add_message(user_msg).await;
         }
 
         // Get conversation history (now includes the user message we just saved)
         let history: Vec<Message> = {
-            let mut mgr = self.session_mgr.lock().await;
-            let session = mgr.get_or_create(&self.session_key);
-            session.get_history(max_history).to_vec()
+            let handle = self.session_handle.lock().await;
+            handle.get_history(max_history).to_vec()
         };
 
         // Token tracker for status indicator
@@ -1091,15 +1369,31 @@ impl SessionActor {
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
+                &self.user_status_config,
             )
         });
 
         // Set up progressive streaming reporter
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
         let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx,
+            stream_tx.clone(),
         ));
         self.agent.set_reporter(reporter);
+
+        // Wire adaptive router status callback to forward through the stream channel.
+        // This lets failover events inside chat_stream() surface as LlmStatus messages.
+        if let Some(ref router) = self.adaptive_router {
+            let status_tx = stream_tx.clone();
+            router.set_status_callback(Some(Arc::new(move |message: String| {
+                let _ = status_tx
+                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
+            })));
+        }
+
+        // Set provider layer on the status composer
+        if let Some(ref handle) = status_handle {
+            handle.set_provider(self.agent.provider_name(), self.agent.model_id());
+        }
 
         // Spawn stream forwarder task (only for channels that support editing)
         let stream_forwarder = if let Some(ref si) = self.status_indicator {
@@ -1167,6 +1461,7 @@ impl SessionActor {
 
         let started = Instant::now();
         let mut overflow_served = false;
+        let mut overflow_commands: Vec<InboundMessage> = Vec::new();
 
         let (agent_result, llm_latency) = loop {
             tokio::select! {
@@ -1177,8 +1472,11 @@ impl SessionActor {
                         Err(e) => {
                             warn!(session = %self.session_key, error = %e, "agent task panicked");
                             self.send_reply("Internal error during processing.").await;
-                            // Clean up reporter + status
+                            // Clean up reporter + status + callback
                             self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(ref router) = self.adaptive_router {
+                                router.set_status_callback(None);
+                            }
                             if let Some(handle) = status_handle {
                                 handle.stop().await;
                             }
@@ -1193,6 +1491,12 @@ impl SessionActor {
                             if crew_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
                                 self.send_reply("🛑 Cancelled.").await;
+                                continue;
+                            }
+                            // Check if this is a slash command — handle inline
+                            // instead of spawning an overflow agent.
+                            if message.content.trim().starts_with('/') {
+                                overflow_commands.push(message);
                                 continue;
                             }
                             let elapsed = started.elapsed();
@@ -1216,6 +1520,9 @@ impl SessionActor {
                         None => {
                             // All senders dropped — actor shutting down
                             self.agent.set_reporter(Arc::new(crew_agent::SilentReporter));
+                            if let Some(ref router) = self.adaptive_router {
+                                router.set_status_callback(None);
+                            }
                             if let Some(handle) = status_handle {
                                 handle.stop().await;
                             }
@@ -1227,6 +1534,15 @@ impl SessionActor {
         };
 
         // ── Post-processing (back to &mut self) ────────────────────────
+
+        // Drop the semaphore permit before &mut self operations below.
+        drop(_permit);
+
+        // Handle any slash commands that arrived during the select loop.
+        // We deferred them to avoid &mut self borrow conflicts in tokio::select!.
+        for cmd_msg in overflow_commands {
+            self.try_handle_command(&cmd_msg).await;
+        }
 
         // Feed latency to responsiveness observer
         self.responsiveness.record(llm_latency);
@@ -1264,6 +1580,11 @@ impl SessionActor {
         self.agent
             .set_reporter(Arc::new(crew_agent::SilentReporter));
 
+        // Clear adaptive router status callback (stream_tx is being dropped)
+        if let Some(ref router) = self.adaptive_router {
+            router.set_status_callback(None);
+        }
+
         // Wait for stream forwarder
         let stream_result = if let Some(handle) = stream_forwarder {
             (handle.await).ok()
@@ -1284,7 +1605,7 @@ impl SessionActor {
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
                 {
-                    let mut mgr = self.session_mgr.lock().await;
+                    let mut handle = self.session_handle.lock().await;
                     let messages_to_save = if !conv_response.messages.is_empty()
                         && conv_response.messages[0].role == MessageRole::User
                     {
@@ -1293,7 +1614,7 @@ impl SessionActor {
                         &conv_response.messages
                     };
                     for msg in messages_to_save {
-                        if let Err(e) = mgr.add_message(&self.session_key, msg.clone()).await {
+                        if let Err(e) = handle.add_message(msg.clone()).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
@@ -1301,16 +1622,14 @@ impl SessionActor {
                     // Sort messages by timestamp to restore chronological order.
                     // During concurrent speculative overflow, overflow responses
                     // may have been inserted before the primary call's messages.
-                    let session = mgr.get_or_create(&self.session_key);
-                    session.sort_by_timestamp();
-                    if let Err(e) = mgr.rewrite(&self.session_key).await {
+                    handle.sort_by_timestamp();
+                    if let Err(e) = handle.rewrite().await {
                         warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
                     }
 
                     // Compact if needed
-                    if let Err(e) = crate::compaction::maybe_compact(
-                        &mut mgr,
-                        &self.session_key,
+                    if let Err(e) = crate::compaction::maybe_compact_handle(
+                        &mut handle,
                         &*self.llm_for_compaction,
                     )
                     .await
@@ -1429,16 +1748,47 @@ impl SessionActor {
     /// Each overflow gets its own chat bubble (stream reporter + status
     /// indicator) so the user sees independent progress per message.
     fn serve_overflow(&self, msg: &InboundMessage, pre_primary_history: &[Message]) {
+        // Check per-session overflow concurrency limit
+        let current = self.active_overflow_tasks.load(Ordering::Acquire);
+        if current >= MAX_OVERFLOW_TASKS {
+            warn!(
+                session = %self.session_key,
+                active = current,
+                limit = MAX_OVERFLOW_TASKS,
+                "overflow concurrency limit reached, returning busy response"
+            );
+            let out_tx = self.out_tx.clone();
+            let channel = self.channel.clone();
+            let chat_id = self.chat_id.clone();
+            let reply_to = msg.message_id.clone();
+            tokio::spawn(async move {
+                let _ = out_tx
+                    .send(OutboundMessage {
+                        channel,
+                        chat_id,
+                        content: "I'm currently handling several tasks. Please wait a moment and try again.".to_string(),
+                        reply_to,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    })
+                    .await;
+            });
+            return;
+        }
+        self.active_overflow_tasks.fetch_add(1, Ordering::Release);
+
         info!(
             session = %self.session_key,
             overflow_content_len = msg.content.len(),
             history_len = pre_primary_history.len(),
+            active_overflow = current + 1,
             "speculative: spawning full agent task for overflow with own chat bubble"
         );
 
         // Clone everything needed for the spawned task
         let agent = Arc::clone(&self.agent);
-        let session_mgr = Arc::clone(&self.session_mgr);
+        let session_handle = Arc::clone(&self.session_handle);
+        let overflow_counter = Arc::clone(&self.active_overflow_tasks);
         let out_tx = self.out_tx.clone();
         let channel = self.channel.clone();
         let chat_id = self.chat_id.clone();
@@ -1447,6 +1797,7 @@ impl SessionActor {
         let overflow_reply_to = msg.message_id.clone();
         let session_timeout = self.session_timeout;
         let status_indicator = self.status_indicator.clone();
+        let user_status_config = self.user_status_config.clone();
         let history = pre_primary_history.to_vec();
 
         tokio::spawn(async move {
@@ -1461,8 +1812,8 @@ impl SessionActor {
                 timestamp: chrono::Utc::now(),
             };
             {
-                let mut mgr = session_mgr.lock().await;
-                let _ = mgr.add_message(&session_key, user_msg).await;
+                let mut handle = session_handle.lock().await;
+                let _ = handle.add_message(user_msg).await;
             }
 
             let history: Vec<Message> = history;
@@ -1475,13 +1826,15 @@ impl SessionActor {
                     &content,
                     Arc::clone(&tracker),
                     None,
+                    &user_status_config,
                 )
             });
 
             // ── Per-overflow stream reporter (own chat bubble) ──────────────
             let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
-            let overflow_reporter: Arc<dyn crew_agent::ProgressReporter> =
-                Arc::new(crate::stream_reporter::ChannelStreamReporter::new(stream_tx));
+            let overflow_reporter: Arc<dyn crew_agent::ProgressReporter> = Arc::new(
+                crate::stream_reporter::ChannelStreamReporter::new(stream_tx),
+            );
 
             // Spawn stream forwarder — edits its OWN message, not the primary's
             let stream_forwarder = if let Some(ref si) = status_indicator {
@@ -1502,14 +1855,15 @@ impl SessionActor {
 
             // ── Run agent with task-local reporter override ─────────────────
             let reporter_for_scope = overflow_reporter.clone();
-            let result = crew_agent::TASK_REPORTER.scope(reporter_for_scope, async {
-                tokio::time::timeout(
-                    session_timeout,
-                    agent.process_message_tracked(&content, &history, vec![], &tracker),
-                )
-                .await
-            })
-            .await;
+            let result = crew_agent::TASK_REPORTER
+                .scope(reporter_for_scope, async {
+                    tokio::time::timeout(
+                        session_timeout,
+                        agent.process_message_tracked(&content, &history, vec![], &tracker),
+                    )
+                    .await
+                })
+                .await;
 
             // Drop the reporter so the stream forwarder sees channel close
             drop(overflow_reporter);
@@ -1536,7 +1890,7 @@ impl SessionActor {
                     // to avoid tool_call ID collisions when multiple overflow
                     // tasks run concurrently (e.g. two deep_search_0 IDs).
                     {
-                        let mut mgr = session_mgr.lock().await;
+                        let mut handle = session_handle.lock().await;
                         let final_reply = Message {
                             role: MessageRole::Assistant,
                             content: conv_response.content.clone(),
@@ -1546,7 +1900,7 @@ impl SessionActor {
                             reasoning_content: None,
                             timestamp: chrono::Utc::now(),
                         };
-                        let _ = mgr.add_message(&session_key, final_reply).await;
+                        let _ = handle.add_message(final_reply).await;
                     }
 
                     let reply = strip_think_tags(&conv_response.content);
@@ -1595,6 +1949,8 @@ impl SessionActor {
                         .await;
                 }
             }
+            // Decrement active overflow counter
+            overflow_counter.fetch_sub(1, Ordering::Release);
         });
     }
 
@@ -1611,8 +1967,8 @@ impl SessionActor {
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
         let history: Vec<Message> = {
-            let mut mgr = self.session_mgr.lock().await;
-            let session = mgr.get_or_create(&self.session_key);
+            let mut handle = self.session_handle.lock().await;
+            let session = handle.get_or_create();
             session.get_history(max_history).to_vec()
         };
 
@@ -1632,15 +1988,30 @@ impl SessionActor {
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
+                &self.user_status_config,
             )
         });
 
         // Set up progressive streaming reporter if we have a channel
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
         let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx,
+            stream_tx.clone(),
         ));
         self.agent.set_reporter(reporter);
+
+        // Wire adaptive router status callback for failover notifications
+        if let Some(ref router) = self.adaptive_router {
+            let status_tx = stream_tx.clone();
+            router.set_status_callback(Some(Arc::new(move |message: String| {
+                let _ = status_tx
+                    .send(crate::stream_reporter::StreamProgressEvent::LlmStatus { message });
+            })));
+        }
+
+        // Set provider layer on the status composer
+        if let Some(ref handle) = status_handle {
+            handle.set_provider(self.agent.provider_name(), self.agent.model_id());
+        }
 
         // Spawn stream forwarder task — edits a channel message as text arrives.
         // Only for channels that support message editing (Discord, Telegram, Feishu).
@@ -1719,6 +2090,11 @@ impl SessionActor {
         self.agent
             .set_reporter(Arc::new(crew_agent::SilentReporter));
 
+        // Clear adaptive router status callback
+        if let Some(ref router) = self.adaptive_router {
+            router.set_status_callback(None);
+        }
+
         // Wait for stream forwarder to complete and get its result
         let stream_result = if let Some(handle) = stream_forwarder {
             (handle.await).ok()
@@ -1737,11 +2113,10 @@ impl SessionActor {
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
                 {
-                    let mut mgr = self.session_mgr.lock().await;
-
+                    let mut handle = self.session_handle.lock().await;
                     // Auto-generate summary from first user message
                     {
-                        let session = mgr.get_or_create(&self.session_key);
+                        let session = handle.get_or_create();
                         if session.summary.is_none() && !inbound.content.trim().is_empty() {
                             let summary: String = inbound.content.chars().take(100).collect();
                             session.summary = Some(summary);
@@ -1749,15 +2124,14 @@ impl SessionActor {
                     }
 
                     for msg in &conv_response.messages {
-                        if let Err(e) = mgr.add_message(&self.session_key, msg.clone()).await {
+                        if let Err(e) = handle.add_message(msg.clone()).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
 
                     // Compact if needed
-                    if let Err(e) = crate::compaction::maybe_compact(
-                        &mut mgr,
-                        &self.session_key,
+                    if let Err(e) = crate::compaction::maybe_compact_handle(
+                        &mut handle,
                         &*self.llm_for_compaction,
                     )
                     .await
@@ -2035,13 +2409,18 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
-            session_mgr: session_mgr.clone(),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
             llm_for_compaction: Arc::new(DelayedMockProvider::new(
                 "compaction",
                 vec![(Duration::ZERO, make_response("compacted"))],
             )),
             out_tx,
             status_indicator: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -2052,6 +2431,7 @@ mod tests {
             responsiveness,
             adaptive_router,
             memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2111,13 +2491,18 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
-            session_mgr: session_mgr.clone(),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
             llm_for_compaction: Arc::new(DelayedMockProvider::new(
                 "compaction",
                 vec![(Duration::ZERO, make_response("compacted"))],
             )),
             out_tx,
             status_indicator: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -2128,6 +2513,7 @@ mod tests {
             responsiveness,
             adaptive_router: Some(router),
             memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2253,8 +2639,9 @@ mod tests {
 
         // ── Phase 4: Verify history is sorted by timestamp ──
         {
-            let mut mgr = session_mgr.lock().await;
-            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            // Reload from disk (actor writes via its own SessionHandle to per-user dir)
+            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let session = handle.session();
             let messages = &session.messages;
             assert!(
                 messages.len() >= 4,
@@ -2301,17 +2688,11 @@ mod tests {
 
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
             "router-a",
-            vec![(
-                Duration::from_millis(100),
-                make_response("unused"),
-            )],
+            vec![(Duration::from_millis(100), make_response("unused"))],
         ));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
             "router-b",
-            vec![(
-                Duration::from_millis(100),
-                make_response("unused"),
-            )],
+            vec![(Duration::from_millis(100), make_response("unused"))],
         ));
 
         let (tx, mut rx, handle, _session_mgr) =
@@ -2434,8 +2815,9 @@ mod tests {
 
         // Verify background result is in session history
         {
-            let mut mgr = session_mgr.lock().await;
-            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            // Reload from disk (actor writes via its own SessionHandle to per-user dir)
+            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let session = handle.session();
             let has_bg_msg = session
                 .messages
                 .iter()
@@ -2494,8 +2876,9 @@ mod tests {
 
         // Verify session history: second user message should contain batched content
         {
-            let mut mgr = session_mgr.lock().await;
-            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            // Reload from disk (actor writes via its own SessionHandle to per-user dir)
+            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
                 .iter()
@@ -2571,8 +2954,9 @@ mod tests {
 
         // Verify session history: "second message" should NOT appear as a user message
         {
-            let mut mgr = session_mgr.lock().await;
-            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            // Reload from disk (actor writes via its own SessionHandle to per-user dir)
+            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
                 .iter()
@@ -2638,8 +3022,9 @@ mod tests {
 
         // All 3 user messages should be in history individually
         {
-            let mut mgr = session_mgr.lock().await;
-            let session = mgr.get_or_create(&SessionKey::new("cli", "test"));
+            // Reload from disk (actor writes via its own SessionHandle to per-user dir)
+            let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+            let session = handle.session();
             let user_messages: Vec<&str> = session
                 .messages
                 .iter()

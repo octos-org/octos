@@ -54,7 +54,34 @@ pub struct SandboxConfig {
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
     pub docker: DockerConfig,
+
+    /// Restrict file reads to these paths (plus the workspace cwd).
+    /// Empty = allow all reads (default, backward compatible).
+    /// Non-empty = only allow reads from cwd + these paths (kernel-enforced on macOS/Linux).
+    #[serde(default)]
+    pub read_allow_paths: Vec<String>,
 }
+
+/// Default system paths that must be readable for shell commands to work.
+const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt/homebrew", // macOS Homebrew
+    "/Library",      // macOS system libraries
+    "/System",       // macOS system
+    "/Applications", // macOS apps (for tool binaries)
+    "/private/tmp",
+    "/private/var/folders",
+    "/tmp",
+    "/var/tmp",
+    "/etc", // system config (needed for DNS resolution, etc.)
+    "/dev/null",
+    "/dev/urandom",
+    "/dev/random",
+];
 
 impl Default for SandboxConfig {
     fn default() -> Self {
@@ -63,6 +90,7 @@ impl Default for SandboxConfig {
             mode: SandboxMode::Auto,
             allow_network: false,
             docker: DockerConfig::default(),
+            read_allow_paths: Vec::new(),
         }
     }
 }
@@ -70,7 +98,7 @@ impl Default for SandboxConfig {
 /// Docker sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DockerConfig {
-    /// Docker image to use (default: "alpine:3.21").
+    /// Docker image to use (default: "ubuntu:24.04").
     #[serde(default = "default_docker_image")]
     pub image: String,
 
@@ -89,6 +117,31 @@ pub struct DockerConfig {
     /// Workspace mount mode.
     #[serde(default)]
     pub mount_mode: MountMode,
+
+    /// Additional bind mounts (host:container or host:container:ro).
+    #[serde(default)]
+    pub extra_binds: Vec<String>,
+}
+
+/// Bind mount sources that could lead to container escape or host compromise.
+const BLOCKED_DOCKER_BIND_SOURCES: &[&str] = &[
+    "/var/run/docker.sock",
+    "docker.sock",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+];
+
+/// Check if a bind mount source is dangerous.
+fn is_blocked_bind_source(source: &str) -> bool {
+    let normalized = source.trim_end_matches('/');
+    BLOCKED_DOCKER_BIND_SOURCES.iter().any(|blocked| {
+        normalized == *blocked
+            || normalized.ends_with("/docker.sock")
+            || (normalized.starts_with(blocked)
+                && normalized.as_bytes().get(blocked.len()) == Some(&b'/'))
+    })
 }
 
 impl Default for DockerConfig {
@@ -99,12 +152,13 @@ impl Default for DockerConfig {
             memory_limit: None,
             pids_limit: None,
             mount_mode: MountMode::ReadWrite,
+            extra_binds: Vec::new(),
         }
     }
 }
 
 fn default_docker_image() -> String {
-    "alpine:3.21".to_string()
+    "ubuntu:24.04".to_string()
 }
 
 /// Workspace mount mode for Docker sandbox.
@@ -204,6 +258,9 @@ impl Sandbox for BwrapSandbox {
 /// macOS sandbox using sandbox-exec.
 pub struct MacosSandbox {
     allow_network: bool,
+    /// When non-empty, restrict file-read* to these paths + cwd.
+    /// Empty = allow all reads (backward compatible).
+    read_allow_paths: Vec<String>,
 }
 
 impl Sandbox for MacosSandbox {
@@ -232,23 +289,80 @@ impl Sandbox for MacosSandbox {
             "(deny network*)"
         };
 
+        // Build file-read rules: global if no read_allow_paths, restricted otherwise
+        let read_rules = if self.read_allow_paths.is_empty() {
+            "(allow file-read*)".to_string()
+        } else {
+            let mut rules = Vec::new();
+            // Always allow reading the workspace
+            rules.push(format!(
+                "(allow file-read* (subpath \"{cwd}\"))",
+                cwd = cwd_escaped
+            ));
+            // Add configured read paths
+            for path in &self.read_allow_paths {
+                rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
+            }
+            // Add default system paths
+            for path in DEFAULT_READ_ALLOW_PATHS {
+                if !self.read_allow_paths.iter().any(|p| p == *path) {
+                    if Path::new(path).exists() {
+                        rules.push(format!("(allow file-read* (subpath \"{path}\"))"));
+                    }
+                }
+            }
+            rules.join("\n")
+        };
+
+        // Resolve cwd to its real path (macOS /tmp → /private/tmp symlink).
+        // SBPL subpath rules operate on real paths, so if cwd is /tmp/foo the
+        // rule must use /private/tmp/foo or writes will be denied.
+        let real_cwd = std::fs::canonicalize(cwd)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| cwd_escaped.to_string());
+        // Validate the resolved path too
+        if real_cwd
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+        {
+            tracing::error!("resolved cwd contains SBPL metacharacters, refusing to execute");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("echo 'sandbox error: resolved cwd contains invalid characters' >&2; exit 1");
+            return cmd;
+        }
+
         let profile = format!(
             r#"(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
+(allow process-info*)
 (allow sysctl-read)
-(allow file-read*)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix*)
+(allow signal)
+(allow file-ioctl)
+{read_rules}
 (allow file-write* (subpath "{cwd}"))
-(allow file-write* (subpath "/private/tmp"))
-(allow file-write* (subpath "/private/var/folders"))
 {network_rule}
 "#,
-            cwd = cwd_escaped,
+            read_rules = read_rules,
+            cwd = real_cwd,
             network_rule = network_rule,
         );
 
+        // Create a per-user tmp dir inside the workspace so programs that
+        // need temp files (Python tempfile, compilers, etc.) still work.
+        let user_tmp = cwd.join("tmp");
+        let _ = std::fs::create_dir_all(&user_tmp);
+
         let mut cmd = Command::new("sandbox-exec");
+        // Redirect TMPDIR/TEMP/TMP to the per-user tmp inside the workspace
+        cmd.env("TMPDIR", &user_tmp);
+        cmd.env("TEMP", &user_tmp);
+        cmd.env("TMP", &user_tmp);
         // Clear dangerous environment variables (sandbox-exec inherits parent env)
         for var in BLOCKED_ENV_VARS {
             cmd.env_remove(var);
@@ -314,6 +428,18 @@ impl Sandbox for DockerSandbox {
                 .arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
             return fail;
         }
+        // Validate cwd against dangerous mount sources
+        if is_blocked_bind_source(&cwd_str) {
+            tracing::error!(
+                cwd = %cwd_str,
+                "cwd is a blocked bind mount source, refusing to execute"
+            );
+            let mut fail = Command::new("sh");
+            fail.arg("-c")
+                .arg("echo 'sandbox error: dangerous bind mount source blocked' >&2; exit 1");
+            return fail;
+        }
+
         match self.config.mount_mode {
             MountMode::ReadWrite => {
                 cmd.arg("-v").arg(format!("{cwd_str}:/workspace"));
@@ -326,6 +452,19 @@ impl Sandbox for DockerSandbox {
             MountMode::None => {
                 cmd.arg("-w").arg("/tmp");
             }
+        }
+
+        // Extra bind mounts (validated against dangerous sources)
+        for bind in &self.config.extra_binds {
+            let source = bind.split(':').next().unwrap_or(bind);
+            if is_blocked_bind_source(source) {
+                tracing::warn!(
+                    bind = %bind,
+                    "skipping dangerous bind mount source"
+                );
+                continue;
+            }
+            cmd.arg("-v").arg(bind);
         }
 
         cmd.arg(&self.config.image);
@@ -348,6 +487,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         }),
         SandboxMode::Macos => Box::new(MacosSandbox {
             allow_network: config.allow_network,
+            read_allow_paths: config.read_allow_paths.clone(),
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: config.docker.clone(),
@@ -361,6 +501,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             } else if cfg!(target_os = "macos") && which_exists("sandbox-exec") {
                 Box::new(MacosSandbox {
                     allow_network: config.allow_network,
+                    read_allow_paths: config.read_allow_paths.clone(),
                 })
             } else if which_exists("docker") {
                 Box::new(DockerSandbox {
@@ -427,6 +568,7 @@ mod tests {
     fn test_macos_sandbox_command() {
         let sb = MacosSandbox {
             allow_network: true,
+            read_allow_paths: Vec::new(),
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -437,6 +579,20 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.iter().any(|a| a.contains("allow network")));
+
+        // Verify /private/tmp is NOT in SBPL write rules (loophole fixed)
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+            "SBPL should NOT allow writes to /private/tmp (loophole)"
+        );
+        assert!(
+            !profile.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
+            "SBPL should NOT allow writes to /private/var/folders"
+        );
     }
 
     #[test]
@@ -458,7 +614,7 @@ mod tests {
         assert!(args.contains(&"none".to_string())); // --network none
         assert!(args.contains(&"no-new-privileges".to_string()));
         assert!(args.contains(&"ALL".to_string())); // --cap-drop ALL
-        assert!(args.contains(&"alpine:3.21".to_string()));
+        assert!(args.contains(&"ubuntu:24.04".to_string()));
         assert!(args.contains(&"echo hi".to_string()));
     }
 
@@ -556,6 +712,7 @@ mod tests {
     fn test_macos_sandbox_rejects_control_chars() {
         let sb = MacosSandbox {
             allow_network: false,
+            read_allow_paths: Vec::new(),
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -591,6 +748,7 @@ mod tests {
     fn test_macos_sandbox_rejects_sbpl_metacharacters() {
         let sb = MacosSandbox {
             allow_network: false,
+            read_allow_paths: Vec::new(),
         };
         // Parentheses, backslash, and quote should all be rejected
         for path in &[
@@ -740,7 +898,7 @@ mod tests {
     #[test]
     fn test_docker_config_default() {
         let config = DockerConfig::default();
-        assert_eq!(config.image, "alpine:3.21");
+        assert_eq!(config.image, "ubuntu:24.04");
         assert!(config.cpu_limit.is_none());
         assert!(config.memory_limit.is_none());
         assert!(config.pids_limit.is_none());
@@ -754,7 +912,7 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.mode, SandboxMode::Auto);
         assert!(!config.allow_network);
-        assert_eq!(config.docker.image, "alpine:3.21");
+        assert_eq!(config.docker.image, "ubuntu:24.04");
     }
 
     // --- create_sandbox with SandboxMode::None ---
@@ -766,6 +924,7 @@ mod tests {
             mode: SandboxMode::None,
             allow_network: false,
             docker: DockerConfig::default(),
+            read_allow_paths: Vec::new(),
         };
         let sb = create_sandbox(&config);
         // Should produce a NoSandbox (sh -c)
@@ -799,6 +958,7 @@ mod tests {
     fn test_macos_sandbox_denies_network() {
         let sb = MacosSandbox {
             allow_network: false,
+            read_allow_paths: Vec::new(),
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -848,6 +1008,7 @@ mod tests {
     fn test_macos_sandbox_accepts_valid_path() {
         let sb = MacosSandbox {
             allow_network: false,
+            read_allow_paths: Vec::new(),
         };
         let cmd = sb.wrap_command("echo ok", Path::new("/Users/test/project"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -873,9 +1034,137 @@ mod tests {
     fn test_macos_sandbox_rejects_del_character() {
         let sb = MacosSandbox {
             allow_network: false,
+            read_allow_paths: Vec::new(),
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/evil\x7Fpath"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
         assert_eq!(prog, "sh");
+    }
+
+    // --- Blocked Docker bind sources ---
+
+    #[test]
+    fn should_block_docker_socket_bind() {
+        assert!(is_blocked_bind_source("/var/run/docker.sock"));
+        assert!(is_blocked_bind_source("/home/user/.docker/docker.sock"));
+        assert!(is_blocked_bind_source("docker.sock"));
+    }
+
+    #[test]
+    fn should_block_dangerous_system_dirs() {
+        assert!(is_blocked_bind_source("/etc"));
+        assert!(is_blocked_bind_source("/etc/"));
+        assert!(is_blocked_bind_source("/etc/passwd"));
+        assert!(is_blocked_bind_source("/proc"));
+        assert!(is_blocked_bind_source("/sys"));
+        assert!(is_blocked_bind_source("/dev"));
+    }
+
+    #[test]
+    fn should_allow_safe_bind_paths() {
+        assert!(!is_blocked_bind_source("/home/user/workspace"));
+        assert!(!is_blocked_bind_source("/tmp"));
+        assert!(!is_blocked_bind_source("/opt/data"));
+    }
+
+    #[test]
+    fn should_reject_docker_sandbox_with_blocked_cwd() {
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/etc"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        // Should fall back to error shell
+        assert_eq!(prog, "sh");
+    }
+
+    #[test]
+    fn should_skip_blocked_extra_binds() {
+        let sb = DockerSandbox {
+            config: DockerConfig {
+                extra_binds: vec![
+                    "/home/user/data:/data:ro".to_string(),
+                    "/var/run/docker.sock:/var/run/docker.sock".to_string(),
+                    "/proc:/host-proc:ro".to_string(),
+                ],
+                ..DockerConfig::default()
+            },
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp/safe"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // Safe bind should be present
+        assert!(
+            args.iter().any(|a| a.contains("/home/user/data")),
+            "safe bind mount should be included"
+        );
+        // Dangerous binds should be filtered out
+        assert!(
+            !args.iter().any(|a| a.contains("docker.sock")),
+            "docker.sock bind should be blocked"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("/proc")),
+            "/proc bind should be blocked"
+        );
+    }
+
+    // --- macOS restricted read paths ---
+
+    #[test]
+    fn should_use_global_file_read_when_no_read_paths() {
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // Should contain unrestricted file-read*
+        assert!(
+            args.iter().any(|a| a.contains("(allow file-read*)\n")),
+            "should have global file-read* when read_allow_paths is empty"
+        );
+    }
+
+    #[test]
+    fn should_restrict_reads_when_read_paths_configured() {
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: vec!["/custom/path".to_string()],
+        };
+        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        // Should NOT contain unrestricted file-read*
+        assert!(
+            !profile.contains("(allow file-read*)\n"),
+            "should not have global file-read*"
+        );
+        // Should contain workspace read
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/tmp/test"))"#),
+            "should allow reading workspace"
+        );
+        // Should contain custom path
+        assert!(
+            profile.contains(r#"(allow file-read* (subpath "/custom/path"))"#),
+            "should allow reading custom path"
+        );
     }
 }

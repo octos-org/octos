@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use eyre::{bail, Context, Result};
+use eyre::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// The type of plugin.
@@ -194,10 +194,7 @@ impl PluginManifest {
         // Each tool must have a name.
         for tool in &self.tools {
             if tool.name.is_empty() {
-                bail!(
-                    "tool in plugin '{}' has an empty name",
-                    self.id
-                );
+                bail!("tool in plugin '{}' has an empty name", self.id);
             }
         }
         Ok(())

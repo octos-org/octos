@@ -34,26 +34,35 @@ struct SynthesizeInput {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn api_base_url() -> String {
-    if let Ok(url) = std::env::var("OMINIX_API_URL") {
-        return url.trim_end_matches('/').to_string();
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let discovery = Path::new(&home).join(".ominix").join("api_url");
-        if let Ok(url) = std::fs::read_to_string(&discovery) {
-            let url = url.trim();
-            if !url.is_empty() {
-                return url.trim_end_matches('/').to_string();
-            }
-        }
-    }
-    "http://localhost:8080".to_string()
+/// Resolve URL for a specific ominix-api service.
+/// 3-process architecture: ASR on :8081, preset TTS on :8082, clone TTS on :8083.
+/// Falls back to OMINIX_API_URL for single-process setups.
+fn asr_url() -> String {
+    std::env::var("OMINIX_ASR_URL")
+        .unwrap_or_else(|_| "http://localhost:8081".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn tts_url() -> String {
+    std::env::var("OMINIX_TTS_URL")
+        .unwrap_or_else(|_| "http://localhost:8082".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn clone_url() -> String {
+    std::env::var("OMINIX_CLONE_URL")
+        .unwrap_or_else(|_| "http://localhost:8083".to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(5))
+        .tcp_keepalive(Duration::from_secs(15))
         .build()
         .expect("failed to build HTTP client")
 }
@@ -128,9 +137,9 @@ fn handle_transcribe(input_json: &str) {
         }
     }
 
-    let base_url = api_base_url();
+    let asr = asr_url();
     let client = http_client();
-    if let Err(e) = check_health(&client, &base_url) {
+    if let Err(e) = check_health(&client, &asr) {
         fail(&e);
     }
 
@@ -143,7 +152,7 @@ fn handle_transcribe(input_json: &str) {
     });
 
     let resp = match client
-        .post(format!("{base_url}/v1/audio/transcriptions"))
+        .post(format!("{asr}/v1/audio/transcriptions"))
         .json(&body)
         .send()
     {
@@ -191,9 +200,8 @@ fn handle_synthesize(input_json: &str) {
         fail("'text' must not be empty");
     }
 
-    let base_url = api_base_url();
     let client = http_client();
-    if let Err(e) = check_health(&client, &base_url) {
+    if let Err(e) = check_health(&client, &asr_url()) {
         fail(&e);
     }
 
@@ -212,8 +220,8 @@ fn handle_synthesize(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
-    let body = if let Some(ref ref_audio) = input.reference_audio {
-        // Voice cloning mode: use reference_audio for x-vector speaker embedding (requires Base model)
+    let (endpoint, body) = if let Some(ref ref_audio) = input.reference_audio {
+        // Voice cloning → clone port directly (Base model)
         let ref_path = Path::new(ref_audio);
         if !ref_path.exists() {
             fail(&format!("Reference audio not found: {ref_audio}"));
@@ -221,26 +229,28 @@ fn handle_synthesize(input_json: &str) {
         if !ref_path.is_file() {
             fail(&format!("Not a file: {ref_audio}"));
         }
-        json!({
-            "input": input.text,
-            "reference_audio": ref_audio,
-            "language": language
-        })
+        (
+            format!("{}/v1/audio/speech/clone", clone_url()),
+            json!({
+                "input": input.text,
+                "reference_audio": ref_audio,
+                "language": language
+            }),
+        )
     } else {
-        // Preset voice mode
+        // Preset voice → TTS port directly (CustomVoice model)
         let speaker = input.speaker.unwrap_or_else(|| "vivian".to_string());
-        json!({
-            "input": input.text,
-            "voice": speaker,
-            "language": language
-        })
+        (
+            format!("{}/v1/audio/speech", tts_url()),
+            json!({
+                "input": input.text,
+                "voice": speaker,
+                "language": language
+            }),
+        )
     };
 
-    let resp = match client
-        .post(format!("{base_url}/v1/audio/speech"))
-        .json(&body)
-        .send()
-    {
+    let resp = match client.post(&endpoint).json(&body).send() {
         Ok(r) => r,
         Err(e) => fail(&format!("TTS request failed: {e}")),
     };
@@ -270,7 +280,11 @@ fn handle_synthesize(input_json: &str) {
     // 24kHz 16-bit mono = 48000 bytes/sec
     let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
 
-    let mode = if input.reference_audio.is_some() { "cloned voice" } else { "preset voice" };
+    let mode = if input.reference_audio.is_some() {
+        "cloned voice"
+    } else {
+        "preset voice"
+    };
     succeed(&format!(
         "Generated audio: {output_path} ({duration_secs:.1}s, {mode}, {} bytes). Use send_file to deliver it to the user.",
         wav_bytes.len()

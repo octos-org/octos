@@ -101,6 +101,45 @@ pub trait Channel: Send + Sync {
         content.to_string()
     }
 
+    /// Add an emoji reaction to a message. Default: no-op.
+    async fn react_to_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove an emoji reaction from a message. Default: no-op.
+    async fn remove_reaction(&self, _chat_id: &str, _message_id: &str, _emoji: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Send a rich embed message. Default: falls back to plain text.
+    async fn send_embed(
+        &self,
+        chat_id: &str,
+        title: &str,
+        description: &str,
+        fields: &[(String, String, bool)],
+        _color: Option<u32>,
+    ) -> Result<Option<String>> {
+        let mut text = format!("**{title}**\n{description}");
+        for (name, value, _inline) in fields {
+            text.push_str(&format!("\n**{name}:** {value}"));
+        }
+        let msg = OutboundMessage {
+            channel: self.name().to_string(),
+            chat_id: chat_id.to_string(),
+            content: text,
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        };
+        self.send_with_id(&msg).await
+    }
+
     /// Check channel health. Returns Ok(healthy) or Err with diagnosis.
     ///
     /// Used by the admin dashboard to show per-channel status. Default: unknown
@@ -188,9 +227,7 @@ impl ChannelManager {
                     } else if msg.content.is_empty() {
                         // Metadata-only message (e.g., completion signal) — deliver
                         // directly if metadata is present; skip empty messages otherwise.
-                        if !msg.metadata.is_null()
-                            && msg.metadata != serde_json::json!({})
-                        {
+                        if !msg.metadata.is_null() && msg.metadata != serde_json::json!({}) {
                             if let Err(e) = channel.send(&msg).await {
                                 error!(
                                     channel = msg.channel,

@@ -5,6 +5,7 @@
 //! in-memory with configurable expiry.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -53,13 +54,11 @@ fn default_session_hours() -> u64 {
 
 struct PendingOtp {
     code: String,
-    #[allow(dead_code)]
-    email: String,
     created_at: DateTime<Utc>,
     attempts: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub user_id: String,
     pub role: UserRole,
@@ -67,7 +66,7 @@ pub struct ActiveSession {
     pub expires_at: DateTime<Utc>,
 }
 
-/// In-memory OTP and session manager.
+/// OTP and session manager with optional disk persistence.
 pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
     sessions: RwLock<HashMap<String, ActiveSession>>,
@@ -78,6 +77,8 @@ pub struct AuthManager {
     session_expiry_hours: u64,
     pub allow_self_registration: bool,
     user_store: Arc<UserStore>,
+    /// Path to persist sessions. `None` = in-memory only (tests).
+    sessions_path: Option<PathBuf>,
 }
 
 impl AuthManager {
@@ -98,6 +99,7 @@ impl AuthManager {
             session_expiry_hours,
             allow_self_registration,
             user_store,
+            sessions_path: None,
         }
     }
 
@@ -106,6 +108,31 @@ impl AuthManager {
     pub fn with_smtp_password(mut self, password: String) -> Self {
         self.smtp_password = Some(password);
         self
+    }
+
+    /// Set the path for session persistence and load any existing sessions.
+    pub fn with_sessions_path(mut self, path: PathBuf) -> Self {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, ActiveSession>>(&data) {
+                let now = Utc::now();
+                let active: HashMap<String, ActiveSession> = saved
+                    .into_iter()
+                    .filter(|(_, s)| now < s.expires_at)
+                    .collect();
+                let count = active.len();
+                self.sessions = RwLock::new(active);
+                tracing::info!(count, path = %path.display(), "restored persisted sessions");
+            }
+        }
+        self.sessions_path = Some(path);
+        self
+    }
+
+    /// Persist current sessions to disk (best-effort).
+    fn persist_sessions_blocking(sessions: &HashMap<String, ActiveSession>, path: &PathBuf) {
+        if let Ok(data) = serde_json::to_string(sessions) {
+            let _ = std::fs::write(path, data);
+        }
     }
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
@@ -140,7 +167,6 @@ impl AuthManager {
                 email_lower.clone(),
                 PendingOtp {
                     code: code.clone(),
-                    email: email_lower.clone(),
                     created_at: now,
                     attempts: 0,
                 },
@@ -246,6 +272,9 @@ impl AuthManager {
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(token.clone(), session);
+            if let Some(ref path) = self.sessions_path {
+                Self::persist_sessions_blocking(&sessions, path);
+            }
         }
 
         Ok(Some(token))
@@ -262,6 +291,9 @@ impl AuthManager {
                 // Eagerly remove expired session
                 let mut sessions = self.sessions.write().await;
                 sessions.remove(token);
+                if let Some(ref path) = self.sessions_path {
+                    Self::persist_sessions_blocking(&sessions, path);
+                }
                 return None;
             }
             session.user_id.clone()
@@ -283,6 +315,9 @@ impl AuthManager {
     pub async fn revoke_session(&self, token: &str) {
         let mut sessions = self.sessions.write().await;
         sessions.remove(token);
+        if let Some(ref path) = self.sessions_path {
+            Self::persist_sessions_blocking(&sessions, path);
+        }
     }
 
     /// Clean up expired OTPs and sessions.
@@ -296,7 +331,13 @@ impl AuthManager {
 
         {
             let mut sessions = self.sessions.write().await;
+            let before = sessions.len();
             sessions.retain(|_, session| now < session.expires_at);
+            if sessions.len() != before {
+                if let Some(ref path) = self.sessions_path {
+                    Self::persist_sessions_blocking(&sessions, path);
+                }
+            }
         }
     }
 

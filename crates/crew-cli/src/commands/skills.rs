@@ -29,7 +29,7 @@ pub struct InstallResult {
 }
 
 const DEFAULT_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/humanagency-org/skill-registry/main/registry.json";
+    "https://raw.githubusercontent.com/hagency-org/skill-registry/main/registry.json";
 
 /// Pre-built binary info for a specific platform.
 #[derive(Debug, Clone, Deserialize)]
