@@ -28,6 +28,9 @@ crates/crew-cli/static/admin/
 .envrc
 .crew/
 
+# Deploy script (contains credentials)
+scripts/deploy.sh
+
 # Agent research output
 *.md
 !README.md
