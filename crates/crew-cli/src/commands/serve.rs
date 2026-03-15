@@ -182,8 +182,7 @@ impl ServeCommand {
                         if let Some(pw) = p.config.env_vars.get(pw_env) {
                             if pw == crate::auth::keychain::KEYCHAIN_MARKER {
                                 // Resolve from keychain
-                                if let Ok(Some(secret)) =
-                                    crate::auth::keychain::get_secret(pw_env)
+                                if let Ok(Some(secret)) = crate::auth::keychain::get_secret(pw_env)
                                 {
                                     tracing::info!(
                                         var = %pw_env,

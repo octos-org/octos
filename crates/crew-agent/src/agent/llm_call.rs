@@ -131,6 +131,10 @@ impl Agent {
                         reason,
                         "abnormal LLM response, retrying"
                     );
+                    // Clear stream forwarder buffer before retry so partial
+                    // text from this attempt isn't concatenated with the next.
+                    self.reporter()
+                        .report(ProgressEvent::StreamRetry { iteration });
                     self.reporter().report(ProgressEvent::LlmStatus {
                         message: format!(
                             "Retrying ({}/{})... {}",
@@ -153,6 +157,10 @@ impl Agent {
                             iteration,
                             "retryable stream error, retrying"
                         );
+                        // Clear stream forwarder buffer before retry so partial
+                        // text from this attempt isn't concatenated with the next.
+                        self.reporter()
+                            .report(ProgressEvent::StreamRetry { iteration });
                         self.reporter().report(ProgressEvent::LlmStatus {
                             message: format!(
                                 "Retrying ({}/{})... stream error",

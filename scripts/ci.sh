@@ -153,6 +153,54 @@ if [ "$QUICK" = false ] && [ -z "$SUBSYSTEM" ]; then
     fi
 fi
 
+# 3b. Focused test groups — verify critical subsystems explicitly
+section "Focused Test Groups"
+
+# Adaptive routing (Off/Hedge/Lane, circuit breaker, scoring, metrics)
+echo "  Running: adaptive routing tests"
+if cargo test -p crew-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-adaptive.log | tail -5; then
+    N=$(grep "^test result:" /tmp/crew-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    pass "adaptive routing ($N tests)"
+else
+    fail "adaptive routing"
+fi
+
+# Responsiveness observer (baseline, degradation, recovery)
+echo "  Running: responsiveness observer tests"
+if cargo test -p crew-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-resp.log | tail -5; then
+    N=$(grep "^test result:" /tmp/crew-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    pass "responsiveness observer ($N tests)"
+else
+    fail "responsiveness observer"
+fi
+
+# Queue modes + speculative overflow + auto-escalation
+echo "  Running: session actor tests (queue modes, speculative, escalation)"
+if cargo test -p crew-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
+    N=$(grep "^test result:" /tmp/crew-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    pass "session actor ($N tests)"
+else
+    fail "session actor"
+fi
+
+# Security sandbox (write isolation, /tmp loophole, Python escapes, SSRF, symlinks)
+echo "  Running: security sandbox tests"
+if cargo test -p crew-agent --test security_sandbox $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-security.log | tail -5; then
+    N=$(grep "^test result:" /tmp/crew-ci-security.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    pass "security sandbox ($N tests)"
+else
+    fail "security sandbox"
+fi
+
+# Session persistence (JSONL, LRU, fork, rewrite, sort)
+echo "  Running: session persistence tests"
+if cargo test -p crew-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-session.log | tail -5; then
+    N=$(grep "^test result:" /tmp/crew-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    pass "session persistence ($N tests)"
+else
+    fail "session persistence"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 ELAPSED=$(( $(date +%s) - STARTED ))
 section "Done"
@@ -165,6 +213,7 @@ echo "    • Responsiveness: baseline learning, degradation, recovery"
 echo "    • Queue modes: Followup, Collect, Steer, Speculative"
 echo "    • Speculative overflow: concurrent, patience threshold, background tasks"
 echo "    • Auto-escalation: degradation → Hedge+Speculative, recovery → Off+Followup"
+echo "    • Security: write isolation, /tmp loophole, Python escapes, cross-user, SSRF, symlinks"
 echo "    • Session: persistence, LRU, fork, rewrite, timestamp sort"
 
 if [ "$FAIL" -gt 0 ]; then

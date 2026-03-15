@@ -94,6 +94,15 @@ struct Input {
     enabled: Option<bool>,
     #[serde(default)]
     enable: Option<bool>,
+    /// Toggle sandbox: true = on, false = off
+    #[serde(default)]
+    sandbox: Option<bool>,
+    /// Sandbox mode override: "auto", "macos", "docker", "bwrap"
+    #[serde(default)]
+    sandbox_mode: Option<String>,
+    /// Allow network inside sandbox
+    #[serde(default)]
+    sandbox_network: Option<bool>,
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -193,8 +202,22 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
                 }
             })
             .unwrap_or_default();
+        let sandbox_status = s
+            .config
+            .extra
+            .get("sandbox")
+            .and_then(|sb| sb.get("enabled"))
+            .and_then(|e| e.as_bool())
+            .map(|on| {
+                if on {
+                    " | sandbox: ON"
+                } else {
+                    " | sandbox: OFF"
+                }
+            })
+            .unwrap_or("");
         lines.push(format!(
-            "  - {id} ({name}, {status}) [{channels}]{prompt_preview}",
+            "  - {id} ({name}, {status}) [{channels}]{prompt_preview}{sandbox_status}",
             id = s.id,
             name = s.name,
         ));
@@ -244,6 +267,36 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         env_vars.insert(env_name, token.clone());
     }
 
+    // Inherit sandbox config from parent profile
+    let mut extra = HashMap::new();
+    if let Ok(parent_data) = std::fs::read_to_string(&parent_path) {
+        if let Ok(parent_json) = serde_json::from_str::<serde_json::Value>(&parent_data) {
+            if let Some(sb) = parent_json
+                .get("config")
+                .and_then(|c| c.get("sandbox"))
+                .cloned()
+            {
+                extra.insert("sandbox".to_string(), sb);
+            }
+        }
+    }
+    // Override with explicit sandbox input
+    if input.sandbox.is_some() || input.sandbox_mode.is_some() || input.sandbox_network.is_some() {
+        let sandbox = extra
+            .entry("sandbox".to_string())
+            .or_insert_with(|| json!({}));
+        let sb = sandbox.as_object_mut().unwrap();
+        if let Some(on) = input.sandbox {
+            sb.insert("enabled".to_string(), json!(on));
+        }
+        if let Some(ref mode) = input.sandbox_mode {
+            sb.insert("mode".to_string(), json!(mode));
+        }
+        if let Some(net) = input.sandbox_network {
+            sb.insert("allow_network".to_string(), json!(net));
+        }
+    }
+
     let now = Utc::now();
     let profile = UserProfile {
         id: sub_id.clone(),
@@ -258,6 +311,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
                 ..Default::default()
             },
             env_vars,
+            extra,
             ..Default::default()
         },
         created_at: now,
@@ -398,6 +452,26 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
         .as_deref()
         .unwrap_or("(none)");
 
+    let sandbox_info = profile
+        .config
+        .extra
+        .get("sandbox")
+        .map(|sb| {
+            let enabled = sb.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+            let mode = sb.get("mode").and_then(|m| m.as_str()).unwrap_or("auto");
+            let net = sb
+                .get("allow_network")
+                .and_then(|n| n.as_bool())
+                .unwrap_or(true);
+            format!(
+                "\nSandbox: {} (mode: {}, network: {})",
+                if enabled { "ON" } else { "OFF" },
+                mode,
+                if net { "allowed" } else { "blocked" }
+            )
+        })
+        .unwrap_or_else(|| "\nSandbox: OFF (not configured)".to_string());
+
     let msg = format!(
         "Sub-account: {id}\n\
          Name: {name}\n\
@@ -405,7 +479,7 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
          Status: {status}\n\
          Channels: [{channels}]\n\
          System prompt: {prompt}\n\
-         Created: {created}{parent_info}",
+         Created: {created}{sandbox_info}{parent_info}",
         id = profile.id,
         name = profile.name,
         created = profile.created_at.format("%Y-%m-%d %H:%M UTC"),
@@ -568,8 +642,39 @@ fn action_update_by_id(profiles_dir: &Path, parent_id: &str, sub_id: &str, input
         changed.push(if en { "enabled" } else { "disabled" });
     }
 
+    // Update sandbox settings
+    if input.sandbox.is_some() || input.sandbox_mode.is_some() || input.sandbox_network.is_some() {
+        let sandbox = profile
+            .config
+            .extra
+            .entry("sandbox".to_string())
+            .or_insert_with(|| json!({}));
+        let sb = sandbox.as_object_mut().unwrap();
+
+        if let Some(on) = input.sandbox {
+            sb.insert("enabled".to_string(), json!(on));
+            changed.push(if on {
+                "sandbox enabled"
+            } else {
+                "sandbox disabled"
+            });
+        }
+        if let Some(ref mode) = input.sandbox_mode {
+            sb.insert("mode".to_string(), json!(mode));
+            changed.push("sandbox mode");
+        }
+        if let Some(net) = input.sandbox_network {
+            sb.insert("allow_network".to_string(), json!(net));
+            changed.push(if net {
+                "sandbox network allowed"
+            } else {
+                "sandbox network blocked"
+            });
+        }
+    }
+
     if changed.is_empty() {
-        output_error("Nothing to update. Provide at least one field to change (telegram_token, telegram_senders, whatsapp, feishu_app_id, feishu_app_secret, system_prompt, enabled).");
+        output_error("Nothing to update. Provide at least one field to change (telegram_token, telegram_senders, whatsapp, feishu_app_id, feishu_app_secret, system_prompt, enabled, sandbox, sandbox_mode, sandbox_network).");
         return;
     }
 

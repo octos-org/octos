@@ -13,11 +13,14 @@ use reqwest::Client as HttpClient;
 use serenity::Client;
 use serenity::all::{
     Context, EditMessage, EventHandler, GatewayIntents, Http, Message as DiscordMessage, MessageId,
-    Ready,
+    ReactionType, Ready,
 };
-use serenity::builder::{CreateAttachment, CreateMessage};
+use serenity::builder::{CreateAttachment, CreateEmbed, CreateMessage};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Maximum message IDs to track for dedup.
+const MAX_SEEN_IDS: usize = 1000;
 
 use crate::channel::Channel;
 use crate::media::download_media;
@@ -28,6 +31,7 @@ pub struct DiscordChannel {
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
     media_dir: PathBuf,
+    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl DiscordChannel {
@@ -44,7 +48,43 @@ impl DiscordChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             media_dir,
+            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Check if a message ID has been seen; add if not.
+    #[cfg(test)]
+    fn dedup_check(&self, msg_id: &str) -> bool {
+        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(msg_id) {
+            return true;
+        }
+        if seen.len() >= MAX_SEEN_IDS {
+            seen.clear();
+        }
+        seen.insert(msg_id.to_string());
+        false
+    }
+
+    /// Parse an emoji string into a serenity ReactionType.
+    /// Supports Unicode emoji (e.g. "👍") and custom emoji format "<:name:id>".
+    fn parse_emoji(emoji: &str) -> Result<ReactionType> {
+        // Custom emoji format: <:name:id> or <a:name:id>
+        if emoji.starts_with('<') && emoji.ends_with('>') {
+            let inner = &emoji[1..emoji.len() - 1];
+            let parts: Vec<&str> = inner.split(':').collect();
+            if parts.len() == 3 {
+                let animated = parts[0] == "a";
+                let name = parts[1].to_string();
+                let id: u64 = parts[2].parse().wrap_err("invalid custom emoji ID")?;
+                return Ok(ReactionType::Custom {
+                    animated,
+                    id: serenity::model::id::EmojiId::new(id),
+                    name: Some(name),
+                });
+            }
+        }
+        Ok(ReactionType::Unicode(emoji.to_string()))
     }
 }
 
@@ -54,6 +94,7 @@ struct Handler {
     allowed_senders: HashSet<String>,
     media_dir: PathBuf,
     download_http: HttpClient,
+    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -61,6 +102,20 @@ impl EventHandler for Handler {
     async fn message(&self, _ctx: Context, msg: DiscordMessage) {
         if msg.author.bot {
             return;
+        }
+
+        // Dedup: skip messages already seen (e.g. on reconnect)
+        {
+            let msg_id_str = msg.id.to_string();
+            let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.contains(&msg_id_str) {
+                debug!(msg_id = %msg_id_str, "Discord: dedup filtered message");
+                return;
+            }
+            if seen.len() >= MAX_SEEN_IDS {
+                seen.clear();
+            }
+            seen.insert(msg_id_str);
         }
 
         let sender_id = msg.author.id.to_string();
@@ -142,6 +197,7 @@ impl Channel for DiscordChannel {
             allowed_senders: self.allowed_senders.clone(),
             media_dir: self.media_dir.clone(),
             download_http: HttpClient::new(),
+            seen_ids: Arc::clone(&self.seen_ids),
         };
 
         let mut client = Client::builder(&self.token, intents)
@@ -229,6 +285,79 @@ impl Channel for DiscordChannel {
         Ok(())
     }
 
+    async fn react_to_message(&self, chat_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let reaction = Self::parse_emoji(emoji)?;
+        self.http
+            .create_reaction(
+                serenity::model::id::ChannelId::new(channel_id),
+                MessageId::new(msg_id),
+                &reaction,
+            )
+            .await
+            .wrap_err("failed to add Discord reaction")?;
+        Ok(())
+    }
+
+    async fn remove_reaction(&self, chat_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+        let msg_id: u64 = message_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord message_id: {message_id}"))?;
+
+        let reaction = Self::parse_emoji(emoji)?;
+        self.http
+            .delete_reaction_me(
+                serenity::model::id::ChannelId::new(channel_id),
+                MessageId::new(msg_id),
+                &reaction,
+            )
+            .await
+            .wrap_err("failed to remove Discord reaction")?;
+        Ok(())
+    }
+
+    async fn send_embed(
+        &self,
+        chat_id: &str,
+        title: &str,
+        description: &str,
+        fields: &[(String, String, bool)],
+        color: Option<u32>,
+    ) -> Result<Option<String>> {
+        let channel_id: u64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Discord channel_id: {chat_id}"))?;
+
+        let channel = serenity::model::id::ChannelId::new(channel_id);
+
+        let mut embed = CreateEmbed::new().title(title).description(description);
+
+        if let Some(c) = color {
+            embed = embed.color(c);
+        }
+
+        for (name, value, inline) in fields {
+            embed = embed.field(name, value, *inline);
+        }
+
+        let builder = CreateMessage::new().embed(embed);
+        let sent = channel
+            .send_message(&*self.http, builder)
+            .await
+            .wrap_err("failed to send Discord embed")?;
+
+        Ok(Some(sent.id.to_string()))
+    }
+
     fn is_allowed(&self, sender_id: &str) -> bool {
         self.allowed_senders.is_empty() || self.allowed_senders.contains(sender_id)
     }
@@ -250,6 +379,7 @@ mod tests {
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             media_dir: PathBuf::from("/tmp/test-media"),
+            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -282,5 +412,58 @@ mod tests {
     fn test_max_message_length() {
         let ch = make_channel(vec![]);
         assert_eq!(ch.max_message_length(), 1900);
+    }
+
+    #[test]
+    fn test_dedup() {
+        let ch = make_channel(vec![]);
+        assert!(!ch.dedup_check("msg1"));
+        assert!(ch.dedup_check("msg1")); // duplicate
+        assert!(!ch.dedup_check("msg2"));
+    }
+
+    #[test]
+    fn test_dedup_overflow_clears() {
+        let ch = make_channel(vec![]);
+        for i in 0..MAX_SEEN_IDS {
+            ch.dedup_check(&format!("msg_{i}"));
+        }
+        assert!(!ch.dedup_check("new_msg"));
+        assert!(!ch.dedup_check("msg_0"));
+    }
+
+    #[test]
+    fn test_parse_unicode_emoji() {
+        let rt = DiscordChannel::parse_emoji("👍").unwrap();
+        match rt {
+            ReactionType::Unicode(s) => assert_eq!(s, "👍"),
+            _ => panic!("expected Unicode reaction type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_emoji() {
+        let rt = DiscordChannel::parse_emoji("<:rust:123456789>").unwrap();
+        match rt {
+            ReactionType::Custom { animated, id, name } => {
+                assert!(!animated);
+                assert_eq!(id.get(), 123456789);
+                assert_eq!(name.as_deref(), Some("rust"));
+            }
+            _ => panic!("expected Custom reaction type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_animated_custom_emoji() {
+        let rt = DiscordChannel::parse_emoji("<a:party:987654321>").unwrap();
+        match rt {
+            ReactionType::Custom { animated, id, name } => {
+                assert!(animated);
+                assert_eq!(id.get(), 987654321);
+                assert_eq!(name.as_deref(), Some("party"));
+            }
+            _ => panic!("expected Custom reaction type"),
+        }
     }
 }

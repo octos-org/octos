@@ -75,10 +75,79 @@ fn api_base_url() -> String {
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
+        // No global timeout — streaming PCM chunks keep the connection alive.
+        // Per-request timeouts are set where needed.
         .connect_timeout(Duration::from_secs(5))
         .build()
         .expect("failed to build HTTP client")
+}
+
+/// Wrap raw PCM bytes (16-bit signed LE, mono) in a WAV header.
+fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let file_len = 36 + data_len; // 44-byte header minus 8 for RIFF+size
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
+/// Call TTS API with streaming PCM, collect all bytes, return WAV data.
+/// Streaming avoids timeout issues — chunks flow continuously.
+fn stream_tts_to_wav(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    body: &serde_json::Value,
+) -> Result<Vec<u8>, String> {
+    let resp = client
+        .post(format!("{base_url}/v1/audio/speech"))
+        .json(body)
+        .send()
+        .map_err(|e| format!("TTS request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let resp_text = resp.text().unwrap_or_default();
+        return Err(format!(
+            "TTS error (HTTP {status}): {}",
+            truncate(&resp_text, 200)
+        ));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("Failed to read TTS response: {e}"))?;
+
+    if bytes.is_empty() {
+        return Err("TTS returned empty response".to_string());
+    }
+
+    // If server returned WAV already (e.g. voice clone path), pass through
+    if content_type.contains("wav") || (bytes.len() >= 4 && &bytes[..4] == b"RIFF") {
+        return Ok(bytes.to_vec());
+    }
+
+    // Otherwise it's raw PCM — wrap in WAV header (24kHz, 16-bit, mono)
+    Ok(pcm_to_wav(&bytes, 24000))
 }
 
 fn check_health(client: &reqwest::blocking::Client, base_url: &str) -> Result<(), String> {
@@ -94,7 +163,7 @@ fn check_health(client: &reqwest::blocking::Client, base_url: &str) -> Result<()
         )),
         Err(e) => Err(format!(
             "Cannot reach ominix-api at {base_url}: {e}. \
-             Start it with: ominix-api --port 8081"
+             Start it with: ominix-api --port 8080"
         )),
     }
 }
@@ -130,7 +199,9 @@ fn timestamp() -> u64 {
 /// Per-profile voice profiles directory: `$CREW_DATA_DIR/voice_profiles/`.
 /// Each saved profile is a raw audio file named `{name}.wav`.
 fn voice_profiles_dir() -> Option<PathBuf> {
-    std::env::var("CREW_DATA_DIR").ok().map(|d| Path::new(&d).join("voice_profiles"))
+    std::env::var("CREW_DATA_DIR")
+        .ok()
+        .map(|d| Path::new(&d).join("voice_profiles"))
 }
 
 /// Resolve a speaker name: if a saved voice profile exists, return its path.
@@ -152,7 +223,13 @@ fn sanitize_profile_name(name: &str) -> String {
     name.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -248,28 +325,7 @@ fn synthesize_segment(
         "language": language
     });
 
-    let resp = client
-        .post(format!("{base_url}/v1/audio/speech"))
-        .json(&body)
-        .send()
-        .map_err(|e| format!("TTS request failed: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let resp_text = resp.text().unwrap_or_default();
-        return Err(format!(
-            "TTS error (HTTP {status}): {}",
-            truncate(&resp_text, 200)
-        ));
-    }
-
-    let wav_bytes = resp
-        .bytes()
-        .map_err(|e| format!("Failed to read TTS response: {e}"))?;
-
-    if wav_bytes.len() < 44 {
-        return Err("TTS returned invalid WAV data (too small)".to_string());
-    }
+    let wav_bytes = stream_tts_to_wav(client, base_url, &body)?;
 
     std::fs::write(output_path, &wav_bytes)
         .map_err(|e| format!("Failed to write {}: {e}", output_path.display()))?;
@@ -326,29 +382,12 @@ fn handle_synthesize(input_json: &str) {
             "language": language
         });
 
-        let resp = match client
-            .post(format!("{base_url}/v1/audio/speech"))
-            .json(&body)
-            .timeout(Duration::from_secs(120))
-            .send()
-        {
-            Ok(r) => r,
-            Err(e) => fail(&format!("TTS (clone) request failed: {e}")),
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let resp_text = resp.text().unwrap_or_default();
-            fail(&format!("TTS (clone) error (HTTP {status}): {}", truncate(&resp_text, 200)));
-        }
-
-        let wav_bytes = match resp.bytes() {
+        // Clone path returns WAV (has reference_audio → wants_wav=true in API)
+        let wav_bytes = match stream_tts_to_wav(&client, &base_url, &body) {
             Ok(b) => b,
-            Err(e) => fail(&format!("Failed to read TTS response: {e}")),
+            Err(e) => fail(&format!("TTS (clone) failed: {e}")),
         };
-        if wav_bytes.len() < 44 {
-            fail("TTS returned invalid WAV data (too small)");
-        }
+
         if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
             fail(&format!("Failed to write {output_path}: {e}"));
         }
@@ -447,33 +486,11 @@ fn handle_voice_clone(input_json: &str) {
         "language": language
     });
 
-    let resp = match client
-        .post(format!("{base_url}/v1/audio/speech"))
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-    {
-        Ok(r) => r,
-        Err(e) => fail(&format!("Voice clone request failed: {e}")),
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let resp_text = resp.text().unwrap_or_default();
-        fail(&format!(
-            "Voice clone error (HTTP {status}): {}",
-            truncate(&resp_text, 200)
-        ));
-    }
-
-    let wav_bytes = match resp.bytes() {
+    // Clone path returns WAV (reference_audio triggers wants_wav in API)
+    let wav_bytes = match stream_tts_to_wav(&client, &base_url, &body) {
         Ok(b) => b,
-        Err(e) => fail(&format!("Failed to read clone response: {e}")),
+        Err(e) => fail(&format!("Voice clone failed: {e}")),
     };
-
-    if wav_bytes.len() < 44 {
-        fail("Voice clone returned invalid WAV data (too small)");
-    }
 
     if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
         fail(&format!("Failed to write {output_path}: {e}"));
@@ -585,13 +602,8 @@ fn handle_list_profiles(_input_json: &str) {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?");
-        let size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("?");
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         profiles.push(format!("- **{name}** ({ext}, {size} bytes)"));
     }
 

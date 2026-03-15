@@ -14,6 +14,7 @@ members = [
     "crates/app-skills/account-manager",
     "crates/app-skills/time",
     "crates/app-skills/weather",
+    "crates/app-skills/voice",
     "crates/platform-skills/voice",
     "crates/crew-pipeline",
     "crates/crew-plugin",

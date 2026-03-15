@@ -146,7 +146,7 @@ console.log(JSON.stringify(result));
 ## Publishing to the Registry
 
 1. Push your skill to a GitHub repo
-2. Submit to the [hagency skill registry](https://github.com/humanagency-org/skill-registry)
+2. Submit to the [hagency skill registry](https://github.com/hagency-org/skill-registry)
 3. The registry team audits, builds binaries, and publishes
 
 ## Multi-Skill Repos

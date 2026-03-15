@@ -192,7 +192,7 @@ impl HttpMcpConnection {
 
         let resp = req
             .json(&request)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
             .wrap_err("failed to send HTTP request to MCP server")?;
@@ -530,7 +530,7 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let mut conn = self.connection.lock().await;
             conn.rpc_call(
                 "tools/call",
@@ -542,7 +542,7 @@ impl Tool for McpTool {
             .await
         })
         .await
-        .wrap_err("MCP tool call timed out after 30s")?
+        .wrap_err("MCP tool call timed out after 60s")?
         .wrap_err_with(|| format!("MCP tool '{}' call failed", self.name))?;
 
         // Parse MCP tool result: { "content": [{"type": "text", "text": "..."}] }

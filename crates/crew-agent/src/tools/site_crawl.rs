@@ -42,18 +42,12 @@ pub struct DeepCrawlTool {
 }
 
 impl DeepCrawlTool {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(research_base: impl Into<PathBuf>) -> Self {
         Self {
             research_base: research_base.into(),
             config: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
-        self.config = Some(config);
-        self
     }
 }
 

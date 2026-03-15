@@ -38,7 +38,7 @@ pub mod registry;
 
 pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, MetricsSnapshot, SharedMetrics,
-    SharedPolicy, SharedProviderMetrics,
+    SharedPolicy, SharedProviderMetrics, StatusCallback,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};

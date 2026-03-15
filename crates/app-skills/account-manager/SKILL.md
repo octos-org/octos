@@ -59,7 +59,19 @@ Incrementally update config — only provide the fields you want to change:
 }
 ```
 
-Supported fields: `telegram_token`, `telegram_senders`, `whatsapp` (bool), `feishu_app_id`, `feishu_app_secret`, `system_prompt`, `enabled` (bool).
+Supported fields: `telegram_token`, `telegram_senders`, `whatsapp` (bool), `feishu_app_id`, `feishu_app_secret`, `system_prompt`, `enabled` (bool), `sandbox` (bool), `sandbox_mode` ("auto"/"macos"/"docker"/"bwrap"), `sandbox_network` (bool).
+
+### Toggle sandbox on a sub-account
+
+```json
+{
+  "action": "update",
+  "sub_account_id": "parent-id--work-bot",
+  "sandbox": true,
+  "sandbox_mode": "auto",
+  "sandbox_network": true
+}
+```
 
 ### Start/stop a sub-account
 

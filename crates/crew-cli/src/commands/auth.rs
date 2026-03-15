@@ -291,12 +291,7 @@ fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
 
     let mut updated_count = 0;
     for mut profile in profiles {
-        if profile
-            .config
-            .env_vars
-            .get(name)
-            .map(|v| v.as_str())
-            == Some(keychain::KEYCHAIN_MARKER)
+        if profile.config.env_vars.get(name).map(|v| v.as_str()) == Some(keychain::KEYCHAIN_MARKER)
         {
             profile.config.env_vars.remove(name);
             profile.updated_at = chrono::Utc::now();
@@ -324,10 +319,7 @@ fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
 fn unlock_keychain(password: Option<String>) -> Result<()> {
     // Check if already accessible
     if keychain::is_accessible() {
-        println!(
-            "{} Keychain is already unlocked",
-            "OK".green().bold()
-        );
+        println!("{} Keychain is already unlocked", "OK".green().bold());
         return Ok(());
     }
 

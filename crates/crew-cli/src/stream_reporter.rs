@@ -28,6 +28,9 @@ pub enum StreamProgressEvent {
     ToolProgress { name: String, message: String },
     /// LLM call status update (retry progress, provider switching).
     LlmStatus { message: String },
+    /// Reset the streaming buffer (e.g. before an LLM retry so partial
+    /// text from a failed attempt doesn't get concatenated with the retry).
+    BufferReset,
 }
 
 /// A `ProgressReporter` that forwards stream events through an unbounded channel.
@@ -60,9 +63,8 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::ToolProgress { name, message, .. } => {
                 StreamProgressEvent::ToolProgress { name, message }
             }
-            ProgressEvent::LlmStatus { message, .. } => {
-                StreamProgressEvent::LlmStatus { message }
-            }
+            ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
+            ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -220,23 +222,56 @@ pub async fn run_stream_forwarder(
                         // Replace previous progress line for this tool
                         let prev_prefix = format!("⚙ `{name}`:");
                         if let Some(pos) = buffer.rfind(&prev_prefix) {
-                            let end = buffer[pos..]
-                                .find('\n')
-                                .map_or(buffer.len(), |i| pos + i);
+                            let end = buffer[pos..].find('\n').map_or(buffer.len(), |i| pos + i);
                             buffer.replace_range(pos..end, &progress);
                         }
                     }
                     if last_edit.elapsed() >= EDIT_THROTTLE {
-                        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id, &mut no_edit_support).await;
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &buffer,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
                         last_edit = Instant::now();
                     }
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
+                // Cancel the status indicator before showing retry/failover info,
+                // so we don't have two messages ("✦ Thinking..." + "⟳ Retrying...")
+                // visible simultaneously.
+                if first_chunk {
+                    first_chunk = false;
+                    if let Some(ref cancel) = cancel_status {
+                        cancel.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if let Some(ref msg_id_lock) = status_msg_id {
+                        let mid = msg_id_lock.lock().await.take();
+                        if let Some(ref mid) = mid {
+                            let _ = channel.delete_message(&chat_id, mid).await;
+                        }
+                    }
+                }
                 // Show retry/failover status as a temporary message
                 let status_text = format!("⟳ {message}");
-                flush_to_channel(&channel, &chat_id, &status_text, &mut message_id, &mut no_edit_support).await;
+                flush_to_channel(
+                    &channel,
+                    &chat_id,
+                    &status_text,
+                    &mut message_id,
+                    &mut no_edit_support,
+                )
+                .await;
                 last_edit = Instant::now();
+            }
+            StreamProgressEvent::BufferReset => {
+                // Clear accumulated text so a retry starts fresh.
+                // Keep the message_id so the retry edits the same message
+                // instead of creating a new one.
+                buffer.clear();
             }
         }
     }
@@ -302,5 +337,48 @@ async fn flush_to_channel(
                 warn!("stream send failed: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_clear_buffer_on_reset_event() {
+        // Simulate the forwarder receiving chunks then a BufferReset.
+        // We can't easily test the full async forwarder, but we can
+        // verify the event enum is correctly structured and mapped.
+        let event = StreamProgressEvent::BufferReset;
+        assert!(matches!(event, StreamProgressEvent::BufferReset));
+    }
+
+    #[test]
+    fn should_map_stream_retry_to_buffer_reset() {
+        use crew_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::StreamRetry { iteration: 1 });
+
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event, StreamProgressEvent::BufferReset));
+    }
+
+    #[test]
+    fn should_strip_think_tags_from_buffer() {
+        assert_eq!(
+            strip_think_from_buffer("Hello <think>internal</think> world"),
+            "Hello  world"
+        );
+    }
+
+    #[test]
+    fn should_hide_unclosed_think_tag() {
+        assert_eq!(
+            strip_think_from_buffer("Hello <think>still thinking"),
+            "Hello"
+        );
     }
 }

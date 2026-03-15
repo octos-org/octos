@@ -69,7 +69,6 @@ pub trait LlmProvider: Send + Sync {
     /// The adaptive router uses this to update failure metrics so subsequent calls
     /// may failover to a different provider.
     fn report_late_failure(&self) {}
-
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.
@@ -83,10 +82,9 @@ pub(crate) fn truncate_error_body(body: &str) -> String {
 }
 
 /// Default LLM request timeout in seconds.
-/// Tuned from real-world testing: typical LLM responses complete in 2-5s,
-/// multi-tool chains in ~25s. 60s gives ample headroom while failing over
-/// faster than the previous 120s default.
-pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 60;
+/// 120s accommodates long multi-tool chains and reasoning-heavy models.
+/// Connect timeout (10s) ensures fast failover when a provider is unreachable.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
 /// Default LLM connect timeout in seconds.
 /// Reduced from 30s: if a provider can't connect in 10s, fail over sooner.
 pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 10;

@@ -197,6 +197,10 @@ impl TelegramChannel {
                 "queue",
                 "View/change queue mode (followup|collect|steer|interrupt|spec)",
             ),
+            BotCommand::new(
+                "status",
+                "Configure status layers (greeting|provider|metrics|words|add|remove)",
+            ),
         ];
         match self.bot.set_my_commands(commands).await {
             Ok(_) => info!("Telegram bot commands registered"),
@@ -262,6 +266,9 @@ impl Channel for TelegramChannel {
         self.set_commands().await;
 
         let mut consecutive_failures: u32 = 0;
+        // Track the last processed update ID across reconnections to prevent
+        // duplicate processing when `polling_default` resets its offset.
+        let mut last_update_id: i32 = 0;
 
         // Outer reconnection loop — restarts polling when the stream ends.
         loop {
@@ -275,7 +282,7 @@ impl Channel for TelegramChannel {
 
             // Reset failure counter on successful stream creation
             consecutive_failures = 0;
-            info!("Telegram polling stream connected");
+            info!(last_update_id, "Telegram polling stream connected");
 
             while let Some(result) = stream.next().await {
                 if self.shutdown.load(Ordering::Acquire) {
@@ -290,6 +297,17 @@ impl Channel for TelegramChannel {
                         continue;
                     }
                 };
+
+                // Dedup: skip updates already processed before reconnection.
+                let uid = update.id.0 as i32;
+                if uid <= last_update_id {
+                    tracing::debug!(
+                        update_id = uid,
+                        "skipping already-processed Telegram update"
+                    );
+                    continue;
+                }
+                last_update_id = uid;
 
                 match update.kind {
                     UpdateKind::Message(msg) => {
@@ -576,17 +594,16 @@ impl Channel for TelegramChannel {
 
             // Check for inline keyboard in metadata
             if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-                let mut req = self.bot
-                    .send_message(ChatId(chat_id), &html);
-                req = req.parse_mode(ParseMode::Html)
-                    .reply_markup(markup);
+                let mut req = self.bot.send_message(ChatId(chat_id), &html);
+                req = req.parse_mode(ParseMode::Html).reply_markup(markup);
                 if let Some(mid) = reply_to {
                     req = req.reply_parameters(ReplyParameters::new(mid));
                 }
                 req.await
                     .wrap_err("failed to send Telegram message with keyboard")?;
             } else {
-                self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?;
+                self.send_html_with_fallback(ChatId(chat_id), &html, reply_to)
+                    .await?;
             }
         }
 
@@ -639,17 +656,16 @@ impl Channel for TelegramChannel {
         let html = markdown_to_telegram_html(&msg.content);
 
         let sent = if let Some(markup) = Self::parse_inline_keyboard(&msg.metadata) {
-            let mut req = self.bot
-                .send_message(ChatId(chat_id), &html);
-            req = req.parse_mode(ParseMode::Html)
-                .reply_markup(markup);
+            let mut req = self.bot.send_message(ChatId(chat_id), &html);
+            req = req.parse_mode(ParseMode::Html).reply_markup(markup);
             if let Some(mid) = reply_to {
                 req = req.reply_parameters(ReplyParameters::new(mid));
             }
             req.await
                 .wrap_err("failed to send Telegram message with keyboard")?
         } else {
-            self.send_html_with_fallback(ChatId(chat_id), &html, reply_to).await?
+            self.send_html_with_fallback(ChatId(chat_id), &html, reply_to)
+                .await?
         };
 
         Ok(Some(sent.id.0.to_string()))

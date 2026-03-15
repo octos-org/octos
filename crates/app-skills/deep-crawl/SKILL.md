@@ -3,7 +3,6 @@ name: deep-crawl
 description: Recursively crawl websites using headless Chrome. Triggers: crawl, scrape website, 爬取, crawl site, deep crawl, website content.
 version: 1.0.0
 author: hagency
-requires_bins: google-chrome
 always: true
 ---
 
