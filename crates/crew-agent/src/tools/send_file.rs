@@ -139,7 +139,13 @@ impl Tool for SendFileTool {
                     }
                 }
                 Err(_) => {
-                    // File doesn't exist or can't be resolved — fall through to exists check
+                    // Path can't be canonicalized (broken symlink, non-existent, etc.).
+                    // Reject rather than silently skip the check — prevents TOCTOU bypass.
+                    return Ok(ToolResult {
+                        output: format!("Error: Cannot resolve file path: {}", input.file_path),
+                        success: false,
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -344,6 +350,27 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.media.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_blocks_nonexistent_path() {
+        // When base_dir is set, non-existent paths should be rejected
+        // (not silently bypassed via canonicalize failure)
+        let base = tempfile::tempdir().unwrap();
+
+        let (tx, _rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345")
+            .with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": "/tmp/nonexistent-secret-file.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("Cannot resolve file path"));
     }
 
     #[tokio::test]
