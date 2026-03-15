@@ -434,19 +434,24 @@ impl Config {
     /// Scans both `.crew/plugins/` (legacy) and `.crew/skills/` (unified packages).
     /// Skill packages that include a `manifest.json` are auto-discovered as tool
     /// providers by `PluginLoader` (packages without manifest.json are skipped).
-    pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
+    /// Resolve plugin/skill directories from a project directory (e.g. `~/.crew`).
+    ///
+    /// The `project_dir` is typically `crew_home` (for managed gateways) or
+    /// `cwd/.crew` (for standalone `crew chat`). This is intentionally decoupled
+    /// from the agent's working directory (`cwd`) to support per-profile file
+    /// isolation where `cwd` is narrowed to the profile's data directory.
+    pub fn plugin_dirs_from_project(project_dir: &Path) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        let crew_dir = cwd.join(".crew");
-        let local_plugins = crew_dir.join("plugins");
+        let local_plugins = project_dir.join("plugins");
         if local_plugins.exists() {
             dirs.push(local_plugins);
         }
-        let local_skills = crew_dir.join("skills");
+        let local_skills = project_dir.join("skills");
         if local_skills.exists() {
             dirs.push(local_skills);
         }
         // Layered skill dirs
-        let bundled = crew_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+        let bundled = project_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
         if bundled.exists() {
             dirs.push(bundled);
         }

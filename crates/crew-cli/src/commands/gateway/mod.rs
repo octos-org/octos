@@ -350,8 +350,15 @@ impl GatewayCommand {
         );
         eprintln!("[gateway] memory store opened");
 
-        // Initialize skills loader (project-level, from cwd/.crew/)
-        let project_dir = cwd.join(".crew");
+        // Derive project_dir from crew_home (when launched by process_manager)
+        // or fall back to cwd/.crew (standalone crew gateway / crew chat mode).
+        // This is decoupled from cwd so that narrowing cwd to data_dir for
+        // per-profile file isolation doesn't break access to shared skills/configs.
+        let project_dir = if let Some(ref crew_home) = self.crew_home {
+            crew_home.clone()
+        } else {
+            cwd.join(".crew")
+        };
 
         // Bootstrap bundled app-skills and platform skills into layered dirs
         let n = crew_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
@@ -485,6 +492,8 @@ impl GatewayCommand {
         let plugin_env = build_plugin_env(&config, &provider_name);
 
         let mut tools;
+        let mut plugin_result;
+        let mut sandbox_config = config.sandbox.clone();
         if admin_mode {
             // Admin mode: register only admin API tools
             tools = ToolRegistry::new();
@@ -512,14 +521,13 @@ impl GatewayCommand {
 
             // Load only admin-relevant plugins (not all bundled skills)
             let admin_skills: &[&str] = &["send-email", "account-manager"];
-            let bundled_dir = cwd
-                .join(".crew")
+            let bundled_dir = project_dir
                 .join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
             for skill_name in admin_skills {
                 let skill_dir = bundled_dir.join(skill_name);
                 if skill_dir.exists() {
                     match crew_agent::PluginLoader::load_plugin(&skill_dir, &plugin_env) {
-                        Ok(plugin_tools) => {
+                        Ok((plugin_tools, _extras)) => {
                             for t in plugin_tools {
                                 tools.register(t);
                             }
@@ -529,10 +537,20 @@ impl GatewayCommand {
                 }
             }
 
+            plugin_result = crew_agent::PluginLoadResult::default();
             info!("admin mode: registered admin API + shell + memory + plugin tools");
         } else {
             // Normal mode: full tool registration
-            let sandbox = crew_agent::create_sandbox(&config.sandbox);
+            // Populate read_allow_paths so the shell sandbox restricts reads to
+            // this profile's data_dir (via cwd) + shared crew home (project_dir).
+            // Without this, macOS SBPL defaults to (allow file-read*) which lets
+            // the shell read any file on disk, including other profiles' data.
+            if sandbox_config.read_allow_paths.is_empty() {
+                sandbox_config
+                    .read_allow_paths
+                    .push(project_dir.to_string_lossy().into_owned());
+            }
+            let sandbox = crew_agent::create_sandbox(&sandbox_config);
             tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
             tools.inject_tool_config(tool_config.clone());
 
@@ -554,15 +572,30 @@ impl GatewayCommand {
 
             // Load plugins with a dedicated work directory for output files
             let plugin_work_dir = data_dir.join("skill-output");
-            let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
+            let mut plugin_dirs = crate::config::Config::plugin_dirs_from_project(&project_dir);
+            // Prepend per-profile skills dir (highest priority)
+            let profile_skills = data_dir.join("skills");
+            if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
+                plugin_dirs.insert(0, profile_skills);
+            }
+            plugin_result = crew_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
-                if let Err(e) = crew_agent::PluginLoader::load_into_with_work_dir(
+                match crew_agent::PluginLoader::load_into_with_work_dir(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
                     Some(&plugin_work_dir),
                 ) {
-                    warn!("plugin loading failed: {e}");
+                    Ok(result) => plugin_result = result,
+                    Err(e) => warn!("plugin loading failed: {e}"),
+                }
+            }
+
+            // Start MCP servers declared in skill manifests
+            if !plugin_result.mcp_servers.is_empty() {
+                match crew_agent::McpClient::start(&plugin_result.mcp_servers).await {
+                    Ok(client) => client.register_tools(&mut tools),
+                    Err(e) => warn!("skill MCP initialization failed: {e}"),
                 }
             }
 
@@ -817,6 +850,18 @@ impl GatewayCommand {
             .await
         };
 
+        // Append skill prompt fragments
+        let system_prompt = if plugin_result.prompt_fragments.is_empty() {
+            system_prompt
+        } else {
+            let mut prompt = system_prompt;
+            for fragment in &plugin_result.prompt_fragments {
+                prompt.push_str("\n\n");
+                prompt.push_str(fragment);
+            }
+            prompt
+        };
+
         // Shared system prompt for hot-reload (factory reads this at actor spawn time)
         let system_prompt = Arc::new(std::sync::RwLock::new(system_prompt));
 
@@ -843,9 +888,11 @@ impl GatewayCommand {
 
         let llm_for_compaction = llm.clone();
 
-        // Build hook executor and context template
-        let hooks = if !config.hooks.is_empty() {
-            Some(Arc::new(HookExecutor::new(config.hooks.clone())))
+        // Build hook executor and context template (merge config + skill hooks)
+        let mut all_hooks = config.hooks.clone();
+        all_hooks.extend(plugin_result.hooks);
+        let hooks = if !all_hooks.is_empty() {
+            Some(Arc::new(HookExecutor::new(all_hooks)))
         } else {
             None
         };
@@ -918,7 +965,7 @@ impl GatewayCommand {
             session_timeout: Duration::from_secs(session_timeout_secs),
             shutdown: shutdown.clone(),
             cwd: cwd.clone(),
-            sandbox_config: config.sandbox.clone(),
+            sandbox_config: sandbox_config.clone(),
             provider_policy: provider_policy_for_factory,
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
@@ -938,7 +985,7 @@ impl GatewayCommand {
             } else if let Some(ref p) = self.config {
                 paths.push(p.clone());
             } else {
-                let local = cwd.join(".crew").join("config.json");
+                let local = project_dir.join("config.json");
                 if local.exists() {
                     paths.push(local);
                 }

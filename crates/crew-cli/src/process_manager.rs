@@ -214,6 +214,8 @@ impl ProcessManager {
             .arg(&profile_path)
             .arg("--data-dir")
             .arg(&data_dir)
+            .arg("--cwd")
+            .arg(&data_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);

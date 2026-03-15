@@ -379,7 +379,8 @@ impl ActorFactory {
 
         // Per-session tools — they write to proxy_tx, not the real out_tx
         let message_tool = MessageTool::with_context(proxy_tx.clone(), channel, chat_id);
-        let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id);
+        let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
+            .with_base_dir(&self.data_dir);
 
         // Build per-user workspace directory for file isolation.
         // Each user's tools are restricted to their own workspace via
