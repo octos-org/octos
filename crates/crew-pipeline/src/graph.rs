@@ -38,6 +38,9 @@ pub struct PipelineNode {
     pub model: Option<String>,
     /// Override context window size in tokens.
     pub context_window: Option<u32>,
+    /// Override max output tokens per LLM call. Default 4096 is too low for
+    /// nodes that write long outputs (e.g. synthesize writing full reports).
+    pub max_output_tokens: Option<u32>,
     /// Allowed tool names for this node. Empty = all builtins.
     pub tools: Vec<String>,
     /// If true, a successful outcome means "pipeline goal achieved".
@@ -69,6 +72,7 @@ impl Default for PipelineNode {
             label: None,
             model: None,
             context_window: None,
+            max_output_tokens: None,
             tools: Vec::new(),
             goal_gate: false,
             max_retries: 0,

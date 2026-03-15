@@ -53,6 +53,11 @@ pub trait LlmProvider: Send + Sync {
         context::context_window_tokens(self.model_id())
     }
 
+    /// Get the maximum output tokens this model supports per call.
+    fn max_output_tokens(&self) -> u32 {
+        context::max_output_tokens(self.model_id())
+    }
+
     /// Get the model identifier.
     fn model_id(&self) -> &str;
 

@@ -19,6 +19,15 @@ use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 
 impl Agent {
+    /// Build a `ChatConfig` with optional `chat_max_tokens` override from `AgentConfig`.
+    fn chat_config(&self) -> ChatConfig {
+        let mut c = ChatConfig::default();
+        if let Some(max) = self.config.chat_max_tokens {
+            c.max_tokens = Some(max);
+        }
+        c
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -86,7 +95,7 @@ impl Agent {
             timestamp: chrono::Utc::now(),
         });
 
-        let config = ChatConfig::default();
+        let config = self.chat_config();
         let mut total_usage = TokenUsage::default();
         let mut files_modified = Vec::new();
         let mut iteration = 0u32;
@@ -274,7 +283,7 @@ impl Agent {
             let mut messages = self.build_initial_messages(task).await;
             let mut total_usage = TokenUsage::default();
             let mut files_modified = Vec::new();
-            let config = ChatConfig::default();
+            let config = self.chat_config();
 
             loop {
                 if let Some(stop) = self.check_budget(iteration, task_start, &total_usage) {

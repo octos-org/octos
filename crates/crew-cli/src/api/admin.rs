@@ -2395,3 +2395,10 @@ pub async fn config_check(
         },
     })))
 }
+
+/// GET /api/admin/model-limits — returns model output token limits from model_limits.json.
+pub async fn model_limits() -> Json<serde_json::Value> {
+    let raw = crew_llm::context::MODEL_LIMITS_JSON;
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    Json(value)
+}

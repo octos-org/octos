@@ -219,6 +219,7 @@ impl Tool for SpawnTool {
                             line.push_str(&format!(", {cost}"));
                         }
                         line.push_str(&format!(", {}k max ctx", m.context_window / 1000));
+                        line.push_str(&format!(", {}k max output", m.max_output_tokens / 1000));
                         if let Some(default_cw) = m.default_context_window {
                             line.push_str(&format!(", {}k default budget", default_cw / 1000));
                         }

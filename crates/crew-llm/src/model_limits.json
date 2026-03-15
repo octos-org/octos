@@ -1,0 +1,46 @@
+{
+  "default_max_tokens": 4096,
+  "default_max_output": 8192,
+  "models": [
+    { "pattern": "claude-opus-4", "max_output": 128000, "tier": "flagship", "description": "Top-tier reasoning, coding, and analysis. Slow, expensive. Best for synthesis and complex tasks." },
+    { "pattern": "claude-sonnet-4", "max_output": 128000, "tier": "strong", "description": "Strong reasoning and coding. Good balance of quality and speed." },
+    { "pattern": "claude-haiku-4", "max_output": 8192, "tier": "fast", "description": "Fast and cheap. Good for simple search and extraction tasks." },
+    { "pattern": "claude-3", "max_output": 8192, "tier": "legacy", "description": "Legacy Claude 3.x model." },
+
+    { "pattern": "gpt-5", "max_output": 128000, "tier": "flagship", "description": "OpenAI flagship. Top-tier reasoning and generation." },
+    { "pattern": "gpt-4.1-mini", "max_output": 16384, "tier": "fast", "description": "Fast, cheap OpenAI model. Good for search and simple tasks." },
+    { "pattern": "gpt-4.1-nano", "max_output": 16384, "tier": "fast", "description": "Cheapest OpenAI model. Best for high-volume simple tasks." },
+    { "pattern": "gpt-4.1", "max_output": 32768, "tier": "strong", "description": "Strong general-purpose OpenAI model." },
+    { "pattern": "gpt-4o", "max_output": 16384, "tier": "strong", "description": "Multimodal OpenAI model with vision support." },
+    { "pattern": "o1", "max_output": 100000, "tier": "flagship", "description": "OpenAI reasoning model. Very high output capacity." },
+    { "pattern": "o3", "max_output": 100000, "tier": "flagship", "description": "OpenAI advanced reasoning model." },
+    { "pattern": "o4", "max_output": 100000, "tier": "flagship", "description": "OpenAI latest reasoning model." },
+
+    { "pattern": "gemini-3", "max_output": 65536, "tier": "flagship", "description": "Google flagship. Strong reasoning, huge context window (1M+)." },
+    { "pattern": "gemini-2.5", "max_output": 65536, "tier": "strong", "description": "Strong Google model with large context and good reasoning. Fast." },
+    { "pattern": "gemini-2", "max_output": 8192, "tier": "fast", "description": "Fast Google model. Good for search tasks." },
+    { "pattern": "gemini-1.5", "max_output": 8192, "tier": "legacy", "description": "Legacy Gemini model." },
+
+    { "pattern": "deepseek", "max_output": 8192, "tier": "strong", "description": "Strong open-weight model. Good reasoning, very cheap. No vision support." },
+
+    { "pattern": "kimi-k2", "max_output": 65535, "tier": "strong", "description": "Moonshot's strong model. Good reasoning, large output, cheap." },
+    { "pattern": "kimi", "max_output": 8192, "tier": "fast", "description": "Moonshot's fast model." },
+    { "pattern": "moonshot", "max_output": 8192, "tier": "fast", "description": "Moonshot model." },
+
+    { "pattern": "glm-5", "max_output": 131072, "tier": "flagship", "description": "Zhipu flagship. Highest max output (131k tokens). Best for very long report synthesis." },
+    { "pattern": "glm-4", "max_output": 4096, "tier": "fast", "description": "Zhipu fast model." },
+    { "pattern": "glm", "max_output": 4096, "tier": "fast", "description": "Zhipu model." },
+
+    { "pattern": "minimax", "max_output": 16384, "tier": "strong", "description": "MiniMax model. Good general-purpose, moderate output." },
+
+    { "pattern": "qwen3.5", "max_output": 16384, "tier": "strong", "description": "Alibaba's strong model. Good reasoning." },
+    { "pattern": "qwen", "max_output": 8192, "tier": "fast", "description": "Alibaba's model. Fast and cheap." },
+
+    { "pattern": "llama-4", "max_output": 16384, "tier": "strong", "description": "Meta's open-weight model." },
+    { "pattern": "llama", "max_output": 8192, "tier": "fast", "description": "Meta's open-weight model." },
+    { "pattern": "mistral", "max_output": 16384, "tier": "strong", "description": "Mistral model. Good for European languages." },
+    { "pattern": "codestral", "max_output": 16384, "tier": "strong", "description": "Mistral's code-specialized model." },
+    { "pattern": "devstral", "max_output": 16384, "tier": "strong", "description": "Mistral's development model." },
+    { "pattern": "nemotron", "max_output": 16384, "tier": "strong", "description": "NVIDIA's model. Good for structured tasks." }
+  ]
+}

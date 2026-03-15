@@ -506,6 +506,7 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         label: attrs.get("label").cloned(),
         model: attrs.get("model").cloned(),
         context_window: attrs.get("context_window").and_then(|s| s.parse().ok()),
+        max_output_tokens: attrs.get("max_output_tokens").and_then(|s| s.parse().ok()),
         tools,
         goal_gate: attrs
             .get("goal_gate")

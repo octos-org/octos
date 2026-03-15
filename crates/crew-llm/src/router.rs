@@ -31,6 +31,8 @@ pub struct SubProviderMeta {
     pub provider_name: String,
     /// Context window size in tokens (the model's maximum).
     pub context_window: u32,
+    /// Maximum output tokens per call for this model.
+    pub max_output_tokens: u32,
     /// Cost info auto-derived from pricing.rs (e.g. "$0.15/1M in, $0.60/1M out").
     pub cost_info: Option<String>,
     /// User-provided description of when/why to use this model.
@@ -142,9 +144,22 @@ impl ProviderRouter {
         description: Option<String>,
         default_context_window: Option<u32>,
     ) {
+        self.register_with_full_meta(key, provider, description, default_context_window, None);
+    }
+
+    /// Register with all metadata fields, including optional max_output_tokens override.
+    pub fn register_with_full_meta(
+        &self,
+        key: &str,
+        provider: Arc<dyn LlmProvider>,
+        description: Option<String>,
+        default_context_window: Option<u32>,
+        max_output_tokens_override: Option<u32>,
+    ) {
         let model_id = provider.model_id().to_string();
         let provider_name = provider.provider_name().to_string();
         let context_window = provider.context_window();
+        let max_output_tokens = max_output_tokens_override.unwrap_or_else(|| provider.max_output_tokens());
 
         let cost_info = pricing::model_pricing(&model_id).map(|p| {
             format!(
@@ -158,6 +173,7 @@ impl ProviderRouter {
             model_id,
             provider_name,
             context_window,
+            max_output_tokens,
             cost_info,
             description,
             default_context_window,

@@ -166,6 +166,11 @@ pub struct SubProviderConfig {
     /// sub-agent trims conversation history during its tool loop.
     #[serde(default)]
     pub default_context_window: Option<u32>,
+    /// Maximum output tokens per LLM call for this model.
+    /// If not set, auto-detected from the model name. Set explicitly when the
+    /// auto-detection is wrong or for custom/local models.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     /// API protocol type: "openai" or "anthropic". Overrides provider default.
     #[serde(default)]
     pub api_type: Option<String>,
@@ -539,6 +544,11 @@ pub struct GatewayConfig {
     /// Maximum seconds for processing a single session message. Default: 600.
     #[serde(default)]
     pub session_timeout_secs: Option<u64>,
+
+    /// Default max output tokens per LLM call. When set, overrides the built-in
+    /// default from model_limits.json. Pipeline nodes can further override per-node.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl Default for GatewayConfig {
@@ -559,6 +569,7 @@ impl Default for GatewayConfig {
             llm_connect_timeout_secs: None,
             tool_timeout_secs: None,
             session_timeout_secs: None,
+            max_output_tokens: None,
         }
     }
 }

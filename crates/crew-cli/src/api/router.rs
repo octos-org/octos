@@ -86,6 +86,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
         .route("/api/my/test-search", post(admin::test_search))
+        .route("/api/my/model-limits", get(admin::model_limits))
         .route(
             "/api/my/profile/accounts",
             get(auth_handlers::my_sub_accounts),
@@ -237,7 +238,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // System update
         .route("/api/admin/system/version", post(admin::system_version))
-        .route("/api/admin/system/update", post(admin::system_update));
+        .route("/api/admin/system/update", post(admin::system_update))
+        // Model limits (from model_limits.json)
+        .route("/api/admin/model-limits", get(admin::model_limits));
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

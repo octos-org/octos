@@ -38,6 +38,96 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
     }
 }
 
+/// Raw JSON content of `model_limits.json`, embedded at compile time.
+/// Re-exported so other crates don't need their own `include_str!` with fragile relative paths.
+pub const MODEL_LIMITS_JSON: &str = include_str!("model_limits.json");
+
+/// All model limits loaded from `model_limits.json` at compile time.
+/// Edit the JSON file to change defaults — no Rust code changes needed.
+static MODEL_LIMITS: std::sync::LazyLock<ModelLimitsConfig> = std::sync::LazyLock::new(|| {
+    let raw = MODEL_LIMITS_JSON;
+    let root: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+
+    let default_max_tokens = root
+        .get("default_max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096) as u32;
+
+    let default_max_output = root
+        .get("default_max_output")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8192) as u32;
+
+    let models = root
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let pattern = e.get("pattern")?.as_str()?.to_string();
+                    let max_output = e.get("max_output")?.as_u64()? as u32;
+                    let description = e.get("description").and_then(|v| v.as_str()).map(String::from);
+                    let tier = e.get("tier").and_then(|v| v.as_str()).map(String::from);
+                    Some(ModelLimitEntry { pattern, max_output, description, tier })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ModelLimitsConfig {
+        default_max_tokens,
+        default_max_output,
+        models,
+    }
+});
+
+struct ModelLimitEntry {
+    pattern: String,
+    max_output: u32,
+    description: Option<String>,
+    #[allow(dead_code)]
+    tier: Option<String>,
+}
+
+struct ModelLimitsConfig {
+    default_max_tokens: u32,
+    default_max_output: u32,
+    models: Vec<ModelLimitEntry>,
+}
+
+/// Default max tokens per LLM call, loaded from `model_limits.json`.
+pub fn default_max_tokens() -> u32 {
+    MODEL_LIMITS.default_max_tokens
+}
+
+/// Look up maximum output token limit for a model.
+///
+/// Checks patterns from `model_limits.json` in order against the lowercase
+/// model ID. Returns `default_max_output` from the JSON if no pattern matches.
+pub fn max_output_tokens(model_id: &str) -> u32 {
+    let m = model_id.to_lowercase();
+    for entry in &MODEL_LIMITS.models {
+        if m.contains(entry.pattern.as_str()) {
+            return entry.max_output;
+        }
+    }
+    MODEL_LIMITS.default_max_output
+}
+
+/// Look up the description for a model from `model_limits.json`.
+///
+/// Returns a human-readable description of the model's strengths and use cases,
+/// or `None` if no matching pattern is found.
+pub fn model_description(model_id: &str) -> Option<String> {
+    let m = model_id.to_lowercase();
+    for entry in &MODEL_LIMITS.models {
+        if m.contains(entry.pattern.as_str()) {
+            return entry.description.clone();
+        }
+    }
+    None
+}
+
 /// Estimate token count from text using character heuristic.
 ///
 /// Uses ~4 chars/token for ASCII (English/code) and ~1.5 chars/token for
@@ -87,6 +177,33 @@ mod tests {
     #[test]
     fn test_context_window_default() {
         assert_eq!(context_window_tokens("unknown-model"), 128_000);
+    }
+
+    #[test]
+    fn test_max_output_tokens_known_models() {
+        assert_eq!(max_output_tokens("claude-opus-4-20250514"), 128_000);
+        assert_eq!(max_output_tokens("kimi-k2.5"), 65_535);
+        assert_eq!(max_output_tokens("glm-5"), 131_072);
+        assert_eq!(max_output_tokens("deepseek-chat"), 8_192);
+        assert_eq!(max_output_tokens("gpt-4o"), 16_384);
+        assert_eq!(max_output_tokens("gemini-3-pro"), 65_536);
+    }
+
+    #[test]
+    fn test_max_output_tokens_default() {
+        assert_eq!(max_output_tokens("unknown-model"), 8_192);
+    }
+
+    #[test]
+    fn test_model_description_known() {
+        let desc = model_description("kimi-k2.5");
+        assert!(desc.is_some());
+        assert!(desc.unwrap().contains("Moonshot"));
+    }
+
+    #[test]
+    fn test_model_description_unknown() {
+        assert!(model_description("unknown-xyz").is_none());
     }
 
     #[test]

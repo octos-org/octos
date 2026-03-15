@@ -85,6 +85,22 @@ export default function GatewayTab({ config, onChange }: Props) {
       </div>
 
       <div>
+        <label className="block text-sm font-medium text-gray-300 mb-1.5">Max Output Tokens</label>
+        <input
+          type="number"
+          value={config.gateway.max_output_tokens ?? ''}
+          onChange={(e) =>
+            updateGateway('max_output_tokens', e.target.value ? Number(e.target.value) : null)
+          }
+          placeholder="4096"
+          className="input max-w-[200px]"
+        />
+        <p className="text-[10px] text-gray-600 mt-1">
+          Default max output tokens per LLM call. Higher values allow longer responses but cost more. Pipeline nodes can override this per-node.
+        </p>
+      </div>
+
+      <div>
         <label className="block text-sm font-medium text-gray-300 mb-1.5">System Prompt</label>
         <textarea
           value={config.gateway.system_prompt ?? ''}

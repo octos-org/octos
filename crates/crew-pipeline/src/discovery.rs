@@ -58,8 +58,14 @@ impl PipelineDiscovery {
         pipelines
     }
 
-    /// Resolve a pipeline name or path to its DOT content.
+    /// Resolve a pipeline name, path, or inline DOT content to its DOT string.
     pub async fn resolve(&self, name_or_path: &str) -> Result<String> {
+        // 0. Check if it's inline DOT content (starts with "digraph")
+        let trimmed = name_or_path.trim();
+        if trimmed.starts_with("digraph ") || trimmed.starts_with("digraph{") {
+            return Ok(name_or_path.to_string());
+        }
+
         // 1. Check if it's a direct file path
         let as_path = PathBuf::from(name_or_path);
         if as_path.exists() && as_path.extension().is_some_and(|e| e == "dot") {
@@ -123,5 +129,26 @@ fn scan_dot_files(dir: &Path, pipelines: &mut Vec<PipelineInfo>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_resolve_inline_dot() {
+        let discovery = PipelineDiscovery::new(Path::new("/tmp"), Path::new("/tmp"));
+        let dot = "digraph test { a [prompt=\"hello\"] }";
+        let result = discovery.resolve(dot).await.unwrap();
+        assert_eq!(result, dot);
+    }
+
+    #[tokio::test]
+    async fn should_resolve_inline_dot_with_whitespace() {
+        let discovery = PipelineDiscovery::new(Path::new("/tmp"), Path::new("/tmp"));
+        let dot = "  digraph research {\n  search -> analyze\n}";
+        let result = discovery.resolve(dot).await.unwrap();
+        assert_eq!(result, dot);
     }
 }

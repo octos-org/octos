@@ -584,9 +584,14 @@ impl GatewayCommand {
             // Session-specific tools (cron, message, send_file, spawn, pipeline)
             // are created per-session by the ActorFactory — not in base registry.
 
-            // Build sub-provider router from config
-            let provider_router = if !config.sub_providers.is_empty() {
+            // Build sub-provider router from config (explicit sub_providers)
+            // or auto-populate from fallback_models so the LLM has a model catalog
+            // for pipeline DOT generation.
+            let provider_router = {
                 let router = Arc::new(ProviderRouter::new());
+                let mut registered = 0usize;
+
+                // 1. Register explicit sub_providers (highest priority)
                 for sp in &config.sub_providers {
                     let sp_config = if sp.api_key_env.is_some() {
                         let mut c = config.clone();
@@ -603,11 +608,12 @@ impl GatewayCommand {
                         sp.api_type.as_deref(),
                     ) {
                         Ok(p) => {
-                            router.register_with_meta(
+                            router.register_with_full_meta(
                                 &sp.key,
                                 Arc::new(RetryProvider::new(p)),
                                 sp.description.clone(),
                                 sp.default_context_window,
+                                sp.max_output_tokens,
                             );
                             println!(
                                 "  {}: {}/{}",
@@ -615,15 +621,95 @@ impl GatewayCommand {
                                 sp.key,
                                 sp.model.as_deref().unwrap_or("default")
                             );
+                            registered += 1;
                         }
                         Err(e) => {
                             warn!(key = %sp.key, provider = %sp.provider, error = %e, "skipping sub-provider");
                         }
                     }
                 }
-                Some(router)
-            } else {
-                None
+
+                // 2. Auto-register primary + fallback models so the LLM can see
+                //    all available models in the pipeline tool's model catalog.
+                //    Keys are "{provider}" or "{provider}-{n}" for duplicates.
+                if config.sub_providers.is_empty() {
+                    // Register primary provider — use model name as key so the
+                    // LLM sees the actual model (e.g. "kimi-k2.5") not the API
+                    // provider type (e.g. "openai").
+                    let primary_key = model_id.clone();
+                    let primary_desc = crew_llm::context::model_description(&primary_key)
+                        .map(|d| format!("Primary model. {d}"))
+                        .unwrap_or_else(|| "Primary model".into());
+                    router.register_with_full_meta(
+                        &primary_key,
+                        llm.clone(),
+                        Some(primary_desc),
+                        None,
+                        None,
+                    );
+                    registered += 1;
+
+                    // Register each fallback — use model name as key
+                    let mut key_counts: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for fb in &config.fallback_models {
+                        let fb_config = if fb.api_key_env.is_some() {
+                            let mut c = config.clone();
+                            c.api_key_env = fb.api_key_env.clone();
+                            c
+                        } else {
+                            config.clone()
+                        };
+                        match super::chat::create_provider_with_api_type(
+                            &fb.provider,
+                            &fb_config,
+                            fb.model.clone(),
+                            fb.base_url.clone(),
+                            fb.api_type.as_deref(),
+                        ) {
+                            Ok(p) => {
+                                // Build a unique key from model name
+                                let base_key = fb
+                                    .model
+                                    .as_deref()
+                                    .unwrap_or(&fb.provider)
+                                    .to_string();
+                                let count = key_counts.entry(base_key.clone()).or_insert(0);
+                                let key = if *count == 0 {
+                                    base_key.clone()
+                                } else {
+                                    format!("{base_key}-{count}")
+                                };
+                                *count += 1;
+
+                                let fb_desc = crew_llm::context::model_description(&key);
+                                router.register_with_full_meta(
+                                    &key,
+                                    Arc::new(RetryProvider::new(p)),
+                                    fb_desc,
+                                    None,
+                                    None,
+                                );
+                                println!(
+                                    "  {}: {}/{}",
+                                    "Auto sub-provider".cyan(),
+                                    key,
+                                    fb.model.as_deref().unwrap_or("default")
+                                );
+                                registered += 1;
+                            }
+                            Err(e) => {
+                                warn!(provider = %fb.provider, error = %e, "skipping fallback as sub-provider");
+                            }
+                        }
+                    }
+                }
+
+                if registered > 0 {
+                    Some(router)
+                } else {
+                    None
+                }
             };
 
             // Capture config for per-session SpawnTool and PipelineTool creation
@@ -736,17 +822,21 @@ impl GatewayCommand {
 
         // Build agent config (shared by all per-session agents)
         let max_iterations = self.max_iterations.or(config.max_iterations).unwrap_or(50);
+        let session_timeout_secs = gw_config
+            .session_timeout_secs
+            .unwrap_or(crew_agent::DEFAULT_SESSION_TIMEOUT_SECS);
         let agent_config = AgentConfig {
             max_iterations,
             save_episodes: false,
             tool_timeout_secs: gw_config
                 .tool_timeout_secs
                 .unwrap_or(crew_agent::DEFAULT_TOOL_TIMEOUT_SECS),
+            // Agent wall-clock timeout matches session timeout so pipelines
+            // can run up to 30 minutes without the agent loop aborting early.
+            max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
+            chat_max_tokens: gw_config.max_output_tokens,
             ..Default::default()
         };
-        let session_timeout_secs = gw_config
-            .session_timeout_secs
-            .unwrap_or(crew_agent::DEFAULT_SESSION_TIMEOUT_SECS);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();

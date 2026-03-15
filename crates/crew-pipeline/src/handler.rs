@@ -162,6 +162,7 @@ impl Handler for CodergenHandler {
             max_iterations: 30,
             max_timeout: node.timeout_secs.map(Duration::from_secs),
             save_episodes: false,
+            chat_max_tokens: node.max_output_tokens,
             ..Default::default()
         };
 

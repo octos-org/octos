@@ -11,6 +11,7 @@ export interface GatewaySettings {
   system_prompt?: string | null
   max_concurrent_sessions?: number | null
   browser_timeout_secs?: number | null
+  max_output_tokens?: number | null
 }
 
 export interface ChannelCredentials {

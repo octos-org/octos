@@ -49,6 +49,9 @@ pub struct AgentConfig {
     pub worker_prompt: Option<String>,
     /// Maximum seconds for all parallel tool calls to complete. Default: 300.
     pub tool_timeout_secs: u64,
+    /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
+    /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
+    pub chat_max_tokens: Option<u32>,
 }
 
 /// Default tool execution timeout in seconds.
@@ -67,6 +70,7 @@ impl Default for AgentConfig {
             save_episodes: true,
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
+            chat_max_tokens: None,
         }
     }
 }

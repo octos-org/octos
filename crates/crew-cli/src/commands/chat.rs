@@ -273,6 +273,7 @@ impl ChatCommand {
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
             save_episodes: true,
+            chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
             ..Default::default()
         };
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)

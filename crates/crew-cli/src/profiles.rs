@@ -329,6 +329,10 @@ pub struct GatewaySettings {
     pub max_concurrent_sessions: Option<usize>,
     #[serde(default)]
     pub browser_timeout_secs: Option<u64>,
+    /// Default max output tokens per LLM call.
+    /// Overrides the built-in default from model_limits.json.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// Manages profile storage as individual JSON files.
@@ -692,6 +696,7 @@ pub(crate) fn config_from_profile(
             system_prompt: profile.config.gateway.system_prompt.clone(),
             max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
             browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
+            max_output_tokens: profile.config.gateway.max_output_tokens,
             ..Default::default()
         }),
         fallback_models,

@@ -592,6 +592,7 @@ impl ServeCommand {
             .with_config(AgentConfig {
                 max_iterations: 20,
                 save_episodes: false,
+                chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
                 ..Default::default()
             })
             .with_reporter(reporter);
