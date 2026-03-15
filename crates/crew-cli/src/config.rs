@@ -490,6 +490,7 @@ pub enum QueueMode {
     /// Process queued messages one at a time (FIFO).
     Followup,
     /// Concatenate queued messages from the same session into one before processing.
+    #[default]
     Collect,
     /// Keep only the latest message, discard older queued messages.
     Steer,
@@ -497,8 +498,7 @@ pub enum QueueMode {
     Interrupt,
     /// If the current LLM call exceeds the patience threshold and a new message
     /// arrives, spawn a full agent task for the new message concurrently.
-    /// Both results are delivered to the user. Default behavior.
-    #[default]
+    /// Both results are delivered to the user.
     Speculative,
 }
 

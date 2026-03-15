@@ -262,7 +262,7 @@ impl GatewayCommand {
                 info!("adaptive routing enabled ({} providers)", providers.len());
                 let mode = ar_config
                     .map(|c| c.mode.into())
-                    .unwrap_or(crew_llm::AdaptiveMode::Hedge);
+                    .unwrap_or(crew_llm::AdaptiveMode::Lane);
                 let qos = ar_config.map(|c| c.qos_ranking).unwrap_or(true);
                 let router = Arc::new(
                     AdaptiveRouter::new(providers, adaptive_config).with_adaptive_config(mode, qos),
