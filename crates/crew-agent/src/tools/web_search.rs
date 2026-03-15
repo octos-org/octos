@@ -1,10 +1,11 @@
 //! Web search tool with multiple provider support.
 //!
-//! Provider priority (cheapest first, paid AI search as fallback):
-//! 1. DuckDuckGo (no key) — free HTML search
-//! 2. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
-//! 3. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 4. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//! Provider priority (best quality first, DDG as free fallback):
+//! 1. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
+//! 2. DuckDuckGo (no key) — free HTML search
+//! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
+//! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
 //! the next one is attempted. Perplexity is last because it costs the most but
@@ -98,6 +99,24 @@ struct YouWebResult {
     snippets: Vec<String>,
 }
 
+// --- Exa types ---
+
+#[derive(Deserialize)]
+struct ExaResponse {
+    results: Option<Vec<ExaResult>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaResult {
+    title: Option<String>,
+    url: String,
+    #[serde(default)]
+    highlights: Vec<String>,
+    #[serde(default)]
+    published_date: Option<String>,
+}
+
 // --- Perplexity types ---
 
 #[derive(Deserialize)]
@@ -124,7 +143,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Supports Perplexity, You.com, Brave, and DuckDuckGo (auto-detected from environment)."
+        "Search the web for information. Supports Exa, Brave, You.com, Perplexity, and DuckDuckGo (auto-detected from environment)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -173,6 +192,17 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Exa (neural search — best for niche/recent topics)
+        if let Ok(api_key) = std::env::var("EXA_API_KEY") {
+            let result = self.exa_search(&input.query, count, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    info!(provider = "exa", query = %input.query, "web search");
+                    return result;
+                }
+            }
+        }
+
         // Brave Search
         if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
             let result = self.brave_search(&input.query, count, &api_key).await;
@@ -208,6 +238,81 @@ impl Tool for WebSearchTool {
 }
 
 impl WebSearchTool {
+    // --- Exa (neural search) ---
+
+    async fn exa_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let body = serde_json::json!({
+            "query": query,
+            "type": "auto",
+            "numResults": count,
+            "contents": {
+                "highlights": {
+                    "numSentences": 3
+                }
+            }
+        });
+
+        let response = self
+            .client
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to call Exa API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: format!("Exa API error ({status}): {body}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let exa: ExaResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse Exa response")?;
+
+        let results = exa.results.unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+
+        let mut output = format!("Results for: {query}\n\n");
+        for (i, r) in results.iter().enumerate() {
+            let title = r.title.as_deref().unwrap_or("(untitled)");
+            output.push_str(&format!("{}. {}\n   {}\n", i + 1, title, r.url));
+
+            if let Some(ref date) = r.published_date {
+                output.push_str(&format!("   Published: {}\n", date));
+            }
+
+            for highlight in &r.highlights {
+                let trimmed = highlight.trim();
+                if !trimmed.is_empty() {
+                    output.push_str(&format!("   {}\n", trimmed));
+                }
+            }
+
+            output.push('\n');
+        }
+
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
     // --- Perplexity Sonar ---
 
     async fn perplexity_search(&self, query: &str, api_key: &str) -> Result<ToolResult> {
