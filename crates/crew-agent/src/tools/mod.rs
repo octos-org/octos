@@ -949,4 +949,24 @@ mod path_tests {
             PathBuf::from("/c")
         );
     }
+
+    /// Per-profile CWD isolation: when cwd is narrowed to a profile's data_dir,
+    /// resolve_path must block access to other profiles' directories.
+    #[test]
+    fn test_resolve_blocks_cross_profile_access() {
+        // Simulate per-profile isolation: cwd = ~/.crew/profiles/alice/data
+        let base = Path::new("/home/user/.crew/profiles/alice/data");
+
+        // Trying to read another profile's data via traversal
+        assert!(resolve_path(base, "../../bob/data/sessions/secret").is_err());
+        assert!(resolve_path(base, "../../../profiles/bob/data/episodes.db").is_err());
+
+        // Trying to reach shared crew home
+        assert!(resolve_path(base, "../../../skills/evil-skill/main").is_err());
+
+        // Valid access within own data dir
+        assert!(resolve_path(base, "skills/my-skill/main").is_ok());
+        assert!(resolve_path(base, "sessions/chat-123.json").is_ok());
+        assert!(resolve_path(base, "skill-output/report.pdf").is_ok());
+    }
 }

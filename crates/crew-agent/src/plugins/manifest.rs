@@ -1,5 +1,7 @@
 //! Plugin manifest parsing.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 /// A plugin manifest (manifest.json).
@@ -19,13 +21,78 @@ pub struct PluginManifest {
     /// Each entry has `url` (download URL) and optional `sha256` (integrity hash).
     /// CI/CD updates this on each release.
     #[serde(default)]
-    pub binaries: std::collections::HashMap<String, BinaryDownload>,
+    pub binaries: HashMap<String, BinaryDownload>,
     /// Whether the plugin needs network access (informational).
     #[serde(default)]
     pub requires_network: bool,
     /// Override default execution timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// MCP servers this skill provides.
+    #[serde(default)]
+    pub mcp_servers: Vec<SkillMcpServer>,
+    /// Lifecycle hooks this skill provides.
+    #[serde(default)]
+    pub hooks: Vec<SkillHookDef>,
+    /// Prompt fragments to inject into the system prompt.
+    #[serde(default)]
+    pub prompts: Option<SkillPrompts>,
+}
+
+impl PluginManifest {
+    /// Whether this manifest declares any extras (MCP servers, hooks, or prompts).
+    pub fn has_extras(&self) -> bool {
+        !self.mcp_servers.is_empty()
+            || !self.hooks.is_empty()
+            || self.prompts.as_ref().map_or(false, |p| !p.include.is_empty())
+    }
+}
+
+/// An MCP server declared by a skill manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillMcpServer {
+    /// Command to spawn (resolved relative to skill dir at load time).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variable NAMES to forward from the process env.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// HTTP transport: URL of the MCP server endpoint.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP transport: additional headers.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+/// A lifecycle hook declared by a skill manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillHookDef {
+    /// Lifecycle event name: "before_tool_call", "after_tool_call", etc.
+    pub event: String,
+    /// Command as argv array. Relative paths resolved against skill directory.
+    pub command: Vec<String>,
+    /// Timeout in milliseconds.
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Tool name filter (empty = all tools).
+    #[serde(default)]
+    pub tool_filter: Vec<String>,
+}
+
+fn default_hook_timeout_ms() -> u64 {
+    5000
+}
+
+/// Prompt fragment configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SkillPrompts {
+    /// Glob patterns for markdown files to include (relative to skill dir).
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// A tool definition within a plugin manifest.

@@ -7,11 +7,35 @@ use eyre::Result;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::hooks::HookConfig;
+use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::ToolRegistry;
 
+use super::extras::{SkillExtras, resolve_extras};
 use super::manifest::PluginManifest;
 use super::tool::PluginTool;
+
+/// Aggregated result from loading plugins across directories.
+#[derive(Debug, Default)]
+pub struct PluginLoadResult {
+    /// Number of tools registered into the `ToolRegistry`.
+    pub tool_count: usize,
+    /// MCP server configs resolved from skill manifests.
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Hook configs resolved from skill manifests.
+    pub hooks: Vec<HookConfig>,
+    /// Prompt fragments read from skill directories.
+    pub prompt_fragments: Vec<String>,
+}
+
+impl PluginLoadResult {
+    fn merge_extras(&mut self, extras: SkillExtras) {
+        self.mcp_servers.extend(extras.mcp_servers);
+        self.hooks.extend(extras.hooks);
+        self.prompt_fragments.extend(extras.prompt_fragments);
+    }
+}
 
 /// Scans plugin directories and registers discovered tools.
 pub struct PluginLoader;
@@ -25,12 +49,13 @@ impl PluginLoader {
     ///
     /// `extra_env` is injected into every plugin process (e.g. provider base URLs, API keys).
     ///
-    /// Returns the number of tools registered.
+    /// Returns a `PluginLoadResult` with tool count and any resolved extras
+    /// (MCP servers, hooks, prompt fragments).
     pub fn load_into(
         registry: &mut ToolRegistry,
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
-    ) -> Result<usize> {
+    ) -> Result<PluginLoadResult> {
         Self::load_into_with_work_dir(registry, dirs, extra_env, None)
     }
 
@@ -40,8 +65,8 @@ impl PluginLoader {
         dirs: &[PathBuf],
         extra_env: &[(String, String)],
         work_dir: Option<&Path>,
-    ) -> Result<usize> {
-        let mut count = 0;
+    ) -> Result<PluginLoadResult> {
+        let mut result = PluginLoadResult::default();
 
         for dir in dirs {
             if !dir.exists() {
@@ -61,12 +86,13 @@ impl PluginLoader {
                 }
 
                 match Self::load_plugin_with_work_dir(&path, extra_env, work_dir) {
-                    Ok(tools) => {
+                    Ok((tools, extras)) => {
                         let n = tools.len();
                         for tool in tools {
                             registry.register(tool);
                         }
-                        count += n;
+                        result.tool_count += n;
+                        result.merge_extras(extras);
                     }
                     Err(e) => {
                         warn!(
@@ -79,32 +105,58 @@ impl PluginLoader {
             }
         }
 
-        if count > 0 {
-            info!(tools = count, "loaded plugin tools");
+        if result.tool_count > 0 {
+            info!(tools = result.tool_count, "loaded plugin tools");
+        }
+        if !result.mcp_servers.is_empty() || !result.hooks.is_empty() {
+            info!(
+                mcp_servers = result.mcp_servers.len(),
+                hooks = result.hooks.len(),
+                prompt_fragments = result.prompt_fragments.len(),
+                "loaded skill extras"
+            );
         }
 
-        Ok(count)
+        Ok(result)
     }
 
-    /// Load a single plugin directory and return its tools.
+    /// Load a single plugin directory and return its tools and extras.
     pub fn load_plugin(
         plugin_dir: &Path,
         extra_env: &[(String, String)],
-    ) -> Result<Vec<PluginTool>> {
+    ) -> Result<(Vec<PluginTool>, SkillExtras)> {
         Self::load_plugin_with_work_dir(plugin_dir, extra_env, None)
     }
 
     /// Load a single plugin directory with an optional working directory.
+    ///
+    /// Returns `(tools, extras)`. If the manifest declares no tools but has
+    /// extras (MCP servers, hooks, prompts), the executable search is skipped
+    /// and an empty tool vec is returned alongside the resolved extras.
     pub fn load_plugin_with_work_dir(
         plugin_dir: &Path,
         extra_env: &[(String, String)],
         work_dir: Option<&Path>,
-    ) -> Result<Vec<PluginTool>> {
+    ) -> Result<(Vec<PluginTool>, SkillExtras)> {
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
         let manifest: PluginManifest = serde_json::from_str(&content)
             .map_err(|e| eyre::eyre!("invalid manifest.json: {e}"))?;
+
+        // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
+        let extras = resolve_extras(&manifest, plugin_dir);
+
+        // If no tools declared, skip executable search entirely.
+        if manifest.tools.is_empty() {
+            if manifest.has_extras() {
+                info!(
+                    plugin = %manifest.name,
+                    "loaded extras-only skill (no tools)"
+                );
+            }
+            return Ok((vec![], extras));
+        }
 
         // Find executable: try plugin name, then "main"
         let dir_name = plugin_dir
@@ -206,7 +258,7 @@ impl PluginLoader {
             })
             .collect();
 
-        Ok(tools)
+        Ok((tools, extras))
     }
 }
 
@@ -243,16 +295,16 @@ mod tests {
         let result =
             PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap().tool_count, 0);
     }
 
     #[test]
     fn test_load_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = ToolRegistry::new();
-        let count =
+        let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(result.tool_count, 0);
     }
 
     #[cfg(unix)]
@@ -280,9 +332,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let count =
+        let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
     }
 
@@ -309,9 +361,9 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let count =
+        let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(result.tool_count, 1);
     }
 
     #[cfg(unix)]
@@ -332,9 +384,9 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         // Should succeed overall (skips failed plugin) but register 0 tools
-        let count =
+        let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(result.tool_count, 0);
     }
 
     #[test]

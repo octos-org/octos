@@ -226,10 +226,20 @@ impl ChatCommand {
         }
 
         // Load plugins (includes app-skills from .crew/skills/)
-        let plugin_dirs = Config::plugin_dirs(&cwd);
+        let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".crew"));
+        let mut plugin_result = crew_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]) {
-                eprintln!("Warning: plugin loading failed: {e}");
+            match crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]) {
+                Ok(result) => plugin_result = result,
+                Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
+            }
+        }
+
+        // Start MCP servers declared in skill manifests
+        if !plugin_result.mcp_servers.is_empty() {
+            match crew_agent::McpClient::start(&plugin_result.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => eprintln!("Warning: skill MCP initialization failed: {e}"),
             }
         }
 
@@ -300,8 +310,16 @@ impl ChatCommand {
             agent.append_system_prompt(&bank_summary);
         }
 
-        if !config.hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        // Inject skill prompt fragments
+        for fragment in &plugin_result.prompt_fragments {
+            agent.append_system_prompt(fragment);
+        }
+
+        // Merge config hooks with skill-declared hooks
+        let mut all_hooks = config.hooks.clone();
+        all_hooks.extend(plugin_result.hooks);
+        if !all_hooks.is_empty() {
+            agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
         if let Some(embedder) = create_embedder(&config) {

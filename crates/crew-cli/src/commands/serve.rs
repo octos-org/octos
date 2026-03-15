@@ -575,14 +575,26 @@ impl ServeCommand {
         crew_agent::bootstrap::bootstrap_platform_skills(&crew_home);
 
         // Plugins (includes bootstrapped skills from bundled-app-skills/)
-        let mut plugin_dirs = Config::plugin_dirs(cwd);
-        // Platform skills are admin-only — add them here (not in Config::plugin_dirs)
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&crew_home);
+        // Platform skills are admin-only — add them here (not in Config::plugin_dirs_from_project)
         let platform_dir = crew_home.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR);
         if platform_dir.exists() {
             plugin_dirs.push(platform_dir);
         }
+        let mut plugin_result = crew_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]);
+            if let Ok(result) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[])
+            {
+                plugin_result = result;
+            }
+        }
+
+        // Start MCP servers declared in skill manifests
+        if !plugin_result.mcp_servers.is_empty() {
+            match crew_agent::McpClient::start(&plugin_result.mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => tracing::warn!("skill MCP initialization failed: {e}"),
+            }
         }
 
         let reporter: Arc<dyn crew_agent::ProgressReporter> =
@@ -597,8 +609,16 @@ impl ServeCommand {
             })
             .with_reporter(reporter);
 
-        if !config.hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(config.hooks.clone())));
+        // Inject skill prompt fragments
+        for fragment in &plugin_result.prompt_fragments {
+            agent.append_system_prompt(fragment);
+        }
+
+        // Merge config hooks with skill-declared hooks
+        let mut all_hooks = config.hooks.clone();
+        all_hooks.extend(plugin_result.hooks);
+        if !all_hooks.is_empty() {
+            agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
         }
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
