@@ -412,6 +412,7 @@ pub mod research_utils;
 pub mod save_memory;
 pub mod send_file;
 pub mod shell;
+#[allow(dead_code)]
 pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod synthesize_research;

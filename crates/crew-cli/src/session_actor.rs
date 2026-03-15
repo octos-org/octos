@@ -384,7 +384,7 @@ impl ActorFactory {
         // Build per-user workspace directory for file isolation.
         // Each user's tools are restricted to their own workspace via
         // resolve_path() (application-level) and sandbox-exec SBPL (kernel-level on macOS).
-        let encoded_base = crew_bus::session::encode_path_component(&session_key.base_key());
+        let encoded_base = crew_bus::session::encode_path_component(session_key.base_key());
         let user_workspace = self
             .data_dir
             .join("users")
@@ -501,7 +501,7 @@ impl ActorFactory {
         )));
 
         // Load per-user status configuration
-        let user_status_config = UserStatusConfig::load(&self.data_dir, &session_key.base_key());
+        let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());
 
         let actor = SessionActor {
             session_key: session_key.clone(),
@@ -1093,7 +1093,7 @@ impl SessionActor {
 
         // Persist changes
         let base_key = self.session_key.base_key();
-        if let Err(e) = self.user_status_config.save(&self.data_dir, &base_key) {
+        if let Err(e) = self.user_status_config.save(&self.data_dir, base_key) {
             warn!(error = %e, "failed to save user status config");
         }
     }
@@ -1870,10 +1870,7 @@ impl SessionActor {
 
             // Wait for stream forwarder to finish flushing
             let stream_result = if let Some(handle) = stream_forwarder {
-                match handle.await {
-                    Ok(sr) => Some(sr),
-                    Err(_) => None,
-                }
+                handle.await.ok()
             } else {
                 None
             };
@@ -1908,7 +1905,7 @@ impl SessionActor {
                     // the stream message), skip the duplicate out_tx send.
                     let already_streamed = stream_result
                         .as_ref()
-                        .map_or(false, |sr| sr.message_id.is_some());
+                        .is_some_and(|sr| sr.message_id.is_some());
 
                     if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx

@@ -1,6 +1,5 @@
 //! Tool execution: dispatching tool calls with hooks and timeout handling.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crew_core::{Message, MessageRole, TokenUsage};

@@ -801,7 +801,7 @@ impl PipelineExecutor {
                     let handler = codergen_handler.clone();
                     let max_retries = synth_node.max_retries;
                     let worker_label = synth_node.label.clone().unwrap_or_else(|| task_id.clone());
-                    let dp_label = dp_label.clone();
+                    let dp_label = dp_label.to_owned();
                     let done_count = completed_count.clone();
 
                     futures.push(async move {

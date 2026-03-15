@@ -11,22 +11,16 @@ mod message_repair;
 mod streaming;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, RwLock};
 
-use crew_core::{AgentId, Message, MessageRole, TokenUsage};
+use crew_core::{AgentId, Message, TokenUsage};
 use crew_llm::{EmbeddingProvider, LlmProvider};
 use crew_memory::EpisodeStore;
 
 use crate::hooks::{HookContext, HookExecutor};
-use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
+use crate::progress::{ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
-
-// Re-export free functions used internally by submodules
-pub(crate) use message_repair::{
-    normalize_system_messages, repair_message_order, repair_tool_pairs, sanitize_tool_call_id,
-    truncate_old_tool_results,
-};
 
 tokio::task_local! {
     /// Task-local reporter override.  When set (via `TASK_REPORTER.scope()`),
