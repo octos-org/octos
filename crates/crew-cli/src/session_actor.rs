@@ -1433,6 +1433,8 @@ impl SessionActor {
                     self.chat_id.clone(),
                     cancel_status,
                     status_msg_id,
+                    Arc::clone(&self.active_sessions),
+                    self.session_key.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -1881,6 +1883,8 @@ impl SessionActor {
                     chat_id.clone(),
                     cancel_status,
                     status_msg_id,
+                    active_sessions.clone(),
+                    session_key.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -2077,6 +2081,8 @@ impl SessionActor {
                     self.chat_id.clone(),
                     cancel_status,
                     status_msg_id,
+                    Arc::clone(&self.active_sessions),
+                    self.session_key.clone(),
                 )))
             } else {
                 drop(stream_rx);

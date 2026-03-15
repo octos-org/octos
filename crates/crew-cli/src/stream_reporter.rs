@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crew_agent::progress::{ProgressEvent, ProgressReporter};
-use crew_bus::Channel;
-use crew_core::OutboundMessage;
-use tokio::sync::mpsc;
-use tracing::warn;
+use crew_bus::{ActiveSessionStore, Channel};
+use crew_core::{OutboundMessage, SessionKey};
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, warn};
 
 /// Events forwarded from the synchronous reporter to the async forwarder.
 #[derive(Debug)]
@@ -102,18 +102,42 @@ pub struct StreamResult {
     pub text: String,
 }
 
+/// Check if a session is currently the active session for its chat.
+///
+/// When inactive, streaming edits must be skipped so replies go through
+/// the proxy → pending buffer path and can be flushed on session switch.
+async fn is_session_active(
+    session_key: &SessionKey,
+    active_sessions: &Mutex<ActiveSessionStore>,
+) -> bool {
+    let my_topic = session_key.topic().unwrap_or("");
+    let base_key = session_key.base_key();
+    let active_topic = active_sessions
+        .lock()
+        .await
+        .get_active_topic(base_key)
+        .to_string();
+    my_topic == active_topic
+}
+
 /// Run the stream forwarder task.
 ///
 /// Receives `StreamProgressEvent`s and progressively edits a channel message
 /// with accumulated text. Returns once the sender is dropped (agent completes).
 ///
 /// `cancel_status` — if provided, stops the status indicator when first chunk arrives.
+///
+/// `active_sessions` + `session_key` — used to check if this session is currently
+/// active before sending/editing channel messages. When inactive, all direct
+/// channel operations are skipped to prevent cross-session message leaks.
 pub async fn run_stream_forwarder(
     mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
     channel: Arc<dyn Channel>,
     chat_id: String,
     cancel_status: Option<Arc<std::sync::atomic::AtomicBool>>,
     status_msg_id: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    session_key: SessionKey,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -132,12 +156,16 @@ pub async fn run_stream_forwarder(
                     if let Some(ref cancel) = cancel_status {
                         cancel.store(true, std::sync::atomic::Ordering::Release);
                     }
-                    // Delete the status message
-                    if let Some(ref msg_id_lock) = status_msg_id {
-                        let mid = msg_id_lock.lock().await.take();
-                        if let Some(ref mid) = mid {
-                            let _ = channel.delete_message(&chat_id, mid).await;
+                    // Delete the status message (only if this session is active)
+                    if is_session_active(&session_key, &active_sessions).await {
+                        if let Some(ref msg_id_lock) = status_msg_id {
+                            let mid = msg_id_lock.lock().await.take();
+                            if let Some(ref mid) = mid {
+                                let _ = channel.delete_message(&chat_id, mid).await;
+                            }
                         }
+                    } else {
+                        debug!(session = %session_key, "skipping status delete (inactive)");
                     }
                 }
 
@@ -145,6 +173,9 @@ pub async fn run_stream_forwarder(
 
                 // Throttled edit — strip <think> blocks before showing to user
                 if !no_edit_support && last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
+                    if !is_session_active(&session_key, &active_sessions).await {
+                        continue;
+                    }
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
                         flush_to_channel(
@@ -161,7 +192,10 @@ pub async fn run_stream_forwarder(
             }
             StreamProgressEvent::StreamDone { .. } => {
                 // Flush remaining buffer — strip think tags
-                if !no_edit_support && !buffer.is_empty() {
+                if !no_edit_support
+                    && !buffer.is_empty()
+                    && is_session_active(&session_key, &active_sessions).await
+                {
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
                         flush_to_channel(
@@ -177,7 +211,10 @@ pub async fn run_stream_forwarder(
             }
             StreamProgressEvent::ToolStarted { name } => {
                 // Flush text before tool status
-                if !no_edit_support && !buffer.is_empty() {
+                if !no_edit_support
+                    && !buffer.is_empty()
+                    && is_session_active(&session_key, &active_sessions).await
+                {
                     buffer.push_str(&format!("\n\n⚙ `{name}`..."));
                     flush_to_channel(
                         &channel,
@@ -200,15 +237,17 @@ pub async fn run_stream_forwarder(
                     if buffer.contains(&pending) {
                         buffer = buffer.replace(&pending, &completed);
                     }
-                    flush_to_channel(
-                        &channel,
-                        &chat_id,
-                        &buffer,
-                        &mut message_id,
-                        &mut no_edit_support,
-                    )
-                    .await;
-                    last_edit = Instant::now();
+                    if is_session_active(&session_key, &active_sessions).await {
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &buffer,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
+                        last_edit = Instant::now();
+                    }
                 }
             }
             StreamProgressEvent::ToolProgress { name, message } => {
@@ -226,7 +265,9 @@ pub async fn run_stream_forwarder(
                             buffer.replace_range(pos..end, &progress);
                         }
                     }
-                    if last_edit.elapsed() >= EDIT_THROTTLE {
+                    if last_edit.elapsed() >= EDIT_THROTTLE
+                        && is_session_active(&session_key, &active_sessions).await
+                    {
                         flush_to_channel(
                             &channel,
                             &chat_id,
@@ -240,32 +281,34 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
-                // Cancel the status indicator before showing retry/failover info,
-                // so we don't have two messages ("✦ Thinking..." + "⟳ Retrying...")
-                // visible simultaneously.
+                // Cancel the status indicator before showing retry/failover info
                 if first_chunk {
                     first_chunk = false;
                     if let Some(ref cancel) = cancel_status {
                         cancel.store(true, std::sync::atomic::Ordering::Release);
                     }
-                    if let Some(ref msg_id_lock) = status_msg_id {
-                        let mid = msg_id_lock.lock().await.take();
-                        if let Some(ref mid) = mid {
-                            let _ = channel.delete_message(&chat_id, mid).await;
+                    if is_session_active(&session_key, &active_sessions).await {
+                        if let Some(ref msg_id_lock) = status_msg_id {
+                            let mid = msg_id_lock.lock().await.take();
+                            if let Some(ref mid) = mid {
+                                let _ = channel.delete_message(&chat_id, mid).await;
+                            }
                         }
                     }
                 }
                 // Show retry/failover status as a temporary message
-                let status_text = format!("⟳ {message}");
-                flush_to_channel(
-                    &channel,
-                    &chat_id,
-                    &status_text,
-                    &mut message_id,
-                    &mut no_edit_support,
-                )
-                .await;
-                last_edit = Instant::now();
+                if is_session_active(&session_key, &active_sessions).await {
+                    let status_text = format!("⟳ {message}");
+                    flush_to_channel(
+                        &channel,
+                        &chat_id,
+                        &status_text,
+                        &mut message_id,
+                        &mut no_edit_support,
+                    )
+                    .await;
+                    last_edit = Instant::now();
+                }
             }
             StreamProgressEvent::BufferReset => {
                 // Clear accumulated text so a retry starts fresh.
@@ -277,7 +320,11 @@ pub async fn run_stream_forwarder(
     }
 
     // Final flush — only if we have an active streamed message to update
-    if !no_edit_support && !buffer.is_empty() && message_id.is_none() {
+    if !no_edit_support
+        && !buffer.is_empty()
+        && message_id.is_none()
+        && is_session_active(&session_key, &active_sessions).await
+    {
         let visible = strip_think_from_buffer(&buffer);
         if !visible.is_empty() {
             flush_to_channel(
