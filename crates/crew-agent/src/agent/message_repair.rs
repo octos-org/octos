@@ -318,7 +318,7 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
 /// `MAX_OLD_TOOL_RESULT_CHARS`.  Tool results in the current conversation
 /// round (after the last user message) are kept intact so the agent can
 /// reference them.
-pub(crate) fn truncate_old_tool_results(messages: &mut Vec<Message>) {
+pub(crate) fn truncate_old_tool_results(messages: &mut [Message]) {
     const MAX_OLD_TOOL_RESULT_CHARS: usize = 800;
 
     // Find the last user message -- everything before it is "old" context

@@ -25,7 +25,7 @@ use tracing::warn;
 // ---------------------------------------------------------------------------
 
 /// How a layer's content is displayed and updated.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerPolicy {
     /// Always visible, content set once (e.g. provider name).
@@ -35,13 +35,8 @@ pub enum LayerPolicy {
     /// Appears temporarily then auto-clears after duration.
     Transient { duration_secs: u64 },
     /// Shows latest value, replaced by next update (e.g. retry status).
+    #[default]
     Replaceable,
-}
-
-impl Default for LayerPolicy {
-    fn default() -> Self {
-        Self::Replaceable
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +205,7 @@ impl UserStatusConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(&path, json)
     }
 

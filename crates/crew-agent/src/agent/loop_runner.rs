@@ -1,7 +1,6 @@
 //! Main agent loop: process_message and run_task orchestration.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
