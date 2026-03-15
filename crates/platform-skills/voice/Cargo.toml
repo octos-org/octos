@@ -14,3 +14,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json", "multipart"], default-features = false }
 base64 = "0.22"
+
+[package.metadata.release]
+release = false

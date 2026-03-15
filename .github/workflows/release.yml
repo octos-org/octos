@@ -35,7 +35,15 @@ jobs:
           done
           cd dist && tar czf ../crew-bundle-aarch64-apple-darwin.tar.gz *
 
+      - name: Install git-cliff
+        run: cargo install git-cliff --locked
+
+      - name: Generate release notes
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          git-cliff --latest --strip header -o RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: crew-bundle-aarch64-apple-darwin.tar.gz
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md

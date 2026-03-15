@@ -15,3 +15,6 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls", "hostname"] }
 base64 = "0.22"
+
+[package.metadata.release]
+release = false

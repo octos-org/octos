@@ -19,3 +19,6 @@ scraper = "0.22"
 ego-tree = "0.10"
 regex = "1"
 url = "2"
+
+[package.metadata.release]
+release = false

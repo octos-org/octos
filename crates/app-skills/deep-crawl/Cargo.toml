@@ -22,3 +22,6 @@ chrono = "0.4"
 which = "7"
 futures-util = "0.3"
 tempfile = "3"
+
+[package.metadata.release]
+release = false

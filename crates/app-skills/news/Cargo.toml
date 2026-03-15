@@ -16,3 +16,6 @@ serde_json = "1"
 scraper = "0.21"
 regex = "1"
 chrono = "0.4"
+
+[package.metadata.release]
+release = false

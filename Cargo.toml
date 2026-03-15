@@ -164,3 +164,13 @@ tar = "0.4"
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
+
+# -- Release configuration --------------------------------------------------
+[workspace.metadata.release]
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+tag-message = "Release {{version}}"
+pre-release-commit-message = "chore: release {{version}}"
+pre-release-hook = ["git-cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
+publish = false
