@@ -163,17 +163,23 @@ fi
 # ── Build ─────────────────────────────────────────────────────────────
 section "Building crew-rs"
 
+INSTALL_FLAG=""
 BUILD_FLAG=""
-if [ "$PROFILE" = "release" ]; then
+if [ "$PROFILE" = "dev" ]; then
+    INSTALL_FLAG="--debug"
+    BUILD_FLAG=""
+else
+    # cargo install defaults to --release; passing it explicitly errors on newer Rust
+    INSTALL_FLAG=""
     BUILD_FLAG="--release"
 fi
 
 if [ -n "$CLI_FEATURES" ]; then
     echo "    cargo install crew-cli with features: $CLI_FEATURES"
-    cargo install --path crates/crew-cli --features "$CLI_FEATURES" $BUILD_FLAG
+    cargo install --path crates/crew-cli --features "$CLI_FEATURES" $INSTALL_FLAG
 else
     echo "    cargo install crew-cli (no extra features)"
-    cargo install --path crates/crew-cli $BUILD_FLAG
+    cargo install --path crates/crew-cli $INSTALL_FLAG
 fi
 ok "crew binary installed to $PREFIX/crew"
 

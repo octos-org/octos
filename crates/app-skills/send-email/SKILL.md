@@ -3,7 +3,7 @@ name: send-email
 description: Send emails via SMTP or Feishu/Lark Mail. Triggers: send email, 发邮件, email to, 发送邮件, mail, send mail.
 version: 1.0.0
 author: hagency
-always: true
+always: false
 ---
 
 # Send Email Skill

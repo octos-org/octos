@@ -116,6 +116,13 @@ impl Agent {
             synthesize_missing_tool_results(&mut messages);
             truncate_old_tool_results(&mut messages);
 
+            if iteration == 1 && tools_spec.len() > 25 {
+                tracing::warn!(
+                    tools = tools_spec.len(),
+                    "high tool count may cause empty responses with some models; \
+                     consider reducing skills (always: false) or adding a tool_policy deny list"
+                );
+            }
             tracing::info!(
                 iteration,
                 messages = messages.len(),

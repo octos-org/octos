@@ -49,10 +49,10 @@ pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage}
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use tools::{
-    BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool,
-    ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
+    ActivateToolsTool, BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
+    GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool,
+    SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool,
+    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
     WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
 };
