@@ -23,8 +23,24 @@ impl PluginLoader {
     /// - `manifest.json` — plugin metadata and tool definitions
     /// - An executable file (same name as directory, or `main`)
     ///
+    /// `extra_env` is injected into every plugin process (e.g. provider base URLs, API keys).
+    ///
     /// Returns the number of tools registered.
-    pub fn load_into(registry: &mut ToolRegistry, dirs: &[PathBuf]) -> Result<usize> {
+    pub fn load_into(
+        registry: &mut ToolRegistry,
+        dirs: &[PathBuf],
+        extra_env: &[(String, String)],
+    ) -> Result<usize> {
+        Self::load_into_with_work_dir(registry, dirs, extra_env, None)
+    }
+
+    /// Like `load_into`, but sets a working directory for plugin processes.
+    pub fn load_into_with_work_dir(
+        registry: &mut ToolRegistry,
+        dirs: &[PathBuf],
+        extra_env: &[(String, String)],
+        work_dir: Option<&Path>,
+    ) -> Result<usize> {
         let mut count = 0;
 
         for dir in dirs {
@@ -44,7 +60,7 @@ impl PluginLoader {
                     continue;
                 }
 
-                match Self::load_plugin(&path) {
+                match Self::load_plugin_with_work_dir(&path, extra_env, work_dir) {
                     Ok(tools) => {
                         let n = tools.len();
                         for tool in tools {
@@ -71,7 +87,19 @@ impl PluginLoader {
     }
 
     /// Load a single plugin directory and return its tools.
-    pub fn load_plugin(plugin_dir: &Path) -> Result<Vec<PluginTool>> {
+    pub fn load_plugin(
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+    ) -> Result<Vec<PluginTool>> {
+        Self::load_plugin_with_work_dir(plugin_dir, extra_env, None)
+    }
+
+    /// Load a single plugin directory with an optional working directory.
+    pub fn load_plugin_with_work_dir(
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+        work_dir: Option<&Path>,
+    ) -> Result<Vec<PluginTool>> {
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -167,9 +195,14 @@ impl PluginLoader {
             .tools
             .into_iter()
             .map(|def| {
-                PluginTool::new(manifest.name.clone(), def, verified_exe.clone())
+                let mut tool = PluginTool::new(manifest.name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
-                    .with_timeout(timeout)
+                    .with_extra_env(extra_env.to_vec())
+                    .with_timeout(timeout);
+                if let Some(dir) = work_dir {
+                    tool = tool.with_work_dir(dir.to_path_buf());
+                }
+                tool
             })
             .collect();
 
@@ -207,7 +240,8 @@ mod tests {
     #[test]
     fn test_load_nonexistent_dir() {
         let mut registry = ToolRegistry::new();
-        let result = PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")]);
+        let result =
+            PluginLoader::load_into(&mut registry, &[PathBuf::from("/nonexistent/path")], &[]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -216,7 +250,8 @@ mod tests {
     fn test_load_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = ToolRegistry::new();
-        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        let count =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -245,7 +280,8 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        let count =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(count, 1);
         assert_eq!(registry.len(), 1);
     }
@@ -273,7 +309,8 @@ mod tests {
         std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut registry = ToolRegistry::new();
-        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        let count =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(count, 1);
     }
 
@@ -295,7 +332,8 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         // Should succeed overall (skips failed plugin) but register 0 tools
-        let count = PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()]).unwrap();
+        let count =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(count, 0);
     }
 

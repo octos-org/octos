@@ -135,7 +135,8 @@ impl Handler for CodergenHandler {
 
         // Load plugin tools (app-skills like deep-search, deep-crawl, etc.)
         if !self.plugin_dirs.is_empty() {
-            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &self.plugin_dirs) {
+            if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &self.plugin_dirs, &[])
+            {
                 warn!("plugin loading in pipeline handler: {e}");
             }
         }

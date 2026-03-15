@@ -480,6 +480,10 @@ impl GatewayCommand {
             Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
         > = None;
 
+        // Build env vars to inject into plugin processes so skills can route
+        // API calls through the configured provider/gateway (e.g. r9s.ai).
+        let plugin_env = build_plugin_env(&config, &provider_name);
+
         let mut tools;
         if admin_mode {
             // Admin mode: register only admin API tools
@@ -514,7 +518,7 @@ impl GatewayCommand {
             for skill_name in admin_skills {
                 let skill_dir = bundled_dir.join(skill_name);
                 if skill_dir.exists() {
-                    match crew_agent::PluginLoader::load_plugin(&skill_dir) {
+                    match crew_agent::PluginLoader::load_plugin(&skill_dir, &plugin_env) {
                         Ok(plugin_tools) => {
                             for t in plugin_tools {
                                 tools.register(t);
@@ -548,10 +552,16 @@ impl GatewayCommand {
                 }
             }
 
-            // Load plugins
+            // Load plugins with a dedicated work directory for output files
+            let plugin_work_dir = data_dir.join("skill-output");
             let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
             if !plugin_dirs.is_empty() {
-                if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
+                if let Err(e) = crew_agent::PluginLoader::load_into_with_work_dir(
+                    &mut tools,
+                    &plugin_dirs,
+                    &plugin_env,
+                    Some(&plugin_work_dir),
+                ) {
                     warn!("plugin loading failed: {e}");
                 }
             }
@@ -1836,4 +1846,115 @@ async fn transcribe_via_skill(
         let msg = result["output"].as_str().unwrap_or("unknown error");
         eyre::bail!("voice skill failed: {msg}")
     }
+}
+
+/// Build environment variables to inject into plugin processes so skills can
+/// route API calls through the configured provider/gateway.
+///
+/// Maps crew-rs provider config → env vars that downstream skills understand:
+/// - `GEMINI_API_KEY`, `GEMINI_BASE_URL` — for Gemini-backed skills (mofa, etc.)
+/// - `DASHSCOPE_API_KEY` — for Dashscope/Qwen skills
+/// - `OPENAI_API_KEY`, `OPENAI_BASE_URL` — for OpenAI-compatible skills
+fn build_plugin_env(config: &crate::config::Config, provider_name: &str) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+
+    // Resolve the provider's base URL (config override > registry default)
+    let base_url = config.base_url.clone().or_else(|| {
+        crew_llm::registry::lookup(provider_name)
+            .and_then(|e| e.default_base_url)
+            .map(String::from)
+    });
+
+    // AI gateway providers (r9s, etc.) support multiple downstream APIs with
+    // the same credentials. Inject env vars for ALL downstream APIs so skills
+    // like mofa-slides (Gemini), mofa-infographic (Gemini + Dashscope) work.
+    let is_gateway = matches!(provider_name, "r9s" | "r9s.ai");
+
+    if let Ok(api_key) = config.get_api_key(provider_name) {
+        if is_gateway {
+            // Gateway: same API key works for all downstream providers
+            env.push(("GEMINI_API_KEY".to_string(), api_key.clone()));
+            env.push(("DASHSCOPE_API_KEY".to_string(), api_key.clone()));
+            env.push(("OPENAI_API_KEY".to_string(), api_key));
+        } else {
+            let key_var = match provider_name {
+                "gemini" | "google" => "GEMINI_API_KEY",
+                "dashscope" | "qwen" => "DASHSCOPE_API_KEY",
+                _ => "OPENAI_API_KEY",
+            };
+            env.push((key_var.to_string(), api_key));
+        }
+    }
+
+    if let Some(ref url) = base_url {
+        if is_gateway {
+            // Gateway: each downstream API has its own path prefix.
+            // The registry base_url is the OpenAI-compatible endpoint (e.g. https://api.r9s.ai/v1).
+            // Derive the Gemini and Dashscope URLs by replacing the path.
+            let origin = url.trim_end_matches('/');
+            let origin_base = origin.rfind("/v").map(|i| &origin[..i]).unwrap_or(origin);
+            env.push((
+                "GEMINI_BASE_URL".to_string(),
+                format!("{origin_base}/v1beta"),
+            ));
+            env.push((
+                "DASHSCOPE_BASE_URL".to_string(),
+                format!("{origin_base}/compatible-mode/v1"),
+            ));
+            env.push(("OPENAI_BASE_URL".to_string(), url.clone()));
+        } else {
+            let url_var = match provider_name {
+                "gemini" | "google" => "GEMINI_BASE_URL",
+                "dashscope" | "qwen" => "DASHSCOPE_BASE_URL",
+                _ => "OPENAI_BASE_URL",
+            };
+            env.push((url_var.to_string(), url.clone()));
+        }
+    }
+
+    // Also inject keys for any secondary providers configured as fallbacks,
+    // so skills that call multiple APIs (e.g. Gemini for image + Dashscope for OCR)
+    // can access all configured keys.
+    for fb in &config.fallback_models {
+        let fb_provider = fb.provider.as_str();
+        let fb_config = if fb.api_key_env.is_some() {
+            let mut c = config.clone();
+            c.api_key_env = fb.api_key_env.clone();
+            c
+        } else {
+            config.clone()
+        };
+
+        if let Ok(key) = fb_config.get_api_key(fb_provider) {
+            let key_var = match fb_provider {
+                "gemini" | "google" => "GEMINI_API_KEY",
+                "dashscope" | "qwen" => "DASHSCOPE_API_KEY",
+                _ => continue, // don't overwrite primary OPENAI_API_KEY
+            };
+            if !env.iter().any(|(k, _)| k == key_var) {
+                env.push((key_var.to_string(), key));
+            }
+        }
+
+        if let Some(ref url) = fb.base_url {
+            let url_var = match fb_provider {
+                "gemini" | "google" => "GEMINI_BASE_URL",
+                "dashscope" | "qwen" => "DASHSCOPE_BASE_URL",
+                _ => continue,
+            };
+            if !env.iter().any(|(k, _)| k == url_var) {
+                env.push((url_var.to_string(), url.clone()));
+            }
+        }
+    }
+
+    if !env.is_empty() {
+        info!(
+            count = env.len(),
+            vars = ?env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            "injecting provider env vars into plugin processes"
+        );
+    }
+
+    env
 }

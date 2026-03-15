@@ -24,6 +24,10 @@ pub struct PluginTool {
     executable: PathBuf,
     /// Environment variables to strip from the plugin's environment.
     blocked_env: Vec<String>,
+    /// Extra environment variables to inject into the plugin's environment.
+    extra_env: Vec<(String, String)>,
+    /// Working directory for plugin execution (created on first use).
+    work_dir: Option<PathBuf>,
     /// Execution timeout.
     timeout: Duration,
 }
@@ -38,6 +42,8 @@ impl PluginTool {
             tool_def,
             executable,
             blocked_env: vec![],
+            extra_env: vec![],
+            work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
         }
     }
@@ -45,6 +51,19 @@ impl PluginTool {
     /// Set environment variables to block from plugin execution.
     pub fn with_blocked_env(mut self, blocked: Vec<String>) -> Self {
         self.blocked_env = blocked;
+        self
+    }
+
+    /// Set extra environment variables to inject into plugin execution.
+    pub fn with_extra_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.extra_env = env;
+        self
+    }
+
+    /// Set the working directory for plugin processes.
+    /// The directory is created automatically if it doesn't exist.
+    pub fn with_work_dir(mut self, dir: PathBuf) -> Self {
+        self.work_dir = Some(dir);
         self
     }
 
@@ -103,6 +122,25 @@ impl Tool for PluginTool {
         // Remove blocked environment variables
         for var in &self.blocked_env {
             cmd.env_remove(var);
+        }
+
+        // Inject extra environment variables (e.g. provider base URLs, API keys)
+        for (key, val) in &self.extra_env {
+            cmd.env(key, val);
+        }
+
+        // Expose a work directory for plugin output files, but do NOT change
+        // cwd — plugins resolve style/config files relative to their executable
+        // location, so changing cwd breaks those lookups.
+        if let Some(ref dir) = self.work_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "failed to create plugin work_dir"
+                );
+            }
+            cmd.env("CREW_WORK_DIR", dir);
         }
 
         let mut child = cmd.spawn().wrap_err_with(|| {
@@ -284,6 +322,23 @@ mod tests {
             .with_blocked_env(vec!["SECRET".into(), "TOKEN".into()]);
 
         assert_eq!(tool.blocked_env, vec!["SECRET", "TOKEN"]);
+    }
+
+    #[test]
+    fn with_extra_env_sets_vars() {
+        let def = make_tool_def("t", "d");
+        let tool =
+            PluginTool::new("p".into(), def, PathBuf::from("/bin/echo")).with_extra_env(vec![
+                (
+                    "GEMINI_BASE_URL".into(),
+                    "https://api.r9s.ai/gemini/v1beta".into(),
+                ),
+                ("GEMINI_API_KEY".into(), "test-key".into()),
+            ]);
+
+        assert_eq!(tool.extra_env.len(), 2);
+        assert_eq!(tool.extra_env[0].0, "GEMINI_BASE_URL");
+        assert_eq!(tool.extra_env[1].0, "GEMINI_API_KEY");
     }
 
     #[test]
