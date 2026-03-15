@@ -1,0 +1,76 @@
+name: Release (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump level'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install tools
+        run: |
+          cargo install cargo-release --locked
+          cargo install git-cliff --locked
+
+      - name: Set build metadata
+        run: |
+          echo "CREW_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "CREW_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Run cargo release
+        run: cargo release ${{ inputs.bump }} --execute --no-confirm
+
+      - name: Build crew CLI
+        run: cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
+
+      - name: Build app-skill binaries
+        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p asr -p clock -p weather
+
+      - name: Bundle release tarball
+        run: |
+          mkdir dist
+          for b in crew news_fetch deep-search deep_crawl send_email account_manager asr clock weather; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../crew-bundle-aarch64-apple-darwin.tar.gz *
+
+      - name: Generate release notes
+        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - name: Get new version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: crew-bundle-aarch64-apple-darwin.tar.gz
+          body_path: RELEASE_NOTES.md
