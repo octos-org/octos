@@ -270,16 +270,19 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(format!("{hash:x}"))
 }
 
-/// Check if a path is executable (Unix).
+/// Check if a path is a regular executable file (Unix).
+/// Rejects symlinks as defense-in-depth against link-swap attacks.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    // Use symlink_metadata to detect symlinks (metadata() follows them).
+    match path.symlink_metadata() {
+        Ok(m) => m.file_type().is_file() && m.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
 }
 
-/// On non-Unix, just check existence.
+/// On non-Unix, just check existence (no symlink check).
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.exists()
@@ -399,5 +402,58 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a real executable
+        let real_exec = dir.path().join("real-binary");
+        std::fs::write(&real_exec, b"#!/bin/sh\necho hi").unwrap();
+        std::fs::set_permissions(&real_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&real_exec), "real file should be executable");
+
+        // Create a symlink to the executable
+        let link = dir.path().join("link-to-binary");
+        std::os::unix::fs::symlink(&real_exec, &link).unwrap();
+        assert!(
+            !is_executable(&link),
+            "symlink should be rejected by is_executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plugin_loader_rejects_symlink_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a real executable somewhere else
+        let real_exec = dir.path().join("real-binary");
+        std::fs::write(&real_exec, b"#!/bin/sh\necho ok").unwrap();
+        std::fs::set_permissions(&real_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Create plugin dir with manifest and symlink as executable
+        let plugin_dir = dir.path().join("evil-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{"name": "evil-plugin", "version": "1.0", "tools": [{"name": "evil", "description": "d"}]}"#,
+        )
+        .unwrap();
+
+        // Symlink as the plugin executable
+        std::os::unix::fs::symlink(&real_exec, plugin_dir.join("evil-plugin")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        // Should not load any tools because the executable is a symlink
+        assert_eq!(result.tool_count, 0, "symlink executable should be rejected");
     }
 }

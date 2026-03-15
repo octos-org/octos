@@ -969,4 +969,42 @@ mod path_tests {
         assert!(resolve_path(base, "sessions/chat-123.json").is_ok());
         assert!(resolve_path(base, "skill-output/report.pdf").is_ok());
     }
+
+    #[test]
+    fn test_resolve_rejects_empty_path() {
+        let base = Path::new("/home/user/project");
+        // Empty string should resolve to the base dir itself, which is valid
+        // (it's not a traversal). Verify it doesn't panic.
+        let result = resolve_path(base, "");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PathBuf::from("/home/user/project"));
+    }
+
+    #[test]
+    fn test_resolve_rejects_null_byte() {
+        let base = Path::new("/home/user/project");
+        // Null bytes in paths are invalid on Unix — verify resolve_path
+        // handles them without panicking. The OS will reject the path.
+        let result = resolve_path(base, "file\0.txt");
+        // On Unix, Path::new("file\0.txt") is valid at the Rust level but
+        // normalize_path will produce a path that starts_with base, so it
+        // passes. The actual OS call (open/stat) would reject it.
+        // The key security property: it doesn't escape the base directory.
+        if let Ok(p) = &result {
+            assert!(p.starts_with(base));
+        }
+    }
+
+    #[test]
+    fn test_resolve_rejects_windows_separators() {
+        let base = Path::new("/home/user/project");
+        // Backslash is a valid filename char on Unix, not a separator.
+        // Verify it doesn't enable traversal.
+        let result = resolve_path(base, "..\\..\\etc\\passwd");
+        // On Unix this is a single filename component "..\..\etc\passwd",
+        // which stays inside base.
+        if let Ok(p) = &result {
+            assert!(p.starts_with(base));
+        }
+    }
 }

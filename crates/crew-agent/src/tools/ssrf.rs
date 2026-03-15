@@ -80,6 +80,65 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    // --- Async check_ssrf() tests ---
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_localhost() {
+        let result = check_ssrf("http://localhost/secret").await;
+        assert!(result.is_some(), "localhost should be blocked");
+        assert!(result.unwrap().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_loopback_ip() {
+        let result = check_ssrf("http://127.0.0.1:8080/admin").await;
+        assert!(result.is_some(), "127.0.0.1 should be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_metadata_endpoint() {
+        // AWS metadata endpoint
+        let result = check_ssrf("http://169.254.169.254/latest/meta-data/").await;
+        assert!(result.is_some(), "AWS metadata IP should be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_private_network() {
+        let result = check_ssrf("http://10.0.0.1/internal").await;
+        assert!(result.is_some(), "10.x.x.x should be blocked");
+
+        let result = check_ssrf("http://192.168.1.1/router").await;
+        assert!(result.is_some(), "192.168.x.x should be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_invalid_url() {
+        let result = check_ssrf("not-a-url").await;
+        assert!(result.is_some(), "invalid URL should be blocked");
+        assert!(result.unwrap().contains("Invalid URL"));
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_no_host() {
+        let result = check_ssrf("file:///etc/passwd").await;
+        assert!(result.is_some(), "file:// URL should be blocked (no host)");
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_allows_public_ip() {
+        // 8.8.8.8 is Google's public DNS — always resolves to itself
+        let result = check_ssrf("https://8.8.8.8/").await;
+        assert!(result.is_none(), "public IP 8.8.8.8 should be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_ssrf_blocks_ipv6_loopback() {
+        let result = check_ssrf("http://[::1]/secret").await;
+        assert!(result.is_some(), "IPv6 loopback should be blocked");
+    }
+
+    // --- Sync helper tests ---
+
     #[test]
     fn test_private_host_localhost() {
         assert!(is_private_host("localhost"));

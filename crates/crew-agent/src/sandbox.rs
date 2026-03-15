@@ -563,6 +563,33 @@ mod tests {
     }
 
     #[test]
+    fn test_bwrap_sandbox_env_sanitization() {
+        let sb = BwrapSandbox {
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp"));
+        // env_remove() sets env vars to None in the command's environment.
+        // get_envs() returns (key, Option<value>) — None means env_remove.
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in BLOCKED_ENV_VARS {
+            assert!(
+                removed.iter().any(|r| r == *var),
+                "bwrap should env_remove {var}"
+            );
+        }
+    }
+
+    #[test]
     fn test_macos_sandbox_command() {
         let sb = MacosSandbox {
             allow_network: true,
