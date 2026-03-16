@@ -104,7 +104,7 @@ fn test_completions_bash() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Bash completions should contain function definitions
-    assert!(stdout.contains("_crew"));
+    assert!(stdout.contains("_octos"));
 }
 
 #[test]
