@@ -1908,10 +1908,7 @@ impl SessionActor {
 
             // Wait for stream forwarder to finish flushing
             let stream_result = if let Some(handle) = stream_forwarder {
-                match handle.await {
-                    Ok(sr) => Some(sr),
-                    Err(_) => None,
-                }
+                handle.await.ok()
             } else {
                 None
             };
@@ -1957,7 +1954,7 @@ impl SessionActor {
                     let already_streamed = session_active
                         && stream_result
                             .as_ref()
-                            .map_or(false, |sr| sr.message_id.is_some());
+                            .is_some_and(|sr| sr.message_id.is_some());
 
                     if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx
