@@ -1771,7 +1771,7 @@ pub async fn platform_models_available(
             let role = allowlist.find(&m.id).map(|p| p.role.as_str()).unwrap_or("");
             let mut v = serde_json::to_value(&m).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("enabled_for_crew".into(), enabled.into());
+                obj.insert("enabled_for_octos".into(), enabled.into());
                 if enabled {
                     obj.insert("role".into(), role.into());
                 }

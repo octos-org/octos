@@ -3,7 +3,7 @@
 use std::process::Command;
 
 /// Get the path to the octos binary.
-fn crew_binary() -> std::path::PathBuf {
+fn octos_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps
@@ -13,7 +13,7 @@ fn crew_binary() -> std::path::PathBuf {
 
 #[test]
 fn test_help_command() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .arg("--help")
         .output()
         .expect("Failed to execute command");
@@ -30,7 +30,7 @@ fn test_help_command() {
 
 #[test]
 fn test_version_command() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .arg("--version")
         .output()
         .expect("Failed to execute command");
@@ -42,7 +42,7 @@ fn test_version_command() {
 
 #[test]
 fn test_init_help() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["init", "--help"])
         .output()
         .expect("Failed to execute command");
@@ -55,7 +55,7 @@ fn test_init_help() {
 
 #[test]
 fn test_chat_help() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["chat", "--help"])
         .output()
         .expect("Failed to execute command");
@@ -70,7 +70,7 @@ fn test_chat_help() {
 
 #[test]
 fn test_clean_help() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["clean", "--help"])
         .output()
         .expect("Failed to execute command");
@@ -84,7 +84,7 @@ fn test_clean_help() {
 
 #[test]
 fn test_completions_help() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["completions", "--help"])
         .output()
         .expect("Failed to execute command");
@@ -96,7 +96,7 @@ fn test_completions_help() {
 
 #[test]
 fn test_completions_bash() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["completions", "bash"])
         .output()
         .expect("Failed to execute command");
@@ -109,7 +109,7 @@ fn test_completions_bash() {
 
 #[test]
 fn test_completions_zsh() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["completions", "zsh"])
         .output()
         .expect("Failed to execute command");
@@ -122,7 +122,7 @@ fn test_completions_zsh() {
 
 #[test]
 fn test_completions_fish() {
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["completions", "fish"])
         .output()
         .expect("Failed to execute command");
@@ -137,7 +137,7 @@ fn test_completions_fish() {
 fn test_init_defaults_in_temp_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["init", "--defaults", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -156,10 +156,10 @@ fn test_init_defaults_in_temp_dir() {
 }
 
 #[test]
-fn test_clean_no_crew_dir() {
+fn test_clean_no_octos_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["clean", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -171,11 +171,11 @@ fn test_clean_no_crew_dir() {
 }
 
 #[test]
-fn test_clean_empty_crew_dir() {
+fn test_clean_empty_octos_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp_dir.path().join(".octos")).unwrap();
 
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["clean", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -189,11 +189,11 @@ fn test_clean_empty_crew_dir() {
 #[test]
 fn test_clean_dry_run_with_all() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let crew_dir = temp_dir.path().join(".octos");
-    std::fs::create_dir_all(&crew_dir).unwrap();
-    std::fs::write(crew_dir.join("episodes.redb"), "fake-db").unwrap();
+    let octos_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&octos_dir).unwrap();
+    std::fs::write(octos_dir.join("episodes.redb"), "fake-db").unwrap();
 
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["clean", "--all", "--dry-run", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -205,17 +205,17 @@ fn test_clean_dry_run_with_all() {
     assert!(stdout.contains("Dry run"));
 
     // File should still exist
-    assert!(crew_dir.join("episodes.redb").exists());
+    assert!(octos_dir.join("episodes.redb").exists());
 }
 
 #[test]
 fn test_clean_all_removes_redb() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let crew_dir = temp_dir.path().join(".octos");
-    std::fs::create_dir_all(&crew_dir).unwrap();
-    std::fs::write(crew_dir.join("episodes.redb"), "fake-db").unwrap();
+    let octos_dir = temp_dir.path().join(".octos");
+    std::fs::create_dir_all(&octos_dir).unwrap();
+    std::fs::write(octos_dir.join("episodes.redb"), "fake-db").unwrap();
 
-    let output = Command::new(crew_binary())
+    let output = Command::new(octos_binary())
         .args(["clean", "--all", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -226,5 +226,5 @@ fn test_clean_all_removes_redb() {
     assert!(stdout.contains("Cleaned"));
 
     // Database file should be deleted
-    assert!(!crew_dir.join("episodes.redb").exists());
+    assert!(!octos_dir.join("episodes.redb").exists());
 }

@@ -254,7 +254,7 @@ fn all_tools() -> Vec<ToolSpec> {
 // System prompt — extensive, realistic agent prompt with tool use instructions
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT: &str = r#"You are Crew, an advanced AI assistant with access to a comprehensive set of tools. You help users with research, coding, task management, and communication.
+const SYSTEM_PROMPT: &str = r#"You are Octos, an advanced AI assistant with access to a comprehensive set of tools. You help users with research, coding, task management, and communication.
 
 ## Your Capabilities
 

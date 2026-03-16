@@ -318,9 +318,9 @@ impl Updater {
 
     /// Clean skill dirs so bootstrap recreates them on next start.
     fn clean_skills(&self) {
-        let crew_dir = dirs::home_dir().map(|h| h.join(".octos").join("skills"));
+        let octos_dir = dirs::home_dir().map(|h| h.join(".octos").join("skills"));
 
-        if let Some(skills_dir) = crew_dir {
+        if let Some(skills_dir) = octos_dir {
             if skills_dir.exists() {
                 let skills = [
                     "news",

@@ -172,7 +172,7 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
     registry.register(platform_skills::PlatformSkillsTool::new(ctx.clone()));
 
     // System update
-    registry.register(update::UpdateCrewTool::new(ctx));
+    registry.register(update::UpdateOctosTool::new(ctx));
 }
 
 #[cfg(test)]
@@ -247,7 +247,7 @@ mod tests {
             "admin_create_sub_account",
             "admin_manage_skills",
             "admin_platform_skills",
-            "admin_update_crew",
+            "admin_update_octos",
         ];
 
         let specs = registry.specs();

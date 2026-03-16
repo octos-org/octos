@@ -106,7 +106,7 @@ pub struct GatewayCommand {
     #[arg(long, hide = true)]
     pub parent_profile: Option<PathBuf>,
 
-    /// Crew home directory for ProfileStore access (used by managed gateways).
+    /// Octos home directory for ProfileStore access (used by managed gateways).
     #[arg(long, hide = true)]
     pub octos_home: Option<PathBuf>,
 }

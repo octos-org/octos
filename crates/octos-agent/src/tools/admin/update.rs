@@ -8,11 +8,11 @@ use serde::Deserialize;
 
 use super::{AdminApiContext, Tool, ToolResult};
 
-pub struct UpdateCrewTool {
+pub struct UpdateOctosTool {
     ctx: Arc<AdminApiContext>,
 }
 
-impl UpdateCrewTool {
+impl UpdateOctosTool {
     pub fn new(ctx: Arc<AdminApiContext>) -> Self {
         Self { ctx }
     }
@@ -28,9 +28,9 @@ struct UpdateInput {
 }
 
 #[async_trait]
-impl Tool for UpdateCrewTool {
+impl Tool for UpdateOctosTool {
     fn name(&self) -> &str {
-        "admin_update_crew"
+        "admin_update_octos"
     }
     fn description(&self) -> &str {
         "Check for octos updates or apply an update. Actions: 'check' to see current/latest version, 'update' to download and install the latest (or a specific) version. The service restarts automatically after update. Requires 'github_token' for private repos — ask the user if not provided."
@@ -76,7 +76,7 @@ impl Tool for UpdateCrewTool {
     }
 }
 
-impl UpdateCrewTool {
+impl UpdateOctosTool {
     async fn check_version(&self, token: Option<&str>) -> Result<ToolResult> {
         // Pass token via POST so it doesn't leak in query strings/logs
         let body = serde_json::json!({ "github_token": token });
@@ -189,15 +189,15 @@ mod tests {
     }
 
     #[test]
-    fn update_crew_metadata() {
-        let tool = UpdateCrewTool::new(ctx());
-        assert_eq!(tool.name(), "admin_update_crew");
+    fn update_octos_metadata() {
+        let tool = UpdateOctosTool::new(ctx());
+        assert_eq!(tool.name(), "admin_update_octos");
         assert!(tool.description().contains("update"));
     }
 
     #[test]
-    fn update_crew_schema_action_enum() {
-        let tool = UpdateCrewTool::new(ctx());
+    fn update_octos_schema_action_enum() {
+        let tool = UpdateOctosTool::new(ctx());
         let schema = tool.input_schema();
         let enums: Vec<&str> = schema["properties"]["action"]["enum"]
             .as_array()
@@ -209,8 +209,8 @@ mod tests {
     }
 
     #[test]
-    fn update_crew_schema_required_action() {
-        let tool = UpdateCrewTool::new(ctx());
+    fn update_octos_schema_required_action() {
+        let tool = UpdateOctosTool::new(ctx());
         let schema = tool.input_schema();
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -222,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn update_crew_schema_has_version_field() {
-        let tool = UpdateCrewTool::new(ctx());
+    fn update_octos_schema_has_version_field() {
+        let tool = UpdateOctosTool::new(ctx());
         let schema = tool.input_schema();
         assert_eq!(schema["properties"]["version"]["type"], "string");
     }
