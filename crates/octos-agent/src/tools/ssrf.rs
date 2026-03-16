@@ -69,10 +69,7 @@ pub(crate) async fn check_ssrf_with_addrs(url: &str) -> Result<SsrfCheckResult, 
 /// This is the simple API for callers that don't need resolved addresses (e.g.
 /// browser/crawl tools where a separate process handles the actual connection).
 pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
-    match check_ssrf_with_addrs(url).await {
-        Ok(_) => None,
-        Err(msg) => Some(msg),
-    }
+    check_ssrf_with_addrs(url).await.err()
 }
 
 /// Check if a hostname is private/internal (string check + IP parse).

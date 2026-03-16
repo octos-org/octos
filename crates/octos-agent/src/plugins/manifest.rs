@@ -47,7 +47,7 @@ impl PluginManifest {
             || self
                 .prompts
                 .as_ref()
-                .map_or(false, |p| !p.include.is_empty())
+                .is_some_and(|p| !p.include.is_empty())
     }
 }
 
