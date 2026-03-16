@@ -1,7 +1,7 @@
 {
   "name": "voice-skill",
   "version": "1.0.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Speech-to-text (ASR) and text-to-speech (TTS) via OminiX Qwen3 models",
   "timeout_secs": 600,
   "requires_network": true,

@@ -1,7 +1,7 @@
 {
   "name": "weather",
   "version": "1.0.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Get current weather for any city worldwide via Open-Meteo (free, no API key)",
   "timeout_secs": 15,
   "requires_network": true,

@@ -1,4 +1,4 @@
-# crew-rs
+# octos
 
 Rust-native AI agent framework with multi-channel gateway, 14 LLM providers, web dashboard, and coding automation tools.
 
@@ -123,8 +123,8 @@ npm install -g pptxgenjs react-icons react react-dom sharp
 
 ```bash
 # Clone the repository
-git clone https://github.com/hagency-org/crew-rs.git
-cd crew-rs
+git clone https://github.com/octos-org/octos.git
+cd octos
 
 # Quick local deploy (builds, installs, sets up service)
 ./scripts/local-deploy.sh --full    # All features + dashboard + skills
@@ -694,7 +694,7 @@ cargo install --path crates/crew-cli --features whatsapp
 
 ### Feishu / Lark
 
-Feishu (Chinese) and Lark (international) are the same platform by ByteDance. crew-rs supports both via a single `feishu` channel type with a `region` setting.
+Feishu (Chinese) and Lark (international) are the same platform by ByteDance. octos supports both via a single `feishu` channel type with a `region` setting.
 
 **Build**:
 ```bash
@@ -1114,7 +1114,7 @@ Native Rust office file manipulation for DOCX, PPTX, and XLSX files. Replaces Py
 
 ## Memory System
 
-crew-rs has a hybrid memory system:
+octos has a hybrid memory system:
 
 - **Episodic memory**: Stored in `episodes.redb` (redb database). Task completion summaries for learning from past experiences.
 - **Long-term memory**: `MEMORY.md` file for persistent notes and preferences.
@@ -1244,7 +1244,7 @@ The heartbeat service runs periodic background checks independently of cron jobs
 ## Architecture
 
 ```
-crew-rs/
+octos/
   crates/
     crew-core/         # Types, task model, message protocols, UTF-8 utilities
     crew-memory/       # Episodic memory (redb), memory store, hybrid BM25+vector search

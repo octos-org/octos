@@ -1,4 +1,4 @@
-# User Manual: crew-rs
+# User Manual: octos
 
 ## Table of Contents
 
@@ -17,7 +17,7 @@
 
 ## Introduction
 
-crew-rs is a Rust-native AI agent framework that operates in two modes:
+octos is a Rust-native AI agent framework that operates in two modes:
 
 - **Chat mode** (`crew chat`): Interactive multi-turn conversation with tools (or single-message via `--message`)
 - **Gateway mode** (`crew gateway`): Persistent daemon serving multiple messaging channels
@@ -52,17 +52,17 @@ crew-rs is a Rust-native AI agent framework that operates in two modes:
 ### From Source
 
 ```bash
-git clone https://github.com/hagency-org/crew-rs
-cd crew-rs
+git clone https://github.com/octos-org/octos
+cd octos
 
 # Basic (CLI, chat, run, gateway with CLI channel)
-cargo install --path crates/crew-cli
+cargo install --path crates/octos-cli
 
 # With messaging channels
-cargo install --path crates/crew-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
+cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
 
 # With browser automation (requires Chrome/Chromium)
-cargo install --path crates/crew-cli --features browser
+cargo install --path crates/octos-cli --features browser
 
 # Verify
 crew --version
@@ -115,7 +115,7 @@ crew chat --message "Add a hello function to lib.rs"
 ### Config Files
 
 Loaded in order (first found wins):
-1. `.crew/config.json` (project-local)
+1. `.octos/config.json` (project-local)
 2. `~/.config/crew/config.json` (global)
 
 ### Basic Config
@@ -156,7 +156,7 @@ Use `${VAR_NAME}` syntax:
 ```json
 {
   "base_url": "${ANTHROPIC_BASE_URL}",
-  "model": "${CREW_MODEL}"
+  "model": "${OCTOS_MODEL}"
 }
 ```
 
@@ -185,7 +185,7 @@ Options:
 
 Features:
 - Arrow keys, line editing (rustyline)
-- Persistent history at `.crew/history/chat_history`
+- Persistent history at `.octos/history/chat_history`
 - Exit: `/exit`, `/quit`, `exit`, `quit`, `:q`, Ctrl+C, Ctrl+D
 - Full tool access (shell, files, search, web)
 
@@ -232,14 +232,14 @@ Options:
 ```
 
 Creates:
-- `.crew/config.json` - Provider/model config
-- `.crew/.gitignore` - Ignores state files
-- `.crew/AGENTS.md` - Agent instructions template
-- `.crew/SOUL.md` - Personality template
-- `.crew/USER.md` - User info template
-- `.crew/memory/` - Memory storage directory
-- `.crew/sessions/` - Session history directory
-- `.crew/skills/` - Custom skills directory
+- `.octos/config.json` - Provider/model config
+- `.octos/.gitignore` - Ignores state files
+- `.octos/AGENTS.md` - Agent instructions template
+- `.octos/SOUL.md` - Personality template
+- `.octos/USER.md` - User info template
+- `.octos/memory/` - Memory storage directory
+- `.octos/sessions/` - Session history directory
+- `.octos/skills/` - Custom skills directory
 
 ---
 
@@ -255,11 +255,11 @@ Options:
 ```
 
 ```
-crew-rs Status
+octos Status
 ══════════════════════════════════════════════════
 
-Config:    .crew/config.json (found)
-Workspace: .crew/            (found)
+Config:    .octos/config.json (found)
+Workspace: .octos/            (found)
 Provider:  anthropic
 Model:     claude-sonnet-4-20250514
 
@@ -327,7 +327,7 @@ crew auth logout --provider openai          # Remove stored credential
 crew auth status                            # Show authenticated providers
 ```
 
-Credentials are stored in `~/.crew/auth.json` (file mode 0600). The auth store is checked before environment variables when resolving API keys.
+Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked before environment variables when resolving API keys.
 
 ### `crew skills`
 
@@ -339,7 +339,7 @@ crew skills install user/repo/skill-name    # Install from GitHub
 crew skills remove skill-name               # Remove a skill
 ```
 
-Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.crew/skills/`.
+Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.octos/skills/`.
 
 ---
 
@@ -366,7 +366,7 @@ Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.crew/ski
 
 ### Provider Auto-Detection
 
-When `--provider` is omitted, crew-rs detects from model name:
+When `--provider` is omitted, octos detects from model name:
 
 ```bash
 crew chat --model gpt-4o           # -> openai
@@ -564,7 +564,7 @@ Shows a table with channel name, compile status (feature flags), and config summ
 
 ### Heartbeat
 
-The heartbeat service periodically reads `.crew/HEARTBEAT.md` and sends its content to the agent if non-empty. Default interval: 30 minutes. Use this for background task instructions.
+The heartbeat service periodically reads `.octos/HEARTBEAT.md` and sends its content to the agent if non-empty. Default interval: 30 minutes. Use this for background task instructions.
 
 ---
 
@@ -576,23 +576,23 @@ Loaded into the system prompt at startup:
 
 | File | Purpose |
 |------|---------|
-| `.crew/AGENTS.md` | Agent instructions and guidelines |
-| `.crew/SOUL.md` | Personality and values |
-| `.crew/USER.md` | User information and preferences |
-| `.crew/TOOLS.md` | Tool-specific guidance |
-| `.crew/IDENTITY.md` | Custom identity definition |
+| `.octos/AGENTS.md` | Agent instructions and guidelines |
+| `.octos/SOUL.md` | Personality and values |
+| `.octos/USER.md` | User information and preferences |
+| `.octos/TOOLS.md` | Tool-specific guidance |
+| `.octos/IDENTITY.md` | Custom identity definition |
 
 Create via `crew init` (creates AGENTS, SOUL, USER templates).
 
 ### Memory System
 
-- **Long-term**: `.crew/memory/MEMORY.md` - Persistent notes
-- **Daily**: `.crew/memory/YYYY-MM-DD.md` - Auto-created daily logs
+- **Long-term**: `.octos/memory/MEMORY.md` - Persistent notes
+- **Daily**: `.octos/memory/YYYY-MM-DD.md` - Auto-created daily logs
 - **Recent**: Last 7 days of daily notes included in context
 
 ### Skills
 
-Place custom skills in `.crew/skills/{name}/SKILL.md`:
+Place custom skills in `.octos/skills/{name}/SKILL.md`:
 
 ```markdown
 ---
@@ -614,7 +614,7 @@ Skills with `always: true` are included in every prompt. Others are available fo
 
 ### Built-in System Skills
 
-crew-rs bundles 3 system skills at compile time:
+octos bundles 3 system skills at compile time:
 
 | Skill | Description | Requirements |
 |-------|-------------|-------------|
@@ -622,11 +622,11 @@ crew-rs bundles 3 system skills at compile time:
 | skill-store | Skill installation and management | (none) |
 | skill-creator | How to create custom skills | (none) |
 
-Workspace skills in `.crew/skills/` override built-in skills with the same name.
+Workspace skills in `.octos/skills/` override built-in skills with the same name.
 
 ### Bundled App-Skills
 
-8 app-skills are compiled as separate binaries and bootstrapped into `.crew/skills/` at gateway startup:
+8 app-skills are compiled as separate binaries and bootstrapped into `.octos/skills/` at gateway startup:
 
 | Skill | Binary | Description |
 |-------|--------|-------------|
@@ -644,7 +644,7 @@ Workspace skills in `.crew/skills/` override built-in skills with the same name.
 ### Files
 
 ```
-.crew/
+.octos/
 ├── config.json          # Configuration (versioned, auto-migrated)
 ├── cron.json            # Cron job store
 ├── AGENTS.md            # Agent instructions
@@ -806,7 +806,7 @@ Run shell commands before/after tool calls and LLM calls. Configure in `config.j
   "hooks": [
     {
       "event": "before_tool_call",
-      "command": ["python3", "~/.crew/hooks/audit.py"],
+      "command": ["python3", "~/.octos/hooks/audit.py"],
       "timeout_ms": 3000,
       "tool_filter": ["shell", "write_file"]
     }
@@ -840,13 +840,13 @@ Control how messages arriving during an active agent run are handled:
 The REST API server (feature: `api`) includes an embedded web UI:
 
 ```bash
-cargo install --path crates/crew-cli --features api
+cargo install --path crates/octos-cli --features api
 crew serve                              # Binds to 127.0.0.1:8080
 crew serve --host 0.0.0.0 --port 3000  # Accept external connections
 # Open http://localhost:8080
 ```
 
-Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `crew_llm_tokens_total`).
+Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `octos_llm_tokens_total`).
 
 ### Hybrid Memory Search
 
@@ -888,7 +888,7 @@ Retry mechanism handles this automatically (3 attempts with backoff). If persist
 
 ```bash
 RUST_LOG=debug crew chat
-RUST_LOG=crew_agent=trace crew chat --message "task"
+RUST_LOG=octos_agent=trace crew chat --message "task"
 ```
 
 ### Environment Variables

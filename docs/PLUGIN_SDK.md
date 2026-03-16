@@ -1,10 +1,10 @@
 # Plugin SDK — Design Document
 
-crew-rs extensibility architecture for skills, tools, channels, and hooks.
+octos extensibility architecture for skills, tools, channels, and hooks.
 
 ## Status
 
-**Current state**: crew-rs has three extension points, each with its own mechanism:
+**Current state**: octos has three extension points, each with its own mechanism:
 - **App Skills** — Rust binaries, stdin/stdout JSON protocol (see `app-skill-dev-guide.md`)
 - **Skills** — SKILL.md + .dot pipeline files (declarative, no code)
 - **Hooks** — Shell commands on lifecycle events (see `HOOKS.md`)
@@ -18,7 +18,7 @@ crew-rs extensibility architecture for skills, tools, channels, and hooks.
 A plugin is a directory with a `manifest.json` that declares what it provides:
 
 ```
-~/.crew/plugins/my-plugin/
+~/.octos/plugins/my-plugin/
 ├── manifest.json       # Plugin declaration
 ├── SKILL.md            # Optional: LLM instructions
 ├── main                # Optional: executable binary
@@ -128,8 +128,8 @@ Plugins are discovered from multiple locations with precedence (highest first):
 |----------|----------|-------------|
 | 1 | Profile `plugins` config | Per-profile plugin overrides |
 | 2 | `<data_dir>/plugins/` | Per-profile installed plugins |
-| 3 | `~/.crew/plugins/` | User-installed plugins |
-| 4 | `~/.crew/skills/` | Legacy app-skills (auto-migrated) |
+| 3 | `~/.octos/plugins/` | User-installed plugins |
+| 4 | `~/.octos/skills/` | Legacy app-skills (auto-migrated) |
 | 5 | Bundled | Compiled into the binary |
 
 Higher-priority plugins override lower-priority ones with the same `id`.
@@ -416,7 +416,7 @@ Current bundled SKILL.md + .dot files become skill plugins by adding a `manifest
 ### Phase 1: Manifest + Discovery (foundation)
 
 - [ ] Define `manifest.json` schema (JSON Schema file in repo)
-- [ ] Plugin discovery: scan `~/.crew/plugins/`, `<data_dir>/plugins/`, bundled
+- [ ] Plugin discovery: scan `~/.octos/plugins/`, `<data_dir>/plugins/`, bundled
 - [ ] Precedence resolution (profile > user > bundled)
 - [ ] Gating: check `requires.bins`, `requires.env`, `requires.os`
 - [ ] Migrate existing `BUNDLED_APP_SKILLS` to use manifest-based loading
@@ -458,7 +458,7 @@ Current bundled SKILL.md + .dot files become skill plugins by adding a `manifest
 
 ```
 crates/
-├── crew-plugin/                    # New crate: Plugin SDK types + protocol
+├── octos-plugin/                    # New crate: Plugin SDK types + protocol
 │   ├── src/
 │   │   ├── lib.rs                  # Public API
 │   │   ├── manifest.rs             # Manifest parsing + validation
@@ -468,12 +468,12 @@ crates/
 │   │   └── types.rs                # PluginType, PluginStatus, etc.
 │   └── Cargo.toml
 │
-├── crew-cli/src/
+├── octos-cli/src/
 │   ├── plugin_manager.rs           # Plugin lifecycle management
 │   ├── channel_plugin.rs           # Channel plugin subprocess manager
 │   └── hook_plugin.rs              # Hook plugin subprocess manager
 │
-├── crew-agent/src/
+├── octos-agent/src/
 │   └── tools/admin/plugins.rs      # Admin plugin management tools
 ```
 

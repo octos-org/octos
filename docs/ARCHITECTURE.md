@@ -1,34 +1,34 @@
-# Architecture Document: crew-rs
+# Architecture Document: octos
 
 ## Overview
 
-crew-rs is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 **Workspace members**:
-- **6 core crates**: crew-core, crew-memory, crew-llm, crew-agent, crew-bus, crew-cli
-- **1 pipeline crate**: crew-pipeline
+- **6 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli
+- **1 pipeline crate**: octos-pipeline
 - **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
 - **1 platform-skill crate**: asr
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        crew-cli                             │
+│                        octos-cli                             │
 │           (CLI: chat, gateway, init, status)                │
 ├──────────────────────────┬──────────────────────────────────┤
-│       crew-agent         │           crew-bus               │
+│       octos-agent         │           octos-bus               │
 │  (Agent, Tools, Skills)  │  (Channels, Sessions, Cron)     │
 ├──────────┬───────────────┼──────────────────────────────────┤
-│crew-memory│  crew-llm    │       crew-pipeline              │
+│octos-memory│  octos-llm    │       octos-pipeline              │
 │(Episodes) │ (Providers)  │  (DOT-based orchestration)      │
 ├──────────┴───────────────┴──────────────────────────────────┤
-│                       crew-core                             │
+│                       octos-core                             │
 │            (Types, Messages, Gateway Protocol)              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## crew-core — Foundation Types
+## octos-core — Foundation Types
 
 Shared types with no internal dependencies. Only depends on serde, chrono, uuid, eyre.
 
@@ -147,7 +147,7 @@ pub struct Error {
 
 ---
 
-## crew-llm — LLM Provider Abstraction
+## octos-llm — LLM Provider Abstraction
 
 ### Provider Trait
 
@@ -196,7 +196,7 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
 
 ### Provider Registry (`registry/`)
 
-All providers are defined in `crew-llm/src/registry/` — one file per provider. Each file exports a `ProviderEntry` with metadata (name, aliases, default model, API key env var, base URL) and a `create()` factory function. Adding a new provider = one file + one line in `mod.rs`.
+All providers are defined in `octos-llm/src/registry/` — one file per provider. Each file exports a `ProviderEntry` with metadata (name, aliases, default model, API key env var, base URL) and a `create()` factory function. Adding a new provider = one file + one line in `mod.rs`.
 
 ```rust
 pub struct ProviderEntry {
@@ -391,11 +391,11 @@ pub trait EmbeddingProvider: Send + Sync {
 
 ---
 
-## crew-memory — Persistence & Search
+## octos-memory — Persistence & Search
 
 ### EpisodeStore
 
-redb database at `.crew/episodes.redb` with three tables:
+redb database at `.octos/episodes.redb` with three tables:
 
 | Table | Key | Value | Purpose |
 |---|---|---|---|
@@ -471,7 +471,7 @@ pub struct HybridIndex {
 
 ---
 
-## crew-agent — Agent Runtime
+## octos-agent — Agent Runtime
 
 ### Agent Core
 
@@ -753,8 +753,8 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
 #### CLI Management (`crew skills`)
 
 - `list` — shows built-in skills (with override status) + workspace skills
-- `install <user/repo/skill-name>` — fetches `SKILL.md` from `https://raw.githubusercontent.com/{repo}/main/SKILL.md` (15s timeout), saves to `.crew/skills/{name}/SKILL.md`. Fails if skill already exists.
-- `remove <name>` — deletes `.crew/skills/{name}/` directory
+- `install <user/repo/skill-name>` — fetches `SKILL.md` from `https://raw.githubusercontent.com/{repo}/main/SKILL.md` (15s timeout), saves to `.octos/skills/{name}/SKILL.md`. Fails if skill already exists.
+- `remove <name>` — deletes `.octos/skills/{name}/` directory
 
 #### Integration with Gateway
 
@@ -771,14 +771,14 @@ Plugins extend the agent with external tools via standalone executables. Each pl
 #### Directory Layout
 
 ```
-.crew/plugins/           # local (project-level)
-~/.crew/plugins/         # global (user-level)
+.octos/plugins/           # local (project-level)
+~/.octos/plugins/         # global (user-level)
   └── my-plugin/
       ├── manifest.json  # plugin metadata + tool definitions
       └── my-plugin      # executable (or "main" as fallback)
 ```
 
-**Discovery order**: local `.crew/plugins/` first, then global `~/.crew/plugins/`. Both are scanned by `Config::plugin_dirs()`.
+**Discovery order**: local `.octos/plugins/` first, then global `~/.octos/plugins/`. Both are scanned by `Config::plugin_dirs()`.
 
 #### PluginManifest
 
@@ -981,7 +981,7 @@ Detects repetitive agent behavior (e.g., calling the same tool with same args). 
 
 ---
 
-## crew-bus — Gateway Infrastructure
+## octos-bus — Gateway Infrastructure
 
 ### Message Bus
 
@@ -1024,7 +1024,7 @@ pub trait Channel: Send + Sync {
 
 **Markdown to HTML**: `markdown_html.rs` converts Markdown to Telegram-compatible HTML for rich message formatting.
 
-**Media**: `download_media()` helper downloads photos/voice/audio/documents to `.crew/media/`.
+**Media**: `download_media()` helper downloads photos/voice/audio/documents to `.octos/media/`.
 
 **Transcription**: Voice/audio auto-transcribed via GroqTranscriber before agent processing.
 
@@ -1044,7 +1044,7 @@ MAX_CHUNKS = 50 (DoS limit). UTF-8 safe boundary detection via `char_indices()`.
 
 ### Session Manager
 
-JSONL persistence at `.crew/sessions/{key}.jsonl`.
+JSONL persistence at `.octos/sessions/{key}.jsonl`.
 
 - **In-memory cache**: LRU with disk sync on write
 - **Filenames**: Percent-encoded SessionKey, truncated to 183 chars with `_{hash:016X}` suffix on truncation to prevent collisions
@@ -1054,7 +1054,7 @@ JSONL persistence at `.crew/sessions/{key}.jsonl`.
 
 ### Cron Service
 
-JSON persistence at `.crew/cron.json`.
+JSON persistence at `.octos/cron.json`.
 
 **Schedule types**:
 - `Every { seconds: u64 }` — recurring interval
@@ -1069,7 +1069,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 
 ---
 
-## crew-cli — CLI & Configuration
+## octos-cli — CLI & Configuration
 
 ### Commands
 
@@ -1077,7 +1077,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 |---|---|
 | `chat` | Interactive multi-turn chat. Readline with history. Exit: exit/quit/:q |
 | `gateway` | Persistent multi-channel daemon with session management |
-| `init` | Initialize .crew/ with config, templates, directories |
+| `init` | Initialize .octos/ with config, templates, directories |
 | `status` | Show config, provider, API keys, bootstrap files |
 | `auth login/logout/status` | OAuth PKCE (OpenAI), device code, paste-token |
 | `cron list/add/remove/enable` | CLI cron job management |
@@ -1092,13 +1092,13 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 
 ### Configuration
 
-Loaded from `.crew/config.json` (local) or `~/.config/crew/config.json` (global). Local takes precedence.
+Loaded from `.octos/config.json` (local) or `~/.config/crew/config.json` (global). Local takes precedence.
 
 - **`${VAR}` expansion**: Environment variable substitution in string values
 - **Versioned config**: Version field with automatic `migrate_config()` framework
 - **Provider auto-detect** (`registry::detect_provider(model)`): claude→anthropic, gpt/o1/o3/o4→openai, gemini→gemini, deepseek→deepseek, kimi/moonshot→moonshot, qwen→dashscope, glm→zhipu, llama/mixtral→groq. Patterns defined per-provider in `registry/`.
 
-**API key resolution order**: Auth store (`~/.crew/auth.json`) → environment variable.
+**API key resolution order**: Auth store (`~/.octos/auth.json`) → environment variable.
 
 ### Auth Module
 
@@ -1113,7 +1113,7 @@ Loaded from `.crew/config.json` (local) or `~/.config/crew/config.json` (global)
 
 **Paste Token**: Prompt for API key from stdin, store as `auth_method: "paste_token"`.
 
-**AuthStore**: `~/.crew/auth.json` (mode 0600). `{credentials: {provider: AuthCredential}}`.
+**AuthStore**: `~/.octos/auth.json` (mode 0600). `{credentials: {provider: AuthCredential}}`.
 
 ### Config Watcher
 
@@ -1139,7 +1139,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 **Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
 
-**Prometheus Metrics**: `crew_tool_calls_total` (counter, labels: tool, success), `crew_tool_call_duration_seconds` (histogram, label: tool), `crew_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
+**Prometheus Metrics**: `crew_tool_calls_total` (counter, labels: tool, success), `crew_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 
 ### Session Compaction (Gateway)
 
@@ -1147,7 +1147,7 @@ Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summari
 
 ---
 
-## crew-pipeline — DOT-based Pipeline Orchestration
+## octos-pipeline — DOT-based Pipeline Orchestration
 
 DOT-based pipeline orchestration engine for defining and executing multi-step workflows.
 
@@ -1208,7 +1208,7 @@ System messages (cron, heartbeat, spawn results) flow through the same bus with 
 ## Feature Flags
 
 ```toml
-# crew-bus
+# octos-bus
 telegram = ["teloxide"]
 discord  = ["serenity"]
 slack    = ["tokio-tungstenite"]
@@ -1216,25 +1216,25 @@ whatsapp = ["tokio-tungstenite"]
 feishu   = ["tokio-tungstenite"]
 email    = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
-# crew-agent (browser is always compiled in, no longer feature-gated)
+# octos-agent (browser is always compiled in, no longer feature-gated)
 git      = ["gix"]                  # git operations via gitoxide
 ast      = ["tree-sitter"]          # code_structure.rs AST analysis
 admin-bot = [...]                   # admin/ directory tools
 
-# crew-bus (additional)
+# octos-bus (additional)
 wecom    = [...]                    # WeCom/WeChat Work channel
 twilio   = [...]                    # Twilio SMS/MMS channel
 
-# crew-cli
+# octos-cli
 api      = ["axum", "tower-http", "futures"]
-telegram = ["crew-bus/telegram"]
-discord  = ["crew-bus/discord"]
-slack    = ["crew-bus/slack"]
-whatsapp = ["crew-bus/whatsapp"]
-feishu   = ["crew-bus/feishu"]
-email    = ["crew-bus/email"]
-wecom    = ["crew-bus/wecom"]
-twilio   = ["crew-bus/twilio"]
+telegram = ["octos-bus/telegram"]
+discord  = ["octos-bus/discord"]
+slack    = ["octos-bus/slack"]
+whatsapp = ["octos-bus/whatsapp"]
+feishu   = ["octos-bus/feishu"]
+email    = ["octos-bus/email"]
+wecom    = ["octos-bus/wecom"]
+twilio   = ["octos-bus/twilio"]
 ```
 
 ---
@@ -1243,9 +1243,9 @@ twilio   = ["crew-bus/twilio"]
 
 ```
 crates/
-├── crew-core/src/
+├── octos-core/src/
 │   ├── lib.rs, task.rs, types.rs, error.rs, gateway.rs, message.rs, utils.rs
-├── crew-llm/src/
+├── octos-llm/src/
 │   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, failover.rs, sse.rs
 │   ├── embedding.rs, pricing.rs, context.rs, transcription.rs, vision.rs
 │   ├── adaptive.rs, swappable.rs, router.rs, ominix.rs
@@ -1253,9 +1253,9 @@ crates/
 │   └── registry/ (mod.rs + 14 provider entries: anthropic, openai, gemini,
 │                   openrouter, deepseek, groq, moonshot, dashscope, minimax,
 │                   zhipu, zai, nvidia, ollama, vllm)
-├── crew-memory/src/
+├── octos-memory/src/
 │   ├── lib.rs, episode.rs, store.rs, memory_store.rs, hybrid_search.rs
-├── crew-agent/src/
+├── octos-agent/src/
 │   ├── lib.rs, agent.rs, progress.rs, policy.rs, compaction.rs, sanitize.rs, hooks.rs
 │   ├── sandbox.rs, mcp.rs, skills.rs, builtin_skills.rs
 │   ├── bundled_app_skills.rs, bootstrap.rs, prompt_guard.rs
@@ -1269,20 +1269,20 @@ crates/
 │               deep_research_pipeline, synthesize_research, research_utils,
 │               admin/ (profiles, skills, sub_accounts, system,
 │                       platform_skills, update))
-├── crew-bus/src/
+├── octos-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs, coalesce.rs, media.rs
 │   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
 │   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
 │   ├── wecom_channel.rs, twilio_channel.rs, markdown_html.rs
 │   ├── cron_service.rs, cron_types.rs, heartbeat.rs
-└── crew-cli/src/
+└── octos-cli/src/
     ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs
     ├── auth/ (mod.rs, store.rs, oauth.rs, token.rs)
     ├── api/ (mod.rs, router.rs, handlers.rs, sse.rs, metrics.rs, static_files.rs)
     └── commands/ (mod, chat, init, status, gateway, clean,
                    completions, cron, channels, auth, skills, docs, serve,
                    office, account)
-├── crew-pipeline/src/
+├── octos-pipeline/src/
 │   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
 │   ├── condition.rs, tool.rs, validate.rs
 ```
@@ -1296,7 +1296,7 @@ crates/
 - `secrecy::SecretString` — all provider API keys are wrapped; prevents accidental logging/display
 
 ### Authentication & Credentials
-- API keys: auth store (`~/.crew/auth.json`, mode 0600) checked before env vars
+- API keys: auth store (`~/.octos/auth.json`, mode 0600) checked before env vars
 - OAuth PKCE with SHA-256 challenges, state parameter (CSRF protection)
 - Constant-time byte comparison for API bearer tokens (timing attack prevention)
 
@@ -1333,9 +1333,9 @@ crates/
 
 ### Why Rust
 
-crew-rs uses Rust with the tokio async runtime, which provides significant advantages over Python (OpenClaw, etc.) and Node.js (NanoCloud, etc.) agent frameworks for concurrent session handling:
+octos uses Rust with the tokio async runtime, which provides significant advantages over Python (OpenClaw, etc.) and Node.js (NanoCloud, etc.) agent frameworks for concurrent session handling:
 
-**True parallelism** — Tokio tasks run across all CPU cores simultaneously. Python has the GIL, so even with asyncio, CPU-bound work (JSON parsing, context compaction, token counting) is single-core. Node.js is single-threaded entirely. In crew-rs, 10 concurrent sessions doing context compaction actually execute in parallel across cores.
+**True parallelism** — Tokio tasks run across all CPU cores simultaneously. Python has the GIL, so even with asyncio, CPU-bound work (JSON parsing, context compaction, token counting) is single-core. Node.js is single-threaded entirely. In octos, 10 concurrent sessions doing context compaction actually execute in parallel across cores.
 
 **Memory efficiency** — No garbage collector, no runtime overhead per object. Agent sessions are compact structs on the heap. A Python agent session carries interpreter overhead, GC metadata on every object, and dict-based attribute lookup. This matters with hundreds of sessions and large conversation histories in memory.
 

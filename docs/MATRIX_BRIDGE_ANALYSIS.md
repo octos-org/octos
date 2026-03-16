@@ -1,14 +1,14 @@
-# Matrix Bridge Hub Analysis for crew-rs
+# Matrix Bridge Hub Analysis for octos
 
 ## Executive Summary
 
-This document evaluates using a Matrix homeserver as a unified messaging bridge hub for crew-rs, where all external messaging platforms (Telegram, WhatsApp, Discord, etc.) connect to crew-rs through Matrix bridges instead of direct API integrations.
+This document evaluates using a Matrix homeserver as a unified messaging bridge hub for octos, where all external messaging platforms (Telegram, WhatsApp, Discord, etc.) connect to octos through Matrix bridges instead of direct API integrations.
 
-**Conclusion**: Matrix-as-hub is not recommended as a replacement for crew-rs's existing direct integrations, but is valuable as an **optional additional channel** for niche platforms and users who already run Matrix infrastructure.
+**Conclusion**: Matrix-as-hub is not recommended as a replacement for octos's existing direct integrations, but is valuable as an **optional additional channel** for niche platforms and users who already run Matrix infrastructure.
 
 ## Background
 
-### Current crew-rs Architecture (Direct Integration)
+### Current octos Architecture (Direct Integration)
 
 ```
 Telegram ──→ TelegramChannel  ──→┐
@@ -30,7 +30,7 @@ Signal   ──→ mautrix-signal   ──→┤
 Slack    ──→ mautrix-slack    ──→┘
 ```
 
-crew-rs would implement a single Matrix channel adapter. All external platforms connect through Matrix bridges (mautrix family). Each external user appears as a ghost user (e.g., `@telegram_12345:server`).
+octos would implement a single Matrix channel adapter. All external platforms connect through Matrix bridges (mautrix family). Each external user appears as a ghost user (e.g., `@telegram_12345:server`).
 
 ## Matrix Bridge Ecosystem
 
@@ -68,8 +68,8 @@ The mautrix bridges are maintained by Tulir Asokan and battle-tested at scale by
 2. Bridge process (mautrix-telegram) receives via platform API
 3. Bridge creates a "ghost user" on Matrix (e.g., `@telegram_12345:yourserver.com`)
 4. Bridge forwards message to a "portal room" on the Matrix homeserver
-5. crew-rs's Matrix client receives the message via `/sync` API
-6. crew-rs processes and replies in the Matrix room
+5. octos's Matrix client receives the message via `/sync` API
+6. octos processes and replies in the Matrix room
 7. Bridge picks up the reply and sends it back to the original platform
 
 ### Identifying Source Platform
@@ -170,7 +170,7 @@ Each bridge generates a registration YAML that must be added to Synapse's `homes
 
 ### Do NOT Replace Existing Direct Integrations
 
-crew-rs already has working, full-featured adapters for Telegram, WhatsApp, Feishu, Twilio, and WeCom. Switching to Matrix bridges would:
+octos already has working, full-featured adapters for Telegram, WhatsApp, Feishu, Twilio, and WeCom. Switching to Matrix bridges would:
 
 1. **Lose platform-specific features** (inline keyboards, rich cards, bot APIs)
 2. **Add operational complexity** (6+ services to maintain instead of one binary)
@@ -179,7 +179,7 @@ crew-rs already has working, full-featured adapters for Telegram, WhatsApp, Feis
 
 ### DO Add Matrix as an Optional Channel
 
-Implementing a `MatrixChannel` adapter for crew-rs provides two benefits:
+Implementing a `MatrixChannel` adapter for octos provides two benefits:
 
 1. **Users with existing Matrix infrastructure** can connect to crew through their homeserver — bridges they already run will "just work"
 2. **Niche platforms** (LINE, KakaoTalk, Google Chat, IRC) can be accessed through community bridges without writing Rust code

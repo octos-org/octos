@@ -1,6 +1,6 @@
 # Local Deployment Guide
 
-Deploy crew-rs on your own machine (macOS, Linux, or Windows via WSL2).
+Deploy octos on your own machine (macOS, Linux, or Windows via WSL2).
 
 ## Quick Start
 
@@ -48,8 +48,8 @@ brew install node ffmpeg poppler
 brew install --cask libreoffice
 
 # 3. Clone and deploy
-git clone https://github.com/hagency-org/crew-rs.git
-cd crew-rs
+git clone https://github.com/octos-org/octos.git
+cd octos
 ./scripts/local-deploy.sh --full
 
 # 4. Set API key and run
@@ -59,17 +59,17 @@ crew chat
 
 **Background service (launchd):**
 
-The deploy script creates `~/Library/LaunchAgents/io.crew.crew-serve.plist`.
+The deploy script creates `~/Library/LaunchAgents/io.octos.octos-serve.plist`.
 
 ```bash
 # Start service (survives reboot)
-launchctl load ~/Library/LaunchAgents/io.crew.crew-serve.plist
+launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
 
 # Stop service
-launchctl unload ~/Library/LaunchAgents/io.crew.crew-serve.plist
+launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
 
 # View logs
-tail -f ~/.crew/serve.log
+tail -f ~/.octos/serve.log
 ```
 
 ### Linux (Ubuntu/Debian)
@@ -87,8 +87,8 @@ source "$HOME/.cargo/env"
 sudo apt install -y nodejs npm ffmpeg poppler-utils
 
 # 4. Clone and deploy
-git clone https://github.com/hagency-org/crew-rs.git
-cd crew-rs
+git clone https://github.com/octos-org/octos.git
+cd octos
 ./scripts/local-deploy.sh --full
 
 # 5. Set API key and run
@@ -126,7 +126,7 @@ sudo dnf install -y gcc pkg-config openssl-devel
 
 ### Windows (WSL2)
 
-crew-rs does not build natively on Windows. Use WSL2 instead:
+octos does not build natively on Windows. Use WSL2 instead:
 
 ```powershell
 # 1. Install WSL2 (PowerShell as admin)
@@ -153,7 +153,7 @@ Then the systemd user unit approach works. Otherwise, use a startup script:
 ```bash
 # Add to ~/.bashrc or ~/.profile
 if ! pgrep -f "crew serve" >/dev/null; then
-    nohup crew serve --port 8080 > ~/.crew/serve.log 2>&1 &
+    nohup crew serve --port 8080 > ~/.octos/serve.log 2>&1 &
 fi
 ```
 
@@ -179,15 +179,15 @@ Options:
 2. Builds `crew` binary with selected features
 3. Builds app-skill binaries (unless `--no-skills`)
 4. Signs binaries on macOS (ad-hoc codesign)
-5. Runs `crew init` if `~/.crew` doesn't exist
+5. Runs `crew init` if `~/.octos` doesn't exist
 6. Creates background service file (launchd on macOS, systemd on Linux)
 
 **Uninstall:**
 
 ```bash
 ./scripts/local-deploy.sh --uninstall
-# Data directory (~/.crew) is NOT removed. Delete manually:
-rm -rf ~/.crew
+# Data directory (~/.octos) is NOT removed. Delete manually:
+rm -rf ~/.octos
 ```
 
 ## Post-Install Configuration
@@ -207,7 +207,7 @@ crew auth login --provider openai
 
 ### Config File
 
-Edit `~/.crew/config.json` (or `.crew/config.json` in project directory):
+Edit `~/.octos/config.json` (or `.octos/config.json` in project directory):
 
 ```json
 {
@@ -232,14 +232,14 @@ crew chat --message "Hello"  # Quick test
 ## Upgrading
 
 ```bash
-cd crew-rs
+cd octos
 git pull origin main
 ./scripts/local-deploy.sh --full   # Rebuilds and reinstalls
 
 # If running as a service, restart it:
 # macOS:
-launchctl unload ~/Library/LaunchAgents/io.crew.crew-serve.plist
-launchctl load ~/Library/LaunchAgents/io.crew.crew-serve.plist
+launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
+launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
 # Linux:
 systemctl --user restart crew-serve
 ```
@@ -253,5 +253,5 @@ systemctl --user restart crew-serve
 | macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/crew` |
 | Dashboard not accessible | Check port: `crew serve --port 8080`, open `http://localhost:8080/admin/` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
-| Service won't start | Check logs: `tail -f ~/.crew/serve.log` or `journalctl --user -u crew-serve` |
+| Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u crew-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |

@@ -2,7 +2,7 @@
   "name": "deep-crawl",
   "version": "1.0.0",
   "description": "Recursively crawl a website using headless Chrome (CDP). Renders JavaScript, follows same-origin links via BFS, extracts text from each page, and saves results to disk.",
-  "author": "hagency",
+  "author": "octos",
   "requires_bins": ["google-chrome"],
   "tools": [
     {

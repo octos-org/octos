@@ -2,7 +2,7 @@
 name: clock
 description: Get current date and time in any timezone. Triggers: time, clock, what time, 几点, 现在时间, 时间, current time, date today, timezone.
 version: 1.0.0
-author: hagency
+author: octos
 always: false
 ---
 

@@ -1,6 +1,6 @@
 # Background Tasks & Adaptive UX — Dev Plan
 
-Concrete implementation plan grounded in the actual crew-rs codebase. Each phase is independently shippable.
+Concrete implementation plan grounded in the actual octos codebase. Each phase is independently shippable.
 
 ---
 
@@ -30,7 +30,7 @@ This works, but the result goes through the full agent loop — the main agent r
 
 ### Changes
 
-**File: `crates/crew-cli/src/session_actor.rs`**
+**File: `crates/octos-cli/src/session_actor.rs`**
 
 Add a dedicated result injection path to `SessionActor`:
 
@@ -97,7 +97,7 @@ Some(ActorMessage::BackgroundResult { task_id, label, summary, full_result, succ
 }
 ```
 
-**File: `crates/crew-agent/src/tools/spawn.rs`**
+**File: `crates/octos-agent/src/tools/spawn.rs`**
 
 Change background mode to send `BackgroundResult` instead of `InboundMessage`:
 
@@ -154,7 +154,7 @@ if let Err(TrySendError::Full(_)) = handle.tx.try_send(msg) {
 
 ### Changes
 
-**File: `crates/crew-core/src/types.rs`** — Add queue mode enum:
+**File: `crates/octos-core/src/types.rs`** — Add queue mode enum:
 
 ```rust
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
@@ -173,7 +173,7 @@ pub enum QueueMode {
 }
 ```
 
-**File: `crates/crew-cli/src/session_actor.rs`** — Replace backpressure with queue:
+**File: `crates/octos-cli/src/session_actor.rs`** — Replace backpressure with queue:
 
 ```rust
 // New field on SessionActor
@@ -279,7 +279,7 @@ fn dequeue_next(&mut self) -> Option<InboundMessage> {
 
 ### Changes
 
-**File: `crates/crew-core/src/abort.rs`** (new, ~40 LOC):
+**File: `crates/octos-core/src/abort.rs`** (new, ~40 LOC):
 
 ```rust
 /// Check if a message is an abort trigger.
@@ -310,11 +310,11 @@ static ABORT_TRIGGERS: &[&str] = &[
 ];
 ```
 
-**File: `crates/crew-cli/src/session_actor.rs`** — Check before queuing:
+**File: `crates/octos-cli/src/session_actor.rs`** — Check before queuing:
 
 ```rust
 ActorMessage::Inbound { message, .. } => {
-    if crew_core::abort::is_abort_trigger(&message.content) {
+    if octos_core::abort::is_abort_trigger(&message.content) {
         // Cancel current run
         self.cancelled.store(true, Ordering::SeqCst);
         self.message_queue.clear();
@@ -336,7 +336,7 @@ ActorMessage::Inbound { message, .. } => {
 
 **Goal:** Teach the agent about background tasks, queue behavior, and cancellation so it uses them naturally.
 
-### File: `crates/crew-cli/src/prompts/gateway_default.txt`
+### File: `crates/octos-cli/src/prompts/gateway_default.txt`
 
 Current prompt is 45 lines. Add a new section:
 
@@ -372,7 +372,7 @@ Current prompt is 45 lines. Add a new section:
 +immediately. Do not apologize excessively — just acknowledge and move on.
 ```
 
-### File: `crates/crew-agent/src/prompts/worker.txt`
+### File: `crates/octos-agent/src/prompts/worker.txt`
 
 Add awareness that background workers should be concise and structured:
 
@@ -390,7 +390,7 @@ Add awareness that background workers should be concise and structured:
 +  the parent agent to ask follow-up questions.
 ```
 
-### File: `crates/crew-cli/src/prompts/admin_default.txt`
+### File: `crates/octos-cli/src/prompts/admin_default.txt`
 
 No changes needed — admin prompt is for profile management, not user-facing chat.
 
@@ -419,7 +419,7 @@ This is lightweight — a one-line append to the system prompt only when collect
 
 **Goal:** Detect when the current LLM provider is degraded and automatically activate failover.
 
-### File: `crates/crew-llm/src/responsiveness.rs` (new, ~100 LOC)
+### File: `crates/octos-llm/src/responsiveness.rs` (new, ~100 LOC)
 
 ```rust
 use std::collections::VecDeque;
@@ -484,7 +484,7 @@ impl ResponsivenessObserver {
 }
 ```
 
-### Integration point: `crates/crew-llm/src/adaptive.rs`
+### Integration point: `crates/octos-llm/src/adaptive.rs`
 
 The `AdaptiveRouter` already tracks latency EMA and has circuit breaker logic. Add:
 
@@ -527,7 +527,7 @@ impl AdaptiveRouter {
 
 ### Changes
 
-**File: `crates/crew-llm/src/adaptive.rs`**
+**File: `crates/octos-llm/src/adaptive.rs`**
 
 Add a callback/event when provider switches:
 
@@ -570,7 +570,7 @@ impl AdaptiveRouter {
 }
 ```
 
-**File: `crates/crew-agent/src/agent.rs`**
+**File: `crates/octos-agent/src/agent.rs`**
 
 In `call_llm_with_hooks()`, after a successful call, if the provider wrapper reports a switch, inject a brief system message:
 
@@ -604,7 +604,7 @@ The agent sees this as context and can optionally mention it to the user. No ext
 
 ### Changes
 
-**File: `crates/crew-agent/src/tools/mod.rs`** — Extend Tool trait:
+**File: `crates/octos-agent/src/tools/mod.rs`** — Extend Tool trait:
 
 ```rust
 #[async_trait]
@@ -634,7 +634,7 @@ pub enum ToolProgress {
 }
 ```
 
-**File: `crates/crew-agent/src/agent.rs`** — In tool execution, wire progress to reporter:
+**File: `crates/octos-agent/src/agent.rs`** — In tool execution, wire progress to reporter:
 
 ```rust
 // In handle_tool_use(), for each tool call:
@@ -662,7 +662,7 @@ tokio::spawn(async move {
 let result = tool.execute_with_progress(args, progress_tx).await;
 ```
 
-**File: `crates/crew-cli/src/session_actor.rs`** — `ChannelStreamReporter` handles `tool_progress`:
+**File: `crates/octos-cli/src/session_actor.rs`** — `ChannelStreamReporter` handles `tool_progress`:
 
 The reporter already supports streaming text deltas to the channel via message editing. Add a `tool_progress()` method that updates the streaming message with the current tool status:
 
@@ -725,7 +725,7 @@ async fn execute_with_progress(
 
 ### 8.1 Config Schema Changes
 
-**File: `crates/crew-cli/src/config.rs`**
+**File: `crates/octos-cli/src/config.rs`**
 
 Extend `AdaptiveRoutingConfig` with the new toggles:
 
@@ -774,7 +774,7 @@ pub struct GatewayConfig {
 }
 ```
 
-**Config file example (`.crew/config.json`):**
+**Config file example (`.octos/config.json`):**
 
 ```json
 {
@@ -796,7 +796,7 @@ pub struct GatewayConfig {
 
 ### 8.2 Runtime State Store
 
-**File: `crates/crew-llm/src/adaptive.rs`**
+**File: `crates/octos-llm/src/adaptive.rs`**
 
 The `AdaptiveRouter` already holds provider state behind internal mutability. Add runtime toggle flags:
 
@@ -883,7 +883,7 @@ if self.qos_ranking_enabled.load(Ordering::Acquire) {
 
 ### 8.3 Chat Commands
 
-**File: `crates/crew-cli/src/commands/gateway/mod.rs`**
+**File: `crates/octos-cli/src/commands/gateway/mod.rs`**
 
 Add new commands in the command dispatch section (alongside `/new`, `/s`, `/config`):
 
@@ -1003,7 +1003,7 @@ Aliases: `cb` for circuit-breaker, `lc` for lane-changing, `ranking` for qos.
 
 ### 8.4 Dashboard API Endpoints
 
-**File: `crates/crew-cli/src/api/router.rs`**
+**File: `crates/octos-cli/src/api/router.rs`**
 
 Add routes under the existing `/api/my/profile` namespace:
 
@@ -1089,7 +1089,7 @@ struct QueueModeUpdate {
 
 ### 8.5 Hot-Reload from Config File
 
-**File: `crates/crew-cli/src/commands/gateway/mod.rs`** — Extend `ConfigChange`:
+**File: `crates/octos-cli/src/commands/gateway/mod.rs`** — Extend `ConfigChange`:
 
 Currently, `ConfigWatcher` emits `ConfigChange::HotReload { system_prompt, max_history }`. Extend:
 
@@ -1176,7 +1176,7 @@ This gets shared as `Arc<SharedQueueMode>` in `ActorFactory` and `AppState`, rea
 
 ### 8.7 Prompt Changes for Adaptive Commands
 
-**File: `crates/crew-cli/src/prompts/gateway_default.txt`** — Append to the prompt additions from Phase 4:
+**File: `crates/octos-cli/src/prompts/gateway_default.txt`** — Append to the prompt additions from Phase 4:
 
 ```diff
 +## Adaptive Features
@@ -1251,7 +1251,7 @@ Phase 8 depends on Phase 5-6 (toggles control adaptive features) + Phase 2 (queu
 
 ## Related Documents
 
-- [CREW_UX_VISION.md](./CREW_UX_VISION.md) — Overall UX vision
+- [OCTOS_UX_VISION.md](./OCTOS_UX_VISION.md) — Overall UX vision
 - [OPENCLAW_CROSS_POLLINATION.md](./OPENCLAW_CROSS_POLLINATION.md) — Cross-pollination analysis
 - [CHANNEL_ADAPTER_PATTERN.md](./CHANNEL_ADAPTER_PATTERN.md) — Channel adapter refactor (enables edit-in-place streaming)
 - [PROVIDER_RACING.md](./PROVIDER_RACING.md) — Provider racing design (complementary to lane changing)

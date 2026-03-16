@@ -1,6 +1,6 @@
-# crew-rs UX Vision
+# octos UX Vision
 
-Crew-rs's UX strategy: adopt OpenClaw's proven interaction patterns, then layer on crew-rs's unique adaptive intelligence capabilities that OpenClaw lacks.
+Crew-rs's UX strategy: adopt OpenClaw's proven interaction patterns, then layer on octos's unique adaptive intelligence capabilities that OpenClaw lacks.
 
 ---
 
@@ -35,7 +35,7 @@ User: "стоп"          // Russian
 
 **Implementation (done):**
 - `CancellationToken` propagation from session → agent run → subagents → tool calls
-- 30+ multilingual abort trigger words across 9 languages (`crew-core/src/abort.rs`):
+- 30+ multilingual abort trigger words across 9 languages (`octos-core/src/abort.rs`):
   - English: stop, abort, cancel, halt, interrupt, quit, enough
   - Chinese: 停, 停止, 取消, 停下, 别说了
   - Japanese: やめて, 止めて, ストップ
@@ -51,7 +51,7 @@ User: "стоп"          // Russian
 
 ### 3. Queued Messages Answered Together
 
-When the user sends multiple messages while the agent is busy, crew-rs handles them according to the configured queue mode.
+When the user sends multiple messages while the agent is busy, octos handles them according to the configured queue mode.
 
 ```
 User: "Also check the Rust implementation"
@@ -110,16 +110,16 @@ Never leave the user staring at a blank screen. Output appears progressively as 
 
 ---
 
-## crew-rs Differentiators
+## octos Differentiators
 
-These capabilities are unique to crew-rs and don't exist in OpenClaw.
+These capabilities are unique to octos and don't exist in OpenClaw.
 
 ### 5. Adaptive Routing with Exclusive Modes
 
-crew-rs's adaptive routing system uses an `AdaptiveMode` enum with three mutually exclusive strategies, plus an orthogonal QoS toggle. This replaces the previous independent boolean toggles.
+octos's adaptive routing system uses an `AdaptiveMode` enum with three mutually exclusive strategies, plus an orthogonal QoS toggle. This replaces the previous independent boolean toggles.
 
 ```rust
-// crates/crew-llm/src/adaptive.rs
+// crates/octos-llm/src/adaptive.rs
 pub enum AdaptiveMode {
     Off = 0,    // Static priority, failover only on circuit-broken
     Hedge = 1,  // Race 2 providers, take winner, cancel loser
@@ -317,7 +317,7 @@ This prevents confusion when users enable racing but only have one provider conf
 
 ### 7. Auto-Escalation via ResponsivenessObserver
 
-The `ResponsivenessObserver` (`crew-llm/src/responsiveness.rs`) monitors LLM response latencies and automatically escalates/de-escalates adaptive protection.
+The `ResponsivenessObserver` (`octos-llm/src/responsiveness.rs`) monitors LLM response latencies and automatically escalates/de-escalates adaptive protection.
 
 ```rust
 pub struct ResponsivenessObserver {
@@ -470,27 +470,27 @@ Both `adaptive_routing.mode` and `gateway.queue_mode` can be changed at runtime 
 
 | Feature | Status | Files |
 |---------|--------|-------|
-| Background tasks (spawn) | ✅ Done | `crew-agent/src/tools/spawn.rs`, `session_actor.rs` |
-| Multilingual abort | ✅ Done | `crew-core/src/abort.rs` (30+ triggers, 9 languages) |
+| Background tasks (spawn) | ✅ Done | `octos-agent/src/tools/spawn.rs`, `session_actor.rs` |
+| Multilingual abort | ✅ Done | `octos-core/src/abort.rs` (30+ triggers, 9 languages) |
 | Queue modes (5) | ✅ Done | `config.rs` (QueueMode), `session_actor.rs` (drain_queue) |
 | Slash commands (/adaptive, /queue) | ✅ Done | `session_actor.rs` (try_handle_command) |
-| AdaptiveMode enum | ✅ Done | `crew-llm/src/adaptive.rs` (Off/Hedge/Lane as AtomicU8) |
+| AdaptiveMode enum | ✅ Done | `octos-llm/src/adaptive.rs` (Off/Hedge/Lane as AtomicU8) |
 | Hedged racing | ✅ Done | `adaptive.rs` (hedged_chat, tokio::select!) |
 | Lane changing (score-based) | ✅ Done | `adaptive.rs` (select_provider, score()) |
 | QoS ranking toggle | ✅ Done | `adaptive.rs` (AtomicBool, orthogonal) |
-| ResponsivenessObserver | ✅ Done | `crew-llm/src/responsiveness.rs` |
+| ResponsivenessObserver | ✅ Done | `octos-llm/src/responsiveness.rs` |
 | Auto-escalation/recovery | ✅ Done | `session_actor.rs` (Hedge+Speculative / Off+Followup) |
 | Concurrent speculative overflow | ✅ Done | `session_actor.rs` (process_inbound_speculative, serve_overflow, tokio::spawn + select!) |
 | System prompt documentation | ✅ Done | `prompts/gateway_default.txt` |
-| ToolProgress enum | ⚠️ Defined | `crew-agent/src/tools/mod.rs` (no consumers) |
+| ToolProgress enum | ⚠️ Defined | `octos-agent/src/tools/mod.rs` (no consumers) |
 | Dashboard API | ❌ Not started | — |
 | Hot-reload settings | ❌ Not started | — |
 
 ---
 
-## Comparison: crew-rs vs OpenClaw UX
+## Comparison: octos vs OpenClaw UX
 
-| Capability | OpenClaw | crew-rs (current) |
+| Capability | OpenClaw | octos (current) |
 |-----------|----------|-------------------|
 | Background tasks | ✅ Subagent spawn | ✅ SpawnTool with `mode: "background"` |
 | User cancel | ✅ 30+ triggers | ✅ 30+ triggers, 9 languages, cascade abort |
@@ -504,7 +504,7 @@ Both `adaptive_routing.mode` and `gateway.queue_mode` can be changed at runtime 
 | Slash commands | ✅ /adaptive /queue | ✅ /adaptive /queue (runtime mode switching) |
 | Skill status emission | ❌ | ⚠️ ToolProgress defined, no consumers |
 
-**crew-rs's edge:** Adaptive intelligence. OpenClaw has better UX polish today, but crew-rs combines that polish with runtime intelligence — the system observes, learns, and adapts without operator intervention.
+**octos's edge:** Adaptive intelligence. OpenClaw has better UX polish today, but octos combines that polish with runtime intelligence — the system observes, learns, and adapts without operator intervention.
 
 ---
 

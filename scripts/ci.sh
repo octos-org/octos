@@ -116,7 +116,7 @@ else
 
     # Queue modes + speculative overflow + auto-escalation
     echo "  Running: session actor tests (queue modes, speculative, escalation)"
-    if cargo test -p crew-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
+    if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
         N=$(grep "^test result:" /tmp/crew-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "session actor ($N tests)"
     else
@@ -132,13 +132,13 @@ else
         fail "session persistence"
     fi
 
-    # crew-cli with API feature
+    # octos-cli with API feature
     if [ "$QUICK" = false ]; then
-        echo "  Running: crew-cli with API feature"
-        if cargo test -p crew-cli --features api $TEST_THREADS_FLAG 2>&1 | tail -3; then
-            pass "crew-cli --features api"
+        echo "  Running: octos-cli with API feature"
+        if cargo test -p octos-cli --features api $TEST_THREADS_FLAG 2>&1 | tail -3; then
+            pass "octos-cli --features api"
         else
-            fail "crew-cli --features api"
+            fail "octos-cli --features api"
         fi
     fi
 fi
@@ -176,7 +176,7 @@ fi
 
 # Queue modes + speculative overflow + auto-escalation
 echo "  Running: session actor tests (queue modes, speculative, escalation)"
-if cargo test -p crew-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
+if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
     N=$(grep "^test result:" /tmp/crew-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "session actor ($N tests)"
 else

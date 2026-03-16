@@ -3,7 +3,7 @@ name = "news_fetch"
 version = "1.0.0"
 edition = "2021"
 description = "Standalone news fetcher: RSS, Hacker News API, Yahoo scraping, article deep-fetch"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "news_fetch"

@@ -206,14 +206,14 @@ fn handle_synthesize(input_json: &str) {
     }
 
     let output_path = input.output_path.unwrap_or_else(|| {
-        // Prefer CREW_WORK_DIR (set by PluginTool for per-profile isolation),
-        // fall back to CREW_DATA_DIR, then /tmp as last resort.
-        let base = std::env::var("CREW_WORK_DIR")
-            .or_else(|_| std::env::var("CREW_DATA_DIR"))
+        // Prefer OCTOS_WORK_DIR (set by PluginTool for per-profile isolation),
+        // fall back to OCTOS_DATA_DIR, then /tmp as last resort.
+        let base = std::env::var("OCTOS_WORK_DIR")
+            .or_else(|_| std::env::var("OCTOS_DATA_DIR"))
             .unwrap_or_else(|_| "/tmp".to_string());
         let dir = Path::new(&base).join("voice");
         std::fs::create_dir_all(&dir).ok();
-        format!("{}/crew_tts_{}.wav", dir.display(), timestamp())
+        format!("{}/octos_tts_{}.wav", dir.display(), timestamp())
     });
 
     if let Some(parent) = Path::new(&output_path).parent() {

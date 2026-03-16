@@ -3,7 +3,7 @@ name = "clock"
 version = "1.0.0"
 edition = "2021"
 description = "Get current time in any timezone"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "clock"

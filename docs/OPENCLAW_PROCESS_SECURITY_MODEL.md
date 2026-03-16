@@ -1,6 +1,6 @@
 # OpenClaw Process & Security Model
 
-Reference analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) process isolation and security architecture. Compared against crew-rs for cross-pollination opportunities.
+Reference analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) process isolation and security architecture. Compared against octos for cross-pollination opportunities.
 
 Last updated: 2026-03-10.
 
@@ -17,7 +17,7 @@ OpenClaw is designed as a **personal assistant** framework — one trusted opera
 | Session ↔ Session | Session key routing + per-session JSONL files | Application-level |
 | Tool execution | Optional Docker sandbox (per-session/agent/shared) | Container-level |
 
-**crew-rs comparison**: crew-rs targets multi-tenant (profile = tenant, OS process boundary). OpenClaw is single-tenant per Gateway, multi-agent within the Gateway.
+**octos comparison**: octos targets multi-tenant (profile = tenant, OS process boundary). OpenClaw is single-tenant per Gateway, multi-agent within the Gateway.
 
 ---
 
@@ -42,17 +42,17 @@ Gateway (single long-lived Node.js process)
 └── Maintenance timers (cleanup, cron, health)
 ```
 
-**Key difference from crew-rs**: OpenClaw runs everything in ONE Node.js process. No child-process-per-profile. Isolation between agents is in-process (directory + session key scoping). crew-rs spawns a separate OS process per profile via `crew serve`.
+**Key difference from octos**: OpenClaw runs everything in ONE Node.js process. No child-process-per-profile. Isolation between agents is in-process (directory + session key scoping). octos spawns a separate OS process per profile via `crew serve`.
 
 ### Session Lane Concurrency
 
-OpenClaw limits concurrent agent runs per agent via **session lanes** (default 4). This is analogous to crew-rs's queue mode — prevents resource exhaustion from many simultaneous chats.
+OpenClaw limits concurrent agent runs per agent via **session lanes** (default 4). This is analogous to octos's queue mode — prevents resource exhaustion from many simultaneous chats.
 
 ---
 
 ## 3. DM Scope (`dmScope`)
 
-`dmScope` controls how direct messages from different users map to agent sessions. This is OpenClaw's most notable session isolation feature that crew-rs lacks.
+`dmScope` controls how direct messages from different users map to agent sessions. This is OpenClaw's most notable session isolation feature that octos lacks.
 
 ### The Problem
 
@@ -104,14 +104,14 @@ OpenClaw supports `identityLinks` — a map of canonical user names to platform-
 }
 ```
 
-### crew-rs Comparison
+### octos Comparison
 
-crew-rs always uses `channel:chat_id` as the session key (equivalent to `"per-channel-peer"`). This is hardcoded — no configurable scoping. crew-rs does NOT support:
+octos always uses `channel:chat_id` as the session key (equivalent to `"per-channel-peer"`). This is hardcoded — no configurable scoping. octos does NOT support:
 - Shared main session (`"main"` mode) — useful for single-user personal assistant
 - Cross-channel identity linking (`identityLinks`)
 - Per-account scoping (multi-account per channel)
 
-**Recommendation**: Add configurable `dm_scope` to crew-rs profile config. Default to `"per-channel-peer"` (current behavior). The `"main"` mode is valuable for personal single-user setups where the operator IS the only user.
+**Recommendation**: Add configurable `dm_scope` to octos profile config. Default to `"per-channel-peer"` (current behavior). The `"main"` mode is valuable for personal single-user setups where the operator IS the only user.
 
 ---
 
@@ -142,9 +142,9 @@ crew-rs always uses `channel:chat_id` as the session key (equivalent to `"per-ch
 └── sandboxes/                           # Docker sandbox workspaces
 ```
 
-**crew-rs comparison**:
+**octos comparison**:
 
-| Aspect | OpenClaw | crew-rs |
+| Aspect | OpenClaw | octos |
 |--------|----------|---------|
 | Top-level scoping | Per-agent | Per-profile (OS process) then per-user |
 | Session files | `agents/<agentId>/agent/sessions/` | `users/<base_key>/sessions/` |
@@ -152,13 +152,13 @@ crew-rs always uses `channel:chat_id` as the session key (equivalent to `"per-ch
 | Memory | Per-agent | Per-profile (`episodes.redb`) |
 | Workspace | Per-agent configurable path | Per-profile `--cwd` |
 
-**Key insight**: OpenClaw scopes data per-agent (not per-user within agent). Sessions within an agent are separated by session key but live in the same directory. crew-rs now has per-user directories — finer isolation within a profile.
+**Key insight**: OpenClaw scopes data per-agent (not per-user within agent). Sessions within an agent are separated by session key but live in the same directory. octos now has per-user directories — finer isolation within a profile.
 
 ### Session Persistence
 
-- Format: JSONL (same as crew-rs)
-- Crash safety: atomic write-then-rename (same as crew-rs)
-- File size limit: 10MB (same as crew-rs)
+- Format: JSONL (same as octos)
+- Crash safety: atomic write-then-rename (same as octos)
+- File size limit: 10MB (same as octos)
 - Session maintenance: configurable cleanup, pruning, LRU cache
 - Duplicate agent directory detection at startup (`findDuplicateAgentDirs()`)
 
@@ -210,7 +210,7 @@ OpenClaw **blocks specific dangerous bind sources**:
 - `/etc` — prevents host config access
 - `/proc`, `/sys`, `/dev` — prevents kernel interface access
 
-**crew-rs does NOT have this** — a valuable addition.
+**octos does NOT have this** — a valuable addition.
 
 ### Browser Sandbox
 
@@ -222,7 +222,7 @@ Dedicated Docker container with:
 
 ### Env Sanitization
 
-Same 18 blocked env vars as crew-rs (`LD_PRELOAD`, `DYLD_*`, `NODE_OPTIONS`, etc.).
+Same 18 blocked env vars as octos (`LD_PRELOAD`, `DYLD_*`, `NODE_OPTIONS`, etc.).
 
 ---
 
@@ -235,9 +235,9 @@ Same 18 blocked env vars as crew-rs (`LD_PRELOAD`, `DYLD_*`, `NODE_OPTIONS`, etc
 | Gateway auth | Global | Config file or `OPENCLAW_GATEWAY_TOKEN` env |
 | Secret refs | Config-level | `{ $ref: "secret:..." }` in config |
 
-**Auth profile rotation**: Per-agent OAuth + API key rotation with failover (401/403 → next provider, 429/5xx → retry + failover). Same pattern as crew-rs.
+**Auth profile rotation**: Per-agent OAuth + API key rotation with failover (401/403 → next provider, 429/5xx → retry + failover). Same pattern as octos.
 
-**crew-rs comparison**: crew-rs stores credentials as env vars or in profile config. OpenClaw's per-agent credential files with `auth-profiles.json` provide better isolation when running multiple agents. crew-rs's profile-level isolation (OS process) compensates — credentials can't leak between profiles.
+**octos comparison**: octos stores credentials as env vars or in profile config. OpenClaw's per-agent credential files with `auth-profiles.json` provide better isolation when running multiple agents. octos's profile-level isolation (OS process) compensates — credentials can't leak between profiles.
 
 ---
 
@@ -263,11 +263,11 @@ Each instance gets:
 - Own port
 - Profile shorthand: `openclaw --profile rescue` auto-scopes everything
 
-**crew-rs equivalent**: `crew serve` with multiple profiles — each profile gets its own child process and `data_dir`. crew-rs's approach is more automated (dashboard manages profiles, auto-spawns processes).
+**octos equivalent**: `crew serve` with multiple profiles — each profile gets its own child process and `data_dir`. octos's approach is more automated (dashboard manages profiles, auto-spawns processes).
 
 ---
 
-## 8. What crew-rs Can Learn
+## 8. What octos Can Learn
 
 ### High Priority
 
@@ -277,15 +277,15 @@ Each instance gets:
 
 3. **Dangerous bind mount blocking** — Block `docker.sock`, `/etc`, `/proc`, `/sys`, `/dev` in Docker sandbox mounts. Simple check, prevents container escape.
 
-4. **Sandbox scope options** — Add per-session vs per-agent vs shared container scope. Currently crew-rs creates a new sandbox per shell invocation (most expensive option).
+4. **Sandbox scope options** — Add per-session vs per-agent vs shared container scope. Currently octos creates a new sandbox per shell invocation (most expensive option).
 
 ### Medium Priority
 
 5. **Sandbox mode `"non-main"`** — Only sandbox non-main sessions. Main session (operator) runs unsandboxed for convenience, while external users get sandboxed. Good default for production.
 
-6. **Workspace access modes** — `none`/`ro`/`rw` mount options for Docker sandbox. Currently crew-rs has `ro`/`rw` but no `none` (fully isolated workspace).
+6. **Workspace access modes** — `none`/`ro`/`rw` mount options for Docker sandbox. Currently octos has `ro`/`rw` but no `none` (fully isolated workspace).
 
-7. **Browser sandbox isolation** — Dedicated container with network isolation, noVNC, and CDP CIDR allowlist. Currently crew-rs's browser tool runs on host.
+7. **Browser sandbox isolation** — Dedicated container with network isolation, noVNC, and CDP CIDR allowlist. Currently octos's browser tool runs on host.
 
 ### Lower Priority
 
@@ -295,9 +295,9 @@ Each instance gets:
 
 ---
 
-## 9. What OpenClaw Can Learn from crew-rs
+## 9. What OpenClaw Can Learn from octos
 
-| Area | crew-rs Advantage |
+| Area | octos Advantage |
 |------|-------------------|
 | **Per-user directories** | `users/{base_key}/sessions/` — finer isolation than OpenClaw's flat per-agent sessions |
 | **Per-actor state** | `SessionHandle` per actor — zero cross-user mutex contention |
@@ -313,7 +313,7 @@ Each instance gets:
 ## 10. Architecture Comparison Summary
 
 ```
-crew-rs multi-tenant model:                OpenClaw single-tenant model:
+octos multi-tenant model:                OpenClaw single-tenant model:
 
 crew serve (control plane)                  Gateway (single Node.js process)
 ├── Profile A (child process)               ├── Agent "main"
@@ -335,7 +335,7 @@ Isolation: OS process per profile           Isolation: directory per agent
 
 ## Related Documents
 
-- [SESSION_ACTOR_ARCHITECTURE.md](./SESSION_ACTOR_ARCHITECTURE.md) — crew-rs per-actor model
-- [SECURITY_ARCHITECTURE.md](./SECURITY_ARCHITECTURE.md) — crew-rs security layers
+- [SESSION_ACTOR_ARCHITECTURE.md](./SESSION_ACTOR_ARCHITECTURE.md) — octos per-actor model
+- [SECURITY_ARCHITECTURE.md](./SECURITY_ARCHITECTURE.md) — octos security layers
 - [OPENCLAW_CROSS_POLLINATION.md](./OPENCLAW_CROSS_POLLINATION.md) — Feature cross-pollination guide
 - [OPENCLAW_CHANNEL_ARCHITECTURE.md](./OPENCLAW_CHANNEL_ARCHITECTURE.md) — Channel adapter patterns

@@ -1,6 +1,6 @@
 # OpenClaw Channel Architecture Review
 
-A comprehensive analysis of OpenClaw's channel system, compared with crew-rs's `Channel` trait, to identify patterns worth adopting and gaps to address.
+A comprehensive analysis of OpenClaw's channel system, compared with octos's `Channel` trait, to identify patterns worth adopting and gaps to address.
 
 ## 1. Architecture Overview
 
@@ -30,7 +30,7 @@ ChannelPlugin = {
 }
 ```
 
-crew-rs uses a **flat trait** with 12 methods. Simpler, but less extensible.
+octos uses a **flat trait** with 12 methods. Simpler, but less extensible.
 
 ## 2. Channel Registry
 
@@ -51,7 +51,7 @@ Extensions (plugin system):
 - **matrix** — `@vector-im/matrix-bot-sdk` + E2EE
 - **mattermost**, **nextcloud-talk**, and 30+ others
 
-### crew-rs: 6 Built-in (Feature-Gated)
+### octos: 6 Built-in (Feature-Gated)
 
 1. **telegram** — teloxide
 2. **whatsapp** — Custom WebSocket bridge (Node.js sidecar)
@@ -62,16 +62,16 @@ Extensions (plugin system):
 
 ### Gap Analysis
 
-| Platform | OpenClaw | crew-rs | Notes |
+| Platform | OpenClaw | octos | Notes |
 |----------|----------|---------|-------|
 | Telegram | Yes | Yes | Both mature |
-| WhatsApp | Yes (Baileys) | Yes (bridge) | crew-rs uses Node sidecar |
-| Discord | Yes | No | Major gap for crew-rs |
-| Slack | Yes | No | Major gap for crew-rs |
+| WhatsApp | Yes (Baileys) | Yes (bridge) | octos uses Node sidecar |
+| Discord | Yes | No | Major gap for octos |
+| Slack | Yes | No | Major gap for octos |
 | Signal | Yes | No | |
-| Feishu/Lark | No | Yes | crew-rs advantage |
-| WeCom | No | Yes | crew-rs advantage |
-| Twilio/SMS | No | Yes | crew-rs advantage |
+| Feishu/Lark | No | Yes | octos advantage |
+| WeCom | No | Yes | octos advantage |
+| Twilio/SMS | No | Yes | octos advantage |
 | Matrix | Extension | No | Recommended to add |
 | IRC | Yes | No | Low priority |
 | LINE | Yes | No | Regional |
@@ -105,13 +105,13 @@ The `ChannelConfigAdapter` provides:
 
 Agents can target specific accounts via tool parameters.
 
-### crew-rs: Single Account Per Channel
+### octos: Single Account Per Channel
 
 Each channel entry in `config.json` is one account. Multiple accounts of the same type require multiple channel entries with different `channel_type` values or settings. No first-class multi-account abstraction.
 
 ### Recommendation
 
-Multi-account is valuable for separating concerns (e.g., customer support bot vs. alert bot on the same Telegram). Consider adding an `account_id` field to crew-rs channel config and routing.
+Multi-account is valuable for separating concerns (e.g., customer support bot vs. alert bot on the same Telegram). Consider adding an `account_id` field to octos channel config and routing.
 
 ## 4. Message Flow
 
@@ -132,7 +132,7 @@ Key middleware:
 - **Media extraction**: Normalizes images/audio/video to standard URLs
 - **Thread detection**: Extracts reply-to and thread IDs
 
-### Inbound Pipeline (crew-rs)
+### Inbound Pipeline (octos)
 
 ```
 Platform Event
@@ -143,7 +143,7 @@ Platform Event
   → Agent.process_message()
 ```
 
-### Gap: crew-rs lacks
+### Gap: octos lacks
 
 - **Deduplication** — no debounce for duplicate webhook deliveries
 - **Message coalescing** — rapid messages processed individually
@@ -172,7 +172,7 @@ Platform-specific formatting:
 - **Discord**: Native Markdown (no conversion)
 - **Slack**: mrkdwn format in blocks
 
-### crew-rs
+### octos
 
 ```
 Agent Response
@@ -182,7 +182,7 @@ Agent Response
   → Channel.send()
 ```
 
-### Gap: crew-rs lacks
+### Gap: octos lacks
 
 - **Write-ahead queue** — no crash recovery for outbound messages
 - **Platform-specific Markdown conversion** — sends raw text
@@ -211,7 +211,7 @@ Features:
 - Safety TTL (prevent infinite typing)
 - Clean stop on reply completion
 
-### crew-rs
+### octos
 
 ```rust
 // In StatusIndicator:
@@ -240,7 +240,7 @@ Platform support:
 - WhatsApp: Within 15 min (limited)
 - Signal/iMessage: No edit support
 
-### crew-rs
+### octos
 
 ```rust
 channel.edit_message(chat_id, message_id, new_content).await
@@ -272,7 +272,7 @@ Each channel can expose unique features:
 - File uploads
 - App home tab
 
-### crew-rs
+### octos
 
 Currently no channel-specific feature exposure. All channels get the same `send()` / `edit_message()` interface. Telegram inline keyboards, Feishu cards, etc. require adding methods to the `Channel` trait or using metadata.
 
@@ -297,9 +297,9 @@ Add an optional `send_rich()` or `send_with_metadata()` method that accepts chan
    - Owner/admin checks per action
    - Platform-specific (Telegram owner, Discord guild admin)
 
-Allowlists stored in files: `.crew/channels/{channel}/{account}/allow-from`
+Allowlists stored in files: `.octos/channels/{channel}/{account}/allow-from`
 
-### crew-rs: Single Level
+### octos: Single Level
 
 ```rust
 channel.is_allowed(sender_id) -> bool
@@ -309,7 +309,7 @@ Plus gateway-level `allowed_users` config.
 
 ### Gap
 
-crew-rs lacks group-level policies and mention-gating. Currently, if a bot is in a Telegram group, it responds to every message.
+octos lacks group-level policies and mention-gating. Currently, if a bot is in a Telegram group, it responds to every message.
 
 ## 10. Health Monitoring
 
@@ -321,7 +321,7 @@ crew-rs lacks group-level policies and mention-gating. Currently, if a bot is in
 - `collectStatusIssues()` — list of problems with suggested fixes
 - `buildAccountSnapshot()` — full state for dashboard display
 
-### crew-rs
+### octos
 
 No equivalent. Channel failures surface as runtime errors in logs.
 
@@ -338,7 +338,7 @@ Add a `health_check()` method to the `Channel` trait for the admin dashboard.
 - Tool execution cards with real-time progress
 - Reading indicator (animated dots) in web UI
 
-### crew-rs
+### octos
 
 Just implemented: `ChannelStreamReporter` + `run_stream_forwarder()`:
 - 1s throttled text deltas → channel message edits
@@ -353,7 +353,7 @@ Just implemented: `ChannelStreamReporter` + `run_stream_forwarder()`:
 
 2. **Mention-gating for groups** — In group chats, only respond when @mentioned. Prevents the bot from responding to every message.
 
-3. **Platform-specific Markdown conversion** — WhatsApp, Signal, etc. have different formatting rules. Currently crew-rs sends raw text.
+3. **Platform-specific Markdown conversion** — WhatsApp, Signal, etc. have different formatting rules. Currently octos sends raw text.
 
 4. **Channel health probing** — For the admin dashboard, expose a `probe()` method.
 
@@ -375,7 +375,7 @@ Just implemented: `ChannelStreamReporter` + `run_stream_forwarder()`:
 
 ## 13. Architectural Comparison Summary
 
-| Aspect | OpenClaw | crew-rs |
+| Aspect | OpenClaw | octos |
 |--------|----------|---------|
 | **Pattern** | Plugin adapters (~20 slots) | Flat trait (12 methods) |
 | **Channels** | 9 built-in + extensions | 6 feature-gated |
@@ -392,4 +392,4 @@ Just implemented: `ChannelStreamReporter` + `run_stream_forwarder()`:
 | **Complexity** | High (~50 files, ~15K lines) | Low (~10 files, ~3K lines) |
 | **Language** | TypeScript (Node.js) | Rust (single binary) |
 
-crew-rs trades extensibility for simplicity and operational ease (single binary, no runtime dependencies). The flat `Channel` trait covers 90% of use cases. The remaining 10% (rich formatting, multi-account, group policies) can be added incrementally without a full plugin system.
+octos trades extensibility for simplicity and operational ease (single binary, no runtime dependencies). The flat `Channel` trait covers 90% of use cases. The remaining 10% (rich formatting, multi-account, group policies) can be added incrementally without a full plugin system.

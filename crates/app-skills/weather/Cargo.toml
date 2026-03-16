@@ -3,7 +3,7 @@ name = "weather"
 version = "1.0.0"
 edition = "2021"
 description = "Get current weather for any city worldwide"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "weather"

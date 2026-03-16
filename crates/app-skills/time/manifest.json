@@ -1,7 +1,7 @@
 {
   "name": "clock",
   "version": "1.0.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Get current date and time in any timezone worldwide",
   "timeout_secs": 5,
   "requires_network": false,

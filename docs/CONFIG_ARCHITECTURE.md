@@ -4,7 +4,7 @@
 
 ## Core Principle
 
-**The profile JSON is the single source of truth.** The dashboard writes `~/.crew/profiles/{id}.json`, and everything else derives from it. There is no intermediate config file.
+**The profile JSON is the single source of truth.** The dashboard writes `~/.octos/profiles/{id}.json`, and everything else derives from it. There is no intermediate config file.
 
 ```
 profiles/{id}.json ──→ gateway process (reads directly)
@@ -69,7 +69,7 @@ UserProfile                          Config
 ```
 crew gateway --config config.json     # traditional format
 crew gateway --profile profile.json   # profile format
-crew gateway                          # auto-detect from cwd/.crew/config.json
+crew gateway                          # auto-detect from cwd/.octos/config.json
 ```
 
 All three paths produce a `Config` struct. The gateway doesn't care which format the file is — `ConfigWatcher::parse_first()` handles both transparently.

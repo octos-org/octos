@@ -18,11 +18,11 @@ FILTER="${1:-all}"
 # Build test binaries (suppressing warnings)
 echo "Building test binaries..."
 cargo test -p crew-llm --test ux_adaptive --no-run 2>/dev/null
-cargo test -p crew-cli queue_ux --no-run 2>/dev/null
+cargo test -p octos-cli queue_ux --no-run 2>/dev/null
 
 # Find the test binaries
 LLM_BIN=$(cargo test -p crew-llm --test ux_adaptive --no-run 2>&1 | grep 'Executable tests/ux_adaptive' | awk '{print $NF}' | tr -d '()')
-CLI_BIN=$(cargo test -p crew-cli queue_ux --no-run 2>&1 | grep 'Executable unittests' | awk '{print $NF}' | tr -d '()')
+CLI_BIN=$(cargo test -p octos-cli queue_ux --no-run 2>&1 | grep 'Executable unittests' | awk '{print $NF}' | tr -d '()')
 
 run_test() {
     local bin="$1" name="$2"
@@ -50,7 +50,7 @@ if [[ "$FILTER" == "all" || "$FILTER" == "adaptive" ]]; then
     run_test "$LLM_BIN" test_responsiveness_baseline_learning
 fi
 
-# Queue mode tests (crew-cli)
+# Queue mode tests (octos-cli)
 if [[ "$FILTER" == "all" || "$FILTER" == "queue" ]]; then
     run_test "$CLI_BIN" queue_ux_followup_real_llm
     run_test "$CLI_BIN" queue_ux_collect_real_llm
@@ -59,7 +59,7 @@ if [[ "$FILTER" == "all" || "$FILTER" == "queue" ]]; then
     run_test "$CLI_BIN" queue_ux_hedge_mode_real_llm
 fi
 
-# Session switching + deep search buffering tests (crew-cli)
+# Session switching + deep search buffering tests (octos-cli)
 if [[ "$FILTER" == "all" || "$FILTER" == "session" ]]; then
     run_test "$CLI_BIN" queue_ux_session_switching_real_llm
     run_test "$CLI_BIN" queue_ux_deep_search_switch_back_real_llm

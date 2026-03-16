@@ -2,7 +2,7 @@
   "name": "news",
   "version": "1.0.0",
   "description": "Fetches raw news headlines and article content from Google News, Hacker News, Yahoo News, Substack, and Medium.",
-  "author": "hagency",
+  "author": "octos",
   "tools": [
     {
       "name": "news_fetch",

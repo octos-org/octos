@@ -45,7 +45,7 @@ Inject into LLM prompt:
 
 #### Phase 1: Plumbing
 
-1. Add `reply_to_message_id: Option<String>` to `InboundMessage` (crew-core/src/gateway.rs)
+1. Add `reply_to_message_id: Option<String>` to `InboundMessage` (octos-core/src/gateway.rs)
 2. Capture `msg.reply_to_message().map(|r| r.id.0.to_string())` in Telegram channel inbound path
 3. Store outbound platform message IDs in session history `Message` struct (new field `platform_msg_id: Option<String>`)
 4. After `send_message` / `send_html_with_fallback`, capture the returned Telegram msg ID and save it back to session

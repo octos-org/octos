@@ -1,7 +1,7 @@
 {
   "name": "send-email",
   "version": "1.0.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Send emails via SMTP or Feishu/Lark Mail API",
   "tools": [
     {

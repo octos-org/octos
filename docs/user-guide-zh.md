@@ -80,7 +80,7 @@ crew serve --host 0.0.0.0 --port 3000
 
 #### 配置 SMTP 发送 OTP 邮件
 
-在 serve 配置文件中添加 `dashboard_auth`（`~/.crew/config.json` 或按配置文件）：
+在 serve 配置文件中添加 `dashboard_auth`（`~/.octos/config.json` 或按配置文件）：
 
 ```json
 {
@@ -340,7 +340,7 @@ crew auth status
 crew auth logout --provider openai
 ```
 
-凭据存储在 `~/.crew/auth.json`（文件权限 0600）。解析 API 密钥时，认证存储**优先于**环境变量。
+凭据存储在 `~/.octos/auth.json`（文件权限 0600）。解析 API 密钥时，认证存储**优先于**环境变量。
 
 ---
 
@@ -848,7 +848,7 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
 
 每个 通道:聊天ID 对维护独立的会话（对话历史）。
 
-- **会话持久化：** `.crew/sessions/` 中的 JSONL 文件
+- **会话持久化：** `.octos/sessions/` 中的 JSONL 文件
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
 - **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
 - **上下文压缩：** 当对话超过 LLM 的上下文窗口时，较旧的消息会自动压缩（工具参数被剥离，早期消息被摘要）
@@ -858,7 +858,7 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
 智能体跨会话维护长期记忆：
 
 - **`MEMORY.md`** — 持久化笔记，始终加载到上下文中
-- **每日笔记** — `.crew/memory/YYYY-MM-DD.md`，自动创建
+- **每日笔记** — `.octos/memory/YYYY-MM-DD.md`，自动创建
 - **近期记忆** — 最近 7 天的每日笔记包含在上下文中
 - **回忆录** — 任务完成摘要存储在 `episodes.redb` 中
 
@@ -991,10 +991,10 @@ crew cron enable <job-id> --disable
 
 ### 11.11 心跳
 
-心跳服务每 30 分钟读取 `.crew/HEARTBEAT.md` 并将其内容发送给智能体。用于后台任务指令：
+心跳服务每 30 分钟读取 `.octos/HEARTBEAT.md` 并将其内容发送给智能体。用于后台任务指令：
 
 ```markdown
-<!-- .crew/HEARTBEAT.md -->
+<!-- .octos/HEARTBEAT.md -->
 检查 GitHub 仓库中的新 issue，汇总所有紧急问题。
 ```
 
@@ -1002,7 +1002,7 @@ crew cron enable <job-id> --disable
 
 ## 12. 内置应用技能
 
-内置应用技能作为编译好的二进制文件随 `crew` 一起发布。它们在 gateway 启动时自动安装到 `.crew/skills/` — 无需手动安装。
+内置应用技能作为编译好的二进制文件随 `crew` 一起发布。它们在 gateway 启动时自动安装到 `.octos/skills/` — 无需手动安装。
 
 ### 12.1 新闻获取
 
@@ -1565,10 +1565,10 @@ crew skills search "网页抓取"
 
 ### 14.3 技能目录结构
 
-技能位于 `.crew/skills/<名称>/`，包含：
+技能位于 `.octos/skills/<名称>/`，包含：
 
 ```
-.crew/skills/my-skill/
+.octos/skills/my-skill/
 ├── SKILL.md         # 必需：指令 + frontmatter
 ├── manifest.json    # 工具技能必需：工具定义
 ├── main             # 编译好的二进制文件（或脚本）
@@ -1663,12 +1663,12 @@ requires_env: MY_API_KEY
 
 技能从以下目录加载（按优先级排序）：
 
-1. `.crew/plugins/`（旧版）
-2. `.crew/skills/`（用户安装的自定义技能）
-3. `.crew/bundled-app-skills/`（内置：news、deep-search 等）
-4. `.crew/platform-skills/`（平台：asr/tts）
-5. `~/.crew/plugins/`（全局旧版）
-6. `~/.crew/skills/`（全局自定义）
+1. `.octos/plugins/`（旧版）
+2. `.octos/skills/`（用户安装的自定义技能）
+3. `.octos/bundled-app-skills/`（内置：news、deep-search 等）
+4. `.octos/platform-skills/`（平台：asr/tts）
+5. `~/.octos/plugins/`（全局旧版）
+6. `~/.octos/skills/`（全局自定义）
 
 用户安装的技能覆盖同名的内置技能。
 
@@ -1679,7 +1679,7 @@ requires_env: MY_API_KEY
 1. 创建技能目录：
 
 ```bash
-mkdir -p .crew/skills/translator
+mkdir -p .octos/skills/translator
 ```
 
 2. 创建 `SKILL.md`：
@@ -1762,7 +1762,7 @@ with urllib.request.urlopen(req) as resp:
 5. 设置可执行权限：
 
 ```bash
-chmod +x .crew/skills/translator/main
+chmod +x .octos/skills/translator/main
 ```
 
 6. 测试使用：
@@ -1928,12 +1928,12 @@ chmod +x .crew/skills/translator/main
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
 | **系统** | |
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
-| `CREW_LOG_JSON` | 启用 JSON 格式日志（设置为任意值） |
+| `OCTOS_LOG_JSON` | 启用 JSON 格式日志（设置为任意值） |
 
 ### 15.3 文件布局
 
 ```
-~/.crew/                        # 全局配置目录
+~/.octos/                        # 全局配置目录
 ├── auth.json                   # 存储的 API 凭据（权限 0600）
 ├── profiles/                   # 配置文件（serve 模式）
 │   ├── my-bot.json
@@ -1941,7 +1941,7 @@ chmod +x .crew/skills/translator/main
 ├── skills/                     # 全局自定义技能
 └── serve.log                   # Serve 模式日志文件
 
-.crew/                          # 项目/配置文件数据目录
+.octos/                          # 项目/配置文件数据目录
 ├── config.json                 # 配置
 ├── cron.json                   # 定时任务
 ├── AGENTS.md                   # 智能体指令
@@ -1972,4 +1972,4 @@ chmod +x .crew/skills/translator/main
 
 ---
 
-*本指南涵盖截至 2026 年 3 月的 Crew 版本。最新更新请参阅仓库 [github.com/hagency-org/crew-rs](https://github.com/hagency-org/crew-rs)。*
+*本指南涵盖截至 2026 年 3 月的 Crew 版本。最新更新请参阅仓库 [github.com/octos-org/octos](https://github.com/octos-org/octos)。*

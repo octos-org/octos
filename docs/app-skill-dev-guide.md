@@ -1,6 +1,6 @@
 # Crew App Skill Development Guide
 
-This guide covers everything you need to build, register, and deploy a new app skill for crew-rs.
+This guide covers everything you need to build, register, and deploy a new app skill for octos.
 
 ---
 
@@ -11,7 +11,7 @@ An app skill is a **standalone executable binary** that communicates with the cr
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
                          ↓
-              Gateway spawns: ~/.crew/skills/weather/main get_weather
+              Gateway spawns: ~/.octos/skills/weather/main get_weather
                          ↓
               Stdin:  {"city": "Paris"}
               Stdout: {"output": "Paris, France\nClear sky\n...", "success": true}
@@ -37,7 +37,7 @@ crates/app-skills/my-skill/
 After bootstrapping, the skill is installed at:
 
 ```
-~/.crew/skills/my-skill/
+~/.octos/skills/my-skill/
 ├── main                # Executable binary (copied from target/)
 ├── manifest.json       # Tool definitions
 └── SKILL.md            # Documentation
@@ -260,7 +260,7 @@ members = [
 
 ### 7. Register in bundled_app_skills.rs
 
-In `crates/crew-agent/src/bundled_app_skills.rs`, add to `BUNDLED_APP_SKILLS`:
+In `crates/octos-agent/src/bundled_app_skills.rs`, add to `BUNDLED_APP_SKILLS`:
 
 ```rust
 pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
@@ -276,7 +276,7 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
 
 **Tuple format:** `(dir_name, binary_name, skill_md, manifest_json)`
 
-- `dir_name`: Name of the directory under `~/.crew/skills/`
+- `dir_name`: Name of the directory under `~/.octos/skills/`
 - `binary_name`: Name of the binary in `target/release/` (must match `[[bin]] name` in Cargo.toml)
 - `skill_md`: Embedded SKILL.md content
 - `manifest_json`: Embedded manifest.json content
@@ -319,7 +319,7 @@ cargo build --release --workspace
 crew gateway
 
 # Check skill was loaded
-ls ~/.crew/skills/my-skill/
+ls ~/.octos/skills/my-skill/
 # main  manifest.json  SKILL.md
 
 # Ask the agent to use your skill
@@ -556,7 +556,7 @@ Add a `prompts` object to `manifest.json`:
 **Example: skill directory layout**
 
 ```
-~/.crew/skills/my-style-guide/
+~/.octos/skills/my-style-guide/
 ├── manifest.json
 ├── SKILL.md
 └── prompts/
@@ -763,7 +763,7 @@ Skills can be rebuilt and deployed independently:
 cargo build --release -p weather
 
 # Copy to remote server
-scp target/release/weather remote:~/.crew/skills/weather/main
+scp target/release/weather remote:~/.octos/skills/weather/main
 
 # No gateway restart needed — next tool call uses the new binary
 ```
@@ -787,7 +787,7 @@ Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `crew` b
 - [ ] Add to `BUNDLED_APP_SKILLS` in `bundled_app_skills.rs`
 - [ ] `cargo build --workspace` succeeds
 - [ ] Standalone test: `echo '{"param": "value"}' | ./target/debug/my_skill my_tool`
-- [ ] Gateway test: skill appears in `~/.crew/skills/` and agent can use it
+- [ ] Gateway test: skill appears in `~/.octos/skills/` and agent can use it
 
 ### For extras (MCP servers, hooks, prompt fragments)
 

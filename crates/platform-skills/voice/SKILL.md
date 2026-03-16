@@ -2,7 +2,7 @@
 name: voice
 description: OminiX ASR (speech-to-text), TTS (text-to-speech), voice cloning with saved profiles, and model management via Qwen3 models on Apple Silicon. Triggers: voice, transcribe audio, text to speech, voice clone, clone voice, save voice, my voice, model management, download model, 语音识别, 语音合成, 语音克隆, 保存声音, speak this, read aloud, 模型管理.
 version: 1.0.0
-author: hagency
+author: octos
 always: true
 ---
 

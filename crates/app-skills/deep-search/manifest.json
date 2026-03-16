@@ -1,7 +1,7 @@
 {
   "name": "deep-search",
   "version": "2.0.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Deep multi-round web research: iterative search across multiple angles, parallel page crawling, reference chasing, and structured report generation.",
   "timeout_secs": 600,
   "tools": [

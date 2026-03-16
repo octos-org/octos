@@ -80,7 +80,7 @@ The dashboard uses email-based One-Time Password (OTP) authentication. No passwo
 
 #### Configure SMTP for OTP Emails
 
-Add `dashboard_auth` to your serve config (`~/.crew/config.json` or per-profile):
+Add `dashboard_auth` to your serve config (`~/.octos/config.json` or per-profile):
 
 ```json
 {
@@ -348,7 +348,7 @@ crew auth status
 crew auth logout --provider openai
 ```
 
-Credentials are stored in `~/.crew/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
+Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
 
 ---
 
@@ -857,7 +857,7 @@ Model switches are persisted to the profile JSON file. On gateway restart, the b
 
 Each channel:chat_id pair maintains its own session (conversation history).
 
-- **Session persistence:** JSONL files in `.crew/sessions/`
+- **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
 - **Session forking:** `/new` creates a branched conversation with parent_key tracking
 - **Context compaction:** When conversation exceeds the LLM's context window, older messages are automatically compacted (tool arguments stripped, early messages summarized)
@@ -867,7 +867,7 @@ Each channel:chat_id pair maintains its own session (conversation history).
 The agent maintains long-term memory across sessions:
 
 - **`MEMORY.md`** — Persistent notes, always loaded into context
-- **Daily notes** — `.crew/memory/YYYY-MM-DD.md`, auto-created
+- **Daily notes** — `.octos/memory/YYYY-MM-DD.md`, auto-created
 - **Recent memory** — Last 7 days of daily notes included in context
 - **Episodes** — Task completion summaries stored in `episodes.redb`
 
@@ -1000,10 +1000,10 @@ When a user sends messages while the agent is processing:
 
 ### 11.11 Heartbeat
 
-The heartbeat service reads `.crew/HEARTBEAT.md` every 30 minutes and sends its content to the agent. Use it for background task instructions:
+The heartbeat service reads `.octos/HEARTBEAT.md` every 30 minutes and sends its content to the agent. Use it for background task instructions:
 
 ```markdown
-<!-- .crew/HEARTBEAT.md -->
+<!-- .octos/HEARTBEAT.md -->
 Check for new issues in the GitHub repo and summarize any urgent ones.
 ```
 
@@ -1011,7 +1011,7 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 ## 12. Bundled App Skills
 
-Bundled app skills ship as compiled binaries alongside the `crew` binary. They are automatically bootstrapped into `.crew/skills/` on gateway startup — no installation required.
+Bundled app skills ship as compiled binaries alongside the `crew` binary. They are automatically bootstrapped into `.octos/skills/` on gateway startup — no installation required.
 
 ### 12.1 News Fetch
 
@@ -1582,10 +1582,10 @@ crew skills search "web scraping"
 
 ### 14.3 Skill Directory Structure
 
-A skill lives in `.crew/skills/<name>/` and contains:
+A skill lives in `.octos/skills/<name>/` and contains:
 
 ```
-.crew/skills/my-skill/
+.octos/skills/my-skill/
 ├── SKILL.md         # Required: instructions + frontmatter
 ├── manifest.json    # Required for tool skills: tool definitions
 ├── main             # Compiled binary (or script)
@@ -1680,12 +1680,12 @@ The tool binary receives JSON input on stdin and outputs JSON on stdout:
 
 Skills are loaded from these directories (in priority order):
 
-1. `.crew/plugins/` (legacy)
-2. `.crew/skills/` (user-installed custom skills)
-3. `.crew/bundled-app-skills/` (bundled: news, deep-search, etc.)
-4. `.crew/platform-skills/` (platform: asr/tts)
-5. `~/.crew/plugins/` (global legacy)
-6. `~/.crew/skills/` (global custom)
+1. `.octos/plugins/` (legacy)
+2. `.octos/skills/` (user-installed custom skills)
+3. `.octos/bundled-app-skills/` (bundled: news, deep-search, etc.)
+4. `.octos/platform-skills/` (platform: asr/tts)
+5. `~/.octos/plugins/` (global legacy)
+6. `~/.octos/skills/` (global custom)
 
 User-installed skills override bundled skills with the same name.
 
@@ -1696,7 +1696,7 @@ User-installed skills override bundled skills with the same name.
 1. Create the skill directory:
 
 ```bash
-mkdir -p .crew/skills/translator
+mkdir -p .octos/skills/translator
 ```
 
 2. Create `SKILL.md`:
@@ -1779,7 +1779,7 @@ with urllib.request.urlopen(req) as resp:
 5. Make it executable:
 
 ```bash
-chmod +x .crew/skills/translator/main
+chmod +x .octos/skills/translator/main
 ```
 
 6. Test it:
@@ -1945,12 +1945,12 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
-| `CREW_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
+| `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
 
 ### 15.3 File Layout
 
 ```
-~/.crew/                        # Global config directory
+~/.octos/                        # Global config directory
 ├── auth.json                   # Stored API credentials (mode 0600)
 ├── profiles/                   # Profile configs (serve mode)
 │   ├── my-bot.json
@@ -1958,7 +1958,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ├── skills/                     # Global custom skills
 └── serve.log                   # Serve mode log file
 
-.crew/                          # Project/profile data directory
+.octos/                          # Project/profile data directory
 ├── config.json                 # Configuration
 ├── cron.json                   # Scheduled jobs
 ├── AGENTS.md                   # Agent instructions
@@ -1989,4 +1989,4 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 
 ---
 
-*This guide covers Crew version as of March 2026. For the latest updates, see the repository at [github.com/hagency-org/crew-rs](https://github.com/hagency-org/crew-rs).*
+*This guide covers Crew version as of March 2026. For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*

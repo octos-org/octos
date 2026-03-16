@@ -1,6 +1,6 @@
 # Action Plan: Lessons from IronClaw Comparison
 
-> Prioritized action items for crew-rs derived from deep code review of IronClaw.
+> Prioritized action items for octos derived from deep code review of IronClaw.
 > Date: 2026-03-07
 
 ---
@@ -8,14 +8,14 @@
 ## Priority 1: Critical Bugs (Fix Now)
 
 ### 1.1 Fix `&body[..200]` UTF-8 byte-slice panic
-**File**: `crates/crew-llm/src/provider.rs` (truncate_error_body)
+**File**: `crates/octos-llm/src/provider.rs` (truncate_error_body)
 **Risk**: Panics on multi-byte UTF-8 error bodies from LLM providers (CJK, emoji, accented chars).
-**Fix**: Use `crew_core::truncate_utf8()` which already exists and handles char boundaries correctly.
+**Fix**: Use `octos_core::truncate_utf8()` which already exists and handles char boundaries correctly.
 **Effort**: 1 hour
 
 ### 1.2 Audit all byte-index slicing across codebase
 **Action**: `grep -rn '\[\.\.' crates/` and verify every slice is on a char boundary or ASCII-only.
-**Why**: IronClaw had 3 critical UTF-8 panics in safety-critical code. Same bug class likely exists in crew-rs beyond the known provider.rs instance.
+**Why**: IronClaw had 3 critical UTF-8 panics in safety-critical code. Same bug class likely exists in octos beyond the known provider.rs instance.
 **Effort**: 2-3 hours
 
 ---
@@ -24,7 +24,7 @@
 
 ### 2.1 Add LLM output leak detection
 **What**: Scan LLM responses for secrets before delivering to users.
-**Why**: IronClaw scans at two points (tool output + LLM response). crew-rs only scans tool output. An LLM can hallucinate or regurgitate API keys from its context window.
+**Why**: IronClaw scans at two points (tool output + LLM response). octos only scans tool output. An LLM can hallucinate or regurgitate API keys from its context window.
 **How**:
 - Extend `sanitize.rs` credential patterns into a `LeakDetector` that runs on assistant messages
 - Hook into the agent loop after LLM response, before channel delivery
@@ -42,7 +42,7 @@
 
 ### 2.3 Add tool approval model
 **What**: Dangerous tools require user confirmation before execution.
-**Why**: IronClaw has Never/UnlessAutoApproved/Always approval levels. crew-rs auto-executes everything including shell commands.
+**Why**: IronClaw has Never/UnlessAutoApproved/Always approval levels. octos auto-executes everything including shell commands.
 **How**:
 - Add `approval_required: bool` to tool metadata (or per-tool in config)
 - Default: shell, write_file, edit_file, spawn require approval
@@ -52,8 +52,8 @@
 
 ### 2.4 Validate shell working directory
 **What**: If shell tool accepts a `cwd`/`workdir` parameter, validate it against allowed paths.
-**Why**: IronClaw has this exact vulnerability — LLM-supplied workdir used as-is. Verify crew-rs isn't vulnerable to the same pattern.
-**Action**: Audit `crates/crew-agent/src/tools/shell.rs` for workdir handling. If present, add path validation.
+**Why**: IronClaw has this exact vulnerability — LLM-supplied workdir used as-is. Verify octos isn't vulnerable to the same pattern.
+**Action**: Audit `crates/octos-agent/src/tools/shell.rs` for workdir handling. If present, add path validation.
 **Effort**: 2-4 hours
 
 ---
@@ -67,7 +67,7 @@
 - New crate: `crew-secrets`
 - AES-256-GCM encryption (use `aes-gcm` crate)
 - Master key from OS keychain (`keyring` crate — macOS Keychain, GNOME Keyring, Windows Credential Manager)
-- Store: encrypted JSON file at `~/.crew/secrets.enc`
+- Store: encrypted JSON file at `~/.octos/secrets.enc`
 - Migration: import existing env vars on first run
 - CLI: `crew secret set/get/list/delete`
 - Zero-exposure: secrets never in tool/WASM process memory
@@ -85,7 +85,7 @@
 
 ### 3.3 Policy engine for prompt injection
 **What**: Replace binary block/allow with configurable severity and actions.
-**Why**: IronClaw's policy engine lets users tune sensitivity: Critical→Block, High→Warn, Medium→Sanitize, Low→Allow. crew-rs currently blocks or doesn't.
+**Why**: IronClaw's policy engine lets users tune sensitivity: Critical→Block, High→Warn, Medium→Sanitize, Low→Allow. octos currently blocks or doesn't.
 **How**:
 - `PromptPolicy` with severity levels and actions
 - Config-driven rules (users can adjust thresholds)
@@ -94,7 +94,7 @@
 
 ### 3.4 SSRF defense: add DNS resolution check
 **What**: After resolving hostname, verify IP isn't private before connecting.
-**Why**: crew-rs blocks direct private IPs in `ssrf.rs`, but DNS rebinding can resolve `evil.com` → `169.254.169.254`. Need to check resolved IP after DNS.
+**Why**: octos blocks direct private IPs in `ssrf.rs`, but DNS rebinding can resolve `evil.com` → `169.254.169.254`. Need to check resolved IP after DNS.
 **How**:
 - In `web_fetch` and `browser` tools, resolve DNS first
 - Check all resolved IPs against private ranges
@@ -109,7 +109,7 @@
 **What**: LRU + TTL cache for LLM responses.
 **Why**: IronClaw caches non-tool completions with SHA-256 keyed LRU (1000 entries, 1hr TTL). Saves cost on repeated/similar queries.
 **How**:
-- Add `CachedProvider` wrapper in `crew-llm`
+- Add `CachedProvider` wrapper in `octos-llm`
 - Key: hash of (model, messages, temperature, max_tokens)
 - Never cache tool-calling responses
 - Config: `cache_enabled`, `cache_max_entries`, `cache_ttl_secs`
@@ -117,9 +117,9 @@
 
 ### 4.2 Circuit breaker for LLM providers
 **What**: 3-state circuit breaker (Closed→Open→HalfOpen) wrapping LLM calls.
-**Why**: IronClaw has a full circuit breaker that stops hammering failing providers. crew-rs's RetryProvider retries blindly.
+**Why**: IronClaw has a full circuit breaker that stops hammering failing providers. octos's RetryProvider retries blindly.
 **How**:
-- `CircuitBreakerProvider` decorator in `crew-llm`
+- `CircuitBreakerProvider` decorator in `octos-llm`
 - Config: failure_threshold (5), recovery_timeout (30s), half_open_probes (2)
 - Transient errors trip breaker; auth/config errors don't
 **Effort**: 2-3 days
@@ -150,7 +150,7 @@
 ## Priority 5: Code Quality (Ongoing)
 
 ### 5.1 Enforce `unsafe_code = "deny"` workspace-wide
-**Status**: Already done in crew-rs Cargo.toml. Verify no `#[allow(unsafe_code)]` bypasses exist.
+**Status**: Already done in octos Cargo.toml. Verify no `#[allow(unsafe_code)]` bypasses exist.
 **Action**: `grep -rn 'allow.*unsafe_code' crates/`
 **Effort**: 30 minutes
 
@@ -158,13 +158,13 @@
 **Current**: ~1,465 unwraps across 131 files (~16.5/KLOC).
 **Target**: Zero in non-test code paths.
 **Priority files** (highest unwrap density):
-- `crates/crew-bus/src/session.rs` (~101 unwraps)
-- `crates/crew-agent/src/skills.rs` (~62 unwraps)
-- `crates/crew-memory/src/memory_store.rs` (~50 unwraps)
+- `crates/octos-bus/src/session.rs` (~101 unwraps)
+- `crates/octos-agent/src/skills.rs` (~62 unwraps)
+- `crates/octos-memory/src/memory_store.rs` (~50 unwraps)
 **Effort**: Ongoing, file-by-file
 
 ### 5.3 Add transaction safety to multi-step DB operations
-**Why**: IronClaw's code review found multiple non-atomic multi-step operations. Same pattern likely exists in crew-rs's redb usage.
+**Why**: IronClaw's code review found multiple non-atomic multi-step operations. Same pattern likely exists in octos's redb usage.
 **Action**: Audit all redb write operations for atomicity. Multi-step writes should use redb's `WriteTransaction`.
 **Effort**: 1-2 days
 
@@ -179,7 +179,7 @@
 
 ### 6.1 In-session async task spawning with context merge
 **What**: Allow users to continue chatting while a long-running task processes in background, then merge results back.
-**Status**: Neither IronClaw nor crew-rs supports this. IronClaw's background jobs are isolated islands with no merge-back.
+**Status**: Neither IronClaw nor octos supports this. IronClaw's background jobs are isolated islands with no merge-back.
 **Challenge**: LLM conversation history has no clean merge semantic for divergent branches.
 **Approach**:
 - Fork conversation context on long-running task detection
@@ -196,7 +196,7 @@
 ### 6.3 WASM tool sandbox
 **What**: IronClaw runs tools as WASM components with fuel metering, memory limits, and fresh-instance-per-call isolation.
 **Trade-off**: Stronger isolation than process sandbox, but significant dev friction (WIT bindings, wasm32-wasip2 toolchain). IronClaw's WASM channel ecosystem has only 2 working implementations despite the infrastructure investment.
-**Recommendation**: Not worth adopting unless crew-rs plans a third-party tool marketplace. bwrap/sandbox-exec is sufficient for first-party tools.
+**Recommendation**: Not worth adopting unless octos plans a third-party tool marketplace. bwrap/sandbox-exec is sufficient for first-party tools.
 **Effort**: 3-4 weeks
 
 ---

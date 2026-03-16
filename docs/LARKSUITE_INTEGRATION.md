@@ -1,6 +1,6 @@
 # Larksuite / Feishu Integration Guide
 
-crew-rs supports both **Feishu** (China, `open.feishu.cn`) and **Larksuite** (international, `open.larksuite.com`) as messaging channels.
+octos supports both **Feishu** (China, `open.feishu.cn`) and **Larksuite** (international, `open.larksuite.com`) as messaging channels.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ Lark User <──────────── REST API (interactive card) <─
 6. **Enable permissions**: `im:message`, `im:message:send_as_bot`, `im:resource`
 7. **Publish the app**: App Release → Version Management → Create Version → Apply for Online Release
 
-## Config (`~/.crew/config.json`)
+## Config (`~/.octos/config.json`)
 
 ```json
 {
@@ -69,7 +69,7 @@ For Feishu China, use `"type": "feishu"` with `"mode": "ws"` (default).
 
 ```bash
 # Build with feishu feature
-cargo build --release -p crew-cli --features telegram,whatsapp,feishu
+cargo build --release -p octos-cli --features telegram,whatsapp,feishu
 
 # Start ngrok tunnel
 ngrok http 9321

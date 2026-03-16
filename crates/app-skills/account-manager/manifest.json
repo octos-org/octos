@@ -1,7 +1,7 @@
 {
   "name": "account-manager",
   "version": "1.1.0",
-  "author": "hagency",
+  "author": "octos",
   "description": "Manage sub-accounts under the current profile",
   "tools": [
     {

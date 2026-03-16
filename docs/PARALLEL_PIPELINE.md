@@ -1,6 +1,6 @@
 # Parallel Pipeline Execution
 
-crew-pipeline supports parallel fan-out/fan-in via the `parallel` handler kind.
+octos-pipeline supports parallel fan-out/fan-in via the `parallel` handler kind.
 
 ## Problem
 

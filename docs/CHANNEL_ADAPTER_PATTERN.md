@@ -2,14 +2,14 @@
 
 Based on analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) (Mar 2026).
 
-crew-rs currently uses a single monolithic `Channel` trait (14 methods in `crew-bus/src/channel.rs`). OpenClaw decomposes channel behavior into 14+ fine-grained adapter traits, each handling one concern. This document proposes adopting the pattern for crew-rs.
+octos currently uses a single monolithic `Channel` trait (14 methods in `octos-bus/src/channel.rs`). OpenClaw decomposes channel behavior into 14+ fine-grained adapter traits, each handling one concern. This document proposes adopting the pattern for octos.
 
 ---
 
 ## Problem with the Monolithic Trait
 
 ```rust
-// Current crew-rs — one trait, all methods
+// Current octos — one trait, all methods
 #[async_trait]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;

@@ -3,7 +3,7 @@ name = "account-manager"
 version = "1.0.0"
 edition = "2021"
 description = "Standalone account management skill for sub-account CRUD"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "account_manager"

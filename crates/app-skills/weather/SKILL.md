@@ -2,7 +2,7 @@
 name: weather
 description: Get current weather for any city worldwide. Triggers: weather, forecast, temperature, 天气, 气温, how cold, how hot, is it raining, wind.
 version: 1.0.0
-author: hagency
+author: octos
 always: false
 ---
 

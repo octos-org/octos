@@ -1,6 +1,6 @@
 # macOS Keychain Integration
 
-crew-rs supports storing API keys in the macOS Keychain instead of plaintext in
+octos supports storing API keys in the macOS Keychain instead of plaintext in
 profile JSON files. This provides hardware-backed encryption on Apple Silicon
 and OS-level access control.
 
@@ -11,7 +11,7 @@ and OS-level access control.
   crew auth set-key  │     macOS Keychain            │
   ─────────────────► │  (AES encrypted, per-user)    │
                      │                               │
-                     │  service: "crew-rs"            │
+                     │  service: "octos"            │
                      │  account: "OPENAI_API_KEY"     │
                      │  password: "sk-proj-abc..."    │
                      └──────────────┬───────────────┘
@@ -155,13 +155,13 @@ This means OTP email works regardless of how `crew serve` is started (LaunchAgen
 
 ## Keychain Entry Format
 
-- **Service**: `crew-rs` (constant for all entries)
+- **Service**: `octos` (constant for all entries)
 - **Account**: The environment variable name (e.g., `OPENAI_API_KEY`)
 - **Password**: The actual secret value
 
 Verify with:
 ```bash
-security find-generic-password -s crew-rs -a OPENAI_API_KEY -w
+security find-generic-password -s octos -a OPENAI_API_KEY -w
 ```
 
 ## Admin Dashboard
@@ -174,11 +174,11 @@ usual `sk-1***def` masked format. The `save_with_merge()` logic preserves the
 
 | File | Role |
 |------|------|
-| `crates/crew-cli/src/auth/keychain.rs` | Core keyring wrapper (set/get/delete/resolve/unlock) |
-| `crates/crew-cli/src/commands/auth.rs` | CLI subcommands (set-key, keys, remove-key, unlock) |
-| `crates/crew-cli/src/process_manager.rs` | Resolves markers before env injection |
-| `crates/crew-cli/src/profiles.rs` | Masking + merge logic for dashboard |
-| `crates/crew-cli/src/otp.rs` | SMTP password fallback from profile/keychain |
+| `crates/octos-cli/src/auth/keychain.rs` | Core keyring wrapper (set/get/delete/resolve/unlock) |
+| `crates/octos-cli/src/commands/auth.rs` | CLI subcommands (set-key, keys, remove-key, unlock) |
+| `crates/octos-cli/src/process_manager.rs` | Resolves markers before env injection |
+| `crates/octos-cli/src/profiles.rs` | Masking + merge logic for dashboard |
+| `crates/octos-cli/src/otp.rs` | SMTP password fallback from profile/keychain |
 
 ## Limitations for Headless / Server Deployments
 
@@ -253,8 +253,8 @@ For `crew serve` OTP email, also set `SMTP_PASSWORD` in the launchd plist:
 Protect the files with filesystem permissions:
 
 ```bash
-chmod 600 ~/.crew/profiles/*.json
-chmod 600 ~/Library/LaunchAgents/io.ominix.crew-serve.plist
+chmod 600 ~/.octos/profiles/*.json
+chmod 600 ~/Library/LaunchAgents/io.ominix.octos-serve.plist
 ```
 
 ## Backward Compatibility

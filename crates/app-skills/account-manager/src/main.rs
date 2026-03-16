@@ -1,7 +1,7 @@
 //! Standalone account-manager skill binary.
 //!
 //! Manages sub-accounts under a parent profile by reading/writing profile JSON
-//! files in `$CREW_HOME/profiles/`. Communicates via stdin/stdout JSON protocol.
+//! files in `$OCTOS_HOME/profiles/`. Communicates via stdin/stdout JSON protocol.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-// ── Profile types (minimal mirror of crew-cli profiles) ──────────────
+// ── Profile types (minimal mirror of octos-cli profiles) ──────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserProfile {
@@ -122,29 +122,29 @@ fn main() {
         }
     };
 
-    let crew_home = match std::env::var("CREW_HOME") {
+    let octos_home = match std::env::var("OCTOS_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
-            // Fallback: ~/.crew
+            // Fallback: ~/.octos
             match home_dir() {
-                Some(h) => h.join(".crew"),
+                Some(h) => h.join(".octos"),
                 None => {
-                    output_error("CREW_HOME is not set and cannot determine home directory");
+                    output_error("OCTOS_HOME is not set and cannot determine home directory");
                     return;
                 }
             }
         }
     };
 
-    let profile_id = match std::env::var("CREW_PROFILE_ID") {
+    let profile_id = match std::env::var("OCTOS_PROFILE_ID") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            output_error("CREW_PROFILE_ID is not set — this tool must be run from a gateway");
+            output_error("OCTOS_PROFILE_ID is not set — this tool must be run from a gateway");
             return;
         }
     };
 
-    let profiles_dir = crew_home.join("profiles");
+    let profiles_dir = octos_home.join("profiles");
     if !profiles_dir.exists() {
         output_error(&format!(
             "Profiles directory not found: {}",

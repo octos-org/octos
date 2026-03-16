@@ -1,6 +1,6 @@
 # Slack Reference Architecture
 
-Based on analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) Slack implementation (Mar 2026). This documents the features and patterns crew-rs should adopt for a production-grade Slack integration.
+Based on analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) Slack implementation (Mar 2026). This documents the features and patterns octos should adopt for a production-grade Slack integration.
 
 ---
 
@@ -35,7 +35,7 @@ OpenClaw's Slack channel is one of the most feature-rich workplace integrations 
 - Body limit: 1MB max per request
 - Better for serverless/edge deployments
 
-### crew-rs recommendation
+### octos recommendation
 
 Start with Socket Mode (simpler setup, no URL exposure). Add HTTP mode later for serverless use cases.
 
@@ -308,7 +308,7 @@ Every event handler wraps in try/catch. A failing reaction handler does not cras
 
 ---
 
-## 13. Implementation Priority for crew-rs
+## 13. Implementation Priority for octos
 
 | Priority | Feature | Effort | Impact |
 |----------|---------|--------|--------|

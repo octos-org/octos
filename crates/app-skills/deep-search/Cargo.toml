@@ -3,7 +3,7 @@ name = "deep-search"
 version = "2.0.0"
 edition = "2021"
 description = "Deep multi-round web research: iterative search, parallel crawling, reference chasing"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "deep-search"

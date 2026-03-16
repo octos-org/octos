@@ -1,10 +1,10 @@
-# OpenClaw Top 10 Skills — Gap Analysis vs crew-rs
+# OpenClaw Top 10 Skills — Gap Analysis vs octos
 
-> Based on the viral "龙虾必看！OpenClaw全网最实用的10个技能" article. Mapped against crew-rs actual capabilities as of 2026-03-15.
+> Based on the viral "龙虾必看！OpenClaw全网最实用的10个技能" article. Mapped against octos actual capabilities as of 2026-03-15.
 
 ## Summary
 
-| # | OpenClaw Skill | What It Does | crew-rs Equivalent | Coverage | Gap |
+| # | OpenClaw Skill | What It Does | octos Equivalent | Coverage | Gap |
 |---|---|---|---|---|---|
 | 1 | **self-improving-agent** (自我迭代) | Remember errors, self-optimize over time | `EpisodeStore` + `save_memory`/`recall_memory` + hybrid BM25+vector search | 90% | Has cross-session memory and outcome tracking. Missing: explicit error→correction feedback loop |
 | 2 | **gog** (Google全家桶) | Gmail, Calendar, Drive, Docs automation | `send-email` skill (SMTP only) | 10% | No Google API integration. Only outbound SMTP email |

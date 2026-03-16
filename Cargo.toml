@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/crew-core",
-    "crates/crew-memory",
-    "crates/crew-llm",
-    "crates/crew-agent",
-    "crates/crew-bus",
-    "crates/crew-cli",
+    "crates/octos-core",
+    "crates/octos-memory",
+    "crates/octos-llm",
+    "crates/octos-agent",
+    "crates/octos-bus",
+    "crates/octos-cli",
     "crates/app-skills/news",
     "crates/app-skills/deep-search",
     "crates/app-skills/deep-crawl",
@@ -16,30 +16,30 @@ members = [
     "crates/app-skills/weather",
     "crates/app-skills/voice",
     "crates/platform-skills/voice",
-    "crates/crew-pipeline",
-    "crates/crew-plugin",
+    "crates/octos-pipeline",
+    "crates/octos-plugin",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
-authors = ["crew-rs team"]
+authors = ["octos team"]
 license = "Apache-2.0"
-repository = "https://github.com/heyong4725/crew-rs"
+repository = "https://github.com/octos-org/octos"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
 
 [workspace.dependencies]
 # Internal crates
-crew-core = { path = "crates/crew-core" }
-crew-memory = { path = "crates/crew-memory" }
-crew-llm = { path = "crates/crew-llm" }
-crew-agent = { path = "crates/crew-agent" }
-crew-bus = { path = "crates/crew-bus" }
-crew-pipeline = { path = "crates/crew-pipeline" }
-crew-plugin = { path = "crates/crew-plugin" }
+octos-core = { path = "crates/octos-core" }
+octos-memory = { path = "crates/octos-memory" }
+octos-llm = { path = "crates/octos-llm" }
+octos-agent = { path = "crates/octos-agent" }
+octos-bus = { path = "crates/octos-bus" }
+octos-pipeline = { path = "crates/octos-pipeline" }
+octos-plugin = { path = "crates/octos-plugin" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }

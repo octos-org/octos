@@ -37,10 +37,10 @@ After the full workspace run, the CI script re-runs critical subsystems individu
 
 | Group | Crate | Test Filter | Count | What It Covers |
 |-------|-------|-------------|-------|----------------|
-| Adaptive routing | `crew-llm` | `adaptive::tests` | 19 | Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, racing |
-| Responsiveness | `crew-llm` | `responsiveness::tests` | 8 | Baseline learning, degradation detection, recovery, threshold boundaries |
-| Session actor | `crew-cli` | `session_actor::tests` | 9 | Queue modes, speculative overflow, auto-escalation/deescalation |
-| Session persistence | `crew-bus` | `session::tests` | 28 | JSONL storage, LRU eviction, fork, rewrite, timestamp sort |
+| Adaptive routing | `octos-llm` | `adaptive::tests` | 19 | Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, racing |
+| Responsiveness | `octos-llm` | `responsiveness::tests` | 8 | Baseline learning, degradation detection, recovery, threshold boundaries |
+| Session actor | `octos-cli` | `session_actor::tests` | 9 | Queue modes, speculative overflow, auto-escalation/deescalation |
+| Session persistence | `octos-bus` | `session::tests` | 28 | JSONL storage, LRU eviction, fork, rewrite, timestamp sort |
 
 Session actor tests always run single-threaded (`--test-threads=1`) because they spawn full actors with mock providers and can OOM under parallel execution.
 
@@ -48,7 +48,7 @@ Session actor tests always run single-threaded (`--test-threads=1`) because they
 
 ## Feature Coverage
 
-### Adaptive Routing (`crates/crew-llm/src/adaptive.rs` — 19 tests)
+### Adaptive Routing (`crates/octos-llm/src/adaptive.rs` — 19 tests)
 
 Tests the `AdaptiveRouter` which manages multiple LLM providers with metrics-driven selection.
 
@@ -101,7 +101,7 @@ Tests the `AdaptiveRouter` which manages multiple LLM providers with metrics-dri
 | `test_adaptive_status_reports_correctly` | Status struct reflects current mode/count |
 | `test_empty_router_panics` | Asserts at least 1 provider required |
 
-### Responsiveness Observer (`crates/crew-llm/src/responsiveness.rs` — 8 tests)
+### Responsiveness Observer (`crates/octos-llm/src/responsiveness.rs` — 8 tests)
 
 Tests the latency tracker that drives auto-escalation.
 
@@ -128,7 +128,7 @@ Tests the latency tracker that drives auto-escalation.
 | `test_multiple_activation_cycles` | Activate → deactivate → reactivate works |
 | `test_window_caps_at_max_size` | Rolling window stays at 20 entries |
 
-### Queue Modes and Session Actor (`crates/crew-cli/src/session_actor.rs` — 9 tests)
+### Queue Modes and Session Actor (`crates/octos-cli/src/session_actor.rs` — 9 tests)
 
 Tests the per-session actor that owns message processing, queue policies, and auto-protection.
 
@@ -173,7 +173,7 @@ Tests the per-session actor that owns message processing, queue policies, and au
 |------|-----------------|
 | `test_strip_think_tags` | `<think>...</think>` block removal from LLM output |
 
-### Session Persistence (`crates/crew-bus/src/session.rs` — 28 tests)
+### Session Persistence (`crates/octos-bus/src/session.rs` — 28 tests)
 
 Tests JSONL-backed session storage with LRU caching.
 
@@ -266,16 +266,16 @@ Tests JSONL-backed session storage with LRU caching.
 
 ```bash
 # Single test
-cargo test -p crew-llm --lib adaptive::tests::test_hedged_racing_picks_faster_provider
+cargo test -p octos-llm --lib adaptive::tests::test_hedged_racing_picks_faster_provider
 
 # One subsystem
-cargo test -p crew-llm --lib adaptive::tests
+cargo test -p octos-llm --lib adaptive::tests
 
 # Session actor (always single-threaded)
-cargo test -p crew-cli session_actor::tests -- --test-threads=1
+cargo test -p octos-cli session_actor::tests -- --test-threads=1
 
 # With output
-cargo test -p crew-cli session_actor::tests -- --test-threads=1 --nocapture
+cargo test -p octos-cli session_actor::tests -- --test-threads=1 --nocapture
 ```
 
 ## GitHub Actions CI
@@ -299,7 +299,7 @@ The local `scripts/ci.sh` is a superset — it runs the same three steps plus fo
 | `scripts/ci.sh` | Local CI script (this document) |
 | `scripts/pre-release.sh` | Full release smoke tests (build, E2E, skill binaries) |
 | `.github/workflows/ci.yml` | GitHub Actions CI |
-| `crates/crew-llm/src/adaptive.rs` | Adaptive router + 19 tests |
-| `crates/crew-llm/src/responsiveness.rs` | Responsiveness observer + 8 tests |
-| `crates/crew-cli/src/session_actor.rs` | Session actor + 9 tests |
-| `crates/crew-bus/src/session.rs` | Session persistence + 28 tests |
+| `crates/octos-llm/src/adaptive.rs` | Adaptive router + 19 tests |
+| `crates/octos-llm/src/responsiveness.rs` | Responsiveness observer + 8 tests |
+| `crates/octos-cli/src/session_actor.rs` | Session actor + 9 tests |
+| `crates/octos-bus/src/session.rs` | Session persistence + 28 tests |

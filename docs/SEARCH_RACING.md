@@ -50,10 +50,10 @@ With racing, each worker would be faster on DDG failures (no sequential wait), b
 
 | Task | File | Effort |
 |------|------|--------|
-| Add `tokio::select!` race logic | `crates/crew-agent/src/tools/web_search.rs` | 1 hr |
+| Add `tokio::select!` race logic | `crates/octos-agent/src/tools/web_search.rs` | 1 hr |
 | Handle edge cases (both fail, partial results) | Same file | 0.5 hr |
-| Config flag `search_racing: bool` (default: false) | `crates/crew-cli/src/config.rs` | 0.5 hr |
-| Unit tests with mock providers | `crates/crew-agent/src/tools/web_search.rs` (#[cfg(test)]) | 0.5 hr |
+| Config flag `search_racing: bool` (default: false) | `crates/octos-cli/src/config.rs` | 0.5 hr |
+| Unit tests with mock providers | `crates/octos-agent/src/tools/web_search.rs` (#[cfg(test)]) | 0.5 hr |
 
 ## Trade-offs
 
@@ -76,6 +76,6 @@ With racing, each worker would be faster on DDG failures (no sequential wait), b
 
 ## Reference
 
-- LLM hedged racing: `crates/crew-llm/src/adaptive.rs` (lines 649-689)
-- Current search failover: `crates/crew-agent/src/tools/web_search.rs` (lines 170-237)
-- Deep search parallel fetch: `crates/crew-agent/src/tools/deep_search.rs` (line 133, `join_all`)
+- LLM hedged racing: `crates/octos-llm/src/adaptive.rs` (lines 649-689)
+- Current search failover: `crates/octos-agent/src/tools/web_search.rs` (lines 170-237)
+- Deep search parallel fetch: `crates/octos-agent/src/tools/deep_search.rs` (line 133, `join_all`)

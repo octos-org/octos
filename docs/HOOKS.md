@@ -1,6 +1,6 @@
 # Hook System — Stable API Contract
 
-Hooks are the primary extension point for external applications to enforce LLM policies, record metrics, and audit agent behavior — per profile, without modifying crew-rs code.
+Hooks are the primary extension point for external applications to enforce LLM policies, record metrics, and audit agent behavior — per profile, without modifying octos code.
 
 ## Overview
 
@@ -98,13 +98,13 @@ In `config.json` or per-profile JSON:
   "hooks": [
     {
       "event": "before_tool_call",
-      "command": ["python3", "~/.crew/hooks/guard.py"],
+      "command": ["python3", "~/.octos/hooks/guard.py"],
       "timeout_ms": 3000,
       "tool_filter": ["shell", "write_file"]
     },
     {
       "event": "after_llm_call",
-      "command": ["python3", "~/.crew/hooks/cost-tracker.py"],
+      "command": ["python3", "~/.octos/hooks/cost-tracker.py"],
       "timeout_ms": 5000
     }
   ]

@@ -1,6 +1,6 @@
 # Session Actor Architecture
 
-Reference architecture for crew-rs gateway processing model, user isolation, and data protection. Reflects the current implementation.
+Reference architecture for octos gateway processing model, user isolation, and data protection. Reflects the current implementation.
 
 **Status**: Fully implemented (Phases 1-5)
 **Last updated**: 2026-03-10
@@ -298,19 +298,19 @@ User sends message
 ```
 crew serve
 ├── Profile "main" (parent)                  ← OS process 1
-│   ├── data_dir: ~/.crew/profiles/main/
+│   ├── data_dir: ~/.octos/profiles/main/
 │   ├── provider: kimi-2.5 (KIMI_API_KEY)
 │   ├── channels: [telegram:bot-A, feishu:app-X]
 │   └── users: alice, bob, charlie
 │
 ├── Profile "sub-1" (child of main)          ← OS process 2
-│   ├── data_dir: ~/.crew/profiles/sub-1/
+│   ├── data_dir: ~/.octos/profiles/sub-1/
 │   ├── provider: inherits from parent (or overrides)
 │   ├── channels: [telegram:bot-B]
 │   └── users: dave, eve
 │
 └── Profile "sub-2" (child of main)          ← OS process 3
-    ├── data_dir: ~/.crew/profiles/sub-2/
+    ├── data_dir: ~/.octos/profiles/sub-2/
     └── channels: [whatsapp:bot-C]
 ```
 
@@ -372,7 +372,7 @@ There is no cross-channel identity linking. `telegram:12345` and `whatsapp:86138
 | Secret | Storage | Isolation |
 |--------|---------|-----------|
 | API keys | OS environment variables | Per-profile process (not inherited by children unless configured) |
-| Auth tokens | `~/.crew/auth.json` | Per-host (shared) |
+| Auth tokens | `~/.octos/auth.json` | Per-host (shared) |
 | Session content | JSONL files | Per-user directory |
 | `BLOCKED_ENV_VARS` (18) | Stripped from: sandbox, MCP, hooks, plugins, browser | All child processes |
 
@@ -396,16 +396,16 @@ The per-user directory structure enables progressive hardening:
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DEFAULT_TOOL_TIMEOUT_SECS` | 600 (10 min) | `crew-agent/src/agent/mod.rs` |
-| `MAX_TOOL_TIMEOUT_SECS` | 1800 (30 min) | `crew-agent/src/agent/mod.rs` |
-| `DEFAULT_SESSION_TIMEOUT_SECS` | 1800 (30 min) | `crew-agent/src/agent/mod.rs` |
-| `DEFAULT_LLM_TIMEOUT_SECS` | 120 (2 min) | `crew-llm/src/provider.rs` |
-| `MAX_OVERFLOW_TASKS` | 5 | `crew-cli/src/session_actor.rs` |
-| `ACTOR_INBOX_SIZE` | 32 | `crew-cli/src/session_actor.rs` |
-| `DEFAULT_IDLE_TIMEOUT_SECS` | 1800 (30 min) | `crew-cli/src/session_actor.rs` |
-| `MAX_PENDING_PER_SESSION` | 50 | `crew-cli/src/session_actor.rs` |
-| Plugin timeout (default) | 600s | `crew-agent/src/plugins/tool.rs` |
-| MCP timeout | 60s | `crew-agent/src/mcp.rs` |
+| `DEFAULT_TOOL_TIMEOUT_SECS` | 600 (10 min) | `octos-agent/src/agent/mod.rs` |
+| `MAX_TOOL_TIMEOUT_SECS` | 1800 (30 min) | `octos-agent/src/agent/mod.rs` |
+| `DEFAULT_SESSION_TIMEOUT_SECS` | 1800 (30 min) | `octos-agent/src/agent/mod.rs` |
+| `DEFAULT_LLM_TIMEOUT_SECS` | 120 (2 min) | `octos-llm/src/provider.rs` |
+| `MAX_OVERFLOW_TASKS` | 5 | `octos-cli/src/session_actor.rs` |
+| `ACTOR_INBOX_SIZE` | 32 | `octos-cli/src/session_actor.rs` |
+| `DEFAULT_IDLE_TIMEOUT_SECS` | 1800 (30 min) | `octos-cli/src/session_actor.rs` |
+| `MAX_PENDING_PER_SESSION` | 50 | `octos-cli/src/session_actor.rs` |
+| Plugin timeout (default) | 600s | `octos-agent/src/plugins/tool.rs` |
+| MCP timeout | 60s | `octos-agent/src/mcp.rs` |
 
 ### 7.2 Adaptive QoS
 

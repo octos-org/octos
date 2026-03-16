@@ -872,213 +872,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crew-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "chromiumoxide",
- "chrono",
- "crew-core",
- "crew-llm",
- "crew-memory",
- "dirs",
- "eyre",
- "flate2",
- "futures",
- "gix",
- "glob",
- "htmd",
- "ignore",
- "lettre",
- "libc",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "similar",
- "tar",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "crew-bus"
-version = "0.1.0"
-dependencies = [
- "async-imap",
- "async-trait",
- "axum",
- "chrono",
- "chrono-tz",
- "crew-core",
- "cron",
- "eyre",
- "futures",
- "lettre",
- "lru",
- "mailparse",
- "reqwest 0.12.28",
- "rustls 0.23.36",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "serenity",
- "teloxide",
- "tempfile",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-test",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "uuid",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "crew-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "clap",
- "clap_complete",
- "color-eyre",
- "colored 2.2.0",
- "crew-agent",
- "crew-bus",
- "crew-core",
- "crew-llm",
- "crew-memory",
- "crew-pipeline",
- "dirs",
- "eyre",
- "flate2",
- "futures",
- "image",
- "keyring",
- "lettre",
- "metrics",
- "metrics-exporter-prometheus",
- "open",
- "quick-xml",
- "rand 0.8.5",
- "regex",
- "reqwest 0.12.28",
- "rust-embed",
- "rustyline",
- "serde",
- "serde_json",
- "sha2",
- "sysinfo",
- "tar",
- "teloxide",
- "tempfile",
- "tokio",
- "tokio-test",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "zip",
-]
-
-[[package]]
-name = "crew-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "eyre",
- "serde",
- "serde_json",
- "tokio-test",
- "uuid",
-]
-
-[[package]]
-name = "crew-llm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "crew-core",
- "eyre",
- "futures",
- "reqwest 0.12.28",
- "secrecy 0.10.3",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "crew-memory"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "chrono",
- "crew-core",
- "eyre",
- "hnsw_rs",
- "redb",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "crew-pipeline"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "crew-agent",
- "crew-core",
- "crew-llm",
- "crew-memory",
- "eyre",
- "futures",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "crew-plugin"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "which 7.0.3",
-]
-
-[[package]]
 name = "cron"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3682,6 +3475,213 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "octos-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chromiumoxide",
+ "chrono",
+ "dirs",
+ "eyre",
+ "flate2",
+ "futures",
+ "gix",
+ "glob",
+ "htmd",
+ "ignore",
+ "lettre",
+ "libc",
+ "octos-core",
+ "octos-llm",
+ "octos-memory",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "octos-bus"
+version = "0.1.0"
+dependencies = [
+ "async-imap",
+ "async-trait",
+ "axum",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "eyre",
+ "futures",
+ "lettre",
+ "lru",
+ "mailparse",
+ "octos-core",
+ "reqwest 0.12.28",
+ "rustls 0.23.36",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "serenity",
+ "teloxide",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-test",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uuid",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "octos-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "color-eyre",
+ "colored 2.2.0",
+ "dirs",
+ "eyre",
+ "flate2",
+ "futures",
+ "image",
+ "keyring",
+ "lettre",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "octos-agent",
+ "octos-bus",
+ "octos-core",
+ "octos-llm",
+ "octos-memory",
+ "octos-pipeline",
+ "open",
+ "quick-xml",
+ "rand 0.8.5",
+ "regex",
+ "reqwest 0.12.28",
+ "rust-embed",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "tar",
+ "teloxide",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "octos-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "serde",
+ "serde_json",
+ "tokio-test",
+ "uuid",
+]
+
+[[package]]
+name = "octos-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "eyre",
+ "futures",
+ "octos-core",
+ "reqwest 0.12.28",
+ "secrecy 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "octos-memory"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "eyre",
+ "hnsw_rs",
+ "octos-core",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "octos-pipeline"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "eyre",
+ "futures",
+ "octos-agent",
+ "octos-core",
+ "octos-llm",
+ "octos-memory",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "octos-plugin"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "which 7.0.3",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@
 header = """
 # Changelog
 
-All notable changes to crew-rs will be documented in this file.
+All notable changes to octos will be documented in this file.
 """
 body = """
 {% if version %}\

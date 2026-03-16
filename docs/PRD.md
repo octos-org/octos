@@ -1,8 +1,8 @@
-# Product Requirements Document: crew-rs
+# Product Requirements Document: octos
 
 ## Executive Summary
 
-crew-rs is a Rust-native AI agent framework that provides both a coding automation CLI and a multi-channel messaging gateway. It supports 14 LLM providers, 8 messaging channels (CLI + 7 platforms), and a rich tool system for autonomous task execution.
+octos is a Rust-native AI agent framework that provides both a coding automation CLI and a multi-channel messaging gateway. It supports 14 LLM providers, 8 messaging channels (CLI + 7 platforms), and a rich tool system for autonomous task execution.
 
 ## Problem Statement
 

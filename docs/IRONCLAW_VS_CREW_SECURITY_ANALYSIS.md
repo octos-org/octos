@@ -1,14 +1,14 @@
-# Security Feature Analysis: IronClaw vs crew-rs
+# Security Feature Analysis: IronClaw vs octos
 
 > Comparative deep-dive based on source code review of both codebases.
 > Date: 2026-03-07
 
 ## Executive Summary
 
-IronClaw and crew-rs take fundamentally different security postures:
+IronClaw and octos take fundamentally different security postures:
 
 - **IronClaw**: Defense-in-depth with encrypted secrets, WASM sandboxing, network proxies, and trust-based attenuation. Heavier operational footprint, stronger isolation guarantees.
-- **crew-rs**: Lightweight, practical security with O_NOFOLLOW file safety, sophisticated prompt injection detection, and platform-native sandboxing (bwrap/sandbox-exec). Leaner, easier to deploy, fewer moving parts to fail.
+- **octos**: Lightweight, practical security with O_NOFOLLOW file safety, sophisticated prompt injection detection, and platform-native sandboxing (bwrap/sandbox-exec). Leaner, easier to deploy, fewer moving parts to fail.
 
 Neither is strictly superior. Each has critical gaps the other addresses.
 
@@ -37,9 +37,9 @@ IronClaw implements a full secrets management system (`src/secrets/`):
 - `secret_list` / `secret_delete` exposed to agent
 - No `secret_read` tool — values are never exposed, even to the LLM
 
-### crew-rs: Environment Variables + Redaction
+### octos: Environment Variables + Redaction
 
-crew-rs stores credentials as environment variables or config values:
+octos stores credentials as environment variables or config values:
 
 | Component | Implementation |
 |-----------|---------------|
@@ -48,7 +48,7 @@ crew-rs stores credentials as environment variables or config values:
 | Redaction | Pattern-based credential detection in `sanitize.rs` |
 | Access model | SDK-level — credentials in process memory |
 
-**Credential redaction patterns** (`crates/crew-agent/src/sanitize.rs`):
+**Credential redaction patterns** (`crates/octos-agent/src/sanitize.rs`):
 - OpenAI: `sk-` prefix (20+ chars)
 - Anthropic: `sk-ant-` prefix
 - AWS: `AKIA` + 16 uppercase alphanumeric
@@ -59,9 +59,9 @@ crew-rs stores credentials as environment variables or config values:
 
 ### Verdict
 
-**IronClaw is significantly stronger.** Encrypted-at-rest secrets with OS keychain master key and zero-exposure injection is a production-grade secrets model. crew-rs relies on env vars (plaintext in memory, visible via `/proc/self/environ` on Linux, leaked by debug dumps). The `BLOCKED_ENV_VARS` scrubbing is defense against accidental exposure, not a security boundary.
+**IronClaw is significantly stronger.** Encrypted-at-rest secrets with OS keychain master key and zero-exposure injection is a production-grade secrets model. octos relies on env vars (plaintext in memory, visible via `/proc/self/environ` on Linux, leaked by debug dumps). The `BLOCKED_ENV_VARS` scrubbing is defense against accidental exposure, not a security boundary.
 
-**crew-rs gap**: No encrypted storage. A compromised process can read all secrets from memory.
+**octos gap**: No encrypted storage. A compromised process can read all secrets from memory.
 **IronClaw gap**: Gateway auth token stored as plaintext `String` instead of `SecretString` (`src/config/channels.rs:47`), inconsistent with its own encrypted model.
 
 ---
@@ -96,9 +96,9 @@ crew-rs stores credentials as environment variables or config values:
 - Capabilities declared via JSON (allowed HTTP hosts, polling intervals, rate limits)
 - Workspace writes scoped to `channels/<name>/` prefix
 
-### crew-rs: bwrap + sandbox-exec + Docker
+### octos: bwrap + sandbox-exec + Docker
 
-**Three sandbox backends** (`crates/crew-agent/src/sandbox.rs`), auto-detected:
+**Three sandbox backends** (`crates/octos-agent/src/sandbox.rs`), auto-detected:
 
 | Backend | Platform | Isolation |
 |---------|----------|-----------|
@@ -117,9 +117,9 @@ crew-rs stores credentials as environment variables or config values:
 
 ### Verdict
 
-**Both are strong, different trade-offs.** IronClaw's WASM sandbox provides finer-grained isolation (fuel metering, per-invocation fresh state) but only for WASM tools. Docker adds network proxy with credential injection. crew-rs provides **platform-native sandboxing** (bwrap on Linux, sandbox-exec on macOS) that's lighter weight and doesn't require Docker. crew-rs's `BLOCKED_ENV_VARS` list is more comprehensive (18 vars vs IronClaw's shell scrubbing).
+**Both are strong, different trade-offs.** IronClaw's WASM sandbox provides finer-grained isolation (fuel metering, per-invocation fresh state) but only for WASM tools. Docker adds network proxy with credential injection. octos provides **platform-native sandboxing** (bwrap on Linux, sandbox-exec on macOS) that's lighter weight and doesn't require Docker. octos's `BLOCKED_ENV_VARS` list is more comprehensive (18 vars vs IronClaw's shell scrubbing).
 
-**crew-rs gap**: No network-level proxy. Containers/sandboxes either have full network or none. No credential injection at transit time.
+**octos gap**: No network-level proxy. Containers/sandboxes either have full network or none. No credential injection at transit time.
 **IronClaw gap**: No macOS sandbox-exec fallback. No bwrap support. Requires Docker daemon for non-WASM isolation.
 
 ---
@@ -151,9 +151,9 @@ crew-rs stores credentials as environment variables or config values:
 </tool_output>
 ```
 
-### crew-rs: Sophisticated Prompt Guard
+### octos: Sophisticated Prompt Guard
 
-**PromptGuard** (`crates/crew-agent/src/prompt_guard.rs`):
+**PromptGuard** (`crates/octos-agent/src/prompt_guard.rs`):
 
 | Feature | Detail |
 |---------|--------|
@@ -172,7 +172,7 @@ crew-rs stores credentials as environment variables or config values:
 - Base64/hex encoded payloads
 - Markdown/HTML comment hiding
 
-**Output sanitization** (`crates/crew-agent/src/sanitize.rs`):
+**Output sanitization** (`crates/octos-agent/src/sanitize.rs`):
 - Strips base64 data URIs (images, binary)
 - Removes long hex strings (64+ chars)
 - Redacts known credential patterns
@@ -180,11 +180,11 @@ crew-rs stores credentials as environment variables or config values:
 
 ### Verdict
 
-**crew-rs has more sophisticated prompt injection defense.** The `prompt_guard.rs` handles Unicode homoglyphs, zero-width characters, and RTL overrides that IronClaw's `sanitizer.rs` does not detect. crew-rs's test suite for injection patterns is notably more thorough.
+**octos has more sophisticated prompt injection defense.** The `prompt_guard.rs` handles Unicode homoglyphs, zero-width characters, and RTL overrides that IronClaw's `sanitizer.rs` does not detect. octos's test suite for injection patterns is notably more thorough.
 
-**IronClaw has a stronger overall safety architecture** — the policy engine with severity levels and configurable actions (Block/Warn/Review/Sanitize) is more flexible than crew-rs's binary block/allow. IronClaw's leak detector scanning LLM responses before they reach users is a layer crew-rs lacks.
+**IronClaw has a stronger overall safety architecture** — the policy engine with severity levels and configurable actions (Block/Warn/Review/Sanitize) is more flexible than octos's binary block/allow. IronClaw's leak detector scanning LLM responses before they reach users is a layer octos lacks.
 
-**crew-rs gap**: No leak detection on LLM output. No configurable policy engine. No tool output wrapping/escaping.
+**octos gap**: No leak detection on LLM output. No configurable policy engine. No tool output wrapping/escaping.
 **IronClaw gap**: No Unicode homoglyph detection. No zero-width character stripping. No RTL override detection. Multiple UTF-8 byte-slice bugs in the safety layer itself (see Section 8).
 
 ---
@@ -203,9 +203,9 @@ fn validate_path(path: &str) -> Result<PathBuf, ToolError> {
 
 **Vulnerability**: This is a classic TOCTOU (Time-of-Check-Time-of-Use) race. Between `canonicalize()` and `open()`, a symlink can be swapped in. The path is validated as safe, then a different file is actually opened.
 
-### crew-rs: O_NOFOLLOW Pattern
+### octos: O_NOFOLLOW Pattern
 
-File tools (`crates/crew-agent/src/tools/read_file.rs`, `write_file.rs`) use:
+File tools (`crates/octos-agent/src/tools/read_file.rs`, `write_file.rs`) use:
 ```rust
 // Unix: O_NOFOLLOW eliminates TOCTOU
 std::fs::OpenOptions::new()
@@ -223,10 +223,10 @@ std::fs::OpenOptions::new()
 
 ### Verdict
 
-**crew-rs is materially safer.** `O_NOFOLLOW` is the correct solution to symlink-based path traversal. IronClaw's `canonicalize → open` pattern has a real race condition window that could be exploited by a malicious tool or concurrent process.
+**octos is materially safer.** `O_NOFOLLOW` is the correct solution to symlink-based path traversal. IronClaw's `canonicalize → open` pattern has a real race condition window that could be exploited by a malicious tool or concurrent process.
 
 **IronClaw gap**: No `O_NOFOLLOW` usage anywhere in file tools.
-**crew-rs gap**: `O_NOFOLLOW` is Unix-only; Windows file tools fall back to check-then-open.
+**octos gap**: `O_NOFOLLOW` is Unix-only; Windows file tools fall back to check-then-open.
 
 ---
 
@@ -248,9 +248,9 @@ std::fs::OpenOptions::new()
 
 **Pattern matching weakness**: `"sudo "` requires a trailing space. `sudo\t` (tab), `sudo\n` (newline), `eval\t` all bypass the check.
 
-### crew-rs
+### octos
 
-**Shell tool** (`crates/crew-agent/src/tools/shell.rs`) + **CommandPolicy** (`policy.rs`):
+**Shell tool** (`crates/octos-agent/src/tools/shell.rs`) + **CommandPolicy** (`policy.rs`):
 
 | Protection | Detail |
 |------------|--------|
@@ -265,10 +265,10 @@ std::fs::OpenOptions::new()
 
 ### Verdict
 
-**crew-rs is stronger.** Whitespace-normalized pattern matching + mandatory sandbox execution is a better defense model than IronClaw's raw pattern matching without sandbox fallback. IronClaw's unvalidated `workdir` parameter is a real vulnerability.
+**octos is stronger.** Whitespace-normalized pattern matching + mandatory sandbox execution is a better defense model than IronClaw's raw pattern matching without sandbox fallback. IronClaw's unvalidated `workdir` parameter is a real vulnerability.
 
 **IronClaw gap**: `workdir` path traversal, whitespace bypass in patterns, no lightweight sandbox for shell (Docker only).
-**crew-rs gap**: Simpler pattern set (fewer specific patterns than IronClaw).
+**octos gap**: Simpler pattern set (fewer specific patterns than IronClaw).
 
 ---
 
@@ -286,9 +286,9 @@ std::fs::OpenOptions::new()
 
 **Default allowlist includes**: Package registries (npm, PyPI, crates.io), docs sites, GitHub, common APIs.
 
-### crew-rs: SSRF Protection + Binary Network Control
+### octos: SSRF Protection + Binary Network Control
 
-**SSRF protection** (`crates/crew-agent/src/tools/ssrf.rs`):
+**SSRF protection** (`crates/octos-agent/src/tools/ssrf.rs`):
 
 Private IP ranges blocked:
 - IPv4: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (AWS metadata), `0.0.0.0`
@@ -299,10 +299,10 @@ Private IP ranges blocked:
 
 ### Verdict
 
-**IronClaw has finer-grained network control.** The domain-allowlist proxy allows specific APIs while blocking everything else — crew-rs can only do all-or-nothing network access per sandbox. However, crew-rs's SSRF protection (private IP blocking with DNS resolution check) catches a class of attacks that IronClaw's domain allowlist doesn't directly address (DNS rebinding to private IPs).
+**IronClaw has finer-grained network control.** The domain-allowlist proxy allows specific APIs while blocking everything else — octos can only do all-or-nothing network access per sandbox. However, octos's SSRF protection (private IP blocking with DNS resolution check) catches a class of attacks that IronClaw's domain allowlist doesn't directly address (DNS rebinding to private IPs).
 
 **IronClaw gap**: No SSRF private IP checking. Domain allowlist doesn't prevent DNS rebinding.
-**crew-rs gap**: No domain-level proxy. No credential injection at network level. Binary network on/off.
+**octos gap**: No domain-level proxy. No credential injection at network level. Binary network on/off.
 
 ---
 
@@ -325,9 +325,9 @@ Downloaded skills automatically lose access to dangerous tools. This prevents a 
 - `ApprovalRequirement::Always` — requires approval every invocation
 - `ToolDomain::Orchestrator` vs `Container` — prevents container-domain tools from running on host
 
-### crew-rs: Policy-Based Tool Filtering
+### octos: Policy-Based Tool Filtering
 
-**ToolPolicy** (`crates/crew-agent/src/tools/policy.rs`):
+**ToolPolicy** (`crates/octos-agent/src/tools/policy.rs`):
 
 ```json
 {
@@ -346,10 +346,10 @@ Downloaded skills automatically lose access to dangerous tools. This prevents a 
 
 ### Verdict
 
-**Complementary strengths.** IronClaw's trust-based attenuation is specifically designed for untrusted code from registries — a threat model crew-rs doesn't address. crew-rs's per-provider tool policies (restricting local Ollama models from web tools) address a different threat: weaker models being less reliable with dangerous tools.
+**Complementary strengths.** IronClaw's trust-based attenuation is specifically designed for untrusted code from registries — a threat model octos doesn't address. octos's per-provider tool policies (restricting local Ollama models from web tools) address a different threat: weaker models being less reliable with dangerous tools.
 
 **IronClaw gap**: No per-provider tool restrictions. A local Ollama model gets the same tools as Claude.
-**crew-rs gap**: No trust model for skills. Downloaded skills get full tool access.
+**octos gap**: No trust model for skills. Downloaded skills get full tool access.
 
 ---
 
@@ -372,20 +372,20 @@ Downloaded skills automatically lose access to dangerous tools. This prevents a 
 | 11 | **Medium** | Gateway auth token stored as plaintext String | `src/config/channels.rs:47` |
 | 12 | **Medium** | WebSocket origin check ignores port | `src/channels/web/server.rs:848-860` |
 
-### crew-rs
+### octos
 
 | # | Severity | Issue | Location |
 |---|----------|-------|----------|
-| 1 | **High** | `&body[..200]` byte-slice in error truncation | `crates/crew-llm/src/provider.rs` (truncate_error_body) |
-| 2 | **Medium** | macOS sandbox-exec is deprecated (macOS 15+) | `crates/crew-agent/src/sandbox.rs` |
+| 1 | **High** | `&body[..200]` byte-slice in error truncation | `crates/octos-llm/src/provider.rs` (truncate_error_body) |
+| 2 | **Medium** | macOS sandbox-exec is deprecated (macOS 15+) | `crates/octos-agent/src/sandbox.rs` |
 | 3 | **Low** | No leak detection on LLM output before sending to user | Architectural gap |
-| 4 | **Low** | Downloaded skills get full tool access | `crates/crew-agent/src/skills.rs` |
+| 4 | **Low** | Downloaded skills get full tool access | `crates/octos-agent/src/skills.rs` |
 
 ### Verdict
 
 IronClaw has more discovered vulnerabilities, partly because it has more attack surface (WASM runtime, network proxy, dual DB backends). The critical UTF-8 bugs in IronClaw's safety layer are particularly concerning because they're in the code meant to provide security guarantees.
 
-crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class of vulnerability, and the lack of LLM output scanning is an architectural gap.
+octos has fewer issues but the `&body[..200]` byte-slice bug is the same class of vulnerability, and the lack of LLM output scanning is an architectural gap.
 
 ---
 
@@ -403,9 +403,9 @@ crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class
 - Removes sensitive env vars before command execution
 - Detects command injection patterns (chained commands, subshells)
 
-### crew-rs: Output Sanitization
+### octos: Output Sanitization
 
-**Sanitizer** (`crates/crew-agent/src/sanitize.rs`):
+**Sanitizer** (`crates/octos-agent/src/sanitize.rs`):
 - Scans tool output only (not LLM responses)
 - Redacts: OpenAI keys, Anthropic keys, AWS keys, GitHub tokens, GitLab tokens, Bearer tokens, generic secrets
 - Strips: base64 data URIs, long hex strings (64+ chars)
@@ -413,13 +413,13 @@ crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class
 
 ### Verdict
 
-**IronClaw is stronger.** Dual-point scanning (tool output + LLM response) catches secrets that the LLM might generate or hallucinate. crew-rs only scans tool output, so a leaked secret in an LLM response goes straight to the user.
+**IronClaw is stronger.** Dual-point scanning (tool output + LLM response) catches secrets that the LLM might generate or hallucinate. octos only scans tool output, so a leaked secret in an LLM response goes straight to the user.
 
 ---
 
 ## 10. Feature Comparison Matrix
 
-| Security Feature | IronClaw | crew-rs |
+| Security Feature | IronClaw | octos |
 |-----------------|----------|---------|
 | **Encrypted secrets at rest** | AES-256-GCM + OS keychain | None (env vars) |
 | **Zero-exposure credential injection** | Docker proxy + WASM host | None |
@@ -450,7 +450,7 @@ crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class
 
 ## 11. Recommendations
 
-### For IronClaw (adopt from crew-rs)
+### For IronClaw (adopt from octos)
 
 1. **Adopt `O_NOFOLLOW`** on all file I/O operations — eliminates TOCTOU race conditions
 2. **Add Unicode homoglyph detection** to sanitizer — Cyrillic lookalikes bypass current patterns
@@ -460,10 +460,10 @@ crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class
 6. **Validate shell `workdir`** parameter against allowed directories
 7. **Normalize whitespace** in shell dangerous-pattern matching
 8. **Add SSRF private IP blocking** — DNS rebinding can bypass domain allowlists
-9. **Expand `BLOCKED_ENV_VARS`** to match crew-rs's 18-var list (add `PERL5OPT`, `RUBYOPT`, `GEM_HOME`, etc.)
+9. **Expand `BLOCKED_ENV_VARS`** to match octos's 18-var list (add `PERL5OPT`, `RUBYOPT`, `GEM_HOME`, etc.)
 10. **Enforce `unsafe_code = "deny"`** in `Cargo.toml`, not just documentation
 
-### For crew-rs (adopt from IronClaw)
+### For octos (adopt from IronClaw)
 
 1. **Add encrypted secrets store** — env vars are insufficient for production credential management
 2. **Add LLM output leak detection** — scan responses before delivery to users
@@ -480,18 +480,18 @@ crew-rs has fewer issues but the `&body[..200]` byte-slice bug is the same class
 
 ## 12. Threat Model Comparison
 
-| Threat | IronClaw Defense | crew-rs Defense | Winner |
+| Threat | IronClaw Defense | octos Defense | Winner |
 |--------|-----------------|-----------------|--------|
 | **Compromised WASM tool** | Sandbox + zero-exposure credentials | N/A (no WASM tools) | IronClaw |
 | **Compromised Docker container** | Network proxy + credential injection | Env scrubbing + resource limits | IronClaw |
-| **Prompt injection via tool output** | Sanitizer + policy engine + content escaping | PromptGuard + defanging | crew-rs (better detection) |
-| **Prompt injection via Unicode tricks** | Not detected | Homoglyph + ZWC + RTL detection | crew-rs |
+| **Prompt injection via tool output** | Sanitizer + policy engine + content escaping | PromptGuard + defanging | octos (better detection) |
+| **Prompt injection via Unicode tricks** | Not detected | Homoglyph + ZWC + RTL detection | octos |
 | **Secret exfiltration via LLM response** | LeakDetector scans LLM output | Not scanned | IronClaw |
 | **Secret exfiltration via tool output** | LeakDetector (15+ patterns) | Sanitizer (7+ patterns) | IronClaw |
-| **Symlink-based file traversal** | canonicalize (TOCTOU race) | O_NOFOLLOW (atomic) | crew-rs |
-| **Shell command injection** | Pattern blocklist (whitespace bypass) | SafePolicy + normalization + sandbox | crew-rs |
-| **DNS rebinding / SSRF** | Domain proxy (no IP check) | Private IP blocking + DNS resolution | crew-rs |
+| **Symlink-based file traversal** | canonicalize (TOCTOU race) | O_NOFOLLOW (atomic) | octos |
+| **Shell command injection** | Pattern blocklist (whitespace bypass) | SafePolicy + normalization + sandbox | octos |
+| **DNS rebinding / SSRF** | Domain proxy (no IP check) | Private IP blocking + DNS resolution | octos |
 | **Malicious registry skill** | Trust attenuation (read-only tools) | Full tool access | IronClaw |
-| **Weak model misusing dangerous tools** | Same tools for all models | Per-provider tool policies | crew-rs |
-| **Env var leakage** | Shell scrubbing only | 18 vars across shell + MCP + sandbox | crew-rs |
+| **Weak model misusing dangerous tools** | Same tools for all models | Per-provider tool policies | octos |
+| **Env var leakage** | Shell scrubbing only | 18 vars across shell + MCP + sandbox | octos |
 | **Memory dump / core dump secrets** | Encrypted at rest, keychain master key | Plaintext in memory | IronClaw |

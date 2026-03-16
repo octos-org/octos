@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-release smoke test suite for crew-rs.
+# Pre-release smoke test suite for octos.
 # Usage: ./scripts/pre-release.sh [--skip-build] [--skip-e2e] [--release]
 #
 # Runs all checks before a release:
@@ -50,13 +50,13 @@ fi
 # ── 2. Clippy ──────────────────────────────────────────────────────────
 section "Clippy Lint"
 # Only fail on compilation errors, not warnings.
-cargo clippy --workspace --all-targets > /tmp/crew-clippy.log 2>&1 || true
-CLIPPY_ERRS=$(grep -c "^error" /tmp/crew-clippy.log || true)
-CLIPPY_WARNS=$(grep -c "^warning\[" /tmp/crew-clippy.log || true)
+cargo clippy --workspace --all-targets > /tmp/octos-clippy.log 2>&1 || true
+CLIPPY_ERRS=$(grep -c "^error" /tmp/octos-clippy.log || true)
+CLIPPY_WARNS=$(grep -c "^warning\[" /tmp/octos-clippy.log || true)
 if [ "${CLIPPY_ERRS:-0}" -eq 0 ]; then
     pass "cargo clippy (${CLIPPY_WARNS:-0} warnings)"
 else
-    tail -5 /tmp/crew-clippy.log
+    tail -5 /tmp/octos-clippy.log
     fail "cargo clippy (${CLIPPY_ERRS} errors)"
 fi
 
@@ -80,17 +80,17 @@ else
 fi
 
 echo ""
-echo "  Running: cargo test -p crew-cli --features api"
-if cargo test -p crew-cli --features api 2>&1 | tee /tmp/crew-test-cli-api.log | tail -3; then
+echo "  Running: cargo test -p octos-cli --features api"
+if cargo test -p octos-cli --features api 2>&1 | tee /tmp/crew-test-cli-api.log | tail -3; then
     CLI_PASS=$(grep "^test result:" /tmp/crew-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     CLI_FAIL=$(grep "^test result:" /tmp/crew-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/failed/){gsub(/[^0-9]/,"",$i);f+=$i}}}END{print f+0}')
     if [ "$CLI_FAIL" -eq 0 ]; then
-        pass "crew-cli API tests (${CLI_PASS} passed)"
+        pass "octos-cli API tests (${CLI_PASS} passed)"
     else
-        fail "crew-cli API tests (${CLI_FAIL} failures)"
+        fail "octos-cli API tests (${CLI_FAIL} failures)"
     fi
 else
-    fail "crew-cli API tests"
+    fail "octos-cli API tests"
 fi
 
 # ── 4. Build ───────────────────────────────────────────────────────────
@@ -100,18 +100,18 @@ if [ "$SKIP_BUILD" = true ]; then
     skip "release build (--skip-build)"
 else
     BUILD_FLAGS="--features telegram,whatsapp,feishu,twilio,api"
-    echo "  Building crew-cli ($PROFILE) with $BUILD_FLAGS"
+    echo "  Building octos-cli ($PROFILE) with $BUILD_FLAGS"
 
     if [ "$PROFILE" = "release" ]; then
-        BUILD_CMD="cargo build --release -p crew-cli $BUILD_FLAGS"
+        BUILD_CMD="cargo build --release -p octos-cli $BUILD_FLAGS"
     else
-        BUILD_CMD="cargo build -p crew-cli $BUILD_FLAGS"
+        BUILD_CMD="cargo build -p octos-cli $BUILD_FLAGS"
     fi
 
     if $BUILD_CMD 2>&1 | tail -3; then
-        pass "crew-cli build ($PROFILE)"
+        pass "octos-cli build ($PROFILE)"
     else
-        fail "crew-cli build ($PROFILE)"
+        fail "octos-cli build ($PROFILE)"
     fi
 
     echo "  Building app-skills (release)"
@@ -156,12 +156,12 @@ else
             fail "crew --help"
         fi
 
-        # 5c. Init creates .crew directory
+        # 5c. Init creates .octos directory
         pushd "$E2E_DIR" > /dev/null
-        if $CREW init 2>&1 && [ -d ".crew" ]; then
-            pass "crew init (creates .crew/)"
+        if $CREW init 2>&1 && [ -d ".octos" ]; then
+            pass "octos init (creates .octos/)"
         else
-            fail "crew init"
+            fail "octos init"
         fi
 
         # 5d. Status runs without crash
@@ -214,8 +214,8 @@ else
         fi
 
         # 5k. Init config is valid JSON
-        if [ -f ".crew/config.json" ]; then
-            if python3 -m json.tool .crew/config.json > /dev/null 2>&1; then
+        if [ -f ".octos/config.json" ]; then
+            if python3 -m json.tool .octos/config.json > /dev/null 2>&1; then
                 pass "config.json is valid JSON"
             else
                 fail "config.json is invalid JSON"

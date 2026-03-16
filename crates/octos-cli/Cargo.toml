@@ -1,0 +1,79 @@
+[package]
+name = "octos-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI interface for octos"
+
+[[bin]]
+name = "octos"
+path = "src/main.rs"
+
+[dependencies]
+octos-core = { workspace = true }
+octos-agent = { workspace = true }
+octos-memory = { workspace = true }
+octos-llm = { workspace = true }
+octos-bus = { workspace = true }
+octos-pipeline = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+colored = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+eyre = { workspace = true }
+uuid = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+rustyline = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+open = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+image = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
+base64 = { workspace = true }
+keyring = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+teloxide = { workspace = true, optional = true }
+sysinfo = { version = "0.34", optional = true }
+
+[features]
+default = []
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "octos-bus/api"]
+admin-bot = ["dep:teloxide", "dep:futures", "api"]
+telegram = ["octos-bus/telegram"]
+discord = ["octos-bus/discord"]
+slack = ["octos-bus/slack"]
+whatsapp = ["octos-bus/whatsapp"]
+email = ["octos-bus/email"]
+feishu = ["octos-bus/feishu"]
+twilio = ["octos-bus/twilio"]
+wecom = ["octos-bus/wecom"]
+wecom-bot = ["octos-bus/wecom-bot"]
+git = ["octos-agent/git"]
+ast = ["octos-agent/ast"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio-test = { workspace = true }

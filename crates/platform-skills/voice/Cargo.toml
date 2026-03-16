@@ -3,7 +3,7 @@ name = "voice"
 version = "1.0.0"
 edition = "2021"
 description = "Voice skill binary (ASR/TTS/model management) using ominix-api on Apple Silicon"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "voice"

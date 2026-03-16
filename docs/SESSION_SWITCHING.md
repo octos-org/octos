@@ -14,7 +14,7 @@ tasks (deep search, pipelines, etc.).
 
 ## Key Components
 
-### ActiveSessionStore (`crew-bus/src/session.rs`)
+### ActiveSessionStore (`octos-bus/src/session.rs`)
 
 Persisted to `active_sessions.json`. Maps `base_key → active_topic`.
 

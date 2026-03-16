@@ -175,14 +175,14 @@ A structured database mapping **topics → search engines + languages + portals 
 ### File Location
 
 ```
-crates/crew-agent/src/source_registry.rs       # Rust structs + lookup logic
-crates/crew-agent/data/source_registry.toml     # Data file (embedded via include_str!)
+crates/octos-agent/src/source_registry.rs       # Rust structs + lookup logic
+crates/octos-agent/data/source_registry.toml     # Data file (embedded via include_str!)
 ```
 
 ### Rust Data Structures
 
 ```rust
-// crates/crew-agent/src/source_registry.rs
+// crates/octos-agent/src/source_registry.rs
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -406,7 +406,7 @@ pub struct SourcePlan {
 
 ### TOML Data File
 
-Location: `crates/crew-agent/data/source_registry.toml`
+Location: `crates/octos-agent/data/source_registry.toml`
 
 ```toml
 # =============================================================================
@@ -1038,7 +1038,7 @@ Implement the actual HTTP/scrape logic for each search engine in the registry. E
 ### File Location
 
 ```
-crates/crew-agent/src/search/
+crates/octos-agent/src/search/
     mod.rs              # SearchBackend trait + factory
     serper.rs           # Serper.dev (Google proxy) + SiteProxyBackend (X, Reddit, LinkedIn)
     google.rs           # Google Custom Search + Google News RSS (legacy, CSE closing Jan 2027)
@@ -1053,7 +1053,7 @@ crates/crew-agent/src/search/
 ### SearchBackend Trait
 
 ```rust
-// crates/crew-agent/src/search/mod.rs
+// crates/octos-agent/src/search/mod.rs
 
 use eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -1125,7 +1125,7 @@ pub fn create_backend(engine: &crate::source_registry::SearchEngine) -> Option<B
 ### Example: Google Custom Search Implementation
 
 ```rust
-// crates/crew-agent/src/search/google.rs
+// crates/octos-agent/src/search/google.rs
 
 pub struct GoogleSearchBackend {
     client: reqwest::Client,
@@ -1274,7 +1274,7 @@ pub fn parse_rss_items(
 ### Example: Baidu Scrape Implementation
 
 ```rust
-// crates/crew-agent/src/search/baidu.rs
+// crates/octos-agent/src/search/baidu.rs
 
 pub struct BaiduSearchBackend {
     client: reqwest::Client,
@@ -1319,7 +1319,7 @@ impl SearchBackend for BaiduSearchBackend {
 Serper.dev is our **recommended primary search backend**. It provides Google results via a clean JSON API without needing to set up Google Custom Search Engine (which is closing to new customers by Jan 2027). At $50/month for 50K queries, it's the best cost/quality ratio.
 
 ```rust
-// crates/crew-agent/src/search/serper.rs
+// crates/octos-agent/src/search/serper.rs
 
 pub struct SerperBackend {
     client: reqwest::Client,
@@ -1404,7 +1404,7 @@ Instead of paying $200+/mo for X API or dealing with Reddit's OAuth, we use Goog
 - **LinkedIn** (`site:linkedin.com`): Industry expert takes, company announcements, professional network signals
 
 ```rust
-// crates/crew-agent/src/search/serper.rs (same file as SerperBackend)
+// crates/octos-agent/src/search/serper.rs (same file as SerperBackend)
 
 /// Proxy backend that searches within a specific platform using site: operator.
 /// Reuses Serper as the underlying search engine.
@@ -1457,7 +1457,7 @@ impl SearchBackend for SiteProxyBackend {
 Perplexity provides AI-synthesized answers with source citations. Unlike traditional search engines that return links, Perplexity returns pre-digested analysis. Best used for **verification** and **gap-filling** rather than primary collection.
 
 ```rust
-// crates/crew-agent/src/search/perplexity.rs
+// crates/octos-agent/src/search/perplexity.rs
 
 pub struct PerplexityBackend {
     client: reqwest::Client,
@@ -1533,7 +1533,7 @@ impl SearchBackend for PerplexityBackend {
 ### MultiSearcher: Query Multiple Engines in Parallel
 
 ```rust
-// crates/crew-agent/src/search/mod.rs
+// crates/octos-agent/src/search/mod.rs
 
 pub struct MultiSearcher {
     backends: Vec<Box<dyn SearchBackend>>,
@@ -1636,7 +1636,7 @@ The single entry-point tool that the main agent calls. Plans the research, spawn
 ### File Location
 
 ```
-crates/crew-agent/src/tools/deep_research_v2.rs
+crates/octos-agent/src/tools/deep_research_v2.rs
 ```
 
 ### Tool Registration Name
@@ -1675,7 +1675,7 @@ crates/crew-agent/src/tools/deep_research_v2.rs
 ### Rust Struct
 
 ```rust
-// crates/crew-agent/src/tools/deep_research_v2.rs
+// crates/octos-agent/src/tools/deep_research_v2.rs
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -1692,11 +1692,11 @@ use crate::agent::{Agent, AgentConfig, AgentId};
 use crate::search::{MultiSearcher, SearchOptions, SearchResult};
 use crate::source_registry::{Portal, SourcePlan, SourceRegistry};
 use crate::tools::{Tool, ToolPolicy, ToolRegistry, ToolResult};
-use crew_core::{Message, MessageRole, Task, TaskContext, TaskKind, TokenUsage};
-use crew_llm::config::ChatConfig;
-use crew_llm::provider::LlmProvider;
-use crew_llm::types::ToolSpec;
-use crew_memory::EpisodeStore;
+use octos_core::{Message, MessageRole, Task, TaskContext, TaskKind, TokenUsage};
+use octos_llm::config::ChatConfig;
+use octos_llm::provider::LlmProvider;
+use octos_llm::types::ToolSpec;
+use octos_memory::EpisodeStore;
 
 /// Constants
 const MAX_AGENTS: usize = 20;
@@ -2527,7 +2527,7 @@ pub struct PartialResult {
 
 ## 11. Prompt Templates
 
-All prompts live in `crates/crew-agent/src/prompts/`. They use `{placeholder}` syntax filled by `format!()`.
+All prompts live in `crates/octos-agent/src/prompts/`. They use `{placeholder}` syntax filled by `format!()`.
 
 ### `research_planner.txt`
 
@@ -2709,34 +2709,34 @@ _Reviewed and improved. Original: N words, Improved: M words. Citations: K sourc
 
 | File | Purpose |
 |---|---|
-| `crates/crew-agent/src/source_registry.rs` | Source registry structs + lookup logic |
-| `crates/crew-agent/data/source_registry.toml` | Source database (embedded via `include_str!`) |
-| `crates/crew-agent/src/search/mod.rs` | SearchBackend trait + factory + MultiSearcher |
-| `crates/crew-agent/src/search/serper.rs` | Serper.dev backend + SiteProxyBackend (X, Reddit, LinkedIn) |
-| `crates/crew-agent/src/search/google.rs` | Google CSE + Google News RSS backends (legacy) |
-| `crates/crew-agent/src/search/bing.rs` | Bing Web + News backends (legacy) |
-| `crates/crew-agent/src/search/baidu.rs` | Baidu scrape backend |
-| `crates/crew-agent/src/search/perplexity.rs` | Perplexity Sonar AI meta-search backend |
-| `crates/crew-agent/src/search/rss.rs` | Generic RSS parser |
-| `crates/crew-agent/src/tools/deep_research_v2.rs` | Orchestrator tool |
-| `crates/crew-agent/src/prompts/research_planner.txt` | Planning prompt |
-| `crates/crew-agent/src/prompts/research_collector.txt` | Sub-agent prompt |
-| `crates/crew-agent/src/prompts/research_critic.txt` | Self-critique prompt |
+| `crates/octos-agent/src/source_registry.rs` | Source registry structs + lookup logic |
+| `crates/octos-agent/data/source_registry.toml` | Source database (embedded via `include_str!`) |
+| `crates/octos-agent/src/search/mod.rs` | SearchBackend trait + factory + MultiSearcher |
+| `crates/octos-agent/src/search/serper.rs` | Serper.dev backend + SiteProxyBackend (X, Reddit, LinkedIn) |
+| `crates/octos-agent/src/search/google.rs` | Google CSE + Google News RSS backends (legacy) |
+| `crates/octos-agent/src/search/bing.rs` | Bing Web + News backends (legacy) |
+| `crates/octos-agent/src/search/baidu.rs` | Baidu scrape backend |
+| `crates/octos-agent/src/search/perplexity.rs` | Perplexity Sonar AI meta-search backend |
+| `crates/octos-agent/src/search/rss.rs` | Generic RSS parser |
+| `crates/octos-agent/src/tools/deep_research_v2.rs` | Orchestrator tool |
+| `crates/octos-agent/src/prompts/research_planner.txt` | Planning prompt |
+| `crates/octos-agent/src/prompts/research_collector.txt` | Sub-agent prompt |
+| `crates/octos-agent/src/prompts/research_critic.txt` | Self-critique prompt |
 
 ### Files to Modify
 
 | File | Change |
 |---|---|
-| `crates/crew-agent/src/lib.rs` | Add `pub mod source_registry;` and `pub mod search;`, re-export `DeepResearchOrchestrator` |
-| `crates/crew-agent/src/tools/mod.rs` | Add `pub mod deep_research_v2;` and `pub use deep_research_v2::DeepResearchOrchestrator;` |
-| `crates/crew-agent/Cargo.toml` | Add `toml` dependency (for registry parsing) |
-| `crates/crew-cli/src/commands/gateway.rs` | Register `DeepResearchOrchestrator` tool, update system prompt |
-| `crates/crew-cli/src/commands/chat.rs` | Register `DeepResearchOrchestrator` tool |
+| `crates/octos-agent/src/lib.rs` | Add `pub mod source_registry;` and `pub mod search;`, re-export `DeepResearchOrchestrator` |
+| `crates/octos-agent/src/tools/mod.rs` | Add `pub mod deep_research_v2;` and `pub use deep_research_v2::DeepResearchOrchestrator;` |
+| `crates/octos-agent/Cargo.toml` | Add `toml` dependency (for registry parsing) |
+| `crates/octos-cli/src/commands/gateway.rs` | Register `DeepResearchOrchestrator` tool, update system prompt |
+| `crates/octos-cli/src/commands/chat.rs` | Register `DeepResearchOrchestrator` tool |
 
 ### Dependencies to Add
 
 ```toml
-# crates/crew-agent/Cargo.toml
+# crates/octos-agent/Cargo.toml
 [dependencies]
 toml = "0.8"   # For source_registry.toml parsing
 ```
@@ -2766,7 +2766,7 @@ No other new dependencies — all HTTP, async, serde, etc. are already in the wo
 ### Research Directory Structure (on disk)
 
 ```
-~/.crew/research/
+~/.octos/research/
     2026-world-cup-predictions/
         _plan.json               # Research plan (JSON, for debugging)
         partial_01.md            # Sub-agent 1 findings: "English sports press"
@@ -2786,7 +2786,7 @@ No other new dependencies — all HTTP, async, serde, etc. are already in the wo
 ### Source Code Layout
 
 ```
-crates/crew-agent/
+crates/octos-agent/
     src/
         source_registry.rs       # Registry structs + lookup
         search/
@@ -2979,7 +2979,7 @@ mod tests {
 ### Integration Tests
 
 ```rust
-// crates/crew-agent/tests/deep_research_integration.rs
+// crates/octos-agent/tests/deep_research_integration.rs
 
 #[tokio::test]
 #[ignore] // Requires API keys
@@ -3041,7 +3041,7 @@ Deliverables:
 - [ ] `SourceRegistry` struct with `load()`, `match_topics()`, `plan_sources()`
 - [ ] TOML data file with 10+ topics
 - [ ] Unit tests for topic matching
-- [ ] `cargo test -p crew-agent` passes
+- [ ] `cargo test -p octos-agent` passes
 
 ### Milestone 1: Search Engine Backends (3-5 days)
 
@@ -3158,11 +3158,11 @@ This is a separate project, probably 2-3 months of work. The architecture we bui
 
 ### Internal Codebase References
 
-- `crates/crew-agent/src/tools/deep_research.rs` — Existing sub-agent spawning patterns
-- `crates/crew-agent/src/tools/synthesize_research.rs` — Map-reduce synthesis patterns
-- `crates/crew-agent/src/tools/deep_search.rs` — Page fetching and file saving patterns
-- `crates/crew-agent/src/tools/web_search.rs` — DuckDuckGo/Brave/You.com/Perplexity backends
-- `crates/crew-agent/src/tools/web_fetch.rs` — SSRF protection, HTML-to-markdown
-- `crates/crew-agent/src/agent.rs` — Agent, AgentConfig, Agent::new() builder pattern
-- `crates/crew-agent/src/plugins/tool.rs` — Plugin tool stdin/stdout protocol
-- `crates/crew-agent/src/bootstrap.rs` — Bundled app-skill bootstrap pattern
+- `crates/octos-agent/src/tools/deep_research.rs` — Existing sub-agent spawning patterns
+- `crates/octos-agent/src/tools/synthesize_research.rs` — Map-reduce synthesis patterns
+- `crates/octos-agent/src/tools/deep_search.rs` — Page fetching and file saving patterns
+- `crates/octos-agent/src/tools/web_search.rs` — DuckDuckGo/Brave/You.com/Perplexity backends
+- `crates/octos-agent/src/tools/web_fetch.rs` — SSRF protection, HTML-to-markdown
+- `crates/octos-agent/src/agent.rs` — Agent, AgentConfig, Agent::new() builder pattern
+- `crates/octos-agent/src/plugins/tool.rs` — Plugin tool stdin/stdout protocol
+- `crates/octos-agent/src/bootstrap.rs` — Bundled app-skill bootstrap pattern

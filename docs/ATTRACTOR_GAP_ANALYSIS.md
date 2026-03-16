@@ -1,19 +1,19 @@
 # Attractor Spec Gap Analysis
 
-Audit of crew-rs against [strongdm/attractor](https://github.com/strongdm/attractor) NLSpecs.
+Audit of octos against [strongdm/attractor](https://github.com/strongdm/attractor) NLSpecs.
 Date: 2026-03-06
 
 ## Spec-to-Crate Mapping
 
-| Attractor Spec | crew-rs Crate | Coverage |
+| Attractor Spec | octos Crate | Coverage |
 |---|---|---|
-| unified-llm-spec | `crew-llm` | ~60% |
-| coding-agent-loop-spec | `crew-agent` + `crew-bus` | ~65% |
-| attractor-spec (pipeline) | `crew-pipeline` | ~55% |
+| unified-llm-spec | `octos-llm` | ~60% |
+| coding-agent-loop-spec | `octos-agent` + `octos-bus` | ~65% |
+| attractor-spec (pipeline) | `octos-pipeline` | ~55% |
 
 ---
 
-## 1. Unified LLM Client (`crew-llm`)
+## 1. Unified LLM Client (`octos-llm`)
 
 ### Implemented
 
@@ -49,7 +49,7 @@ Date: 2026-03-06
 
 ---
 
-## 2. Coding Agent Loop (`crew-agent`)
+## 2. Coding Agent Loop (`octos-agent`)
 
 ### Implemented
 
@@ -85,7 +85,7 @@ Date: 2026-03-06
 
 ---
 
-## 3. Pipeline Orchestration (`crew-pipeline`)
+## 3. Pipeline Orchestration (`octos-pipeline`)
 
 ### Implemented
 
@@ -129,17 +129,17 @@ Date: 2026-03-06
 
 | Task | Gap IDs | Crate | Est. Lines |
 |---|---|---|---|
-| Add `cache_control` annotations for Anthropic | L2 | crew-llm | ~80 |
-| Complete `TokenUsage` (reasoning, cache read/write) | L4 | crew-llm | ~60 |
-| Add Anthropic extended thinking support | L8 | crew-llm | ~120 |
-| Update Anthropic API version header | L9 | crew-llm | ~5 |
-| Add response metadata to `ChatResponse` (id, model, raw) | L11 | crew-llm | ~50 |
-| Implement loop detection (tool call signature tracking) | A1 | crew-agent | ~200 |
-| Per-tool output truncation with head/tail split | A6 | crew-agent | ~150 |
-| Reasoning effort control (low/medium/high config) | A8 | crew-llm + agent | ~80 |
-| Shape-to-handler mapping in DOT parser | P9 | crew-pipeline | ~40 |
-| `context.*` variables in condition evaluator | P11 | crew-pipeline | ~60 |
-| Typed value parsing in DOT (Duration, Bool, Int) | P14 | crew-pipeline | ~80 |
+| Add `cache_control` annotations for Anthropic | L2 | octos-llm | ~80 |
+| Complete `TokenUsage` (reasoning, cache read/write) | L4 | octos-llm | ~60 |
+| Add Anthropic extended thinking support | L8 | octos-llm | ~120 |
+| Update Anthropic API version header | L9 | octos-llm | ~5 |
+| Add response metadata to `ChatResponse` (id, model, raw) | L11 | octos-llm | ~50 |
+| Implement loop detection (tool call signature tracking) | A1 | octos-agent | ~200 |
+| Per-tool output truncation with head/tail split | A6 | octos-agent | ~150 |
+| Reasoning effort control (low/medium/high config) | A8 | octos-llm + agent | ~80 |
+| Shape-to-handler mapping in DOT parser | P9 | octos-pipeline | ~40 |
+| `context.*` variables in condition evaluator | P11 | octos-pipeline | ~60 |
+| Typed value parsing in DOT (Duration, Bool, Int) | P14 | octos-pipeline | ~80 |
 
 **Estimated total**: ~925 lines, 1-2 weeks
 
@@ -149,22 +149,22 @@ Date: 2026-03-06
 
 | Task | Gap IDs | Crate | Est. Lines |
 |---|---|---|---|
-| Migrate OpenAI to Responses API | L1 | crew-llm | ~400 |
-| Add `response_format` / structured output | L3 | crew-llm | ~300 |
-| Gemini caching + thinkingConfig | L7 | crew-llm | ~150 |
-| StreamAccumulator utility | L12 | crew-llm | ~100 |
-| Steering/follow-up message queues | A2 | crew-agent | ~250 |
-| Session state machine (IDLE/PROCESSING/etc.) | A4 | crew-agent | ~150 |
-| Session config object (max_turns, tool_rounds) | A5 | crew-agent | ~200 |
-| System prompt layering + AGENTS.md discovery | A7 | crew-agent | ~250 |
-| Event system upgrade (publish-subscribe) | A11 | crew-agent | ~300 |
-| SIGTERM->wait->SIGKILL for shell processes | A12 | crew-agent | ~100 |
-| Pipeline checkpoint save/resume | P1 | crew-pipeline | ~500 |
-| Model stylesheet (CSS-like config) | P3 | crew-pipeline | ~350 |
-| Artifact store (memory + disk backing) | P6 | crew-pipeline | ~250 |
-| Run directory with status.json per node | P7 | crew-pipeline | ~200 |
-| Subgraph parsing and class derivation | P8 | crew-pipeline | ~200 |
-| Pipeline observability events | P12 | crew-pipeline | ~250 |
+| Migrate OpenAI to Responses API | L1 | octos-llm | ~400 |
+| Add `response_format` / structured output | L3 | octos-llm | ~300 |
+| Gemini caching + thinkingConfig | L7 | octos-llm | ~150 |
+| StreamAccumulator utility | L12 | octos-llm | ~100 |
+| Steering/follow-up message queues | A2 | octos-agent | ~250 |
+| Session state machine (IDLE/PROCESSING/etc.) | A4 | octos-agent | ~150 |
+| Session config object (max_turns, tool_rounds) | A5 | octos-agent | ~200 |
+| System prompt layering + AGENTS.md discovery | A7 | octos-agent | ~250 |
+| Event system upgrade (publish-subscribe) | A11 | octos-agent | ~300 |
+| SIGTERM->wait->SIGKILL for shell processes | A12 | octos-agent | ~100 |
+| Pipeline checkpoint save/resume | P1 | octos-pipeline | ~500 |
+| Model stylesheet (CSS-like config) | P3 | octos-pipeline | ~350 |
+| Artifact store (memory + disk backing) | P6 | octos-pipeline | ~250 |
+| Run directory with status.json per node | P7 | octos-pipeline | ~200 |
+| Subgraph parsing and class derivation | P8 | octos-pipeline | ~200 |
+| Pipeline observability events | P12 | octos-pipeline | ~250 |
 
 **Estimated total**: ~3,950 lines, 4-6 weeks
 
@@ -174,18 +174,18 @@ Date: 2026-03-06
 
 | Task | Gap IDs | Crate | Est. Lines |
 |---|---|---|---|
-| High-level APIs (generate, generate_object, stream) | L5 | crew-llm | ~600 |
-| Middleware/interceptor pipeline | L6 | crew-llm | ~400 |
-| Typed error hierarchy | L10 | crew-llm | ~300 |
-| Model catalog (ModelInfo with metadata) | L13 | crew-llm | ~250 |
-| Provider-aligned toolsets (apply_patch, read_many_files) | A3 | crew-agent | ~800 |
-| Execution environment abstraction | A9 | crew-agent | ~600 |
-| Turn type semantics | A10 | crew-agent/core | ~200 |
-| Human-in-the-loop (Interviewer pattern) | P2 | crew-pipeline | ~500 |
-| Fidelity modes for context carryover | P4 | crew-pipeline | ~400 |
-| Manager loop handler (child pipeline supervision) | P5 | crew-pipeline | ~500 |
-| Thread resolution for session reuse | P10 | crew-pipeline | ~250 |
-| HTTP server for pipeline management | P13 | crew-pipeline | ~600 |
+| High-level APIs (generate, generate_object, stream) | L5 | octos-llm | ~600 |
+| Middleware/interceptor pipeline | L6 | octos-llm | ~400 |
+| Typed error hierarchy | L10 | octos-llm | ~300 |
+| Model catalog (ModelInfo with metadata) | L13 | octos-llm | ~250 |
+| Provider-aligned toolsets (apply_patch, read_many_files) | A3 | octos-agent | ~800 |
+| Execution environment abstraction | A9 | octos-agent | ~600 |
+| Turn type semantics | A10 | octos-agent/core | ~200 |
+| Human-in-the-loop (Interviewer pattern) | P2 | octos-pipeline | ~500 |
+| Fidelity modes for context carryover | P4 | octos-pipeline | ~400 |
+| Manager loop handler (child pipeline supervision) | P5 | octos-pipeline | ~500 |
+| Thread resolution for session reuse | P10 | octos-pipeline | ~250 |
+| HTTP server for pipeline management | P13 | octos-pipeline | ~600 |
 
 **Estimated total**: ~5,400 lines, 6-8 weeks
 

@@ -3,7 +3,7 @@ name = "deep-crawl"
 version = "1.0.0"
 edition = "2021"
 description = "CDP-based recursive site crawler using headless Chrome"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "deep_crawl"

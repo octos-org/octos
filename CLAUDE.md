@@ -17,7 +17,7 @@ cargo install --path crates/crew-cli  # Install CLI locally
 
 ## Architecture
 
-crew-rs is a Rust-native AI coding agent framework. 6-crate workspace, layered:
+octos is a Rust-native AI coding agent framework. 6-crate workspace, layered:
 
 ```
 crew-cli  (CLI: clap commands, config loading, config watcher)

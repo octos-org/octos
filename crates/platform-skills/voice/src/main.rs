@@ -196,10 +196,10 @@ fn timestamp() -> u64 {
         .as_secs()
 }
 
-/// Per-profile voice profiles directory: `$CREW_DATA_DIR/voice_profiles/`.
+/// Per-profile voice profiles directory: `$OCTOS_DATA_DIR/voice_profiles/`.
 /// Each saved profile is a raw audio file named `{name}.wav`.
 fn voice_profiles_dir() -> Option<PathBuf> {
-    std::env::var("CREW_DATA_DIR")
+    std::env::var("OCTOS_DATA_DIR")
         .ok()
         .map(|d| Path::new(&d).join("voice_profiles"))
 }
@@ -353,7 +353,7 @@ fn handle_synthesize(input_json: &str) {
 
     let output_path = input
         .output_path
-        .unwrap_or_else(|| format!("/tmp/crew_tts_{}.wav", timestamp()));
+        .unwrap_or_else(|| format!("/tmp/octos_tts_{}.wav", timestamp()));
 
     if let Some(parent) = Path::new(&output_path).parent() {
         if !parent.exists() {
@@ -521,7 +521,7 @@ fn handle_voice_clone(input_json: &str) {
 /// Save an audio file as a named voice profile.
 fn save_voice_profile(name: &str, audio_path: &Path) -> Result<String, String> {
     let dir = voice_profiles_dir()
-        .ok_or_else(|| "CREW_DATA_DIR not set — cannot save voice profiles".to_string())?;
+        .ok_or_else(|| "OCTOS_DATA_DIR not set — cannot save voice profiles".to_string())?;
 
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create voice_profiles dir: {e}"))?;
@@ -579,7 +579,7 @@ fn handle_save_profile(input_json: &str) {
 fn handle_list_profiles(_input_json: &str) {
     let dir = match voice_profiles_dir() {
         Some(d) => d,
-        None => fail("CREW_DATA_DIR not set — no voice profiles directory"),
+        None => fail("OCTOS_DATA_DIR not set — no voice profiles directory"),
     };
 
     if !dir.exists() {

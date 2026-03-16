@@ -1,0 +1,58 @@
+[package]
+name = "octos-bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Message bus, channels, and session management for octos gateway"
+
+[features]
+default = []
+api = ["axum"]
+telegram = ["teloxide"]
+discord = ["serenity"]
+slack = ["tokio-tungstenite"]
+whatsapp = ["tokio-tungstenite"]
+feishu = ["tokio-tungstenite", "axum"]
+twilio = ["axum"]
+wecom = ["axum"]
+wecom-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
+email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
+
+[dependencies]
+octos-core = { workspace = true }
+tokio = { workspace = true }
+lru = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+uuid = { workspace = true }
+cron = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+
+# Optional: channel integrations
+teloxide = { workspace = true, optional = true }
+serenity = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+# Optional: email / wecom-bot TLS
+async-imap = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+lettre = { workspace = true, optional = true }
+mailparse = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

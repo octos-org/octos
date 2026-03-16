@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local deployment for crew-rs on macOS and Linux.
+# Local deployment for octos on macOS and Linux.
 # Usage: ./scripts/local-deploy.sh [OPTIONS]
 #
 # Options:
@@ -24,7 +24,7 @@ SETUP_SERVICE=true
 UNINSTALL=false
 PROFILE="release"
 PREFIX="${CARGO_HOME:-$HOME/.cargo}/bin"
-DATA_DIR="${CREW_HOME:-$HOME/.crew}"
+DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -53,26 +53,26 @@ err()     { echo "    ERROR: $1"; exit 1; }
 
 # ── Uninstall ─────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
-    section "Uninstalling crew-rs"
+    section "Uninstalling octos"
 
     # Stop and remove service
     case "$OS" in
         Darwin)
-            launchctl unload ~/Library/LaunchAgents/io.crew.crew-serve.plist 2>/dev/null || true
-            rm -f ~/Library/LaunchAgents/io.crew.crew-serve.plist
+            launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/io.octos.octos-serve.plist
             ok "launchd service removed"
             ;;
         Linux)
-            systemctl --user stop crew-serve.service 2>/dev/null || true
-            systemctl --user disable crew-serve.service 2>/dev/null || true
-            rm -f ~/.config/systemd/user/crew-serve.service
+            systemctl --user stop octos-serve.service 2>/dev/null || true
+            systemctl --user disable octos-serve.service 2>/dev/null || true
+            rm -f ~/.config/systemd/user/octos-serve.service
             systemctl --user daemon-reload 2>/dev/null || true
             ok "systemd service removed"
             ;;
     esac
 
     # Remove binaries
-    BINS=(crew news_fetch deep-search deep_crawl send_email account_manager clock weather)
+    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather)
     for bin in "${BINS[@]}"; do
         rm -f "$PREFIX/$bin"
     done
@@ -161,7 +161,7 @@ else
 fi
 
 # ── Build ─────────────────────────────────────────────────────────────
-section "Building crew-rs"
+section "Building octos"
 
 INSTALL_FLAG=""
 BUILD_FLAG=""
@@ -175,13 +175,13 @@ else
 fi
 
 if [ -n "$CLI_FEATURES" ]; then
-    echo "    cargo install crew-cli with features: $CLI_FEATURES"
-    cargo install --path crates/crew-cli --features "$CLI_FEATURES" $INSTALL_FLAG
+    echo "    cargo install octos-cli with features: $CLI_FEATURES"
+    cargo install --path crates/octos-cli --features "$CLI_FEATURES" $INSTALL_FLAG
 else
-    echo "    cargo install crew-cli (no extra features)"
-    cargo install --path crates/crew-cli $INSTALL_FLAG
+    echo "    cargo install octos-cli (no extra features)"
+    cargo install --path crates/octos-cli $INSTALL_FLAG
 fi
-ok "crew binary installed to $PREFIX/crew"
+ok "octos binary installed to $PREFIX/octos"
 
 # App-skills
 if [ "$BUILD_SKILLS" = true ]; then
@@ -213,10 +213,10 @@ if [ "$BUILD_SKILLS" = true ]; then
 fi
 
 # ── Initialize ────────────────────────────────────────────────────────
-section "Initializing crew workspace"
+section "Initializing octos workspace"
 
 if [ ! -d "$DATA_DIR" ]; then
-    "$PREFIX/crew" init --defaults 2>/dev/null || "$PREFIX/crew" init 2>/dev/null || true
+    "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
     ok "created $DATA_DIR"
 else
     ok "$DATA_DIR already exists (skipping init)"
@@ -226,13 +226,13 @@ fi
 if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
     section "Setting up background service"
 
-    CREW_BIN="$PREFIX/crew"
+    OCTOS_BIN="$PREFIX/octos"
 
     case "$OS" in
         Darwin)
             # launchd plist
             PLIST_DIR="$HOME/Library/LaunchAgents"
-            PLIST_FILE="$PLIST_DIR/io.crew.crew-serve.plist"
+            PLIST_FILE="$PLIST_DIR/io.octos.octos-serve.plist"
             mkdir -p "$PLIST_DIR"
 
             cat > "$PLIST_FILE" << EOF
@@ -241,10 +241,10 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.crew.crew-serve</string>
+    <string>io.octos.octos-serve</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$CREW_BIN</string>
+        <string>$OCTOS_BIN</string>
         <string>serve</string>
         <string>--port</string>
         <string>8080</string>
@@ -261,7 +261,7 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
     <dict>
         <key>PATH</key>
         <string>$PREFIX:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>CREW_HOME</key>
+        <key>OCTOS_HOME</key>
         <string>$DATA_DIR</string>
     </dict>
 </dict>
@@ -276,21 +276,21 @@ EOF
         Linux)
             # systemd user unit
             UNIT_DIR="$HOME/.config/systemd/user"
-            UNIT_FILE="$UNIT_DIR/crew-serve.service"
+            UNIT_FILE="$UNIT_DIR/octos-serve.service"
             mkdir -p "$UNIT_DIR"
 
             cat > "$UNIT_FILE" << EOF
 [Unit]
-Description=crew-rs serve (dashboard + gateway)
+Description=octos serve (dashboard + gateway)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$CREW_BIN serve --port 8080
+ExecStart=$OCTOS_BIN serve --port 8080
 Restart=on-failure
 RestartSec=5
-Environment=CREW_HOME=$DATA_DIR
+Environment=OCTOS_HOME=$DATA_DIR
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
 
 [Install]
@@ -298,10 +298,10 @@ WantedBy=default.target
 EOF
             systemctl --user daemon-reload
             ok "systemd unit written to $UNIT_FILE"
-            echo "    To start:  systemctl --user start crew-serve"
-            echo "    To enable: systemctl --user enable crew-serve"
-            echo "    To stop:   systemctl --user stop crew-serve"
-            echo "    Logs:      journalctl --user -u crew-serve -f"
+            echo "    To start:  systemctl --user start octos-serve"
+            echo "    To enable: systemctl --user enable octos-serve"
+            echo "    To stop:   systemctl --user stop octos-serve"
+            echo "    Logs:      journalctl --user -u octos-serve -f"
             ;;
     esac
 else
@@ -314,7 +314,7 @@ fi
 # ── Summary ───────────────────────────────────────────────────────────
 section "Deployment complete"
 echo ""
-echo "    Binary:     $PREFIX/crew"
+echo "    Binary:     $PREFIX/octos"
 echo "    Data dir:   $DATA_DIR"
 echo "    Config:     $DATA_DIR/config.json"
 echo ""
@@ -322,7 +322,7 @@ echo "  Next steps:"
 echo "    1. Set your API key:  export ANTHROPIC_API_KEY=sk-..."
 echo "    2. Start chatting:    crew chat"
 if [ -n "$CLI_FEATURES" ]; then
-    echo "    3. Start dashboard:   crew serve"
+    echo "    3. Start dashboard:   octos serve"
     echo "    4. Open browser:      http://localhost:8080/admin/"
 fi
 echo ""

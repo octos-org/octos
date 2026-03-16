@@ -13,8 +13,8 @@
 Thumbs.db
 
 # Crew state (keep config, ignore runtime data)
-.crew/tasks/
-.crew/*.redb
+.octos/tasks/
+.octos/*.redb
 
 # Node
 node_modules/
@@ -26,7 +26,7 @@ crates/crew-cli/static/admin/
 .env
 .env.local
 .envrc
-.crew/
+.octos/
 
 # Deploy script (contains credentials)
 scripts/deploy.sh

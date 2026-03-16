@@ -1,12 +1,12 @@
 # Security Architecture
 
-crew-rs multi-tenant AI agent gateway security reference. Last updated: 2026-03-15.
+octos multi-tenant AI agent gateway security reference. Last updated: 2026-03-15.
 
 ---
 
 ## 1. Threat Model
 
-crew-rs runs multiple AI agent profiles on a single host, each with access to shell execution, file I/O, web requests, and LLM APIs. The security surface includes:
+octos runs multiple AI agent profiles on a single host, each with access to shell execution, file I/O, web requests, and LLM APIs. The security surface includes:
 
 | Threat | Vector | Impact |
 |--------|--------|--------|
@@ -33,7 +33,7 @@ Session isolation operates at three levels: **profile** (OS process), **user** (
 
 #### Profile-level isolation (OS process boundary)
 
-Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.crew/profiles/{id}/`). Profiles share no in-process state — cross-profile access requires filesystem traversal (mitigated by sandboxing, §2.3).
+Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.octos/profiles/{id}/`). Profiles share no in-process state — cross-profile access requires filesystem traversal (mitigated by sandboxing, §2.3).
 
 #### User-level isolation (per-actor SessionHandle)
 
@@ -54,7 +54,7 @@ Within a profile, each user (identified by `channel:chat_id`) gets a dedicated `
         default.jsonl
 ```
 
-**SessionKey construction** (`crew-core/src/types.rs`): Keys are `{channel}:{chat_id}` (e.g., `telegram:12345`), optionally with topic suffix `#research`. The `base_key` (without topic) determines the user directory. Session filenames are percent-encoded with an FNV-1a hash suffix on truncation to prevent collisions.
+**SessionKey construction** (`octos-core/src/types.rs`): Keys are `{channel}:{chat_id}` (e.g., `telegram:12345`), optionally with topic suffix `#research`. The `base_key` (without topic) determines the user directory. Session filenames are percent-encoded with an FNV-1a hash suffix on truncation to prevent collisions.
 
 **Backward compatibility**: `SessionHandle::open()` tries the new per-user path first, then falls back to the legacy flat path (`{data_dir}/sessions/{encoded_key}.jsonl`). On successful legacy load, the file is auto-migrated to the new path and the old file is removed.
 
@@ -107,7 +107,7 @@ Each user gets a dedicated workspace directory for tool execution:
 
 ### 2.2 File I/O Safety
 
-`resolve_path()` in `crew-agent/src/tools/mod.rs`:
+`resolve_path()` in `octos-agent/src/tools/mod.rs`:
 
 1. **Rejects absolute paths** -- user-provided paths must be relative.
 2. **Normalizes `..` components** without filesystem access (`normalize_path`).
@@ -121,7 +121,7 @@ On non-Unix platforms, a fallback `symlink_metadata()` check is used (TOCTOU win
 
 ### 2.3 Sandbox Backends
 
-Three sandbox backends in `crew-agent/src/sandbox.rs`, selectable via `SandboxConfig`:
+Three sandbox backends in `octos-agent/src/sandbox.rs`, selectable via `SandboxConfig`:
 
 **Bubblewrap (Linux)**:
 - Read-only bind mounts for `/usr`, `/lib`, `/bin`, `/sbin`, `/etc`.
@@ -196,7 +196,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.4 Tool Policy
 
-`ToolPolicy` in `crew-agent/src/tools/policy.rs` provides allow/deny lists with **deny-wins** semantics:
+`ToolPolicy` in `octos-agent/src/tools/policy.rs` provides allow/deny lists with **deny-wins** semantics:
 
 - **Deny list checked first**. If a tool matches any deny entry, it is blocked regardless of allow list.
 - **Empty allow list** = allow everything not denied.
@@ -211,7 +211,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.5 SSRF Protection
 
-`crew-agent/src/tools/ssrf.rs` provides shared SSRF validation for `web_fetch`, `browser`, and MCP HTTP transports.
+`octos-agent/src/tools/ssrf.rs` provides shared SSRF validation for `web_fetch`, `browser`, and MCP HTTP transports.
 
 **Two-phase check** (`check_ssrf`):
 1. **Hostname validation** (`is_private_host`): Blocks `localhost`, `localhost.`, and any IP literal that resolves to a private range.
@@ -224,7 +224,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.6 Plugin Integrity
 
-`crew-agent/src/plugins/loader.rs` handles plugin loading with integrity verification:
+`octos-agent/src/plugins/loader.rs` handles plugin loading with integrity verification:
 
 1. **Manifest parsing**: `manifest.json` must exist and contain valid JSON with tool definitions.
 2. **Executable discovery**: Tries directory name, then `main`. Must be executable (`mode & 0o111 != 0` on Unix).
@@ -238,7 +238,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.7 MCP Security
 
-`crew-agent/src/mcp.rs` secures MCP server integration:
+`octos-agent/src/mcp.rs` secures MCP server integration:
 
 **Schema validation** (`validate_schema`):
 - Maximum nesting depth: 10 levels (`MAX_SCHEMA_DEPTH`).
@@ -264,7 +264,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.8 Auth Middleware
 
-`crew-cli/src/api/router.rs` implements two-tier authentication:
+`octos-cli/src/api/router.rs` implements two-tier authentication:
 
 **Token extraction**: Bearer header (`Authorization: Bearer {token}`) with query parameter fallback (`?token={token}`) for SSE/EventSource.
 
@@ -282,7 +282,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.9 Hook Security
 
-`crew-agent/src/hooks.rs` runs lifecycle hooks with multiple safety measures:
+`octos-agent/src/hooks.rs` runs lifecycle hooks with multiple safety measures:
 
 **Argv execution**: Commands are specified as an argv array (not shell strings). No shell interpretation -- prevents command injection via hook configuration.
 
@@ -300,15 +300,15 @@ All backends remove these from the child process environment before execution.
 
 ### 2.10 Per-Profile CWD Isolation
 
-When `crew serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.crew/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
+When `crew serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
 
 #### CWD scoping
 
-The gateway `--cwd` flag sets the process working directory before any tool initialization. Since builtin file tools (`read_file`, `write_file`, `edit_file`, `diff_edit`, `glob`, `grep`, `list_dir`, `git`) resolve user-supplied paths via `resolve_path(cwd, user_path)`, setting `cwd = ~/.crew/profiles/{id}/data/` means these tools can only access files within that profile's data directory. Cross-profile file access is blocked because `resolve_path()` verifies the resolved path `starts_with(base_dir)`, and `base_dir` is now the profile's own directory.
+The gateway `--cwd` flag sets the process working directory before any tool initialization. Since builtin file tools (`read_file`, `write_file`, `edit_file`, `diff_edit`, `glob`, `grep`, `list_dir`, `git`) resolve user-supplied paths via `resolve_path(cwd, user_path)`, setting `cwd = ~/.octos/profiles/{id}/data/` means these tools can only access files within that profile's data directory. Cross-profile file access is blocked because `resolve_path()` verifies the resolved path `starts_with(base_dir)`, and `base_dir` is now the profile's own directory.
 
 #### Shell sandbox read restriction
 
-On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `crew serve` populates `read_allow_paths` with `project_dir` (the `--crew-home` path, typically `~/.crew/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
+On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `crew serve` populates `read_allow_paths` with `project_dir` (the `--crew-home` path, typically `~/.octos/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
 
 ```scheme
 ;; Instead of (allow file-read*), generate:
@@ -331,7 +331,7 @@ This restricts shell command reads at the kernel level to the profile's data, sh
 
 #### project_dir decoupled from cwd
 
-Shared resources -- installed skills (`~/.crew/skills/`), global config (`~/.crew/config.json`), bundled app-skills -- are loaded from `--crew-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
+Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.octos/config.json`), bundled app-skills -- are loaded from `--crew-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
 
 #### Remaining gaps
 
@@ -389,7 +389,7 @@ Shared resources -- installed skills (`~/.crew/skills/`), global config (`~/.cre
 
 ## 4. Hardening Recommendations
 
-Inspired by LAMP shared hosting's 25-year-old multi-tenant isolation model, which crew-rs is essentially re-solving for AI agents. LAMP's key insight: **the kernel should enforce isolation, not application code**. Application-level checks (`resolve_path()`, tool policy) are defense-in-depth, not the primary boundary.
+Inspired by LAMP shared hosting's 25-year-old multi-tenant isolation model, which octos is essentially re-solving for AI agents. LAMP's key insight: **the kernel should enforce isolation, not application code**. Application-level checks (`resolve_path()`, tool policy) are defense-in-depth, not the primary boundary.
 
 ### 4.1 Enable sandbox by default (short-term)
 
@@ -399,7 +399,7 @@ Change `SandboxConfig::default()` to `enabled: true`. Auto-detection (`SandboxMo
 
 **LAMP equivalent**: Each PHP-FPM pool runs as a separate Unix user (`webA`, `webB`). The kernel enforces everything — file permissions, process visibility, signal delivery.
 
-**crew-rs target**: `crew serve` spawns each profile's gateway child process as a dedicated Unix user.
+**octos target**: `crew serve` spawns each profile's gateway child process as a dedicated Unix user.
 
 ```rust
 // In process_manager.rs, when spawning a profile gateway:
@@ -429,25 +429,25 @@ sudo chmod 700 /home/crew_abc/
 
 # crew serve spawns:
 sudo -u crew_profile_abc crew gateway \
-  --data-dir /home/crew_abc/.crew \
+  --data-dir /home/crew_abc/.octos \
   --cwd /home/crew_abc/workspace
 ```
 
-**Config** (`~/.crew/profiles/{id}.json`):
+**Config** (`~/.octos/profiles/{id}.json`):
 ```json
 {
   "isolation": {
     "run_as_user": "crew_profile_abc",
-    "data_dir": "/home/crew_abc/.crew",
+    "data_dir": "/home/crew_abc/.octos",
     "cwd": "/home/crew_abc/workspace"
   }
 }
 ```
 
 **Files to modify**:
-- `crates/crew-cli/src/process_manager.rs` — Add `run_as_user` to `Command::new()` via `sudo -u`
-- `crates/crew-cli/src/profiles.rs` — Add `isolation` config section
-- `crates/crew-cli/src/commands/gateway/mod.rs` — Read isolation config
+- `crates/octos-cli/src/process_manager.rs` — Add `run_as_user` to `Command::new()` via `sudo -u`
+- `crates/octos-cli/src/profiles.rs` — Add `isolation` config section
+- `crates/octos-cli/src/commands/gateway/mod.rs` — Read isolation config
 
 ### 4.3 Read isolation (medium-term)
 
@@ -494,7 +494,7 @@ ruleset.restrict_self()?;
 **Risk**: Overly restrictive read lists break commands that need unexpected system paths. Needs a configurable allowlist with sensible defaults and an escape hatch (`sandbox.read_allow_paths` in config).
 
 **Files to modify**:
-- `crates/crew-agent/src/sandbox.rs` — Add `read_paths: Vec<PathBuf>` to `SandboxConfig`, update SBPL generation and bwrap bind mounts
+- `crates/octos-agent/src/sandbox.rs` — Add `read_paths: Vec<PathBuf>` to `SandboxConfig`, update SBPL generation and bwrap bind mounts
 - New: Landlock backend in `sandbox.rs` (Linux 5.13+ detection via `prctl(PR_GET_NO_NEW_PRIVS)`)
 
 ### 4.4 Disk quotas (medium-term)
@@ -570,7 +570,7 @@ fn validate_bind_mount(source: &str) -> Result<()> {
 ```
 
 **Files to modify**:
-- `crates/crew-agent/src/sandbox.rs` — Add validation in `DockerSandbox::wrap_command()`
+- `crates/octos-agent/src/sandbox.rs` — Add validation in `DockerSandbox::wrap_command()`
 
 ### 4.6 Persistent Docker containers (medium-term)
 
@@ -604,8 +604,8 @@ async fn prune_idle_containers(max_idle: Duration, max_age: Duration) { ... }
 **Performance**: First command ~300ms (container creation), subsequent ~5ms (`docker exec`). Filesystem state (installed packages, build artifacts) persists across commands within a session.
 
 **Files to modify**:
-- `crates/crew-agent/src/sandbox.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
-- `crates/crew-cli/src/session_actor.rs` — Tie container lifecycle to `SessionActor` lifetime
+- `crates/octos-agent/src/sandbox.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
+- `crates/octos-cli/src/session_actor.rs` — Tie container lifecycle to `SessionActor` lifetime
 
 ### 4.7 Profile containers with network isolation (long-term)
 
@@ -626,13 +626,13 @@ crew serve (host)
 │     --network crew-internal \
 │     -v /data/sales:/data \
 │     --cpus 2 --memory 1g \
-│     crew-rs gateway --profile sales
+│     octos gateway --profile sales
 │
 ├── docker run -d --name crew-support \
 │     --network crew-internal \
 │     -v /data/support:/data \
 │     --cpus 1 --memory 512m \
-│     crew-rs gateway --profile support
+│     octos gateway --profile support
 ```
 
 #### The network problem
@@ -700,12 +700,12 @@ impl AllowlistProxy {
 }
 ```
 
-**Config** (`~/.crew/profiles/{id}.json`):
+**Config** (`~/.octos/profiles/{id}.json`):
 ```json
 {
   "isolation": {
     "run_in_container": true,
-    "image": "crew-rs:latest",
+    "image": "octos:latest",
     "cpus": "2",
     "memory": "1g",
     "allowed_domains": [
@@ -730,10 +730,10 @@ impl AllowlistProxy {
 **SSRF protection upgrade**: With the proxy model, SSRF protection moves from application-level (`ssrf.rs` checking in every tool) to infrastructure-level (proxy rejects private IPs for all traffic). Defense in depth — `ssrf.rs` stays as a second check, but the proxy is the primary gate.
 
 **Files to modify**:
-- `crates/crew-cli/src/process_manager.rs` — Spawn profiles as Docker containers
-- `crates/crew-cli/src/profiles.rs` — Add container isolation config
-- New: `crates/crew-cli/src/proxy.rs` — Domain-allowlist HTTPS CONNECT proxy (~200 LOC)
-- `crates/crew-cli/src/commands/serve.rs` — Start proxy alongside control plane
+- `crates/octos-cli/src/process_manager.rs` — Spawn profiles as Docker containers
+- `crates/octos-cli/src/profiles.rs` — Add container isolation config
+- New: `crates/octos-cli/src/proxy.rs` — Domain-allowlist HTTPS CONNECT proxy (~200 LOC)
+- `crates/octos-cli/src/commands/serve.rs` — Start proxy alongside control plane
 
 ### 4.8 Additional hardening
 
@@ -777,12 +777,12 @@ impl AllowlistProxy {
 
 ## 5. LAMP Stack Comparison
 
-crew-rs is solving the same multi-tenant isolation problem that PHP shared hosting solved 25+ years ago. This comparison identifies gaps and guides the hardening roadmap.
+octos is solving the same multi-tenant isolation problem that PHP shared hosting solved 25+ years ago. This comparison identifies gaps and guides the hardening roadmap.
 
 ### Isolation model comparison
 
 ```
-LAMP shared hosting (1990s):          crew-rs (2026):
+LAMP shared hosting (1990s):          octos (2026):
 
 Apache/nginx (root)                    crew serve (control plane)
 ├── PHP-FPM pool for tenant A          ├── Profile A (child process)
@@ -798,7 +798,7 @@ Apache/nginx (root)                    crew serve (control plane)
 
 ### Gap analysis
 
-| LAMP Feature | Enforcement | crew-rs Equivalent | Enforcement | Gap | Planned Fix |
+| LAMP Feature | Enforcement | octos Equivalent | Enforcement | Gap | Planned Fix |
 |-------------|-------------|-------------------|-------------|-----|-------------|
 | Per-tenant Unix UID | Kernel (DAC) | Per-profile OS process | Process boundary only | **No UID isolation** | §4.2 per-profile UID |
 | `chroot` / bind mount | Kernel | Per-user workspace | Application + SBPL writes | **Reads not restricted** | §4.3 read isolation (Landlock/SBPL) |
@@ -810,9 +810,9 @@ Apache/nginx (root)                    crew serve (control plane)
 | Network ACL (iptables) | Kernel | SSRF check in app | Application code | **No per-profile network** | §4.7 proxy allowlist |
 | Bandwidth metering | Kernel/iptables | None | — | **No metering** | §4.7 proxy can meter |
 
-### What crew-rs already does better than LAMP
+### What octos already does better than LAMP
 
-| Area | crew-rs Advantage |
+| Area | octos Advantage |
 |------|-------------------|
 | **SSRF protection** | DNS-resolved private IP blocking — PHP has no built-in SSRF guard |
 | **Symlink safety** | `O_NOFOLLOW` atomic rejection — PHP historically vulnerable to symlink races |

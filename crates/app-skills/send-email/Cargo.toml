@@ -3,7 +3,7 @@ name = "send-email"
 version = "1.0.0"
 edition = "2021"
 description = "Standalone send_email skill binary for SMTP and Feishu/Lark Mail"
-authors = ["hagency"]
+authors = ["octos"]
 
 [[bin]]
 name = "send_email"

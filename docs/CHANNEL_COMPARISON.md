@@ -1,10 +1,10 @@
-# Channel Integration Comparison: crew-rs vs OpenClaw
+# Channel Integration Comparison: octos vs OpenClaw
 
-A side-by-side comparison of how crew-rs and OpenClaw integrate with messaging platforms.
+A side-by-side comparison of how octos and OpenClaw integrate with messaging platforms.
 
 ## 1. Core Abstraction
 
-### crew-rs: Flat Trait (12 methods)
+### octos: Flat Trait (12 methods)
 
 ```rust
 pub trait Channel: Send + Sync {
@@ -65,7 +65,7 @@ ChannelPlugin = {
 
 ## 2. Connection Methods
 
-| Platform | crew-rs | OpenClaw |
+| Platform | octos | OpenClaw |
 |----------|---------|----------|
 | **Telegram** | Long polling (teloxide) | Long polling (grammY) |
 | **WhatsApp** | WebSocket to Node.js bridge (Baileys sidecar) | Direct Baileys integration (same process) |
@@ -78,25 +78,25 @@ ChannelPlugin = {
 | **Matrix** | N/A | matrix-bot-sdk (extension) |
 | **iMessage** | N/A | Apple Messages (WIP) |
 
-### crew-rs unique: Pure Rust Cryptography
+### octos unique: Pure Rust Cryptography
 
-crew-rs implements cryptographic primitives (SHA-1, SHA-256, AES-128-CBC, AES-256-CBC, HMAC, Base64) in pure Rust for Feishu, WeCom, and Twilio webhook signature verification. No OpenSSL or external crypto dependency. This is a deliberate design choice for the single-binary deployment model.
+octos implements cryptographic primitives (SHA-1, SHA-256, AES-128-CBC, AES-256-CBC, HMAC, Base64) in pure Rust for Feishu, WeCom, and Twilio webhook signature verification. No OpenSSL or external crypto dependency. This is a deliberate design choice for the single-binary deployment model.
 
-### crew-rs unique: WhatsApp via Bridge Architecture
+### octos unique: WhatsApp via Bridge Architecture
 
 ```
-WhatsApp ←→ Node.js Bridge (Baileys) ←→ WebSocket ←→ crew-rs
+WhatsApp ←→ Node.js Bridge (Baileys) ←→ WebSocket ←→ octos
                                               ↓
                                Port 3001 (WS) + Port 3002 (media HTTP)
 ```
 
-The bridge runs as a separate Node.js process. crew-rs communicates via WebSocket JSON messages (`{"type":"send","to":"...","text":"..."}`). Media files are served via HTTP on port 3002.
+The bridge runs as a separate Node.js process. octos communicates via WebSocket JSON messages (`{"type":"send","to":"...","text":"..."}`). Media files are served via HTTP on port 3002.
 
 OpenClaw embeds Baileys directly in the same Node.js process — simpler deployment but couples to Node.js.
 
 ## 3. Inbound Message Pipeline
 
-### crew-rs
+### octos
 
 ```
 Platform Event
@@ -134,7 +134,7 @@ Platform Event
 
 ### Differences
 
-| Step | crew-rs | OpenClaw |
+| Step | octos | OpenClaw |
 |------|---------|----------|
 | **Normalization** | In-channel (each channel handles its own format) | Centralized normalize layer |
 | **Access control** | `is_allowed()` single check | 3-level: DM policy + group policy + action gates |
@@ -146,7 +146,7 @@ Platform Event
 
 ## 4. Outbound Message Pipeline
 
-### crew-rs
+### octos
 
 ```
 Agent Response (ConversationResponse.content)
@@ -189,7 +189,7 @@ Agent Response
 
 ### Differences
 
-| Step | crew-rs | OpenClaw |
+| Step | octos | OpenClaw |
 |------|---------|----------|
 | **Crash recovery** | None | Write-ahead queue |
 | **Send hooks** | None | Pre/post-send hooks |
@@ -202,7 +202,7 @@ Agent Response
 
 ### Telegram
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | Long polling | Yes (teloxide) | Yes (grammY) |
 | Text messages | Yes | Yes |
@@ -222,7 +222,7 @@ Agent Response
 
 ### WhatsApp
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | Protocol | Baileys via Node.js bridge | Baileys direct |
 | Separate process | Yes (bridge.js sidecar) | No (same process) |
@@ -235,9 +235,9 @@ Agent Response
 | Edit/delete | No | Limited |
 | Markdown conversion | No (raw text) | Yes (**→*) |
 
-### Feishu/Lark (crew-rs only)
+### Feishu/Lark (octos only)
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | WebSocket mode | Yes (default) | N/A |
 | Webhook mode | Yes (port 9321) | N/A |
@@ -252,7 +252,7 @@ Agent Response
 
 ### Slack
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | Socket Mode | Yes | Yes |
 | Text messages | Yes | Yes |
@@ -265,7 +265,7 @@ Agent Response
 
 ### Discord
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | Gateway | Yes (Serenity) | Yes (discord.js) |
 | Text messages | Yes | Yes |
@@ -277,9 +277,9 @@ Agent Response
 | Server moderation | No | Yes |
 | Max message length | 1900 chars | 2000 chars |
 
-### WeCom (crew-rs only)
+### WeCom (octos only)
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | Webhook callback | Yes (port 9322) | N/A |
 | AES-128-CBC crypto | Yes (pure Rust) | N/A |
@@ -287,9 +287,9 @@ Agent Response
 | Text/image/voice/file | Yes | N/A |
 | Department targeting | Yes (toparty) | N/A |
 
-### Twilio (crew-rs only)
+### Twilio (octos only)
 
-| Feature | crew-rs | OpenClaw |
+| Feature | octos | OpenClaw |
 |---------|---------|----------|
 | SMS/MMS | Yes | N/A |
 | Webhook (port 8090) | Yes | N/A |
@@ -299,7 +299,7 @@ Agent Response
 
 ## 6. Access Control Comparison
 
-### crew-rs
+### octos
 
 ```
 Gateway Config
@@ -317,7 +317,7 @@ Others: direct HashSet lookup
 ```
 DM Policy (per account):
   → "allowlist" (default) / "open" / "disabled"
-  → allowFrom file: .crew/channels/{channel}/{account}/allow-from
+  → allowFrom file: .octos/channels/{channel}/{account}/allow-from
 
 Group Policy (per group):
   → mention-gating: only respond when @mentioned
@@ -331,11 +331,11 @@ Action Gates (per action):
 
 ### Impact
 
-crew-rs bots in Telegram groups respond to **every message**. This is a significant UX problem — the bot becomes noisy and unusable in active groups. Mention-gating (only respond when @mentioned or replied to) is a high-priority improvement.
+octos bots in Telegram groups respond to **every message**. This is a significant UX problem — the bot becomes noisy and unusable in active groups. Mention-gating (only respond when @mentioned or replied to) is a high-priority improvement.
 
 ## 7. Media Handling Comparison
 
-### crew-rs
+### octos
 
 **Download flow** (per channel):
 - Each channel downloads media to a temp directory
@@ -371,7 +371,7 @@ is_image(path) → bool   // .jpg, .jpeg, .png, .gif, .webp
 
 ### Differences
 
-| Aspect | crew-rs | OpenClaw |
+| Aspect | octos | OpenClaw |
 |--------|---------|----------|
 | Download location | Per-channel temp dir | Configurable media roots |
 | Size limits | None (platform-enforced) | Configurable per-account |
@@ -381,7 +381,7 @@ is_image(path) → bool   // .jpg, .jpeg, .png, .gif, .webp
 
 ## 8. Error Handling
 
-### crew-rs
+### octos
 
 - Channel failures logged but don't crash the gateway
 - Individual message send failures → log error, continue
@@ -399,7 +399,7 @@ is_image(path) → bool   // .jpg, .jpeg, .png, .gif, .webp
 ## 9. Architecture Summary
 
 ```
-                    crew-rs                          OpenClaw
+                    octos                          OpenClaw
                     ──────                           ────────
 
 Abstraction     Flat trait (12 methods)          Plugin adapters (~20 slots)
@@ -420,7 +420,7 @@ Language        Rust                            TypeScript
 Lines of code   ~5K (all channels)              ~15K (channel system)
 ```
 
-## 10. Recommended Improvements for crew-rs
+## 10. Recommended Improvements for octos
 
 ### Must Have (High Impact, Moderate Effort)
 

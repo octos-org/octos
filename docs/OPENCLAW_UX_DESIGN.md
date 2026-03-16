@@ -1,6 +1,6 @@
 # OpenClaw UX Design Approach
 
-Based on comprehensive analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) (Mar 2026). Documents the full UX philosophy, patterns, and implementation details for crew-rs to adopt.
+Based on comprehensive analysis of [openclaw/openclaw](https://github.com/openclaw/openclaw) (Mar 2026). Documents the full UX philosophy, patterns, and implementation details for octos to adopt.
 
 ---
 
@@ -45,9 +45,9 @@ Six core principles drive every OpenClaw surface (CLI, web, mobile, chat channel
 - Helpers suggest fixes: `openclaw doctor` for invalid state
 - Onboarding continues only after valid state achieved
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs currently uses `crew init` with basic config generation. Adopt:
+octos currently uses `crew init` with basic config generation. Adopt:
 - Two-tier wizard (quick vs manual)
 - Security acknowledgement
 - Inline validation with recovery hints
@@ -101,9 +101,9 @@ Features:
 - Multi-line cell wrapping at break chars (`/`, `-`, `_`, `.`)
 - Correct width calculation for colored text and emoji
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs uses `colored` + `tabled` crates. Adopt:
+octos uses `colored` + `tabled` crates. Adopt:
 - Shared palette constants (define once, use everywhere)
 - Progress with delayed start (avoid flicker)
 - ANSI-safe table wrapping
@@ -143,9 +143,9 @@ Architecture (`src/channels/draft-stream-loop.ts`):
 - WhatsApp: Configurable, default on. Skipped for unauthorized senders.
 - Privacy-aware: never sends receipts from blocked users
 
-### crew-rs adoption (partial)
+### octos adoption (partial)
 
-crew-rs now has `ChannelStreamReporter` with progressive edit-in-place streaming:
+octos now has `ChannelStreamReporter` with progressive edit-in-place streaming:
 - `stream_reporter.rs` accumulates chunks and edits a single message at a throttled rate (1000ms)
 - `<think>...</think>` blocks stripped before flushing to user (`strip_think_from_buffer()` handles partial/unclosed tags)
 - Status indicator (`✦ Thinking...`) deleted on first chunk arrival
@@ -203,9 +203,9 @@ Recognizes 30+ trigger words across languages:
 
 On abort: kills active run, clears queue, stops subagents, processes new message immediately.
 
-### crew-rs adoption ✅ Implemented
+### octos adoption ✅ Implemented
 
-crew-rs now has full queue mode support and multilingual abort:
+octos now has full queue mode support and multilingual abort:
 
 - **5 queue modes**: followup (default), collect, steer, interrupt, speculative
 - **Runtime switching**: `/queue followup|collect|steer|interrupt|spec` slash command
@@ -213,10 +213,10 @@ crew-rs now has full queue mode support and multilingual abort:
 - **Steer mode**: keeps only latest message, discards older
 - **Interrupt mode**: cancels current run, processes new message immediately
 - **Speculative mode**: primary agent call spawned as tokio task; inbox polled concurrently via `select!`; overflow messages exceeding patience threshold get immediate lightweight router responses while the slow call continues
-- **Multilingual abort**: 30+ trigger words across 9 languages (English, Chinese, Japanese, Russian, French, Spanish, Hindi, Arabic, Korean) in `crew-core/src/abort.rs`
+- **Multilingual abort**: 30+ trigger words across 9 languages (English, Chinese, Japanese, Russian, French, Spanish, Hindi, Arabic, Korean) in `octos-core/src/abort.rs`
 - **Slash command**: `/queue` shows current mode, no LLM round-trip
 
-See [CREW_UX_VISION.md](./CREW_UX_VISION.md) for full queue mode details and speculative overflow architecture.
+See [OCTOS_UX_VISION.md](./OCTOS_UX_VISION.md) for full queue mode details and speculative overflow architecture.
 
 ---
 
@@ -261,9 +261,9 @@ Examples from OpenClaw:
 - Validates auth profiles via keychain
 - Checks workspace integrity
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs uses `eyre` with suggestion hints (good foundation). Add:
+octos uses `eyre` with suggestion hints (good foundation). Add:
 - `crew doctor` command for proactive scanning
 - Inline fix commands in error messages
 - Structured error categories (config, auth, channel, network)
@@ -297,7 +297,7 @@ openclaw pairing approve telegram ABC123XYZ  # Approve
 - Works across all channels (generic flow)
 - Auto-adds approved sender to allowlist
 
-### crew-rs adoption
+### octos adoption
 
 Replace binary `allowed_senders` with pairing mode. See [OPENCLAW_CROSS_POLLINATION.md](./OPENCLAW_CROSS_POLLINATION.md) section 3.
 
@@ -332,9 +332,9 @@ discord/prod: enabled · configured · running · connected
 ⚠ slack/work: missing app token (required for Socket Mode)
 ```
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs has basic `crew status`. Add:
+octos has basic `crew status`. Add:
 - Per-account detail display
 - Last in/out timestamps
 - Actionable warnings with fix commands
@@ -372,9 +372,9 @@ crew-rs has basic `crew status`. Add:
 - **Slack:** Slash commands with Block Kit argument menus
 - **Text:** All commands also work as plain text (`/new`, `new`, `/start`)
 
-### crew-rs adoption (partial)
+### octos adoption (partial)
 
-crew-rs has `/new`, `/s` (switch session) and now also:
+octos has `/new`, `/s` (switch session) and now also:
 - **`/adaptive`** — view/toggle adaptive routing mode (off/hedge/lane) and QoS ranking ✅
 - **`/queue`** — view/change queue mode (followup/collect/steer/interrupt/speculative) ✅
 - **`/stop`** — multilingual abort triggers (30+ words, 9 languages) ✅
@@ -411,9 +411,9 @@ Same content, different formatting:
 | Max chars | 2000 | 4096 | 4000 | 4000 |
 | Streaming | Edit message | Draft/edit | Native stream | None |
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs's message coalescing already handles per-channel limits. Add:
+octos's message coalescing already handles per-channel limits. Add:
 - Per-channel markdown conversion (especially Slack mrkdwn)
 - Unified session identity across channels
 
@@ -438,9 +438,9 @@ crew-rs's message coalescing already handles per-channel limits. Add:
 - Language picker available
 - Falls back to English for missing translations
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs uses `colored` which respects `NO_COLOR`. Ensure:
+octos uses `colored` which respects `NO_COLOR`. Ensure:
 - Table output accounts for ANSI width
 - Terminal width checked before rendering
 - Keyboard navigation in interactive prompts (`rustyline` already supports this)
@@ -471,9 +471,9 @@ Single-page app served on gateway port (`http://127.0.0.1:18789/`):
 - Optimistic lock on config writes (base-hash guard)
 - Loopback auto-approved, remote requires pairing
 
-### crew-rs adoption
+### octos adoption
 
-crew-rs has a React dashboard. Ensure feature parity on:
+octos has a React dashboard. Ensure feature parity on:
 - Channel status with QR login
 - Session management (list, inspect, adjust)
 - Live log tailing
@@ -501,9 +501,9 @@ crew-rs has a React dashboard. Ensure feature parity on:
 - Built-in update flow
 - Settings panels for channels, skills, cron
 
-### crew-rs adoption
+### octos adoption
 
-Not directly applicable (crew-rs is CLI-first), but consider:
+Not directly applicable (octos is CLI-first), but consider:
 - System tray integration for gateway mode
 - Desktop notifications for channel events
 
@@ -530,7 +530,7 @@ Persistent outbound queue (`src/infra/outbound/delivery-queue.ts`):
 
 ---
 
-## Summary: What crew-rs Should Adopt (Priority Order)
+## Summary: What octos Should Adopt (Priority Order)
 
 | Priority | Feature | Status | Impact |
 |----------|---------|--------|--------|
@@ -538,7 +538,7 @@ Persistent outbound queue (`src/infra/outbound/delivery-queue.ts`):
 | P0 | Actionable error messages with fix commands | ❌ Planned | Developer trust |
 | P1 | Queue modes (followup/collect/steer/interrupt/speculative) | ✅ **Done** | Handles concurrent messages gracefully |
 | P1 | Multilingual abort triggers (30+ words, 9 languages) | ✅ **Done** | International user support |
-| P1 | Adaptive routing (Off/Hedge/Lane + QoS) | ✅ **Done** | Unique crew-rs differentiator |
+| P1 | Adaptive routing (Off/Hedge/Lane + QoS) | ✅ **Done** | Unique octos differentiator |
 | P1 | Slash commands (/adaptive, /queue) | ✅ **Done** | Runtime control without restart |
 | P1 | Auto-escalation (ResponsivenessObserver) | ✅ **Done** | Self-healing on degradation |
 | P1 | Hedged racing (race 2, take winner) | ✅ **Done** | Halves worst-case latency |

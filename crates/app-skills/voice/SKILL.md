@@ -2,7 +2,7 @@
 name: voice-skill
 description: Speech-to-text (ASR) and text-to-speech (TTS) via OminiX Qwen3 models. Triggers: voice, transcribe, speech to text, text to speech, read aloud, speak this, send voice, 语音识别, 语音合成, 朗读, 发语音.
 version: 1.0.0
-author: hagency
+author: octos
 always: true
 ---
 

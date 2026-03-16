@@ -1,14 +1,14 @@
-# Feature Parity: crew-rs vs Moltis
+# Feature Parity: octos vs Moltis
 
-Comparison of [crew-rs](https://github.com/heyong4725/crew-rs) (6-crate workspace, coding agent CLI + gateway) against [Moltis](https://github.com/moltis-org/moltis) (27-crate workspace, local-first AI gateway with web UI).
+Comparison of [octos](https://github.com/heyong4725/octos) (6-crate workspace, coding agent CLI + gateway) against [Moltis](https://github.com/moltis-org/moltis) (27-crate workspace, local-first AI gateway with web UI).
 
 Both are Rust, single-binary, multi-provider, sandboxed agent frameworks.
 
 ---
 
-## Features crew-rs ALREADY HAS (parity)
+## Features octos ALREADY HAS (parity)
 
-| Feature | crew-rs | Moltis |
+| Feature | octos | Moltis |
 |---|---|---|
 | Multi-provider LLM | 4 native + 8 compatible (12 total) | 16+ providers |
 | Streaming SSE | Per-provider parsers | WebSocket streaming |
@@ -38,34 +38,34 @@ Both are Rust, single-binary, multi-provider, sandboxed agent frameworks.
 
 ---
 
-## Features Moltis HAS that crew-rs LACKS
+## Features Moltis HAS that octos LACKS
 
-| # | Feature | Moltis Implementation | Improvement Potential for crew-rs |
+| # | Feature | Moltis Implementation | Improvement Potential for octos |
 |---|---|---|---|
 | 1 | ~~**Hook/Lifecycle System**~~ | 17 lifecycle events (BeforeToolCall, BeforeLLMCall, MessageSending, etc.). Sequential for modifying, parallel for read-only. Shell protocol (JSON stdin, exit code + stdout). Circuit breaker (3 failures -> auto-disable). HOOK.md discovery. | **DONE** -- 4 events (before/after tool call, before/after LLM call). Shell protocol (JSON stdin, exit codes 0/1/2+). Circuit breaker with configurable threshold. Tool filtering. Env sanitization via BLOCKED_ENV_VARS. Wired into chat, gateway, serve. Config hot-reload aware. |
 | 2 | ~~**Built-in Web UI**~~ | SPA embedded via `include_dir!()`. WebSocket streaming. Settings panel. Hook editor. Session browser. | **DONE** -- Embedded SPA via `rust-embed` at `/` with session sidebar, chat, SSE streaming, dark theme. |
-| 3 | **WebAuthn / Passkey Auth** | FIDO2 credentials (Touch ID, security keys). Stored in SQLite. | **LOW** -- crew-rs targets CLI/bot use cases where passkeys are less relevant. |
-| 4 | **Apple Container** (macOS native containers) | Native macOS containerization beyond sandbox-exec. | **LOW** -- crew-rs already has sandbox-exec. Apple Container is newer/niche. |
+| 3 | **WebAuthn / Passkey Auth** | FIDO2 credentials (Touch ID, security keys). Stored in SQLite. | **LOW** -- octos targets CLI/bot use cases where passkeys are less relevant. |
+| 4 | **Apple Container** (macOS native containers) | Native macOS containerization beyond sandbox-exec. | **LOW** -- octos already has sandbox-exec. Apple Container is newer/niche. |
 | 5 | ~~**Browser Automation**~~ | Playwright-based browser tool with session pool. | **DONE** -- Headless Chrome via CDP over tokio-tungstenite. Feature-gated `browser`. Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, zombie reaping, secure tempfiles. |
 | 6 | **TTS (Text-to-Speech)** | Multiple TTS providers (ElevenLabs, etc.). | **LOW** -- Niche for CLI/bot agent. |
-| 7 | **Onboarding Wizard** | Guided first-run setup for identity, profile, personality. | **LOW** -- crew-rs has `crew init` which is simpler but sufficient. |
+| 7 | **Onboarding Wizard** | Guided first-run setup for identity, profile, personality. | **LOW** -- octos has `crew init` which is simpler but sufficient. |
 | 8 | **Sandbox Image Management** | CLI commands: `sandbox list/build/clean/remove`. Deterministic image tags (hash of base + packages). Auto-rebuild on package change. | **LOW** -- Nice UX but not critical. |
 | 9 | ~~**Message Queue Modes**~~ | `followup` (replay each queued message) vs `collect` (concatenate). Handles messages arriving during active agent run. | **DONE** -- `QueueMode::Followup` (FIFO) vs `QueueMode::Collect` (merge by session) via `gateway.queue_mode`. |
 | 10 | ~~**Prometheus Metrics**~~ | `/metrics` endpoint, SQLite history for metrics. | **DONE** -- `/metrics` endpoint with tool call counters/histograms and LLM token counters. |
-| 11 | **fd-lock for Sessions** | File-level locking prevents concurrent JSONL corruption. | **LOW** -- crew-rs uses atomic write-then-rename which is mostly safe. |
+| 11 | **fd-lock for Sessions** | File-level locking prevents concurrent JSONL corruption. | **LOW** -- octos uses atomic write-then-rename which is mostly safe. |
 | 12 | **Per-IP Rate Limiting** | Built-in throttling for unauthenticated traffic. `429 + Retry-After`. | **LOW** -- Only relevant for the REST API feature. |
 
 ---
 
-## Features crew-rs HAS that Moltis LACKS
+## Features octos HAS that Moltis LACKS
 
-| Feature | crew-rs | Notes |
+| Feature | octos | Notes |
 |---|---|---|
 | **WhatsApp channel** | WebSocket bridge to Baileys | Moltis doesn't have this |
 | **Slack channel** | Socket Mode + REST | Moltis doesn't have this |
 | **Feishu/Lark channel** | WebSocket + REST | Moltis doesn't have this |
 | **Email channel** | IMAP + SMTP | Moltis doesn't have this |
-| **Heartbeat service** | Periodic HEARTBEAT.md check | Unique to crew-rs |
+| **Heartbeat service** | Periodic HEARTBEAT.md check | Unique to octos |
 | **diff_edit tool** | Unified diff with fuzzy matching | Moltis uses standard edit |
 | **Pricing module** | Per-model cost tracking | Not mentioned in Moltis |
 | **OAuth PKCE for OpenAI** | Browser + device code flows | Moltis has OAuth but less documented |
@@ -100,7 +100,7 @@ Both are Rust, single-binary, multi-provider, sandboxed agent frameworks.
 
 10. ~~**Built-in web UI**~~ DONE -- Embedded SPA via `rust-embed` at `/` with session sidebar, chat, SSE streaming, dark theme. Vanilla HTML/CSS/JS, no build tools.
 
-11. ~~**Prometheus metrics endpoint**~~ DONE -- `/metrics` endpoint with `crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `crew_llm_tokens_total` counters/histograms via `metrics` + `metrics-exporter-prometheus`.
+11. ~~**Prometheus metrics endpoint**~~ DONE -- `/metrics` endpoint with `crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `octos_llm_tokens_total` counters/histograms via `metrics` + `metrics-exporter-prometheus`.
 
 12. ~~**Message queue modes**~~ DONE -- `QueueMode::Followup` (FIFO, default) vs `QueueMode::Collect` (merge queued messages by session) via `gateway.queue_mode` config field.
 

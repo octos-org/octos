@@ -1,6 +1,6 @@
 # Plugin Sandbox & Tool Policy Design
 
-> Two-layer security for crew-rs plugins: tool-level permission policies
+> Two-layer security for octos plugins: tool-level permission policies
 > (which tools can be called) and runtime sandboxing (what a tool can do).
 
 ## Status
@@ -14,7 +14,7 @@
 
 ## 1. Why Sandbox Plugins?
 
-crew-rs plugins are currently arbitrary binaries invoked via subprocess. This works
+octos plugins are currently arbitrary binaries invoked via subprocess. This works
 for trusted first-party plugins but provides no protection against:
 
 - Memory exhaustion (plugin allocates unbounded memory)
@@ -76,7 +76,7 @@ separate concern.
 Major agent frameworks (LangChain, CrewAI, AutoGen) have **no built-in per-tool
 authorization**. This is widely recognized as a gap.
 
-### Proposed Design for crew-rs
+### Proposed Design for octos
 
 Tool policies are defined per-profile in the profile config:
 
@@ -112,7 +112,7 @@ Tool policies are defined per-profile in the profile config:
 3. Skill-level declarations (a skill can restrict its own tools)
 4. Default: allow (backward compatible)
 
-**Implementation location:** `crew-agent` tool dispatch, before calling
+**Implementation location:** `octos-agent` tool dispatch, before calling
 `ToolRunner::run()`. This is a ~50-line check with no new dependencies.
 
 ### What This Enables
@@ -185,7 +185,7 @@ Several production projects already combine AI agents with Wasm sandboxing:
 | **[Hyper-MCP](https://github.com/tuananh/hyper-mcp)** | Wasm | Fast MCP server with Wasm plugin extensions. |
 | **[Extism](https://extism.org)** | Wasmtime | General Wasm plugin framework with explicit AI/LLM integration guides. Host grants capabilities to each plugin. |
 
-Wassette is the closest to what crew-rs needs: a Rust + Wasmtime host that runs
+Wassette is the closest to what octos needs: a Rust + Wasmtime host that runs
 tools as sandboxed Wasm components with deny-by-default capabilities and
 per-domain network approval.
 
@@ -194,7 +194,7 @@ per-domain network approval.
 ## 6. Wasmtime vs WasmEdge
 
 Both are production-grade Wasm runtimes. Here's why **Wasmtime** is the better
-fit for crew-rs.
+fit for octos.
 
 ### Head-to-head
 
@@ -214,12 +214,12 @@ fit for crew-rs.
 | **WASI-NN (ML)** | ONNX runtime | GGML, Whisper, TF-Lite, ONNX, OpenVINO |
 | **Docker/OCI integration** | No | Yes (Docker Desktop ships WasmEdge) |
 
-### Why Wasmtime wins for crew-rs
+### Why Wasmtime wins for octos
 
 1. **Pure Rust crate** — `cargo add wasmtime`, zero system dependencies. WasmEdge
    requires installing a C++ library and cmake.
 
-2. **Tokio-native async** — crew-rs is a tokio application. Wasmtime's
+2. **Tokio-native async** — octos is a tokio application. Wasmtime's
    `call_async` and `ResourceLimiterAsync` integrate directly with our event loop.
    WasmEdge would require bridging between async runtimes.
 
@@ -239,7 +239,7 @@ fit for crew-rs.
 - Plugins that need **WASI-NN** for ML inference (Whisper, GGML, etc.)
 - Environments where Docker integration matters
 
-These are real advantages but not relevant for crew-rs's use case of sandboxing
+These are real advantages but not relevant for octos's use case of sandboxing
 plugin code within a Rust host process.
 
 ---
@@ -258,7 +258,7 @@ Current model. Plugins are binaries invoked via stdin/stdout JSON protocol.
 
 Add per-profile tool allow/deny rules to the orchestration layer. See §2 above.
 
-- **Effort**: ~50 lines in `crew-agent` tool dispatch
+- **Effort**: ~50 lines in `octos-agent` tool dispatch
 - **No new dependencies**
 - **Solves**: "customer bot can't call admin tools" use case
 - **Implementation**: Check `tool_policy` rules before `ToolRunner::run()`
@@ -291,7 +291,7 @@ manifest.json:
 
 ```
 ┌─────────────────────────────────────────────┐
-│  crew-rs host process                       │
+│  octos host process                       │
 │                                             │
 │  ┌───────────────┐  ┌───────────────────┐   │
 │  │ Native Plugin │  │ Wasm Sandbox      │   │
@@ -312,7 +312,7 @@ manifest.json:
 
 **Implementation steps**:
 
-1. Add `wasmtime` dependency to `crew-plugin` (feature-gated: `sandbox`)
+1. Add `wasmtime` dependency to `octos-plugin` (feature-gated: `sandbox`)
 2. Define plugin WIT interface:
    ```wit
    package crew:plugin@0.1.0;
@@ -336,7 +336,7 @@ manifest.json:
 3. `WasmPluginRunner` struct: instantiates Wasm module with fuel/memory limits
    and WASI capability configuration
 4. Plugin dispatch: check `manifest.runtime` → route to subprocess or Wasm runner
-5. Guest SDK crate (`crew-plugin-guest`) for Rust plugins compiling to
+5. Guest SDK crate (`octos-plugin-guest`) for Rust plugins compiling to
    `wasm32-wasip2`
 
 ### Phase 4 — Syscall Filtering on Native Plugins (Optional)

@@ -1,28 +1,28 @@
 # OpenClaw Cross-Pollination Guide
 
-Based on comprehensive code review of [openclaw/openclaw](https://github.com/openclaw/openclaw) (Mar 2026). This documents what crew-rs should adopt from OpenClaw and what crew-rs already does better.
+Based on comprehensive code review of [openclaw/openclaw](https://github.com/openclaw/openclaw) (Mar 2026). This documents what octos should adopt from OpenClaw and what octos already does better.
 
 ---
 
-## What crew-rs Should Adopt from OpenClaw
+## What octos Should Adopt from OpenClaw
 
 ### 1. Channel Adapter Pattern
 
-**Current crew-rs**: Single `Channel` trait with 14 methods.
+**Current octos**: Single `Channel` trait with 14 methods.
 **OpenClaw**: 14+ decomposed adapter traits per channel.
 
 See [CHANNEL_ADAPTER_PATTERN.md](./CHANNEL_ADAPTER_PATTERN.md) for the full proposal with Rust trait definitions and migration plan.
 
 ### 2. Slack Reference Architecture
 
-**Current crew-rs**: Basic Slack with Socket Mode, text-only.
+**Current octos**: Basic Slack with Socket Mode, text-only.
 **OpenClaw**: 40+ file Slack implementation with streaming, Block Kit, threading, slash commands.
 
 See [SLACK_REFERENCE_ARCHITECTURE.md](./SLACK_REFERENCE_ARCHITECTURE.md) for the full feature reference and implementation priority.
 
 ### 3. DM Pairing Mode
 
-**Current crew-rs**: Binary `allowed_senders` list — edit config to add users.
+**Current octos**: Binary `allowed_senders` list — edit config to add users.
 **OpenClaw**: 4-mode DM policy (pairing, allowlist, open, disabled).
 
 The **pairing mode** is the key innovation:
@@ -53,7 +53,7 @@ pub struct PairingChallenge {
 
 ### 4. Secret Redaction in Logs
 
-**Current crew-rs**: Basic `tracing` output, no redaction.
+**Current octos**: Basic `tracing` output, no redaction.
 **OpenClaw**: 13+ regex patterns covering API keys, PEM blocks, token prefixes.
 
 Token prefixes to redact:
@@ -79,7 +79,7 @@ Implementation: Add a tracing subscriber layer that intercepts log output and ap
 
 ### 5. Webhook Body Flood Protection
 
-**Current crew-rs**: No body size limits on webhook handlers.
+**Current octos**: No body size limits on webhook handlers.
 **OpenClaw**: Per-request streaming byte tracking with hard limits.
 
 ```rust
@@ -94,7 +94,7 @@ Enforce on every HTTP webhook handler (Telegram, Slack HTTP mode, Feishu, etc.).
 
 ### 6. Unauthorized Flood Guard (WebSocket)
 
-**Current crew-rs**: No auth flood detection on WebSocket connections.
+**Current octos**: No auth flood detection on WebSocket connections.
 **OpenClaw**: Closes connections after N unauthorized attempts with logarithmic logging.
 
 ```rust
@@ -109,7 +109,7 @@ Apply to the dashboard WebSocket and any gateway WebSocket endpoints.
 
 ### 7. Reconnection Intelligence
 
-**Current crew-rs**: Fixed 5-second backoff for WhatsApp.
+**Current octos**: Fixed 5-second backoff for WhatsApp.
 **OpenClaw**: Error-code-specific handling per channel.
 
 Pattern to adopt:
@@ -139,7 +139,7 @@ Map specific error codes to actions:
 
 ### 8. Multi-Account Per Channel
 
-**Current crew-rs**: One connection per channel type.
+**Current octos**: One connection per channel type.
 **OpenClaw**: Multiple accounts per channel with independent config.
 
 ```rust
@@ -160,7 +160,7 @@ Use cases:
 
 ### 9. Per-Channel/Per-Group Tool Policies
 
-**Current crew-rs**: Global tool policy only.
+**Current octos**: Global tool policy only.
 **OpenClaw**: Tool policies scoped to channel, group, or even individual Slack channels.
 
 ```rust
@@ -176,7 +176,7 @@ Critical for safety: restrict `exec`, `write_file`, `shell` in group chats where
 
 ### 10. Health Monitoring & Status
 
-**Current crew-rs**: No channel health reporting.
+**Current octos**: No channel health reporting.
 **OpenClaw**: Per-channel health state with connection tracking, issue collection, and probe support.
 
 ```rust
@@ -202,33 +202,33 @@ Expose via dashboard API for real-time monitoring.
 
 ---
 
-## What crew-rs Already Does Better
+## What octos Already Does Better
 
-These are areas where crew-rs's existing implementation is ahead of OpenClaw. Keep and maintain these advantages.
+These are areas where octos's existing implementation is ahead of OpenClaw. Keep and maintain these advantages.
 
 ### 1. Adaptive Model Routing with Circuit Breakers
 
-crew-rs's `AdaptiveRouter` scores providers using weighted metrics (latency EMA + error rate + priority). OpenClaw uses static fallback chains with per-profile cooldown but no metrics-driven routing.
+octos's `AdaptiveRouter` scores providers using weighted metrics (latency EMA + error rate + priority). OpenClaw uses static fallback chains with per-profile cooldown but no metrics-driven routing.
 
-**Keep**: `crates/crew-llm/src/adaptive.rs`
+**Keep**: `crates/octos-llm/src/adaptive.rs`
 
 ### 2. Hybrid Memory Search (BM25 + HNSW)
 
-crew-rs has a dedicated memory crate with BM25 keyword scoring + HNSW vector similarity. OpenClaw uses SQLite without hybrid retrieval.
+octos has a dedicated memory crate with BM25 keyword scoring + HNSW vector similarity. OpenClaw uses SQLite without hybrid retrieval.
 
-**Keep**: `crates/crew-memory/src/hybrid_search.rs`
+**Keep**: `crates/octos-memory/src/hybrid_search.rs`
 
 ### 3. Token-Aware Compaction
 
-crew-rs's compaction is model-aware, estimating actual token counts. More precise than character-count heuristics.
+octos's compaction is model-aware, estimating actual token counts. More precise than character-count heuristics.
 
-**Keep**: `crates/crew-agent/src/compaction.rs`
+**Keep**: `crates/octos-agent/src/compaction.rs`
 
 ### 4. Platform-Specific Sandbox Backends
 
 Three backends with auto-detection: bubblewrap (Linux), sandbox-exec (macOS), Docker. OpenClaw's sandbox is Docker-focused.
 
-**Keep**: `crates/crew-agent/src/sandbox.rs`
+**Keep**: `crates/octos-agent/src/sandbox.rs`
 
 ### 5. Environment Variable Sanitization
 
@@ -240,7 +240,7 @@ Three backends with auto-detection: bubblewrap (Linux), sandbox-exec (macOS), Do
 
 1MB max per tool call with non-allocating `estimate_json_size`. OpenClaw has no equivalent guard.
 
-**Keep**: `crates/crew-agent/src/tools/mod.rs`
+**Keep**: `crates/octos-agent/src/tools/mod.rs`
 
 ### 7. Structured Error Context (eyre)
 
@@ -252,7 +252,7 @@ Three backends with auto-detection: bubblewrap (Linux), sandbox-exec (macOS), Do
 
 Write-then-rename for crash-safe JSONL persistence. Prevents half-written files.
 
-**Keep**: `crates/crew-bus/src/session.rs`
+**Keep**: `crates/octos-bus/src/session.rs`
 
 ### 9. Native Performance
 
@@ -264,7 +264,7 @@ Pure Rust with rustls, no V8 overhead. Streaming via async channels without buff
 
 ## Subagent Enhancements
 
-crew-rs already has background subagent spawning via `SpawnTool` (`crates/crew-agent/src/tools/spawn.rs`). Four enhancements to make it production-grade:
+octos already has background subagent spawning via `SpawnTool` (`crates/octos-agent/src/tools/spawn.rs`). Four enhancements to make it production-grade:
 
 ### 11. Cascade Abort
 
@@ -316,7 +316,7 @@ impl SubagentRegistry {
 }
 ```
 
-**Integration** (`crates/crew-agent/src/tools/spawn.rs`):
+**Integration** (`crates/octos-agent/src/tools/spawn.rs`):
 ```rust
 // In background spawn (line ~358):
 let cancel = CancellationToken::new();
@@ -338,7 +338,7 @@ let handle = tokio::spawn(async move {
 registry.register(subagent_id, parent_session, cancel, handle);
 ```
 
-**In SessionActor cancel handler** (`crates/crew-cli/src/session_actor.rs`):
+**In SessionActor cancel handler** (`crates/octos-cli/src/session_actor.rs`):
 ```rust
 ActorMessage::Cancel => {
     self.cancelled.store(true, Ordering::Relaxed);
@@ -347,9 +347,9 @@ ActorMessage::Cancel => {
 ```
 
 **Files to modify**:
-- `crates/crew-agent/src/tools/spawn.rs` — Add `CancellationToken` to spawned tasks
-- `crates/crew-cli/src/session_actor.rs` — Call `cancel_for_parent()` on cancel
-- New: `crates/crew-agent/src/subagent_registry.rs` — Registry struct (~80 LOC)
+- `crates/octos-agent/src/tools/spawn.rs` — Add `CancellationToken` to spawned tasks
+- `crates/octos-cli/src/session_actor.rs` — Call `cancel_for_parent()` on cancel
+- New: `crates/octos-agent/src/subagent_registry.rs` — Registry struct (~80 LOC)
 
 ### 12. Result Streaming
 
@@ -409,7 +409,7 @@ tokio::spawn(async move {
 });
 ```
 
-**In Agent loop** (`crates/crew-agent/src/agent.rs`):
+**In Agent loop** (`crates/octos-agent/src/agent.rs`):
 ```rust
 // After each LLM streaming chunk:
 if let Some(ref tx) = self.progress_tx {
@@ -429,9 +429,9 @@ if let Some(ref tx) = self.progress_tx {
 ```
 
 **Files to modify**:
-- `crates/crew-agent/src/agent.rs` — Add optional `progress_tx` channel, emit progress events
-- `crates/crew-agent/src/tools/spawn.rs` — Create channel, forward to parent
-- New: `crates/crew-agent/src/subagent_progress.rs` — Types (~40 LOC)
+- `crates/octos-agent/src/agent.rs` — Add optional `progress_tx` channel, emit progress events
+- `crates/octos-agent/src/tools/spawn.rs` — Create channel, forward to parent
+- New: `crates/octos-agent/src/subagent_progress.rs` — Types (~40 LOC)
 
 ### 13. Multi-Level Spawning
 
@@ -463,7 +463,7 @@ impl SpawnContext {
 }
 ```
 
-**Integration in SpawnTool** (`crates/crew-agent/src/tools/spawn.rs`):
+**Integration in SpawnTool** (`crates/octos-agent/src/tools/spawn.rs`):
 ```rust
 // Replace the hard deny (line ~303):
 // OLD:
@@ -497,7 +497,7 @@ let child_spawn_tool = SpawnTool::new(/* ... */)
 - Each level inherits parent's tool policy restrictions (deny list accumulates)
 
 **Files to modify**:
-- `crates/crew-agent/src/tools/spawn.rs` — Replace hard deny with depth check
+- `crates/octos-agent/src/tools/spawn.rs` — Replace hard deny with depth check
 - New: `SpawnContext` struct in spawn.rs or separate file (~30 LOC)
 
 ### 14. Context Forking
@@ -545,7 +545,7 @@ if let Some(n) = input.fork_context {
 worker.run_task_with_context(&subtask, initial_messages).await
 ```
 
-**In Agent** (`crates/crew-agent/src/agent.rs`):
+**In Agent** (`crates/octos-agent/src/agent.rs`):
 ```rust
 // Modify run_task to accept optional pre-seeded messages:
 pub async fn run_task_with_context(
@@ -569,14 +569,14 @@ let forked = truncate_to_token_budget(parent_history, max_fork_tokens);
 ```
 
 **Files to modify**:
-- `crates/crew-agent/src/tools/spawn.rs` — Add `fork_context` param, read parent history
-- `crates/crew-agent/src/agent.rs` — Add `run_task_with_context()` variant
+- `crates/octos-agent/src/tools/spawn.rs` — Add `fork_context` param, read parent history
+- `crates/octos-agent/src/agent.rs` — Add `run_task_with_context()` variant
 
 ---
 
 ## Provider Racing
 
-crew-rs's `LlmProvider` trait (`&self + Send + Sync`) already allows concurrent calls. Add a `RacingProvider` wrapper that races two providers and returns whichever responds first.
+octos's `LlmProvider` trait (`&self + Send + Sync`) already allows concurrent calls. Add a `RacingProvider` wrapper that races two providers and returns whichever responds first.
 
 See [PROVIDER_RACING.md](./PROVIDER_RACING.md) for the full design with code, streaming racing, adaptive integration, and cost considerations.
 
@@ -589,14 +589,14 @@ See [PROVIDER_RACING.md](./PROVIDER_RACING.md) for the full design with code, st
 | Per-sender rate limiting | No sliding-window rate limit at channel ingress | High |
 | Cost-aware routing | Neither dynamically selects cheaper models | Medium |
 | Request correlation IDs | No trace ID propagation across async boundaries | Medium |
-| Config migration system | crew-rs has unused `version` field | Medium |
+| Config migration system | octos has unused `version` field | Medium |
 | Plugin runtime sandboxing | Plugins can access full Node.js/Rust APIs | Low |
 
 ---
 
 ## Summary
 
-| Area | OpenClaw Advantage | crew-rs Advantage |
+| Area | OpenClaw Advantage | octos Advantage |
 |------|-------------------|-------------------|
 | Channel abstraction | Adapter pattern (14 traits) | -- |
 | Slack depth | 40+ files, Block Kit, streaming | -- |
@@ -623,4 +623,4 @@ See [PROVIDER_RACING.md](./PROVIDER_RACING.md) for the full design with code, st
 - [PROVIDER_RACING.md](./PROVIDER_RACING.md) — Provider racing design and implementation
 - [OPENCLAW_UX_DESIGN.md](./OPENCLAW_UX_DESIGN.md) — OpenClaw's UX design approach
 - [openclaw-gap-analysis.md](./openclaw-gap-analysis.md) — Previous gap analysis (all 9 items complete)
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — crew-rs architecture overview
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — octos architecture overview

@@ -1,24 +1,24 @@
 # NLSpec Features Guide
 
-Technical documentation for the NLSpec feature set implemented across crew-rs. These features were added to close gaps identified in the [Attractor NLSpec audit](./ATTRACTOR_GAP_ANALYSIS.md).
+Technical documentation for the NLSpec feature set implemented across octos. These features were added to close gaps identified in the [Attractor NLSpec audit](./ATTRACTOR_GAP_ANALYSIS.md).
 
 ## Architecture Overview
 
-NLSpec features span three crates in the crew-rs workspace:
+NLSpec features span three crates in the octos workspace:
 
 ```
-crew-llm          LLM abstraction layer
+octos-llm          LLM abstraction layer
   - error.rs        Typed error hierarchy
   - high_level.rs   Ergonomic LlmClient API
   - middleware.rs    Request/response interceptors
   - catalog.rs      Model registry with capabilities & costs
 
-crew-agent         Agent runtime
+octos-agent         Agent runtime
   - exec_env.rs     Execution environment abstraction
   - provider_tools.rs  Per-provider tool adjustments
   - turn.rs         Typed conversation turns
 
-crew-pipeline      Pipeline orchestration
+octos-pipeline      Pipeline orchestration
   - human_gate.rs   Human-in-the-loop gates
   - fidelity.rs     Context carryover control
   - manager.rs      Child pipeline supervision
@@ -28,14 +28,14 @@ crew-pipeline      Pipeline orchestration
 
 ---
 
-## crew-llm Features
+## octos-llm Features
 
-### Typed Error Hierarchy (`crew_llm::error`)
+### Typed Error Hierarchy (`octos_llm::error`)
 
 Replaces string-matching on `eyre::Report` with structured, actionable errors.
 
 ```rust
-use crew_llm::error::{LlmError, LlmErrorKind};
+use octos_llm::error::{LlmError, LlmErrorKind};
 
 match client.generate("hello").await {
     Ok(text) => println!("{text}"),
@@ -87,13 +87,13 @@ assert_eq!(err.kind(), &LlmErrorKind::RateLimited);
 assert!(err.is_retryable());
 ```
 
-### High-Level LLM Client (`crew_llm::high_level`)
+### High-Level LLM Client (`octos_llm::high_level`)
 
 Ergonomic wrapper around `LlmProvider` for common patterns.
 
 ```rust
-use crew_llm::high_level::LlmClient;
-use crew_llm::config::ChatConfig;
+use octos_llm::high_level::LlmClient;
+use octos_llm::config::ChatConfig;
 
 let client = LlmClient::new(provider);
 
@@ -134,12 +134,12 @@ let client = LlmClient::new(provider)
     });
 ```
 
-### Middleware Pipeline (`crew_llm::middleware`)
+### Middleware Pipeline (`octos_llm::middleware`)
 
 Composable request/response interceptors for cross-cutting concerns.
 
 ```rust
-use crew_llm::middleware::{MiddlewareStack, LlmMiddleware, LoggingMiddleware, CostTracker};
+use octos_llm::middleware::{MiddlewareStack, LlmMiddleware, LoggingMiddleware, CostTracker};
 
 // Stack middleware layers
 let tracker = Arc::new(CostTracker::new());
@@ -159,7 +159,7 @@ println!("Request count: {}", tracker.request_count());
 **Custom middleware (e.g., caching):**
 
 ```rust
-use crew_llm::middleware::LlmMiddleware;
+use octos_llm::middleware::LlmMiddleware;
 
 struct CacheMiddleware { /* ... */ }
 
@@ -196,12 +196,12 @@ impl LlmMiddleware for CacheMiddleware {
 
 **Note:** Streaming calls (`chat_stream`) bypass middleware layers (logged as a debug warning). This is by design since streaming responses can't be buffered for `after()` hooks without breaking the streaming contract.
 
-### Model Catalog (`crew_llm::catalog`)
+### Model Catalog (`octos_llm::catalog`)
 
 Programmatic model discovery with capabilities, costs, and aliases.
 
 ```rust
-use crew_llm::catalog::ModelCatalog;
+use octos_llm::catalog::ModelCatalog;
 
 let catalog = ModelCatalog::with_defaults();
 
@@ -251,14 +251,14 @@ catalog.register(ModelInfo {
 
 ---
 
-## crew-agent Features
+## octos-agent Features
 
-### Execution Environment (`crew_agent::exec_env`)
+### Execution Environment (`octos_agent::exec_env`)
 
 Abstracts command execution across local and Docker environments.
 
 ```rust
-use crew_agent::exec_env::{LocalEnvironment, DockerEnvironment, ExecEnvironment};
+use octos_agent::exec_env::{LocalEnvironment, DockerEnvironment, ExecEnvironment};
 
 // Local execution
 let local = LocalEnvironment::new("/path/to/workdir");
@@ -282,12 +282,12 @@ let entries = local.list_dir("src").await?;
 - Docker paths are validated against injection characters (`\0`, `\n`, `\r`, `:`)
 - Docker `write_file` checks command exit status
 
-### Provider Toolsets (`crew_agent::provider_tools`)
+### Provider Toolsets (`octos_agent::provider_tools`)
 
 Per-provider tool adjustments for optimal tool use across different LLM providers.
 
 ```rust
-use crew_agent::provider_tools::{ProviderToolsets, ToolAdjustment};
+use octos_agent::provider_tools::{ProviderToolsets, ToolAdjustment};
 
 let toolsets = ProviderToolsets::with_defaults();
 
@@ -315,13 +315,13 @@ toolsets.register("my-provider", ToolAdjustment {
 | anthropic | diff_edit, shell | - |
 | google | shell, read_file, write_file | diff_edit |
 
-### Typed Turns (`crew_agent::turn`)
+### Typed Turns (`octos_agent::turn`)
 
 Typed wrapper around `Message` that tracks conversation semantics.
 
 ```rust
-use crew_agent::turn::{Turn, TurnKind, turns_to_messages};
-use crew_core::Message;
+use octos_agent::turn::{Turn, TurnKind, turns_to_messages};
+use octos_core::Message;
 
 // Create typed turns
 let turns = vec![
@@ -348,14 +348,14 @@ let messages: Vec<Message> = turns_to_messages(&turns);
 
 ---
 
-## crew-pipeline Features
+## octos-pipeline Features
 
-### Human-in-the-Loop Gates (`crew_pipeline::human_gate`)
+### Human-in-the-Loop Gates (`octos_pipeline::human_gate`)
 
 Block pipeline execution pending human approval or input.
 
 ```rust
-use crew_pipeline::human_gate::{
+use octos_pipeline::human_gate::{
     ChannelInputProvider, HumanInputProvider, HumanRequest, HumanInputType,
 };
 
@@ -376,7 +376,7 @@ tokio::spawn(async move {
 });
 
 // UI/CLI sends back the human's decision
-use crew_pipeline::human_gate::HumanResponse;
+use octos_pipeline::human_gate::HumanResponse;
 sender.send(HumanResponse {
     approved: true,
     input: None,
@@ -401,18 +401,18 @@ HumanInputType::Choice {
 **Auto-approve for testing/CI:**
 
 ```rust
-use crew_pipeline::human_gate::AutoApproveProvider;
+use octos_pipeline::human_gate::AutoApproveProvider;
 let provider = AutoApproveProvider; // Always returns approved=true
 ```
 
 **Timeout:** Default 5 minutes (`DEFAULT_INPUT_TIMEOUT`). Configurable via `ChannelInputProvider::with_timeout(Duration)`.
 
-### Context Fidelity Control (`crew_pipeline::fidelity`)
+### Context Fidelity Control (`octos_pipeline::fidelity`)
 
 Controls how much context carries over between pipeline nodes.
 
 ```rust
-use crew_pipeline::fidelity::FidelityMode;
+use octos_pipeline::fidelity::FidelityMode;
 
 // Full context (default) — pass everything
 let mode = FidelityMode::Full;
@@ -441,12 +441,12 @@ let mode = FidelityMode::parse("full")?;             // Full
 
 **Safety limits:** `max_chars` capped at 10MB, `max_lines` capped at 100K.
 
-### Pipeline Manager (`crew_pipeline::manager`)
+### Pipeline Manager (`octos_pipeline::manager`)
 
 Supervisor pattern for orchestrating child pipelines.
 
 ```rust
-use crew_pipeline::manager::{PipelineManager, SupervisionStrategy, ChildSpec};
+use octos_pipeline::manager::{PipelineManager, SupervisionStrategy, ChildSpec};
 
 // Define child pipelines
 let children = vec![
@@ -491,13 +491,13 @@ let node_outcome = outcome.to_node_outcome("ci_gate");
 // node_outcome.content contains "[pass] lint: ok\n[fail] test: error..."
 ```
 
-### Thread Registry (`crew_pipeline::thread`)
+### Thread Registry (`octos_pipeline::thread`)
 
 Reuse LLM conversation sessions across pipeline nodes.
 
 ```rust
-use crew_pipeline::thread::{Thread, ThreadRegistry};
-use crew_core::Message;
+use octos_pipeline::thread::{Thread, ThreadRegistry};
+use octos_core::Message;
 
 let registry = ThreadRegistry::new();
 
@@ -517,12 +517,12 @@ let model = thread.model_id();   // "claude-sonnet-4-20250514"
 
 **Limits:** Max 1,000 threads per registry, max 10,000 messages per thread.
 
-### Pipeline Server (`crew_pipeline::server`)
+### Pipeline Server (`octos_pipeline::server`)
 
 HTTP interface for submitting and monitoring pipeline runs.
 
 ```rust
-use crew_pipeline::server::{PipelineServer, SubmitRequest, RunStatus};
+use octos_pipeline::server::{PipelineServer, SubmitRequest, RunStatus};
 
 // Submit a pipeline run
 let request = SubmitRequest {

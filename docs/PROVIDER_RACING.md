@@ -22,7 +22,7 @@ The racing logic is part of `AdaptiveRouter` rather than a standalone wrapper. T
 3. Single atomic mode check determines the code path
 
 ```rust
-// crates/crew-llm/src/adaptive.rs
+// crates/octos-llm/src/adaptive.rs
 
 pub enum AdaptiveMode {
     Off = 0,    // Static priority, failover on circuit-broken
@@ -447,13 +447,13 @@ The key insight: concurrent messages create **valid interleaving** (user A, then
 
 | File | What |
 |------|------|
-| `crates/crew-llm/src/adaptive.rs` | `AdaptiveMode` enum, `hedged_chat()`, `select_provider()` |
-| `crates/crew-llm/src/responsiveness.rs` | `ResponsivenessObserver` for auto-escalation + patience baseline |
-| `crates/crew-cli/src/config.rs` | `AdaptiveRoutingMode`, `AdaptiveRoutingConfig`, `FallbackModel` |
-| `crates/crew-cli/src/session_actor.rs` | `process_inbound_speculative` (spawn + select!), `serve_overflow` (overflow with history snapshot), `/adaptive` and `/queue` commands, auto-escalation |
-| `crates/crew-cli/src/compaction.rs` | Session compaction with tool-pair-aware split boundary |
-| `crates/crew-cli/src/commands/gateway/mod.rs` | Config → router wiring (`with_adaptive_config`), `adaptive_router_ref` |
-| `crates/crew-agent/src/agent.rs` | `Agent` (Arc-compatible), `repair_message_order()`, `repair_tool_pairs()`, `is_retriable_response()` |
+| `crates/octos-llm/src/adaptive.rs` | `AdaptiveMode` enum, `hedged_chat()`, `select_provider()` |
+| `crates/octos-llm/src/responsiveness.rs` | `ResponsivenessObserver` for auto-escalation + patience baseline |
+| `crates/octos-cli/src/config.rs` | `AdaptiveRoutingMode`, `AdaptiveRoutingConfig`, `FallbackModel` |
+| `crates/octos-cli/src/session_actor.rs` | `process_inbound_speculative` (spawn + select!), `serve_overflow` (overflow with history snapshot), `/adaptive` and `/queue` commands, auto-escalation |
+| `crates/octos-cli/src/compaction.rs` | Session compaction with tool-pair-aware split boundary |
+| `crates/octos-cli/src/commands/gateway/mod.rs` | Config → router wiring (`with_adaptive_config`), `adaptive_router_ref` |
+| `crates/octos-agent/src/agent.rs` | `Agent` (Arc-compatible), `repair_message_order()`, `repair_tool_pairs()`, `is_retriable_response()` |
 
 ---
 
@@ -483,8 +483,8 @@ QoS ranking is orthogonal because it modifies the scoring function, not the rout
 
 ## Related Documents
 
-- [CREW_UX_VISION.md](./CREW_UX_VISION.md) — Full UX vision with all capabilities
+- [OCTOS_UX_VISION.md](./OCTOS_UX_VISION.md) — Full UX vision with all capabilities
 - [OPENCLAW_UX_DESIGN.md](./OPENCLAW_UX_DESIGN.md) — OpenClaw's UX patterns
 - [OPENCLAW_CROSS_POLLINATION.md](./OPENCLAW_CROSS_POLLINATION.md) — Full cross-pollination guide
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — crew-rs architecture overview
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — octos architecture overview
 - [TESTING.md](./TESTING.md) — CI script, test inventory, and testing guide
