@@ -12,21 +12,20 @@
 .DS_Store
 Thumbs.db
 
-# Crew state (keep config, ignore runtime data)
-.octos/tasks/
-.octos/*.redb
+# Octos runtime state (keep config, ignore runtime data)
+.octos/
+.crew/
 
 # Node
 node_modules/
 
 # Dashboard build output
-crates/crew-cli/static/admin/
+crates/octos-cli/static/admin/
 
 # Environment
 .env
 .env.local
 .envrc
-.octos/
 
 # Deploy script (contains credentials)
 scripts/deploy.sh
@@ -37,6 +36,6 @@ scripts/deploy.sh
 !CLAUDE.md
 !CHANGELOG.md
 !docs/**/*.md
-!crates/crew-agent/skills/**/SKILL.md
+!crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md
