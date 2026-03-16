@@ -69,6 +69,7 @@ feishu = ["octos-bus/feishu"]
 twilio = ["octos-bus/twilio"]
 wecom = ["octos-bus/wecom"]
 wecom-bot = ["octos-bus/wecom-bot"]
+qq-bot = ["octos-bus/qq-bot"]
 git = ["octos-agent/git"]
 ast = ["octos-agent/ast"]
 
