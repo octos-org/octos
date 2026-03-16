@@ -11,7 +11,7 @@ import LoginPage from './pages/LoginPage'
 import UsersPage from './pages/UsersPage'
 import AdminBotPage from './pages/AdminBotPage'
 import ServerMetricsPage from './pages/ServerMetricsPage'
-import { HomePage, LlmPage, MessagingPage, ToolsPage, SystemPage } from './pages/profile'
+import { HomePage, LlmPage, MessagingPage, ToolsPage, SkillsPage, SystemPage } from './pages/profile'
 
 export default function App() {
   return (
@@ -33,6 +33,7 @@ export default function App() {
               <Route path="llm" element={<LlmPage />} />
               <Route path="messaging" element={<MessagingPage />} />
               <Route path="tools" element={<ToolsPage />} />
+              <Route path="skills" element={<SkillsPage />} />
               <Route path="system" element={<SystemPage />} />
             </Route>
 
@@ -42,6 +43,7 @@ export default function App() {
               <Route path="llm" element={<LlmPage />} />
               <Route path="messaging" element={<MessagingPage />} />
               <Route path="tools" element={<ToolsPage />} />
+              <Route path="skills" element={<SkillsPage />} />
               <Route path="system" element={<SystemPage />} />
             </Route>
           </Route>

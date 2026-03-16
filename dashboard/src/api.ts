@@ -161,6 +161,21 @@ export const api = {
 
   systemMetrics: (opts?: { procs?: boolean }) =>
     request<SystemMetrics>(`/system/metrics${opts?.procs ? '?procs=1' : ''}`),
+
+  // Skills management
+  listProfileSkills: (id: string) =>
+    request<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(
+      `/profiles/${id}/skills`,
+    ),
+
+  installProfileSkill: (id: string, data: { repo: string; force: boolean; branch: string }) =>
+    request<{ ok: boolean; installed: string[]; skipped: string[]; deps_installed: boolean }>(
+      `/profiles/${id}/skills`,
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
+
+  removeProfileSkill: (id: string, name: string) =>
+    request<ActionResponse>(`/profiles/${id}/skills/${name}`, { method: 'DELETE' }),
 }
 
 // ── Auth API (public) ───────────────────────────────────────────────

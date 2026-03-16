@@ -28,21 +28,35 @@ export default function Sidebar() {
         {/* Admin global links — always visible for admins */}
         {isAdmin && (
           <>
-            <SidebarLink to="/" end icon={<GridIcon />} label="Dashboard" />
-            <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
-            {/* My Profile sub-nav — nested tree view */}
-            {myProfileMatch && (
-              <div className="ml-4 pl-3 border-l border-gray-700/40 space-y-0.5">
-                <SidebarLink to="/my" end icon={<HomeIcon />} label="Home" />
-                <SidebarLink to="/my/llm" icon={<CpuIcon />} label="LLM Providers" />
-                <SidebarLink to="/my/messaging" icon={<MessageIcon />} label="Messaging" />
-                <SidebarLink to="/my/tools" icon={<WrenchIcon />} label="Tools" />
-                <SidebarLink to="/my/system" icon={<CogIcon />} label="System" />
-              </div>
+            {/* Back to dashboard (admin only) */}
+            {isAdmin && adminProfileMatch && (
+              <Link
+                to="/"
+                className="flex items-center gap-2 px-3 py-2 mb-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                <ChevronLeftIcon />
+                All Profiles
+              </Link>
             )}
-            <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
-            <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
-            <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
+
+            {/* Profile category navigation */}
+            <SidebarLink to={profileBase} end icon={<HomeIcon />} label="Home" />
+            <SidebarLink to={`${profileBase}/llm`} icon={<CpuIcon />} label="LLM Providers" />
+            <SidebarLink to={`${profileBase}/messaging`} icon={<MessageIcon />} label="Messaging" />
+            <SidebarLink to={`${profileBase}/tools`} icon={<WrenchIcon />} label="Tools" />
+            <SidebarLink to={`${profileBase}/skills`} icon={<PuzzleIcon />} label="Skills" />
+            <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
+
+            {/* Admin links (separator + bottom section) */}
+            {isAdmin && (
+              <>
+                <div className="border-t border-gray-700/30 my-3" />
+                <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
+                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+                <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
+                <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
+              </>
+            )}
           </>
         )}
 
@@ -53,24 +67,8 @@ export default function Sidebar() {
             <SidebarLink to="/my/llm" icon={<CpuIcon />} label="LLM Providers" />
             <SidebarLink to="/my/messaging" icon={<MessageIcon />} label="Messaging" />
             <SidebarLink to="/my/tools" icon={<WrenchIcon />} label="Tools" />
+            <SidebarLink to="/my/skills" icon={<PuzzleIcon />} label="Skills" />
             <SidebarLink to="/my/system" icon={<CogIcon />} label="System" />
-          </>
-        )}
-
-        {/* Admin viewing another profile — tree nested under separator */}
-        {isAdmin && adminProfileMatch && (
-          <>
-            <div className="border-t border-gray-700/30 my-3" />
-            <p className="px-3 py-1 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
-              {adminProfileMatch.params.id}
-            </p>
-            <div className="ml-1 space-y-0.5">
-              <SidebarLink to={profileBase} end icon={<HomeIcon />} label="Home" />
-              <SidebarLink to={`${profileBase}/llm`} icon={<CpuIcon />} label="LLM Providers" />
-              <SidebarLink to={`${profileBase}/messaging`} icon={<MessageIcon />} label="Messaging" />
-              <SidebarLink to={`${profileBase}/tools`} icon={<WrenchIcon />} label="Tools" />
-              <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
-            </div>
           </>
         )}
       </nav>
@@ -158,6 +156,14 @@ function WrenchIcon() {
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
       <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+    </svg>
+  )
+}
+
+function PuzzleIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z" />
     </svg>
   )
 }
