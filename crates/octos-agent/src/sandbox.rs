@@ -294,6 +294,8 @@ impl Sandbox for MacosSandbox {
             "(allow file-read*)".to_string()
         } else {
             let mut rules = Vec::new();
+            // dyld needs to stat "/" during process startup (macOS Sequoia+).
+            rules.push("(allow file-read* (literal \"/\"))".to_string());
             // Always allow reading the workspace
             rules.push(format!(
                 "(allow file-read* (subpath \"{cwd}\"))",

@@ -22,6 +22,10 @@ pub struct AnthropicProvider {
     api_key: SecretString,
     model: String,
     base_url: String,
+    /// Label for logs/failover. Defaults to `"anthropic"` but overridden by
+    /// registry entries (e.g. `"zai"`, `"r9s"`) so providers are
+    /// distinguishable in failover chains.
+    provider_label: String,
 }
 
 impl AnthropicProvider {
@@ -35,6 +39,7 @@ impl AnthropicProvider {
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
             base_url: "https://api.anthropic.com".to_string(),
+            provider_label: "anthropic".to_string(),
         }
     }
 
@@ -54,6 +59,12 @@ impl AnthropicProvider {
     /// Replace the HTTP client with one using custom timeouts (in seconds).
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self
+    }
+
+    /// Override the provider label shown in logs and status display.
+    pub fn with_provider_label(mut self, label: impl Into<String>) -> Self {
+        self.provider_label = label.into();
         self
     }
 
@@ -226,7 +237,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "anthropic"
+        &self.provider_label
     }
 }
 

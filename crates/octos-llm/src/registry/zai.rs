@@ -31,7 +31,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.z.ai/api/anthropic".into());
-    let mut provider = AnthropicProvider::new(&key, &model).with_base_url(&url);
+    let mut provider = AnthropicProvider::new(&key, &model)
+        .with_base_url(&url)
+        .with_provider_label("zai");
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }

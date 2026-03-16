@@ -37,7 +37,9 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
             .strip_suffix("/v1")
             .map(|base| format!("{base}/anthropic"))
             .unwrap_or_else(|| format!("{url}/anthropic"));
-        let mut provider = AnthropicProvider::new(&key, &model).with_base_url(&anthropic_url);
+        let mut provider = AnthropicProvider::new(&key, &model)
+            .with_base_url(&anthropic_url)
+            .with_provider_label("r9s");
         if let Some((t, c)) = http_timeout {
             provider = provider.with_http_timeout(t, c);
         }
