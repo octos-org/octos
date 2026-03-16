@@ -1,4 +1,6 @@
-# octos
+# Octos
+
+> Like an octopus — every arm thinks independently, but they share one brain.
 
 Rust-native AI agent framework with multi-channel gateway, 14 LLM providers, web dashboard, and coding automation tools.
 
@@ -61,14 +63,14 @@ Comprehensive guides covering dashboard setup, LLM providers, tool configuration
 - **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP), Twilio SMS, WeCom/WeChat Work
 - **Web dashboard**: Multi-user admin panel with per-user profile management, gateway controls, and live log streaming
 - **Email OTP auth**: Larksuite-style email verification code login for the dashboard
-- **OAuth login**: `crew auth login` with PKCE browser flow, device code flow, or paste-token
+- **OAuth login**: `octos auth login` with PKCE browser flow, device code flow, or paste-token
 - **Provider failover**: Automatic fallback chain across multiple LLM providers
 - **Sub-provider spawning**: Configure multiple LLMs for subagent use with cost/capability metadata
 - **Vision support**: Send images to vision-capable LLMs (Anthropic, OpenAI, Gemini, OpenRouter)
 - **Voice transcription**: Groq Whisper auto-transcription for voice messages
 - **Media handling**: Auto-download photos, voice, audio, documents from channels
 - **Interactive chat**: Multi-turn conversation with readline history
-- **Single-message mode**: Non-interactive `crew chat --message "..."` for scripting
+- **Single-message mode**: Non-interactive `octos chat --message "..."` for scripting
 - **Memory system**: Episodic memory, daily notes, long-term memory, hybrid BM25+vector search
 - **Skills system**: Markdown-based skills with YAML frontmatter + 6 built-in skills
 - **Sandbox isolation**: bwrap (Linux), sandbox-exec (macOS), Docker with resource limits
@@ -131,20 +133,20 @@ cd octos
 ./scripts/local-deploy.sh --minimal # CLI + chat only
 
 # Or install manually:
-cargo install --path crates/crew-cli
+cargo install --path crates/octos-cli
 
 # Install with all messaging channels + dashboard
-cargo install --path crates/crew-cli --features api,telegram,discord,slack,whatsapp,feishu,email
+cargo install --path crates/octos-cli --features api,telegram,discord,slack,whatsapp,feishu,email
 
 # Install with specific channels
-cargo install --path crates/crew-cli --features telegram,discord
+cargo install --path crates/octos-cli --features telegram,discord
 
 # Install with browser automation (requires Chrome/Chromium)
-cargo install --path crates/crew-cli --features browser
+cargo install --path crates/octos-cli --features browser
 
 # Or build locally without installing
 cargo build --release
-./target/release/crew --help
+./target/release/octos --help
 ```
 
 See **[Local Deployment Guide](docs/LOCAL_DEPLOYMENT.md)** for platform-specific instructions (macOS, Linux, Windows/WSL2), background service setup, and troubleshooting.
@@ -153,7 +155,7 @@ See **[Local Deployment Guide](docs/LOCAL_DEPLOYMENT.md)** for platform-specific
 
 | Feature | Description |
 |---------|-------------|
-| `api` | Web dashboard + REST API server (`crew serve`) |
+| `api` | Web dashboard + REST API server (`octos serve`) |
 | `telegram` | Telegram bot channel (teloxide) |
 | `discord` | Discord bot channel (serenity) |
 | `slack` | Slack bot channel (WebSocket Socket Mode) |
@@ -172,154 +174,154 @@ See **[Local Deployment Guide](docs/LOCAL_DEPLOYMENT.md)** for platform-specific
 
 ```bash
 # Initialize configuration and workspace
-crew init
+octos init
 
 # Set your API key (or use OAuth login)
 export ANTHROPIC_API_KEY=your-key-here
-# Or: crew auth login -p anthropic
+# Or: octos auth login -p anthropic
 
 # Interactive chat
-crew chat
+octos chat
 
 # Single-message mode (non-interactive)
-crew chat --message "Add a hello function to lib.rs"
+octos chat --message "Add a hello function to lib.rs"
 
 # Check system status
-crew status
+octos status
 ```
 
 ---
 
 ## CLI Commands
 
-### `crew chat`
+### `octos chat`
 
 Interactive multi-turn conversation:
 
 ```bash
-crew chat                          # Default provider (Anthropic)
-crew chat --provider openai        # Use OpenAI
-crew chat --model gpt-4o           # Auto-detects OpenAI from model name
-crew chat --verbose                # Show tool outputs
-crew chat --message "Fix the bug"  # Single message, non-interactive
+octos chat                          # Default provider (Anthropic)
+octos chat --provider openai        # Use OpenAI
+octos chat --model gpt-4o           # Auto-detects OpenAI from model name
+octos chat --verbose                # Show tool outputs
+octos chat --message "Fix the bug"  # Single message, non-interactive
 ```
 
-### `crew gateway`
+### `octos gateway`
 
 Run as a persistent multi-channel messaging daemon:
 
 ```bash
-crew gateway                       # Uses config from .crew/config.json
-crew gateway --provider openai     # Override provider
-crew gateway --verbose             # Verbose logging
-crew gateway --data-dir /data/bob  # Custom data directory
+octos gateway                       # Uses config from .octos/config.json
+octos gateway --provider openai     # Override provider
+octos gateway --verbose             # Verbose logging
+octos gateway --data-dir /data/bob  # Custom data directory
 ```
 
-### `crew serve`
+### `octos serve`
 
 Start the web dashboard + REST API server (requires `api` feature):
 
 ```bash
-crew serve                         # Listen on 127.0.0.1:8080
-crew serve --port 8090             # Custom port
-crew serve --host 0.0.0.0          # Accept connections from all interfaces
-crew serve --auth-token my-secret  # Set admin auth token
-crew serve --data-dir ~/.crew      # Custom data directory
-crew serve --config /path/to/config.json
+octos serve                         # Listen on 127.0.0.1:8080
+octos serve --port 8090             # Custom port
+octos serve --host 0.0.0.0          # Accept connections from all interfaces
+octos serve --auth-token my-secret  # Set admin auth token
+octos serve --data-dir ~/.octos      # Custom data directory
+octos serve --config /path/to/config.json
 ```
 
-### `crew init`
+### `octos init`
 
 Initialize workspace with config and bootstrap files:
 
 ```bash
-crew init              # Interactive setup
-crew init --defaults   # Use defaults (Anthropic/Claude)
+octos init              # Interactive setup
+octos init --defaults   # Use defaults (Anthropic/Claude)
 ```
 
 Creates:
-- `.crew/config.json` - Configuration
-- `.crew/AGENTS.md` - Agent instructions
-- `.crew/SOUL.md` - Personality definition
-- `.crew/USER.md` - User preferences
-- `.crew/memory/`, `.crew/sessions/`, `.crew/skills/` directories
+- `.octos/config.json` - Configuration
+- `.octos/AGENTS.md` - Agent instructions
+- `.octos/SOUL.md` - Personality definition
+- `.octos/USER.md` - User preferences
+- `.octos/memory/`, `.octos/sessions/`, `.octos/skills/` directories
 
-### `crew status`
+### `octos status`
 
 Show system status (config, API keys, bootstrap files).
 
-### `crew auth`
+### `octos auth`
 
 OAuth login and API key management:
 
 ```bash
-crew auth login --provider openai         # PKCE browser OAuth flow
-crew auth login --provider openai --device-code  # Device code flow
-crew auth login --provider anthropic      # Paste-token flow
-crew auth logout --provider openai        # Remove stored credential
-crew auth status                          # Show authenticated providers
+octos auth login --provider openai         # PKCE browser OAuth flow
+octos auth login --provider openai --device-code  # Device code flow
+octos auth login --provider anthropic      # Paste-token flow
+octos auth logout --provider openai        # Remove stored credential
+octos auth status                          # Show authenticated providers
 ```
 
-### `crew cron`
+### `octos cron`
 
 Manage scheduled cron jobs:
 
 ```bash
-crew cron list                          # List active jobs
-crew cron list --all                    # Include disabled jobs
-crew cron add --name "daily" --message "Run report" --cron "0 0 9 * * * *"
-crew cron add --name "check" --message "Check status" --every 3600
-crew cron remove <job-id>
-crew cron enable <job-id>               # Enable a job
-crew cron enable <job-id> --disable     # Disable a job
+octos cron list                          # List active jobs
+octos cron list --all                    # Include disabled jobs
+octos cron add --name "daily" --message "Run report" --cron "0 0 9 * * * *"
+octos cron add --name "check" --message "Check status" --every 3600
+octos cron remove <job-id>
+octos cron enable <job-id>               # Enable a job
+octos cron enable <job-id> --disable     # Disable a job
 ```
 
-### `crew skills`
+### `octos skills`
 
 Manage skills:
 
 ```bash
-crew skills list                          # List installed skills
-crew skills install user/repo/skill-name  # Install from GitHub
-crew skills remove skill-name             # Remove a skill
+octos skills list                          # List installed skills
+octos skills install user/repo/skill-name  # Install from GitHub
+octos skills remove skill-name             # Remove a skill
 ```
 
-### `crew channels status`
+### `octos channels status`
 
 Show configured gateway channels and their compile/config status.
 
-### `crew account`
+### `octos account`
 
 Manage sub-accounts under profiles:
 
 ```bash
-crew account list --profile <id>     # List sub-accounts
-crew account create --profile <id> <name>  # Create sub-account
-crew account update <id>             # Update sub-account
-crew account delete <id>             # Delete sub-account
-crew account info <id>               # Show sub-account details
-crew account start <id>              # Start sub-account gateway
-crew account stop <id>               # Stop sub-account gateway
+octos account list --profile <id>     # List sub-accounts
+octos account create --profile <id> <name>  # Create sub-account
+octos account update <id>             # Update sub-account
+octos account delete <id>             # Delete sub-account
+octos account info <id>               # Show sub-account details
+octos account start <id>              # Start sub-account gateway
+octos account stop <id>               # Stop sub-account gateway
 ```
 
-### `crew office`
+### `octos office`
 
 Office file manipulation:
 
 ```bash
-crew office extract <file>           # Extract text from DOCX/PPTX/XLSX
-crew office unpack <file> <dir>      # Unpack archive to directory
-crew office pack <dir> <output>      # Pack directory into archive
-crew office clean <dir>              # Remove orphaned files from unpacked PPTX
-crew office add-slide <dir> <source> # Add slide by duplicating or from layout
-crew office validate <path>          # Validate document structure
+octos office extract <file>           # Extract text from DOCX/PPTX/XLSX
+octos office unpack <file> <dir>      # Unpack archive to directory
+octos office pack <dir> <output>      # Pack directory into archive
+octos office clean <dir>              # Remove orphaned files from unpacked PPTX
+octos office add-slide <dir> <source> # Add slide by duplicating or from layout
+octos office validate <path>          # Validate document structure
 ```
 
 ### Other Commands
 
 ```bash
-crew clean [--all]       # Clean up state/database files
-crew completions <shell> # Generate shell completions (bash/zsh/fish)
+octos clean [--all]       # Clean up state/database files
+octos completions <shell> # Generate shell completions (bash/zsh/fish)
 ```
 
 ---
@@ -331,11 +333,11 @@ crew completions <shell> # Generate shell completions (bash/zsh/fish)
 Config is loaded in this priority order:
 
 1. **CLI flag**: `--config /path/to/config.json`
-2. **Project-local**: `.crew/config.json` (in current directory)
+2. **Project-local**: `.octos/config.json` (in current directory)
 3. **Global**: Platform-specific config directory:
-   - **macOS**: `~/Library/Application Support/crew/config.json`
-   - **Linux**: `~/.config/crew/config.json`
-   - **Windows**: `%APPDATA%\crew\config.json`
+   - **macOS**: `~/Library/Application Support/octos/config.json`
+   - **Linux**: `~/.config/octos/config.json`
+   - **Windows**: `%APPDATA%\octos\config.json`
 
 ### Basic Config
 
@@ -520,10 +522,10 @@ Each channel is feature-gated. You must build with the corresponding feature fla
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features telegram
+cargo install --path crates/octos-cli --features telegram
 ```
 
-**Config** (`.crew/config.json`):
+**Config** (`.octos/config.json`):
 ```json
 {
   "provider": "anthropic",
@@ -553,7 +555,7 @@ export TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 2. Copy the bot token provided by BotFather
 3. Set it as `TELEGRAM_BOT_TOKEN` environment variable
 4. (Optional) Get your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot) and add it to `allowed_senders` to restrict access
-5. Run `crew gateway`
+5. Run `octos gateway`
 
 **Features**: Text messages, photo/document/voice/audio download, vision (sends images to LLM), voice transcription (via Groq Whisper), message coalescing (4096 char limit).
 
@@ -565,7 +567,7 @@ export TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features discord
+cargo install --path crates/octos-cli --features discord
 ```
 
 **Config**:
@@ -597,7 +599,7 @@ export DISCORD_BOT_TOKEN=your-discord-bot-token
    - Scopes: `bot`
    - Bot Permissions: `Send Messages`, `Read Message History`, `Attach Files`
 5. Invite the bot to your server using the generated URL
-6. Set `DISCORD_BOT_TOKEN` and run `crew gateway`
+6. Set `DISCORD_BOT_TOKEN` and run `octos gateway`
 
 **Features**: Text messages, attachment handling, message coalescing (2000 char limit).
 
@@ -609,7 +611,7 @@ export DISCORD_BOT_TOKEN=your-discord-bot-token
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features slack
+cargo install --path crates/octos-cli --features slack
 ```
 
 **Config**:
@@ -650,7 +652,7 @@ export SLACK_APP_TOKEN=xapp-your-app-token
    - `message.im`
    - `message.mpim`
 5. Install the app to your workspace and copy the `xoxb-` bot token
-6. Set both environment variables and run `crew gateway`
+6. Set both environment variables and run `octos gateway`
 
 **Features**: Text messages, file sharing, thread support, message coalescing (4000 char limit).
 
@@ -662,7 +664,7 @@ WhatsApp integration uses a Node.js WebSocket bridge (e.g., [whatsapp-web.js](ht
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features whatsapp
+cargo install --path crates/octos-cli --features whatsapp
 ```
 
 **Config**:
@@ -686,7 +688,7 @@ cargo install --path crates/crew-cli --features whatsapp
 2. Run the bridge — it will show a QR code to scan with your WhatsApp mobile app
 3. After scanning, the bridge connects to WhatsApp Web and listens on a WebSocket port (default: 3001)
 4. Configure `bridge_url` to point to the bridge's WebSocket endpoint
-5. Run `crew gateway`
+5. Run `octos gateway`
 
 **Features**: Text messages, media handling, message coalescing.
 
@@ -698,7 +700,7 @@ Feishu (Chinese) and Lark (international) are the same platform by ByteDance. oc
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features feishu
+cargo install --path crates/octos-cli --features feishu
 ```
 
 **Config**:
@@ -747,7 +749,7 @@ export FEISHU_ENCRYPT_KEY=xxxxxxxxxxxxxxxxxxxx
    - **Webhook mode** (`"mode": "webhook"`): Requires a publicly accessible URL pointing to the bot (set `webhook_port`)
 7. Set the `region` to `"feishu"` (China) or `"lark"` (international) based on your platform
 8. Publish/activate the app on the Feishu admin console
-9. Set environment variables and run `crew gateway`
+9. Set environment variables and run `octos gateway`
 
 **Features**: Text messages, rich text, image/file handling, card messages, WebSocket or webhook connectivity.
 
@@ -759,7 +761,7 @@ Email channel polls an IMAP inbox for new messages and sends replies via SMTP.
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features email
+cargo install --path crates/octos-cli --features email
 ```
 
 **Config**:
@@ -796,7 +798,7 @@ export EMAIL_PASSWORD=your-app-password
 3. Set `EMAIL_USERNAME` to your Gmail address and `EMAIL_PASSWORD` to the app password
 4. Use `imap.gmail.com:993` for IMAP and `smtp.gmail.com:465` for SMTP
 5. Add trusted sender emails to `allowed_senders` to restrict who can message the bot
-6. Run `crew gateway`
+6. Run `octos gateway`
 
 **Features**: Plain text and HTML email parsing, attachment handling, IMAP IDLE for near-instant notification, reply threading.
 
@@ -806,7 +808,7 @@ export EMAIL_PASSWORD=your-app-password
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features twilio
+cargo install --path crates/octos-cli --features twilio
 ```
 
 Twilio integration requires a Twilio account, phone number, and webhook configuration. The channel uses an HTTP webhook endpoint (via axum) to receive incoming SMS.
@@ -819,7 +821,7 @@ WeCom (企业微信) is Tencent's enterprise messaging platform. The channel use
 
 **Build**:
 ```bash
-cargo install --path crates/crew-cli --features wecom
+cargo install --path crates/octos-cli --features wecom
 ```
 
 **Config**:
@@ -855,7 +857,7 @@ export WECOM_AGENT_SECRET=your-agent-secret
 3. Note the **Agent ID** (numeric) from the app settings
 4. Under **Receive Messages**, set the callback URL to point to your server on the configured `webhook_port` (default: 9322)
 5. Copy the **Token** and **EncodingAESKey** from the callback configuration page
-6. Set environment variables and run `crew gateway`
+6. Set environment variables and run `octos gateway`
 
 **Features**: Text messages, image/file/voice media handling, message dedup, pure-Rust AES/SHA1 crypto (no external deps).
 
@@ -869,16 +871,16 @@ The web dashboard provides a browser-based admin panel for managing multiple gat
 
 ```bash
 # Build with API feature
-cargo install --path crates/crew-cli --features api,telegram,discord,slack,whatsapp,feishu,email
+cargo install --path crates/octos-cli --features api,telegram,discord,slack,whatsapp,feishu,email
 
 # Start the server
-crew serve --port 8080
+octos serve --port 8080
 
 # With auth token for remote access
-crew serve --host 0.0.0.0 --port 8080 --auth-token my-secret-token
+octos serve --host 0.0.0.0 --port 8080 --auth-token my-secret-token
 
 # With custom data and config directories
-crew serve --data-dir ~/.crew --config /path/to/config.json
+octos serve --data-dir ~/.octos --config /path/to/config.json
 ```
 
 The dashboard is accessible at `http://localhost:8080/admin/`.
@@ -892,7 +894,7 @@ The dashboard is accessible at `http://localhost:8080/admin/`.
 
 The dashboard supports Larksuite-style email verification code login. Users enter their email, receive a 6-digit code, and verify it to get a session.
 
-**Configure SMTP** in your config file (e.g., `~/Library/Application Support/crew/config.json` on macOS):
+**Configure SMTP** in your config file (e.g., `~/Library/Application Support/octos/config.json` on macOS):
 
 ```json
 {
@@ -933,7 +935,7 @@ Users are stored as JSON files in `{data_dir}/users/`. Each user has:
 **Admin operations** (via dashboard or API):
 - Create users with specific roles
 - Delete users
-- Promote/demote user roles (edit the JSON file directly at `~/.crew/users/{id}.json`)
+- Promote/demote user roles (edit the JSON file directly at `~/.octos/users/{id}.json`)
 
 **User roles**:
 - **Admin**: Full access to all profiles, user management, and system settings
@@ -956,7 +958,7 @@ Each user gets a profile that bundles all configuration needed to run their own 
 5. Click "Start" to launch your personal gateway
 6. View live logs in the log viewer
 
-The process manager spawns each gateway as a child process of the `crew serve` server, with environment variables from the profile's `env_vars` passed to the child process.
+The process manager spawns each gateway as a child process of the `octos serve` server, with environment variables from the profile's `env_vars` passed to the child process.
 
 ### Dashboard API Reference
 
@@ -1026,24 +1028,24 @@ The process manager spawns each gateway as a child process of the `crew serve` s
 
 ## Multi-User Setup
 
-By default, all data (episodes, memory, sessions, research) is stored in `~/.crew`. To run multiple users on a shared machine, override the data directory:
+By default, all data (episodes, memory, sessions, research) is stored in `~/.octos`. To run multiple users on a shared machine, override the data directory:
 
 ```bash
 # Using environment variable (recommended for services)
-CREW_HOME=/data/crew/alice crew gateway --config /shared/config.json
-CREW_HOME=/data/crew/bob   crew gateway --config /shared/config.json
+OCTOS_HOME=/data/octos/alice octos gateway --config /shared/config.json
+OCTOS_HOME=/data/octos/bob   octos gateway --config /shared/config.json
 
 # Using CLI flag
-crew chat --data-dir /data/crew/alice
-crew chat --data-dir /data/crew/bob
+octos chat --data-dir /data/octos/alice
+octos chat --data-dir /data/octos/bob
 ```
 
-Resolution order: `--data-dir` flag > `CREW_HOME` env var > `~/.crew`.
+Resolution order: `--data-dir` flag > `OCTOS_HOME` env var > `~/.octos`.
 
 Each user gets isolated storage:
 
 ```
-/data/crew/alice/
+/data/octos/alice/
 ├── episodes.redb     # Episodic memory DB
 ├── memory/           # Long-term memory + daily notes
 ├── sessions/         # Conversation history (JSONL)
@@ -1055,7 +1057,7 @@ Each user gets isolated storage:
 └── cron.json         # Scheduled jobs
 ```
 
-When using the dashboard (`crew serve`), each user profile gets its own data directory at `~/.crew/profiles/{user-id}/data/`, with isolated memory, sessions, and research storage.
+When using the dashboard (`octos serve`), each user profile gets its own data directory at `~/.octos/profiles/{user-id}/data/`, with isolated memory, sessions, and research storage.
 
 ---
 
@@ -1102,13 +1104,13 @@ Named groups: `group:fs` (read_file/write_file/edit_file/diff_edit), `group:runt
 
 ## Account Management
 
-Sub-accounts inherit LLM provider config from a parent profile but have their own data directory (memory, sessions, episodes, skills) and channels. See `crew account` CLI commands above.
+Sub-accounts inherit LLM provider config from a parent profile but have their own data directory (memory, sessions, episodes, skills) and channels. See `octos account` CLI commands above.
 
 ---
 
 ## Office Tools
 
-Native Rust office file manipulation for DOCX, PPTX, and XLSX files. Replaces Python scripts with `zip` + `quick-xml`. See `crew office` CLI commands above.
+Native Rust office file manipulation for DOCX, PPTX, and XLSX files. Replaces Python scripts with `zip` + `quick-xml`. See `octos office` CLI commands above.
 
 ---
 
@@ -1151,12 +1153,12 @@ Review the provided code for:
 3. Code style
 ```
 
-**Built-in skills**: 6 pre-installed skills. **Custom skills** are stored in `.crew/skills/` or `~/.crew/skills/`.
+**Built-in skills**: 6 pre-installed skills. **Custom skills** are stored in `.octos/skills/` or `~/.octos/skills/`.
 
 ```bash
-crew skills list                          # List all skills
-crew skills install user/repo/skill       # Install from GitHub
-crew skills remove skill-name             # Remove a skill
+octos skills list                          # List all skills
+octos skills install user/repo/skill       # Install from GitHub
+octos skills remove skill-name             # Remove a skill
 ```
 
 ---
@@ -1224,17 +1226,17 @@ Schedule recurring tasks:
 }
 ```
 
-Then use the `cron` tool in conversation or the `crew cron` CLI:
+Then use the `cron` tool in conversation or the `octos cron` CLI:
 
 ```bash
 # Cron expression (7-field: sec min hour dom month dow year)
-crew cron add --name "morning-report" --message "Generate daily report" --cron "0 0 9 * * * *"
+octos cron add --name "morning-report" --message "Generate daily report" --cron "0 0 9 * * * *"
 
 # Interval-based (every N seconds)
-crew cron add --name "health-check" --message "Check API health" --every 3600
+octos cron add --name "health-check" --message "Check API health" --every 3600
 
 # One-shot
-crew cron add --name "reminder" --message "Submit the PR" --once-at "2025-01-15T10:00:00Z"
+octos cron add --name "reminder" --message "Submit the PR" --once-at "2025-01-15T10:00:00Z"
 ```
 
 The heartbeat service runs periodic background checks independently of cron jobs.
@@ -1246,19 +1248,19 @@ The heartbeat service runs periodic background checks independently of cron jobs
 ```
 octos/
   crates/
-    crew-core/         # Types, task model, message protocols, UTF-8 utilities
-    crew-memory/       # Episodic memory (redb), memory store, hybrid BM25+vector search
-    crew-llm/          # LLM provider abstraction (14 provider registry entries)
-    crew-agent/        # Agent runtime, tool system, sandbox, MCP, compaction, hooks, plugins
-    crew-bus/          # Message bus, channels, sessions, cron, heartbeat, coalescing
-    crew-cli/          # CLI interface, API server, dashboard, profiles, user management, OTP auth
-    crew-pipeline/     # DOT-based pipeline parser, executor, and tool integration
+    octos-core/         # Types, task model, message protocols, UTF-8 utilities
+    octos-memory/       # Episodic memory (redb), memory store, hybrid BM25+vector search
+    octos-llm/          # LLM provider abstraction (14 provider registry entries)
+    octos-agent/        # Agent runtime, tool system, sandbox, MCP, compaction, hooks, plugins
+    octos-bus/          # Message bus, channels, sessions, cron, heartbeat, coalescing
+    octos-cli/          # CLI interface, API server, dashboard, profiles, user management, OTP auth
+    octos-pipeline/     # DOT-based pipeline parser, executor, and tool integration
     app-skills/        # 7 bundled app-skills (news, deep-search, deep-crawl, send-email, weather, account-manager, time)
     platform-skills/   # Platform-specific skills (asr)
   dashboard/           # React 19 + Vite + Tailwind CSS web dashboard
 ```
 
-**Agent loop** (`crew-agent/src/agent.rs`):
+**Agent loop** (`octos-agent/src/agent.rs`):
 1. Build messages (system prompt + conversation history + memory context)
 2. Call LLM with tool specs (filtered by ToolPolicy + provider policy)
 3. If tool calls returned -> execute tools -> append results -> loop
@@ -1281,8 +1283,8 @@ octos/
 ```bash
 cargo build --workspace           # Build all crates
 cargo test --workspace            # Run all tests
-cargo test -p crew-agent          # Test single crate
-cargo test -p crew-cli test_name  # Run single test
+cargo test -p octos-agent          # Test single crate
+cargo test -p octos-cli test_name  # Run single test
 cargo clippy --workspace          # Lint
 cargo fmt --all                   # Format
 cargo fmt --all -- --check        # Check formatting
