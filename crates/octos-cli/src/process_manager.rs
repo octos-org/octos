@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use octos_agent::sandbox::BLOCKED_ENV_VARS;
 use eyre::{Result, bail};
+use octos_agent::sandbox::BLOCKED_ENV_VARS;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;

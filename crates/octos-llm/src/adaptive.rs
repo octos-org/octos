@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 

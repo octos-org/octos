@@ -286,13 +286,12 @@ mod tests {
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);
-        assert!(extras
-            .prompt_fragments
-            .iter()
-            .any(|f| f.contains("Hello")));
-        assert!(extras
-            .prompt_fragments
-            .iter()
-            .any(|f| f.contains("Be careful")));
+        assert!(extras.prompt_fragments.iter().any(|f| f.contains("Hello")));
+        assert!(
+            extras
+                .prompt_fragments
+                .iter()
+                .any(|f| f.contains("Be careful"))
+        );
     }
 }

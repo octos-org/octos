@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
+use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client;
 use teloxide::prelude::*;
 use teloxide::types::{

@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use eyre::{Result, WrapErr};
 use octos_agent::TokenTracker;
 use octos_agent::progress::ProgressEvent;
 use octos_agent::tools::TOOL_CTX;
 use octos_core::{Message, MessageRole, TokenUsage};
 use octos_llm::{ChatConfig, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
-use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::{info, warn};
 

@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+use eyre::{Result, WrapErr};
 use octos_core::{Message, MessageRole, TokenUsage};
 use octos_llm::{ChatConfig, LlmProvider};
-use eyre::{Result, WrapErr};
 use tracing::{info, warn};
 
 /// Maximum chars per LLM batch (~80K chars ≈ ~20K tokens).
@@ -435,10 +435,7 @@ mod tests {
         std::fs::create_dir_all(&outside_research).unwrap();
 
         // Absolute path outside data_dir — should be rejected
-        let result = resolve_research_dir(
-            data_dir.path(),
-            &outside_research.to_string_lossy(),
-        );
+        let result = resolve_research_dir(data_dir.path(), &outside_research.to_string_lossy());
         assert!(result.is_none(), "should reject path outside data_dir");
     }
 

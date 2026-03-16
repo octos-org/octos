@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::Result;
+use octos_core::{InboundMessage, OutboundMessage};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 

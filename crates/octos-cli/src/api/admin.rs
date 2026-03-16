@@ -2014,31 +2014,30 @@ pub async fn list_sessions(
     let sessions_dir = data_dir.join("sessions");
 
     // Helper to build a session JSON entry from a path and decoded key.
-    let build_session_entry =
-        |path: &std::path::Path, decoded_key: String, file_name: String| {
-            let meta = std::fs::metadata(path).ok();
-            let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
-                let dt: chrono::DateTime<Utc> = t.into();
-                dt.to_rfc3339()
-            });
-            // Count lines (messages = lines - 1 for metadata line)
-            let line_count = std::fs::File::open(path)
-                .ok()
-                .map(|f| {
-                    use std::io::BufRead;
-                    std::io::BufReader::new(f).lines().count()
-                })
-                .unwrap_or(0);
-            let msg_count = line_count.saturating_sub(1);
-            serde_json::json!({
-                "key": decoded_key,
-                "file": file_name,
-                "messages": msg_count,
-                "size_bytes": size_bytes,
-                "modified": modified,
+    let build_session_entry = |path: &std::path::Path, decoded_key: String, file_name: String| {
+        let meta = std::fs::metadata(path).ok();
+        let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.and_then(|m| m.modified().ok()).map(|t| {
+            let dt: chrono::DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        });
+        // Count lines (messages = lines - 1 for metadata line)
+        let line_count = std::fs::File::open(path)
+            .ok()
+            .map(|f| {
+                use std::io::BufRead;
+                std::io::BufReader::new(f).lines().count()
             })
-        };
+            .unwrap_or(0);
+        let msg_count = line_count.saturating_sub(1);
+        serde_json::json!({
+            "key": decoded_key,
+            "file": file_name,
+            "messages": msg_count,
+            "size_bytes": size_bytes,
+            "modified": modified,
+        })
+    };
 
     // Use a map keyed by decoded_key so per-user entries take precedence.
     let mut session_map = std::collections::HashMap::<String, serde_json::Value>::new();
@@ -2073,8 +2072,7 @@ pub async fn list_sessions(
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            let base_key =
-                octos_bus::SessionManager::decode_filename(&encoded_base_key);
+            let base_key = octos_bus::SessionManager::decode_filename(&encoded_base_key);
 
             let user_sessions_dir = user_path.join("sessions");
             if let Ok(sess_entries) = std::fs::read_dir(&user_sessions_dir) {
@@ -2094,8 +2092,7 @@ pub async fn list_sessions(
                         format!("{}#{}", base_key, topic)
                     };
                     let file_label = format!("{}/{}", encoded_base_key, topic);
-                    let entry_val =
-                        build_session_entry(&path, decoded_key.clone(), file_label);
+                    let entry_val = build_session_entry(&path, decoded_key.clone(), file_label);
                     // Per-user takes precedence over legacy.
                     session_map.insert(decoded_key, entry_val);
                 }

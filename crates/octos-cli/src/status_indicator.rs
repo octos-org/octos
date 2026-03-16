@@ -538,11 +538,7 @@ mod tests {
         async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
             Ok(())
         }
-        async fn delete_message(
-            &self,
-            _chat_id: &str,
-            _message_id: &str,
-        ) -> eyre::Result<()> {
+        async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> eyre::Result<()> {
             // Simulate a hung Telegram API call
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(())

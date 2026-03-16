@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
 use colored::Colorize;
+use eyre::{Result, WrapErr};
 use octos_agent::{Agent, AgentConfig, ConsoleReporter, HookExecutor, ToolRegistry};
 use octos_core::{AgentId, Message, MessageRole};
 use octos_llm::{
@@ -13,7 +14,6 @@ use octos_llm::{
     RetryProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use eyre::{Result, WrapErr};
 use rustyline::DefaultEditor;
 
 use super::Executable;

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
-use eyre::Result;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::message_repair::{
@@ -324,7 +324,8 @@ impl Agent {
                     StopReason::EndTurn | StopReason::StopSequence => {
                         if self.config.save_episodes {
                             let summary = response.content.clone().unwrap_or_default();
-                            let summary_truncated = octos_core::truncated_utf8(&summary, 500, "...");
+                            let summary_truncated =
+                                octos_core::truncated_utf8(&summary, 500, "...");
 
                             let mut episode = Episode::new(
                                 task.id.clone(),

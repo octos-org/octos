@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use octos_agent::ToolRegistry;
 use eyre::Result;
+use octos_agent::ToolRegistry;
 
 use super::Executable;
 

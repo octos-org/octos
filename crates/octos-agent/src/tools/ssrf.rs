@@ -255,7 +255,10 @@ mod tests {
         // This domain should fail DNS resolution → must be blocked (fail closed)
         let result =
             check_ssrf_with_addrs("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
-        assert!(result.is_err(), "DNS failure should block request (fail closed)");
+        assert!(
+            result.is_err(),
+            "DNS failure should block request (fail closed)"
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("DNS resolution failed") || err.contains("fail closed"),
@@ -266,8 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_ssrf_blocks_nonexistent_domain() {
         // The simple API should also fail closed
-        let result =
-            check_ssrf("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
+        let result = check_ssrf("https://this-domain-does-not-exist-ssrf-test.invalid/foo").await;
         assert!(
             result.is_some(),
             "DNS failure should block via simple API too"

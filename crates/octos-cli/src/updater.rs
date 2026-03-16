@@ -347,7 +347,10 @@ impl Updater {
     /// Get the current version string.
     pub fn current_version() -> String {
         let version = env!("CARGO_PKG_VERSION");
-        match (option_env!("OCTOS_GIT_HASH"), option_env!("OCTOS_BUILD_DATE")) {
+        match (
+            option_env!("OCTOS_GIT_HASH"),
+            option_env!("OCTOS_BUILD_DATE"),
+        ) {
             (Some(hash), Some(date)) => format!("{version} ({hash} {date})"),
             _ => version.to_string(),
         }

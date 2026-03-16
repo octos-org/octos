@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 
 use crate::config::ChatConfig;
 use crate::pricing;
@@ -159,7 +159,8 @@ impl ProviderRouter {
         let model_id = provider.model_id().to_string();
         let provider_name = provider.provider_name().to_string();
         let context_window = provider.context_window();
-        let max_output_tokens = max_output_tokens_override.unwrap_or_else(|| provider.max_output_tokens());
+        let max_output_tokens =
+            max_output_tokens_override.unwrap_or_else(|| provider.max_output_tokens());
 
         let cost_info = pricing::model_pricing(&model_id).map(|p| {
             format!(

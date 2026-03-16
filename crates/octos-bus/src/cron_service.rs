@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
-use octos_core::InboundMessage;
 use eyre::{Result, WrapErr};
+use octos_core::InboundMessage;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};

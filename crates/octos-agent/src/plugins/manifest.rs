@@ -44,7 +44,10 @@ impl PluginManifest {
     pub fn has_extras(&self) -> bool {
         !self.mcp_servers.is_empty()
             || !self.hooks.is_empty()
-            || self.prompts.as_ref().map_or(false, |p| !p.include.is_empty())
+            || self
+                .prompts
+                .as_ref()
+                .map_or(false, |p| !p.include.is_empty())
     }
 }
 

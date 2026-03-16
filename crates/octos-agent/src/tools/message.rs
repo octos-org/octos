@@ -1,8 +1,8 @@
 //! Message tool for cross-channel messaging.
 
 use async_trait::async_trait;
-use octos_core::OutboundMessage;
 use eyre::{Result, WrapErr};
+use octos_core::OutboundMessage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 

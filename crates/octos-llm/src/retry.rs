@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 use tracing::{debug, warn};
 
 use crate::config::ChatConfig;

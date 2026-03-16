@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
+use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};

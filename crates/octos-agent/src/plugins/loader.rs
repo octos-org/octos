@@ -454,6 +454,9 @@ mod tests {
         let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         // Should not load any tools because the executable is a symlink
-        assert_eq!(result.tool_count, 0, "symlink executable should be rejected");
+        assert_eq!(
+            result.tool_count, 0,
+            "symlink executable should be rejected"
+        );
     }
 }

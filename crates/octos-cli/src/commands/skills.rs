@@ -893,7 +893,9 @@ fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
     let skill_file = skill_dir.join("SKILL.md");
 
     if !skill_file.exists() {
-        eyre::bail!("Skill '{name}' not found. Install it with: octos skills install <repo>/{name}");
+        eyre::bail!(
+            "Skill '{name}' not found. Install it with: octos skills install <repo>/{name}"
+        );
     }
 
     let content = std::fs::read_to_string(&skill_file)?;
@@ -1253,8 +1255,9 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     // Try 1: download from manifest.json binaries (skill repo's own CI/CD)
     if has_manifest {
         if let Ok(manifest_str) = std::fs::read_to_string(dir.join("manifest.json")) {
-            if let Ok(manifest) =
-                serde_json::from_str::<octos_agent::plugins::manifest::PluginManifest>(&manifest_str)
+            if let Ok(manifest) = serde_json::from_str::<
+                octos_agent::plugins::manifest::PluginManifest,
+            >(&manifest_str)
             {
                 if let Some(info) = manifest.binaries.get(&key) {
                     println!("  Downloading binary for {} from manifest...", key.cyan());

@@ -2,10 +2,10 @@
 
 use std::sync::atomic::Ordering;
 
-use octos_core::{Message, MessageRole, TokenUsage};
-use octos_llm::{ChatResponse, ChatStream, StopReason, StreamEvent};
 use eyre::Result;
 use futures::StreamExt;
+use octos_core::{Message, MessageRole, TokenUsage};
+use octos_llm::{ChatResponse, ChatStream, StopReason, StreamEvent};
 use tracing::warn;
 
 use super::Agent;

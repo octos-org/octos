@@ -95,11 +95,7 @@ async fn test_deepseek_responds() {
     let provider = deepseek();
     let start = Instant::now();
     let resp = provider
-        .chat(
-            &[msg("Capital of France? One word.")],
-            &[],
-            &chat_config(),
-        )
+        .chat(&[msg("Capital of France? One word.")], &[], &chat_config())
         .await
         .expect("deepseek should respond");
     let text = resp_text(&resp);
@@ -254,8 +250,7 @@ async fn test_lane_mode_selects_best_provider() {
 #[ignore]
 async fn test_failover_from_broken_to_working() {
     let broken: Arc<dyn LlmProvider> = Arc::new(
-        OpenAIProvider::new("sk-INVALID", "kimi-k2.5")
-            .with_base_url("https://api.moonshot.ai/v1"),
+        OpenAIProvider::new("sk-INVALID", "kimi-k2.5").with_base_url("https://api.moonshot.ai/v1"),
     );
     let working = deepseek();
 
@@ -385,7 +380,13 @@ async fn test_responsiveness_baseline_learning() {
         should_activate,
         observer.sample_count()
     );
-    assert!(baseline.is_some(), "should have learned baseline after 6 queries");
-    assert!(!should_activate, "should not activate with normal latencies");
+    assert!(
+        baseline.is_some(),
+        "should have learned baseline after 6 queries"
+    );
+    assert!(
+        !should_activate,
+        "should not activate with normal latencies"
+    );
     println!("OK Responsiveness baseline learning works");
 }

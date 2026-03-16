@@ -4,9 +4,9 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use octos_core::{Message, SessionKey};
 use eyre::Result;
 use lru::LruCache;
+use octos_core::{Message, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -1791,8 +1791,9 @@ mod tests {
             "created_at": old,
             "updated_at": old
         });
-        let legacy_research_path =
-            tmp.path().join("sessions/telegram%3A12345%23research.jsonl");
+        let legacy_research_path = tmp
+            .path()
+            .join("sessions/telegram%3A12345%23research.jsonl");
         std::fs::write(
             &legacy_research_path,
             format!(
@@ -1804,9 +1805,7 @@ mod tests {
         .unwrap();
 
         // --- Per-user layout ---
-        let user_sessions_dir = tmp
-            .path()
-            .join("users/telegram%3A12345/sessions");
+        let user_sessions_dir = tmp.path().join("users/telegram%3A12345/sessions");
         std::fs::create_dir_all(&user_sessions_dir).unwrap();
 
         // Default session (newer — should win over legacy default)
@@ -1851,11 +1850,13 @@ mod tests {
         assert_eq!(entries.len(), 3, "expected 3 entries, got: {entries:?}");
 
         // Sorted by updated_at descending: default(now) > research(old) >= coding(old)
-        let topics: Vec<Option<&str>> =
-            entries.iter().map(|e| e.topic.as_deref()).collect();
+        let topics: Vec<Option<&str>> = entries.iter().map(|e| e.topic.as_deref()).collect();
 
         // Default session (from per-user, not legacy) should be first (newest)
-        assert_eq!(entries[0].topic, None, "first entry should be default session");
+        assert_eq!(
+            entries[0].topic, None,
+            "first entry should be default session"
+        );
         assert_eq!(
             entries[0].updated_at, now,
             "default session should come from per-user layout (newer timestamp)"

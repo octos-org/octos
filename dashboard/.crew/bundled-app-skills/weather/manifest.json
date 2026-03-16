@@ -1,0 +1,42 @@
+{
+  "name": "weather",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "Get current weather for any city worldwide via Open-Meteo (free, no API key)",
+  "timeout_secs": 15,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a city. Returns temperature, humidity, wind speed, and conditions. IMPORTANT: Always use English city names (e.g. 'Saratoga' not '萨拉托加', 'Tokyo' not '东京').",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "City name in English, optionally with country (e.g. 'Stockholm', 'Tokyo', 'New York, US'). Always translate non-English names to English."
+          }
+        },
+        "required": ["city"]
+      }
+    },
+    {
+      "name": "get_forecast",
+      "description": "Get multi-day weather forecast for a city. Returns daily high/low temperatures, conditions, precipitation, and wind. IMPORTANT: Always use English city names (e.g. 'Paris, France' not '巴黎').",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "City name in English, optionally with country (e.g. 'Paris, France', 'Tokyo'). Always translate non-English names to English."
+          },
+          "days": {
+            "type": "integer",
+            "description": "Number of forecast days (1-16, default 7)"
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  ]
+}

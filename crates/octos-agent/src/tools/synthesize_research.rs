@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use eyre::{Result, WrapErr};
 use octos_core::TokenUsage;
 use octos_llm::LlmProvider;
-use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::info;
 

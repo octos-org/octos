@@ -1,10 +1,10 @@
 //! Session compaction: summarize old messages to keep sessions manageable.
 
 use chrono::Utc;
+use eyre::Result;
 use octos_bus::{SessionHandle, SessionManager};
 use octos_core::{Message, MessageRole, SessionKey};
 use octos_llm::{ChatConfig, LlmProvider};
-use eyre::Result;
 use tracing::debug;
 
 /// Default minimum messages before compaction triggers.

@@ -5,9 +5,9 @@
 //! provider only for actual OpenAI endpoints with capable models.
 
 use async_trait::async_trait;
-use octos_core::{Message, MessageRole};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+use octos_core::{Message, MessageRole};
 
 use reqwest::Client;
 use serde::Deserialize;

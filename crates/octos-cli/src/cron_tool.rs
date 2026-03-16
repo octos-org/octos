@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use eyre::{Result, WrapErr};
 use octos_agent::tools::{Tool, ToolResult};
 use octos_bus::{CronPayload, CronSchedule, CronService};
-use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 pub struct CronTool {

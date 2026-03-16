@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use clap::Args;
 use colored::Colorize;
+use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager,
@@ -24,7 +25,6 @@ use octos_llm::{
     SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use eyre::{Result, WrapErr};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
@@ -521,8 +521,7 @@ impl GatewayCommand {
 
             // Load only admin-relevant plugins (not all bundled skills)
             let admin_skills: &[&str] = &["send-email", "account-manager"];
-            let bundled_dir = project_dir
-                .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
             for skill_name in admin_skills {
                 let skill_dir = bundled_dir.join(skill_name);
                 if skill_dir.exists() {
@@ -702,11 +701,8 @@ impl GatewayCommand {
                         ) {
                             Ok(p) => {
                                 // Build a unique key from model name
-                                let base_key = fb
-                                    .model
-                                    .as_deref()
-                                    .unwrap_or(&fb.provider)
-                                    .to_string();
+                                let base_key =
+                                    fb.model.as_deref().unwrap_or(&fb.provider).to_string();
                                 let count = key_counts.entry(base_key.clone()).or_insert(0);
                                 let key = if *count == 0 {
                                     base_key.clone()
@@ -738,11 +734,7 @@ impl GatewayCommand {
                     }
                 }
 
-                if registered > 0 {
-                    Some(router)
-                } else {
-                    None
-                }
+                if registered > 0 { Some(router) } else { None }
             };
 
             // Capture config for per-session SpawnTool and PipelineTool creation
@@ -1545,10 +1537,7 @@ impl GatewayCommand {
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
 
                     // Rebuild keyboard with updated active marker
-                    let entries = session_mgr
-                        .lock()
-                        .await
-                        .list_user_sessions(&base_key_str);
+                    let entries = session_mgr.lock().await.list_user_sessions(&base_key_str);
                     let keyboard = session_ui::build_session_keyboard(&entries, topic);
                     let text = session_ui::build_session_text(&entries, topic);
 
@@ -1568,11 +1557,8 @@ impl GatewayCommand {
                     info!(session = %label, "session switched via inline keyboard");
 
                     // Flush any buffered messages from the target session
-                    let target_key = SessionKey::with_topic(
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        topic,
-                    );
+                    let target_key =
+                        SessionKey::with_topic(&inbound.channel, &inbound.chat_id, topic);
                     actor_registry.flush_pending(&target_key.to_string()).await;
                     continue;
                 }
@@ -1703,10 +1689,7 @@ impl GatewayCommand {
 
             // Handle /sessions command — list all sessions with inline keyboard
             if cmd == "/sessions" {
-                let entries = session_mgr
-                    .lock()
-                    .await
-                    .list_user_sessions(&base_key_str);
+                let entries = session_mgr.lock().await.list_user_sessions(&base_key_str);
                 let active_topic = active_sessions
                     .lock()
                     .await

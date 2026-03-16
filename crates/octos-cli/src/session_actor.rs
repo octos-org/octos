@@ -2492,9 +2492,7 @@ mod tests {
             adaptive_router,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            active_sessions: Arc::new(Mutex::new(
-                ActiveSessionStore::open(dir.path()).unwrap(),
-            )),
+            active_sessions: Arc::new(Mutex::new(ActiveSessionStore::open(dir.path()).unwrap())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2577,9 +2575,7 @@ mod tests {
             adaptive_router: Some(router),
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            active_sessions: Arc::new(Mutex::new(
-                ActiveSessionStore::open(dir.path()).unwrap(),
-            )),
+            active_sessions: Arc::new(Mutex::new(ActiveSessionStore::open(dir.path()).unwrap())),
         };
 
         let handle = tokio::spawn(actor.run());

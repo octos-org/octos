@@ -96,7 +96,10 @@ mod tests {
     #[test]
     fn test_chat_config_defaults() {
         let config = ChatConfig::default();
-        assert_eq!(config.max_tokens, Some(crate::context::default_max_tokens()));
+        assert_eq!(
+            config.max_tokens,
+            Some(crate::context::default_max_tokens())
+        );
         assert_eq!(config.temperature, Some(0.0));
         assert!(matches!(config.tool_choice, ToolChoice::Auto));
         assert!(config.stop_sequences.is_empty());

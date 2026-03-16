@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use octos_core::OutboundMessage;
 use eyre::{Result, WrapErr};
+use octos_core::OutboundMessage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -136,7 +136,8 @@ impl Tool for SendFileTool {
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
         if let Some(ref base_dir) = self.base_dir {
-            let canonical_base = std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
+            let canonical_base =
+                std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     if !canonical_path.starts_with(&canonical_base) {
@@ -328,8 +329,7 @@ mod tests {
         std::fs::write(&outside_file, "secret data").unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345")
-            .with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
         let result = tool
             .execute(&serde_json::json!({
@@ -349,8 +349,7 @@ mod tests {
         std::fs::write(&inside_file, "report content").unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345")
-            .with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
         let result = tool
             .execute(&serde_json::json!({
@@ -371,8 +370,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345")
-            .with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
         let result = tool
             .execute(&serde_json::json!({
@@ -395,8 +393,7 @@ mod tests {
         std::fs::write(&file, "pptx data").unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345")
-            .with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
         // Pass relative path — should resolve to base_dir/skill-output/deck.pptx
         let result = tool
@@ -429,8 +426,7 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345")
-            .with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
         // Try path traversal via ../
         let traversal = format!(

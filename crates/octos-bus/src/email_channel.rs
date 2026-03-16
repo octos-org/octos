@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+use octos_core::{InboundMessage, OutboundMessage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 

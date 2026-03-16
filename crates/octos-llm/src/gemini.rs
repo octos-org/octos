@@ -1,9 +1,9 @@
 //! Google Gemini provider implementation.
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+use octos_core::Message;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

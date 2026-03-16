@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use eyre::{Result, WrapErr};
 use octos_agent::{Tool, ToolPolicy, ToolResult};
 use octos_llm::{LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
-use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 use crate::discovery::PipelineDiscovery;
@@ -228,13 +228,24 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
                         best_synth.max_output_tokens.to_string(),
                     )
                 } else {
-                    ("cheap".into(), "strong".into(), "strong".into(), "16384".into())
+                    (
+                        "cheap".into(),
+                        "strong".into(),
+                        "strong".into(),
+                        "16384".into(),
+                    )
                 }
             } else {
-                ("cheap".into(), "strong".into(), "strong".into(), "16384".into())
+                (
+                    "cheap".into(),
+                    "strong".into(),
+                    "strong".into(),
+                    "16384".into(),
+                )
             };
 
-        let example = format!("\
+        let example = format!(
+            "\
 Example:\n\
 digraph research {{\n  \
   plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
@@ -247,7 +258,8 @@ model=\"{strong_model}\", tools=\"read_file\", timeout_secs=\"300\"]\n  \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"600\"]\n  \
   plan_and_search -> analyze\n  \
   analyze -> synthesize\n\
-}}");
+}}"
+        );
 
         let pipeline_desc = if model_catalog.is_empty() {
             format!(
@@ -301,7 +313,11 @@ model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write
         let is_inline = input.pipeline.trim().starts_with("digraph ");
         tracing::info!(
             inline = is_inline,
-            pipeline_arg = if is_inline { "(inline DOT)" } else { &input.pipeline },
+            pipeline_arg = if is_inline {
+                "(inline DOT)"
+            } else {
+                &input.pipeline
+            },
             "run_pipeline invoked"
         );
 

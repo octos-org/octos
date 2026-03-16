@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use clap::Args;
 use colored::Colorize;
+use eyre::{Result, WrapErr};
 use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
 use octos_core::AgentId;
 use octos_llm::{LlmProvider, RetryProvider};
 use octos_memory::EpisodeStore;
-use eyre::{Result, WrapErr};
 
 use super::Executable;
 use super::chat::create_provider;

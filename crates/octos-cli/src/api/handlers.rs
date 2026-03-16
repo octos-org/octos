@@ -172,9 +172,9 @@ async fn chat_streaming(
 
     // Create per-request channel and reporter
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(Arc::new(
-        ChannelReporter::new(tx.clone()),
-    )));
+    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
+        Arc::new(ChannelReporter::new(tx.clone())),
+    ));
 
     // Build per-request agent sharing resources with the base agent
     let request_agent = Agent::new_shared(

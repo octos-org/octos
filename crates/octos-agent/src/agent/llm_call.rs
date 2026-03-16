@@ -2,10 +2,10 @@
 
 use std::time::{Duration, Instant};
 
+use eyre::Result;
 use octos_core::Message;
 use octos_core::TokenUsage;
 use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
-use eyre::Result;
 use tracing::warn;
 
 use super::Agent;

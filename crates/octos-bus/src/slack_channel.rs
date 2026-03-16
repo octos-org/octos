@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
 use futures::{SinkExt, StreamExt};
+use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::mpsc;

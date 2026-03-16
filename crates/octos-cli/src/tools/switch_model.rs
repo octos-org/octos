@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use eyre::Result;
 use octos_agent::tools::{Tool, ToolResult};
 use octos_llm::{LlmProvider, ProviderChain, RetryProvider, SwappableProvider};
-use eyre::Result;
 use serde::Deserialize;
 use tracing::info;
 

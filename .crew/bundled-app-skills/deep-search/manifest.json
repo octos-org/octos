@@ -1,0 +1,36 @@
+{
+  "name": "deep-search",
+  "version": "2.0.0",
+  "author": "hagency",
+  "description": "Deep multi-round web research: iterative search across multiple angles, parallel page crawling, reference chasing, and structured report generation.",
+  "timeout_secs": 600,
+  "tools": [
+    {
+      "name": "deep_search",
+      "description": "Perform deep multi-round web research on a topic. Searches from multiple angles (follow-up queries, time-qualified, controversy), fetches all pages in parallel, chases most-referenced external sources, and produces a structured research report with source previews. Saves everything under ./research/<query>/. Use read_file on specific source files for detailed synthesis.",
+      "entrypoint": "target/release/deep-search",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The research topic or question to investigate"
+          },
+          "depth": {
+            "type": "integer",
+            "description": "Research depth: 1=quick (single search + crawl, ~1min), 2=standard (3 search rounds + reference chasing, ~3min), 3=thorough (5 search rounds + aggressive link chasing, ~5min). Default: 2"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Number of search results per round (1-10, default: 8)"
+          },
+          "search_engine": {
+            "type": "string",
+            "description": "Preferred search engine: perplexity, duckduckgo, brave, you (default: auto-detect, prefers perplexity)"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  ]
+}

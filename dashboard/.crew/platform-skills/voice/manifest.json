@@ -1,0 +1,166 @@
+{
+  "name": "voice",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "OminiX voice skill: ASR, TTS, and model management via local Qwen3 models on Apple Silicon",
+  "timeout_secs": 300,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "voice_transcribe",
+      "description": "Transcribe an audio file to text using OminiX ASR (Qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "audio_path": {
+            "type": "string",
+            "description": "Absolute path to the audio file to transcribe"
+          },
+          "language": {
+            "type": "string",
+            "description": "Transcription language: 'Chinese' (default), 'English', 'Japanese', 'Korean', 'Cantonese', etc."
+          }
+        },
+        "required": ["audio_path"]
+      }
+    },
+    {
+      "name": "voice_synthesize",
+      "description": "Synthesize speech from text using OminiX TTS (Qwen3). Produces a WAV audio file. Use this when the user asks for a voice reply or text-to-speech. After generating, use send_file to deliver the audio to the user.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to synthesize into speech"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the WAV file. Default: /tmp/crew_tts_<timestamp>.wav"
+          },
+          "language": {
+            "type": "string",
+            "description": "Speech language: 'chinese' (default), 'english', 'japanese', 'korean'"
+          },
+          "speaker": {
+            "type": "string",
+            "description": "Voice name: a preset ('vivian', 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee') OR a saved voice profile name. Use voice_list_profiles to see saved profiles."
+          }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "voice_clone",
+      "description": "Clone a voice from a reference audio sample (3-10 seconds) and synthesize new speech in that voice. Uses ECAPA-TDNN x-vector speaker embedding extraction. Requires the Base TTS model (not CustomVoice). After generating, use send_file to deliver the audio. IMPORTANT: When the user sends a voice sample for cloning, always ask what name they want for this voice profile, then set save_as to save it for future use.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "reference_audio": {
+            "type": "string",
+            "description": "Absolute path to reference audio file (3-10 seconds, WAV/OGG/MP3/FLAC/M4A). The voice in this clip will be cloned."
+          },
+          "text": {
+            "type": "string",
+            "description": "The text to synthesize in the cloned voice"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the WAV file. Default: /tmp/crew_clone_<timestamp>.wav"
+          },
+          "language": {
+            "type": "string",
+            "description": "Speech language: 'chinese' (default), 'english', 'japanese', 'korean'"
+          },
+          "save_as": {
+            "type": "string",
+            "description": "Save this voice as a named profile for future use. The name can then be used as speaker in voice_synthesize."
+          }
+        },
+        "required": ["reference_audio", "text"]
+      }
+    },
+    {
+      "name": "voice_save_profile",
+      "description": "Save an audio sample as a named voice profile for future TTS cloning. The saved profile can then be used as the speaker parameter in voice_synthesize. Profiles are private to this user/profile.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name for this voice profile (e.g. 'alice', 'my_voice', 'boss'). Lowercase alphanumeric + underscore/hyphen."
+          },
+          "audio_path": {
+            "type": "string",
+            "description": "Absolute path to the reference audio file (3-10 seconds)"
+          }
+        },
+        "required": ["name", "audio_path"]
+      }
+    },
+    {
+      "name": "voice_list_profiles",
+      "description": "List all saved voice profiles for this user. Shows profile names that can be used as the speaker parameter in voice_synthesize.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "list_models",
+      "description": "List all loaded models and available models in the catalog on the local ominix-api server. Use this to check which ASR/TTS/LLM models are installed and which can be downloaded.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "download_model",
+      "description": "Download a model from the catalog to the local machine. Use list_models first to see available model IDs. Downloads can take several minutes for large models.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model_id": {
+            "type": "string",
+            "description": "Model ID from the catalog (e.g. 'Qwen3-ASR-2B-MLX-4bit', 'Qwen3-TTS-1.5B-MLX-4bit')"
+          }
+        },
+        "required": ["model_id"]
+      }
+    },
+    {
+      "name": "load_model",
+      "description": "Load a downloaded model into GPU memory for inference. The model must already be downloaded locally.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Model name or path to load"
+          },
+          "model_type": {
+            "type": "string",
+            "description": "Type of model: 'llm' (default), 'asr', 'tts'"
+          }
+        },
+        "required": ["model"]
+      }
+    },
+    {
+      "name": "unload_model",
+      "description": "Unload a model from GPU memory to free resources.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model_type": {
+            "type": "string",
+            "description": "Type of model to unload: 'llm', 'asr', 'tts'"
+          }
+        },
+        "required": ["model_type"]
+      }
+    }
+  ]
+}

@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use eyre::Result;
 use octos_core::TokenUsage;
 use octos_llm::ToolSpec;
-use eyre::Result;
 
 use crate::progress::ProgressReporter;
 
@@ -1020,10 +1020,7 @@ mod cwd_isolation_tests {
     async fn test_rebind_cwd_file_tools_reject_outside_paths() {
         // Create initial registry with a broad cwd
         let broad_cwd = std::path::Path::new("/tmp");
-        let registry = ToolRegistry::with_builtins_and_sandbox(
-            broad_cwd,
-            Box::new(NoSandbox),
-        );
+        let registry = ToolRegistry::with_builtins_and_sandbox(broad_cwd, Box::new(NoSandbox));
 
         // Now rebind to a narrow cwd (simulating per-profile isolation)
         let narrow_cwd = tempfile::tempdir().expect("create temp dir");
@@ -1036,10 +1033,7 @@ mod cwd_isolation_tests {
 
         // read_file inside cwd should succeed
         let result = rebound
-            .execute(
-                "read_file",
-                &serde_json::json!({"path": "allowed.txt"}),
-            )
+            .execute("read_file", &serde_json::json!({"path": "allowed.txt"}))
             .await;
         assert!(result.is_ok(), "read inside narrow cwd should work");
         let tr = result.unwrap();
@@ -1092,18 +1086,11 @@ mod cwd_isolation_tests {
             .await;
         assert!(result.is_ok());
         let tr = result.unwrap();
-        assert!(
-            tr.success,
-            "list_dir inside cwd should work: {}",
-            tr.output
-        );
+        assert!(tr.success, "list_dir inside cwd should work: {}", tr.output);
 
         // list_dir with traversal should fail
         let result = rebound
-            .execute(
-                "list_dir",
-                &serde_json::json!({"path": "../../"}),
-            )
+            .execute("list_dir", &serde_json::json!({"path": "../../"}))
             .await;
         assert!(result.is_ok());
         let tr = result.unwrap();
@@ -1117,10 +1104,8 @@ mod cwd_isolation_tests {
     #[tokio::test]
     async fn test_rebind_cwd_preserves_non_cwd_tools() {
         let initial_cwd = tempfile::tempdir().expect("create temp dir");
-        let registry = ToolRegistry::with_builtins_and_sandbox(
-            initial_cwd.path(),
-            Box::new(NoSandbox),
-        );
+        let registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
 
         let new_cwd = tempfile::tempdir().expect("create temp dir");
         let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));

@@ -1,8 +1,8 @@
 //! LLM provider trait.
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 
 use crate::config::ChatConfig;
 use crate::context;

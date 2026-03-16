@@ -302,10 +302,9 @@ impl Sandbox for MacosSandbox {
             // Add configured read paths — validate each for SBPL metacharacters
             // to prevent sandbox profile injection (same check as cwd above).
             for path in &self.read_allow_paths {
-                if path
-                    .bytes()
-                    .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
-                {
+                if path.bytes().any(|b| {
+                    b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
+                }) {
                     tracing::error!(
                         path = %path,
                         "read_allow_paths entry contains SBPL metacharacters, skipping"
@@ -1252,9 +1251,7 @@ mod tests {
     fn should_reject_read_allow_paths_with_parens() {
         let sb = MacosSandbox {
             allow_network: false,
-            read_allow_paths: vec![
-                "/path/with(parens)".to_string(),
-            ],
+            read_allow_paths: vec!["/path/with(parens)".to_string()],
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -1334,9 +1331,7 @@ mod tests {
         if escaped {
             // Clean up and fail
             let _ = std::fs::remove_file("/tmp/sandbox_escape_test_file");
-            panic!(
-                "sandbox failed to block write outside cwd! stdout={stdout}, stderr={stderr}"
-            );
+            panic!("sandbox failed to block write outside cwd! stdout={stdout}, stderr={stderr}");
         }
     }
 
@@ -1380,10 +1375,7 @@ mod tests {
             // Only allow reads from cwd + system paths — NOT outside dir
             read_allow_paths: vec!["/nonexistent/path".to_string()],
         };
-        let cmd_str = format!(
-            "cat {} 2>&1; echo exit=$?",
-            secret_file.display()
-        );
+        let cmd_str = format!("cat {} 2>&1; echo exit=$?", secret_file.display());
         let mut cmd = sb.wrap_command(&cmd_str, cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
         let stdout = String::from_utf8_lossy(&output.stdout);

@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use octos_core::{InboundMessage, OutboundMessage};
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;

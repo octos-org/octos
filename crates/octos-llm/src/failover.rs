@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 use tracing::{info, warn};
 
 use crate::config::ChatConfig;

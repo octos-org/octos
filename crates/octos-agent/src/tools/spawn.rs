@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
+use eyre::{Result, WrapErr};
 use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
-use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::{info, warn};
 

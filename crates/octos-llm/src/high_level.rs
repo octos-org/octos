@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use octos_core::Message;
 use eyre::Result;
+use octos_core::Message;
 
 use crate::config::{ChatConfig, ResponseFormat};
 use crate::provider::LlmProvider;

@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use eyre::Result;
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
-use eyre::Result;
 use tracing::{info, warn};
 
 use crate::condition;
@@ -135,7 +135,8 @@ impl Handler for CodergenHandler {
 
         // Load plugin tools (app-skills like deep-search, deep-crawl, etc.)
         if !self.plugin_dirs.is_empty() {
-            if let Err(e) = octos_agent::PluginLoader::load_into(&mut tools, &self.plugin_dirs, &[]) {
+            if let Err(e) = octos_agent::PluginLoader::load_into(&mut tools, &self.plugin_dirs, &[])
+            {
                 warn!("plugin loading in pipeline handler: {e}");
             }
         }

@@ -64,4 +64,4 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
-          cargo test -p crew-agent --test security_sandbox -- --nocapture
+          cargo test -p octos-agent --test security_sandbox -- --nocapture

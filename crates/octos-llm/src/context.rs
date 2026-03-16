@@ -66,9 +66,17 @@ static MODEL_LIMITS: std::sync::LazyLock<ModelLimitsConfig> = std::sync::LazyLoc
                 .filter_map(|e| {
                     let pattern = e.get("pattern")?.as_str()?.to_string();
                     let max_output = e.get("max_output")?.as_u64()? as u32;
-                    let description = e.get("description").and_then(|v| v.as_str()).map(String::from);
+                    let description = e
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let tier = e.get("tier").and_then(|v| v.as_str()).map(String::from);
-                    Some(ModelLimitEntry { pattern, max_output, description, tier })
+                    Some(ModelLimitEntry {
+                        pattern,
+                        max_output,
+                        description,
+                        tier,
+                    })
                 })
                 .collect()
         })

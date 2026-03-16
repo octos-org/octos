@@ -2,9 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+use eyre::Result;
 use octos_core::{Message, MessageRole, TokenUsage};
 use octos_llm::ChatResponse;
-use eyre::Result;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
