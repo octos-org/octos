@@ -27,7 +27,8 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
 pub fn record_tool_call(name: &str, success: bool, duration_secs: f64) {
     let labels = [("tool", name.to_string()), ("success", success.to_string())];
     counter!("octos_tool_calls_total", &labels).increment(1);
-    histogram!("octos_tool_call_duration_seconds", "tool" => name.to_string()).record(duration_secs);
+    histogram!("octos_tool_call_duration_seconds", "tool" => name.to_string())
+        .record(duration_secs);
 }
 
 /// Record LLM token usage.
