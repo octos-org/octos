@@ -36,7 +36,7 @@
           },
           "output_path": {
             "type": "string",
-            "description": "Path to save the WAV file. Default: /tmp/crew_tts_<timestamp>.wav"
+            "description": "Path to save the WAV file. Default: /tmp/octos_tts_<timestamp>.wav"
           },
           "language": {
             "type": "string",
@@ -66,7 +66,7 @@
           },
           "output_path": {
             "type": "string",
-            "description": "Path to save the WAV file. Default: /tmp/crew_clone_<timestamp>.wav"
+            "description": "Path to save the WAV file. Default: /tmp/octos_clone_<timestamp>.wav"
           },
           "language": {
             "type": "string",

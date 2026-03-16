@@ -106,4 +106,4 @@ Supported fields: `telegram_token`, `telegram_senders`, `whatsapp` (bool), `feis
 
 ## Environment Variables
 
-This tool reads `CREW_HOME` and `CREW_PROFILE_ID` from the environment (set automatically by the gateway). No manual configuration is needed.
+This tool reads `OCTOS_HOME` and `OCTOS_PROFILE_ID` from the environment (set automatically by the gateway). No manual configuration is needed.

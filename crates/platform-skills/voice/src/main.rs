@@ -467,7 +467,7 @@ fn handle_voice_clone(input_json: &str) {
 
     let output_path = input
         .output_path
-        .unwrap_or_else(|| format!("/tmp/crew_clone_{}.wav", timestamp()));
+        .unwrap_or_else(|| format!("/tmp/octos_clone_{}.wav", timestamp()));
 
     if let Some(parent) = Path::new(&output_path).parent() {
         if !parent.exists() {

@@ -51,7 +51,7 @@ Generate speech audio from text. Produces a WAV file. The `speaker` parameter ac
 
 **Parameters:**
 - `text` (required): Text to synthesize
-- `output_path` (optional): Where to save WAV. Default: `/tmp/crew_tts_<timestamp>.wav`
+- `output_path` (optional): Where to save WAV. Default: `/tmp/octos_tts_<timestamp>.wav`
 - `language` (optional, default "chinese"): "chinese", "english", "japanese", "korean"
 - `speaker` (optional, default "vivian"): Preset name OR saved voice profile name
 
@@ -69,7 +69,7 @@ Clone any voice from a short reference audio (3-10 seconds) and synthesize new s
 - `reference_audio` (required): Absolute path to reference audio (3-10s)
 - `text` (required): Text to synthesize in the cloned voice
 - `save_as` (optional): Save this voice as a named profile for future use
-- `output_path` (optional): Where to save WAV. Default: `/tmp/crew_clone_<timestamp>.wav`
+- `output_path` (optional): Where to save WAV. Default: `/tmp/octos_clone_<timestamp>.wav`
 - `language` (optional, default "chinese"): "chinese", "english", "japanese", "korean"
 
 ### voice_save_profile

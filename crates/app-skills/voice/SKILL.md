@@ -57,7 +57,7 @@ Generate speech audio from text. Produces a WAV file. Supports both preset voice
 ```
 
 - `text` (required): Text to synthesize
-- `output_path` (optional): Where to save WAV. Default: `<CREW_WORK_DIR>/voice/crew_tts_<timestamp>.wav`
+- `output_path` (optional): Where to save WAV. Default: `<OCTOS_WORK_DIR>/voice/octos_tts_<timestamp>.wav`
 - `language` (optional, default "chinese"): "chinese", "english", "japanese", "korean"
 - `speaker` (optional, default "vivian"): vivian, serena, ryan, aiden, eric, dylan, uncle_fu, ono_anna, sohee
 - `reference_audio` (optional): Path to a 3-10s WAV reference clip for voice cloning. When provided, the Base model's x-vector speaker encoder extracts the voice embedding and generates speech in that voice. Overrides `speaker`.
