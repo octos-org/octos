@@ -639,10 +639,33 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         return vec![];
     }
 
+    // Detect error events from the SSE layer (network failures, etc.)
+    if event.event.as_deref() == Some("error") {
+        let msg = serde_json::from_str::<serde_json::Value>(&event.data)
+            .ok()
+            .and_then(|v| {
+                v["error"]["message"]
+                    .as_str()
+                    .or_else(|| v["error"].as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| event.data.clone());
+        return vec![StreamEvent::Error(msg)];
+    }
+
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
+
+    // Provider-level error in JSON payload (e.g. DashScope {"error":{"message":"..."}})
+    if let Some(err) = data.get("error") {
+        let msg = err["message"]
+            .as_str()
+            .or_else(|| err.as_str())
+            .unwrap_or("unknown error");
+        return vec![StreamEvent::Error(msg.to_string())];
+    }
 
     let mut events = Vec::new();
 
