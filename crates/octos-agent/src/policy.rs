@@ -67,20 +67,45 @@ fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Check if `pattern` appears in `haystack` at a word boundary.
+///
+/// A word boundary is start/end of string or a non-alphanumeric character.
+/// This prevents "mkfs" from matching inside "unmkfsblah" or "sudo" inside "pseudocode".
+fn contains_at_word_boundary(haystack: &str, pattern: &str) -> bool {
+    let pat_bytes = pattern.as_bytes();
+    let hay_bytes = haystack.as_bytes();
+    if pat_bytes.len() > hay_bytes.len() {
+        return false;
+    }
+    for i in 0..=(hay_bytes.len() - pat_bytes.len()) {
+        if &hay_bytes[i..i + pat_bytes.len()] == pat_bytes {
+            // Check left boundary: start of string or non-alphanumeric
+            let left_ok = i == 0 || !hay_bytes[i - 1].is_ascii_alphanumeric();
+            // Check right boundary: end of string or non-alphanumeric
+            let right_ok = i + pat_bytes.len() == hay_bytes.len()
+                || !hay_bytes[i + pat_bytes.len()].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl CommandPolicy for SafePolicy {
     fn check(&self, command: &str, _cwd: &std::path::Path) -> Decision {
         let normalized = normalize_whitespace(command);
 
         // Check deny patterns first
         for pattern in &self.deny_patterns {
-            if normalized.contains(pattern.as_str()) {
+            if contains_at_word_boundary(&normalized, pattern) {
                 return Decision::Deny;
             }
         }
 
         // Check ask patterns
         for pattern in &self.ask_patterns {
-            if normalized.contains(pattern.as_str()) {
+            if contains_at_word_boundary(&normalized, pattern) {
                 return Decision::Ask;
             }
         }
@@ -151,6 +176,36 @@ mod tests {
         assert_eq!(
             policy.check("git status", Path::new("/tmp")),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn test_safe_policy_word_boundary() {
+        let policy = SafePolicy::default();
+        // "sudo" should NOT match inside "pseudocode"
+        assert_eq!(
+            policy.check("pseudocode is fun", Path::new("/tmp")),
+            Decision::Allow
+        );
+        // "mkfs" should NOT match inside "unmkfs"
+        assert_eq!(
+            policy.check("unmkfs something", Path::new("/tmp")),
+            Decision::Allow
+        );
+        // But standalone "mkfs" should still be caught
+        assert_eq!(
+            policy.check("mkfs /dev/sda", Path::new("/tmp")),
+            Decision::Deny
+        );
+        // And "sudo" standalone should still be caught
+        assert_eq!(
+            policy.check("sudo ls", Path::new("/tmp")),
+            Decision::Ask
+        );
+        // Pattern at end of string
+        assert_eq!(
+            policy.check("run sudo", Path::new("/tmp")),
+            Decision::Ask
         );
     }
 }

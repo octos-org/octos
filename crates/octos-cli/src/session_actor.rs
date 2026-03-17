@@ -19,7 +19,7 @@ use octos_llm::{
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -294,7 +294,7 @@ pub struct ActorFactory {
     /// Optional embedder for episodic memory recall.
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// Active session store — used to check if a session is currently active.
-    pub active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    pub active_sessions: Arc<RwLock<ActiveSessionStore>>,
     /// Pending message buffer — replies from inactive sessions are held here.
     pub pending_messages: PendingMessages,
     /// Queue mode for handling messages arriving during active agent runs.
@@ -562,7 +562,7 @@ async fn outbound_forwarder(
     session_key: SessionKey,
     channel: String,
     chat_id: String,
-    active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pending_messages: PendingMessages,
 ) {
     let my_topic = session_key.topic().unwrap_or("").to_string();
@@ -571,7 +571,7 @@ async fn outbound_forwarder(
 
     while let Some(msg) = proxy_rx.recv().await {
         let active_topic = active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic(&base_key)
             .to_string();
@@ -588,6 +588,15 @@ async fn outbound_forwarder(
                 buf.push(msg);
             } else {
                 warn!(session = %session_key, "pending buffer full, dropping message");
+                // Replace the last buffered message with a truncation notice so the
+                // user sees feedback when they switch to this session.
+                if let Some(last) = buf.last_mut() {
+                    last.content = format!(
+                        "{}\n\n⚠️ Buffer full ({MAX_PENDING_PER_SESSION} messages). \
+                         Some responses were dropped. Switch to this session to continue.",
+                        last.content,
+                    );
+                }
             }
             drop(pending); // release lock before sending notification
 
@@ -657,7 +666,7 @@ struct SessionActor {
     /// Active session store — used to check if this session is currently active.
     /// When inactive, streaming edits are skipped so replies go through the
     /// proxy → pending buffer path and can be flushed on session switch.
-    active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
 }
 
 impl SessionActor {
@@ -669,7 +678,7 @@ impl SessionActor {
         let base_key = self.session_key.base_key();
         let active_topic = self
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic(base_key)
             .to_string();
@@ -1945,7 +1954,7 @@ impl SessionActor {
                         let my_topic = session_key.topic().unwrap_or("");
                         let base_key = session_key.base_key();
                         let active_topic = active_sessions
-                            .lock()
+                            .read()
                             .await
                             .get_active_topic(base_key)
                             .to_string();
@@ -2489,7 +2498,7 @@ mod tests {
             adaptive_router,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            active_sessions: Arc::new(Mutex::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2572,7 +2581,7 @@ mod tests {
             adaptive_router: Some(router),
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            active_sessions: Arc::new(Mutex::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
         };
 
         let handle = tokio::spawn(actor.run());

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
 use octos_bus::{ActiveSessionStore, Channel};
 use octos_core::{OutboundMessage, SessionKey};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
 /// Events forwarded from the synchronous reporter to the async forwarder.
@@ -108,12 +108,12 @@ pub struct StreamResult {
 /// the proxy → pending buffer path and can be flushed on session switch.
 async fn is_session_active(
     session_key: &SessionKey,
-    active_sessions: &Mutex<ActiveSessionStore>,
+    active_sessions: &RwLock<ActiveSessionStore>,
 ) -> bool {
     let my_topic = session_key.topic().unwrap_or("");
     let base_key = session_key.base_key();
     let active_topic = active_sessions
-        .lock()
+        .read()
         .await
         .get_active_topic(base_key)
         .to_string();
@@ -136,7 +136,7 @@ pub async fn run_stream_forwarder(
     chat_id: String,
     cancel_status: Option<Arc<std::sync::atomic::AtomicBool>>,
     status_msg_id: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
-    active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
     session_key: SessionKey,
 ) -> StreamResult {
     let mut buffer = String::new();

@@ -93,10 +93,12 @@ impl LatencySamples {
         if self.len == 0 {
             return 0;
         }
-        let mut sorted: Vec<u64> = self.buf[..self.len].to_vec();
-        sorted.sort_unstable();
+        // Stack-allocated copy avoids per-call heap allocation.
+        let mut sorted = self.buf;
+        let slice = &mut sorted[..self.len];
+        slice.sort_unstable();
         let idx = ((self.len as f64) * 0.95).ceil() as usize;
-        sorted[idx.min(self.len) - 1]
+        slice[idx.min(self.len) - 1]
     }
 }
 

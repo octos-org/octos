@@ -25,7 +25,7 @@ use octos_llm::{
     SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use super::Executable;
@@ -928,7 +928,7 @@ impl GatewayCommand {
         let max_history = Arc::new(std::sync::atomic::AtomicUsize::new(gw_config.max_history));
 
         // Active session store for multi-session support
-        let active_sessions = Arc::new(Mutex::new(
+        let active_sessions = Arc::new(RwLock::new(
             ActiveSessionStore::open(&data_dir).wrap_err("failed to open active session store")?,
         ));
 
@@ -1505,7 +1505,7 @@ impl GatewayCommand {
             let base_session_key = inbound.session_key();
             let base_key_str = base_session_key.0.clone();
             let session_key = {
-                let store = active_sessions.lock().await;
+                let store = active_sessions.read().await;
                 store.resolve_session_key(&base_key_str)
             };
 
@@ -1531,7 +1531,7 @@ impl GatewayCommand {
                 // Session switch callback: "s:topic" or "s:" for default
                 if let Some(topic) = callback_data.strip_prefix("s:") {
                     active_sessions
-                        .lock()
+                        .write()
                         .await
                         .switch_to(&base_key_str, topic)
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -1602,7 +1602,7 @@ impl GatewayCommand {
                             .await;
                     } else {
                         active_sessions
-                            .lock()
+                            .write()
                             .await
                             .switch_to(&base_key_str, name)
                             .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -1624,7 +1624,7 @@ impl GatewayCommand {
                 if name.is_empty() {
                     // Switch to default session
                     active_sessions
-                        .lock()
+                        .write()
                         .await
                         .switch_to(&base_key_str, "")
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -1649,7 +1649,7 @@ impl GatewayCommand {
                         .await;
                 } else {
                     active_sessions
-                        .lock()
+                        .write()
                         .await
                         .switch_to(&base_key_str, name)
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -1691,7 +1691,7 @@ impl GatewayCommand {
             if cmd == "/sessions" {
                 let entries = session_mgr.lock().await.list_user_sessions(&base_key_str);
                 let active_topic = active_sessions
-                    .lock()
+                    .read()
                     .await
                     .get_active_topic(&base_key_str)
                     .to_string();
@@ -1716,7 +1716,7 @@ impl GatewayCommand {
 
             // Handle /back (or /b) command — switch to previous session
             if cmd == "/back" || cmd == "/b" {
-                let result = active_sessions.lock().await.go_back(&base_key_str);
+                let result = active_sessions.write().await.go_back(&base_key_str);
                 match result {
                     Ok(Some(topic)) => {
                         let label = if topic.is_empty() {
@@ -1769,7 +1769,7 @@ impl GatewayCommand {
                     match session_mgr.lock().await.clear(&del_key).await {
                         Ok(()) => {
                             active_sessions
-                                .lock()
+                                .write()
                                 .await
                                 .remove_topic(&base_key_str, name)
                                 .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
