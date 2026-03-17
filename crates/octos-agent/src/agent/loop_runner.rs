@@ -471,7 +471,10 @@ impl Agent {
                 tc.id = sanitize_tool_call_id(&tc.id);
 
                 if tc.id.is_empty() || !seen_ids.insert(tc.id.clone()) {
-                    let new_id = format!("call_{}_{}", i, &tc.name);
+                    static SEQ: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let new_id = format!("call_{}_{}", i, seq);
                     tracing::warn!(
                         old_id = %tc.id,
                         new_id = %new_id,
