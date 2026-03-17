@@ -16,14 +16,15 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{delete, get, post};
 use chrono::Utc;
 use eyre::Result;
-use octos_core::{InboundMessage, OutboundMessage};
-use serde::Deserialize;
+use octos_core::{InboundMessage, OutboundMessage, SessionKey};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
+use crate::SessionManager;
 use crate::channel::Channel;
 
 /// Shared state for the API channel's HTTP handlers.
@@ -32,6 +33,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
+    sessions: Arc<Mutex<SessionManager>>,
 }
 
 /// Request body for POST /chat.
@@ -51,15 +53,22 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    sessions: Arc<Mutex<SessionManager>>,
 }
 
 impl ApiChannel {
-    pub fn new(port: u16, auth_token: Option<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        port: u16,
+        auth_token: Option<String>,
+        shutdown: Arc<AtomicBool>,
+        sessions: Arc<Mutex<SessionManager>>,
+    ) -> Self {
         Self {
             port,
             auth_token,
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
         }
     }
 }
@@ -75,10 +84,14 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
+            sessions: self.sessions.clone(),
         };
 
         let app = Router::new()
             .route("/chat", post(handle_chat))
+            .route("/sessions", get(handle_list_sessions))
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .route("/sessions/{id}", delete(handle_delete_session))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -236,9 +249,100 @@ async fn handle_chat(
         .into_response()
 }
 
+// ── Session REST endpoints ───────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SessionInfo {
+    id: String,
+    message_count: usize,
+}
+
+#[derive(Serialize)]
+struct MessageInfo {
+    role: String,
+    content: String,
+    timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_limit() -> usize {
+    100
+}
+
+/// GET /sessions — list all API sessions.
+async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
+    let sess = state.sessions.lock().await;
+    let list: Vec<SessionInfo> = sess
+        .list_sessions()
+        .into_iter()
+        .filter_map(|(id, count)| {
+            let chat_id = id.strip_prefix("api:")?;
+            Some(SessionInfo {
+                id: chat_id.to_string(),
+                message_count: count,
+            })
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+/// GET /sessions/:id/messages — get session message history.
+async fn handle_session_messages(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
+) -> Response {
+    let limit = params.limit.min(500);
+    let offset = params.offset.min(10_000);
+    let fetch_count = match offset.checked_add(limit) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
+    };
+    let key = SessionKey::new("api", &id);
+    let mut sess = state.sessions.lock().await;
+    let session = sess.get_or_create(&key);
+    let messages: Vec<MessageInfo> = session
+        .get_history(fetch_count)
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|m| MessageInfo {
+            role: m.role.to_string(),
+            content: m.content.clone(),
+            timestamp: m.timestamp.to_rfc3339(),
+        })
+        .collect();
+    Json(messages).into_response()
+}
+
+/// DELETE /sessions/:id — delete a session.
+async fn handle_delete_session(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let key = SessionKey::new("api", &id);
+    let mut sess = state.sessions.lock().await;
+    match sess.clear(&key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sessions() -> Arc<Mutex<SessionManager>> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()))
+    }
 
     #[test]
     fn chat_request_deserialize() {
@@ -257,19 +361,19 @@ mod tests {
 
     #[test]
     fn api_channel_name() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         assert_eq!(ch.name(), "api");
     }
 
     #[test]
     fn api_channel_max_message_length() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
 
     #[tokio::test]
     async fn send_to_pending_client() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -294,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_completion_closes_stream() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -322,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_unknown_chat_is_noop() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let msg = OutboundMessage {
             channel: "api".into(),
             chat_id: "nonexistent".into(),

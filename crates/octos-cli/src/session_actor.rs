@@ -472,10 +472,13 @@ impl ActorFactory {
             );
         }
 
+        // Per-session cancellation flag: shared with the agent so that
+        // interrupt mode can stop a running agent loop mid-iteration.
+        let cancelled = Arc::new(AtomicBool::new(false));
         let mut agent = Agent::new(agent_id, self.llm.clone(), tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
-            .with_shutdown(self.shutdown.clone())
+            .with_shutdown(cancelled.clone())
             .with_system_prompt(system_prompt);
 
         if let Some(ref embedder) = self.embedder {
@@ -521,13 +524,15 @@ impl ActorFactory {
             session_timeout: self.session_timeout,
             semaphore,
             global_shutdown: self.shutdown.clone(),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled,
             queue_mode: self.queue_mode,
             responsiveness: ResponsivenessObserver::new(),
             adaptive_router: self.adaptive_router.clone(),
             memory_store: self.memory_store.clone(),
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: self.active_sessions.clone(),
+            user_workspace: user_workspace.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -663,10 +668,17 @@ struct SessionActor {
     memory_store: Option<Arc<MemoryStore>>,
     /// Active overflow task counter for concurrency limiting.
     active_overflow_tasks: Arc<std::sync::atomic::AtomicU32>,
+    /// Cancellation flag for in-flight overflow tasks.
+    /// Set when a slash command is handled so overflow responses don't
+    /// interleave with command replies (GitHub issue #21).
+    overflow_cancelled: Arc<AtomicBool>,
     /// Active session store — used to check if this session is currently active.
     /// When inactive, streaming edits are skipped so replies go through the
     /// proxy → pending buffer path and can be flushed on session switch.
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
+    /// Per-user workspace directory — the agent's sandboxed working directory.
+    /// Media files uploaded by the user are copied here so read_file can access them.
+    user_workspace: std::path::PathBuf,
 }
 
 impl SessionActor {
@@ -710,12 +722,19 @@ impl SessionActor {
 
                             // Handle slash commands (no LLM round-trip)
                             if self.try_handle_command(&message).await {
+                                // Cancel any in-flight overflow tasks so their
+                                // responses don't preempt the command reply (#21).
+                                self.overflow_cancelled.store(true, Ordering::Release);
                                 continue;
                             }
 
                             // Drain any queued messages according to queue mode
                             let (final_message, final_media) =
                                 self.drain_queue(message, image_media).await;
+
+                            // Copy uploaded media files into the agent's sandboxed
+                            // working directory so read_file can access them.
+                            let final_media = self.copy_media_to_workspace(final_media);
 
                             // In speculative mode, detect slow LLM calls and
                             // spawn concurrent agent tasks for overflow messages.
@@ -776,6 +795,10 @@ impl SessionActor {
             }
             "/status" => {
                 self.handle_status_command(&parts[1..]).await;
+                true
+            }
+            "/reset" => {
+                self.handle_reset_command().await;
                 true
             }
             _ => false, // Unknown slash command — pass through to LLM
@@ -1128,6 +1151,31 @@ impl SessionActor {
         }
     }
 
+    /// `/reset` — reset session state for test isolation.
+    ///
+    /// Resets queue mode to default (collect), adaptive mode to off,
+    /// and clears conversation history for the current session.
+    async fn handle_reset_command(&mut self) {
+        // Reset queue mode to default
+        self.queue_mode = QueueMode::default();
+
+        // Reset adaptive routing to off
+        if let Some(ref router) = self.adaptive_router {
+            router.set_mode(AdaptiveMode::Off);
+        }
+
+        // Clear conversation history
+        {
+            let mut handle = self.session_handle.lock().await;
+            if let Err(e) = handle.clear().await {
+                warn!(error = %e, "failed to clear session history");
+            }
+        }
+
+        self.send_reply("Reset: queue=collect, adaptive=off, history cleared.")
+            .await;
+    }
+
     /// Send a short reply to the user (for command responses).
     async fn send_reply(&self, content: &str) {
         let _ = self
@@ -1141,6 +1189,21 @@ impl SessionActor {
                 metadata: serde_json::json!({}),
             })
             .await;
+
+        // Send completion marker so the API channel closes the SSE stream.
+        if self.channel == "api" {
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({"_completion": true}),
+                })
+                .await;
+        }
     }
 
     /// Drain any already-queued messages from the inbox and combine them
@@ -1197,6 +1260,9 @@ impl SessionActor {
                 (msg, combined_media)
             }
             QueueMode::Steer | QueueMode::Interrupt => {
+                // Coalescing delay: give rapid follow-up messages time to arrive
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
                 let mut latest_message = message;
                 let mut latest_media = image_media;
 
@@ -1315,6 +1381,45 @@ impl SessionActor {
             .await;
     }
 
+    /// Copy media files from their original location (e.g. profile media_dir)
+    /// into the agent's sandboxed `user_workspace` so that `read_file` and
+    /// other cwd-bound tools can access them.  Returns the updated paths.
+    fn copy_media_to_workspace(&self, media: Vec<String>) -> Vec<String> {
+        media
+            .into_iter()
+            .map(|path| {
+                let src = std::path::Path::new(&path);
+                if !src.exists() {
+                    return path;
+                }
+                let Some(filename) = src.file_name() else {
+                    return path;
+                };
+                let dest = self.user_workspace.join(filename);
+                match std::fs::copy(src, &dest) {
+                    Ok(_) => {
+                        debug!(
+                            session = %self.session_key,
+                            src = %src.display(),
+                            dest = %dest.display(),
+                            "copied media file to workspace"
+                        );
+                        dest.to_string_lossy().into_owned()
+                    }
+                    Err(e) => {
+                        warn!(
+                            session = %self.session_key,
+                            src = %src.display(),
+                            error = %e,
+                            "failed to copy media to workspace, using original path"
+                        );
+                        path
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Speculative processing: runs the LLM call but monitors the inbox.
     /// If the call exceeds 2× responsiveness baseline and a new user message
     /// arrives, the new message gets a quick LLM response via the adaptive
@@ -1325,6 +1430,9 @@ impl SessionActor {
         inbound: InboundMessage,
         image_media: Vec<String>,
     ) {
+        // Reset overflow cancellation from any prior command handling (#21).
+        self.overflow_cancelled.store(false, Ordering::Release);
+
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
 
@@ -1577,8 +1685,13 @@ impl SessionActor {
 
         // Handle any slash commands that arrived during the select loop.
         // We deferred them to avoid &mut self borrow conflicts in tokio::select!.
-        for cmd_msg in overflow_commands {
-            self.try_handle_command(&cmd_msg).await;
+        for cmd_msg in &overflow_commands {
+            self.try_handle_command(cmd_msg).await;
+        }
+        // If any deferred commands were processed, cancel in-flight overflow
+        // tasks so their responses don't preempt command replies (#21).
+        if !overflow_commands.is_empty() {
+            self.overflow_cancelled.store(true, Ordering::Release);
         }
 
         // Feed latency to responsiveness observer
@@ -1771,6 +1884,11 @@ impl SessionActor {
             }
         }
 
+        // Reset per-session cancellation flag so the next message starts fresh.
+        // This must happen AFTER the agent finishes, so it has had a chance to
+        // observe the shutdown signal during its iteration loop.
+        self.cancelled.store(false, Ordering::Release);
+
         // Send completion marker so the API channel can close the SSE stream.
         if self.channel == "api" {
             let _ = self
@@ -1844,6 +1962,7 @@ impl SessionActor {
         let user_status_config = self.user_status_config.clone();
         let history = pre_primary_history.to_vec();
         let active_sessions = self.active_sessions.clone();
+        let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -1925,6 +2044,19 @@ impl SessionActor {
             // Stop status indicator (deletes the "✦ Thinking..." message)
             if let Some(handle) = status_handle {
                 handle.stop().await;
+            }
+
+            // If a slash command was handled while this overflow task was
+            // running, suppress the response so it doesn't preempt the
+            // command reply (GitHub issue #21).
+            if overflow_cancelled.load(Ordering::Acquire) {
+                info!(
+                    session = %session_key,
+                    "overflow task cancelled by command, suppressing response"
+                );
+                // Still decrement and return — skip sending any reply.
+                overflow_counter.fetch_sub(1, Ordering::Release);
+                return;
             }
 
             match result {
@@ -2291,6 +2423,9 @@ impl SessionActor {
             }
         }
 
+        // Reset per-session cancellation flag so the next message starts fresh.
+        self.cancelled.store(false, Ordering::Release);
+
         // Send completion marker so the API channel can close the SSE stream.
         if self.channel == "api" {
             let _ = self
@@ -2498,7 +2633,9 @@ mod tests {
             adaptive_router,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2535,7 +2672,7 @@ mod tests {
 
         // AdaptiveRouter with separate providers for overflow (serve_overflow only)
         let router = Arc::new(
-            AdaptiveRouter::new(router_providers, AdaptiveConfig::default())
+            AdaptiveRouter::new(router_providers, &[], AdaptiveConfig::default())
                 .with_adaptive_config(AdaptiveMode::Hedge, false),
         );
 
@@ -2581,7 +2718,9 @@ mod tests {
             adaptive_router: Some(router),
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -2990,11 +3129,13 @@ mod tests {
         let (tx, mut rx, handle, session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Steer, None, false, &dir).await;
 
-        // Send first message → starts 2s processing
+        // Send first message → goes through 500ms coalescing delay, then starts 2s processing
         tx.send(make_inbound("first message")).await.unwrap();
 
-        // Wait then queue two more — steer should discard "second" and keep "third"
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the 500ms coalescing + some processing time, then queue two more.
+        // The first message must be past drain_queue before follow-ups arrive,
+        // otherwise the coalescing delay will pick them up and steer immediately.
+        tokio::time::sleep(Duration::from_millis(800)).await;
         tx.send(make_inbound("second message (discarded)"))
             .await
             .unwrap();
@@ -3004,7 +3145,7 @@ mod tests {
 
         // Collect responses (expect 2: first + steered)
         let mut responses = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
         while responses.len() < 2 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(msg)) => responses.push(msg.content),
@@ -3134,7 +3275,7 @@ mod tests {
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-a", vec![]));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-b", vec![]));
         let router = Arc::new(
-            AdaptiveRouter::new(vec![router_a, router_b], AdaptiveConfig::default())
+            AdaptiveRouter::new(vec![router_a, router_b], &[], AdaptiveConfig::default())
                 .with_adaptive_config(AdaptiveMode::Off, false),
         );
         assert_eq!(router.mode(), AdaptiveMode::Off);
@@ -3216,7 +3357,7 @@ mod tests {
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-a", vec![]));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("r-b", vec![]));
         let router = Arc::new(
-            AdaptiveRouter::new(vec![router_a, router_b], AdaptiveConfig::default())
+            AdaptiveRouter::new(vec![router_a, router_b], &[], AdaptiveConfig::default())
                 .with_adaptive_config(AdaptiveMode::Off, false),
         );
 

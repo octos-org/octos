@@ -278,28 +278,36 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
-pub async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<SessionInfo>>, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let sess = sessions.lock().await;
-    let list = sess
-        .list_sessions()
-        .into_iter()
-        .filter_map(|(id, count)| {
-            // Only return API sessions, stripping the "api:" prefix so the
-            // frontend can use the raw chat_id with other endpoints.
-            let chat_id = id.strip_prefix("api:")?;
-            Some(SessionInfo {
-                id: chat_id.to_string(),
-                message_count: count,
+pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Response {
+    // If local sessions available, use them directly
+    if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        let list: Vec<SessionInfo> = sess
+            .list_sessions()
+            .into_iter()
+            .filter_map(|(id, count)| {
+                let chat_id = id.strip_prefix("api:")?;
+                Some(SessionInfo {
+                    id: chat_id.to_string(),
+                    message_count: count,
+                })
             })
-        })
-        .collect();
-    Ok(Json(list))
+            .collect();
+        return Json(list).into_response();
+    }
+
+    // Proxy to gateway if available
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            return super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".to_string(),
+    )
+        .into_response()
 }
 
 /// GET /api/sessions/:id/messages -- get session history.
@@ -321,31 +329,40 @@ pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
-) -> Result<Json<Vec<MessageInfo>>, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let limit = params.limit.min(500);
-    let offset = params.offset.min(10_000);
-    let fetch_count = offset
-        .checked_add(limit)
-        .ok_or((StatusCode::BAD_REQUEST, "invalid pagination".into()))?;
-    let key = SessionKey::new("api", &id);
-    let mut sess = sessions.lock().await;
-    let session = sess.get_or_create(&key);
-    let messages = session
-        .get_history(fetch_count)
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|m| MessageInfo {
-            role: m.role.to_string(),
-            content: m.content.clone(),
-            timestamp: m.timestamp.to_rfc3339(),
-        })
-        .collect();
-    Ok(Json(messages))
+) -> Response {
+    if let Some(sessions) = &state.sessions {
+        let limit = params.limit.min(500);
+        let offset = params.offset.min(10_000);
+        let fetch_count = match offset.checked_add(limit) {
+            Some(n) => n,
+            None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
+        };
+        let key = SessionKey::new("api", &id);
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&key);
+        let messages: Vec<MessageInfo> = session
+            .get_history(fetch_count)
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| MessageInfo {
+                role: m.role.to_string(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.to_rfc3339(),
+            })
+            .collect();
+        return Json(messages).into_response();
+    }
+
+    // Proxy to gateway
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            let path = format!("/sessions/{id}/messages?limit={}&offset={}", params.limit, params.offset);
+            return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
 }
 
 #[derive(Serialize)]
@@ -359,18 +376,28 @@ pub struct MessageInfo {
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let key = SessionKey::new("api", &id);
-    let mut sess = sessions.lock().await;
-    sess.clear(&key).await.map_err(|e| {
-        tracing::error!(error = %e, "delete session failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Response {
+    if let Some(sessions) = &state.sessions {
+        let key = SessionKey::new("api", &id);
+        let mut sess = sessions.lock().await;
+        return match sess.clear(&key).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "delete session failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+    }
+
+    // Proxy to gateway
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            let path = format!("/sessions/{id}");
+            return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
 }
 
 /// GET /api/status -- server status.
