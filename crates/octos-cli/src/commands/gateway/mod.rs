@@ -230,6 +230,7 @@ impl GatewayCommand {
         } else {
             let mut providers: Vec<Arc<dyn LlmProvider>> =
                 vec![Arc::new(RetryProvider::new(base_provider))];
+            let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
             for fb in &config.fallback_models {
                 let fb_config = if fb.api_key_env.is_some() {
                     let mut c = config.clone();
@@ -245,7 +246,10 @@ impl GatewayCommand {
                     fb.base_url.clone(),
                     fb.api_type.as_deref(),
                 ) {
-                    Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
+                    Ok(p) => {
+                        providers.push(Arc::new(RetryProvider::new(p)));
+                        costs.push(fb.cost_per_m.unwrap_or(0.0));
+                    }
                     Err(e) => {
                         warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
                     }
@@ -265,7 +269,8 @@ impl GatewayCommand {
                     .unwrap_or(octos_llm::AdaptiveMode::Lane);
                 let qos = ar_config.map(|c| c.qos_ranking).unwrap_or(true);
                 let router = Arc::new(
-                    AdaptiveRouter::new(providers, adaptive_config).with_adaptive_config(mode, qos),
+                    AdaptiveRouter::new(providers, &costs, adaptive_config)
+                        .with_adaptive_config(mode, qos),
                 );
                 adaptive_router_ref = Some(router.clone());
                 router
@@ -1229,6 +1234,7 @@ impl GatewayCommand {
                         port,
                         auth_token,
                         shutdown.clone(),
+                        session_mgr.clone(),
                     )));
                 }
                 #[cfg(feature = "wecom-bot")]

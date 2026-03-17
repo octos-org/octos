@@ -41,6 +41,8 @@ pub struct AdaptiveConfig {
     pub weight_latency: f64,
     pub weight_error_rate: f64,
     pub weight_priority: f64,
+    /// Weight for published token cost (0.0 = ignore cost).
+    pub weight_cost: f64,
 }
 
 impl Default for AdaptiveConfig {
@@ -52,9 +54,10 @@ impl Default for AdaptiveConfig {
             error_rate_threshold: 0.3,
             probe_probability: 0.1,
             probe_interval_secs: 60,
-            weight_latency: 0.4,
-            weight_error_rate: 0.4,
+            weight_latency: 0.3,
+            weight_error_rate: 0.3,
             weight_priority: 0.2,
+            weight_cost: 0.2,
         }
     }
 }
@@ -235,6 +238,7 @@ pub struct SharedPolicy {
     pub weight_latency: f64,
     pub weight_error_rate: f64,
     pub weight_priority: f64,
+    pub weight_cost: f64,
 }
 
 /// Shared metrics file format for inter-process export.
@@ -265,6 +269,8 @@ struct AdaptiveSlot {
     metrics: ProviderMetrics,
     /// Config-order priority (0 = primary, 1 = first fallback, etc.).
     priority: usize,
+    /// Published output price in USD per million tokens (0.0 = unknown/free).
+    cost_per_m: f64,
 }
 
 /// Adaptive routing mode — mutually exclusive strategies.
@@ -339,8 +345,15 @@ pub struct AdaptiveRouter {
 impl AdaptiveRouter {
     /// Create a new adaptive router from providers (in priority order).
     ///
+    /// `costs` — published output price in USD/M tokens per provider.
+    /// Pass an empty slice to use 0.0 (unknown) for all.
+    ///
     /// Panics if `providers` is empty.
-    pub fn new(providers: Vec<std::sync::Arc<dyn LlmProvider>>, config: AdaptiveConfig) -> Self {
+    pub fn new(
+        providers: Vec<std::sync::Arc<dyn LlmProvider>>,
+        costs: &[f64],
+        config: AdaptiveConfig,
+    ) -> Self {
         assert!(
             !providers.is_empty(),
             "AdaptiveRouter requires at least one provider"
@@ -352,6 +365,7 @@ impl AdaptiveRouter {
                 provider: p,
                 metrics: ProviderMetrics::new(),
                 priority: i,
+                cost_per_m: costs.get(i).copied().unwrap_or(0.0),
             })
             .collect();
         Self {
@@ -471,8 +485,26 @@ impl AdaptiveRouter {
                 weight_latency: self.config.weight_latency,
                 weight_error_rate: self.config.weight_error_rate,
                 weight_priority: self.config.weight_priority,
+                weight_cost: self.config.weight_cost,
             },
             providers,
+        }
+    }
+
+    /// Normalized cost for a slot (0..1). Providers with unknown cost (0.0) get 0.
+    fn norm_cost(&self, slot: &AdaptiveSlot) -> f64 {
+        if self.config.weight_cost <= 0.0 || slot.cost_per_m <= 0.0 {
+            return 0.0;
+        }
+        let max_cost = self
+            .slots
+            .iter()
+            .map(|s| s.cost_per_m)
+            .fold(0.0_f64, f64::max);
+        if max_cost > 0.0 {
+            slot.cost_per_m / max_cost
+        } else {
+            0.0
         }
     }
 
@@ -481,9 +513,11 @@ impl AdaptiveRouter {
         let total = slot.metrics.success_count.load(Ordering::Relaxed)
             + slot.metrics.failure_count.load(Ordering::Relaxed);
 
-        // Cold start: no data yet → use priority only
+        // Cold start: no data yet → use priority + cost
         if total == 0 {
-            return self.config.weight_priority * (slot.priority as f64 / self.slots.len() as f64);
+            let norm_priority = slot.priority as f64 / self.slots.len() as f64;
+            return self.config.weight_priority * norm_priority
+                + self.config.weight_cost * self.norm_cost(slot);
         }
 
         // Normalized latency: ema / threshold (capped at 2.0)
@@ -499,6 +533,7 @@ impl AdaptiveRouter {
         self.config.weight_latency * norm_latency
             + self.config.weight_error_rate * err_rate
             + self.config.weight_priority * norm_priority
+            + self.config.weight_cost * self.norm_cost(slot)
     }
 
     /// Select provider index and whether this is a probe request.
@@ -620,11 +655,11 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Option<Result<ChatResponse>> {
-        // Pick the best alternate provider (not the primary, not the same provider
-        // name, not circuit-broken). Racing the same provider against itself wastes
-        // API calls with no failover benefit.
+        // Pick the cheapest alternate provider for hedging. When cost data is
+        // available, always hedge with the lowest-cost provider. Falls back to
+        // score-based selection when no cost data exists.
         let primary_name = self.slots[primary_idx].provider.provider_name();
-        let alternate_idx = self
+        let candidates: Vec<(usize, &AdaptiveSlot)> = self
             .slots
             .iter()
             .enumerate()
@@ -633,9 +668,27 @@ impl AdaptiveRouter {
                     && s.provider.provider_name() != primary_name
                     && !s.metrics.is_circuit_open(self.config.failure_threshold)
             })
-            .map(|(i, s)| (i, self.score(s)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)?;
+            .collect();
+        let alternate_idx = {
+            // Prefer cheapest provider with known cost (cost_per_m > 0)
+            let cheapest = candidates
+                .iter()
+                .filter(|(_, s)| s.cost_per_m > 0.0)
+                .min_by(|a, b| {
+                    a.1.cost_per_m
+                        .partial_cmp(&b.1.cost_per_m)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| *i);
+            // Fall back to best score if no cost data
+            cheapest.or_else(|| {
+                candidates
+                    .iter()
+                    .map(|(i, s)| (*i, self.score(s)))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+            })?
+        };
 
         info!(
             primary = self.slots[primary_idx].provider.provider_name(),
@@ -1017,10 +1070,10 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig {
+            &[], AdaptiveConfig {
                 probe_probability: 0.0, // Disable probes for determinism
                 ..Default::default()
-            },
+            }
         );
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
@@ -1046,7 +1099,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
@@ -1077,7 +1130,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // First call: primary fails (consecutive_failures=1, trips circuit breaker),
@@ -1112,7 +1165,7 @@ mod tests {
                     error_msg: "P2",
                 }),
             ],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         let result = router.chat(&[], &[], &ChatConfig::default()).await;
@@ -1129,7 +1182,7 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         let _ = router.chat(&[], &[], &ChatConfig::default()).await;
@@ -1161,7 +1214,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         // On cold start, primary (priority=0) should score lower than fallback (priority=1)
@@ -1208,7 +1261,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Lane changing OFF (default) — should always pick primary despite higher latency
@@ -1249,7 +1302,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
         router.set_mode(AdaptiveMode::Off);
 
@@ -1286,7 +1339,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Enable hedged racing
@@ -1329,7 +1382,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         router.set_mode(AdaptiveMode::Hedge);
@@ -1361,7 +1414,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Hedging OFF (default) — should use primary (priority order)
@@ -1372,7 +1425,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "at least one provider")]
     fn test_empty_router_panics() {
-        let _ = AdaptiveRouter::new(vec![], AdaptiveConfig::default());
+        let _ = AdaptiveRouter::new(vec![], &[], AdaptiveConfig::default());
     }
 
     /// Lane mode selects best provider by score after warm-up.
@@ -1402,7 +1455,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Warm up in Off mode (priority order → primary always selected)
@@ -1436,7 +1489,7 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            config,
+            &[], config
         );
         router.set_mode(AdaptiveMode::Hedge);
 
@@ -1465,7 +1518,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         assert_eq!(router.mode(), AdaptiveMode::Off);
@@ -1497,7 +1550,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         let status = router.adaptive_status();
@@ -1529,10 +1582,10 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            AdaptiveConfig {
+            &[], AdaptiveConfig {
                 probe_probability: 0.0,
                 ..Default::default()
-            },
+            }
         );
 
         // Make some calls
@@ -1569,7 +1622,7 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            AdaptiveConfig::default(),
+            &[], AdaptiveConfig::default()
         );
 
         let status = router.adaptive_status();
@@ -1610,7 +1663,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Initially no failures
@@ -1661,7 +1714,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
 
         // Late failure opens circuit breaker on primary
@@ -1699,7 +1752,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
         router.set_mode(AdaptiveMode::Hedge);
 
@@ -1739,7 +1792,7 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            config,
+            &[], config
         );
         router.set_mode(AdaptiveMode::Hedge);
 

@@ -120,6 +120,7 @@ async fn test_deepseek_responds() {
 async fn test_hedge_mode_races_two_providers() {
     let router = Arc::new(AdaptiveRouter::new(
         vec![kimi(), deepseek()],
+        &[],
         AdaptiveConfig::default(),
     ));
     router.set_mode(AdaptiveMode::Hedge);
@@ -161,6 +162,7 @@ async fn test_hedge_mode_races_two_providers() {
 async fn test_hedge_mode_3_queries_builds_metrics() {
     let router = Arc::new(AdaptiveRouter::new(
         vec![kimi(), deepseek()],
+        &[],
         AdaptiveConfig::default(),
     ));
     router.set_mode(AdaptiveMode::Hedge);
@@ -210,6 +212,7 @@ async fn test_hedge_mode_3_queries_builds_metrics() {
 async fn test_lane_mode_selects_best_provider() {
     let router = Arc::new(AdaptiveRouter::new(
         vec![kimi(), deepseek()],
+        &[],
         AdaptiveConfig::default(),
     ));
     router.set_mode(AdaptiveMode::Lane);
@@ -256,6 +259,7 @@ async fn test_failover_from_broken_to_working() {
 
     let router = Arc::new(AdaptiveRouter::new(
         vec![broken, working],
+        &[],
         AdaptiveConfig {
             failure_threshold: 1,
             ..Default::default()

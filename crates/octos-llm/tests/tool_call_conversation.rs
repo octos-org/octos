@@ -948,7 +948,7 @@ async fn test_adaptive_router_with_real_providers() {
         ..Default::default()
     };
 
-    let router = AdaptiveRouter::new(providers, config);
+    let router = AdaptiveRouter::new(providers, &[], config);
 
     let messages = build_tool_call_conversation();
     let tools = all_tools();

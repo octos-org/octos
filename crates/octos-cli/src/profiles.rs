@@ -185,6 +185,9 @@ pub struct FallbackModelConfig {
     /// API protocol type: "openai" or "anthropic".
     #[serde(default)]
     pub api_type: Option<String>,
+    /// Published output price in USD per million tokens (for cost-aware routing).
+    #[serde(default)]
+    pub cost_per_m: Option<f64>,
 }
 
 /// Channel-specific credentials (tagged by type).
@@ -680,6 +683,7 @@ pub(crate) fn config_from_profile(
             api_key_env: fb.api_key_env.clone(),
             model_hints: None,
             api_type: fb.api_type.clone(),
+            cost_per_m: fb.cost_per_m,
         })
         .collect();
 
