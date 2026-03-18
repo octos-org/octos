@@ -902,6 +902,23 @@ impl GatewayCommand {
             None
         };
 
+        // Mark base tools that should never be auto-evicted by LRU.
+        tools.set_base_tools([
+            "run_pipeline",
+            "deep_search",
+            "deep_crawl",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "list_dir",
+            "glob",
+            "grep",
+            "message",
+            "send_file",
+            "activate_tools",
+        ]);
+
         // Auto-defer non-core tool groups when tool count is high to prevent
         // overwhelming LLMs that struggle with many tool specs.
         // Many models (DeepSeek, OpenAI) return empty responses with >15 tools.

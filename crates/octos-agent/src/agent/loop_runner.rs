@@ -116,6 +116,18 @@ impl Agent {
             }
 
             iteration += 1;
+
+            // LRU tool management: tick iteration counter and auto-evict idle tools
+            self.tools.tick();
+            let evicted = self.tools.auto_evict();
+            if !evicted.is_empty() {
+                tracing::info!(
+                    evicted = %evicted.join(", "),
+                    count = evicted.len(),
+                    "auto-evicted idle tools"
+                );
+            }
+
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
             normalize_system_messages(&mut messages);
@@ -301,6 +313,16 @@ impl Agent {
                 let iter_start = Instant::now();
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
+
+                // LRU tool management
+                self.tools.tick();
+                let evicted = self.tools.auto_evict();
+                if !evicted.is_empty() {
+                    tracing::info!(
+                        evicted = %evicted.join(", "),
+                        "auto-evicted idle tools in task"
+                    );
+                }
 
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);

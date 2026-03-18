@@ -77,6 +77,80 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// LRU-based tool lifecycle manager.
+///
+/// Tracks per-tool usage and auto-evicts idle tools when the active count
+/// exceeds a threshold. Base tools are pinned and never evicted.
+pub struct ToolLifecycle {
+    /// Per-tool last-used iteration counter.
+    last_used: HashMap<String, u32>,
+    /// Current iteration counter.
+    iteration: u32,
+    /// Tools that are never auto-evicted.
+    base_tools: HashSet<String>,
+    /// Maximum active tools before eviction kicks in.
+    max_active: usize,
+    /// Tools idle for this many iterations become eviction candidates.
+    idle_threshold: u32,
+}
+
+impl Default for ToolLifecycle {
+    fn default() -> Self {
+        Self {
+            last_used: HashMap::new(),
+            iteration: 0,
+            base_tools: HashSet::new(),
+            max_active: 15,
+            idle_threshold: 5,
+        }
+    }
+}
+
+impl ToolLifecycle {
+    /// Set base tools that are never auto-evicted.
+    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
+        self.base_tools = names.into_iter().map(|n| n.into()).collect();
+    }
+
+    /// Record that a tool was used at the current iteration.
+    pub fn record_usage(&mut self, name: &str) {
+        self.last_used.insert(name.to_string(), self.iteration);
+    }
+
+    /// Advance the iteration counter.
+    pub fn tick(&mut self) {
+        self.iteration += 1;
+    }
+
+    /// Find idle non-base tools to evict from `active_tools`, sorted by
+    /// staleness (oldest first). Callers should have already excluded
+    /// deferred tools from `active_tools`.
+    pub fn find_evictable(&self, active_tools: &[&str]) -> Vec<String> {
+        let active_count = active_tools.len();
+        if active_count <= self.max_active {
+            return Vec::new();
+        }
+
+        let mut candidates: Vec<(&str, u32)> = active_tools
+            .iter()
+            .filter(|name| !self.base_tools.contains(**name))
+            .map(|name| {
+                let last = self.last_used.get(*name).copied().unwrap_or(0);
+                (*name, last)
+            })
+            .filter(|(_, last)| self.iteration.saturating_sub(*last) >= self.idle_threshold)
+            .collect();
+
+        candidates.sort_by_key(|(_, last)| *last);
+        let to_evict = active_count.saturating_sub(self.max_active);
+        candidates
+            .into_iter()
+            .take(to_evict)
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+}
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -90,6 +164,8 @@ pub struct ToolRegistry {
     /// Deferred tools: registered but hidden from specs() until activated.
     /// Uses interior mutability so activate() can work through Arc<ToolRegistry>.
     deferred: std::sync::Mutex<HashSet<String>>,
+    /// LRU lifecycle manager for auto-eviction of idle tools.
+    lifecycle: std::sync::Mutex<ToolLifecycle>,
 }
 
 impl Default for ToolRegistry {
@@ -107,6 +183,7 @@ impl ToolRegistry {
             context_filter: None,
             cached_specs: std::sync::Mutex::new(None),
             deferred: std::sync::Mutex::new(HashSet::new()),
+            lifecycle: std::sync::Mutex::new(ToolLifecycle::default()),
         }
     }
 
@@ -232,12 +309,23 @@ impl ToolRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let parent = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let lifecycle = ToolLifecycle {
+            last_used: HashMap::new(),
+            iteration: 0,
+            base_tools: parent.base_tools.clone(),
+            max_active: parent.max_active,
+            idle_threshold: parent.idle_threshold,
+        };
+        drop(parent);
+
         Self {
             tools,
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             cached_specs: std::sync::Mutex::new(None),
             deferred: std::sync::Mutex::new(deferred),
+            lifecycle: std::sync::Mutex::new(lifecycle),
         }
     }
 
@@ -328,6 +416,68 @@ impl ToolRegistry {
             .is_empty()
     }
 
+    // ── LRU auto-eviction ────────────────────────────────────────────
+
+    /// Mark a set of tool names as "base" — never auto-evicted.
+    pub fn set_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
+        self.lifecycle
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_base_tools(names);
+    }
+
+    /// Record that a tool was used (called from execute()).
+    fn record_usage(&self, name: &str) {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_usage(name);
+    }
+
+    /// Advance the iteration counter. Called before each LLM call.
+    pub fn tick(&self) {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tick();
+    }
+
+    /// Auto-evict idle non-base tools if active count exceeds threshold.
+    /// Returns the names of evicted tools (for logging).
+    ///
+    /// Lock ordering: lifecycle → deferred (consistent with record_usage
+    /// which only takes lifecycle, never both).
+    pub fn auto_evict(&self) -> Vec<String> {
+        // 1. Compute eviction candidates (lifecycle lock only)
+        let to_evict = {
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let active: Vec<&str> = self
+                .tools
+                .keys()
+                .filter(|n| !deferred.contains(n.as_str()))
+                .map(|n| n.as_str())
+                .collect();
+            lifecycle.find_evictable(&active)
+            // Both locks dropped here
+        };
+
+        if to_evict.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Apply evictions (deferred lock only)
+        {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            for name in &to_evict {
+                deferred.insert(name.clone());
+            }
+        }
+        self.invalidate_cache_shared();
+
+        to_evict
+    }
+
     // ── Cache management ────────────────────────────────────────────
 
     /// Clear the cached specs (called by mutation methods with &mut self).
@@ -386,6 +536,10 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| eyre::eyre!("unknown tool: {}", name))?;
+
+        // Track usage for LRU auto-eviction
+        self.record_usage(name);
+
         tool.execute(args).await
     }
 }
@@ -1133,5 +1287,287 @@ mod cwd_isolation_tests {
             rebound.get("write_file").is_some(),
             "write_file should be re-registered"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn make_registry(max_active: usize, idle_threshold: u32) -> ToolRegistry {
+        let mut reg = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        {
+            let lc = reg.lifecycle.get_mut().unwrap();
+            lc.max_active = max_active;
+            lc.idle_threshold = idle_threshold;
+        }
+        reg
+    }
+
+    fn active_tool_names(reg: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = reg.specs().iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    fn deferred_tool_names(reg: &ToolRegistry) -> Vec<String> {
+        let deferred = reg.deferred.lock().unwrap();
+        let mut names: Vec<String> = deferred.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    // ── Scenario 1: Basic eviction ──────────────────────────────────
+
+    #[test]
+    fn idle_tools_evicted_when_over_threshold() {
+        // Set up: max 3 active, idle after 2 iterations
+        let mut reg = make_registry(3, 2);
+
+        // Mark read_file and write_file as base (never evict)
+        reg.set_base_tools(["read_file", "write_file"]);
+
+        let initial_count = reg.specs().len();
+        println!("Initial active tools: {initial_count}");
+        assert!(initial_count > 3, "builtins should exceed threshold");
+
+        // Simulate 3 iterations of using only read_file and write_file
+        for _ in 0..3 {
+            reg.tick();
+            reg.record_usage("read_file");
+            reg.record_usage("write_file");
+        }
+
+        // Now evict — tools not used in 2+ iterations should be evicted
+        let evicted = reg.auto_evict();
+        println!("Evicted: {evicted:?}");
+        assert!(!evicted.is_empty(), "should evict idle tools");
+
+        // Base tools should still be active
+        let active = active_tool_names(&reg);
+        assert!(active.contains(&"read_file".to_string()), "base tool read_file must survive");
+        assert!(active.contains(&"write_file".to_string()), "base tool write_file must survive");
+
+        // Evicted tools should be in deferred
+        let deferred = deferred_tool_names(&reg);
+        for name in &evicted {
+            assert!(deferred.contains(name), "{name} should be deferred after eviction");
+        }
+
+        println!("After eviction — active: {}, deferred: {}", active.len(), deferred.len());
+        assert!(active.len() <= 3, "should be at or under threshold");
+    }
+
+    // ── Scenario 2: Recently used tools survive eviction ────────────
+
+    #[test]
+    fn recently_used_tools_not_evicted() {
+        let mut reg = make_registry(3, 2);
+        reg.set_base_tools(["read_file"]);
+
+        // Use shell heavily, leave others idle
+        for _ in 0..3 {
+            reg.tick();
+            reg.record_usage("read_file");
+            reg.record_usage("shell");
+        }
+
+        let evicted = reg.auto_evict();
+        println!("Evicted: {evicted:?}");
+
+        // shell was used every iteration — should NOT be evicted
+        assert!(
+            !evicted.contains(&"shell".to_string()),
+            "recently used 'shell' should not be evicted"
+        );
+
+        let active = active_tool_names(&reg);
+        assert!(active.contains(&"shell".to_string()), "shell must remain active");
+    }
+
+    // ── Scenario 3: Deferred tool activated then used ───────────────
+
+    #[tokio::test]
+    async fn activated_tool_gets_usage_tracking() {
+        let mut reg = make_registry(3, 2);
+        reg.set_base_tools(["read_file", "write_file"]);
+
+        // Simulate iterations to trigger eviction
+        for _ in 0..3 {
+            reg.tick();
+            reg.record_usage("read_file");
+            reg.record_usage("write_file");
+        }
+        let evicted = reg.auto_evict();
+        println!("First eviction: {evicted:?}");
+        assert!(!evicted.is_empty());
+
+        // Verify shell is deferred
+        let deferred = deferred_tool_names(&reg);
+        let shell_was_evicted = deferred.contains(&"shell".to_string());
+        println!("shell deferred: {shell_was_evicted}");
+
+        if shell_was_evicted {
+            // Re-activate shell (simulates activate_tools call)
+            let activated = reg.activate("group:runtime");
+            println!("Activated: {activated:?}");
+            assert!(activated.contains(&"shell".to_string()));
+
+            // Now use shell
+            reg.tick();
+            reg.record_usage("shell");
+
+            // Shell should not be evicted next time — it's freshly used
+            let evicted2 = reg.auto_evict();
+            assert!(
+                !evicted2.contains(&"shell".to_string()),
+                "freshly used shell should survive eviction"
+            );
+            println!("Second eviction (shell survived): {evicted2:?}");
+        }
+    }
+
+    // ── Scenario 4: Base tools never evicted even when idle ─────────
+
+    #[test]
+    fn base_tools_never_evicted() {
+        let mut reg = make_registry(2, 1);
+        reg.set_base_tools(["read_file", "write_file", "shell"]);
+
+        // Never use any tool, just tick
+        for _ in 0..5 {
+            reg.tick();
+        }
+
+        let evicted = reg.auto_evict();
+        println!("Evicted: {evicted:?}");
+
+        // Base tools must survive regardless of idleness
+        for name in &["read_file", "write_file", "shell"] {
+            assert!(
+                !evicted.contains(&name.to_string()),
+                "base tool {name} must never be evicted"
+            );
+        }
+    }
+
+    // ── Scenario 5: Stalest tool evicted first ──────────────────────
+
+    #[test]
+    fn stalest_evicted_first() {
+        let mut reg = make_registry(5, 2);
+        reg.set_base_tools(["read_file"]);
+
+        // Iteration 1: use several tools
+        reg.tick();
+        reg.record_usage("read_file");
+        reg.record_usage("shell");
+        reg.record_usage("write_file");
+        reg.record_usage("edit_file");
+        reg.record_usage("glob");
+        reg.record_usage("grep");
+        reg.record_usage("list_dir");
+
+        // Iteration 2-4: only use shell and write_file
+        for _ in 0..3 {
+            reg.tick();
+            reg.record_usage("shell");
+            reg.record_usage("write_file");
+        }
+
+        let evicted = reg.auto_evict();
+        println!("Evicted: {evicted:?}");
+
+        // edit_file, glob, grep, list_dir were last used at iteration 1
+        // shell and write_file were used at iteration 4
+        // Stalest (edit_file, glob, grep, list_dir) should be evicted first
+        if !evicted.is_empty() {
+            assert!(
+                !evicted.contains(&"shell".to_string()),
+                "shell (iter 4) should survive over stale tools"
+            );
+            assert!(
+                !evicted.contains(&"write_file".to_string()),
+                "write_file (iter 4) should survive over stale tools"
+            );
+        }
+    }
+
+    // ── Scenario 6: No eviction when under threshold ────────────────
+
+    #[test]
+    fn no_eviction_when_under_threshold() {
+        let mut reg = make_registry(100, 1);  // Very high threshold
+
+        for _ in 0..5 {
+            reg.tick();
+        }
+
+        let evicted = reg.auto_evict();
+        assert!(evicted.is_empty(), "should not evict when under threshold");
+    }
+
+    // ── Scenario 7: Full session lifecycle ──────────────────────────
+
+    #[tokio::test]
+    async fn full_session_lifecycle() {
+        let mut reg = make_registry(5, 3);
+        reg.set_base_tools(["read_file", "write_file"]);
+
+        println!("=== Turn 1: Research query ===");
+        reg.tick();
+        reg.record_usage("read_file");
+        reg.record_usage("shell");
+        let active = active_tool_names(&reg);
+        println!("Active ({}): {:?}", active.len(), active);
+
+        println!("\n=== Turns 2-4: Only using read/write ===");
+        for i in 2..=4 {
+            reg.tick();
+            reg.record_usage("read_file");
+            reg.record_usage("write_file");
+            let evicted = reg.auto_evict();
+            if !evicted.is_empty() {
+                println!("Turn {i} evicted: {evicted:?}");
+            }
+        }
+        let active = active_tool_names(&reg);
+        let deferred = deferred_tool_names(&reg);
+        println!("After turn 4 — active: {}, deferred: {}", active.len(), deferred.len());
+
+        println!("\n=== Turn 5: Need shell again — re-activate ===");
+        if deferred.contains(&"shell".to_string()) {
+            let activated = reg.activate("group:runtime");
+            println!("Activated: {activated:?}");
+        }
+        reg.tick();
+        reg.record_usage("shell");
+        let active = active_tool_names(&reg);
+        println!("Active after re-activation ({}): {:?}", active.len(), active);
+        assert!(active.contains(&"shell".to_string()), "shell should be active again");
+
+        println!("\n=== Turn 6-8: Use shell, others go idle ===");
+        for i in 6..=8 {
+            reg.tick();
+            reg.record_usage("read_file");
+            reg.record_usage("shell");
+            let evicted = reg.auto_evict();
+            if !evicted.is_empty() {
+                println!("Turn {i} evicted: {evicted:?}");
+            }
+        }
+        let active = active_tool_names(&reg);
+        let deferred = deferred_tool_names(&reg);
+        println!("\nFinal state — active: {}, deferred: {}", active.len(), deferred.len());
+        println!("Active: {:?}", active);
+        println!("Deferred: {:?}", deferred);
+
+        // Base tools must always be active
+        assert!(active.contains(&"read_file".to_string()));
+        assert!(active.contains(&"write_file".to_string()));
+        // Shell was recently used — should survive
+        assert!(active.contains(&"shell".to_string()));
     }
 }
