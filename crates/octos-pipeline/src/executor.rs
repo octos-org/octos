@@ -137,9 +137,28 @@ async fn plan_dynamic_tasks(
     user_input: &str,
     max_tasks: u32,
 ) -> Result<(Vec<DynamicTask>, TokenUsage)> {
-    let prompt = format!("{planning_prompt}\n\nUser query: {user_input}");
+    let prompt = format!(
+        "{planning_prompt}\n\nUser query: {user_input}\n\n\
+         IMPORTANT: Respond with ONLY a JSON array of tasks. No explanation, \
+         no markdown, no code fences. Example format:\n\
+         [{{\"task\": \"search for X\", \"label\": \"Label\"}}, \
+         {{\"task\": \"search for Y\", \"label\": \"Label\"}}]\n\
+         Generate up to {max_tasks} tasks."
+    );
 
-    let messages = vec![Message {
+    let messages = vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are a research planner. Output ONLY a JSON array. \
+                      No other text."
+                .to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        },
+        Message {
         role: MessageRole::User,
         content: prompt,
         media: vec![],
