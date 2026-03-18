@@ -232,6 +232,12 @@ impl Tool for PluginTool {
                         .args(["-9", &child_pid.to_string()])
                         .status();
                 }
+                #[cfg(windows)]
+                if child_pid > 0 {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                        .status();
+                }
                 return Err(eyre::eyre!(
                     "plugin '{}' tool '{}' timed out after {}s",
                     self.plugin_name,
@@ -365,6 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn execute_spawns_subprocess_and_captures_output() {
         // Create a temp script that reads stdin and writes structured JSON to stdout.
         let mut script = NamedTempFile::new().expect("create temp file");
@@ -402,6 +409,7 @@ echo '{{"output": "got: '"$INPUT"'", "success": true}}'
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn execute_fallback_on_non_json_stdout() {
         // Script that outputs plain text (not JSON).
         let mut script = NamedTempFile::new().expect("create temp file");
@@ -426,6 +434,7 @@ echo '{{"output": "got: '"$INPUT"'", "success": true}}'
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn execute_timeout_returns_error() {
         // Script that sleeps longer than the timeout.
         let mut script = NamedTempFile::new().expect("create temp file");

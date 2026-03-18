@@ -224,14 +224,21 @@ impl Handler for ShellHandler {
 
         info!(node = %node.id, command = %command, "executing shell node");
 
-        let result = tokio::time::timeout(
-            timeout,
-            tokio::process::Command::new("sh")
+        let result = tokio::time::timeout(timeout, {
+            #[cfg(windows)]
+            let fut = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg(command)
+                .current_dir(&self.working_dir)
+                .output();
+            #[cfg(not(windows))]
+            let fut = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .current_dir(&self.working_dir)
-                .output(),
-        )
+                .output();
+            fut
+        })
         .await;
 
         match result {

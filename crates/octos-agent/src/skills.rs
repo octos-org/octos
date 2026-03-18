@@ -284,7 +284,12 @@ fn strip_frontmatter(content: &str) -> String {
 
 /// Check if a binary exists on PATH.
 fn which_exists(bin: &str) -> bool {
-    std::process::Command::new("which")
+    #[cfg(windows)]
+    let prog = "where";
+    #[cfg(not(windows))]
+    let prog = "which";
+
+    std::process::Command::new(prog)
         .arg(bin)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

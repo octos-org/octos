@@ -599,8 +599,13 @@ impl ProcessManager {
             let _ = proc.stop_tx.send(true);
             // Kill directly by PID so the child dies even if tokio exits
             // immediately after this method returns (e.g. std::process::exit).
+            #[cfg(unix)]
             let _ = std::process::Command::new("kill")
                 .arg(proc.pid.to_string())
+                .status();
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &proc.pid.to_string()])
                 .status();
             tracing::info!(profile = %id, pid = proc.pid, "gateway killed");
         }
@@ -898,8 +903,12 @@ fn find_node() -> Result<PathBuf> {
         if p.is_absolute() && p.exists() {
             return Ok(p.to_path_buf());
         }
-        // Try which
-        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+        // Try which/where
+        #[cfg(windows)]
+        let which_cmd = "where";
+        #[cfg(not(windows))]
+        let which_cmd = "which";
+        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() {
