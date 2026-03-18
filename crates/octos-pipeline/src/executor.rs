@@ -93,10 +93,14 @@ pub struct ExecutorConfig {
 }
 
 /// A single planned sub-task from the LLM planner.
+///
+/// Accepts multiple field name variants because different LLMs use different
+/// names for the same concept (task/query/topic/angle/description).
 #[derive(Debug, Clone, Deserialize)]
 struct DynamicTask {
+    #[serde(alias = "query", alias = "topic", alias = "angle", alias = "description", alias = "search", alias = "instruction")]
     task: String,
-    #[serde(default)]
+    #[serde(default, alias = "name", alias = "title")]
     label: Option<String>,
 }
 

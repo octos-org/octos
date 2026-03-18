@@ -261,10 +261,10 @@ Example:\n\
 digraph research {{\n  \
   plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
 prompt=\"Generate 4-6 research angles covering different aspects. Include both Chinese and English angles for cross-language coverage.\", \
-worker_prompt=\"You are a research specialist. {{task}}. Use deep_search, then read_file to read _search_results.md and top sources. Include ALL URLs and quotes.\", \
-model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search,read_file\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"Cross-reference findings from all search agents. Preserve ALL data points, URLs, quotes. Organize by subtopic.\", \
-model=\"{strong_model}\", tools=\"read_file\", timeout_secs=\"300\"]\n  \
+worker_prompt=\"You are a research specialist. {{task}}. Use deep_search to find information. Include ALL URLs, data points, and direct quotes in your response.\", \
+model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
+  analyze [prompt=\"You will receive research findings from multiple search agents as your input. Cross-reference the findings, resolve contradictions, and organize by subtopic. Preserve ALL data points, URLs, and quotes.\", \
+model=\"{strong_model}\", timeout_secs=\"300\"]\n  \
   synthesize [prompt=\"Write a comprehensive, well-structured report. Include citations with URLs. Save using write_file. Match the query language.\", \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \
