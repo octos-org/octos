@@ -904,9 +904,16 @@ impl GatewayCommand {
 
         // Auto-defer non-core tool groups when tool count is high to prevent
         // overwhelming LLMs that struggle with many tool specs.
+        // Many models (DeepSeek, OpenAI) return empty responses with >15 tools.
         let visible = tools.specs().len();
-        if visible > 25 {
-            for group in &["group:research", "group:memory", "group:admin"] {
+        if visible > 15 {
+            for group in &[
+                "group:research",
+                "group:memory",
+                "group:admin",
+                "group:sessions",
+                "group:web",
+            ] {
                 tools.defer_group(group);
             }
             let after = tools.specs().len();

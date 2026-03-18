@@ -191,7 +191,8 @@ Korean for K-pop, Chinese for Chinese education). This finds primary sources oth
 - Match report language to query language\n\
 - For comparative research, add extra search angles per alternative\n\
 - For technical topics, include angles for official docs, GitHub repos, and benchmarks\n\
-- Model selection: use cheap/fast models for search nodes, pick models with high max_output_tokens for synthesize/report nodes. Avoid using the same model for both search and synthesis.";
+- Model selection: use cheap/fast models for search nodes, pick models with high max_output_tokens for synthesize/report nodes. Avoid using the same model for both search and synthesis.\n\
+- Timeouts: synthesize nodes need the highest timeout (900s) since they run last and may retry. Search: 600s, analyze: 300s.";
 
         let node_attrs = "\
 Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
@@ -265,7 +266,7 @@ model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search,
   analyze [prompt=\"Cross-reference findings from all search agents. Preserve ALL data points, URLs, quotes. Organize by subtopic.\", \
 model=\"{strong_model}\", tools=\"read_file\", timeout_secs=\"300\"]\n  \
   synthesize [prompt=\"Write a comprehensive, well-structured report. Include citations with URLs. Save using write_file. Match the query language.\", \
-model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"600\"]\n  \
+model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \
   analyze -> synthesize\n\
 }}"
