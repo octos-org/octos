@@ -47,7 +47,8 @@ pub(crate) use prompt::build_system_prompt;
     feature = "feishu",
     feature = "twilio",
     feature = "wecom",
-    feature = "wecom-bot"
+    feature = "wecom-bot",
+    feature = "qq-bot"
 ))]
 use prompt::settings_str;
 
@@ -1244,6 +1245,24 @@ impl GatewayCommand {
                     channel_mgr.register(Arc::new(octos_bus::WeComBotChannel::new(
                         &bot_id,
                         &secret,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "qq-bot")]
+                "qq-bot" => {
+                    let app_id = settings_str(&entry.settings, "app_id", "");
+                    let client_secret_env =
+                        settings_str(&entry.settings, "client_secret_env", "QQ_BOT_CLIENT_SECRET");
+                    let client_secret = std::env::var(&client_secret_env).wrap_err_with(|| {
+                        format!("{client_secret_env} environment variable not set")
+                    })?;
+                    if app_id.is_empty() {
+                        eyre::bail!("qq-bot channel requires settings.app_id");
+                    }
+                    channel_mgr.register(Arc::new(octos_bus::QQBotChannel::new(
+                        &app_id,
+                        &client_secret,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
                     )));

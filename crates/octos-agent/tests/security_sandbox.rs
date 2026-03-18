@@ -571,6 +571,7 @@ fn should_normalize_dot_dot_without_escaping() {
 // ── Symlink rejection tests ──────────────────────────────────────────────
 
 #[test]
+#[cfg(unix)]
 fn should_reject_symlink_in_read_no_follow() {
     use std::os::unix::fs::symlink;
 
@@ -587,6 +588,7 @@ fn should_reject_symlink_in_read_no_follow() {
 }
 
 #[test]
+#[cfg(unix)]
 fn should_reject_symlink_in_write_no_follow() {
     use std::os::unix::fs::symlink;
 

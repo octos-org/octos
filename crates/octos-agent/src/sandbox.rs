@@ -204,9 +204,18 @@ pub struct NoSandbox;
 
 impl Sandbox for NoSandbox {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(shell_command).current_dir(cwd);
-        cmd
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(shell_command).current_dir(cwd);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            cmd
+        }
     }
 }
 
@@ -527,7 +536,12 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
 
 /// Check if a binary exists on PATH.
 fn which_exists(bin: &str) -> bool {
-    std::process::Command::new("which")
+    #[cfg(windows)]
+    let prog = "where";
+    #[cfg(not(windows))]
+    let prog = "which";
+
+    std::process::Command::new(prog)
         .arg(bin)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -543,9 +557,12 @@ mod tests {
     #[test]
     fn test_no_sandbox_wraps_directly() {
         let sb = NoSandbox;
-        let cmd = sb.wrap_command("echo hello", Path::new("/tmp"));
-        // Command should be `sh -c "echo hello"` in /tmp
+        let tmp = std::env::temp_dir();
+        let cmd = sb.wrap_command("echo hello", &tmp);
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        #[cfg(windows)]
+        assert_eq!(prog, "cmd");
+        #[cfg(not(windows))]
         assert_eq!(prog, "sh");
     }
 
@@ -601,6 +618,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_command() {
         let sb = MacosSandbox {
@@ -745,6 +763,7 @@ mod tests {
         assert!(args.iter().any(|a| a.contains("exit 1")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_rejects_control_chars() {
         let sb = MacosSandbox {
@@ -781,6 +800,7 @@ mod tests {
         assert!(args.iter().any(|a| a.contains("exit 1")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_rejects_sbpl_metacharacters() {
         let sb = MacosSandbox {
@@ -964,9 +984,12 @@ mod tests {
             read_allow_paths: Vec::new(),
         };
         let sb = create_sandbox(&config);
-        // Should produce a NoSandbox (sh -c)
-        let cmd = sb.wrap_command("echo test", Path::new("/tmp"));
+        let tmp = std::env::temp_dir();
+        let cmd = sb.wrap_command("echo test", &tmp);
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        #[cfg(windows)]
+        assert_eq!(prog, "cmd");
+        #[cfg(not(windows))]
         assert_eq!(prog, "sh");
     }
 
@@ -991,6 +1014,7 @@ mod tests {
 
     // --- macOS sandbox with network denied ---
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_denies_network() {
         let sb = MacosSandbox {
@@ -1041,6 +1065,7 @@ mod tests {
 
     // --- macOS sandbox accepts valid paths ---
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_accepts_valid_path() {
         let sb = MacosSandbox {
@@ -1067,6 +1092,7 @@ mod tests {
 
     // --- macOS sandbox rejects DEL character (0x7F) ---
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_rejects_del_character() {
         let sb = MacosSandbox {
@@ -1153,6 +1179,7 @@ mod tests {
 
     // --- macOS restricted read paths ---
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn should_use_global_file_read_when_no_read_paths() {
         let sb = MacosSandbox {
@@ -1172,6 +1199,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn should_restrict_reads_when_read_paths_configured() {
         let sb = MacosSandbox {
@@ -1205,6 +1233,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn should_reject_read_allow_paths_with_sbpl_metacharacters() {
         // A malicious read_allow_path containing SBPL injection
@@ -1249,6 +1278,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn should_reject_read_allow_paths_with_parens() {
         let sb = MacosSandbox {
@@ -1271,6 +1301,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn should_reject_read_allow_paths_with_control_chars() {
         let sb = MacosSandbox {

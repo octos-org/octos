@@ -438,8 +438,16 @@ fn expand_tilde(path: &str) -> String {
         };
         #[cfg(target_os = "macos")]
         let home_base = "/Users";
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        let home_base = {
+            let drive = std::env::var("SYSTEMDRIVE").unwrap_or_else(|_| "C:".to_string());
+            format!("{drive}\\Users")
+        };
+        #[cfg(not(any(target_os = "macos", windows)))]
         let home_base = "/home";
+        #[cfg(windows)]
+        return format!("{}\\{}{}", home_base, username, suffix);
+        #[cfg(not(windows))]
         return format!("{}/{}{}", home_base, username, suffix);
     }
     path.to_string()
@@ -635,16 +643,17 @@ mod tests {
     fn test_expand_tilde() {
         let expanded = expand_tilde("~/foo/bar");
         assert!(!expanded.starts_with('~'));
-        assert!(expanded.ends_with("/foo/bar"));
+        assert!(expanded.contains("foo/bar") || expanded.contains("foo\\bar"));
 
         // ~username expansion
         let expanded = expand_tilde("~alice/scripts/hook.sh");
-        assert!(expanded.ends_with("/alice/scripts/hook.sh"));
+        assert!(expanded.contains("alice"));
+        assert!(expanded.ends_with("/scripts/hook.sh"));
         assert!(!expanded.starts_with('~'));
 
         // ~username without trailing path
         let expanded = expand_tilde("~bob");
-        assert!(expanded.ends_with("/bob"));
+        assert!(expanded.contains("bob"));
 
         // Non-tilde paths unchanged
         assert_eq!(expand_tilde("/usr/bin/foo"), "/usr/bin/foo");
@@ -660,6 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_executor_allow_hook() {
         let executor = HookExecutor::new(vec![HookConfig {
             event: HookEvent::BeforeToolCall,
@@ -673,6 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_executor_deny_hook() {
         // `false` exits with code 1
         let executor = HookExecutor::new(vec![HookConfig {
@@ -713,6 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_circuit_breaker_below_threshold_still_runs() {
         // After-tool hook that exits with code 2 (error, not deny)
         let executor = HookExecutor::with_threshold(
@@ -735,6 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_circuit_breaker_at_threshold_disables() {
         let executor = HookExecutor::with_threshold(
             vec![HookConfig {
@@ -758,6 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_circuit_breaker_resets_on_success() {
         let executor = HookExecutor::with_threshold(
             vec![HookConfig {

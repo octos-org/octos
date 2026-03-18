@@ -175,9 +175,10 @@ mod tests {
             headers: HashMap::new(),
         };
         let config = resolve_mcp_server(&srv, Path::new("/skills/my-skill"));
-        assert_eq!(
-            config.command.as_deref(),
-            Some("/skills/my-skill/./bin/server")
+        let cmd = config.command.unwrap();
+        assert!(
+            cmd == "/skills/my-skill/./bin/server" || cmd == "/skills/my-skill\\./bin/server",
+            "unexpected resolved command: {cmd}"
         );
     }
 
@@ -227,7 +228,12 @@ mod tests {
             assert!(hook.is_some(), "should resolve event: {event_str}");
             let hook = hook.unwrap();
             assert_eq!(hook.timeout_ms, 3000);
-            assert_eq!(hook.command[0], "/skills/s/./audit.sh");
+            assert!(
+                hook.command[0] == "/skills/s/./audit.sh"
+                    || hook.command[0] == "/skills/s\\./audit.sh",
+                "unexpected resolved command: {}",
+                hook.command[0]
+            );
         }
     }
 

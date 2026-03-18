@@ -1,6 +1,6 @@
 # Local Deployment Guide
 
-Deploy octos on your own machine (macOS, Linux, or Windows via WSL2).
+Deploy octos on your own machine (macOS, Linux, or Windows).
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ Deploy octos on your own machine (macOS, Linux, or Windows via WSL2).
 | Rust | 1.85.0+ | Install via [rustup.rs](https://rustup.rs) |
 | macOS | 13+ | Apple Silicon or Intel |
 | Linux | glibc 2.31+ | Ubuntu 20.04+, Debian 11+, Fedora 34+ |
-| Windows | WSL2 | Use Ubuntu WSL2, not native Windows |
+| Windows | 10/11 | Native build or WSL2 |
 
 ### Optional Dependencies
 
@@ -124,9 +124,43 @@ sudo dnf install -y gcc pkg-config openssl-devel
 # Then follow Ubuntu steps from step 2 onward
 ```
 
+### Windows (Native)
+
+octos builds and runs natively on Windows. Shell commands are executed via `cmd /C`.
+
+```powershell
+# 1. Install Rust (download rustup-init.exe from https://rustup.rs)
+rustup-init.exe
+
+# 2. Clone and build
+git clone https://github.com/octos-org/octos.git
+cd octos
+cargo install --path crates/octos-cli
+
+# 3. Set API key and run
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+crew chat
+```
+
+**PowerShell CI script:**
+
+A local CI script is provided for Windows:
+
+```powershell
+.\scripts\ci.ps1           # Run fmt + clippy + tests
+.\scripts\ci.ps1 -Fix      # Auto-fix formatting
+.\scripts\ci.ps1 -Quick    # Skip clippy (just fmt + test)
+```
+
+**Windows notes:**
+
+- Sandbox is disabled on Windows (no bubblewrap/sandbox-exec equivalent); shell commands run without isolation. Docker sandbox mode still works if Docker Desktop is installed.
+- API keys are stored via Windows Credential Manager (`keyring` crate).
+- Process management uses `taskkill` for cleanup.
+
 ### Windows (WSL2)
 
-octos does not build natively on Windows. Use WSL2 instead:
+Alternatively, you can use WSL2 for a Linux environment:
 
 ```powershell
 # 1. Install WSL2 (PowerShell as admin)
@@ -137,27 +171,11 @@ wsl --install -d Ubuntu
 
 **Accessing the dashboard from Windows:**
 
-When running `octos serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
-
-**Persistent service in WSL2:**
-
-WSL2 supports systemd on recent versions (Windows 11 22H2+). If systemd is enabled in `/etc/wsl.conf`:
-
-```ini
-[boot]
-systemd=true
-```
-
-Then the systemd user unit approach works. Otherwise, use a startup script:
-
-```bash
-# Add to ~/.bashrc or ~/.profile
-if ! pgrep -f "octos serve" >/dev/null; then
-    nohup octos serve --port 8080 > ~/.octos/serve.log 2>&1 &
-fi
-```
+When running `crew serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
 
 ## Deploy Script Reference
+
+On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
 
 ```
 ./scripts/local-deploy.sh [OPTIONS]
@@ -255,3 +273,5 @@ systemctl --user restart octos-serve
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
 | Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u octos-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |
+| Windows: `crew` not found | Ensure `%USERPROFILE%\.cargo\bin` is in your PATH |
+| Windows: shell commands fail | Commands run via `cmd /C`; use Windows-compatible syntax |

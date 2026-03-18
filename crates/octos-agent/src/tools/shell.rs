@@ -234,6 +234,13 @@ impl Tool for ShellTool {
                             .status();
                     }
                 }
+                #[cfg(windows)]
+                if let Some(pid) = child_pid {
+                    use std::process::Command as StdCommand;
+                    let _ = StdCommand::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .status();
+                }
                 Ok(ToolResult {
                     output: format!(
                         "Command timed out after {} seconds",
@@ -253,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_clamped_to_max() {
-        let tool = ShellTool::new("/tmp");
+        let tool = ShellTool::new(std::env::temp_dir());
         let result = tool
             .execute(&serde_json::json!({
                 "command": "echo hello",
@@ -267,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_zero_clamped_to_min() {
-        let tool = ShellTool::new("/tmp");
+        let tool = ShellTool::new(std::env::temp_dir());
         // timeout_secs: 0 would be clamped to 1 second
         let result = tool
             .execute(&serde_json::json!({
@@ -281,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_denied_command() {
-        let tool = ShellTool::new("/tmp");
+        let tool = ShellTool::new(std::env::temp_dir());
         let result = tool
             .execute(&serde_json::json!({"command": "rm -rf /"}))
             .await
@@ -292,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_command_denied_without_approval() {
-        let tool = ShellTool::new("/tmp");
+        let tool = ShellTool::new(std::env::temp_dir());
         // sudo triggers Ask, which must be denied (no interactive approval)
         let result = tool
             .execute(&serde_json::json!({"command": "sudo ls"}))
