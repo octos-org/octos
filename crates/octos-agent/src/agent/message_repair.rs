@@ -14,6 +14,67 @@ pub(crate) fn sanitize_tool_call_id(id: &str) -> String {
         .collect()
 }
 
+/// Normalize all tool_call_ids in messages to `call_` prefix.
+///
+/// When adaptive routing switches providers mid-conversation, the history
+/// contains IDs from different providers (toolu_xxx from Anthropic,
+/// call_function_xxx from Moonshot, fc_xxx from OpenAI Responses, etc.).
+/// OpenAI's APIs reject non-`call_` prefixed IDs with 400 invalid_value.
+///
+/// This rewrites ALL tool_call_ids to a consistent format, ensuring both
+/// the assistant message's tool_calls[].id and the tool message's
+/// tool_call_id match.
+pub(crate) fn normalize_tool_call_ids(messages: &mut [Message]) {
+    use std::collections::HashMap;
+
+    // Build a mapping of old_id → normalized_id
+    let mut id_map: HashMap<String, String> = HashMap::new();
+
+    // First pass: collect all tool_call IDs from assistant messages
+    for msg in messages.iter() {
+        if let Some(ref tool_calls) = msg.tool_calls {
+            for tc in tool_calls {
+                if !tc.id.is_empty() && !tc.id.starts_with("call_") {
+                    let normalized = normalize_one_id(&tc.id);
+                    id_map.insert(tc.id.clone(), normalized);
+                }
+            }
+        }
+    }
+
+    if id_map.is_empty() {
+        return;
+    }
+
+    // Second pass: rewrite IDs in both assistant tool_calls and tool messages
+    for msg in messages.iter_mut() {
+        if let Some(ref mut tool_calls) = msg.tool_calls {
+            for tc in tool_calls.iter_mut() {
+                if let Some(new_id) = id_map.get(&tc.id) {
+                    tc.id = new_id.clone();
+                }
+            }
+        }
+        if let Some(ref old_id) = msg.tool_call_id {
+            if let Some(new_id) = id_map.get(old_id) {
+                msg.tool_call_id = Some(new_id.clone());
+            }
+        }
+    }
+}
+
+fn normalize_one_id(id: &str) -> String {
+    if id.starts_with("call_") || id.starts_with("fc_") {
+        return id.to_string();
+    }
+    let stripped = id
+        .strip_prefix("call_function_")
+        .or_else(|| id.strip_prefix("toolu_"))
+        .or_else(|| id.strip_prefix("chatcmpl-"))
+        .unwrap_or(id);
+    format!("call_{stripped}")
+}
+
 /// Merge all system messages into the first one so providers that require a
 /// single leading system message (e.g. Qwen) don't reject the request.
 ///
