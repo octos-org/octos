@@ -51,7 +51,7 @@ All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> Tool
 
 ### Sandbox (`crew-agent/src/sandbox.rs`)
 
-Three sandbox backends: `Bwrap` (Linux), `Macos` (sandbox-exec), `Docker`. Auto-detection in `SandboxMode::Auto`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
+Three sandbox backends: `Bwrap` (Linux), `Macos` (sandbox-exec), `Docker`. On Windows, falls back to `NoSandbox` (uses `cmd /C`) or Docker if available. Auto-detection in `SandboxMode::Auto`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
 
 ### MCP (`crew-agent/src/mcp.rs`)
 
@@ -118,5 +118,6 @@ All code changes follow the RED -> GREEN -> REFACTOR cycle. See `.claude/rules/t
 - `ShellTool` has `SafePolicy` that denies dangerous commands (rm -rf /, dd, mkfs, fork bomb). Whitespace-normalized before matching. Timeout clamped to [1, 600]s.
 - `BLOCKED_ENV_VARS` shared across sandbox backends, MCP, hooks, and browser tool (18 vars: LD_PRELOAD, DYLD_*, NODE_OPTIONS, etc.)
 - Shared SSRF protection (`tools/ssrf.rs`): blocks private IPs, IPv6 ULA/link-local, IPv4-mapped/compatible addresses
-- Symlink-safe file I/O via `O_NOFOLLOW` on Unix (eliminates TOCTOU races)
+- Symlink-safe file I/O via `O_NOFOLLOW` on Unix (eliminates TOCTOU races); symlink-check fallback on Windows
+- Cross-platform: shell via `cmd /C` on Windows, `sh -c` on Unix; process kill via `taskkill` on Windows, `kill` signals on Unix; `where` on Windows, `which` on Unix for binary discovery
 - API server (`crew serve`) binds to 127.0.0.1 by default (`--host` to override)

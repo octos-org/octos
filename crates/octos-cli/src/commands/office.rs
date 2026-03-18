@@ -1814,7 +1814,7 @@ fn run_soffice_cmd(args: &[&str], timeout_secs: Option<u32>) -> Result<std::proc
             Some("timeout")
         } else {
             // macOS: check for gtimeout (GNU coreutils)
-            Command::new("which")
+            Command::new(if cfg!(windows) { "where" } else { "which" })
                 .arg("gtimeout")
                 .output()
                 .ok()

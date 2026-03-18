@@ -874,6 +874,7 @@ mod nofollow_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_file_io_error_symlink() {
         let err = std::io::Error::from_raw_os_error(libc::ELOOP);
         let result = file_io_error(err, "test.txt");

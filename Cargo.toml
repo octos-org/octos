@@ -73,8 +73,8 @@ dirs = "5"
 rustyline = "15"
 open = "5"
 
-# Keychain (macOS Keychain for secure API key storage)
-keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# Keychain (platform-native secure credential storage)
+keyring = { version = "3", default-features = false }
 
 # HTTP client (using rustls for pure Rust, no OpenSSL)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
