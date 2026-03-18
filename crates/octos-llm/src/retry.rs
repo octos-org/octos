@@ -63,9 +63,13 @@ impl RetryProvider {
     /// should not be retried on the *same* provider but should failover to
     /// a different provider which may have valid credentials.
     pub(crate) fn should_failover(error: &eyre::Report) -> bool {
-        // Auth errors: don't retry same provider, but do failover
+        // Auth errors and timeouts: don't retry same provider, but do failover
         for cause in error.chain() {
             if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
+                // Timeout → failover immediately (don't waste 120s × retries)
+                if reqwest_err.is_timeout() {
+                    return true;
+                }
                 if let Some(status) = reqwest_err.status() {
                     if matches!(status.as_u16(), 401 | 403) {
                         return true;
@@ -104,9 +108,15 @@ impl RetryProvider {
                 if let Some(status) = reqwest_err.status() {
                     return matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529);
                 }
-                // Connection/timeout errors from reqwest are retryable
-                if reqwest_err.is_connect() || reqwest_err.is_timeout() {
+                // Connection errors are retryable (may be transient network issue)
+                if reqwest_err.is_connect() {
                     return true;
+                }
+                // Timeout errors should NOT be retried on the same provider —
+                // if a provider is unresponsive, retrying wastes 120s × retries.
+                // Timeouts trigger failover to a different provider instead.
+                if reqwest_err.is_timeout() {
+                    return false;
                 }
             }
         }

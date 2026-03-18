@@ -100,9 +100,25 @@ impl CodergenHandler {
     }
 
     /// Resolve LLM provider for a node, following SpawnTool pattern.
+    ///
+    /// When a model is explicitly specified and a `ProviderRouter` is available,
+    /// the resolved provider is wrapped with capability-compatible fallbacks.
+    /// This ensures that if the primary model times out or errors, the pipeline
+    /// automatically falls back to another provider with sufficient max_output_tokens.
     fn resolve_provider(&self, model: Option<&str>) -> Result<Arc<dyn LlmProvider>> {
         match (model, &self.provider_router) {
-            (Some(model_key), Some(router)) => router.resolve(model_key),
+            (Some(model_key), Some(router)) => {
+                let primary = router.resolve(model_key)?;
+                let fallbacks = router.compatible_fallbacks(model_key);
+                if !fallbacks.is_empty() {
+                    info!(
+                        model = model_key,
+                        fallback_count = fallbacks.len(),
+                        "pipeline node provider resolved with fallbacks"
+                    );
+                }
+                Ok(octos_llm::FallbackProvider::wrap_if_needed(primary, fallbacks))
+            }
             (Some(model_key), None) => {
                 warn!(
                     model = model_key,

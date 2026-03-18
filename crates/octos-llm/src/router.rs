@@ -198,6 +198,34 @@ impl ProviderRouter {
             .collect()
     }
 
+    /// Find fallback providers compatible with the given key's output capacity.
+    /// Returns providers with max_output_tokens >= the requested model's,
+    /// sorted by max_output_tokens descending (best fallback first).
+    /// Excludes the requested key itself.
+    pub fn compatible_fallbacks(&self, key: &str) -> Vec<Arc<dyn LlmProvider>> {
+        let metadata = self.metadata.read().unwrap_or_else(|e| e.into_inner());
+        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+
+        let min_output = metadata
+            .get(key)
+            .map(|m| m.max_output_tokens)
+            .unwrap_or(0);
+
+        let mut candidates: Vec<(&str, u32)> = metadata
+            .iter()
+            .filter(|(k, m)| k.as_str() != key && m.max_output_tokens >= min_output)
+            .map(|(k, m)| (k.as_str(), m.max_output_tokens))
+            .collect();
+
+        // Sort by max_output descending (best fallback first)
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        candidates
+            .into_iter()
+            .filter_map(|(k, _)| providers.get(k).cloned())
+            .collect()
+    }
+
     /// Get the active sub-provider, if any.
     fn active_provider(&self) -> Result<Arc<dyn LlmProvider>> {
         let active_key = self
@@ -498,5 +526,43 @@ mod tests {
         // Both should have cost info (known models)
         assert!(metas[0].cost_info.is_some());
         assert!(metas[1].cost_info.is_some());
+    }
+
+    #[test]
+    fn test_compatible_fallbacks() {
+        let router = ProviderRouter::new();
+        router.register_with_full_meta(
+            "cheap",
+            Arc::new(MockProvider::new("gpt-4o-mini", 128_000)),
+            Some("Cheap".into()),
+            None,
+            Some(8192),
+        );
+        router.register_with_full_meta(
+            "mid",
+            Arc::new(MockProvider::new("deepseek-chat", 128_000)),
+            Some("Mid".into()),
+            None,
+            Some(16384),
+        );
+        router.register_with_full_meta(
+            "synth",
+            Arc::new(MockProvider::new("gemini-3-flash", 1_000_000)),
+            Some("Synth".into()),
+            None,
+            Some(65536),
+        );
+
+        // "cheap" (8k output) should have 2 fallbacks (mid=16k, synth=65k)
+        let fb = router.compatible_fallbacks("cheap");
+        assert_eq!(fb.len(), 2);
+
+        // "synth" (65k output) should have 0 fallbacks (nothing else is >= 65k)
+        let fb = router.compatible_fallbacks("synth");
+        assert_eq!(fb.len(), 0);
+
+        // "mid" (16k output) should have 1 fallback (synth=65k)
+        let fb = router.compatible_fallbacks("mid");
+        assert_eq!(fb.len(), 1);
     }
 }

@@ -86,7 +86,7 @@ impl RunPipelineTool {
             let max_out_k = m.max_output_tokens / 1000;
             let ctx_k = m.context_window / 1000;
             let mut line = format!(
-                "- '{}': {} ({}), {}k max output, {}k context",
+                "- '{}': {} ({}), {}k output, {}k context",
                 m.key, m.model_id, m.provider_name, max_out_k, ctx_k,
             );
             if let Some(ref cost) = m.cost_info {
@@ -190,7 +190,8 @@ Korean for K-pop, Chinese for Chinese education). This finds primary sources oth
 - Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)\n\
 - Match report language to query language\n\
 - For comparative research, add extra search angles per alternative\n\
-- For technical topics, include angles for official docs, GitHub repos, and benchmarks";
+- For technical topics, include angles for official docs, GitHub repos, and benchmarks\n\
+- Model selection: use cheap/fast models for search nodes, pick models with high max_output_tokens for synthesize/report nodes. Avoid using the same model for both search and synthesis.";
 
         let node_attrs = "\
 Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
@@ -206,7 +207,6 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
                     // highest max_output for synthesis
                     let mut best_search = &metas[0];
                     let mut best_strong = &metas[0];
-                    let mut best_synth = &metas[0];
                     for m in &metas {
                         // Prefer lower max_output as "cheaper/faster" for search
                         if m.max_output_tokens < best_search.max_output_tokens {
@@ -216,8 +216,18 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
                         if m.context_window > best_strong.context_window {
                             best_strong = m;
                         }
-                        // Prefer highest max_output for synthesis
-                        if m.max_output_tokens > best_synth.max_output_tokens {
+                    }
+                    // For synthesis: pick highest max_output, but exclude the
+                    // search model so we don't reuse a cheap/fast model for
+                    // long-form generation.
+                    let mut best_synth = &metas[0];
+                    for m in &metas {
+                        if m.key == best_search.key {
+                            continue;
+                        }
+                        if best_synth.key == best_search.key
+                            || m.max_output_tokens > best_synth.max_output_tokens
+                        {
                             best_synth = m;
                         }
                     }
