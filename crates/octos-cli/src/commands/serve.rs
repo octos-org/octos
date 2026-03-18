@@ -250,6 +250,14 @@ impl ServeCommand {
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
+            tenant_store: crate::tenant::TenantStore::open(&data_dir)
+                .ok()
+                .map(Arc::new),
+            tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
+            frps_server: std::env::var("FRPS_SERVER").ok(),
+            frps_port: std::env::var("FRPS_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok()),
         });
 
         // Auto-start enabled profiles

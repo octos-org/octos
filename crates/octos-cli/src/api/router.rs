@@ -244,7 +244,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Model limits (from model_limits.json)
         .route("/api/admin/model-limits", get(admin::model_limits))
         // Remote shell (for debugging/development via coding agents)
-        .route("/api/admin/shell", post(admin::admin_shell));
+        .route("/api/admin/shell", post(admin::admin_shell))
+        // Tunnel tenant management
+        .route("/api/admin/tenants", get(admin::list_tenants))
+        .route("/api/admin/tenants", post(admin::create_tenant))
+        .route("/api/admin/tenants/{id}", get(admin::get_tenant))
+        .route("/api/admin/tenants/{id}", delete(admin::delete_tenant))
+        .route(
+            "/api/admin/tenants/{id}/setup-script",
+            get(admin::tenant_setup_script),
+        );
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

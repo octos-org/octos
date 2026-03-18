@@ -2529,6 +2529,278 @@ pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResp
     }
 }
 
+// ── Tenant tunnel management ────────────────────────────────────────
+
+/// GET /api/admin/tenants — list all tunnel tenants.
+pub async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<crate::tenant::TenantConfig>>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenants = store
+        .list()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(tenants))
+}
+
+/// GET /api/admin/tenants/{id} — get a single tenant.
+pub async fn get_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenant = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
+    Ok(Json(tenant))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTenantRequest {
+    pub name: String,
+    #[serde(default = "default_local_port")]
+    pub local_port: u16,
+}
+
+fn default_local_port() -> u16 {
+    8080
+}
+
+/// POST /api/admin/tenants — create a new tunnel tenant.
+pub async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateTenantRequest>,
+) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    // Check for duplicate
+    if store
+        .get(&req.name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("tenant '{}' already exists", req.name),
+        ));
+    }
+
+    let ssh_port = store
+        .next_ssh_port()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    let tenant = crate::tenant::TenantConfig {
+        id: req.name.clone(),
+        name: req.name.clone(),
+        subdomain: req.name.clone(),
+        tunnel_token: uuid::Uuid::new_v4().to_string(),
+        ssh_port,
+        local_port: req.local_port,
+        status: crate::tenant::TenantStatus::Pending,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .save(&tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(tenant))
+}
+
+/// DELETE /api/admin/tenants/{id} — delete a tenant.
+pub async fn delete_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let deleted = store
+        .delete(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")));
+    }
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("tenant '{id}' deleted")),
+    }))
+}
+
+/// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
+/// installs octos + frpc on a fresh Mac Mini.
+pub async fn tenant_setup_script(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<String, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenant = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
+
+    let domain = state
+        .tunnel_domain
+        .as_deref()
+        .unwrap_or("octos-cloud.org");
+    let server = state
+        .frps_server
+        .as_deref()
+        .unwrap_or("163.192.33.32");
+    let port = state.frps_port.unwrap_or(7000);
+
+    let frpc_config =
+        crate::tenant::render_frpc_config(&tenant, server, port, domain);
+
+    // Generate a self-contained setup script
+    let script = format!(
+        r#"#!/usr/bin/env bash
+# Auto-generated setup script for tenant: {name}
+# Subdomain: {subdomain}.{domain}
+# SSH tunnel port: {ssh_port}
+#
+# Usage: curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash
+set -euo pipefail
+
+SUBDOMAIN="{subdomain}"
+TUNNEL_TOKEN="{token}"
+FRPS_SERVER="{server}"
+FRPS_PORT={port}
+LOCAL_PORT={local_port}
+SSH_PORT={ssh_port}
+DOMAIN="{domain}"
+
+echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
+
+# ── Install frpc ──────────────────────────────────────────────────────
+FRPC_VERSION="0.61.1"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  FRP_ARCH="amd64" ;;
+    aarch64|arm64) FRP_ARCH="arm64" ;;
+    *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+esac
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+if [ ! -f /usr/local/bin/frpc ]; then
+    echo "    Installing frpc v${{FRPC_VERSION}}..."
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    TARBALL="frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}.tar.gz"
+    curl -fsSL -o "$TMPDIR/$TARBALL" \
+        "https://github.com/fatedier/frp/releases/download/v${{FRPC_VERSION}}/$TARBALL"
+    tar -xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
+    sudo install -m 0755 "$TMPDIR/frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}/frpc" /usr/local/bin/frpc
+    echo "    frpc installed"
+else
+    echo "    frpc already installed"
+fi
+
+# ── Write frpc config ────────────────────────────────────────────────
+sudo mkdir -p /etc/frp
+sudo tee /etc/frp/frpc.toml > /dev/null << 'FRPC_EOF'
+{frpc_config}
+FRPC_EOF
+echo "    frpc config written to /etc/frp/frpc.toml"
+
+# ── Create launchd service (macOS) or systemd service (Linux) ────────
+if [ "$OS" = "darwin" ]; then
+    PLIST_PATH="$HOME/Library/LaunchAgents/io.octos.frpc.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST_PATH" << PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frpc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/frpc</string>
+        <string>-c</string>
+        <string>/etc/frp/frpc.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/frpc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/frpc.log</string>
+</dict>
+</plist>
+PLIST_EOF
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    launchctl load "$PLIST_PATH"
+    echo "    launchd service loaded (io.octos.frpc)"
+else
+    sudo tee /etc/systemd/system/frpc.service > /dev/null << SYSTEMD_EOF
+[Unit]
+Description=frpc tunnel client for octos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable frpc
+    sudo systemctl restart frpc
+    echo "    systemd service started (frpc)"
+fi
+
+# ── Verify tunnel ────────────────────────────────────────────────────
+echo ""
+echo "==> Tunnel setup complete!"
+echo "    Dashboard: https://${{SUBDOMAIN}}.${{DOMAIN}}"
+echo "    SSH:       ssh -p ${{SSH_PORT}} $(whoami)@${{DOMAIN}}"
+echo ""
+echo "    Waiting 5s for tunnel to establish..."
+sleep 5
+if curl -sf --max-time 5 "http://localhost:${{LOCAL_PORT}}/api/status" > /dev/null 2>&1; then
+    echo "    Local octos is running on port ${{LOCAL_PORT}}"
+else
+    echo "    NOTE: octos serve is not running on port ${{LOCAL_PORT}} yet"
+    echo "    Start it with: octos serve --port ${{LOCAL_PORT}}"
+fi
+"#,
+        name = tenant.name,
+        subdomain = tenant.subdomain,
+        domain = domain,
+        token = tenant.tunnel_token,
+        server = server,
+        port = port,
+        local_port = tenant.local_port,
+        ssh_port = tenant.ssh_port,
+        id = tenant.id,
+        frpc_config = frpc_config,
+    );
+
+    Ok(script)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

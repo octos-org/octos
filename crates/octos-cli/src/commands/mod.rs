@@ -1,6 +1,7 @@
 //! CLI commands for octos.
 
 mod account;
+mod admin;
 mod auth;
 mod channels;
 pub(crate) mod chat;
@@ -22,6 +23,7 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
+pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
@@ -73,6 +75,8 @@ fn version_string() -> &'static str {
 pub enum Command {
     /// Manage sub-accounts under profiles.
     Account(AccountCommand),
+    /// Admin commands for tenant and tunnel management.
+    Admin(AdminCommand),
     /// Manage authentication for LLM providers.
     Auth(AuthCommand),
     /// Manage messaging channels.
@@ -160,6 +164,7 @@ impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
             Self::Account(cmd) => cmd.execute(),
+            Self::Admin(cmd) => cmd.execute(),
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
