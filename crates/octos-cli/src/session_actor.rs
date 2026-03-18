@@ -465,11 +465,19 @@ impl ActorFactory {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if has_deferred {
-            system_prompt.push_str(
-                "\n\nSome tools are available on demand. Call `activate_tools` \
-                 with no arguments to see available tool groups, then activate \
-                 the ones you need.",
-            );
+            let groups = tools.deferred_groups();
+            let mut tool_names = Vec::new();
+            for (name, _desc, _count) in &groups {
+                if let Some(info) = octos_agent::tools::policy::TOOL_GROUPS
+                    .iter()
+                    .find(|g| g.name == name)
+                {
+                    tool_names.extend(info.tools.iter().map(|s| *s));
+                }
+            }
+            let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
+            system_prompt
+                .push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
         }
 
         // Per-session cancellation flag: shared with the agent so that
