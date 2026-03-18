@@ -920,8 +920,8 @@ impl GatewayCommand {
         ]);
 
         // Auto-defer non-core tool groups when tool count is high to prevent
-        // overwhelming LLMs that struggle with many tool specs.
-        // Many models (DeepSeek, OpenAI) return empty responses with >15 tools.
+        // overwhelming weaker LLMs (e.g. GLM) that return empty responses
+        // when too many tool definitions are present.
         let visible = tools.specs().len();
         if visible > 15 {
             // Keep research (deep_search, deep_crawl) active — users

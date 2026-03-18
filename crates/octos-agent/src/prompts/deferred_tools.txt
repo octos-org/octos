@@ -3,7 +3,5 @@ Additional tools available on demand: {tool_list}.
 To use them, call `activate_tools` with the names you need:
   activate_tools({"tools": ["save_memory", "recall_memory"]})
 Load all tools you expect to need in a single call to save round-trips.
-IMPORTANT: Keep total active tools under 15 at any time — too many tools
-degrades response quality and causes errors. Only load what you need for
-the current task. When you're done with specialized tools, they stay loaded
-for the session but you should avoid loading unnecessary ones.
+Idle tools are automatically unloaded after a few turns to keep things fast.
+Only load what you need for the current task.
