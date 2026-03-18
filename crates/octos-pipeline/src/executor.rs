@@ -192,11 +192,48 @@ async fn plan_dynamic_tasks(
         &content
     };
 
-    let json_str = extract_json_array(text)
-        .ok_or_else(|| eyre::eyre!("no JSON array found in planning response"))?;
+    let json_str = extract_json_array(text).ok_or_else(|| {
+        let preview: String = text.chars().take(200).collect();
+        eyre::eyre!("no JSON array found in planning response: {preview}")
+    })?;
 
-    let tasks: Vec<DynamicTask> =
-        serde_json::from_str(json_str).wrap_err("failed to parse planning response as JSON")?;
+    // Try strict parsing first, then fall back to extracting any string values
+    let tasks: Vec<DynamicTask> = match serde_json::from_str(json_str) {
+        Ok(tasks) => tasks,
+        Err(strict_err) => {
+            // Fallback: parse as array of generic objects, extract task from
+            // the first string field (regardless of field name)
+            let preview: String = json_str.chars().take(200).collect();
+            tracing::warn!(
+                error = %strict_err,
+                json_preview = %preview,
+                "strict DynamicTask parse failed, trying flexible extraction"
+            );
+            let arr: Vec<serde_json::Map<String, serde_json::Value>> =
+                serde_json::from_str(json_str).map_err(|e| {
+                    eyre::eyre!("failed to parse planning JSON as array of objects: {e}\nJSON: {preview}")
+                })?;
+            arr.into_iter()
+                .filter_map(|obj| {
+                    // Find the first string field as "task", second as "label"
+                    let mut strings: Vec<String> = obj
+                        .values()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if strings.is_empty() {
+                        return None;
+                    }
+                    let task = strings.remove(0);
+                    let label = if strings.is_empty() {
+                        None
+                    } else {
+                        Some(strings.remove(0))
+                    };
+                    Some(DynamicTask { task, label })
+                })
+                .collect()
+        }
+    };
 
     let tasks: Vec<DynamicTask> = tasks.into_iter().take(max_tasks as usize).collect();
     Ok((tasks, usage))
