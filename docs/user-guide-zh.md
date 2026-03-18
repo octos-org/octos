@@ -1,6 +1,6 @@
-# Crew 用户指南
+# Octos 用户指南
 
-部署、配置和使用 Crew AI 智能体平台的完整指南。
+部署、配置和使用 Octos AI 智能体平台的完整指南。
 
 ---
 
@@ -33,16 +33,16 @@
 
 ## 1. 概览
 
-Crew 是一个 Rust 原生的 AI 智能体平台，支持以下运行模式：
+Octos 是一个 Rust 原生的 AI 智能体平台，支持以下运行模式：
 
-- **`crew serve`** — 控制面板 + 管理仪表盘。管理多个 **配置文件**（机器人实例），每个实例作为独立的 gateway 子进程运行，拥有独立的配置、记忆、会话和消息通道。
-- **`crew gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、飞书、邮件、企业微信）。
-- **`crew chat`** — 交互式 CLI 聊天，用于开发和测试。
+- **`octos serve`** — 控制面板 + 管理仪表盘。管理多个 **配置文件**（机器人实例），每个实例作为独立的 gateway 子进程运行，拥有独立的配置、记忆、会话和消息通道。
+- **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、飞书、邮件、企业微信）。
+- **`octos chat`** — 交互式 CLI 聊天，用于开发和测试。
 
 ### 架构
 
 ```
-crew serve（控制面板 + 仪表盘）
+octos serve（控制面板 + 仪表盘）
   ├── 配置 A → gateway 进程（Telegram、WhatsApp）
   ├── 配置 B → gateway 进程（飞书、Slack）
   └── 配置 C → gateway 进程（CLI）
@@ -60,13 +60,13 @@ crew serve（控制面板 + 仪表盘）
 
 ## 2. 仪表盘与 OTP 登录
 
-管理仪表盘是嵌入在 `crew serve` 二进制文件中的 React Web 应用。它提供了管理配置文件、监控 gateway 状态和配置系统的可视化界面。
+管理仪表盘是嵌入在 `octos serve` 二进制文件中的 React Web 应用。它提供了管理配置文件、监控 gateway 状态和配置系统的可视化界面。
 
 ### 2.1 访问仪表盘
 
 ```bash
 # 启动控制面板
-crew serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0 --port 3000
 
 # 仪表盘地址：
 # http://localhost:3000
@@ -146,7 +146,7 @@ export SMTP_PASSWORD="your-app-password"
 
 ## 3. 配置 LLM 提供商
 
-Crew 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
+Octos 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
 
 ### 3.1 支持的提供商
 
@@ -264,13 +264,13 @@ Crew 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对应
 #### 方法 2：CLI 参数
 
 ```bash
-crew chat --provider deepseek --model deepseek-chat
-crew chat --model gpt-4o  # 从模型名称自动检测提供商
+octos chat --provider deepseek --model deepseek-chat
+octos chat --model gpt-4o  # 从模型名称自动检测提供商
 ```
 
 #### 方法 3：自动检测
 
-省略 `provider` 时，Crew 会从模型名称自动检测提供商：
+省略 `provider` 时，Octos 会从模型名称自动检测提供商：
 
 | 模型名模式 | 检测到的提供商 |
 |-----------|--------------|
@@ -324,20 +324,20 @@ crew chat --model gpt-4o  # 从模型名称自动检测提供商
 
 ```bash
 # OAuth PKCE（仅 OpenAI）
-crew auth login --provider openai
+octos auth login --provider openai
 
 # 设备码流程（仅 OpenAI）
-crew auth login --provider openai --device-code
+octos auth login --provider openai --device-code
 
 # 粘贴令牌（所有其他提供商）
-crew auth login --provider anthropic
+octos auth login --provider anthropic
 # → 提示："Paste your API key:"
 
 # 查看已存储的凭据
-crew auth status
+octos auth status
 
 # 删除凭据
-crew auth logout --provider openai
+octos auth logout --provider openai
 ```
 
 凭据存储在 `~/.octos/auth.json`（文件权限 0600）。解析 API 密钥时，认证存储**优先于**环境变量。
@@ -892,13 +892,13 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
 也可以通过 CLI 管理定时任务：
 
 ```bash
-crew cron list                              # 列出活跃任务
-crew cron list --all                        # 包含已禁用的
-crew cron add --name "report" --message "生成日报" --cron "0 0 9 * * * *"
-crew cron add --name "check" --message "检查状态" --every 3600
-crew cron remove <job-id>
-crew cron enable <job-id>
-crew cron enable <job-id> --disable
+octos cron list                              # 列出活跃任务
+octos cron list --all                        # 包含已禁用的
+octos cron add --name "report" --message "生成日报" --cron "0 0 9 * * * *"
+octos cron add --name "check" --message "检查状态" --every 3600
+octos cron remove <job-id>
+octos cron enable <job-id>
+octos cron enable <job-id> --disable
 ```
 
 ### 11.5 多轮工具使用
@@ -1002,7 +1002,7 @@ crew cron enable <job-id> --disable
 
 ## 12. 内置应用技能
 
-内置应用技能作为编译好的二进制文件随 `crew` 一起发布。它们在 gateway 启动时自动安装到 `.octos/skills/` — 无需手动安装。
+内置应用技能作为编译好的二进制文件随 `octos` 一起发布。它们在 gateway 启动时自动安装到 `.octos/skills/` — 无需手动安装。
 
 ### 12.1 新闻获取
 
@@ -1378,7 +1378,7 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 ### 13.1 前提条件
 
 - Apple Silicon Mac（M1/M2/M3/M4）
-- OminiX API 服务器运行中（通过 `crew serve` 管理）
+- OminiX API 服务器运行中（通过 `octos serve` 管理）
 - 已下载模型：`Qwen3-ASR-1.7B-8bit`、`Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
 
 ### 13.2 通过仪表盘管理 OminiX
@@ -1431,7 +1431,7 @@ curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `text` | 字符串 | *（必填）* | 要合成的文本 |
-| `output_path` | 字符串 | `/tmp/crew_tts_<ts>.wav` | 输出文件路径 |
+| `output_path` | 字符串 | `/tmp/octos_tts_<ts>.wav` | 输出文件路径 |
 | `language` | 字符串 | `"chinese"` | `"chinese"`、`"english"`、`"japanese"`、`"korean"` |
 | `speaker` | 字符串 | `"vivian"` | 语音预设 |
 
@@ -1520,19 +1520,19 @@ curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
 
 ```bash
 # 安装仓库中的所有技能
-crew skills install user/repo
+octos skills install user/repo
 
 # 安装特定的技能子目录
-crew skills install user/repo/skill-name
+octos skills install user/repo/skill-name
 
 # 从特定分支安装
-crew skills install user/repo --branch develop
+octos skills install user/repo --branch develop
 
 # 强制覆盖已有技能
-crew skills install user/repo --force
+octos skills install user/repo --force
 
 # 安装到特定配置文件
-crew skills install user/repo --profile my-bot
+octos skills install user/repo --profile my-bot
 ```
 
 **安装过程：**
@@ -1545,22 +1545,22 @@ crew skills install user/repo --profile my-bot
 
 ```bash
 # 列出已安装的技能
-crew skills list
+octos skills list
 
 # 显示技能详情
-crew skills info skill-name
+octos skills info skill-name
 
 # 更新特定技能
-crew skills update skill-name
+octos skills update skill-name
 
 # 更新所有技能
-crew skills update all
+octos skills update all
 
 # 删除技能
-crew skills remove skill-name
+octos skills remove skill-name
 
 # 搜索在线注册表
-crew skills search "网页抓取"
+octos skills search "网页抓取"
 ```
 
 ### 14.3 技能目录结构
@@ -1972,4 +1972,4 @@ chmod +x .octos/skills/translator/main
 
 ---
 
-*本指南涵盖截至 2026 年 3 月的 Crew 版本。最新更新请参阅仓库 [github.com/octos-org/octos](https://github.com/octos-org/octos)。*
+*本指南涵盖截至 2026 年 3 月的 Octos 版本。最新更新请参阅仓库 [github.com/octos-org/octos](https://github.com/octos-org/octos)。*

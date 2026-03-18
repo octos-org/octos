@@ -151,7 +151,7 @@ payload = json.load(sys.stdin)
 if payload.get("event") == "before_llm_call":
     # Read cumulative cost from previous after_llm_call
     try:
-        with open("/tmp/crew-cost.json") as f:
+        with open("/tmp/octos-cost.json") as f:
             state = json.load(f)
     except FileNotFoundError:
         state = {}
@@ -165,12 +165,12 @@ elif payload.get("event") == "after_llm_call":
     if cost is not None:
         sid = payload.get("session_id", "default")
         try:
-            with open("/tmp/crew-cost.json") as f:
+            with open("/tmp/octos-cost.json") as f:
                 state = json.load(f)
         except FileNotFoundError:
             state = {}
         state[sid] = cost
-        with open("/tmp/crew-cost.json", "w") as f:
+        with open("/tmp/octos-cost.json", "w") as f:
             json.dump(state, f)
 
 sys.exit(0)
@@ -186,7 +186,7 @@ import json, sys, datetime
 payload = json.load(sys.stdin)
 payload["timestamp"] = datetime.datetime.utcnow().isoformat()
 
-with open("/var/log/crew-audit.jsonl", "a") as f:
+with open("/var/log/octos-audit.jsonl", "a") as f:
     f.write(json.dumps(payload) + "\n")
 
 sys.exit(0)

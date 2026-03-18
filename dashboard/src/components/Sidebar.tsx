@@ -19,7 +19,7 @@ export default function Sidebar() {
       {/* Brand */}
       <div className="px-4 py-5 border-b border-gray-700/50">
         <h1 className="text-lg font-bold text-white tracking-tight">
-          <span className="text-accent">crew-rs</span>
+          <span className="text-accent">octos</span>
           {isAdmin ? ' Admin' : ''}
         </h1>
       </div>
@@ -93,7 +93,7 @@ export default function Sidebar() {
           </div>
         )}
         {!user && (
-          <p className="text-xs text-gray-500">crew-rs v0.1.0</p>
+          <p className="text-xs text-gray-500">octos v0.1.0</p>
         )}
       </div>
     </aside>

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to crew-rs will be documented in this file.
+All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
 ### Bug Fixes
@@ -198,7 +198,7 @@ All notable changes to crew-rs will be documented in this file.
 - Add interactive chat, system status, Zhipu provider, and onboard (Phase 8)
 - Add ListDir tool, cron expressions, CLI subcommands, built-in skills, config migration (Phase 9)
 - Add media handling, vision, voice transcription, skills CLI, Docker, WhatsApp login
-- Add OAuth login (crew auth) and email channel (IMAP/SMTP)
+- Add OAuth login (octos auth) and email channel (IMAP/SMTP)
 - Add streaming responses and context window compaction
 - Add full roadmap — pricing, MCP, sandbox, plugins, REST API
 - Add tool policies, context compaction, and config hot-reload

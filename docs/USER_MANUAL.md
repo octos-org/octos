@@ -19,8 +19,8 @@
 
 octos is a Rust-native AI agent framework that operates in two modes:
 
-- **Chat mode** (`crew chat`): Interactive multi-turn conversation with tools (or single-message via `--message`)
-- **Gateway mode** (`crew gateway`): Persistent daemon serving multiple messaging channels
+- **Chat mode** (`octos chat`): Interactive multi-turn conversation with tools (or single-message via `--message`)
+- **Gateway mode** (`octos gateway`): Persistent daemon serving multiple messaging channels
 
 ### Key Concepts
 
@@ -65,7 +65,7 @@ cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp
 cargo install --path crates/octos-cli --features browser
 
 # Verify
-crew --version
+octos --version
 ```
 
 ### Docker
@@ -84,7 +84,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
 
 # Or any other supported provider (see Providers section)
-# Or use OAuth: crew auth login --provider openai
+# Or use OAuth: octos auth login --provider openai
 ```
 
 Add to `~/.bashrc` or `~/.zshrc` for persistence.
@@ -96,16 +96,16 @@ Add to `~/.bashrc` or `~/.zshrc` for persistence.
 ```bash
 # 1. Initialize workspace
 cd your-project
-crew init
+octos init
 
 # 2. Check setup
-crew status
+octos status
 
 # 3. Start chatting
-crew chat
+octos chat
 
 # 4. Or send a single message
-crew chat --message "Add a hello function to lib.rs"
+octos chat --message "Add a hello function to lib.rs"
 ```
 
 ---
@@ -116,7 +116,7 @@ crew chat --message "Add a hello function to lib.rs"
 
 Loaded in order (first found wins):
 1. `.octos/config.json` (project-local)
-2. `~/.config/crew/config.json` (global)
+2. `~/.config/octos/config.json` (global)
 
 ### Basic Config
 
@@ -164,12 +164,12 @@ Use `${VAR_NAME}` syntax:
 
 ## Commands Reference
 
-### `crew chat`
+### `octos chat`
 
 Interactive multi-turn conversation with readline history.
 
 ```bash
-crew chat [OPTIONS]
+octos chat [OPTIONS]
 
 Options:
   -c, --cwd <PATH>         Working directory
@@ -190,20 +190,20 @@ Features:
 - Full tool access (shell, files, search, web)
 
 ```bash
-crew chat                              # Interactive (default)
-crew chat --provider deepseek          # Use DeepSeek
-crew chat --model glm-4-plus           # Auto-detects Zhipu
-crew chat --message "Fix auth bug"     # Single message, exit
+octos chat                              # Interactive (default)
+octos chat --provider deepseek          # Use DeepSeek
+octos chat --model glm-4-plus           # Auto-detects Zhipu
+octos chat --message "Fix auth bug"     # Single message, exit
 ```
 
 ---
 
-### `crew gateway`
+### `octos gateway`
 
 Run as a persistent multi-channel daemon.
 
 ```bash
-crew gateway [OPTIONS]
+octos gateway [OPTIONS]
 
 Options:
   -c, --cwd <PATH>         Working directory
@@ -219,12 +219,12 @@ Requires `gateway` section in config with `channels` array. Runs continuously un
 
 ---
 
-### `crew init`
+### `octos init`
 
 Initialize workspace with config and bootstrap files.
 
 ```bash
-crew init [OPTIONS]
+octos init [OPTIONS]
 
 Options:
   -c, --cwd <PATH>    Working directory
@@ -243,12 +243,12 @@ Creates:
 
 ---
 
-### `crew status`
+### `octos status`
 
 Show system status.
 
 ```bash
-crew status [OPTIONS]
+octos status [OPTIONS]
 
 Options:
   -c, --cwd <PATH>    Working directory
@@ -283,60 +283,60 @@ Bootstrap Files
 ### Other Commands
 
 ```bash
-crew clean [--all] [--dry-run] # Clean database files
-crew completions <shell>       # Generate completions (bash/zsh/fish/powershell)
-crew docs                      # Generate tool + provider documentation
-crew cron list [--all]         # List cron jobs
-crew cron add [OPTIONS]        # Add a cron job
-crew cron remove <job-id>      # Remove a cron job
-crew cron enable <job-id>      # Enable/disable a cron job
-crew channels status           # Show channel compile/config status
-crew channels login            # WhatsApp QR code login
+octos clean [--all] [--dry-run] # Clean database files
+octos completions <shell>       # Generate completions (bash/zsh/fish/powershell)
+octos docs                      # Generate tool + provider documentation
+octos cron list [--all]         # List cron jobs
+octos cron add [OPTIONS]        # Add a cron job
+octos cron remove <job-id>      # Remove a cron job
+octos cron enable <job-id>      # Enable/disable a cron job
+octos channels status           # Show channel compile/config status
+octos channels login            # WhatsApp QR code login
 ```
 
-### `crew office`
+### `octos office`
 
 Office file manipulation (DOCX/PPTX/XLSX). Native Rust replacements for Python scripts.
 
 ```bash
-crew office extract <file>               # Extract text as Markdown
-crew office unpack <file> <output-dir>   # Unpack into pretty-printed XML
-crew office pack <input-dir> <output>    # Pack directory into Office file
-crew office clean <dir>                  # Remove orphaned files from unpacked PPTX
+octos office extract <file>               # Extract text as Markdown
+octos office unpack <file> <output-dir>   # Unpack into pretty-printed XML
+octos office pack <input-dir> <output>    # Pack directory into Office file
+octos office clean <dir>                  # Remove orphaned files from unpacked PPTX
 ```
 
-### `crew account`
+### `octos account`
 
 Manage sub-accounts under profiles. Sub-accounts inherit LLM provider config but have their own data directory (memory, sessions, skills) and channels.
 
 ```bash
-crew account list --profile <id>                         # List sub-accounts
-crew account create --profile <id> <name> [OPTIONS]      # Create sub-account
-crew account update <id> [OPTIONS]                       # Update sub-account
+octos account list --profile <id>                         # List sub-accounts
+octos account create --profile <id> <name> [OPTIONS]      # Create sub-account
+octos account update <id> [OPTIONS]                       # Update sub-account
 ```
 
-### `crew auth`
+### `octos auth`
 
 OAuth login and API key management.
 
 ```bash
-crew auth login --provider openai           # PKCE browser OAuth
-crew auth login --provider openai --device-code  # Device code flow
-crew auth login --provider anthropic        # Paste-token (stdin)
-crew auth logout --provider openai          # Remove stored credential
-crew auth status                            # Show authenticated providers
+octos auth login --provider openai           # PKCE browser OAuth
+octos auth login --provider openai --device-code  # Device code flow
+octos auth login --provider anthropic        # Paste-token (stdin)
+octos auth logout --provider openai          # Remove stored credential
+octos auth status                            # Show authenticated providers
 ```
 
 Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked before environment variables when resolving API keys.
 
-### `crew skills`
+### `octos skills`
 
 Manage skills.
 
 ```bash
-crew skills list                            # List installed skills
-crew skills install user/repo/skill-name    # Install from GitHub
-crew skills remove skill-name               # Remove a skill
+octos skills list                            # List installed skills
+octos skills install user/repo/skill-name    # Install from GitHub
+octos skills remove skill-name               # Remove a skill
 ```
 
 Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.octos/skills/`.
@@ -369,24 +369,24 @@ Fetches `SKILL.md` from the GitHub repo's main branch and installs to `.octos/sk
 When `--provider` is omitted, octos detects from model name:
 
 ```bash
-crew chat --model gpt-4o           # -> openai
-crew chat --model claude-sonnet-4-20250514  # -> anthropic
-crew chat --model deepseek-chat    # -> deepseek
-crew chat --model glm-4-plus       # -> zhipu
-crew chat --model qwen-max         # -> dashscope
+octos chat --model gpt-4o           # -> openai
+octos chat --model claude-sonnet-4-20250514  # -> anthropic
+octos chat --model deepseek-chat    # -> deepseek
+octos chat --model glm-4-plus       # -> zhipu
+octos chat --model qwen-max         # -> dashscope
 ```
 
 ### Custom Endpoints
 
 ```bash
 # Azure OpenAI
-crew chat --provider openai --base-url "https://your.openai.azure.com/v1" --message "Task"
+octos chat --provider openai --base-url "https://your.openai.azure.com/v1" --message "Task"
 
 # Local Ollama
-crew chat --provider ollama --model llama3.2
+octos chat --provider ollama --model llama3.2
 
 # vLLM server
-crew chat --provider vllm --base-url "http://localhost:8000/v1" --model "meta-llama/Llama-3-70b" --message "Task"
+octos chat --provider vllm --base-url "http://localhost:8000/v1" --model "meta-llama/Llama-3-70b" --message "Task"
 ```
 
 ---
@@ -506,10 +506,10 @@ Config:
 
 ### Voice Transcription
 
-Voice and audio messages from channels are automatically transcribed before being sent to the agent. The system uses OminiX local ASR first (via `OMINIX_API_URL`, set automatically by `crew serve`) and falls back to Groq Whisper (cloud) when OminiX is unavailable. The transcription is prepended as `[transcription: ...]`.
+Voice and audio messages from channels are automatically transcribed before being sent to the agent. The system uses OminiX local ASR first (via `OMINIX_API_URL`, set automatically by `octos serve`) and falls back to Groq Whisper (cloud) when OminiX is unavailable. The transcription is prepended as `[transcription: ...]`.
 
 ```bash
-# OminiX (preferred, local) — set automatically by crew serve
+# OminiX (preferred, local) — set automatically by octos serve
 export OMINIX_API_URL="http://localhost:8080"
 
 # Groq Whisper (fallback, cloud)
@@ -542,14 +542,14 @@ Cron jobs send messages through the bus and can deliver responses to any channel
 Manage jobs directly from the command line (no running gateway needed):
 
 ```bash
-crew cron list                          # List active jobs
-crew cron list --all                    # Include disabled
-crew cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
-crew cron add --name "check" --message "Check status" --every 3600
-crew cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00Z"
-crew cron remove <job-id>
-crew cron enable <job-id>               # Enable
-crew cron enable <job-id> --disable     # Disable
+octos cron list                          # List active jobs
+octos cron list --all                    # Include disabled
+octos cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
+octos cron add --name "check" --message "Check status" --every 3600
+octos cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00Z"
+octos cron remove <job-id>
+octos cron enable <job-id>               # Enable
+octos cron enable <job-id> --disable     # Disable
 ```
 
 ### Channel Status
@@ -557,7 +557,7 @@ crew cron enable <job-id> --disable     # Disable
 Check configured channels and their compile/config status:
 
 ```bash
-crew channels status
+octos channels status
 ```
 
 Shows a table with channel name, compile status (feature flags), and config summary (env vars set/missing).
@@ -582,7 +582,7 @@ Loaded into the system prompt at startup:
 | `.octos/TOOLS.md` | Tool-specific guidance |
 | `.octos/IDENTITY.md` | Custom identity definition |
 
-Create via `crew init` (creates AGENTS, SOUL, USER templates).
+Create via `octos init` (creates AGENTS, SOUL, USER templates).
 
 ### Memory System
 
@@ -668,7 +668,7 @@ Workspace skills in `.octos/skills/` override built-in skills with the same name
 ### Verbose Mode
 
 ```bash
-crew chat -v                 # Shows tool execution details
+octos chat -v                 # Shows tool execution details
 ```
 
 ### Tool Policies
@@ -835,18 +835,18 @@ Control how messages arriving during an active agent run are handled:
 - **`followup`** (default): Process queued messages one at a time (FIFO)
 - **`collect`**: Merge queued messages by session, concatenating content before processing
 
-### Web UI (`crew serve`)
+### Web UI (`octos serve`)
 
 The REST API server (feature: `api`) includes an embedded web UI:
 
 ```bash
 cargo install --path crates/octos-cli --features api
-crew serve                              # Binds to 127.0.0.1:8080
-crew serve --host 0.0.0.0 --port 3000  # Accept external connections
+octos serve                              # Binds to 127.0.0.1:8080
+octos serve --host 0.0.0.0 --port 3000  # Accept external connections
 # Open http://localhost:8080
 ```
 
-Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `octos_llm_tokens_total`).
+Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`octos_tool_calls_total`, `octos_tool_call_duration_seconds`, `octos_llm_tokens_total`).
 
 ### Hybrid Memory Search
 
@@ -878,7 +878,7 @@ The `EmbeddingConfig` supports three fields: `provider` (default: `"openai"`), `
 Error: ANTHROPIC_API_KEY environment variable not set
 ```
 
-Fix: `export ANTHROPIC_API_KEY="your-key"` or check with `crew status`.
+Fix: `export ANTHROPIC_API_KEY="your-key"` or check with `octos status`.
 
 ### Rate Limited (429)
 
@@ -887,8 +887,8 @@ Retry mechanism handles this automatically (3 attempts with backoff). If persist
 ### Debug Logging
 
 ```bash
-RUST_LOG=debug crew chat
-RUST_LOG=octos_agent=trace crew chat --message "task"
+RUST_LOG=debug octos chat
+RUST_LOG=octos_agent=trace octos chat --message "task"
 ```
 
 ### Environment Variables

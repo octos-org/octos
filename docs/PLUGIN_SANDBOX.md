@@ -73,7 +73,7 @@ separate concern.
 | **SupraWall** | Security shim between agent and tools. Per-agent permissions, cost budgets, audit trail. |
 | **Cerbos + MCP** | Policy-based access control for MCP tool calls. Identity-aware (who is the agent acting for). |
 
-Major agent frameworks (LangChain, CrewAI, AutoGen) have **no built-in per-tool
+Major agent frameworks (LangChain, OctosAI, AutoGen) have **no built-in per-tool
 authorization**. This is widely recognized as a gap.
 
 ### Proposed Design for octos
@@ -279,8 +279,8 @@ manifest.json:
     "max_memory_mb": 256,     // Memory cap
     "max_fuel": 10000000,     // Instruction budget
     "allow_network": false,   // WASI capability grants
-    "allow_fs_read": ["/tmp/crew"],
-    "allow_fs_write": ["/tmp/crew"],
+    "allow_fs_read": ["/tmp/octos"],
+    "allow_fs_write": ["/tmp/octos"],
     "allow_env": ["API_KEY"]
   },
   "tools": [...]
@@ -315,7 +315,7 @@ manifest.json:
 1. Add `wasmtime` dependency to `octos-plugin` (feature-gated: `sandbox`)
 2. Define plugin WIT interface:
    ```wit
-   package crew:plugin@0.1.0;
+   package octos:plugin@0.1.0;
 
    interface tool {
      record tool-call {
@@ -354,7 +354,7 @@ On macOS, use `sandbox-exec` (App Sandbox) for equivalent restrictions.
 With Wasm sandboxing in place, untrusted third-party plugins become safe:
 
 - Plugins published as `.wasm` modules to a registry
-- `crew plugin install <name>` downloads and verifies
+- `octos plugin install <name>` downloads and verifies
 - Sandbox limits enforced per manifest
 - Capability review before install (like mobile app permissions)
 

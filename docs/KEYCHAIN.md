@@ -8,7 +8,7 @@ and OS-level access control.
 
 ```
                      ┌──────────────────────────────┐
-  crew auth set-key  │     macOS Keychain            │
+  octos auth set-key  │     macOS Keychain            │
   ─────────────────► │  (AES encrypted, per-user)    │
                      │                               │
                      │  service: "octos"            │
@@ -41,22 +41,22 @@ and OS-level access control.
 
 ```bash
 # Unlock keychain for SSH sessions (required before set-key via SSH)
-crew auth unlock --password <login-password>
-crew auth unlock                               # interactive prompt
+octos auth unlock --password <login-password>
+octos auth unlock                               # interactive prompt
 
 # Store a key in Keychain + update profile to use keychain marker
-crew auth set-key OPENAI_API_KEY sk-proj-abc123
-crew auth set-key OPENAI_API_KEY              # interactive prompt
+octos auth set-key OPENAI_API_KEY sk-proj-abc123
+octos auth set-key OPENAI_API_KEY              # interactive prompt
 
 # With specific profile
-crew auth set-key GEMINI_API_KEY AIzaSy... -p dspfac
+octos auth set-key GEMINI_API_KEY AIzaSy... -p dspfac
 
 # List all keys and their storage status
-crew auth keys
-crew auth keys -p dspfac
+octos auth keys
+octos auth keys -p dspfac
 
 # Remove from Keychain + clean up profile
-crew auth remove-key OPENAI_API_KEY
+octos auth remove-key OPENAI_API_KEY
 ```
 
 ## SSH / Headless Server Setup
@@ -91,7 +91,7 @@ Run once per boot (or add to deploy script):
 ssh cloud@<host>
 
 # 1. Unlock the keychain (requires login password)
-crew auth unlock --password <login-password>
+octos auth unlock --password <login-password>
 
 # 2. That's it — auto-lock is disabled automatically.
 #    The keychain stays unlocked until reboot.
@@ -113,25 +113,25 @@ security set-keychain-settings ~/Library/Keychains/login.keychain-db
 ```bash
 # First deploy: unlock + store keys
 ssh 
-crew auth unlock --password 
-crew auth set-key OPENAI_API_KEY sk-proj-...
-crew auth set-key GEMINI_API_KEY AIzaSy...
+octos auth unlock --password 
+octos auth set-key OPENAI_API_KEY sk-proj-...
+octos auth set-key GEMINI_API_KEY AIzaSy...
 # keys are now in keychain, profiles updated to "keychain:" markers
 
 # Subsequent deploys: just update binary, restart
 # Keychain stays unlocked (auto-login re-unlocks on reboot)
-scp crew :/Users/cloud/.cargo/bin/crew
-ssh  'codesign -f -s - ~/.cargo/bin/crew'
+scp octos :/Users/cloud/.cargo/bin/octos
+ssh  'codesign -f -s - ~/.cargo/bin/octos'
 ```
 
 ### What can go wrong
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "User interaction is not allowed" | Keychain locked (SSH session) | `crew auth unlock --password <pw>` |
+| "User interaction is not allowed" | Keychain locked (SSH session) | `octos auth unlock --password <pw>` |
 | Keychain lookup timed out (3s) | Keychain locked (LaunchAgent) | Enable auto-login, reboot |
-| "keychain marker found but no secret" | Key stored in wrong keychain or never stored | Re-run `crew auth set-key` after unlock |
-| Gateway hangs at startup | Keychain lookup blocking (pre-timeout fix) | Update to latest crew binary |
+| "keychain marker found but no secret" | Key stored in wrong keychain or never stored | Re-run `octos auth set-key` after unlock |
+| Gateway hangs at startup | Keychain lookup blocking (pre-timeout fix) | Update to latest octos binary |
 
 ## Security Comparison
 
@@ -151,7 +151,7 @@ The dashboard OTP email system reads its SMTP password with this fallback chain:
 2. Profile `env_vars` — works when plaintext
 3. Keychain lookup — works when profile has `"keychain:"` marker and keychain is unlocked
 
-This means OTP email works regardless of how `crew serve` is started (LaunchAgent or nohup).
+This means OTP email works regardless of how `octos serve` is started (LaunchAgent or nohup).
 
 ## Keychain Entry Format
 
@@ -188,13 +188,13 @@ that make **plain text env vars the recommended approach** for production.
 
 ### Why Keychain Is Unreliable on Servers
 
-1. **Requires the macOS login password** — To unlock the keychain via SSH, crew
+1. **Requires the macOS login password** — To unlock the keychain via SSH, octos
    must call `security unlock-keychain -p <password>`. This means you need to
    store the user's login password somewhere (deploy script, plist, etc.),
    defeating much of the security benefit.
 
 2. **Re-locks on reboot/sleep** — macOS re-locks the keychain on every reboot
-   and after sleep. The LaunchAgent that starts `crew serve` runs before any
+   and after sleep. The LaunchAgent that starts `octos serve` runs before any
    user logs in via GUI, so the keychain is locked at that point. Auto-login
    helps but is not guaranteed (e.g., after macOS updates that require manual
    login).
@@ -204,8 +204,8 @@ that make **plain text env vars the recommended approach** for production.
    `security set-keychain-settings`, but macOS updates can reset it.
 
 4. **ACL prompts block headless access** — Even with an unlocked keychain, if
-   the `crew` binary was not the application that originally stored the secret,
-   macOS may pop a GUI dialog asking "Allow crew to access this keychain item?"
+   the `octos` binary was not the application that originally stored the secret,
+   macOS may pop a GUI dialog asking "Allow octos to access this keychain item?"
    This dialog cannot be answered over SSH and blocks the lookup until the
    3-second timeout fires.
 
@@ -240,7 +240,7 @@ Set credentials directly in profile `env_vars`:
 }
 ```
 
-For `crew serve` OTP email, also set `SMTP_PASSWORD` in the launchd plist:
+For `octos serve` OTP email, also set `SMTP_PASSWORD` in the launchd plist:
 
 ```xml
 <key>EnvironmentVariables</key>

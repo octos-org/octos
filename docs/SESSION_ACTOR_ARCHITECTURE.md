@@ -12,7 +12,7 @@ Reference architecture for octos gateway processing model, user isolation, and d
 ### 1.1 Runtime Hierarchy
 
 ```
-crew serve (control plane, OS process)
+octos serve (control plane, OS process)
 │
 ├── Profile "work-bot" ──→ Gateway (OS process 1)
 │   │
@@ -296,7 +296,7 @@ User sends message
 ### 5.1 Profile Hierarchy
 
 ```
-crew serve
+octos serve
 ├── Profile "main" (parent)                  ← OS process 1
 │   ├── data_dir: ~/.octos/profiles/main/
 │   ├── provider: kimi-2.5 (KIMI_API_KEY)

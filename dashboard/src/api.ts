@@ -18,8 +18,8 @@ const BASE = '/api/admin'
 
 function getHeaders(): HeadersInit {
   const headers: HeadersInit = { 'Content-Type': 'application/json' }
-  const token = localStorage.getItem('crew_session_token')
-    || localStorage.getItem('crew_auth_token')
+  const token = localStorage.getItem('octos_session_token')
+    || localStorage.getItem('octos_auth_token')
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }
@@ -241,15 +241,15 @@ export const myApi = {
 
 // Helper to get SSE log URL with auth token (user's own profile)
 export function getLogStreamUrl(): string {
-  const token = localStorage.getItem('crew_session_token')
-    || localStorage.getItem('crew_auth_token')
+  const token = localStorage.getItem('octos_session_token')
+    || localStorage.getItem('octos_auth_token')
   const base = `/api/my/profile/logs`
   return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }
 
 export function getAdminLogStreamUrl(profileId: string): string {
-  const token = localStorage.getItem('crew_session_token')
-    || localStorage.getItem('crew_auth_token')
+  const token = localStorage.getItem('octos_session_token')
+    || localStorage.getItem('octos_auth_token')
   const base = `/api/admin/profiles/${profileId}/logs`
   return token ? `${base}?token=${encodeURIComponent(token)}` : base
 }

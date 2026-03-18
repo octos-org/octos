@@ -123,20 +123,20 @@ octos is a Rust-native AI agent framework that provides both a coding automation
 
 | ID | Requirement | Status |
 |----|-------------|--------|
-| FR-7.1 | `crew chat` - interactive conversation | Done |
-| FR-7.2 | `crew chat --message` - single-message mode | Done |
-| FR-7.3 | `crew gateway` - multi-channel daemon | Done |
-| FR-7.4 | `crew init` - workspace setup with bootstrap files | Done |
-| FR-7.5 | `crew status` - system status | Done |
-| FR-7.6 | `crew clean` - cleanup database files | Done |
+| FR-7.1 | `octos chat` - interactive conversation | Done |
+| FR-7.2 | `octos chat --message` - single-message mode | Done |
+| FR-7.3 | `octos gateway` - multi-channel daemon | Done |
+| FR-7.4 | `octos init` - workspace setup with bootstrap files | Done |
+| FR-7.5 | `octos status` - system status | Done |
+| FR-7.6 | `octos clean` - cleanup database files | Done |
 | FR-7.9 | Shell completions (bash/zsh/fish/powershell) | Done |
-| FR-7.10 | `crew cron` - cron job management (list/add/remove/enable) | Done |
-| FR-7.11 | `crew channels status` - channel status display | Done |
-| FR-7.12 | `crew auth` - OAuth login (PKCE, device code, paste-token) | Done |
-| FR-7.13 | `crew skills` - skill install from GitHub | Done |
-| FR-7.14 | `crew channels login` - WhatsApp QR login | Done |
-| FR-7.15 | `crew office` - office automation command | Done |
-| FR-7.16 | `crew pipeline` - pipeline orchestration | Done |
+| FR-7.10 | `octos cron` - cron job management (list/add/remove/enable) | Done |
+| FR-7.11 | `octos channels status` - channel status display | Done |
+| FR-7.12 | `octos auth` - OAuth login (PKCE, device code, paste-token) | Done |
+| FR-7.13 | `octos skills` - skill install from GitHub | Done |
+| FR-7.14 | `octos channels login` - WhatsApp QR login | Done |
+| FR-7.15 | `octos office` - office automation command | Done |
+| FR-7.16 | `octos pipeline` - pipeline orchestration | Done |
 
 ### FR-8: Admin & Operations
 
@@ -199,10 +199,10 @@ octos is a Rust-native AI agent framework that provides both a coding automation
 - [x] Media download from channels (Telegram, Discord, Slack)
 - [x] Vision support (Anthropic, OpenAI, Gemini, OpenRouter)
 - [x] Voice transcription (Groq Whisper)
-- [x] OAuth login (`crew auth` with PKCE, device code, paste-token)
-- [x] Skill install from GitHub (`crew skills install`)
+- [x] OAuth login (`octos auth` with PKCE, device code, paste-token)
+- [x] Skill install from GitHub (`octos skills install`)
 - [x] Email channel (IMAP/SMTP)
-- [x] WhatsApp QR login (`crew channels login`)
+- [x] WhatsApp QR login (`octos channels login`)
 - [x] Docker deployment (multi-stage Dockerfile + docker-compose)
 - [x] Tool policies (allow/deny, groups, provider-specific)
 - [x] Context compaction (token-aware message summarization)

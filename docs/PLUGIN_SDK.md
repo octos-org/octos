@@ -152,7 +152,7 @@ Higher-priority plugins override lower-priority ones with the same `id`.
       "audit-logger": {
         "enabled": true,
         "config": {
-          "log_path": "/var/log/crew-audit.jsonl"
+          "log_path": "/var/log/octos-audit.jsonl"
         }
       }
     }
@@ -355,7 +355,7 @@ Gating is checked before spawning the binary. Failed gates mark the plugin as `u
 
 ## Comparison with OpenClaw
 
-| Aspect | crew.rs Plugin SDK | OpenClaw Plugin SDK |
+| Aspect | octos Plugin SDK | OpenClaw Plugin SDK |
 |--------|-------------------|---------------------|
 | **Language** | Any (subprocess protocol) | TypeScript only (in-process) |
 | **Isolation** | Process-level (fork + exec) | None (shared JS runtime) |
@@ -370,12 +370,12 @@ Gating is checked before spawning the binary. Failed gates mark the plugin as `u
 | **Performance** | Fork/exec overhead per tool call | Zero overhead |
 | **Multi-language** | Yes (any language that does JSON) | No (TypeScript/JS only) |
 
-### crew.rs Advantages
+### octos Advantages
 - **True isolation**: Plugins can't crash the gateway
 - **Language-agnostic**: Write plugins in Rust, Python, Go, shell, anything
 - **Security by default**: Process boundary prevents data leaks
 
-### crew.rs Tradeoffs
+### octos Tradeoffs
 - **Latency**: Fork+exec overhead (~5-50ms per tool call)
 - **No in-process hooks**: Hook plugins are long-running subprocesses
 - **No streaming**: Tool results are atomic (no partial results during execution)
@@ -448,7 +448,7 @@ Current bundled SKILL.md + .dot files become skill plugins by adding a `manifest
 ### Phase 5: Plugin Distribution
 
 - [ ] Plugin registry (GitHub-based or custom)
-- [ ] `crew plugin install <url>` CLI command
+- [ ] `octos plugin install <url>` CLI command
 - [ ] Integrity verification (sha256 in manifest)
 - [ ] Auto-update mechanism
 

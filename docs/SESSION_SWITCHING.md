@@ -1,7 +1,7 @@
 # Session Switching Architecture
 
 This document describes how multi-session message routing, buffering, and delivery
-work in the crew gateway. It covers the proxy/forwarder pattern, the pending
+work in the octos gateway. It covers the proxy/forwarder pattern, the pending
 buffer, and the streaming-vs-proxy interaction that was fixed in the
 session-inactive streaming bug.
 

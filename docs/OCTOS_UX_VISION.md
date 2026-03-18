@@ -1,6 +1,6 @@
 # octos UX Vision
 
-Crew-rs's UX strategy: adopt OpenClaw's proven interaction patterns, then layer on octos's unique adaptive intelligence capabilities that OpenClaw lacks.
+Octos's UX strategy: adopt OpenClaw's proven interaction patterns, then layer on octos's unique adaptive intelligence capabilities that OpenClaw lacks.
 
 ---
 

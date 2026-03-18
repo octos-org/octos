@@ -54,7 +54,7 @@ cd octos
 
 # 4. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
-crew chat
+octos chat
 ```
 
 **Background service (launchd):**
@@ -93,26 +93,26 @@ cd octos
 
 # 5. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
-crew chat
+octos chat
 ```
 
 **Background service (systemd user unit):**
 
-The deploy script creates `~/.config/systemd/user/crew-serve.service`.
+The deploy script creates `~/.config/systemd/user/octos-serve.service`.
 
 ```bash
 # Start service
-systemctl --user start crew-serve
+systemctl --user start octos-serve
 
 # Enable on boot (requires lingering)
 loginctl enable-linger $USER
-systemctl --user enable crew-serve
+systemctl --user enable octos-serve
 
 # View logs
-journalctl --user -u crew-serve -f
+journalctl --user -u octos-serve -f
 
 # Stop service
-systemctl --user stop crew-serve
+systemctl --user stop octos-serve
 ```
 
 ### Linux (Fedora/RHEL)
@@ -137,7 +137,7 @@ wsl --install -d Ubuntu
 
 **Accessing the dashboard from Windows:**
 
-When running `crew serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
+When running `octos serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
 
 **Persistent service in WSL2:**
 
@@ -152,8 +152,8 @@ Then the systemd user unit approach works. Otherwise, use a startup script:
 
 ```bash
 # Add to ~/.bashrc or ~/.profile
-if ! pgrep -f "crew serve" >/dev/null; then
-    nohup crew serve --port 8080 > ~/.octos/serve.log 2>&1 &
+if ! pgrep -f "octos serve" >/dev/null; then
+    nohup octos serve --port 8080 > ~/.octos/serve.log 2>&1 &
 fi
 ```
 
@@ -176,10 +176,10 @@ Options:
 **What the script does:**
 
 1. Checks prerequisites (Rust, platform deps)
-2. Builds `crew` binary with selected features
+2. Builds `octos` binary with selected features
 3. Builds app-skill binaries (unless `--no-skills`)
 4. Signs binaries on macOS (ad-hoc codesign)
-5. Runs `crew init` if `~/.octos` doesn't exist
+5. Runs `octos init` if `~/.octos` doesn't exist
 6. Creates background service file (launchd on macOS, systemd on Linux)
 
 **Uninstall:**
@@ -202,7 +202,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # Or
 export OPENAI_API_KEY=sk-...
 # Or use OAuth login
-crew auth login --provider openai
+octos auth login --provider openai
 ```
 
 ### Config File
@@ -224,9 +224,9 @@ Edit `~/.octos/config.json` (or `.octos/config.json` in project directory):
 ### Verify Installation
 
 ```bash
-crew --version          # Check binary
-crew status             # Check config + API keys
-crew chat --message "Hello"  # Quick test
+octos --version          # Check binary
+octos status             # Check config + API keys
+octos chat --message "Hello"  # Quick test
 ```
 
 ## Upgrading
@@ -241,17 +241,17 @@ git pull origin main
 launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
 launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
 # Linux:
-systemctl --user restart crew-serve
+systemctl --user restart octos-serve
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| `crew: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
+| `octos: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
 | Build fails on Linux | Install `build-essential pkg-config libssl-dev` |
-| macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/crew` |
-| Dashboard not accessible | Check port: `crew serve --port 8080`, open `http://localhost:8080/admin/` |
+| macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/octos` |
+| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080/admin/` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
-| Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u crew-serve` |
+| Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u octos-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |

@@ -64,11 +64,11 @@ fi
 section "Unit & Integration Tests"
 
 echo "  Running: cargo test --workspace"
-if cargo test --workspace 2>&1 | tee /tmp/crew-test-workspace.log | tail -5; then
+if cargo test --workspace 2>&1 | tee /tmp/octos-test-workspace.log | tail -5; then
     # Extract totals
-    TOTAL_PASS=$(grep "^test result:" /tmp/crew-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    TOTAL_FAIL=$(grep "^test result:" /tmp/crew-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/failed/){gsub(/[^0-9]/,"",$i);f+=$i}}}END{print f+0}')
-    TOTAL_IGN=$(grep "^test result:" /tmp/crew-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/ignored/){gsub(/[^0-9]/,"",$i);ig+=$i}}}END{print ig+0}')
+    TOTAL_PASS=$(grep "^test result:" /tmp/octos-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    TOTAL_FAIL=$(grep "^test result:" /tmp/octos-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/failed/){gsub(/[^0-9]/,"",$i);f+=$i}}}END{print f+0}')
+    TOTAL_IGN=$(grep "^test result:" /tmp/octos-test-workspace.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/ignored/){gsub(/[^0-9]/,"",$i);ig+=$i}}}END{print ig+0}')
     echo "  Totals: ${TOTAL_PASS} passed, ${TOTAL_FAIL} failed, ${TOTAL_IGN} ignored"
     if [ "$TOTAL_FAIL" -eq 0 ]; then
         pass "workspace tests (${TOTAL_PASS} passed)"
@@ -81,9 +81,9 @@ fi
 
 echo ""
 echo "  Running: cargo test -p octos-cli --features api"
-if cargo test -p octos-cli --features api 2>&1 | tee /tmp/crew-test-cli-api.log | tail -3; then
-    CLI_PASS=$(grep "^test result:" /tmp/crew-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    CLI_FAIL=$(grep "^test result:" /tmp/crew-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/failed/){gsub(/[^0-9]/,"",$i);f+=$i}}}END{print f+0}')
+if cargo test -p octos-cli --features api 2>&1 | tee /tmp/octos-test-cli-api.log | tail -3; then
+    CLI_PASS=$(grep "^test result:" /tmp/octos-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    CLI_FAIL=$(grep "^test result:" /tmp/octos-test-cli-api.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/failed/){gsub(/[^0-9]/,"",$i);f+=$i}}}END{print f+0}')
     if [ "$CLI_FAIL" -eq 0 ]; then
         pass "octos-cli API tests (${CLI_PASS} passed)"
     else
@@ -131,86 +131,86 @@ if [ "$SKIP_E2E" = true ]; then
     skip "E2E tests (--skip-e2e)"
 else
     if [ "$PROFILE" = "release" ]; then
-        CREW="$ROOT/target/release/crew"
+        OCTOS="$ROOT/target/release/octos"
     else
-        CREW="$ROOT/target/debug/crew"
+        OCTOS="$ROOT/target/debug/octos"
     fi
 
-    if [ ! -f "$CREW" ]; then
-        fail "binary not found at $CREW (run without --skip-build)"
+    if [ ! -f "$OCTOS" ]; then
+        fail "binary not found at $OCTOS (run without --skip-build)"
     else
         E2E_DIR=$(mktemp -d)
         trap 'rm -rf "$E2E_DIR"' EXIT
 
         # 5a. Version output
-        if $CREW --version 2>&1 | grep -q "^crew [0-9]"; then
-            pass "crew --version"
+        if $OCTOS --version 2>&1 | grep -q "^octos [0-9]"; then
+            pass "octos --version"
         else
-            fail "crew --version"
+            fail "octos --version"
         fi
 
         # 5b. Help output
-        if $CREW --help 2>&1 | grep -q "Usage:"; then
-            pass "crew --help"
+        if $OCTOS --help 2>&1 | grep -q "Usage:"; then
+            pass "octos --help"
         else
-            fail "crew --help"
+            fail "octos --help"
         fi
 
         # 5c. Init creates .octos directory
         pushd "$E2E_DIR" > /dev/null
-        if $CREW init 2>&1 && [ -d ".octos" ]; then
+        if $OCTOS init 2>&1 && [ -d ".octos" ]; then
             pass "octos init (creates .octos/)"
         else
             fail "octos init"
         fi
 
         # 5d. Status runs without crash
-        if $CREW status 2>/dev/null; then
-            pass "crew status"
+        if $OCTOS status 2>/dev/null; then
+            pass "octos status"
         else
-            fail "crew status"
+            fail "octos status"
         fi
 
         # 5e. Skills list runs without crash
-        if $CREW skills list 2>/dev/null; then
-            pass "crew skills list"
+        if $OCTOS skills list 2>/dev/null; then
+            pass "octos skills list"
         else
-            fail "crew skills list"
+            fail "octos skills list"
         fi
 
         # 5f. Cron list runs without crash
-        if $CREW cron list 2>/dev/null; then
-            pass "crew cron list"
+        if $OCTOS cron list 2>/dev/null; then
+            pass "octos cron list"
         else
-            fail "crew cron list"
+            fail "octos cron list"
         fi
 
         # 5g. Channels status runs without crash
-        if $CREW channels status 2>/dev/null; then
-            pass "crew channels status"
+        if $OCTOS channels status 2>/dev/null; then
+            pass "octos channels status"
         else
-            fail "crew channels status"
+            fail "octos channels status"
         fi
 
         # 5h. Completions generate without error
-        if $CREW completions bash > /dev/null 2>&1; then
-            pass "crew completions bash"
+        if $OCTOS completions bash > /dev/null 2>&1; then
+            pass "octos completions bash"
         else
-            fail "crew completions bash"
+            fail "octos completions bash"
         fi
 
         # 5i. Docs generates tool documentation
-        if $CREW docs 2>&1 | grep -qi "tool\|provider\|Available"; then
-            pass "crew docs"
+        if $OCTOS docs 2>&1 | grep -qi "tool\|provider\|Available"; then
+            pass "octos docs"
         else
-            fail "crew docs"
+            fail "octos docs"
         fi
 
         # 5j. Clean runs without crash
-        if $CREW clean 2>/dev/null; then
-            pass "crew clean"
+        if $OCTOS clean 2>/dev/null; then
+            pass "octos clean"
         else
-            fail "crew clean"
+            fail "octos clean"
         fi
 
         # 5k. Init config is valid JSON
@@ -225,11 +225,11 @@ else
         fi
 
         # 5l. Auth status runs (no crash even without auth)
-        if $CREW auth status 2>&1; then
-            pass "crew auth status"
+        if $OCTOS auth status 2>&1; then
+            pass "octos auth status"
         else
             # auth status may exit 1 if not logged in, that's fine
-            pass "crew auth status (not logged in)"
+            pass "octos auth status (not logged in)"
         fi
 
         popd > /dev/null

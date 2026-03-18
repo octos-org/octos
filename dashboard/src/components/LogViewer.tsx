@@ -14,7 +14,7 @@ export default function LogViewer({ profileId }: Props) {
     setLines([])
     setConnected(false)
 
-    const token = localStorage.getItem('crew_auth_token')
+    const token = localStorage.getItem('octos_auth_token')
     const base = `/api/admin/profiles/${encodeURIComponent(profileId)}/logs`
     const url = token ? `${base}?token=${encodeURIComponent(token)}` : base
     const eventSource = new EventSource(url)

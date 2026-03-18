@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   base: '/admin/',
   build: {
-    outDir: '../crates/crew-cli/static/admin',
+    outDir: '../crates/octos-cli/static/admin',
     emptyOutDir: true,
   },
   server: {

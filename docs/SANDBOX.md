@@ -4,7 +4,7 @@ octos can isolate shell commands inside a sandbox, preventing the AI agent from 
 
 ## Quick Start
 
-Add to `.octos/config.json` (or `~/.config/crew/config.json`):
+Add to `.octos/config.json` (or `~/.config/octos/config.json`):
 
 ```json
 {
@@ -55,7 +55,7 @@ sudo pacman -S bubblewrap
 | `/proc` | Mounted |
 | PID namespace | Isolated (`--unshare-pid`) |
 | Network | Blocked by default (`--unshare-net`) |
-| Parent process | `--die-with-parent` (killed if crew exits) |
+| Parent process | `--die-with-parent` (killed if octos exits) |
 
 **Limitations:**
 
@@ -330,11 +330,11 @@ which bwrap           # Linux
 which sandbox-exec    # macOS (should always exist)
 which docker          # Any platform
 
-# Check crew status — currently shows provider/config info
-crew status
+# Check octos status — currently shows provider/config info
+octos status
 
 # Test with verbose logging
-RUST_LOG=octos_agent=debug crew chat --message "Run: echo hello"
+RUST_LOG=octos_agent=debug octos chat --message "Run: echo hello"
 ```
 
 In debug logs, you'll see either:

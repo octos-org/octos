@@ -119,7 +119,7 @@ export default function LoginPage() {
         {/* Logo */}
         <div className="text-center mb-8">
           <h1 className="text-2xl font-bold text-white">
-            <span className="text-accent">crew-rs</span>
+            <span className="text-accent">octos</span>
           </h1>
           <p className="text-sm text-gray-500 mt-1">Sign in to your dashboard</p>
         </div>

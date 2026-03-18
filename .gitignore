@@ -14,7 +14,7 @@ Thumbs.db
 
 # Octos runtime state (keep config, ignore runtime data)
 .octos/
-.crew/
+.octos/
 
 # Node
 node_modules/
