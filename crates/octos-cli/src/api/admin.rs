@@ -2399,3 +2399,246 @@ pub async fn model_limits() -> Json<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
     Json(value)
 }
+
+// ── Admin Shell API ─────────────────────────────────────────────────
+
+/// Maximum command length (1MB).
+const MAX_SHELL_COMMAND_LEN: usize = 1_048_576;
+
+/// Default shell timeout in seconds.
+const DEFAULT_SHELL_TIMEOUT: u64 = 30;
+
+/// Maximum shell timeout in seconds.
+const MAX_SHELL_TIMEOUT: u64 = 600;
+
+#[derive(Deserialize)]
+pub struct ShellRequest {
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShellResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+/// POST /api/admin/shell — execute a shell command on the server.
+///
+/// Admin-only. Runs the command with timeout enforcement and returns
+/// stdout, stderr, and exit code. No PTY — stdin/stdout only.
+pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResponse>, (StatusCode, String)> {
+    if req.command.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "command is required".into()));
+    }
+    if req.command.len() > MAX_SHELL_COMMAND_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("command exceeds {}KB limit", MAX_SHELL_COMMAND_LEN / 1024),
+        ));
+    }
+
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT)
+        .clamp(1, MAX_SHELL_TIMEOUT);
+
+    // Determine working directory
+    let cwd = req.cwd.as_deref().unwrap_or(".");
+    let cwd_path = std::path::Path::new(cwd);
+    if !cwd_path.exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("working directory does not exist: {cwd}"),
+        ));
+    }
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(&req.command).current_dir(cwd_path);
+
+    // Sanitize environment — remove dangerous env vars
+    for var in octos_agent::sandbox::BLOCKED_ENV_VARS {
+        cmd.env_remove(var);
+    }
+
+    let cmd_preview = octos_core::truncated_utf8(&req.command, 200, "...");
+    tracing::info!(
+        command = %cmd_preview,
+        cwd = %cwd,
+        timeout = timeout_secs,
+        "admin shell: executing"
+    );
+
+    // Spawn child explicitly so we can kill it on timeout (dropping the
+    // future does NOT kill the child — it becomes an orphan process).
+    let mut child = cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            tracing::error!(error = %e, "admin shell: failed to spawn");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to spawn command: {e}"))
+        })?;
+
+    // Capture PID before wait_with_output() takes ownership
+    let child_pid = child.id();
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            tracing::info!(exit_code, "admin shell: complete");
+            Ok(Json(ShellResponse {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code,
+                timed_out: false,
+            }))
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "admin shell: failed to execute");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to execute command: {e}"),
+            ))
+        }
+        Err(_) => {
+            // Kill the child process on timeout
+            if let Some(pid) = child_pid {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output()
+                    .await;
+            }
+            tracing::warn!(timeout = timeout_secs, "admin shell: timed out, process killed");
+            Ok(Json(ShellResponse {
+                stdout: String::new(),
+                stderr: format!("command timed out after {timeout_secs}s"),
+                exit_code: -1,
+                timed_out: true,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_request_deserialize_minimal() {
+        let json = r#"{"command": "echo hello"}"#;
+        let req: ShellRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "echo hello");
+        assert!(req.cwd.is_none());
+        assert!(req.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn shell_request_deserialize_full() {
+        let json = r#"{"command": "ls", "cwd": "/tmp", "timeout_secs": 60}"#;
+        let req: ShellRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "ls");
+        assert_eq!(req.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(req.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn shell_response_serialize() {
+        let resp = ShellResponse {
+            stdout: "hello\n".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["stdout"], "hello\n");
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["timed_out"], false);
+    }
+
+    #[test]
+    fn shell_constants() {
+        assert_eq!(MAX_SHELL_COMMAND_LEN, 1_048_576);
+        assert_eq!(DEFAULT_SHELL_TIMEOUT, 30);
+        assert_eq!(MAX_SHELL_TIMEOUT, 600);
+    }
+
+    #[tokio::test]
+    async fn shell_echo_command() {
+        let req = ShellRequest {
+            command: "echo hello".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.stdout.trim(), "hello");
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.timed_out);
+    }
+
+    #[tokio::test]
+    async fn shell_empty_command_rejected() {
+        let req = ShellRequest {
+            command: String::new(),
+            cwd: None,
+            timeout_secs: None,
+        };
+        let err = admin_shell(Json(req)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shell_bad_cwd_rejected() {
+        let req = ShellRequest {
+            command: "echo hi".into(),
+            cwd: Some("/nonexistent/path/xyz".into()),
+            timeout_secs: None,
+        };
+        let err = admin_shell(Json(req)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shell_captures_stderr() {
+        let req = ShellRequest {
+            command: "echo err >&2".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.stderr.trim(), "err");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn shell_nonzero_exit_code() {
+        let req = ShellRequest {
+            command: "exit 42".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn shell_timeout() {
+        let req = ShellRequest {
+            command: "sleep 10".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(1),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, -1);
+    }
+}

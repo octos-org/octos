@@ -49,6 +49,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
+        .route("/api/upload", post(handlers::upload))
+        .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/sessions", get(handlers::list_sessions))
         .route(
             "/api/sessions/{id}/messages",
@@ -240,7 +242,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/system/version", post(admin::system_version))
         .route("/api/admin/system/update", post(admin::system_update))
         // Model limits (from model_limits.json)
-        .route("/api/admin/model-limits", get(admin::model_limits));
+        .route("/api/admin/model-limits", get(admin::model_limits))
+        // Remote shell (for debugging/development via coding agents)
+        .route("/api/admin/shell", post(admin::admin_shell));
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();
