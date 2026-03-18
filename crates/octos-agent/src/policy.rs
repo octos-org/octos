@@ -198,14 +198,8 @@ mod tests {
             Decision::Deny
         );
         // And "sudo" standalone should still be caught
-        assert_eq!(
-            policy.check("sudo ls", Path::new("/tmp")),
-            Decision::Ask
-        );
+        assert_eq!(policy.check("sudo ls", Path::new("/tmp")), Decision::Ask);
         // Pattern at end of string
-        assert_eq!(
-            policy.check("run sudo", Path::new("/tmp")),
-            Decision::Ask
-        );
+        assert_eq!(policy.check("run sudo", Path::new("/tmp")), Decision::Ask);
     }
 }
