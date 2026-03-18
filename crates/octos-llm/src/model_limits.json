@@ -27,7 +27,7 @@
     { "pattern": "kimi", "max_output": 8192, "tier": "fast", "description": "Moonshot's fast model." },
     { "pattern": "moonshot", "max_output": 8192, "tier": "fast", "description": "Moonshot model." },
 
-    { "pattern": "glm-5", "max_output": 131072, "tier": "flagship", "description": "Zhipu flagship. Highest max output (131k tokens). Best for very long report synthesis." },
+    { "pattern": "glm-5", "max_output": 131072, "tier": "strong", "description": "Zhipu model. High max output (131k) but may have reliability issues under load. Consider gemini or kimi for synthesis." },
     { "pattern": "glm-4", "max_output": 4096, "tier": "fast", "description": "Zhipu fast model." },
     { "pattern": "glm", "max_output": 4096, "tier": "fast", "description": "Zhipu model." },
 

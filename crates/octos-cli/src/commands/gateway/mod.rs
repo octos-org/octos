@@ -907,6 +907,7 @@ impl GatewayCommand {
             "run_pipeline",
             "deep_search",
             "deep_crawl",
+            "web_search",
             "read_file",
             "write_file",
             "edit_file",
