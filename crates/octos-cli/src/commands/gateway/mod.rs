@@ -907,8 +907,9 @@ impl GatewayCommand {
         // Many models (DeepSeek, OpenAI) return empty responses with >15 tools.
         let visible = tools.specs().len();
         if visible > 15 {
+            // Keep research (deep_search, deep_crawl) active — users
+            // often call these directly. Defer rarely-used groups only.
             for group in &[
-                "group:research",
                 "group:memory",
                 "group:admin",
                 "group:sessions",
