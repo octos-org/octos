@@ -98,23 +98,30 @@ impl ProviderRouter {
         *self.active_key.write().unwrap_or_else(|e| e.into_inner()) = Some(key.to_string());
     }
 
-    /// Resolve a prefixed model ID into a concrete sub-provider.
+    /// Resolve a model key into a concrete sub-provider.
     ///
-    /// Splits `prefixed_model` on the first `/` to extract `(key, model_id)`.
-    /// Returns the provider registered under `key`.
-    ///
+    /// Tries exact key match first (handles keys like `moonshotai/kimi-k2.5`
+    /// where the slash is part of the model ID, not a prefix separator).
+    /// Falls back to splitting on the first `/` to extract a prefix key.
     /// If there is no `/`, treats the entire string as a key lookup.
     pub fn resolve(&self, prefixed_model: &str) -> Result<Arc<dyn LlmProvider>> {
+        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+
+        // Try exact match first (supports keys like "moonshotai/kimi-k2.5")
+        if let Some(provider) = providers.get(prefixed_model) {
+            return Ok(provider.clone());
+        }
+
+        // Fall back to prefix/model split
         let key = match prefixed_model.split_once('/') {
             Some((k, _model)) => k,
             None => prefixed_model,
         };
 
-        let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
         providers
             .get(key)
             .cloned()
-            .ok_or_else(|| eyre::eyre!("no provider registered for key '{key}'"))
+            .ok_or_else(|| eyre::eyre!("no provider registered for key '{prefixed_model}'"))
     }
 
     /// List all registered provider keys.
@@ -206,14 +213,25 @@ impl ProviderRouter {
         let metadata = self.metadata.read().unwrap_or_else(|e| e.into_inner());
         let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
 
+        // Resolve the actual metadata key: try exact match, then prefix-split
+        // (mirrors resolve() logic so we find the right entry)
+        let resolved_key = if metadata.contains_key(key) {
+            key.to_string()
+        } else {
+            key.split_once('/')
+                .map(|(k, _)| k.to_string())
+                .unwrap_or_else(|| key.to_string())
+        };
+
         let min_output = metadata
-            .get(key)
+            .get(&resolved_key)
             .map(|m| m.max_output_tokens)
             .unwrap_or(0);
 
+        // Exclude the resolved key (not the raw key) to avoid falling back to self
         let mut candidates: Vec<(&str, u32)> = metadata
             .iter()
-            .filter(|(k, m)| k.as_str() != key && m.max_output_tokens >= min_output)
+            .filter(|(k, m)| k.as_str() != resolved_key && m.max_output_tokens >= min_output)
             .map(|(k, m)| (k.as_str(), m.max_output_tokens))
             .collect();
 
@@ -564,5 +582,43 @@ mod tests {
         // "mid" (16k output) should have 1 fallback (synth=65k)
         let fb = router.compatible_fallbacks("mid");
         assert_eq!(fb.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_slash_in_key() {
+        // NVIDIA model IDs contain a slash: "moonshotai/kimi-k2.5"
+        // The full string is the key, not a prefix/model split.
+        let router = ProviderRouter::new();
+        router.register(
+            "moonshotai/kimi-k2.5",
+            Arc::new(MockProvider::new("kimi-k2.5", 128_000)),
+        );
+
+        // Exact match should work
+        let resolved = router.resolve("moonshotai/kimi-k2.5").unwrap();
+        assert_eq!(resolved.model_id(), "kimi-k2.5");
+
+        // Prefix-only should NOT match (no "moonshotai" key registered)
+        assert!(router.resolve("moonshotai").is_err());
+    }
+
+    #[test]
+    fn test_resolve_prefers_exact_over_prefix() {
+        // If both "openai" and "openai/gpt-4o" are registered,
+        // exact match takes priority.
+        let router = ProviderRouter::new();
+        router.register("openai", Arc::new(MockProvider::new("gpt-4o", 128_000)));
+        router.register(
+            "openai/gpt-4o-mini",
+            Arc::new(MockProvider::new("gpt-4o-mini", 128_000)),
+        );
+
+        // "openai/gpt-4o-mini" → exact match → gpt-4o-mini
+        let resolved = router.resolve("openai/gpt-4o-mini").unwrap();
+        assert_eq!(resolved.model_id(), "gpt-4o-mini");
+
+        // "openai/gpt-4o" → no exact match → prefix split → "openai" → gpt-4o
+        let resolved = router.resolve("openai/gpt-4o").unwrap();
+        assert_eq!(resolved.model_id(), "gpt-4o");
     }
 }
