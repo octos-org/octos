@@ -181,19 +181,17 @@ impl Tool for RunPipelineTool {
 
         let adaptive_hints = "\
 Adapt the pipeline to the query:\n\
+- Write ALL node prompts yourself based on the user's specific question — do NOT copy the example prompts verbatim\n\
+- Each node prompt should describe the ROLE and GOAL, not which tools to use (the agent discovers tools from its tool spec)\n\
+- Tailor the synthesize prompt to the research type: scientific analysis, news investigation, fact-check, market report, etc.\n\
 - Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics\n\
-- Cross-language: ALWAYS include English search angles for broader coverage. \
-Also add search angles in languages relevant to the topic's origin \
-(e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, \
-Korean for K-pop, Chinese for Chinese education). This finds primary sources others miss.\n\
-- Search tools: use deep_search for web research, deep_crawl for specific sites, read_file to read results\n\
+- Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin \
+(e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)\n\
 - Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)\n\
 - Match report language to query language\n\
-- For comparative research, add extra search angles per alternative\n\
-- For technical topics, include angles for official docs, GitHub repos, and benchmarks\n\
-- Model selection: use cheap/fast models for search nodes, pick models with high max_output_tokens for synthesize/report nodes. Avoid using the same model for both search and synthesis.\n\
-- Timeouts: synthesize nodes need the highest timeout (900s) since they run last and may retry. Search: 600s, analyze: 300s.\n\
-- Analyze nodes should use tools=\"\" (no tools) — they process input text only, no file/search access needed.";
+- Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes\n\
+- Timeouts: synthesize=900s, search=600s, analyze=300s\n\
+- Analyze nodes should use tools=\"\" (no tools) — pure text analysis";
 
         let node_attrs = "\
 Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
@@ -261,12 +259,12 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
 Example:\n\
 digraph research {{\n  \
   plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
-prompt=\"Generate 4-6 research angles covering different aspects. Include cross-language angles for broader coverage.\", \
-worker_prompt=\"You are an expert investigative researcher. {{task}}. Search thoroughly in multiple languages, gather primary sources, data points, statistics, and direct quotes with URLs.\", \
+prompt=\"<WRITE: planner prompt tailored to the specific research question>\", \
+worker_prompt=\"<WRITE: researcher role + {{task}} placeholder, tailored to the domain>\", \
 model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"You are a senior research analyst. Synthesize the findings from multiple research agents below. Cross-reference sources, resolve contradictions, identify key themes and data gaps. Organize by subtopic with all citations preserved.\", \
+  analyze [prompt=\"<WRITE: analyst role prompt tailored to the research type>\", \
 model=\"{strong_model}\", tools=\"\", timeout_secs=\"300\"]\n  \
-  synthesize [prompt=\"You are an expert report writer. Write a comprehensive, well-structured investigative research report. Include all citations with URLs. Match the query language.\", \
+  synthesize [prompt=\"<WRITE: report writer role + output format tailored to the research type, e.g. scientific paper, news investigation, fact-check, market analysis>\", \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \
   analyze -> synthesize\n\
