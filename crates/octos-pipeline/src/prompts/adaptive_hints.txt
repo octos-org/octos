@@ -17,6 +17,12 @@ Adapt the pipeline to the query:
 - Synthesize nodes receive the analysis as input. Give tools="write_file" to save the final report.
 - Match report language to query language
 - Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)
-- Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes
+- Model selection: match model strength to role:
+  * planner_model: MUST be a strong reasoning model (generates structured JSON) — do NOT use lite/nano/mini models
+  * Search workers (model): cheap/fast is fine
+  * Analyze: needs good reasoning + large context window
+  * Synthesize: needs high max_output_tokens for long reports
+  * When two models have similar capability, prefer the cheaper one
+  * Free-tier models (e.g. nvidia/*) are good for search workers
 - Timeouts: synthesize=900s, search=600s, analyze=300s
 - CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'
