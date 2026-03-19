@@ -231,6 +231,20 @@
             font-size: 14px; color: var(--text);
         }
 
+        /* --- Code block --- */
+        .code-block {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 24px; margin-top: 40px; overflow-x: auto;
+        }
+        .code-block pre {
+            font-family: 'SF Mono','Fira Code','Cascadia Code',monospace;
+            font-size: 13px; line-height: 1.8; color: var(--text-dim);
+        }
+        .code-block .comment { color: var(--code-comment); }
+        .code-block .cmd { color: var(--green); }
+        .code-block .flag { color: var(--orange); }
+        .code-block .output { color: var(--accent-light); }
+
         /* --- CTA --- */
         .cta { text-align: center; padding: 100px 24px; }
         .cta h2 { font-size: 36px; margin-bottom: 16px; }
@@ -517,6 +531,35 @@
                     <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
                 </div>
             </div>
+        </div>
+        <!-- Installation code block -->
+        <div class="code-block">
+            <pre><span class="comment" data-lang="en"># After registration, you'll get a setup command. Run it on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，你会获得一条安装命令。在你的 Mac Mini 上运行：</span>
+
+<span class="cmd">curl -fsSL</span> https://octos-cloud.org/api/admin/tenants/alice/setup-script <span class="cmd">| bash</span>
+
+<span class="output">  ==> Setting up octos tunnel for alice.octos-cloud.org
+  ==> Installing frpc...         frpc installed
+  ==> Writing frpc config...     /etc/frp/frpc.toml
+  ==> Starting services...       launchd service loaded (io.octos.frpc)
+  ==> Done!</span>
+
+<span class="comment" data-lang="en"># Or use the full bootstrap script (installs octos + frpc + dashboard):</span><span class="comment" data-lang="zh"># 或使用完整安装脚本（安装 octos + frpc + 管理面板）：</span>
+
+<span class="cmd">./scripts/frp/bootstrap-tenant.sh</span> alice cloud@10.0.1.50 <span class="flag">--password</span> ****
+
+<span class="output">  ==> Building octos (release, all features)...
+  ==> Uploading binaries...      10 binaries uploaded
+  ==> Installing frpc...         frpc v0.61.1
+  ==> Writing frpc config...     tunnel configured
+  ==> Starting services...       launchd services started
+  ==> Verifying...
+      octos serve: RUNNING on port 8080
+      frpc:        RUNNING
+      tunnel:      CONNECTED</span>
+
+<span class="comment" data-lang="en"># Your dashboard is live!</span><span class="comment" data-lang="zh"># 你的面板已上线！</span>
+<span class="cmd">open</span> https://alice.octos-cloud.org</pre>
         </div>
     </div>
 </section>
