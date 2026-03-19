@@ -117,8 +117,11 @@ impl ServeCommand {
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
+        // Check CLI arg, then OCTOS_AUTH_TOKEN env var
         let auth_token = if self.auth_token.is_some() {
             self.auth_token
+        } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
+            Some(env_token)
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \

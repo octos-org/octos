@@ -777,14 +777,10 @@ async function handleRegister(e) {
             'curl -fsSL https://octos-cloud.org/api/admin/tenants/' + tenant.id + '/setup-script | bash';
 
     } catch (e) {
-        // Demo mode: show mock result
-        document.getElementById('formStep1').style.display = 'none';
-        const result = document.getElementById('registerResult');
-        result.style.display = 'block';
-        document.getElementById('resultUrl').textContent = 'https://' + node + '.octos-cloud.org';
-        document.getElementById('resultToken').textContent = 'demo-' + Math.random().toString(36).slice(2, 18);
-        document.getElementById('resultCmd').textContent =
-            'curl -fsSL https://octos-cloud.org/api/admin/tenants/' + node + '/setup-script | bash';
+        const isZh = document.body.getAttribute('data-active-lang') === 'zh';
+        alert(isZh
+            ? '注册服务暂不可用，请稍后重试。'
+            : 'Registration service unavailable. Please try again later.');
     }
     return false;
 }

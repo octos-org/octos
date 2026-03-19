@@ -2531,10 +2531,38 @@ pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResp
 
 // ── Tenant tunnel management ────────────────────────────────────────
 
-/// GET /api/admin/tenants — list all tunnel tenants.
+/// Tenant summary without secrets (for list responses).
+#[derive(Serialize)]
+pub struct TenantSummary {
+    pub id: String,
+    pub name: String,
+    pub subdomain: String,
+    pub ssh_port: u16,
+    pub local_port: u16,
+    pub status: crate::tenant::TenantStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::tenant::TenantConfig> for TenantSummary {
+    fn from(t: crate::tenant::TenantConfig) -> Self {
+        Self {
+            id: t.id,
+            name: t.name,
+            subdomain: t.subdomain,
+            ssh_port: t.ssh_port,
+            local_port: t.local_port,
+            status: t.status,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+        }
+    }
+}
+
+/// GET /api/admin/tenants — list all tunnel tenants (secrets masked).
 pub async fn list_tenants(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<crate::tenant::TenantConfig>>, (StatusCode, String)> {
+) -> Result<Json<Vec<TenantSummary>>, (StatusCode, String)> {
     let store = state.tenant_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "tenant store not configured".into(),
@@ -2542,7 +2570,7 @@ pub async fn list_tenants(
     let tenants = store
         .list()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(tenants))
+    Ok(Json(tenants.into_iter().map(TenantSummary::from).collect()))
 }
 
 /// GET /api/admin/tenants/{id} — get a single tenant.
@@ -2669,8 +2697,8 @@ pub async fn tenant_setup_script(
         .unwrap_or("163.192.33.32");
     let port = state.frps_port.unwrap_or(7000);
 
-    let frpc_config =
-        crate::tenant::render_frpc_config(&tenant, server, port, domain);
+    // NOTE: frpc config is NOT embedded — the frps master token must be
+    // provided as FRPS_TOKEN env var or argument when running the setup script.
 
     // Generate a self-contained setup script
     let script = format!(
@@ -2683,12 +2711,20 @@ pub async fn tenant_setup_script(
 set -euo pipefail
 
 SUBDOMAIN="{subdomain}"
-TUNNEL_TOKEN="{token}"
 FRPS_SERVER="{server}"
 FRPS_PORT={port}
 LOCAL_PORT={local_port}
 SSH_PORT={ssh_port}
 DOMAIN="{domain}"
+
+# frps auth token — must be provided as env var or argument
+FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
+if [ -z "$FRPS_TOKEN" ]; then
+    echo "ERROR: frps auth token required."
+    echo "Usage: FRPS_TOKEN=<token> bash setup.sh"
+    echo "   or: bash setup.sh <token>"
+    exit 1
+fi
 
 echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
 
@@ -2719,8 +2755,27 @@ fi
 
 # ── Write frpc config ────────────────────────────────────────────────
 sudo mkdir -p /etc/frp
-sudo tee /etc/frp/frpc.toml > /dev/null << 'FRPC_EOF'
-{frpc_config}
+sudo tee /etc/frp/frpc.toml > /dev/null << FRPC_EOF
+serverAddr = "$FRPS_SERVER"
+serverPort = $FRPS_PORT
+auth.method = "token"
+auth.token = "$FRPS_TOKEN"
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "${{SUBDOMAIN}}-web"
+type = "http"
+localPort = $LOCAL_PORT
+customDomains = ["${{SUBDOMAIN}}.$DOMAIN"]
+
+[[proxies]]
+name = "${{SUBDOMAIN}}-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = $SSH_PORT
 FRPC_EOF
 echo "    frpc config written to /etc/frp/frpc.toml"
 
@@ -2794,13 +2849,11 @@ fi
         name = tenant.name,
         subdomain = tenant.subdomain,
         domain = domain,
-        token = tenant.tunnel_token,
         server = server,
         port = port,
         local_port = tenant.local_port,
         ssh_port = tenant.ssh_port,
         id = tenant.id,
-        frpc_config = frpc_config,
     );
 
     Ok(script)

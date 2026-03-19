@@ -221,17 +221,20 @@ fn validate_tenant_id(id: &str) -> Result<()> {
 }
 
 /// Generate the frpc TOML config for a tenant by filling the template.
+///
+/// `frps_token` is the shared frps master token (NOT the per-tenant tunnel_token).
 pub fn render_frpc_config(
     tenant: &TenantConfig,
     frps_server: &str,
     frps_port: u16,
+    frps_token: &str,
     tunnel_domain: &str,
 ) -> String {
     let template = include_str!("../../../scripts/frp/tenant-frpc.toml.template");
     template
         .replace("{{FRPS_SERVER}}", frps_server)
         .replace("{{FRPS_PORT}}", &frps_port.to_string())
-        .replace("{{FRPS_TOKEN}}", &tenant.tunnel_token)
+        .replace("{{FRPS_TOKEN}}", frps_token)
         .replace("{{SUBDOMAIN}}", &tenant.subdomain)
         .replace("{{LOCAL_PORT}}", &tenant.local_port.to_string())
         .replace("{{SSH_REMOTE_PORT}}", &tenant.ssh_port.to_string())
@@ -313,10 +316,12 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let config = render_frpc_config(&tenant, "163.192.33.32", 7000, "octos-cloud.org");
+        let config = render_frpc_config(&tenant, "163.192.33.32", 7000, "master-secret", "octos-cloud.org");
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        assert!(config.contains("auth.token = \"test-token-123\""));
+        assert!(config.contains("auth.token = \"master-secret\""));
+        // Must NOT contain the per-tenant token
+        assert!(!config.contains("test-token-123"));
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));

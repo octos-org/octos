@@ -205,14 +205,9 @@ echo ""
 echo "==> Step 5: Initializing octos data..."
 ssh_cmd "mkdir -p ${RDATA}/{profiles,memory,sessions,skills,logs,research,history}"
 
-# Write a basic config.json if it doesn't exist
-ssh_cmd "test -f ${RDATA}/config.json || cat > ${RDATA}/config.json" << EOF
-{
-  "provider": "moonshot",
-  "model": "kimi-2.5",
-  "base_url": "https://api.moonshot.ai/v1",
-  "api_key_env": "KIMI_API_KEY"
-}
+# Write a minimal config.json if it doesn't exist (user configures via dashboard)
+ssh_cmd "test -f ${RDATA}/config.json || cat > ${RDATA}/config.json" << 'EOF'
+{}
 EOF
 echo "    Data directory initialized"
 
@@ -309,8 +304,6 @@ if [ "$REMOTE_OS" = "Darwin" ]; then
         <string>${SERVE_PORT}</string>
         <string>--host</string>
         <string>0.0.0.0</string>
-        <string>--auth-token</string>
-        <string>${AUTH_TOKEN}</string>
     </array>
     <key>KeepAlive</key>
     <true/>
@@ -328,6 +321,8 @@ if [ "$REMOTE_OS" = "Darwin" ]; then
         <string>${REMOTE_HOME}</string>
         <key>OCTOS_DATA_DIR</key>
         <string>${RDATA}</string>
+        <key>OCTOS_AUTH_TOKEN</key>
+        <string>${AUTH_TOKEN}</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${REMOTE_HOME}</string>
@@ -385,7 +380,8 @@ User=$(echo "$SSH_TARGET" | cut -d@ -f1)
 Environment=HOME=${REMOTE_HOME}
 Environment=PATH=${RBIN}:${REMOTE_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=OCTOS_DATA_DIR=${RDATA}
-ExecStart=${RBIN}/octos serve --port ${SERVE_PORT} --host 0.0.0.0 --auth-token ${AUTH_TOKEN}
+Environment=OCTOS_AUTH_TOKEN=${AUTH_TOKEN}
+ExecStart=${RBIN}/octos serve --port ${SERVE_PORT} --host 0.0.0.0
 Restart=always
 RestartSec=5
 WorkingDirectory=${REMOTE_HOME}
