@@ -356,7 +356,108 @@ fn process_worker_results(
     }
 
     let merged_content = merged_parts.join("\n\n---\n\n");
+
+    // Resolve file references: if workers saved results to disk and output
+    // directory paths, read the _search_results.md files and inline their
+    // content. This ensures the converge node gets actual data, not just paths.
+    let merged_content = resolve_search_result_files(&merged_content);
+
     (merged_content, any_error, summaries, total_tokens, outcomes)
+}
+
+/// Scan merged worker output for research directory paths and inline
+/// the `_search_results.md` file contents. Workers may output paths like
+/// "Results saved to: ./research/topic-slug/" — we find those directories
+/// and read their summary files so downstream nodes get actual content.
+fn resolve_search_result_files(content: &str) -> String {
+    use std::path::Path;
+
+    let mut result = content.to_string();
+    let mut appended = Vec::new();
+
+    // Find research directories referenced in the content
+    for line in content.lines() {
+        // Look for paths to research directories
+        let path_candidates: Vec<&str> = line
+            .split_whitespace()
+            .filter(|w| w.contains("/research/") || w.contains("_search_results"))
+            .collect();
+
+        for candidate in path_candidates {
+            let clean = candidate.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '_' && c != '-' && c != '.');
+            let path = Path::new(clean);
+
+            // Try reading _search_results.md from the directory
+            let search_results_path = if path.is_dir() {
+                path.join("_search_results.md")
+            } else if path.file_name().map(|f| f == "_search_results.md").unwrap_or(false) {
+                path.to_path_buf()
+            } else if path.is_dir() {
+                path.join("_search_results.md")
+            } else {
+                continue;
+            };
+
+            if search_results_path.exists() {
+                match std::fs::read_to_string(&search_results_path) {
+                    Ok(file_content) if !file_content.is_empty() => {
+                        let preview = if file_content.len() > 50000 {
+                            format!("{}...(truncated)", &file_content[..50000])
+                        } else {
+                            file_content
+                        };
+                        if !appended.iter().any(|p: &String| p == &search_results_path.to_string_lossy().to_string()) {
+                            appended.push(search_results_path.to_string_lossy().to_string());
+                            result.push_str(&format!(
+                                "\n\n--- Search results from {} ---\n{}",
+                                search_results_path.display(),
+                                preview
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Also scan the working directory for recent research directories
+    if appended.is_empty() {
+        // Fallback: if no paths found in content, look for research dirs in cwd
+        if let Ok(entries) = std::fs::read_dir("research") {
+            let mut dirs: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            // Sort by modified time, newest first
+            dirs.sort_by(|a, b| {
+                b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .cmp(&a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+            });
+            // Read up to 8 most recent _search_results.md
+            for dir in dirs.iter().take(8) {
+                let sr = dir.path().join("_search_results.md");
+                if sr.exists() {
+                    if let Ok(file_content) = std::fs::read_to_string(&sr) {
+                        if !file_content.is_empty() && file_content.len() > 100 {
+                            let preview = if file_content.len() > 50000 {
+                                format!("{}...(truncated)", &file_content[..50000])
+                            } else {
+                                file_content
+                            };
+                            result.push_str(&format!(
+                                "\n\n--- Search results from {} ---\n{}",
+                                sr.display(),
+                                preview
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// The main pipeline executor.
