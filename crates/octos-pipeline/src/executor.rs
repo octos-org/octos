@@ -173,7 +173,7 @@ async fn plan_dynamic_tasks(
     }];
 
     let config = ChatConfig {
-        max_tokens: Some(2000),
+        max_tokens: Some(4096),
         ..Default::default()
     };
 

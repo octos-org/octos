@@ -261,12 +261,12 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
 Example:\n\
 digraph research {{\n  \
   plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
-prompt=\"Generate 4-6 research angles covering different aspects. Include both Chinese and English angles for cross-language coverage.\", \
-worker_prompt=\"You are a research specialist. {{task}}. Call deep_search multiple times IN PARALLEL with different queries to search faster (e.g. one English query + one Chinese query simultaneously). Include ALL URLs, data points, and direct quotes in your response.\", \
+prompt=\"Generate 4-6 research angles covering different aspects. Include cross-language angles for broader coverage.\", \
+worker_prompt=\"You are an expert investigative researcher. {{task}}. Search thoroughly in multiple languages, gather primary sources, data points, statistics, and direct quotes with URLs.\", \
 model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"You will receive research findings from multiple search agents as your input. Cross-reference the findings, resolve contradictions, and organize by subtopic. Preserve ALL data points, URLs, and quotes. Do NOT use any tools — just analyze the input text.\", \
+  analyze [prompt=\"You are a senior research analyst. Synthesize the findings from multiple research agents below. Cross-reference sources, resolve contradictions, identify key themes and data gaps. Organize by subtopic with all citations preserved.\", \
 model=\"{strong_model}\", tools=\"\", timeout_secs=\"300\"]\n  \
-  synthesize [prompt=\"Write a comprehensive, well-structured report. Include citations with URLs. Save using write_file. Match the query language.\", \
+  synthesize [prompt=\"You are an expert report writer. Write a comprehensive, well-structured investigative research report based on the analysis. Include all citations with URLs. Match the query language. Save the report as a file.\", \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \
   analyze -> synthesize\n\
