@@ -213,16 +213,19 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 /// mid-conversation, the history contains foreign IDs like `call_function_xyz`
 /// or `toolu_01abc`. We normalize these to `call_` prefix to prevent 400 errors.
 fn normalize_call_id(id: &str) -> String {
-    if id.starts_with("call_") || id.starts_with("fc_") {
+    // Responses API requires `fc_` prefix on function_call item IDs.
+    // `call_` prefix works for Chat Completions but NOT Responses API.
+    if id.starts_with("fc_") {
         return id.to_string();
     }
-    // Strip known foreign prefixes and re-prefix with `call_`
+    // Strip any existing prefix and re-prefix with `fc_`
     let stripped = id
-        .strip_prefix("call_function_")
+        .strip_prefix("call_")
+        .or_else(|| id.strip_prefix("call_function_"))
         .or_else(|| id.strip_prefix("toolu_"))
         .or_else(|| id.strip_prefix("chatcmpl-"))
         .unwrap_or(id);
-    format!("call_{stripped}")
+    format!("fc_{stripped}")
 }
 
 /// Append one or more Responses API input items for a message.
