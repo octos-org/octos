@@ -192,7 +192,8 @@ Korean for K-pop, Chinese for Chinese education). This finds primary sources oth
 - For comparative research, add extra search angles per alternative\n\
 - For technical topics, include angles for official docs, GitHub repos, and benchmarks\n\
 - Model selection: use cheap/fast models for search nodes, pick models with high max_output_tokens for synthesize/report nodes. Avoid using the same model for both search and synthesis.\n\
-- Timeouts: synthesize nodes need the highest timeout (900s) since they run last and may retry. Search: 600s, analyze: 300s.";
+- Timeouts: synthesize nodes need the highest timeout (900s) since they run last and may retry. Search: 600s, analyze: 300s.\n\
+- Analyze nodes should use tools=\"\" (no tools) — they process input text only, no file/search access needed.";
 
         let node_attrs = "\
 Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
@@ -263,8 +264,8 @@ digraph research {{\n  \
 prompt=\"Generate 4-6 research angles covering different aspects. Include both Chinese and English angles for cross-language coverage.\", \
 worker_prompt=\"You are a research specialist. {{task}}. Call deep_search multiple times IN PARALLEL with different queries to search faster (e.g. one English query + one Chinese query simultaneously). Include ALL URLs, data points, and direct quotes in your response.\", \
 model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"You will receive research findings from multiple search agents as your input. Cross-reference the findings, resolve contradictions, and organize by subtopic. Preserve ALL data points, URLs, and quotes.\", \
-model=\"{strong_model}\", timeout_secs=\"300\"]\n  \
+  analyze [prompt=\"You will receive research findings from multiple search agents as your input. Cross-reference the findings, resolve contradictions, and organize by subtopic. Preserve ALL data points, URLs, and quotes. Do NOT use any tools — just analyze the input text.\", \
+model=\"{strong_model}\", tools=\"\", timeout_secs=\"300\"]\n  \
   synthesize [prompt=\"Write a comprehensive, well-structured report. Include citations with URLs. Save using write_file. Match the query language.\", \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \

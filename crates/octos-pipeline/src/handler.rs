@@ -157,10 +157,29 @@ impl Handler for CodergenHandler {
             }
         }
 
-        let policy = octos_agent::ToolPolicy {
-            allow: node.tools.clone(),
-            deny: vec!["spawn".into(), "run_pipeline".into()],
-            ..Default::default()
+        // Filter out empty tool names (from tools="" in DOT)
+        let allowed: Vec<String> = node
+            .tools
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .cloned()
+            .collect();
+
+        // If tools="" was specified (explicit empty), remove ALL tools
+        // so the agent does text-only processing (no tool calls).
+        let has_tools_attr = !node.tools.is_empty();
+        let policy = if has_tools_attr && allowed.is_empty() {
+            // Explicit tools="" → deny everything
+            octos_agent::ToolPolicy {
+                deny: vec!["*".into()],
+                ..Default::default()
+            }
+        } else {
+            octos_agent::ToolPolicy {
+                allow: allowed,
+                deny: vec!["spawn".into(), "run_pipeline".into()],
+                ..Default::default()
+            }
         };
         tools.apply_policy(&policy);
         if let Some(ref pp) = self.provider_policy {
