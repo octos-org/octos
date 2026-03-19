@@ -191,7 +191,8 @@ Adapt the pipeline to the query:\n\
 - Match report language to query language\n\
 - Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes\n\
 - Timeouts: synthesize=900s, search=600s, analyze=300s\n\
-- Analyze nodes should use tools=\"\" (no tools) — pure text analysis";
+- Analyze nodes should use tools=\"\" (no tools) — pure text analysis\n\
+- CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'";
 
         let node_attrs = "\
 Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
