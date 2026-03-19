@@ -184,6 +184,13 @@ Adapt the pipeline to the query:\n\
 - Write ALL node prompts yourself based on the user's specific question — do NOT copy the example prompts verbatim\n\
 - Each node prompt should describe the ROLE and GOAL, not which tools to use (the agent discovers tools from its tool spec)\n\
 - Tailor the synthesize prompt to the research type: scientific analysis, news investigation, fact-check, market report, etc.\n\
+- Search strategy: deep_search supports multiple engines via search_engine parameter:\n\
+  * 'perplexity' — AI-powered, best for complex/analytical questions, returns synthesized answers with citations\n\
+  * 'tavily' — AI-optimized search, good for factual queries, 1000 free/month\n\
+  * 'duckduckgo' — free, good for simple lookups, may be slow/unreliable\n\
+  * 'brave' — free, fast, good general purpose\n\
+  In worker prompts, instruct which engine to use: perplexity for hard analytical questions, \
+duckduckgo/brave for simple factual lookups. Mix engines across workers for diversity.\n\
 - Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics\n\
 - Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin \
 (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)\n\
