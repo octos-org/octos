@@ -36,7 +36,7 @@ WeChat (mobile)          WorkBuddy (desktop)         octos (server)
 
 ## Step 2: Configure octos
 
-Add the `wecom-bot` channel to your gateway config (`~/.crew/config.json` or your project config):
+Add the `wecom-bot` channel to your gateway config (`~/.octos/config.json` or your project config):
 
 ```json
 {
@@ -69,7 +69,7 @@ Add the `wecom-bot` channel to your gateway config (`~/.crew/config.json` or you
 export WECOM_BOT_SECRET="your_robot_secret_here"
 ```
 
-For persistent deployments, add it to your env file (e.g., `~/.crew/env`).
+For persistent deployments, add it to your env file (e.g., `~/.octos/env`).
 
 ## Step 3: Build and Start octos
 
