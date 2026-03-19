@@ -30,6 +30,9 @@ pub struct TenantConfig {
     /// Local octos serve port on the tenant machine.
     #[serde(default = "default_local_port")]
     pub local_port: u16,
+    /// Dashboard auth token for this tenant's octos serve instance.
+    #[serde(default)]
+    pub auth_token: String,
     /// Current tunnel status.
     #[serde(default)]
     pub status: TenantStatus,
@@ -266,6 +269,7 @@ mod tests {
             tunnel_token: "test-token-123".into(),
             ssh_port: 6001,
             local_port: 8080,
+            auth_token: "test-auth-token".into(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -293,6 +297,7 @@ mod tests {
             tunnel_token: "tok-abc".into(),
             ssh_port: 6001,
             local_port: 8080,
+            auth_token: "test-auth-token".into(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -319,6 +324,7 @@ mod tests {
                 tunnel_token: format!("tok-{id}"),
                 ssh_port: 6001 + id.len() as u16,
                 local_port: 8080,
+                auth_token: format!("auth-{id}"),
                 status: TenantStatus::Pending,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -349,6 +355,7 @@ mod tests {
             tunnel_token: "tok".into(),
             ssh_port: SSH_PORT_START,
             local_port: 8080,
+            auth_token: "test-auth".into(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -371,6 +378,7 @@ mod tests {
             tunnel_token: "tok".into(),
             ssh_port: 6001,
             local_port: 8080,
+            auth_token: "test-auth-token".into(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),

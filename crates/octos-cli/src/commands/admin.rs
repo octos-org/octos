@@ -91,6 +91,7 @@ impl Executable for AdminCommand {
 
                 let ssh_port = store.next_ssh_port()?;
                 let tunnel_token = Uuid::new_v4().to_string();
+                let auth_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
                 let now = chrono::Utc::now();
 
                 let tenant = TenantConfig {
@@ -100,6 +101,7 @@ impl Executable for AdminCommand {
                     tunnel_token: tunnel_token.clone(),
                     ssh_port,
                     local_port,
+                    auth_token: auth_token.clone(),
                     status: TenantStatus::Pending,
                     created_at: now,
                     updated_at: now,
@@ -108,20 +110,21 @@ impl Executable for AdminCommand {
                 store.save(&tenant)?;
 
                 println!("Tenant created:");
-                println!("  ID:        {}", tenant.id);
-                println!("  Subdomain: {}.{}", tenant.subdomain, domain);
-                println!("  SSH port:  {}", tenant.ssh_port);
-                println!("  Token:     {}", tunnel_token);
+                println!("  ID:         {}", tenant.id);
+                println!("  Subdomain:  {}.{}", tenant.subdomain, domain);
+                println!("  SSH port:   {}", tenant.ssh_port);
+                println!("  Auth token: {}", auth_token);
+                println!("  Tunnel tok: {}", tunnel_token);
                 println!();
-                println!("Setup command for the tenant's Mac Mini:");
+                println!("Bootstrap the Mac Mini:");
                 println!(
-                    "  curl -fsSL https://{domain}/setup | bash -s -- {} {}",
-                    tenant.subdomain, tunnel_token
+                    "  ./scripts/frp/bootstrap-tenant.sh {} <user@host> --password <pw>",
+                    tenant.id
                 );
                 println!();
-                println!("Or manually configure frpc:");
-                let config = render_frpc_config(&tenant, &server, port, &domain);
-                println!("{config}");
+                println!("Dashboard will be at:");
+                println!("  http://{}.{}", tenant.subdomain, domain);
+                println!("  Auth token: {}", auth_token);
 
                 Ok(())
             }

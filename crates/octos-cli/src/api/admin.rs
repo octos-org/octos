@@ -2606,6 +2606,11 @@ pub async fn create_tenant(
         tunnel_token: uuid::Uuid::new_v4().to_string(),
         ssh_port,
         local_port: req.local_port,
+        auth_token: format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
         status: crate::tenant::TenantStatus::Pending,
         created_at: now,
         updated_at: now,
