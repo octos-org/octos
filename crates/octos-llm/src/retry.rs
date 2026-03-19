@@ -84,10 +84,13 @@ impl RetryProvider {
             }
         }
 
-        // Content-format 400 errors: the request may work with a different
-        // provider that has different validation rules for message content.
+        // Content-format and auth 400 errors: the request may work with a
+        // different provider that has different validation rules.
         if error_str.contains("400")
-            && (error_str.contains("must not be empty") || error_str.contains("reasoning_content"))
+            && (error_str.contains("must not be empty")
+                || error_str.contains("reasoning_content")
+                || error_str.contains("API key not valid")
+                || error_str.contains("invalid_value"))
         {
             return true;
         }
