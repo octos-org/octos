@@ -603,7 +603,7 @@ async fn web_search(
         let cnt = count;
         let name = eng.to_string();
         handles.push(tokio::spawn(async move {
-            (name.clone(), try_engine_owned(&c, &q, cnt, &name).await)
+            (name.clone(), try_engine(&c, &q, cnt, &name).await)
         }));
     }
 
@@ -711,16 +711,6 @@ async fn parallel_all_engines(
 }
 
 /// Try a specific search engine by name.
-/// try_engine with owned params for use in tokio::spawn.
-async fn try_engine_owned(
-    client: &reqwest::Client,
-    query: &str,
-    count: u8,
-    engine: &str,
-) -> Option<SearchResult> {
-    try_engine(client, query, count, engine).await
-}
-
 async fn try_engine(
     client: &reqwest::Client,
     query: &str,

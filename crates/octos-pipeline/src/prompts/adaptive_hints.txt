@@ -12,9 +12,11 @@ Adapt the pipeline to the query:
   Most workers should omit search_engine (default top-2 racing is fast and reliable).
 - Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics
 - Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)
-- Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)
+- Data flow: workers save search results to unique directories on disk. Downstream nodes (analyze, synthesize) read those files using read_file/list_dir/glob tools. Workers should output ONLY the result directory path, NOT summarize the content.
+- Analyze nodes MUST have tools="read_file" to read _search_results.md from each search directory. Do NOT give list_dir or glob — prevents reading hundreds of individual source pages
+- Synthesize nodes MUST have tools="write_file" to save the final report. The analyzed content is passed as input — no need to read files
 - Match report language to query language
+- Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)
 - Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes
 - Timeouts: synthesize=900s, search=600s, analyze=300s
-- Analyze nodes should use tools="" (no tools) — pure text analysis
 - CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'
