@@ -1,0 +1,30 @@
+name: Build Linux x86_64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set build metadata
+        run: |
+          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build octos CLI
+        run: cargo build --release -p octos-cli --features "api,telegram,feishu,twilio,wecom"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octos-linux-x86_64
+          path: target/release/octos
+          retention-days: 7
