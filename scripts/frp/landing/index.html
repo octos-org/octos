@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Octos Cloud - Your Own AI Agent, Running at Home</title>
+    <meta name="description" content="Self-host a powerful AI coding agent on your Mac Mini. Private, always-on, accessible from anywhere via secure tunnel.">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F419;</text></svg>">
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a26;
+            --border: #1e1e2e;
+            --text: #e4e4ef;
+            --text-dim: #8888a0;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-glow: rgba(99, 102, 241, 0.15);
+            --green: #34d399;
+            --orange: #fb923c;
+            --pink: #f472b6;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* --- Nav --- */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            z-index: 100;
+            background: rgba(10, 10, 15, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+        }
+        .nav-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 24px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 20px;
+            font-weight: 700;
+            text-decoration: none;
+            color: var(--text);
+        }
+        .logo-icon { font-size: 28px; }
+        .nav-links { display: flex; gap: 32px; align-items: center; }
+        .nav-links a {
+            color: var(--text-dim);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+        .nav-links a:hover { color: var(--text); }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: var(--accent-light);
+            box-shadow: 0 0 24px var(--accent-glow);
+        }
+        .btn-ghost {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-ghost:hover {
+            border-color: var(--accent);
+            background: var(--accent-glow);
+        }
+
+        /* --- Hero --- */
+        .hero {
+            padding: 160px 24px 100px;
+            text-align: center;
+            position: relative;
+        }
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 16px;
+            border-radius: 100px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-bottom: 32px;
+        }
+        .hero-badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        h1 {
+            font-size: clamp(36px, 6vw, 64px);
+            font-weight: 800;
+            line-height: 1.1;
+            letter-spacing: -0.03em;
+            margin-bottom: 24px;
+            position: relative;
+        }
+        h1 .gradient {
+            background: linear-gradient(135deg, var(--accent-light), var(--pink));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .hero-sub {
+            font-size: 18px;
+            color: var(--text-dim);
+            max-width: 560px;
+            margin: 0 auto 40px;
+            line-height: 1.7;
+        }
+        .hero-actions {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        /* --- Features --- */
+        section { padding: 80px 24px; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .section-label {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--accent-light);
+            margin-bottom: 12px;
+        }
+        h2 {
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin-bottom: 16px;
+        }
+        .section-desc {
+            color: var(--text-dim);
+            font-size: 16px;
+            max-width: 520px;
+            margin-bottom: 48px;
+        }
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 28px;
+            transition: all 0.25s;
+        }
+        .feature-card:hover {
+            background: var(--bg-card-hover);
+            border-color: rgba(99, 102, 241, 0.3);
+            transform: translateY(-2px);
+        }
+        .feature-icon {
+            font-size: 28px;
+            margin-bottom: 16px;
+        }
+        .feature-card h3 {
+            font-size: 17px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .feature-card p {
+            font-size: 14px;
+            color: var(--text-dim);
+            line-height: 1.6;
+        }
+
+        /* --- How it works --- */
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 24px;
+            counter-reset: step;
+        }
+        .step {
+            position: relative;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px 28px;
+            counter-increment: step;
+        }
+        .step::before {
+            content: counter(step);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: var(--accent-glow);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: var(--accent-light);
+            font-size: 15px;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+        .step h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .step p {
+            font-size: 14px;
+            color: var(--text-dim);
+            line-height: 1.6;
+        }
+
+        /* --- Code block --- */
+        .code-block {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin-top: 40px;
+            overflow-x: auto;
+        }
+        .code-block pre {
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 13px;
+            line-height: 1.8;
+            color: var(--text-dim);
+        }
+        .code-block .comment { color: #555570; }
+        .code-block .cmd { color: var(--green); }
+        .code-block .flag { color: var(--orange); }
+        .code-block .output { color: var(--accent-light); }
+
+        /* --- Architecture diagram --- */
+        .arch-diagram {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 40px;
+            margin-top: 40px;
+            text-align: center;
+        }
+        .arch-diagram pre {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 13px;
+            line-height: 1.7;
+            color: var(--text-dim);
+            display: inline-block;
+            text-align: left;
+        }
+        .arch-diagram .highlight { color: var(--accent-light); }
+        .arch-diagram .green { color: var(--green); }
+        .arch-diagram .orange { color: var(--orange); }
+
+        /* --- Channels --- */
+        .channels-row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-top: 24px;
+        }
+        .channel-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            font-size: 14px;
+            color: var(--text);
+        }
+
+        /* --- CTA --- */
+        .cta {
+            text-align: center;
+            padding: 100px 24px;
+        }
+        .cta h2 {
+            font-size: 36px;
+            margin-bottom: 16px;
+        }
+        .cta p {
+            color: var(--text-dim);
+            font-size: 16px;
+            margin-bottom: 32px;
+        }
+
+        /* --- Footer --- */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 32px 24px;
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 13px;
+        }
+        footer a { color: var(--accent-light); text-decoration: none; }
+
+        /* --- Responsive --- */
+        @media (max-width: 640px) {
+            .nav-links { gap: 16px; }
+            .hero { padding: 120px 16px 60px; }
+            .features-grid { grid-template-columns: 1fr; }
+            .steps { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+    <div class="nav-inner">
+        <a href="/" class="logo">
+            <span class="logo-icon">&#x1F419;</span>
+            <span>Octos Cloud</span>
+        </a>
+        <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#how-it-works">Setup</a>
+            <a href="#architecture">Architecture</a>
+            <a href="https://github.com/octos-org/octos" target="_blank">GitHub</a>
+            <a href="/admin/" class="btn btn-primary">Dashboard</a>
+        </div>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+    <div class="hero-badge">
+        <span class="dot"></span>
+        Open source &middot; Self-hosted &middot; Private
+    </div>
+    <h1>
+        Your Own AI Agent,<br>
+        <span class="gradient">Running at Home</span>
+    </h1>
+    <p class="hero-sub">
+        Octos is a Rust-native AI agent framework that runs on your Mac Mini.
+        Private, always-on, accessible from anywhere through Telegram, Feishu,
+        WhatsApp, or the web&mdash;no cloud subscription required.
+    </p>
+    <div class="hero-actions">
+        <a href="#how-it-works" class="btn btn-primary">Get Started</a>
+        <a href="https://github.com/octos-org/octos" class="btn btn-ghost" target="_blank">
+            View Source
+        </a>
+    </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+    <div class="container">
+        <div class="section-label">Features</div>
+        <h2>Everything you need in an AI agent</h2>
+        <p class="section-desc">
+            A complete agent framework with tool use, memory, multi-provider failover,
+            and messaging channels&mdash;all in a single binary.
+        </p>
+
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F9E0;</div>
+                <h3>Multi-Provider LLM</h3>
+                <p>Supports 12+ LLM providers with automatic failover. OpenAI, Anthropic, Gemini, Moonshot, DeepSeek, and more. Switch models without changing code.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F6E0;&#xFE0F;</div>
+                <h3>Tool System</h3>
+                <p>Shell, file I/O, web search, browser automation, code analysis. Sandboxed execution with configurable policies. Extend with custom MCP servers.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4AC;</div>
+                <h3>Messaging Channels</h3>
+                <p>Connect via Telegram, Feishu/Lark, WhatsApp, Twilio SMS, Discord, Slack, WeChat, email, or the built-in web chat. All channels, one agent.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4BE;</div>
+                <h3>Persistent Memory</h3>
+                <p>Hybrid BM25 + vector search over conversation history. Episode store for task summaries. Your agent remembers across sessions.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F310;</div>
+                <h3>Admin Dashboard</h3>
+                <p>Web-based control panel for managing profiles, channels, API keys, and gateway processes. Monitor status, view logs, restart services.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F512;</div>
+                <h3>Private & Secure</h3>
+                <p>Runs on your hardware. Your data never leaves your machine. Sandboxed tool execution, symlink-safe file I/O, SSRF protection built in.</p>
+            </div>
+        </div>
+
+        <div class="channels-row" style="margin-top: 40px;">
+            <span class="channel-badge">&#x2708;&#xFE0F; Telegram</span>
+            <span class="channel-badge">&#x1F426; Feishu/Lark</span>
+            <span class="channel-badge">&#x1F4F1; WhatsApp</span>
+            <span class="channel-badge">&#x1F4E8; Twilio SMS</span>
+            <span class="channel-badge">&#x1F4E7; Email</span>
+            <span class="channel-badge">&#x1F30D; Web Chat</span>
+            <span class="channel-badge">&#x1F4AC; Discord</span>
+            <span class="channel-badge">&#x1F4BC; WeChat Work</span>
+        </div>
+    </div>
+</section>
+
+<!-- How it Works -->
+<section id="how-it-works" style="background: rgba(99, 102, 241, 0.03);">
+    <div class="container">
+        <div class="section-label">Cloud Onboarding</div>
+        <h2>Up and running in 3 steps</h2>
+        <p class="section-desc">
+            An admin provisions your account, bootstraps your Mac Mini remotely,
+            and you get a fully functional AI dashboard accessible from anywhere.
+        </p>
+
+        <div class="steps">
+            <div class="step">
+                <h3>Create Account</h3>
+                <p>Admin creates a cloud tenant for you. This assigns a subdomain, SSH tunnel port, and generates your dashboard auth token.</p>
+            </div>
+            <div class="step">
+                <h3>Bootstrap Mac Mini</h3>
+                <p>A single script installs octos, frpc tunnel client, configures services, and starts everything. Works on fresh macOS or Linux machines.</p>
+            </div>
+            <div class="step">
+                <h3>Go Live</h3>
+                <p>Your dashboard is immediately accessible at your subdomain. Add LLM API keys, connect messaging channels, and start chatting.</p>
+            </div>
+        </div>
+
+        <div class="code-block">
+            <pre><span class="comment"># Step 1: Admin creates your cloud account</span>
+<span class="cmd">octos admin create-tenant</span> <span class="flag">--name</span> alice
+
+<span class="output">  Tenant created:
+    Subdomain:  alice.octos-cloud.org
+    Auth token: a1b2c3d4e5f6...
+    SSH port:   6001</span>
+
+<span class="comment"># Step 2: Bootstrap the Mac Mini (one command)</span>
+<span class="cmd">./scripts/frp/bootstrap-tenant.sh</span> alice cloud@10.0.1.50 <span class="flag">--password</span> ****
+
+<span class="output">  ==> Building octos (release)...
+  ==> Uploading binaries...
+  ==> Installing frpc tunnel...
+  ==> Starting services...
+  ==> Tunnel: CONNECTED</span>
+
+<span class="comment"># Step 3: Done! Dashboard is live</span>
+<span class="cmd">open</span> https://alice.octos-cloud.org</pre>
+        </div>
+    </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture">
+    <div class="container">
+        <div class="section-label">Architecture</div>
+        <h2>How it connects</h2>
+        <p class="section-desc">
+            Your Mac Mini connects outbound to our relay server via frp tunnel.
+            No port forwarding or public IP needed. Traffic is routed by subdomain.
+        </p>
+
+        <div class="arch-diagram">
+            <pre>
+  <span class="green">Internet</span>
+     |
+     v
+  <span class="highlight">Caddy</span>  (octos-cloud.org, SSL termination)
+     |
+     v
+  <span class="highlight">frps</span>   (tunnel relay, subdomain routing)
+     |         |         |
+     v         v         v
+  <span class="orange">alice</span>     <span class="orange">bob</span>       <span class="orange">carol</span>      &lt;-- frpc tunnels (outbound)
+     |         |         |
+     v         v         v
+  <span class="green">Mini:8080</span> <span class="green">Mini:8080</span> <span class="green">Mini:8080</span>   &lt;-- octos serve (dashboard + API)
+     |         |         |
+     v         v         v
+  Telegram  Feishu   WhatsApp     &lt;-- messaging channels
+            </pre>
+        </div>
+
+        <div class="features-grid" style="margin-top: 40px;">
+            <div class="feature-card">
+                <div class="feature-icon">&#x26A1;</div>
+                <h3>Rust-Native Performance</h3>
+                <p>Single binary, ~30MB. Starts in milliseconds. Handles hundreds of concurrent sessions with minimal memory. No runtime dependencies.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F504;</div>
+                <h3>Auto-Failover</h3>
+                <p>Configure primary + fallback LLM providers. 401/403 triggers failover. 429/5xx triggers retry then failover. Your agent stays online.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4CB;</div>
+                <h3>Multi-Profile</h3>
+                <p>Run multiple agent profiles on one machine. Each with its own LLM provider, channels, system prompt, and data directory. Fully isolated.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="cta">
+    <h2>Ready to adopt your own Octos?</h2>
+    <p>Get a private AI agent running on your Mac Mini in minutes.</p>
+    <div class="hero-actions">
+        <a href="mailto:admin@octos-cloud.org" class="btn btn-primary">Request Access</a>
+        <a href="https://github.com/octos-org/octos" class="btn btn-ghost" target="_blank">Star on GitHub</a>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer>
+    <p>&copy; 2026 Octos Cloud &middot; Built with Rust &middot; <a href="https://github.com/octos-org/octos">Open Source</a></p>
+</footer>
+
+</body>
+</html>
