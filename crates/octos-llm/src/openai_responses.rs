@@ -208,10 +208,10 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 
 /// Normalize a tool_call_id for the OpenAI Responses API.
 ///
-/// The Responses API requires call_ids to begin with `call_` or `fc_`.
-/// When adaptive routing switches from another provider (Moonshot, Anthropic, etc.)
-/// mid-conversation, the history contains foreign IDs like `call_function_xyz`
-/// or `toolu_01abc`. We normalize these to `call_` prefix to prevent 400 errors.
+/// The Responses API requires IDs to begin with `fc_` (not `call_`).
+/// The agent's message_repair normalizes all IDs to `call_` prefix for
+/// Chat Completions compatibility. This second stage rewrites `call_` → `fc_`
+/// specifically for the Responses API format.
 fn normalize_call_id(id: &str) -> String {
     // Responses API requires `fc_` prefix on function_call item IDs.
     // `call_` prefix works for Chat Completions but NOT Responses API.

@@ -658,7 +658,7 @@ async fn web_search(
     // Use the richest result as primary
     let mut primary = successful.remove(0);
 
-    // Append unique content from other engines (dedupe by checking URL overlap)
+    // Append content from other engines (may have URL overlap — acceptable for richer context)
     for (name, other) in &successful {
         if other.output.len() > 100 {
             primary
