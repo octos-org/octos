@@ -2,6 +2,11 @@ name: Build Linux x86_64
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag to build'
+        required: false
+        default: 'fix/pipeline-stream-errors'
 
 permissions:
   contents: read
@@ -11,6 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
