@@ -70,10 +70,25 @@ pub fn check_requirements(reqs: &Requirements, env_vars: &HashMap<String, String
         });
     }
 
-    // Check OS constraint.
+    // Check OS constraint. Normalize/accept common macOS alias "darwin".
     if !reqs.os.is_empty() {
         let current_os = std::env::consts::OS;
-        let matched = reqs.os.iter().any(|os| os == current_os);
+
+        // Treat "darwin" and "macos" as equivalent to avoid manifest/host mismatch
+        // where docs/examples use "darwin" but Rust uses "macos".
+        let matched = reqs.os.iter().any(|os| {
+            if os == current_os {
+                return true;
+            }
+            // Accept common aliasing between darwin <-> macos
+            if (os == "darwin" && current_os == "macos")
+                || (os == "macos" && current_os == "darwin")
+            {
+                return true;
+            }
+            false
+        });
+
         checks.push(GateCheck {
             gate: format!("os:{}", reqs.os.join(",")),
             passed: matched,

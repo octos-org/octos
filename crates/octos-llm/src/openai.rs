@@ -70,7 +70,7 @@ impl ModelHints {
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
         let fixed_temperature =
-            is_o_series || m.contains("k2.5") || m == "gpt-5-nano" || m == "gpt-4.1-nano";
+            is_o_series || m.starts_with("gpt-5") || m.contains("k2.5") || m == "gpt-4.1-nano";
 
         let lacks_vision = m.starts_with("deepseek")
             || m.starts_with("minimax")
@@ -639,10 +639,33 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         return vec![];
     }
 
+    // Detect error events from the SSE layer (network failures, etc.)
+    if event.event.as_deref() == Some("error") {
+        let msg = serde_json::from_str::<serde_json::Value>(&event.data)
+            .ok()
+            .and_then(|v| {
+                v["error"]["message"]
+                    .as_str()
+                    .or_else(|| v["error"].as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| event.data.clone());
+        return vec![StreamEvent::Error(msg)];
+    }
+
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
+
+    // Provider-level error in JSON payload (e.g. DashScope {"error":{"message":"..."}})
+    if let Some(err) = data.get("error") {
+        let msg = err["message"]
+            .as_str()
+            .or_else(|| err.as_str())
+            .unwrap_or("unknown error");
+        return vec![StreamEvent::Error(msg.to_string())];
+    }
 
     let mut events = Vec::new();
 
@@ -748,17 +771,16 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_gpt5() {
-        let h = ModelHints::detect("gpt-5.3-codex");
-        assert!(h.uses_completion_tokens);
-        assert!(!h.fixed_temperature);
-    }
-
-    #[test]
-    fn test_detect_gpt5_nano() {
-        let h = ModelHints::detect("gpt-5-nano");
-        assert!(h.uses_completion_tokens);
-        assert!(h.fixed_temperature);
+    fn test_detect_gpt5_uses_fixed_temperature() {
+        // All gpt-5.* variants use fixed temperature and completion tokens
+        for model in &["gpt-5-nano", "gpt-5.3-codex", "gpt-5.4"] {
+            let h = ModelHints::detect(model);
+            assert!(
+                h.uses_completion_tokens,
+                "{model} should use completion_tokens"
+            );
+            assert!(h.fixed_temperature, "{model} should use fixed_temperature");
+        }
     }
 
     #[test]

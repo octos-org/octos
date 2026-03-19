@@ -77,7 +77,7 @@ ngrok http 9321
 # Start gateway
 LARK_APP_ID="cli_xxxxx" \
 LARK_APP_SECRET="xxxxx" \
-crew gateway --cwd /path/to/workdir
+octos gateway --cwd /path/to/workdir
 ```
 
 ## Features

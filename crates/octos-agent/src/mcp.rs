@@ -54,7 +54,7 @@ impl McpServerConfig {
 
 /// A running MCP server connection (stdio or HTTP).
 enum McpConnection {
-    Stdio(StdioMcpConnection),
+    Stdio(Box<StdioMcpConnection>),
     Http(HttpMcpConnection),
 }
 
@@ -400,12 +400,12 @@ impl McpClient {
             .ok_or_else(|| eyre::eyre!("no stdout"))?;
         let reader = BufReader::new(stdout);
 
-        let conn = McpConnection::Stdio(StdioMcpConnection {
+        let conn = McpConnection::Stdio(Box::new(StdioMcpConnection {
             stdin,
             reader,
             child,
             next_id: 1,
-        });
+        }));
 
         initialize_and_list_tools(conn).await
     }

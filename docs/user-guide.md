@@ -1,6 +1,6 @@
-# Crew User Guide
+# Octos User Guide
 
-A comprehensive guide for deploying, configuring, and using the Crew AI agent platform.
+A comprehensive guide for deploying, configuring, and using the Octos AI agent platform.
 
 ---
 
@@ -33,16 +33,16 @@ A comprehensive guide for deploying, configuring, and using the Crew AI agent pl
 
 ## 1. Overview
 
-Crew is a Rust-native AI agent platform that runs in two modes:
+Octos is a Rust-native AI agent platform that runs in two modes:
 
-- **`crew serve`** — Control plane with admin dashboard. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels.
-- **`crew gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom).
-- **`crew chat`** — Interactive CLI chat for development and testing.
+- **`octos serve`** — Control plane with admin dashboard. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels.
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom).
+- **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
 
 ```
-crew serve (control plane + dashboard)
+octos serve (control plane + dashboard)
   ├── Profile A → gateway process (Telegram, WhatsApp)
   ├── Profile B → gateway process (Feishu, Slack)
   └── Profile C → gateway process (CLI)
@@ -60,13 +60,13 @@ Each profile is fully isolated — its own data directory, memory, sessions, ski
 
 ## 2. Dashboard & OTP Onboarding
 
-The admin dashboard is a React web application embedded in the `crew serve` binary. It provides a visual interface for managing profiles, monitoring gateway status, and configuring the system.
+The admin dashboard is a React web application embedded in the `octos serve` binary. It provides a visual interface for managing profiles, monitoring gateway status, and configuring the system.
 
 ### 2.1 Accessing the Dashboard
 
 ```bash
 # Start the control plane
-crew serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0 --port 3000
 
 # Dashboard is available at:
 # http://localhost:3000
@@ -146,7 +146,7 @@ Once logged in, the dashboard provides:
 
 ## 3. Setting Up LLM Providers
 
-Crew supports 14 LLM providers out of the box. Each provider requires an API key set as an environment variable.
+Octos supports 14 LLM providers out of the box. Each provider requires an API key set as an environment variable.
 
 ### 3.1 Supported Providers
 
@@ -264,13 +264,13 @@ The `api_key_env` field overrides the default env variable name for the provider
 #### Method 2: CLI Flags
 
 ```bash
-crew chat --provider deepseek --model deepseek-chat
-crew chat --model gpt-4o  # auto-detects provider from model name
+octos chat --provider deepseek --model deepseek-chat
+octos chat --model gpt-4o  # auto-detects provider from model name
 ```
 
 #### Method 3: Auto-Detection
 
-When `provider` is omitted, Crew detects the provider from the model name:
+When `provider` is omitted, Octos detects the provider from the model name:
 
 | Model Pattern | Detected Provider |
 |--------------|-------------------|
@@ -332,20 +332,20 @@ Instead of environment variables, you can store API keys via the auth CLI:
 
 ```bash
 # OAuth PKCE (OpenAI only)
-crew auth login --provider openai
+octos auth login --provider openai
 
 # Device code flow (OpenAI only)
-crew auth login --provider openai --device-code
+octos auth login --provider openai --device-code
 
 # Paste-token (all other providers)
-crew auth login --provider anthropic
+octos auth login --provider anthropic
 # → prompts: "Paste your API key:"
 
 # Check stored credentials
-crew auth status
+octos auth status
 
 # Remove credentials
-crew auth logout --provider openai
+octos auth logout --provider openai
 ```
 
 Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
@@ -901,13 +901,13 @@ Bot: [uses cron tool with action="list"]
 Cron jobs can also be managed via CLI:
 
 ```bash
-crew cron list                              # List active jobs
-crew cron list --all                        # Include disabled
-crew cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
-crew cron add --name "check" --message "Check status" --every 3600
-crew cron remove <job-id>
-crew cron enable <job-id>
-crew cron enable <job-id> --disable
+octos cron list                              # List active jobs
+octos cron list --all                        # Include disabled
+octos cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
+octos cron add --name "check" --message "Check status" --every 3600
+octos cron remove <job-id>
+octos cron enable <job-id>
+octos cron enable <job-id> --disable
 ```
 
 ### 11.5 Multi-Turn Tool Use
@@ -1011,7 +1011,7 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 ## 12. Bundled App Skills
 
-Bundled app skills ship as compiled binaries alongside the `crew` binary. They are automatically bootstrapped into `.octos/skills/` on gateway startup — no installation required.
+Bundled app skills ship as compiled binaries alongside the `octos` binary. They are automatically bootstrapped into `.octos/skills/` on gateway startup — no installation required.
 
 ### 12.1 News Fetch
 
@@ -1395,7 +1395,7 @@ Platform skills are server-level skills that require the OminiX backend running 
 ### 13.1 Prerequisites
 
 - Apple Silicon Mac (M1/M2/M3/M4)
-- OminiX API server running (managed via `crew serve`)
+- OminiX API server running (managed via `octos serve`)
 - Models downloaded: `Qwen3-ASR-1.7B-8bit`, `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
 
 ### 13.2 Managing OminiX via Dashboard
@@ -1448,7 +1448,7 @@ Converts text to speech using preset voices.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `text` | string | *(required)* | Text to synthesize |
-| `output_path` | string | `/tmp/crew_tts_<ts>.wav` | Output file path |
+| `output_path` | string | `/tmp/octos_tts_<ts>.wav` | Output file path |
 | `language` | string | `"chinese"` | `"chinese"`, `"english"`, `"japanese"`, `"korean"` |
 | `speaker` | string | `"vivian"` | Voice preset |
 
@@ -1537,19 +1537,19 @@ Custom skills extend the agent with new tools and instructions. They can be inst
 
 ```bash
 # Install all skills from a repo
-crew skills install user/repo
+octos skills install user/repo
 
 # Install a specific skill subdirectory
-crew skills install user/repo/skill-name
+octos skills install user/repo/skill-name
 
 # Install from a specific branch
-crew skills install user/repo --branch develop
+octos skills install user/repo --branch develop
 
 # Force overwrite existing
-crew skills install user/repo --force
+octos skills install user/repo --force
 
 # Install into a specific profile
-crew skills install user/repo --profile my-bot
+octos skills install user/repo --profile my-bot
 ```
 
 **Installation process:**
@@ -1562,22 +1562,22 @@ crew skills install user/repo --profile my-bot
 
 ```bash
 # List installed skills
-crew skills list
+octos skills list
 
 # Show detailed skill info
-crew skills info skill-name
+octos skills info skill-name
 
 # Update a specific skill
-crew skills update skill-name
+octos skills update skill-name
 
 # Update all skills
-crew skills update all
+octos skills update all
 
 # Remove a skill
-crew skills remove skill-name
+octos skills remove skill-name
 
 # Search the online registry
-crew skills search "web scraping"
+octos skills search "web scraping"
 ```
 
 ### 14.3 Skill Directory Structure
@@ -1989,4 +1989,4 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 
 ---
 
-*This guide covers Crew version as of March 2026. For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*
+*This guide covers Octos version as of March 2026. For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*

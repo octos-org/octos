@@ -64,12 +64,12 @@
 **What**: Replace env var credential storage with encrypted-at-rest secrets.
 **Why**: Env vars are plaintext in memory, visible via `/proc/self/environ`, leaked in core dumps, visible in `docker inspect`. IronClaw uses AES-256-GCM + OS keychain master key.
 **How**:
-- New crate: `crew-secrets`
+- New crate: `octos-secrets`
 - AES-256-GCM encryption (use `aes-gcm` crate)
 - Master key from OS keychain (`keyring` crate — macOS Keychain, GNOME Keyring, Windows Credential Manager)
 - Store: encrypted JSON file at `~/.octos/secrets.enc`
 - Migration: import existing env vars on first run
-- CLI: `crew secret set/get/list/delete`
+- CLI: `octos secret set/get/list/delete`
 - Zero-exposure: secrets never in tool/WASM process memory
 **Effort**: 1-2 weeks
 

@@ -15,7 +15,7 @@ Evaluated 2026-03-13. Conclusion: **not worth pursuing**.
 - Must register as an MSP at register.apple.com
 - Apple manually reviews applications — expects enterprise customer service platforms
 - Requires: live agent support, intent routing, automation, public HTTPS (no ngrok)
-- Overkill for crew's use case
+- Overkill for octos's use case
 
 ### 3. Third-party MSP (Sinch, CM.com, Infobip)
 - Use an approved provider's API as a middleman

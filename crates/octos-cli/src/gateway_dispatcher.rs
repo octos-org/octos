@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
 use octos_core::{InboundMessage, OutboundMessage, SessionKey};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
 use crate::commands::gateway::session_ui;
@@ -33,7 +33,7 @@ pub enum DispatchResult {
 /// and the outbound channel. Fully testable without LLM or actor dependencies.
 pub struct GatewayDispatcher {
     pub(crate) session_mgr: Arc<Mutex<SessionManager>>,
-    pub(crate) active_sessions: Arc<Mutex<ActiveSessionStore>>,
+    pub(crate) active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pub(crate) pending_messages: PendingMessages,
     pub(crate) out_tx: mpsc::Sender<OutboundMessage>,
 }
@@ -41,7 +41,7 @@ pub struct GatewayDispatcher {
 impl GatewayDispatcher {
     pub fn new(
         session_mgr: Arc<Mutex<SessionManager>>,
-        active_sessions: Arc<Mutex<ActiveSessionStore>>,
+        active_sessions: Arc<RwLock<ActiveSessionStore>>,
         pending_messages: PendingMessages,
         out_tx: mpsc::Sender<OutboundMessage>,
     ) -> Self {
@@ -107,7 +107,7 @@ impl GatewayDispatcher {
                 .await;
         } else {
             self.active_sessions
-                .lock()
+                .write()
                 .await
                 .switch_to(base_key_str, name)
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -138,7 +138,7 @@ impl GatewayDispatcher {
         let name = cmd.strip_prefix("/s").unwrap_or("").trim();
         if name.is_empty() {
             self.active_sessions
-                .lock()
+                .write()
                 .await
                 .switch_to(base_key_str, "")
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -163,7 +163,7 @@ impl GatewayDispatcher {
                 .await;
         } else {
             self.active_sessions
-                .lock()
+                .write()
                 .await
                 .switch_to(base_key_str, name)
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -220,7 +220,7 @@ impl GatewayDispatcher {
             .list_user_sessions(base_key_str);
         let active_topic = self
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic(base_key_str)
             .to_string();
@@ -256,7 +256,7 @@ impl GatewayDispatcher {
         if cmd != "/back" && cmd != "/b" {
             return None;
         }
-        let result = self.active_sessions.lock().await.go_back(base_key_str);
+        let result = self.active_sessions.write().await.go_back(base_key_str);
         match result {
             Ok(Some(topic)) => {
                 let label = if topic.is_empty() {
@@ -322,7 +322,7 @@ impl GatewayDispatcher {
             match self.session_mgr.lock().await.clear(&del_key).await {
                 Ok(()) => {
                     self.active_sessions
-                        .lock()
+                        .write()
                         .await
                         .remove_topic(base_key_str, name)
                         .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
@@ -360,7 +360,7 @@ impl GatewayDispatcher {
         let topic = callback_data.strip_prefix("s:")?;
 
         self.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to(base_key_str, topic)
             .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
@@ -482,7 +482,7 @@ mod tests {
         let session_mgr = Arc::new(Mutex::new(
             SessionManager::open(tmp.path()).unwrap(),
         ));
-        let active_sessions = Arc::new(Mutex::new(
+        let active_sessions = Arc::new(RwLock::new(
             ActiveSessionStore::open(tmp.path()).unwrap(),
         ));
         let pending: PendingMessages = Arc::new(Mutex::new(HashMap::new()));
@@ -537,7 +537,7 @@ mod tests {
 
         let topic = disp
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic("telegram:123")
             .to_string();
@@ -584,7 +584,7 @@ mod tests {
 
         // First switch to a topic
         disp.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to("telegram:123", "research")
             .unwrap();
@@ -599,7 +599,7 @@ mod tests {
 
         let topic = disp
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic("telegram:123")
             .to_string();
@@ -622,7 +622,7 @@ mod tests {
 
         let topic = disp
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic("telegram:123")
             .to_string();
@@ -683,7 +683,7 @@ mod tests {
         let inbound = make_test_inbound("telegram", "123", "/back");
 
         disp.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to("telegram:123", "research")
             .unwrap();
@@ -704,7 +704,7 @@ mod tests {
         let inbound = make_test_inbound("telegram", "123", "/b");
 
         disp.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to("telegram:123", "deep-search")
             .unwrap();
@@ -787,7 +787,7 @@ mod tests {
 
         let topic = disp
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic("telegram:123")
             .to_string();
@@ -801,7 +801,7 @@ mod tests {
         let inbound = make_test_inbound("telegram", "123", "");
 
         disp.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to("telegram:123", "research")
             .unwrap();
@@ -821,7 +821,7 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let topic = disp
             .active_sessions
-            .lock()
+            .read()
             .await
             .get_active_topic("telegram:123")
             .to_string();
@@ -963,7 +963,7 @@ mod tests {
 
         // Switch to research first, then back should go to default
         disp.active_sessions
-            .lock()
+            .write()
             .await
             .switch_to("telegram:123", "research")
             .unwrap();

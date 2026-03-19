@@ -42,7 +42,7 @@ Gateway (single long-lived Node.js process)
 └── Maintenance timers (cleanup, cron, health)
 ```
 
-**Key difference from octos**: OpenClaw runs everything in ONE Node.js process. No child-process-per-profile. Isolation between agents is in-process (directory + session key scoping). octos spawns a separate OS process per profile via `crew serve`.
+**Key difference from octos**: OpenClaw runs everything in ONE Node.js process. No child-process-per-profile. Isolation between agents is in-process (directory + session key scoping). octos spawns a separate OS process per profile via `octos serve`.
 
 ### Session Lane Concurrency
 
@@ -263,7 +263,7 @@ Each instance gets:
 - Own port
 - Profile shorthand: `openclaw --profile rescue` auto-scopes everything
 
-**octos equivalent**: `crew serve` with multiple profiles — each profile gets its own child process and `data_dir`. octos's approach is more automated (dashboard manages profiles, auto-spawns processes).
+**octos equivalent**: `octos serve` with multiple profiles — each profile gets its own child process and `data_dir`. octos's approach is more automated (dashboard manages profiles, auto-spawns processes).
 
 ---
 
@@ -315,7 +315,7 @@ Each instance gets:
 ```
 octos multi-tenant model:                OpenClaw single-tenant model:
 
-crew serve (control plane)                  Gateway (single Node.js process)
+octos serve (control plane)                  Gateway (single Node.js process)
 ├── Profile A (child process)               ├── Agent "main"
 │   ├── User X (SessionActor + Handle)      │   ├── Session lane 1
 │   ├── User Y (SessionActor + Handle)      │   ├── Session lane 2..4

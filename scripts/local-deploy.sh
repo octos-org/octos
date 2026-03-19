@@ -320,7 +320,7 @@ echo "    Config:     $DATA_DIR/config.json"
 echo ""
 echo "  Next steps:"
 echo "    1. Set your API key:  export ANTHROPIC_API_KEY=sk-..."
-echo "    2. Start chatting:    crew chat"
+echo "    2. Start chatting:    octos chat"
 if [ -n "$CLI_FEATURES" ]; then
     echo "    3. Start dashboard:   octos serve"
     echo "    4. Open browser:      http://localhost:8080/admin/"

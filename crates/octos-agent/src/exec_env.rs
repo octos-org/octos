@@ -86,15 +86,23 @@ impl ExecEnvironment for LocalEnvironment {
         timeout_secs: u64,
     ) -> Result<ExecOutput> {
         let safe_env = sanitize_env(env);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("sh")
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), {
+            #[cfg(windows)]
+            let fut = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg(command)
+                .current_dir(working_dir)
+                .envs(&safe_env)
+                .output();
+            #[cfg(not(windows))]
+            let fut = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
                 .current_dir(working_dir)
                 .envs(&safe_env)
-                .output(),
-        )
+                .output();
+            fut
+        })
         .await;
 
         match result {
@@ -278,8 +286,9 @@ mod tests {
     #[tokio::test]
     async fn should_exec_local_command() {
         let env = LocalEnvironment;
+        let tmp = std::env::temp_dir();
         let output = env
-            .exec("echo hello", Path::new("/tmp"), &HashMap::new(), 10)
+            .exec("echo hello", &tmp, &HashMap::new(), 10)
             .await
             .unwrap();
         assert!(output.success());
@@ -316,10 +325,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn should_timeout_local_command() {
         let env = LocalEnvironment;
+        let tmp = std::env::temp_dir();
+        let result = env.exec("sleep 10", &tmp, &HashMap::new(), 1).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn should_timeout_local_command() {
+        let env = LocalEnvironment;
+        let tmp = std::env::temp_dir();
         let result = env
-            .exec("sleep 10", Path::new("/tmp"), &HashMap::new(), 1)
+            .exec("ping -n 11 127.0.0.1 > nul", &tmp, &HashMap::new(), 1)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
@@ -328,8 +349,9 @@ mod tests {
     #[tokio::test]
     async fn should_report_nonzero_exit() {
         let env = LocalEnvironment;
+        let tmp = std::env::temp_dir();
         let output = env
-            .exec("exit 42", Path::new("/tmp"), &HashMap::new(), 10)
+            .exec("exit 42", &tmp, &HashMap::new(), 10)
             .await
             .unwrap();
         assert!(!output.success());

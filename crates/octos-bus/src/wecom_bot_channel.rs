@@ -203,6 +203,7 @@ impl WeComBotChannel {
                     "msg_type": msg_type,
                 }
             }),
+            message_id: Some(msg_id.to_string()),
         })
     }
 
@@ -370,6 +371,7 @@ impl WeComBotChannel {
                                             }
                                         }
                                         "aibot_event_callback" => {
+                                            info!("WeComBot: event frame: {}", serde_json::to_string(&frame).unwrap_or_default());
                                             if let Some(body) = frame.get("body") {
                                                 let event = body.get("event")
                                                     .and_then(|v| v.as_str())
@@ -410,7 +412,7 @@ impl WeComBotChannel {
                                             }
                                         }
                                         other => {
-                                            debug!(cmd = other, "WeComBot: unknown command");
+                                            info!(cmd = other, "WeComBot: unknown command, frame: {}", serde_json::to_string(&frame).unwrap_or_default());
                                         }
                                     }
                                 }

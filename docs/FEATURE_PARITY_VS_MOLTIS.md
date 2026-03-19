@@ -48,7 +48,7 @@ Both are Rust, single-binary, multi-provider, sandboxed agent frameworks.
 | 4 | **Apple Container** (macOS native containers) | Native macOS containerization beyond sandbox-exec. | **LOW** -- octos already has sandbox-exec. Apple Container is newer/niche. |
 | 5 | ~~**Browser Automation**~~ | Playwright-based browser tool with session pool. | **DONE** -- Headless Chrome via CDP over tokio-tungstenite. Feature-gated `browser`. Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, zombie reaping, secure tempfiles. |
 | 6 | **TTS (Text-to-Speech)** | Multiple TTS providers (ElevenLabs, etc.). | **LOW** -- Niche for CLI/bot agent. |
-| 7 | **Onboarding Wizard** | Guided first-run setup for identity, profile, personality. | **LOW** -- octos has `crew init` which is simpler but sufficient. |
+| 7 | **Onboarding Wizard** | Guided first-run setup for identity, profile, personality. | **LOW** -- octos has `octos init` which is simpler but sufficient. |
 | 8 | **Sandbox Image Management** | CLI commands: `sandbox list/build/clean/remove`. Deterministic image tags (hash of base + packages). Auto-rebuild on package change. | **LOW** -- Nice UX but not critical. |
 | 9 | ~~**Message Queue Modes**~~ | `followup` (replay each queued message) vs `collect` (concatenate). Handles messages arriving during active agent run. | **DONE** -- `QueueMode::Followup` (FIFO) vs `QueueMode::Collect` (merge by session) via `gateway.queue_mode`. |
 | 10 | ~~**Prometheus Metrics**~~ | `/metrics` endpoint, SQLite history for metrics. | **DONE** -- `/metrics` endpoint with tool call counters/histograms and LLM token counters. |
@@ -100,7 +100,7 @@ Both are Rust, single-binary, multi-provider, sandboxed agent frameworks.
 
 10. ~~**Built-in web UI**~~ DONE -- Embedded SPA via `rust-embed` at `/` with session sidebar, chat, SSE streaming, dark theme. Vanilla HTML/CSS/JS, no build tools.
 
-11. ~~**Prometheus metrics endpoint**~~ DONE -- `/metrics` endpoint with `crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `octos_llm_tokens_total` counters/histograms via `metrics` + `metrics-exporter-prometheus`.
+11. ~~**Prometheus metrics endpoint**~~ DONE -- `/metrics` endpoint with `octos_tool_calls_total`, `octos_tool_call_duration_seconds`, `octos_llm_tokens_total` counters/histograms via `metrics` + `metrics-exporter-prometheus`.
 
 12. ~~**Message queue modes**~~ DONE -- `QueueMode::Followup` (FIFO, default) vs `QueueMode::Collect` (merge queued messages by session) via `gateway.queue_mode` config field.
 

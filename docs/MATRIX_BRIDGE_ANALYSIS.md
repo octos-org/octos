@@ -114,7 +114,7 @@ Ghost user MXIDs encode the platform:
 | **Operational complexity** | Synapse + Postgres + N bridges (6+ services) | Single binary |
 | **Reliability** | More failure points; WhatsApp/Signal disconnect periodically | Direct, fewer moving parts |
 | **Bot-specific features** | Invisible through bridges | Full access |
-| **Resource usage** | ~2 GB RAM for Synapse + bridges | Included in crew binary |
+| **Resource usage** | ~2 GB RAM for Synapse + bridges | Included in octos binary |
 | **E2EE support** | Optional (adds complexity) | Platform-dependent |
 
 ## Infrastructure Requirements
@@ -181,7 +181,7 @@ octos already has working, full-featured adapters for Telegram, WhatsApp, Feishu
 
 Implementing a `MatrixChannel` adapter for octos provides two benefits:
 
-1. **Users with existing Matrix infrastructure** can connect to crew through their homeserver — bridges they already run will "just work"
+1. **Users with existing Matrix infrastructure** can connect to octos through their homeserver — bridges they already run will "just work"
 2. **Niche platforms** (LINE, KakaoTalk, Google Chat, IRC) can be accessed through community bridges without writing Rust code
 
 ### Implementation Approach
@@ -200,7 +200,7 @@ Configuration in `config.json`:
     "channel_type": "matrix",
     "settings": {
       "homeserver": "https://matrix.example.com",
-      "user_id": "@crew:example.com",
+      "user_id": "@octos:example.com",
       "access_token": "syt_...",
       "allowed_rooms": ["!roomid:example.com"]
     }

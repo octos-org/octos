@@ -47,7 +47,7 @@ Six core principles drive every OpenClaw surface (CLI, web, mobile, chat channel
 
 ### octos adoption
 
-octos currently uses `crew init` with basic config generation. Adopt:
+octos currently uses `octos init` with basic config generation. Adopt:
 - Two-tier wizard (quick vs manual)
 - Security acknowledgement
 - Inline validation with recovery hints
@@ -264,7 +264,7 @@ Examples from OpenClaw:
 ### octos adoption
 
 octos uses `eyre` with suggestion hints (good foundation). Add:
-- `crew doctor` command for proactive scanning
+- `octos doctor` command for proactive scanning
 - Inline fix commands in error messages
 - Structured error categories (config, auth, channel, network)
 
@@ -334,7 +334,7 @@ discord/prod: enabled · configured · running · connected
 
 ### octos adoption
 
-octos has basic `crew status`. Add:
+octos has basic `octos status`. Add:
 - Per-account detail display
 - Last in/out timestamps
 - Actionable warnings with fix commands
@@ -543,7 +543,7 @@ Persistent outbound queue (`src/infra/outbound/delivery-queue.ts`):
 | P1 | Auto-escalation (ResponsivenessObserver) | ✅ **Done** | Self-healing on degradation |
 | P1 | Hedged racing (race 2, take winner) | ✅ **Done** | Halves worst-case latency |
 | P1 | Concurrent speculative overflow | ✅ **Done** | Never stuck waiting (truly concurrent via tokio::spawn + select!) |
-| P1 | `crew doctor` health scanner | ❌ Planned | Proactive issue detection |
+| P1 | `octos doctor` health scanner | ❌ Planned | Proactive issue detection |
 | P1 | Typing indicators per channel | ❌ Planned | "Agent is thinking" feedback |
 | P2 | Pairing mode for new contacts | ❌ Planned | Better than editing config files |
 | P2 | Channel status with last in/out timestamps | ❌ Planned | Operational visibility |

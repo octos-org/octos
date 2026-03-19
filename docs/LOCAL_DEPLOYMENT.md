@@ -1,6 +1,6 @@
 # Local Deployment Guide
 
-Deploy octos on your own machine (macOS, Linux, or Windows via WSL2).
+Deploy octos on your own machine (macOS, Linux, or Windows).
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ Deploy octos on your own machine (macOS, Linux, or Windows via WSL2).
 | Rust | 1.85.0+ | Install via [rustup.rs](https://rustup.rs) |
 | macOS | 13+ | Apple Silicon or Intel |
 | Linux | glibc 2.31+ | Ubuntu 20.04+, Debian 11+, Fedora 34+ |
-| Windows | WSL2 | Use Ubuntu WSL2, not native Windows |
+| Windows | 10/11 | Native build or WSL2 |
 
 ### Optional Dependencies
 
@@ -54,7 +54,7 @@ cd octos
 
 # 4. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
-crew chat
+octos chat
 ```
 
 **Background service (launchd):**
@@ -93,26 +93,26 @@ cd octos
 
 # 5. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
-crew chat
+octos chat
 ```
 
 **Background service (systemd user unit):**
 
-The deploy script creates `~/.config/systemd/user/crew-serve.service`.
+The deploy script creates `~/.config/systemd/user/octos-serve.service`.
 
 ```bash
 # Start service
-systemctl --user start crew-serve
+systemctl --user start octos-serve
 
 # Enable on boot (requires lingering)
 loginctl enable-linger $USER
-systemctl --user enable crew-serve
+systemctl --user enable octos-serve
 
 # View logs
-journalctl --user -u crew-serve -f
+journalctl --user -u octos-serve -f
 
 # Stop service
-systemctl --user stop crew-serve
+systemctl --user stop octos-serve
 ```
 
 ### Linux (Fedora/RHEL)
@@ -124,9 +124,43 @@ sudo dnf install -y gcc pkg-config openssl-devel
 # Then follow Ubuntu steps from step 2 onward
 ```
 
+### Windows (Native)
+
+octos builds and runs natively on Windows. Shell commands are executed via `cmd /C`.
+
+```powershell
+# 1. Install Rust (download rustup-init.exe from https://rustup.rs)
+rustup-init.exe
+
+# 2. Clone and build
+git clone https://github.com/octos-org/octos.git
+cd octos
+cargo install --path crates/octos-cli
+
+# 3. Set API key and run
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+crew chat
+```
+
+**PowerShell CI script:**
+
+A local CI script is provided for Windows:
+
+```powershell
+.\scripts\ci.ps1           # Run fmt + clippy + tests
+.\scripts\ci.ps1 -Fix      # Auto-fix formatting
+.\scripts\ci.ps1 -Quick    # Skip clippy (just fmt + test)
+```
+
+**Windows notes:**
+
+- Sandbox is disabled on Windows (no bubblewrap/sandbox-exec equivalent); shell commands run without isolation. Docker sandbox mode still works if Docker Desktop is installed.
+- API keys are stored via Windows Credential Manager (`keyring` crate).
+- Process management uses `taskkill` for cleanup.
+
 ### Windows (WSL2)
 
-octos does not build natively on Windows. Use WSL2 instead:
+Alternatively, you can use WSL2 for a Linux environment:
 
 ```powershell
 # 1. Install WSL2 (PowerShell as admin)
@@ -139,25 +173,9 @@ wsl --install -d Ubuntu
 
 When running `crew serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
 
-**Persistent service in WSL2:**
-
-WSL2 supports systemd on recent versions (Windows 11 22H2+). If systemd is enabled in `/etc/wsl.conf`:
-
-```ini
-[boot]
-systemd=true
-```
-
-Then the systemd user unit approach works. Otherwise, use a startup script:
-
-```bash
-# Add to ~/.bashrc or ~/.profile
-if ! pgrep -f "crew serve" >/dev/null; then
-    nohup crew serve --port 8080 > ~/.octos/serve.log 2>&1 &
-fi
-```
-
 ## Deploy Script Reference
+
+On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
 
 ```
 ./scripts/local-deploy.sh [OPTIONS]
@@ -176,10 +194,10 @@ Options:
 **What the script does:**
 
 1. Checks prerequisites (Rust, platform deps)
-2. Builds `crew` binary with selected features
+2. Builds `octos` binary with selected features
 3. Builds app-skill binaries (unless `--no-skills`)
 4. Signs binaries on macOS (ad-hoc codesign)
-5. Runs `crew init` if `~/.octos` doesn't exist
+5. Runs `octos init` if `~/.octos` doesn't exist
 6. Creates background service file (launchd on macOS, systemd on Linux)
 
 **Uninstall:**
@@ -202,7 +220,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # Or
 export OPENAI_API_KEY=sk-...
 # Or use OAuth login
-crew auth login --provider openai
+octos auth login --provider openai
 ```
 
 ### Config File
@@ -224,9 +242,9 @@ Edit `~/.octos/config.json` (or `.octos/config.json` in project directory):
 ### Verify Installation
 
 ```bash
-crew --version          # Check binary
-crew status             # Check config + API keys
-crew chat --message "Hello"  # Quick test
+octos --version          # Check binary
+octos status             # Check config + API keys
+octos chat --message "Hello"  # Quick test
 ```
 
 ## Upgrading
@@ -241,17 +259,19 @@ git pull origin main
 launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
 launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
 # Linux:
-systemctl --user restart crew-serve
+systemctl --user restart octos-serve
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| `crew: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
+| `octos: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
 | Build fails on Linux | Install `build-essential pkg-config libssl-dev` |
-| macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/crew` |
-| Dashboard not accessible | Check port: `crew serve --port 8080`, open `http://localhost:8080/admin/` |
+| macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/octos` |
+| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080/admin/` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
-| Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u crew-serve` |
+| Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u octos-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |
+| Windows: `crew` not found | Ensure `%USERPROFILE%\.cargo\bin` is in your PATH |
+| Windows: shell commands fail | Commands run via `cmd /C`; use Windows-compatible syntax |

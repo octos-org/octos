@@ -110,7 +110,9 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("src/module.rs"));
+        assert!(
+            result.output.contains("src/module.rs") || result.output.contains("src\\module.rs")
+        );
     }
 
     #[tokio::test]

@@ -300,7 +300,7 @@ All backends remove these from the child process environment before execution.
 
 ### 2.10 Per-Profile CWD Isolation
 
-When `crew serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
+When `octos serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
 
 #### CWD scoping
 
@@ -308,18 +308,18 @@ The gateway `--cwd` flag sets the process working directory before any tool init
 
 #### Shell sandbox read restriction
 
-On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `crew serve` populates `read_allow_paths` with `project_dir` (the `--crew-home` path, typically `~/.octos/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
+On macOS, the shell sandbox SBPL profile supports a `read_allow_paths` list. When `octos serve` populates `read_allow_paths` with `project_dir` (the `--octos-home` path, typically `~/.octos/`), the SBPL policy replaces the blanket `(allow file-read*)` with per-path rules:
 
 ```scheme
 ;; Instead of (allow file-read*), generate:
 (allow file-read* (subpath "{data_dir}"))        ;; profile's own data
-(allow file-read* (subpath "{crew_home}"))        ;; shared skills, configs
+(allow file-read* (subpath "{octos_home}"))        ;; shared skills, configs
 (allow file-read* (subpath "/usr"))               ;; system paths
 (allow file-read* (subpath "/bin"))
 ;; ... other system paths
 ```
 
-This restricts shell command reads at the kernel level to the profile's data, shared crew resources, and system paths. A shell command in profile A cannot `cat` files from profile B's data directory.
+This restricts shell command reads at the kernel level to the profile's data, shared octos resources, and system paths. A shell command in profile A cannot `cat` files from profile B's data directory.
 
 #### SendFileTool base_dir validation
 
@@ -331,13 +331,13 @@ This restricts shell command reads at the kernel level to the profile's data, sh
 
 #### project_dir decoupled from cwd
 
-Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.octos/config.json`), bundled app-skills -- are loaded from `--crew-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
+Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.octos/config.json`), bundled app-skills -- are loaded from `--octos-home` (the `project_dir`), not from `cwd`. This decoupling means narrowing `cwd` to the profile's data directory does not break access to shared pipelines and configurations.
 
 #### Remaining gaps
 
 - **SpawnTool and PipelineTool sub-agents**: These use `with_builtins()` without sandbox configuration. `resolve_path()` still enforces path containment, but the shell tool in sub-agents runs unsandboxed.
 - **bwrap `read_allow_paths`**: The Bubblewrap (Linux) sandbox backend does not yet implement `read_allow_paths`. Only macOS SBPL applies read restrictions when `read_allow_paths` is populated.
-- **SBPL read restriction is conditional**: The blanket `(allow file-read*)` is only replaced with per-path rules when `read_allow_paths` is non-empty. If the list is not populated (e.g., standalone `crew chat` without `crew serve`), the old permissive behavior remains.
+- **SBPL read restriction is conditional**: The blanket `(allow file-read*)` is only replaced with per-path rules when `read_allow_paths` is non-empty. If the list is not populated (e.g., standalone `octos chat` without `octos serve`), the old permissive behavior remains.
 
 ---
 
@@ -399,47 +399,47 @@ Change `SandboxConfig::default()` to `enabled: true`. Auto-detection (`SandboxMo
 
 **LAMP equivalent**: Each PHP-FPM pool runs as a separate Unix user (`webA`, `webB`). The kernel enforces everything — file permissions, process visibility, signal delivery.
 
-**octos target**: `crew serve` spawns each profile's gateway child process as a dedicated Unix user.
+**octos target**: `octos serve` spawns each profile's gateway child process as a dedicated Unix user.
 
 ```rust
 // In process_manager.rs, when spawning a profile gateway:
 pub struct ProfileProcess {
-    pub run_as_user: Option<String>,  // e.g., "crew_profile_abc"
+    pub run_as_user: Option<String>,  // e.g., "octos_profile_abc"
 }
 
 // Spawn with UID switch:
-// Option A: sudo -u crew_profile_abc crew gateway --profile abc
+// Option A: sudo -u octos_profile_abc octos gateway --profile abc
 // Option B: setuid() after fork (requires root parent)
 // Option C: macOS launchd per-user plist
 ```
 
 **What this gives us for free (kernel-enforced)**:
-- File isolation: `chmod 700 /home/crew_abc/` — other profiles can't read or write
+- File isolation: `chmod 700 /home/octos_abc/` — other profiles can't read or write
 - Process isolation: `kill()` fails across UIDs without root
 - Signal isolation: can't `SIGKILL` another profile's processes
 - Socket isolation: Unix sockets owned by UID
 - `/proc` hiding: `hidepid=2` on Linux hides other UIDs' processes
 
-**Profile user provisioning** (in `crew serve` or admin API):
+**Profile user provisioning** (in `octos serve` or admin API):
 ```bash
 # Create profile user (one-time, requires admin)
-sudo useradd -r -m -d /home/crew_abc -s /usr/sbin/nologin crew_profile_abc
-sudo chown -R crew_profile_abc:crew_profile_abc /home/crew_abc/
-sudo chmod 700 /home/crew_abc/
+sudo useradd -r -m -d /home/octos_abc -s /usr/sbin/nologin octos_profile_abc
+sudo chown -R octos_profile_abc:octos_profile_abc /home/octos_abc/
+sudo chmod 700 /home/octos_abc/
 
-# crew serve spawns:
-sudo -u crew_profile_abc crew gateway \
-  --data-dir /home/crew_abc/.octos \
-  --cwd /home/crew_abc/workspace
+# octos serve spawns:
+sudo -u octos_profile_abc octos gateway \
+  --data-dir /home/octos_abc/.octos \
+  --cwd /home/octos_abc/workspace
 ```
 
 **Config** (`~/.octos/profiles/{id}.json`):
 ```json
 {
   "isolation": {
-    "run_as_user": "crew_profile_abc",
-    "data_dir": "/home/crew_abc/.octos",
-    "cwd": "/home/crew_abc/workspace"
+    "run_as_user": "octos_profile_abc",
+    "data_dir": "/home/octos_abc/.octos",
+    "cwd": "/home/octos_abc/workspace"
   }
 }
 ```
@@ -509,7 +509,7 @@ ruleset.restrict_self()?;
 sudo quotaon -u /home
 
 # Set per-profile quota
-sudo setquota -u crew_profile_abc \
+sudo setquota -u octos_profile_abc \
   5242880 5767168 \  # 5GB soft / 5.5GB hard (in KB)
   0 0 \              # no inode limit
   /home
@@ -621,15 +621,15 @@ Profile "sales" (host process, PID 1001, uid=yuechen)
 
 **Target model** (profile container):
 ```
-crew serve (host)
-├── docker run -d --name crew-sales \
-│     --network crew-internal \
+octos serve (host)
+├── docker run -d --name octos-sales \
+│     --network octos-internal \
 │     -v /data/sales:/data \
 │     --cpus 2 --memory 1g \
 │     octos gateway --profile sales
 │
-├── docker run -d --name crew-support \
-│     --network crew-internal \
+├── docker run -d --name octos-support \
+│     --network octos-internal \
 │     -v /data/support:/data \
 │     --cpus 1 --memory 512m \
 │     octos gateway --profile support
@@ -638,7 +638,7 @@ crew serve (host)
 #### The network problem
 
 Profile containers need selective network access:
-- **Must reach**: LLM APIs (api.moonshot.ai), channel APIs (api.telegram.org), control plane (crew serve)
+- **Must reach**: LLM APIs (api.moonshot.ai), channel APIs (api.telegram.org), control plane (octos serve)
 - **Must NOT reach**: cloud metadata (169.254.169.254), local network (192.168.0.0/16), other profile containers
 
 `--network none` blocks everything (broken). `--network bridge` allows everything (no isolation). Neither works.
@@ -648,35 +648,35 @@ Profile containers need selective network access:
 Run a domain-allowlist HTTP proxy on the host. Profile containers route all traffic through it.
 
 ```
-crew serve (host, port 3000)
+octos serve (host, port 3000)
 ├── allowlist proxy (host, port 8888)
 │   ├── sales profile: allow api.moonshot.ai, api.telegram.org
 │   ├── support profile: allow api.deepseek.com, api.telegram.org
 │   └── deny all: 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
 │
-├── container "crew-sales" (--network=crew-internal)
+├── container "octos-sales" (--network=octos-internal)
 │   └── HTTPS_PROXY=http://host.docker.internal:8888
 │       → proxy allows api.moonshot.ai ✅
 │       → proxy blocks 169.254.169.254 ❌
-│       → proxy blocks crew-support container ❌
+│       → proxy blocks octos-support container ❌
 │
-├── container "crew-support" (--network=crew-internal)
+├── container "octos-support" (--network=octos-internal)
 │   └── HTTPS_PROXY=http://host.docker.internal:8888
 │       → proxy allows api.deepseek.com ✅
-│       → proxy blocks crew-sales container ❌
+│       → proxy blocks octos-sales container ❌
 ```
 
 **Why proxy over iptables**: DNS names resolve to multiple IPs that change. iptables requires static IPs. A domain-allowlist proxy checks the hostname in the HTTP CONNECT request — works regardless of IP changes.
 
 **Proxy options**:
 - **Squid** — mature, widely deployed, ACL-based domain filtering
-- **Custom Rust proxy** — minimal, embedded in `crew serve`, per-profile config
+- **Custom Rust proxy** — minimal, embedded in `octos serve`, per-profile config
 - **Envoy sidecar** — strongest isolation (one proxy per container), but most complex
 
-**Recommended**: Custom Rust proxy embedded in `crew serve`. Reads `allowed_domains` from each profile config. Single process, no external dependencies.
+**Recommended**: Custom Rust proxy embedded in `octos serve`. Reads `allowed_domains` from each profile config. Single process, no external dependencies.
 
 ```rust
-// In crew serve, spawn a lightweight HTTPS CONNECT proxy
+// In octos serve, spawn a lightweight HTTPS CONNECT proxy
 pub struct AllowlistProxy {
     /// Per-profile domain allowlists, keyed by source IP or auth token.
     rules: HashMap<String, Vec<String>>,
@@ -784,7 +784,7 @@ octos is solving the same multi-tenant isolation problem that PHP shared hosting
 ```
 LAMP shared hosting (1990s):          octos (2026):
 
-Apache/nginx (root)                    crew serve (control plane)
+Apache/nginx (root)                    octos serve (control plane)
 ├── PHP-FPM pool for tenant A          ├── Profile A (child process)
 │   ├── runs as Unix user "webA"       │   ├── runs as SAME user (gap)
 │   ├── chroot /home/webA/             │   ├── per-user workspace dir

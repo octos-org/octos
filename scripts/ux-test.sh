@@ -17,11 +17,11 @@ FILTER="${1:-all}"
 
 # Build test binaries (suppressing warnings)
 echo "Building test binaries..."
-cargo test -p crew-llm --test ux_adaptive --no-run 2>/dev/null
+cargo test -p octos-llm --test ux_adaptive --no-run 2>/dev/null
 cargo test -p octos-cli queue_ux --no-run 2>/dev/null
 
 # Find the test binaries
-LLM_BIN=$(cargo test -p crew-llm --test ux_adaptive --no-run 2>&1 | grep 'Executable tests/ux_adaptive' | awk '{print $NF}' | tr -d '()')
+LLM_BIN=$(cargo test -p octos-llm --test ux_adaptive --no-run 2>&1 | grep 'Executable tests/ux_adaptive' | awk '{print $NF}' | tr -d '()')
 CLI_BIN=$(cargo test -p octos-cli queue_ux --no-run 2>&1 | grep 'Executable unittests' | awk '{print $NF}' | tr -d '()')
 
 run_test() {
@@ -38,7 +38,7 @@ run_test() {
 
 FAILED=0
 
-# Adaptive routing tests (crew-llm)
+# Adaptive routing tests (octos-llm)
 if [[ "$FILTER" == "all" || "$FILTER" == "adaptive" ]]; then
     run_test "$LLM_BIN" test_kimi_responds
     run_test "$LLM_BIN" test_deepseek_responds
