@@ -266,7 +266,7 @@ worker_prompt=\"You are an expert investigative researcher. {{task}}. Search tho
 model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
   analyze [prompt=\"You are a senior research analyst. Synthesize the findings from multiple research agents below. Cross-reference sources, resolve contradictions, identify key themes and data gaps. Organize by subtopic with all citations preserved.\", \
 model=\"{strong_model}\", tools=\"\", timeout_secs=\"300\"]\n  \
-  synthesize [prompt=\"You are an expert report writer. Write a comprehensive, well-structured investigative research report based on the analysis. Include all citations with URLs. Match the query language. Save the report as a file.\", \
+  synthesize [prompt=\"You are an expert report writer. Write a comprehensive, well-structured investigative research report. Include all citations with URLs. Match the query language.\", \
 model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
   plan_and_search -> analyze\n  \
   analyze -> synthesize\n\
