@@ -570,105 +570,106 @@ async fn web_search(
 ) -> SearchResult {
     // If a specific engine is requested, use it directly
     if let Some(eng) = engine {
+        if eng == "all" {
+            // Fire ALL engines in parallel — use sparingly (high resource cost)
+            return parallel_all_engines(client, query, count).await;
+        }
         if let Some(r) = try_engine(client, query, count, eng).await {
             return r;
         }
     }
 
-    // Fire ALL available engines in parallel, merge results.
-    // This maximizes coverage — different engines find different sources.
+    // Default: use the BEST available engine (priority: tavily > perplexity > brave > ddg).
+    // Firing all engines in parallel is available via search_engine="all" but uses
+    // too many connections under concurrent load (8 pipelines × 7 workers × 4 engines = crash).
+    let priority: Vec<(&str, Option<String>)> = vec![
+        ("tavily", std::env::var("TAVILY_API_KEY").ok()),
+        ("perplexity", std::env::var("PERPLEXITY_API_KEY").ok()),
+        ("brave", std::env::var("BRAVE_API_KEY").ok()),
+        ("duckduckgo", Some("free".into())),
+    ];
+
+    for (name, key) in &priority {
+        if let Some(k) = key {
+            if !k.is_empty() {
+                if let Some(r) = try_engine(client, query, count, name).await {
+                    return r;
+                }
+            }
+        }
+    }
+
+    // All engines failed
+    SearchResult {
+        output: format!("No results found from any search engine for: {query}"),
+        success: false,
+    }
+}
+
+/// Fire ALL available engines in parallel and merge results.
+/// Use sparingly — with many concurrent workers this creates hundreds of connections.
+async fn parallel_all_engines(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+) -> SearchResult {
     let mut handles = Vec::new();
 
-    if let Ok(api_key) = std::env::var("TAVILY_API_KEY") {
-        if !api_key.is_empty() {
+    if let Ok(k) = std::env::var("TAVILY_API_KEY") {
+        if !k.is_empty() {
             let c = client.clone();
             let q = query.to_string();
-            let k = api_key.clone();
-            handles.push(tokio::spawn(async move {
-                ("tavily", tavily_search(&c, &q, count, &k).await)
-            }));
+            handles.push(tokio::spawn(async move { ("tavily", tavily_search(&c, &q, count, &k).await) }));
         }
     }
-    if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
-        if !api_key.is_empty() {
+    if let Ok(k) = std::env::var("PERPLEXITY_API_KEY") {
+        if !k.is_empty() {
             let c = client.clone();
             let q = query.to_string();
-            let k = api_key.clone();
-            handles.push(tokio::spawn(async move {
-                ("perplexity", perplexity_search(&c, &q, &k).await)
-            }));
+            handles.push(tokio::spawn(async move { ("perplexity", perplexity_search(&c, &q, &k).await) }));
         }
     }
-    // DuckDuckGo — free but unreliable, include for diversity
+    if let Ok(k) = std::env::var("BRAVE_API_KEY") {
+        let c = client.clone();
+        let q = query.to_string();
+        handles.push(tokio::spawn(async move { ("brave", brave_search(&c, &q, count, &k).await) }));
+    }
     {
         let c = client.clone();
         let q = query.to_string();
-        handles.push(tokio::spawn(async move {
-            ("duckduckgo", ddg_search(&c, &q, count).await)
-        }));
-    }
-    if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
-        let c = client.clone();
-        let q = query.to_string();
-        let k = api_key.clone();
-        handles.push(tokio::spawn(async move {
-            ("brave", brave_search(&c, &q, count, &k).await)
-        }));
+        handles.push(tokio::spawn(async move { ("duckduckgo", ddg_search(&c, &q, count).await) }));
     }
 
-    // Wait for all with a 30s timeout
     let results = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         futures::future::join_all(handles),
-    )
-    .await
-    {
-        Ok(results) => results,
-        Err(_) => {
-            eprintln!("search timeout — some engines didn't respond in 30s");
-            Vec::new()
-        }
+    ).await {
+        Ok(r) => r,
+        Err(_) => Vec::new(),
     };
 
-    // Merge: pick the best result (longest successful output), append others
     let mut successful: Vec<(String, SearchResult)> = results
         .into_iter()
         .filter_map(|r| r.ok())
         .filter(|(_, r)| r.success && !r.output.contains("No results found"))
-        .map(|(name, r)| (name.to_string(), r))
+        .map(|(n, r)| (n.to_string(), r))
         .collect();
 
     if successful.is_empty() {
         return SearchResult {
-            output: format!("No results found from any search engine for: {query}"),
+            output: format!("No results from any engine for: {query}"),
             success: false,
         };
     }
 
-    // Sort by output length descending — richest result first
     successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
-
-    let engines_used: Vec<&str> = successful.iter().map(|(n, _)| n.as_str()).collect();
-    eprintln!(
-        "search engines: {} ({} returned results)",
-        engines_used.join(", "),
-        successful.len()
-    );
-
-    // Use the richest result as primary
     let mut primary = successful.remove(0);
-
-    // Append content from other engines (may have URL overlap — acceptable for richer context)
     for (name, other) in &successful {
         if other.output.len() > 100 {
-            primary
-                .1
-                .output
-                .push_str(&format!("\n\n--- Additional results ({name}) ---\n"));
+            primary.1.output.push_str(&format!("\n\n--- Additional ({name}) ---\n"));
             primary.1.output.push_str(&other.output);
         }
     }
-
     primary.1
 }
 
