@@ -5,7 +5,7 @@
 //! Replies via `aibot_send_msg` (markdown) over the same WebSocket.
 //! No public callback URL required — the bot connects outbound.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,6 +43,8 @@ const RECONNECT_MAX_DELAY_MS: u64 = 60000;
 const MAX_SEEN_IDS: usize = 1000;
 /// Max message length for WeCom markdown.
 const MAX_MSG_LENGTH: usize = 4096;
+/// Maximum req_id entries to track for stream replies.
+const MAX_REQ_ID_ENTRIES: usize = 500;
 
 type WsSink = SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -64,6 +66,9 @@ pub struct WeComBotChannel {
     seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Shared write-half of the WebSocket, set once connected.
     ws_sink: Arc<Mutex<Option<WsSink>>>,
+    /// Maps `chat_id` → `req_id` from the most recent inbound message.
+    /// Used to route streaming replies back via `aibot_respond_msg`.
+    req_id_map: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl WeComBotChannel {
@@ -80,6 +85,7 @@ impl WeComBotChannel {
             shutdown,
             seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             ws_sink: Arc::new(Mutex::new(None)),
+            req_id_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -100,8 +106,23 @@ impl WeComBotChannel {
         false
     }
 
+    /// Store a `req_id` for a chat so streaming replies can reference it.
+    fn store_req_id(&self, chat_id: &str, req_id: &str) {
+        let mut map = self.req_id_map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_REQ_ID_ENTRIES {
+            map.clear();
+        }
+        map.insert(chat_id.to_string(), req_id.to_string());
+    }
+
+    /// Look up the `req_id` for a chat.
+    fn get_req_id(&self, chat_id: &str) -> Option<String> {
+        let map = self.req_id_map.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(chat_id).cloned()
+    }
+
     /// Parse an `aibot_msg_callback` body into an InboundMessage.
-    fn parse_callback(&self, body: &Value) -> Option<InboundMessage> {
+    fn parse_callback(&self, body: &Value, req_id: &str) -> Option<InboundMessage> {
         let msg_type = body.get("msgtype").and_then(|v| v.as_str())?;
         let from_user = body
             .get("from")
@@ -115,6 +136,11 @@ impl WeComBotChannel {
             .get("chatid")
             .and_then(|v| v.as_str())
             .unwrap_or(from_user);
+
+        // Store req_id for streaming replies before any filtering.
+        if !req_id.is_empty() {
+            self.store_req_id(chat_id, req_id);
+        }
 
         if !msg_id.is_empty() && self.dedup_check(msg_id) {
             debug!(msg_id, "WeComBot: dedup filtered message");
@@ -251,6 +277,44 @@ impl WeComBotChannel {
         .to_string()
     }
 
+    /// Build an `aibot_respond_msg` stream frame.
+    ///
+    /// Uses the original message's `req_id` for routing. Content is the full
+    /// accumulated text (not a delta). Set `finish` to `true` on the last frame.
+    fn stream_frame(req_id: &str, stream_id: &str, content: &str, finish: bool) -> String {
+        json!({
+            "cmd": "aibot_respond_msg",
+            "headers": {
+                "req_id": req_id,
+            },
+            "body": {
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "content": content,
+                    "finish": finish,
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// Send a stream frame over the WebSocket.
+    async fn send_ws_frame(&self, frame: &str) -> Result<()> {
+        let mut ws = self.ws_sink.lock().await;
+        match *ws {
+            Some(ref mut sink) => {
+                sink.send(WsMessage::Text(frame.into()))
+                    .await
+                    .wrap_err("WeComBot: failed to send frame")?;
+                Ok(())
+            }
+            None => {
+                bail!("WeComBot: WebSocket not connected");
+            }
+        }
+    }
+
     /// Build a TLS connector for the WebSocket connection.
     fn make_tls_connector() -> Result<tokio_tungstenite::Connector> {
         // Explicitly build a rustls ClientConfig to avoid the CryptoProvider
@@ -361,8 +425,13 @@ impl WeComBotChannel {
 
                                     match cmd {
                                         "aibot_msg_callback" => {
+                                            let req_id = frame
+                                                .get("headers")
+                                                .and_then(|h| h.get("req_id"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
                                             if let Some(body) = frame.get("body") {
-                                                if let Some(inbound) = self.parse_callback(body) {
+                                                if let Some(inbound) = self.parse_callback(body, req_id) {
                                                     if inbound_tx.send(inbound).await.is_err() {
                                                         error!("WeComBot: inbound_tx dropped");
                                                         bail!("inbound channel closed");
@@ -507,6 +576,10 @@ impl Channel for WeComBotChannel {
         Ok(())
     }
 
+    fn supports_edit(&self) -> bool {
+        true
+    }
+
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
         if msg.content.is_empty() {
             return Ok(());
@@ -519,17 +592,7 @@ impl Channel for WeComBotChannel {
         );
 
         let frame = Self::send_msg_frame(&msg.chat_id, &msg.content);
-        let mut ws = self.ws_sink.lock().await;
-        match *ws {
-            Some(ref mut sink) => {
-                sink.send(WsMessage::Text(frame.into()))
-                    .await
-                    .wrap_err("WeComBot: failed to send message")?;
-            }
-            None => {
-                bail!("WeComBot: WebSocket not connected, cannot send");
-            }
-        }
+        self.send_ws_frame(&frame).await?;
 
         if !msg.media.is_empty() {
             warn!(
@@ -537,6 +600,74 @@ impl Channel for WeComBotChannel {
                 "WeComBot: file attachments not supported for group robot, skipping"
             );
         }
+
+        Ok(())
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        if msg.content.is_empty() {
+            return Ok(None);
+        }
+
+        // Look up the req_id for this chat. Without it we can't use the
+        // streaming protocol, so fall back to a regular proactive send.
+        let req_id = match self.get_req_id(&msg.chat_id) {
+            Some(id) => id,
+            None => {
+                debug!(
+                    chat_id = %msg.chat_id,
+                    "WeComBot: no req_id for chat, falling back to send_msg"
+                );
+                self.send(msg).await?;
+                return Ok(None);
+            }
+        };
+
+        let stream_id = format!("stream_{}", Uuid::now_v7());
+
+        let frame = Self::stream_frame(&req_id, &stream_id, &msg.content, false);
+        self.send_ws_frame(&frame).await?;
+
+        debug!(
+            chat_id = %msg.chat_id,
+            stream_id = %stream_id,
+            "WeComBot: started stream"
+        );
+
+        Ok(Some(stream_id))
+    }
+
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
+        let req_id = match self.get_req_id(chat_id) {
+            Some(id) => id,
+            None => {
+                warn!(chat_id, "WeComBot: no req_id for stream edit");
+                return Ok(());
+            }
+        };
+
+        let frame = Self::stream_frame(&req_id, message_id, new_content, false);
+        self.send_ws_frame(&frame).await
+    }
+
+    async fn finish_stream(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+    ) -> Result<()> {
+        let req_id = match self.get_req_id(chat_id) {
+            Some(id) => id,
+            None => {
+                warn!(chat_id, "WeComBot: no req_id for stream finish");
+                return Ok(());
+            }
+        };
+
+        let frame = Self::stream_frame(&req_id, message_id, final_content, true);
+        self.send_ws_frame(&frame).await?;
+
+        debug!(chat_id, stream_id = message_id, "WeComBot: finished stream");
 
         Ok(())
     }
@@ -573,6 +704,7 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
             ws_sink: Arc::new(Mutex::new(None)),
+            req_id_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -631,7 +763,7 @@ mod tests {
             "text": { "content": "@bot hello world" }
         });
 
-        let msg = bot.parse_callback(&body).unwrap();
+        let msg = bot.parse_callback(&body, "req_123").unwrap();
         assert_eq!(msg.channel, "wecom-bot");
         assert_eq!(msg.sender_id, "user123");
         assert_eq!(msg.chat_id, "group_abc");
@@ -649,7 +781,7 @@ mod tests {
             "voice": { "content": "transcribed text here" }
         });
 
-        let msg = bot.parse_callback(&body).unwrap();
+        let msg = bot.parse_callback(&body, "req_v1").unwrap();
         assert_eq!(msg.content, "transcribed text here");
     }
 
@@ -669,7 +801,7 @@ mod tests {
             }
         });
 
-        let msg = bot.parse_callback(&body).unwrap();
+        let msg = bot.parse_callback(&body, "req_m1").unwrap();
         assert_eq!(msg.content, "look at this [image]");
     }
 
@@ -683,7 +815,7 @@ mod tests {
             "from": { "userid": "user1" }
         });
 
-        assert!(bot.parse_callback(&body).is_none());
+        assert!(bot.parse_callback(&body, "req_e1").is_none());
     }
 
     #[test]
@@ -697,7 +829,7 @@ mod tests {
             "text": { "content": "hello" }
         });
 
-        assert!(bot.parse_callback(&body).is_none());
+        assert!(bot.parse_callback(&body, "req_d1").is_none());
     }
 
     #[test]
@@ -730,5 +862,84 @@ mod tests {
                 .unwrap()
                 .starts_with("ping_")
         );
+    }
+
+    #[test]
+    fn should_report_supports_edit() {
+        let bot = make_bot(vec![]);
+        assert!(bot.supports_edit());
+    }
+
+    #[test]
+    fn should_store_and_retrieve_req_id() {
+        let bot = make_bot(vec![]);
+        assert!(bot.get_req_id("chat1").is_none());
+
+        bot.store_req_id("chat1", "req_abc");
+        assert_eq!(bot.get_req_id("chat1").unwrap(), "req_abc");
+
+        // Overwrite with newer req_id
+        bot.store_req_id("chat1", "req_def");
+        assert_eq!(bot.get_req_id("chat1").unwrap(), "req_def");
+    }
+
+    #[test]
+    fn should_clear_req_id_map_on_overflow() {
+        let bot = make_bot(vec![]);
+        for i in 0..MAX_REQ_ID_ENTRIES {
+            bot.store_req_id(&format!("chat_{i}"), &format!("req_{i}"));
+        }
+        // Next store triggers clear
+        bot.store_req_id("chat_new", "req_new");
+        assert_eq!(bot.get_req_id("chat_new").unwrap(), "req_new");
+        assert!(bot.get_req_id("chat_0").is_none());
+    }
+
+    #[test]
+    fn should_store_req_id_during_parse_callback() {
+        let bot = make_bot(vec![]);
+        let body: Value = json!({
+            "msgid": "store_test",
+            "msgtype": "text",
+            "chatid": "group_xyz",
+            "from": { "userid": "user1" },
+            "text": { "content": "hi" }
+        });
+
+        bot.parse_callback(&body, "req_from_server_42");
+        assert_eq!(bot.get_req_id("group_xyz").unwrap(), "req_from_server_42");
+    }
+
+    #[test]
+    fn should_build_stream_frame_intermediate() {
+        let frame: Value = serde_json::from_str(&WeComBotChannel::stream_frame(
+            "req_123",
+            "stream_abc",
+            "Hello world",
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(frame["cmd"], "aibot_respond_msg");
+        assert_eq!(frame["headers"]["req_id"], "req_123");
+        assert_eq!(frame["body"]["msgtype"], "stream");
+        assert_eq!(frame["body"]["stream"]["id"], "stream_abc");
+        assert_eq!(frame["body"]["stream"]["content"], "Hello world");
+        assert_eq!(frame["body"]["stream"]["finish"], false);
+    }
+
+    #[test]
+    fn should_build_stream_frame_final() {
+        let frame: Value = serde_json::from_str(&WeComBotChannel::stream_frame(
+            "req_123",
+            "stream_abc",
+            "Complete response",
+            true,
+        ))
+        .unwrap();
+
+        assert_eq!(frame["cmd"], "aibot_respond_msg");
+        assert_eq!(frame["body"]["stream"]["finish"], true);
+        assert_eq!(frame["body"]["stream"]["content"], "Complete response");
     }
 }
