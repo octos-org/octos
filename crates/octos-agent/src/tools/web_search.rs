@@ -1,11 +1,12 @@
 //! Web search tool with multiple provider support.
 //!
 //! Provider priority (best quality first, DDG as free fallback):
-//! 1. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
-//! 2. DuckDuckGo (no key) — free HTML search
-//! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
-//! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//! 1. Tavily (`TAVILY_API_KEY`) — AI-optimized search, 1k free/month
+//! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
+//! 3. DuckDuckGo (no key) — free HTML search
+//! 4. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
+//! 5. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 6. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
 //! the next one is attempted. Perplexity is last because it costs the most but
@@ -136,6 +137,20 @@ struct PerplexityMessage {
     content: Option<String>,
 }
 
+// --- Tavily types ---
+
+#[derive(Deserialize)]
+struct TavilyResponse {
+    results: Option<Vec<TavilyResult>>,
+}
+
+#[derive(Deserialize)]
+struct TavilyResult {
+    title: String,
+    url: String,
+    content: String,
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -143,7 +158,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Supports Exa, Brave, You.com, Perplexity, and DuckDuckGo (auto-detected from environment)."
+        "Search the web for information. Supports Tavily, Exa, Brave, You.com, Perplexity, and DuckDuckGo (auto-detected from environment)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -177,13 +192,26 @@ impl Tool for WebSearchTool {
         };
         let count = input.count.or(config_count).unwrap_or(5).clamp(1, 10);
 
-        // Provider priority: free/cheap first, Perplexity as AI-powered fallback.
-        // 1. DuckDuckGo (free, always available)
-        // 2. Brave Search (free tier: 2k queries/month)
-        // 3. You.com (API key required)
-        // 4. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+        // Provider priority: Tavily first (best quality), then free/cheap, Perplexity last.
+        // 1. Tavily (AI-optimized, 1k free/month)
+        // 2. DuckDuckGo (free, always available)
+        // 3. Exa (neural search)
+        // 4. Brave Search (free tier: 2k queries/month)
+        // 5. You.com (API key required)
+        // 6. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
 
-        // Try DuckDuckGo first (free, no key needed)
+        // Tavily (AI-optimized search — best for recent/niche topics)
+        if let Ok(api_key) = std::env::var("TAVILY_API_KEY") {
+            let result = self.tavily_search(&input.query, count, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    info!(provider = "tavily", query = %input.query, "web search");
+                    return result;
+                }
+            }
+        }
+
+        // Try DuckDuckGo (free, no key needed)
         let ddg_result = self.ddg_search(&input.query, count).await;
         if let Ok(ref r) = ddg_result {
             if r.success && !r.output.contains("No results found") {
@@ -238,6 +266,64 @@ impl Tool for WebSearchTool {
 }
 
 impl WebSearchTool {
+    // --- Tavily (AI-optimized search) ---
+
+    async fn tavily_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let body = serde_json::json!({
+            "query": query,
+            "max_results": count,
+            "include_answer": false,
+        });
+
+        let response = self
+            .client
+            .post("https://api.tavily.com/search")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to call Tavily API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: format!("Tavily API error ({status}): {body}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let tavily: TavilyResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse Tavily response")?;
+
+        let results = tavily.results.unwrap_or_default();
+
+        if results.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+
+        let mut output = format!("Results for: {query}\n\n");
+        for (i, r) in results.iter().enumerate() {
+            output.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title, r.url));
+            let snippet = octos_core::truncated_utf8(&r.content, 300, "...");
+            output.push_str(&format!("   {}\n\n", snippet));
+        }
+
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
     // --- Exa (neural search) ---
 
     async fn exa_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
@@ -423,11 +509,7 @@ impl WebSearchTool {
             }
             // Include first snippet if available (richer than description)
             if let Some(snippet) = r.snippets.first() {
-                let truncated = if snippet.len() > 300 {
-                    format!("{}...", &snippet[..300])
-                } else {
-                    snippet.clone()
-                };
+                let truncated = octos_core::truncated_utf8(snippet, 300, "...");
                 output.push_str(&format!("   {}\n", truncated));
             }
             output.push('\n');
