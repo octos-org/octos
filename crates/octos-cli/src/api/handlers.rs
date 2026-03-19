@@ -24,6 +24,9 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub stream: bool,
+    /// File paths from prior `/api/upload` call.
+    #[serde(default)]
+    pub media: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +50,7 @@ pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatReques
                 port,
                 &req.message,
                 req.session_id.as_deref(),
+                &req.media,
             )
             .await;
         }
@@ -398,6 +402,120 @@ pub async fn delete_session(
     }
 
     (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
+}
+
+/// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
+///
+/// Accepts multipart/form-data with one or more `file` fields.
+/// Returns JSON array of server-side file paths.
+pub async fn upload(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    // Determine upload directory
+    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to create upload dir: {e}"))
+    })?;
+
+    let mut paths = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut total_size: u64 = 0;
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB per file
+    const MAX_TOTAL_SIZE: u64 = 100 * 1024 * 1024; // 100MB total
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        // Only process fields that have a filename (skip non-file fields)
+        let filename = match field.file_name() {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        // Skip duplicate filenames (browser may send the same file twice)
+        if !seen_names.insert(filename.clone()) {
+            let _ = field.bytes().await; // drain to avoid blocking
+            continue;
+        }
+
+        // Sanitize filename — strip path separators
+        let safe_name = filename
+            .replace(['/', '\\', '\0'], "_")
+            .chars()
+            .take(200)
+            .collect::<String>();
+
+        let data = field.bytes().await.map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("failed to read field: {e}"))
+        })?;
+
+        if data.len() as u64 > MAX_FILE_SIZE {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("file exceeds {MAX_FILE_SIZE} byte limit")));
+        }
+        total_size += data.len() as u64;
+        if total_size > MAX_TOTAL_SIZE {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "total upload exceeds 100MB".into()));
+        }
+
+        // Unique prefix to avoid collisions
+        let dest = upload_dir.join(format!("{}_{safe_name}", uuid::Uuid::now_v7()));
+        tokio::fs::write(&dest, &data).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write file: {e}"))
+        })?;
+
+        tracing::info!(path = %dest.display(), size = data.len(), "file uploaded");
+        paths.push(dest.to_string_lossy().to_string());
+    }
+
+    if paths.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no files in request".into()));
+    }
+
+    Ok(Json(paths))
+}
+
+/// GET /api/files/:filename -- serve uploaded files for display/download.
+pub async fn serve_file(
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Response {
+    let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
+    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    let path = upload_dir.join(&safe_name);
+
+    if !path.exists() || !path.starts_with(&upload_dir) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => d,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // Detect content type from extension
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("pdf") => "application/pdf",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    };
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("content-type", content_type.parse().unwrap());
+    headers.insert(
+        "content-disposition",
+        format!("inline; filename=\"{safe_name}\"").parse().unwrap(),
+    );
+
+    (StatusCode::OK, headers, data).into_response()
 }
 
 /// GET /api/status -- server status.

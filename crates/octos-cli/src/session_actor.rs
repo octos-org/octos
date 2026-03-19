@@ -444,17 +444,20 @@ impl ActorFactory {
 
         tools.register(spawn_tool);
 
-        // Cron tool (per-session context)
         if let Some(ref cron_service) = self.cron_service {
             let cron_tool = CronTool::with_context(cron_service.clone(), channel, chat_id);
             tools.register(cron_tool);
         }
 
-        // Pipeline tool (if available)
         if let Some(ref pf) = self.pipeline_factory {
             let pt = pf.create();
             tools.register_arc(pt);
         }
+
+        // Defer rarely-used per-session tools to keep active tool count low
+        // for providers that choke on many tools (e.g. Dashscope).
+        // Keep run_pipeline active — it's a core research tool.
+        tools.defer(["spawn".to_string(), "cron".to_string()]);
 
         // Build per-session Agent
         let agent_id = AgentId::new(format!("session-{}", session_key));
@@ -744,9 +747,11 @@ impl SessionActor {
                             // working directory so read_file can access them.
                             let final_media = self.copy_media_to_workspace(final_media);
 
-                            // In speculative mode, detect slow LLM calls and
-                            // spawn concurrent agent tasks for overflow messages.
-                            if self.queue_mode == QueueMode::Speculative {
+                            // Use speculative path for API channel (web client) and
+                            // Speculative queue mode. The speculative path spawns the
+                            // agent call and handles overflow messages concurrently,
+                            // so users aren't blocked during long tool calls (pipelines).
+                            if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
                                 self.process_inbound_speculative(final_message, final_media).await;
                             } else {
                                 self.process_inbound(final_message, final_media).await;
@@ -1607,6 +1612,7 @@ impl SessionActor {
                 agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
             )
             .await;
+            eprintln!("[DEBUG] agent_task finished in {}ms, ok={}", start.elapsed().as_millis(), result.is_ok());
             (result, start.elapsed())
         });
 
@@ -1743,8 +1749,16 @@ impl SessionActor {
             router.set_status_callback(None);
         }
 
-        // Wait for stream forwarder
-        let stream_result = if let Some(handle) = stream_forwarder {
+        // Wait for stream forwarder — but NOT for API channel.
+        // For API channel, the forwarder blocks on rx.recv() which requires
+        // _completion to close the SSE sender. Since _completion is sent after
+        // this function's match block, awaiting the forwarder here would deadlock.
+        let stream_result = if self.channel == "api" {
+            // Drop the forwarder handle — it will finish on its own when _completion
+            // arrives and closes the SSE sender.
+            drop(stream_forwarder);
+            None
+        } else if let Some(handle) = stream_forwarder {
             (handle.await).ok()
         } else {
             None
@@ -1757,6 +1771,11 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
+        match &agent_result {
+            Ok(Ok(cr)) => info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages"),
+            Ok(Err(e)) => warn!(session = %self.session_key, error = %e, "agent returned error"),
+            Err(e) => warn!(session = %self.session_key, error = %e, "agent timed out"),
+        }
         match agent_result {
             Ok(Ok(conv_response)) => {
                 // Save tool calls, tool results, and assistant reply to history.
@@ -1774,6 +1793,25 @@ impl SessionActor {
                     for msg in messages_to_save {
                         if let Err(e) = handle.add_message(msg.clone()).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                        }
+                    }
+
+                    // The agent's ConversationResponse puts the final assistant
+                    // text in `content` but may not include it as a Message in
+                    // `messages` (EndTurn returns early without appending).
+                    // Persist it explicitly so session history is complete.
+                    if !conv_response.content.is_empty() {
+                        let assistant_msg = Message {
+                            role: MessageRole::Assistant,
+                            content: conv_response.content.clone(),
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        if let Err(e) = handle.add_message(assistant_msg).await {
+                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                         }
                     }
 
@@ -2253,6 +2291,7 @@ impl SessionActor {
         )
         .await;
         let llm_latency = llm_start.elapsed();
+        eprintln!("[DEBUG] process_inbound: agent returned in {}ms, ok={}", llm_latency.as_millis(), result.is_ok());
 
         // Feed latency to responsiveness observer
         self.responsiveness.record(llm_latency);
@@ -2327,6 +2366,25 @@ impl SessionActor {
                     for msg in &conv_response.messages {
                         if let Err(e) = handle.add_message(msg.clone()).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                        }
+                    }
+
+                    // The agent's ConversationResponse puts the final assistant
+                    // text in `content` but may not include it as a Message in
+                    // `messages` (EndTurn returns early without appending).
+                    // Persist it explicitly so session history is complete.
+                    if !conv_response.content.is_empty() {
+                        let assistant_msg = Message {
+                            role: MessageRole::Assistant,
+                            content: conv_response.content.clone(),
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        if let Err(e) = handle.add_message(assistant_msg).await {
+                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                         }
                     }
 

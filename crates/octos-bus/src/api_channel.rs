@@ -42,6 +42,9 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// File paths from prior upload.
+    #[serde(default)]
+    media: Vec<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -171,6 +174,10 @@ impl Channel for ApiChannel {
         Ok(())
     }
 
+    fn supports_edit(&self) -> bool {
+        true
+    }
+
     fn max_message_length(&self) -> usize {
         1_000_000 // No chunking needed for SSE
     }
@@ -218,7 +225,7 @@ async fn handle_chat(
         chat_id: session_id.clone(),
         content: req.message,
         timestamp: Utc::now(),
-        media: vec![],
+        media: req.media,
         metadata: serde_json::json!({}),
         message_id: None,
     };

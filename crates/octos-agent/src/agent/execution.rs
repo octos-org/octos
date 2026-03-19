@@ -56,7 +56,8 @@ impl Agent {
                         tool_id: tc_id.clone(),
                     });
 
-                    // Before-tool hook: may deny execution
+                    // Before-tool hook: may deny or modify args
+                    let mut effective_args = tc_args.clone();
                     if let Some(ref hooks) = hooks {
                         let payload = HookPayload::before_tool(
                             &tc_name,
@@ -64,27 +65,35 @@ impl Agent {
                             &tc_id,
                             hook_ctx.as_ref(),
                         );
-                        if let HookResult::Deny(reason) =
-                            hooks.run(HookEvent::BeforeToolCall, &payload).await
-                        {
-                            let deny_msg = if reason.is_empty() {
-                                format!("[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.", tc_name)
-                            } else {
-                                format!("[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.", tc_name, reason)
-                            };
-                            return (
-                                Message {
-                                    role: MessageRole::Tool,
-                                    content: deny_msg,
-                                    media: vec![],
-                                    tool_calls: None,
-                                    tool_call_id: Some(tc_id),
-                                    reasoning_content: None,
-                                    timestamp: chrono::Utc::now(),
-                                },
-                                None,
-                                None,
-                            );
+                        match hooks.run(HookEvent::BeforeToolCall, &payload).await {
+                            HookResult::Deny(reason) => {
+                                let deny_msg = if reason.is_empty() {
+                                    format!("[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.", tc_name)
+                                } else {
+                                    format!("[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.", tc_name, reason)
+                                };
+                                return (
+                                    Message {
+                                        role: MessageRole::Tool,
+                                        content: deny_msg,
+                                        media: vec![],
+                                        tool_calls: None,
+                                        tool_call_id: Some(tc_id),
+                                        reasoning_content: None,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                    None,
+                                    None,
+                                );
+                            }
+                            HookResult::Modified(new_args) => {
+                                tracing::info!(
+                                    tool = %tc_name,
+                                    "hook modified tool arguments"
+                                );
+                                effective_args = new_args;
+                            }
+                            _ => {}
                         }
                     }
 
@@ -93,7 +102,7 @@ impl Agent {
                         reporter: reporter.clone(),
                     };
                     let result = TOOL_CTX
-                        .scope(ctx, tools.execute(&tc_name, &tc_args))
+                        .scope(ctx, tools.execute(&tc_name, &effective_args))
                         .await;
 
                     let duration = tool_start.elapsed();
