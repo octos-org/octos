@@ -179,32 +179,8 @@ impl Tool for RunPipelineTool {
         // Build model catalog for the LLM to reference when writing DOT graphs
         let model_catalog = self.build_model_catalog();
 
-        let adaptive_hints = "\
-Adapt the pipeline to the query:\n\
-- Write ALL node prompts yourself based on the user's specific question — do NOT copy the example prompts verbatim\n\
-- Each node prompt should describe the ROLE and GOAL, not which tools to use (the agent discovers tools from its tool spec)\n\
-- Tailor the synthesize prompt to the research type: scientific analysis, news investigation, fact-check, market report, etc.\n\
-- Search strategy: deep_search supports multiple engines via search_engine parameter:\n\
-  * 'perplexity' — AI-powered, best for complex/analytical questions, returns synthesized answers with citations\n\
-  * 'tavily' — AI-optimized search, good for factual queries, 1000 free/month\n\
-  * 'duckduckgo' — free, good for simple lookups, may be slow/unreliable\n\
-  * 'brave' — free, fast, good general purpose\n\
-  In worker prompts, instruct which engine to use: perplexity for hard analytical questions, \
-duckduckgo/brave for simple factual lookups. Mix engines across workers for diversity.\n\
-- Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics\n\
-- Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin \
-(e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)\n\
-- Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)\n\
-- Match report language to query language\n\
-- Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes\n\
-- Timeouts: synthesize=900s, search=600s, analyze=300s\n\
-- Analyze nodes should use tools=\"\" (no tools) — pure text analysis\n\
-- CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'";
-
-        let node_attrs = "\
-Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
-prompt, model, max_output_tokens (default 4096), context_window, tools, timeout_secs, goal_gate, label.\n\
-For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
+        let adaptive_hints = include_str!("prompts/adaptive_hints.txt");
+        let node_attrs = include_str!("prompts/node_attrs.txt");
 
         // Build example DOT using actual model keys when available
         let (search_model, strong_model, synth_model, synth_max_output) =
@@ -262,22 +238,11 @@ For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
                 )
             };
 
-        let example = format!(
-            "\
-Example:\n\
-digraph research {{\n  \
-  plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
-prompt=\"<WRITE: planner prompt tailored to the specific research question>\", \
-worker_prompt=\"<WRITE: researcher role + {{task}} placeholder, tailored to the domain>\", \
-model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"<WRITE: analyst role prompt tailored to the research type>\", \
-model=\"{strong_model}\", tools=\"\", timeout_secs=\"300\"]\n  \
-  synthesize [prompt=\"<WRITE: report writer role + output format tailored to the research type, e.g. scientific paper, news investigation, fact-check, market analysis>\", \
-model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"900\"]\n  \
-  plan_and_search -> analyze\n  \
-  analyze -> synthesize\n\
-}}"
-        );
+        let example = include_str!("prompts/example_dot.txt")
+            .replace("{search_model}", &search_model)
+            .replace("{strong_model}", &strong_model)
+            .replace("{synth_model}", &synth_model)
+            .replace("{synth_max_output}", &synth_max_output);
 
         let pipeline_desc = if model_catalog.is_empty() {
             format!(

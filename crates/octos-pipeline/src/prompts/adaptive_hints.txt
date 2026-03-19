@@ -1,0 +1,19 @@
+Adapt the pipeline to the query:
+- Write ALL node prompts yourself based on the user's specific question — do NOT copy the example prompts verbatim
+- Each node prompt should describe the ROLE and GOAL, not which tools to use (the agent discovers tools from its tool spec)
+- Tailor the synthesize prompt to the research type: scientific analysis, news investigation, fact-check, market report, etc.
+- Search strategy: deep_search supports multiple engines via search_engine parameter:
+  * 'perplexity' — AI-powered, best quality, returns synthesized answers with citations (paid per call)
+  * 'tavily' — AI-optimized, fast, good factual queries (1000 free/month, then paid)
+  * 'brave' — free, fast, good general purpose
+  * 'duckduckgo' — free but slow/unreliable
+  * omit search_engine → fires ALL available engines in parallel (best coverage, highest cost)
+  Balance cost and quality: specify 'perplexity' for critical/complex angles, 'brave' for simple factual lookups, omit for max coverage on the most important angles. Avoid firing all engines on every worker — reserve parallel-all for 1-2 key angles.
+- Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics
+- Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)
+- Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)
+- Match report language to query language
+- Model selection: use cheap/fast models for search nodes, high max_output_tokens models for synthesize nodes
+- Timeouts: synthesize=900s, search=600s, analyze=300s
+- Analyze nodes should use tools="" (no tools) — pure text analysis
+- CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'
