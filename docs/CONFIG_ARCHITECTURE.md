@@ -40,7 +40,7 @@ UserProfile                          Config
 
 ## Data Flow
 
-### Managed gateway (via `crew serve`)
+### Managed gateway (via `octos serve`)
 
 ```
 1. Dashboard PUT /api/admin/profiles/{id}
@@ -55,7 +55,7 @@ UserProfile                          Config
        ↓
 5a. RestartRequired → ProcessManager::restart()
     - stop (kill signal) → 500ms delay → start
-    - Spawns: crew gateway --profile {id}.json --data-dir ... [--bridge-url ...] [--feishu-port ...]
+    - Spawns: octos gateway --profile {id}.json --data-dir ... [--bridge-url ...] [--feishu-port ...]
        ↓
 5b. HotReloadable → no action (gateway's own watcher handles it)
        ↓
@@ -67,9 +67,9 @@ UserProfile                          Config
 ### Standalone gateway (no serve)
 
 ```
-crew gateway --config config.json     # traditional format
-crew gateway --profile profile.json   # profile format
-crew gateway                          # auto-detect from cwd/.octos/config.json
+octos gateway --config config.json     # traditional format
+octos gateway --profile profile.json   # profile format
+octos gateway                          # auto-detect from cwd/.octos/config.json
 ```
 
 All three paths produce a `Config` struct. The gateway doesn't care which format the file is — `ConfigWatcher::parse_first()` handles both transparently.

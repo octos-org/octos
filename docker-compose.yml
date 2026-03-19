@@ -1,38 +1,38 @@
 services:
   # ─────────────────────────────────────────────
-  # crew-rs Chat (one-shot query)
-  #   docker compose --profile agent run --rm crew-agent -m "Hello"
+  # octos Chat (one-shot query)
+  #   docker compose --profile agent run --rm octos-agent -m "Hello"
   # ─────────────────────────────────────────────
-  crew-agent:
+  octos-agent:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: crew-agent
+    container_name: octos-agent
     profiles:
       - agent
     volumes:
-      - ./.crew/config.json:/root/.crew/config.json:ro
-      - crew-workspace:/root/.crew
-    entrypoint: ["crew", "chat"]
+      - ./.octos/config.json:/root/.octos/config.json:ro
+      - octos-workspace:/root/.octos
+    entrypoint: ["octos", "chat"]
     stdin_open: true
     tty: true
 
   # ─────────────────────────────────────────────
-  # crew-rs Gateway (long-running bot)
+  # octos Gateway (long-running bot)
   #   docker compose --profile gateway up -d
   # ─────────────────────────────────────────────
-  crew-gateway:
+  octos-gateway:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: crew-gateway
+    container_name: octos-gateway
     restart: unless-stopped
     profiles:
       - gateway
     volumes:
-      - ./.crew/config.json:/root/.crew/config.json:ro
-      - crew-workspace:/root/.crew
+      - ./.octos/config.json:/root/.octos/config.json:ro
+      - octos-workspace:/root/.octos
     command: ["gateway"]
 
 volumes:
-  crew-workspace:
+  octos-workspace:

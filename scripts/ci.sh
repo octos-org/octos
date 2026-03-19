@@ -73,9 +73,9 @@ fi
 if [ -n "$SUBSYSTEM" ]; then
     # Focused subsystem test
     section "Subsystem Tests: $SUBSYSTEM"
-    CRATE="crew-$SUBSYSTEM"
-    if cargo test -p "$CRATE" $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-sub.log | tail -5; then
-        SUB_PASS=$(grep "^test result:" /tmp/crew-ci-sub.log | awk '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    CRATE="octos-$SUBSYSTEM"
+    if cargo test -p "$CRATE" $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-sub.log | tail -5; then
+        SUB_PASS=$(grep "^test result:" /tmp/octos-ci-sub.log | awk '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "$CRATE tests ($SUB_PASS passed)"
     else
         fail "$CRATE tests"
@@ -85,8 +85,8 @@ else
 
     # 3a. Workspace tests (all crates)
     echo "  Running: cargo test --workspace"
-    if cargo test --workspace $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-test.log | tail -20; then
-        TOTAL=$(grep "^test result:" /tmp/crew-ci-test.log | \
+    if cargo test --workspace $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-test.log | tail -20; then
+        TOTAL=$(grep "^test result:" /tmp/octos-ci-test.log | \
             awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "cargo test --workspace ($TOTAL passed)"
     else
@@ -98,8 +98,8 @@ else
 
     # Adaptive routing (Off/Hedge/Lane, circuit breaker, scoring, metrics)
     echo "  Running: adaptive routing tests"
-    if cargo test -p crew-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-adaptive.log | tail -5; then
-        N=$(grep "^test result:" /tmp/crew-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    if cargo test -p octos-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-adaptive.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "adaptive routing ($N tests)"
     else
         fail "adaptive routing"
@@ -107,8 +107,8 @@ else
 
     # Responsiveness observer (baseline, degradation, recovery)
     echo "  Running: responsiveness observer tests"
-    if cargo test -p crew-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-resp.log | tail -5; then
-        N=$(grep "^test result:" /tmp/crew-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    if cargo test -p octos-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-resp.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "responsiveness observer ($N tests)"
     else
         fail "responsiveness observer"
@@ -116,8 +116,8 @@ else
 
     # Queue modes + speculative overflow + auto-escalation
     echo "  Running: session actor tests (queue modes, speculative, escalation)"
-    if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
-        N=$(grep "^test result:" /tmp/crew-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/octos-ci-actor.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "session actor ($N tests)"
     else
         fail "session actor"
@@ -125,8 +125,8 @@ else
 
     # Session persistence (JSONL, LRU, fork, rewrite, sort)
     echo "  Running: session persistence tests"
-    if cargo test -p crew-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-session.log | tail -5; then
-        N=$(grep "^test result:" /tmp/crew-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+    if cargo test -p octos-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-session.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
         pass "session persistence ($N tests)"
     else
         fail "session persistence"
@@ -158,8 +158,8 @@ section "Focused Test Groups"
 
 # Adaptive routing (Off/Hedge/Lane, circuit breaker, scoring, metrics)
 echo "  Running: adaptive routing tests"
-if cargo test -p crew-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-adaptive.log | tail -5; then
-    N=$(grep "^test result:" /tmp/crew-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+if cargo test -p octos-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-adaptive.log | tail -5; then
+    N=$(grep "^test result:" /tmp/octos-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "adaptive routing ($N tests)"
 else
     fail "adaptive routing"
@@ -167,8 +167,8 @@ fi
 
 # Responsiveness observer (baseline, degradation, recovery)
 echo "  Running: responsiveness observer tests"
-if cargo test -p crew-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-resp.log | tail -5; then
-    N=$(grep "^test result:" /tmp/crew-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+if cargo test -p octos-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-resp.log | tail -5; then
+    N=$(grep "^test result:" /tmp/octos-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "responsiveness observer ($N tests)"
 else
     fail "responsiveness observer"
@@ -176,8 +176,8 @@ fi
 
 # Queue modes + speculative overflow + auto-escalation
 echo "  Running: session actor tests (queue modes, speculative, escalation)"
-if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/crew-ci-actor.log | tail -5; then
-    N=$(grep "^test result:" /tmp/crew-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/octos-ci-actor.log | tail -5; then
+    N=$(grep "^test result:" /tmp/octos-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "session actor ($N tests)"
 else
     fail "session actor"
@@ -185,8 +185,8 @@ fi
 
 # Security sandbox (write isolation, /tmp loophole, Python escapes, SSRF, symlinks)
 echo "  Running: security sandbox tests"
-if cargo test -p crew-agent --test security_sandbox $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-security.log | tail -5; then
-    N=$(grep "^test result:" /tmp/crew-ci-security.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+if cargo test -p octos-agent --test security_sandbox $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-security.log | tail -5; then
+    N=$(grep "^test result:" /tmp/octos-ci-security.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "security sandbox ($N tests)"
 else
     fail "security sandbox"
@@ -194,8 +194,8 @@ fi
 
 # Session persistence (JSONL, LRU, fork, rewrite, sort)
 echo "  Running: session persistence tests"
-if cargo test -p crew-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/crew-ci-session.log | tail -5; then
-    N=$(grep "^test result:" /tmp/crew-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+if cargo test -p octos-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-session.log | tail -5; then
+    N=$(grep "^test result:" /tmp/octos-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
     pass "session persistence ($N tests)"
 else
     fail "session persistence"

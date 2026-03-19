@@ -750,7 +750,7 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
 | tmux | Terminal multiplexer control |
 | weather | Weather information retrieval |
 
-#### CLI Management (`crew skills`)
+#### CLI Management (`octos skills`)
 
 - `list` — shows built-in skills (with override status) + workspace skills
 - `install <user/repo/skill-name>` — fetches `SKILL.md` from `https://raw.githubusercontent.com/{repo}/main/SKILL.md` (15s timeout), saves to `.octos/skills/{name}/SKILL.md`. Fails if skill already exists.
@@ -1092,7 +1092,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 
 ### Configuration
 
-Loaded from `.octos/config.json` (local) or `~/.config/crew/config.json` (global). Local takes precedence.
+Loaded from `.octos/config.json` (local) or `~/.config/octos/config.json` (global). Local takes precedence.
 
 - **`${VAR}` expansion**: Environment variable substitution in string values
 - **Versioned config**: Version field with automatic `migrate_config()` framework
@@ -1139,7 +1139,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 **Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
 
-**Prometheus Metrics**: `crew_tool_calls_total` (counter, labels: tool, success), `crew_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
+**Prometheus Metrics**: `octos_tool_calls_total` (counter, labels: tool, success), `octos_tool_call_duration_seconds` (histogram, label: tool), `octos_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 
 ### Session Compaction (Gateway)
 
@@ -1399,13 +1399,13 @@ Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-a
 
 ### Multi-Tenant Dashboard
 
-The dashboard (`crew serve`) runs each user profile as a **separate gateway OS process**:
+The dashboard (`octos serve`) runs each user profile as a **separate gateway OS process**:
 
 ```
-Dashboard (crew serve)
-  ├─ Profile "alice" → crew gateway --config alice.json  (deepseek, own semaphore)
-  ├─ Profile "bob"   → crew gateway --config bob.json    (kimi, own semaphore)
-  └─ Profile "carol" → crew gateway --config carol.json  (openai, own semaphore)
+Dashboard (octos serve)
+  ├─ Profile "alice" → octos gateway --config alice.json  (deepseek, own semaphore)
+  ├─ Profile "bob"   → octos gateway --config bob.json    (kimi, own semaphore)
+  └─ Profile "carol" → octos gateway --config carol.json  (openai, own semaphore)
 ```
 
 Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. Profiles are fully isolated — no shared state between gateway processes.

@@ -1,5 +1,5 @@
 # ============================================================
-# Stage 1: Build the crew binary
+# Stage 1: Build the octos binary
 # ============================================================
 FROM rust:1.85-alpine AS builder
 
@@ -9,27 +9,27 @@ WORKDIR /src
 
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
-COPY crates/crew-core/Cargo.toml crates/crew-core/Cargo.toml
-COPY crates/crew-llm/Cargo.toml crates/crew-llm/Cargo.toml
-COPY crates/crew-memory/Cargo.toml crates/crew-memory/Cargo.toml
-COPY crates/crew-agent/Cargo.toml crates/crew-agent/Cargo.toml
-COPY crates/crew-bus/Cargo.toml crates/crew-bus/Cargo.toml
-COPY crates/crew-cli/Cargo.toml crates/crew-cli/Cargo.toml
+COPY crates/octos-core/Cargo.toml crates/octos-core/Cargo.toml
+COPY crates/octos-llm/Cargo.toml crates/octos-llm/Cargo.toml
+COPY crates/octos-memory/Cargo.toml crates/octos-memory/Cargo.toml
+COPY crates/octos-agent/Cargo.toml crates/octos-agent/Cargo.toml
+COPY crates/octos-bus/Cargo.toml crates/octos-bus/Cargo.toml
+COPY crates/octos-cli/Cargo.toml crates/octos-cli/Cargo.toml
 
 # Create stub lib.rs files for dependency caching
-RUN mkdir -p crates/crew-core/src && echo "" > crates/crew-core/src/lib.rs && \
-    mkdir -p crates/crew-llm/src && echo "" > crates/crew-llm/src/lib.rs && \
-    mkdir -p crates/crew-memory/src && echo "" > crates/crew-memory/src/lib.rs && \
-    mkdir -p crates/crew-agent/src && echo "" > crates/crew-agent/src/lib.rs && \
-    mkdir -p crates/crew-bus/src && echo "" > crates/crew-bus/src/lib.rs && \
-    mkdir -p crates/crew-cli/src && echo "fn main() {}" > crates/crew-cli/src/main.rs
+RUN mkdir -p crates/octos-core/src && echo "" > crates/octos-core/src/lib.rs && \
+    mkdir -p crates/octos-llm/src && echo "" > crates/octos-llm/src/lib.rs && \
+    mkdir -p crates/octos-memory/src && echo "" > crates/octos-memory/src/lib.rs && \
+    mkdir -p crates/octos-agent/src && echo "" > crates/octos-agent/src/lib.rs && \
+    mkdir -p crates/octos-bus/src && echo "" > crates/octos-bus/src/lib.rs && \
+    mkdir -p crates/octos-cli/src && echo "fn main() {}" > crates/octos-cli/src/main.rs
 
-RUN cargo build --release --bin crew 2>/dev/null || true
+RUN cargo build --release --bin octos 2>/dev/null || true
 
 # Copy full source and build
 COPY . .
 RUN touch crates/*/src/*.rs && \
-    cargo build --release --bin crew \
+    cargo build --release --bin octos \
       --features telegram,discord,slack,whatsapp,feishu,email
 
 # ============================================================
@@ -49,14 +49,14 @@ RUN apk add --no-cache ca-certificates tzdata \
 RUN npm install -g pptxgenjs react-icons react react-dom sharp
 
 # Copy binary
-COPY --from=builder /src/target/release/crew /usr/local/bin/crew
+COPY --from=builder /src/target/release/octos /usr/local/bin/octos
 
 # Copy builtin skills
-COPY --from=builder /src/crates/crew-agent/skills /opt/crew/skills
+COPY --from=builder /src/crates/octos-agent/skills /opt/octos/skills
 
 # Create workspace
-RUN mkdir -p /root/.crew/skills && \
-    cp -r /opt/crew/skills/* /root/.crew/skills/ 2>/dev/null || true
+RUN mkdir -p /root/.octos/skills && \
+    cp -r /opt/octos/skills/* /root/.octos/skills/ 2>/dev/null || true
 
-ENTRYPOINT ["crew"]
+ENTRYPOINT ["octos"]
 CMD ["gateway"]

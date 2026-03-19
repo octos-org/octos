@@ -1,4 +1,4 @@
-# Crew App Skill Development Guide
+# Octos App Skill Development Guide
 
 This guide covers everything you need to build, register, and deploy a new app skill for octos.
 
@@ -6,7 +6,7 @@ This guide covers everything you need to build, register, and deploy a new app s
 
 ## Architecture Overview
 
-An app skill is a **standalone executable binary** that communicates with the crew gateway via a simple **stdin/stdout JSON protocol**. The gateway spawns the skill binary as a child process for each tool call, passes JSON arguments on stdin, and reads JSON results from stdout.
+An app skill is a **standalone executable binary** that communicates with the octos gateway via a simple **stdin/stdout JSON protocol**. The gateway spawns the skill binary as a child process for each tool call, passes JSON arguments on stdin, and reads JSON results from stdout.
 
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
@@ -316,7 +316,7 @@ echo '{"param1": "test"}' | ./target/debug/my_skill unknown_tool
 cargo build --release --workspace
 
 # Start gateway (skills are bootstrapped automatically)
-crew gateway
+octos gateway
 
 # Check skill was loaded
 ls ~/.octos/skills/my-skill/
@@ -768,7 +768,7 @@ scp target/release/weather remote:~/.octos/skills/weather/main
 # No gateway restart needed — next tool call uses the new binary
 ```
 
-Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `crew` binary too (they're embedded via `include_str!`).
+Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `octos` binary too (they're embedded via `include_str!`).
 
 ---
 

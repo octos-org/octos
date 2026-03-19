@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  var token = sessionStorage.getItem("crew_token") || "";
+  var token = sessionStorage.getItem("octos_token") || "";
   var currentSession = "default";
   var sending = false;
 
@@ -52,7 +52,7 @@
 
   authSubmitBtn.addEventListener("click", function () {
     token = authTokenEl.value.trim();
-    sessionStorage.setItem("crew_token", token);
+    sessionStorage.setItem("octos_token", token);
     hideAuth();
     loadSessions();
     pollStatus();
