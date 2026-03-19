@@ -7,9 +7,9 @@ Adapt the pipeline to the query:
   * 'tavily' — AI-optimized, fast, good factual queries (1000 free/month, then paid)
   * 'brave' — free, fast, good general purpose
   * 'duckduckgo' — free but slow/unreliable
-  * omit search_engine → uses best available engine automatically (tavily > perplexity > brave > duckduckgo)
-  * 'all' → fires ALL engines in parallel and merges (best coverage, highest cost — use sparingly)
-  Balance cost and quality: most workers should omit search_engine (uses best single engine). Use search_engine='all' on only 1-2 critical angles where maximum coverage matters.
+  * omit search_engine → races top 2 engines in parallel, picks richest result (good default)
+  * 'all' → fires ALL engines in parallel (max coverage, use sparingly on 1-2 key angles)
+  Most workers should omit search_engine (default top-2 racing is fast and reliable).
 - Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics
 - Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)
 - Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)

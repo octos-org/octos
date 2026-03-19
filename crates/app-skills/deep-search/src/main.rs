@@ -579,31 +579,68 @@ async fn web_search(
         }
     }
 
-    // Default: use the BEST available engine (priority: tavily > perplexity > brave > ddg).
-    // Firing all engines in parallel is available via search_engine="all" but uses
-    // too many connections under concurrent load (8 pipelines × 7 workers × 4 engines = crash).
-    let priority: Vec<(&str, Option<String>)> = vec![
-        ("tavily", std::env::var("TAVILY_API_KEY").ok()),
-        ("perplexity", std::env::var("PERPLEXITY_API_KEY").ok()),
-        ("brave", std::env::var("BRAVE_API_KEY").ok()),
-        ("duckduckgo", Some("free".into())),
-    ];
+    // Default: race top 2 available engines in parallel.
+    // Gives redundancy + speed without the resource explosion of fire-all.
+    // Priority: tavily > perplexity > brave > duckduckgo
+    let mut available: Vec<&str> = Vec::new();
+    if std::env::var("TAVILY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("tavily");
+    }
+    if std::env::var("PERPLEXITY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("perplexity");
+    }
+    if std::env::var("BRAVE_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("brave");
+    }
+    available.push("duckduckgo"); // always available (free)
 
-    for (name, key) in &priority {
-        if let Some(k) = key {
-            if !k.is_empty() {
-                if let Some(r) = try_engine(client, query, count, name).await {
-                    return r;
-                }
-            }
+    // Race top 2
+    let top2: Vec<&str> = available.into_iter().take(2).collect();
+    let mut handles = Vec::new();
+    for eng in &top2 {
+        let c = client.clone();
+        let q = query.to_string();
+        let cnt = count;
+        let name = eng.to_string();
+        handles.push(tokio::spawn(async move {
+            (name.clone(), try_engine_owned(&c, &q, cnt, &name).await)
+        }));
+    }
+
+    let results = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures::future::join_all(handles),
+    ).await {
+        Ok(r) => r,
+        Err(_) => Vec::new(),
+    };
+
+    // Pick the best result (richest successful output)
+    let mut successful: Vec<(String, SearchResult)> = results
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|(name, opt)| opt.map(|r| (name, r)))
+        .collect();
+
+    if successful.is_empty() {
+        return SearchResult {
+            output: format!("No results found from any search engine for: {query}"),
+            success: false,
+        };
+    }
+
+    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    let mut primary = successful.remove(0);
+
+    // Append runner-up if it has substantial unique content
+    if let Some((name, other)) = successful.first() {
+        if other.output.len() > 200 {
+            primary.1.output.push_str(&format!("\n\n--- Also from {name} ---\n"));
+            primary.1.output.push_str(&other.output);
         }
     }
 
-    // All engines failed
-    SearchResult {
-        output: format!("No results found from any search engine for: {query}"),
-        success: false,
-    }
+    primary.1
 }
 
 /// Fire ALL available engines in parallel and merge results.
@@ -674,6 +711,16 @@ async fn parallel_all_engines(
 }
 
 /// Try a specific search engine by name.
+/// try_engine with owned params for use in tokio::spawn.
+async fn try_engine_owned(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    engine: &str,
+) -> Option<SearchResult> {
+    try_engine(client, query, count, engine).await
+}
+
 async fn try_engine(
     client: &reqwest::Client,
     query: &str,
