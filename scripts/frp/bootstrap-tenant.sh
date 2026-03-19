@@ -144,6 +144,7 @@ if [ "$SKIP_TENANT" = false ]; then
         --server "$FRPS_SERVER" \
         --port "$FRPS_PORT" \
         --local-port "$SERVE_PORT" \
+        --auth-token "$AUTH_TOKEN" \
         $DATA_DIR_ARGS 2>&1 || {
         echo "    Tenant may already exist, continuing..."
     }
@@ -154,7 +155,6 @@ fi
 
 # ── Step 2: Build octos binaries ──────────────────────────────────────
 BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather)
-BUILD_TARGET="release"
 
 if [ "$SKIP_BUILD" = false ]; then
     echo ""
@@ -175,9 +175,7 @@ fi
 # ── Step 3: Verify SSH access ─────────────────────────────────────────
 echo ""
 echo "==> Step 3: Verifying SSH access..."
-REMOTE_HOME=$(ssh_cmd 'echo $HOME')
-REMOTE_OS=$(ssh_cmd 'uname -s')
-REMOTE_ARCH=$(ssh_cmd 'uname -m')
+read -r REMOTE_HOME REMOTE_OS REMOTE_ARCH <<< "$(ssh_cmd 'echo $HOME $(uname -s) $(uname -m)')"
 echo "    Connected: ${SSH_TARGET} (${REMOTE_OS}/${REMOTE_ARCH}, home=${REMOTE_HOME})"
 
 RBIN="${REMOTE_HOME}/.cargo/bin"
@@ -208,8 +206,6 @@ echo "==> Step 5: Initializing octos data..."
 ssh_cmd "mkdir -p ${RDATA}/{profiles,memory,sessions,skills,logs,research,history}"
 
 # Write a basic config.json if it doesn't exist
-ssh_cmd "cat > /dev/null" << 'EOF'
-EOF
 ssh_cmd "test -f ${RDATA}/config.json || cat > ${RDATA}/config.json" << EOF
 {
   "provider": "moonshot",
@@ -253,9 +249,14 @@ fi
 echo ""
 echo "==> Step 7: Writing frpc config..."
 
-# Get SSH port from tenant store
-SSH_PORT=$(cargo run -p octos-cli --quiet -- admin list-tenants 2>/dev/null \
-    | grep "^${TENANT_NAME}" | awk '{print $3}' || echo "6001")
+# Get SSH port from tenant JSON file
+TENANT_JSON="${LOCAL_DATA_DIR:-$HOME/.octos}/tenants/${TENANT_NAME}.json"
+if [ -f "$TENANT_JSON" ]; then
+    SSH_PORT=$(python3 -c "import json; print(json.load(open('$TENANT_JSON'))['ssh_port'])" 2>/dev/null || echo "6001")
+else
+    SSH_PORT="6001"
+    echo "    WARNING: tenant JSON not found at $TENANT_JSON, defaulting SSH port to 6001"
+fi
 
 ssh_cmd "sudo mkdir -p /etc/frp && sudo tee /etc/frp/frpc.toml > /dev/null" << EOF
 # frpc config for ${TENANT_NAME}.${DOMAIN}

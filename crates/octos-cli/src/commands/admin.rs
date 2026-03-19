@@ -33,6 +33,9 @@ pub enum AdminAction {
         /// Local octos serve port on the tenant machine.
         #[arg(long, default_value = "8080")]
         local_port: u16,
+        /// Dashboard auth token (auto-generated if not provided).
+        #[arg(long)]
+        auth_token: Option<String>,
         /// Data directory override.
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
@@ -79,6 +82,7 @@ impl Executable for AdminCommand {
                 server,
                 port,
                 local_port,
+                auth_token: auth_token_arg,
                 data_dir,
             } => {
                 let data_dir = super::resolve_data_dir(data_dir)?;
@@ -91,7 +95,8 @@ impl Executable for AdminCommand {
 
                 let ssh_port = store.next_ssh_port()?;
                 let tunnel_token = Uuid::new_v4().to_string();
-                let auth_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+                let auth_token = auth_token_arg
+                    .unwrap_or_else(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
                 let now = chrono::Utc::now();
 
                 let tenant = TenantConfig {

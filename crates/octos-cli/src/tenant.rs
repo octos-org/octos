@@ -15,13 +15,17 @@ pub const SSH_PORT_START: u16 = 6001;
 pub const SSH_PORT_END: u16 = 6999;
 
 /// A tunnel tenant — a remote machine accessible via frp tunnel.
+///
+/// `id`, `name`, and `subdomain` are typically the same value at creation.
+/// They're separate fields to allow future flexibility: `name` for display,
+/// `subdomain` for DNS routing (could differ from `id` if custom domains are added).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantConfig {
     /// Unique identifier (slug: lowercase alphanumeric + hyphens).
     pub id: String,
-    /// Display name.
+    /// Display name (defaults to `id` at creation).
     pub name: String,
-    /// Subdomain (e.g. "alice" → alice.octos-cloud.org).
+    /// Subdomain for tunnel routing (defaults to `id` at creation).
     pub subdomain: String,
     /// Unique tunnel auth token (UUID v4).
     pub tunnel_token: String,
