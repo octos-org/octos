@@ -126,6 +126,7 @@ impl TenantStore {
 
     /// Get a tenant by ID.
     pub fn get(&self, id: &str) -> Result<Option<TenantConfig>> {
+        validate_tenant_id(id)?;
         let path = self.tenant_path(id);
         if !path.exists() {
             return Ok(None);
@@ -137,20 +138,29 @@ impl TenantStore {
         Ok(Some(tenant))
     }
 
-    /// Save a tenant (create or update).
+    /// Save a tenant (create or update). Uses atomic write-then-rename.
     pub fn save(&self, tenant: &TenantConfig) -> Result<()> {
         validate_tenant_id(&tenant.id)?;
         let path = self.tenant_path(&tenant.id);
+        let tmp_path = path.with_extension("json.tmp");
         let content =
             serde_json::to_string_pretty(tenant).wrap_err("failed to serialize tenant")?;
-        std::fs::write(&path, &content)
-            .wrap_err_with(|| format!("failed to write tenant: {}", path.display()))?;
+
+        // Write to temp file then rename for crash safety
+        std::fs::write(&tmp_path, &content)
+            .wrap_err_with(|| format!("failed to write tenant: {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &path)
+            .wrap_err_with(|| format!("failed to rename tenant: {}", path.display()))?;
 
         // Restrict file permissions to owner-only (mode 0600) — contains tunnel token
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+            if let Err(e) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(path = %path.display(), error = %e, "failed to set tenant file permissions");
+            }
         }
 
         Ok(())
@@ -158,6 +168,7 @@ impl TenantStore {
 
     /// Delete a tenant by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
+        validate_tenant_id(id)?;
         let path = self.tenant_path(id);
         if !path.exists() {
             return Ok(false);
@@ -252,6 +263,30 @@ mod tests {
         assert!(validate_tenant_id("alice").is_ok());
         assert!(validate_tenant_id("alice-mini").is_ok());
         assert!(validate_tenant_id("bob-2").is_ok());
+    }
+
+    #[test]
+    fn should_reject_path_traversal_ids() {
+        assert!(validate_tenant_id("../etc").is_err());
+        assert!(validate_tenant_id("..").is_err());
+        assert!(validate_tenant_id("foo/bar").is_err());
+        assert!(validate_tenant_id("foo\\bar").is_err());
+        assert!(validate_tenant_id(".hidden").is_err());
+    }
+
+    #[test]
+    fn should_reject_get_with_invalid_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::open(dir.path()).unwrap();
+        assert!(store.get("../etc/passwd").is_err());
+        assert!(store.get("..").is_err());
+    }
+
+    #[test]
+    fn should_reject_delete_with_invalid_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::open(dir.path()).unwrap();
+        assert!(store.delete("../etc/passwd").is_err());
     }
 
     #[test]

@@ -29,8 +29,14 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 TENANT_DIR = os.environ.get("TENANT_DIR", "/var/lib/octos-cloud/tenants")
 DOMAIN = os.environ.get("TUNNEL_DOMAIN", "octos-cloud.org")
 FRPS_SERVER = os.environ.get("FRPS_SERVER", "163.192.33.32")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+SESSION_TTL = 3600  # 1 hour
+OTP_TTL = 600  # 10 minutes
+MAX_OTP_ATTEMPTS = 5
+MAX_OTP_SENDS_PER_EMAIL = 3  # per 10 min window
+MAX_BODY_SIZE = 4096
 
-# In-memory OTP store: {email: (code, expiry_ts)}
+# In-memory OTP store: {email: {code, expiry, attempts, send_count, first_send}}
 otp_store = {}
 otp_lock = Lock()
 
@@ -83,6 +89,30 @@ def gen_token():
     return uuid.uuid4().hex + uuid.uuid4().hex
 
 
+def validate_name(name):
+    """Validate tenant name: ASCII lowercase alphanumeric + hyphens."""
+    if not name or len(name) > 64:
+        return False
+    if not all(c.isascii() and (c.isalnum() or c == "-") for c in name):
+        return False
+    if not name[0].isalnum() or not name[-1].isalnum():
+        return False
+    return True
+
+
+def cleanup_expired():
+    """Remove expired OTPs and sessions."""
+    now = time.time()
+    with otp_lock:
+        expired = [e for e, v in otp_store.items() if now > v["expiry"]]
+        for e in expired:
+            del otp_store[e]
+    expired_sessions = [t for t, v in sessions.items()
+                        if now - v["created_at"] > SESSION_TTL]
+    for t in expired_sessions:
+        del sessions[t]
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%H:%M:%S')}] {fmt % args}")
@@ -111,7 +141,31 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
+        if length > MAX_BODY_SIZE:
+            raise ValueError("request body too large")
         return json.loads(self.rfile.read(length))
+
+    def _get_session(self):
+        """Extract and validate bearer token session."""
+        auth = self.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        if not token:
+            return None
+        session = sessions.get(token)
+        if not session:
+            return None
+        if time.time() - session["created_at"] > SESSION_TTL:
+            del sessions[token]
+            return None
+        return session
+
+    def _is_admin(self):
+        """Check if request has admin token."""
+        if not ADMIN_TOKEN:
+            return False
+        auth = self.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        return token == ADMIN_TOKEN
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -121,6 +175,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        cleanup_expired()
         if self.path == "/api/auth/send-code":
             self._handle_send_code()
         elif self.path == "/api/auth/verify":
@@ -131,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
             self._text_response(404, "not found")
 
     def do_GET(self):
+        cleanup_expired()
         if self.path == "/api/admin/tenants":
             self._handle_list_tenants()
         elif self.path.startswith("/api/admin/tenants/") and self.path.endswith("/setup-script"):
@@ -143,21 +199,48 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = self._read_body()
             email = data.get("email", "").strip().lower()
-            if not email or "@" not in email:
+            if not email or "@" not in email or len(email) > 256:
                 self._text_response(400, "invalid email")
                 return
 
-            code = "".join(random.choices(string.digits, k=6))
+            now = time.time()
             with otp_lock:
-                otp_store[email] = (code, time.time() + 600)  # 10 min expiry
+                entry = otp_store.get(email)
+                # Rate limit: max N sends per email per OTP_TTL window
+                if entry:
+                    if now < entry["expiry"] and entry["send_count"] >= MAX_OTP_SENDS_PER_EMAIL:
+                        self._text_response(429, "too many codes sent, try again later")
+                        return
+
+                code = "".join(random.choices(string.digits, k=6))
+
+                if entry and now < entry["expiry"]:
+                    # Refresh code but keep send count
+                    otp_store[email] = {
+                        "code": code,
+                        "expiry": now + OTP_TTL,
+                        "attempts": 0,
+                        "send_count": entry["send_count"] + 1,
+                        "first_send": entry["first_send"],
+                    }
+                else:
+                    otp_store[email] = {
+                        "code": code,
+                        "expiry": now + OTP_TTL,
+                        "attempts": 0,
+                        "send_count": 1,
+                        "first_send": now,
+                    }
 
             send_otp_email(email, code)
             self._json_response(200, {"ok": True, "message": "code sent"})
             print(f"  OTP sent to {email}")
 
+        except ValueError as e:
+            self._text_response(400, str(e))
         except Exception as e:
             print(f"  ERROR sending OTP: {e}")
-            self._text_response(500, f"failed to send code: {e}")
+            self._text_response(500, "failed to send verification code")
 
     def _handle_verify(self):
         try:
@@ -166,17 +249,23 @@ class Handler(BaseHTTPRequestHandler):
             code = data.get("code", "").strip()
 
             with otp_lock:
-                stored = otp_store.get(email)
-                if not stored:
+                entry = otp_store.get(email)
+                if not entry:
                     self._text_response(401, "no code sent to this email")
                     return
-                stored_code, expiry = stored
-                if time.time() > expiry:
+                if time.time() > entry["expiry"]:
                     del otp_store[email]
                     self._text_response(401, "code expired")
                     return
-                if code != stored_code:
-                    self._text_response(401, "incorrect code")
+                # Brute force protection
+                if entry["attempts"] >= MAX_OTP_ATTEMPTS:
+                    del otp_store[email]
+                    self._text_response(429, "too many attempts, request a new code")
+                    return
+                if code != entry["code"]:
+                    entry["attempts"] += 1
+                    remaining = MAX_OTP_ATTEMPTS - entry["attempts"]
+                    self._text_response(401, f"incorrect code ({remaining} attempts remaining)")
                     return
                 del otp_store[email]
 
@@ -186,31 +275,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {"ok": True, "token": token, "email": email})
             print(f"  Verified: {email}")
 
+        except ValueError as e:
+            self._text_response(400, str(e))
         except Exception as e:
-            self._text_response(500, str(e))
+            self._text_response(500, "verification failed")
 
     def _handle_create_tenant(self):
         try:
-            # Check auth
-            auth = self.headers.get("Authorization", "")
-            token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
-            session = sessions.get(token)
+            session = self._get_session()
             if not session:
-                self._text_response(401, "unauthorized")
+                self._text_response(401, "unauthorized — verify email first")
                 return
 
             data = self._read_body()
             name = data.get("name", "").strip().lower()
 
-            # Validate name
-            if not name or not all(c.isalnum() or c == "-" for c in name):
-                self._text_response(400, "invalid node name (lowercase alphanumeric + hyphens)")
-                return
-            if name.startswith("-") or name.endswith("-"):
-                self._text_response(400, "name must not start or end with hyphen")
-                return
-            if len(name) > 64:
-                self._text_response(400, "name too long (max 64)")
+            if not validate_name(name):
+                self._text_response(400,
+                    "invalid node name (lowercase ASCII alphanumeric + hyphens, "
+                    "must start/end with alphanumeric, max 64 chars)")
                 return
 
             # Check duplicate
@@ -243,10 +326,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, tenant)
             print(f"  Tenant created: {name} ({session['email']})")
 
+        except ValueError as e:
+            self._text_response(400, str(e))
         except Exception as e:
-            self._text_response(500, str(e))
+            print(f"  ERROR creating tenant: {e}")
+            self._text_response(500, "failed to create tenant")
 
     def _handle_list_tenants(self):
+        # Admin only — requires admin token
+        if not self._is_admin():
+            self._text_response(401, "admin token required")
+            return
         tenants = []
         for f in sorted(Path(TENANT_DIR).glob("*.json")):
             try:
@@ -256,27 +346,55 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response(200, tenants)
 
     def _handle_setup_script(self, tenant_id):
+        # Validate tenant ID to prevent path traversal
+        if not validate_name(tenant_id):
+            self._text_response(400, "invalid tenant id")
+            return
+
+        # Require either the tenant's own session or admin token
+        session = self._get_session()
+        is_admin = self._is_admin()
+        if not session and not is_admin:
+            self._text_response(401, "unauthorized")
+            return
+
         tenant_file = Path(TENANT_DIR) / f"{tenant_id}.json"
         if not tenant_file.exists():
             self._text_response(404, f"tenant '{tenant_id}' not found")
             return
         tenant = json.loads(tenant_file.read_text())
 
-        # Read frps token
-        frps_token_file = Path("/etc/frp/frps-token.txt")
-        frps_token = frps_token_file.read_text().strip() if frps_token_file.exists() else "REPLACE_WITH_FRPS_TOKEN"
+        # Non-admin users can only access their own tenant's setup script
+        if not is_admin:
+            if session["email"] != tenant.get("email"):
+                self._text_response(403, "you can only access your own tenant's setup script")
+                return
+
+        # Use the tenant's own tunnel_token (per-tenant), NOT the frps master token.
+        # The frps master token must be provided separately during bootstrap.
+        tunnel_token = tenant["tunnel_token"]
 
         script = f"""#!/usr/bin/env bash
 # Setup script for {tenant['subdomain']}.{DOMAIN}
+# NOTE: This script configures frpc with a per-tenant token placeholder.
+# You must provide the frps auth token during setup.
 set -euo pipefail
 
 SUBDOMAIN="{tenant['subdomain']}"
 FRPS_SERVER="{FRPS_SERVER}"
 FRPS_PORT=7000
-FRPS_TOKEN="{frps_token}"
 LOCAL_PORT={tenant['local_port']}
 SSH_PORT={tenant['ssh_port']}
 DOMAIN="{DOMAIN}"
+
+# frps auth token — must be provided as argument or environment variable
+FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
+if [ -z "$FRPS_TOKEN" ]; then
+    echo "ERROR: frps auth token required."
+    echo "Usage: FRPS_TOKEN=<token> bash setup.sh"
+    echo "   or: bash setup.sh <token>"
+    exit 1
+fi
 
 echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
 
@@ -301,11 +419,11 @@ fi
 
 # Write config
 sudo mkdir -p /etc/frp
-sudo tee /etc/frp/frpc.toml > /dev/null << 'FRPCEOF'
-serverAddr = "{FRPS_SERVER}"
+sudo tee /etc/frp/frpc.toml > /dev/null << FRPCEOF
+serverAddr = "$FRPS_SERVER"
 serverPort = 7000
 auth.method = "token"
-auth.token = "{frps_token}"
+auth.token = "$FRPS_TOKEN"
 log.to = "/var/log/frpc.log"
 log.level = "info"
 log.maxDays = 7
@@ -368,6 +486,9 @@ echo "    SSH: ssh -p ${{SSH_PORT}} $(whoami)@${{DOMAIN}}"
 if __name__ == "__main__":
     if not SMTP_PASS:
         print("WARNING: SMTP_PASS not set, email sending will fail")
+    if not ADMIN_TOKEN:
+        ADMIN_TOKEN = gen_token()
+        print(f"WARNING: ADMIN_TOKEN not set, generated: {ADMIN_TOKEN}")
 
     print(f"Octos Cloud Registration API")
     print(f"  Port:     {PORT}")
