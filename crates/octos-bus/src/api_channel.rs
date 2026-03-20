@@ -233,14 +233,21 @@ async fn handle_chat(
         .session_id
         .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
 
-    // Create per-request channel for SSE events
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-
-    // Register sender so ApiChannel.send() can route outbound messages here
-    {
+    // Create per-request SSE channel. If a previous request for this session
+    // is still streaming, reuse its sender — don't create a new stream.
+    // This prevents response loss when the user sends multiple messages rapidly.
+    let rx = {
         let mut pending = state.pending.lock().await;
-        pending.insert(session_id.clone(), tx);
-    }
+        if pending.contains_key(&session_id) {
+            // Previous stream still open — send message but don't create new SSE.
+            // The response will arrive on the existing stream.
+            None
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            pending.insert(session_id.clone(), tx);
+            Some(rx)
+        }
+    };
 
     // Build and send InboundMessage to the gateway bus
     let inbound = InboundMessage {
@@ -263,6 +270,15 @@ async fn handle_chat(
         )
             .into_response();
     }
+
+    // If no new SSE stream (previous one still active), return queued acknowledgment
+    let Some(rx) = rx else {
+        return Json(serde_json::json!({
+            "status": "queued",
+            "message": "Message queued — response will arrive on the existing stream"
+        }))
+        .into_response();
+    };
 
     // Return SSE stream that forwards events from the unbounded receiver
     let stream = futures::stream::unfold(rx, |mut rx| async move {
