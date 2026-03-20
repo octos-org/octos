@@ -908,6 +908,7 @@ impl GatewayCommand {
             "deep_search",
             "deep_crawl",
             "web_search",
+            "web_fetch",
             "read_file",
             "write_file",
             "edit_file",
