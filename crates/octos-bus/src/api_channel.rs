@@ -131,7 +131,7 @@ impl Channel for ApiChannel {
                 let _ = tx.send(done.to_string());
                 // Remove sender to close the receiver → SSE stream ends
                 pending.remove(&msg.chat_id);
-                // Clear delta tracking for this chat
+                drop(pending); // release lock before acquiring last_content
                 self.last_content.lock().await.remove(&msg.chat_id);
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
