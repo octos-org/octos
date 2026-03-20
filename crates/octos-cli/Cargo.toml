@@ -45,12 +45,7 @@ base64 = { workspace = true }
 keyring = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
-
-[target.'cfg(windows)'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
+# Optional deps gated by feature flags (api, admin-bot)
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
@@ -61,6 +56,12 @@ lettre = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
