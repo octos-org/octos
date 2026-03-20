@@ -2073,9 +2073,9 @@ impl SessionActor {
         }
 
         // Spawn stream forwarder task — edits a channel message as text arrives.
-        // Only for channels that support message editing (Discord, Telegram, Feishu).
-        // Channels without edit support (WeCom bot, Slack, etc.) skip streaming
-        // to avoid sending duplicate messages.
+        // Only for channels that support message editing/streaming (Discord,
+        // Telegram, Feishu, WeCom bot). Channels without edit support (Slack,
+        // etc.) skip streaming to avoid sending duplicate messages.
         let stream_forwarder = if let Some(ref si) = self.status_indicator {
             let channel = Arc::clone(si.channel());
             if channel.supports_edit() {

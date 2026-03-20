@@ -75,6 +75,20 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Finalize a streamed message.
+    ///
+    /// Called once after the last streaming chunk. Channels that need special
+    /// finalization (e.g. WeCom's `finish: true` stream frame) override this.
+    /// Default: delegates to `edit_message()`.
+    async fn finish_stream(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+    ) -> Result<()> {
+        self.edit_message(chat_id, message_id, final_content).await
+    }
+
     /// Delete a message by platform message ID.
     async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> Result<()> {
         Ok(())

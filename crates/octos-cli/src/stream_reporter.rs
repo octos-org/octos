@@ -191,14 +191,15 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::StreamDone { .. } => {
-                // Flush remaining buffer — strip think tags
+                // Flush remaining buffer — strip think tags. Use finish flush
+                // so channels like WeCom can send `finish: true`.
                 if !no_edit_support
                     && !buffer.is_empty()
                     && is_session_active(&session_key, &active_sessions).await
                 {
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
-                        flush_to_channel(
+                        finish_flush_to_channel(
                             &channel,
                             &chat_id,
                             &visible,
@@ -319,7 +320,8 @@ pub async fn run_stream_forwarder(
         }
     }
 
-    // Final flush — only if we have an active streamed message to update
+    // Final flush — only if we have unsent buffer (no message_id yet).
+    // Use finish flush so streams are properly closed.
     if !no_edit_support
         && !buffer.is_empty()
         && message_id.is_none()
@@ -327,7 +329,7 @@ pub async fn run_stream_forwarder(
     {
         let visible = strip_think_from_buffer(&buffer);
         if !visible.is_empty() {
-            flush_to_channel(
+            finish_flush_to_channel(
                 &channel,
                 &chat_id,
                 &visible,
@@ -356,9 +358,38 @@ async fn flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
 ) {
+    do_flush(channel, chat_id, text, message_id, no_edit_support, false).await;
+}
+
+/// Send the final streaming chunk, signaling the stream is complete.
+///
+/// Channels that need special finalization (e.g. WeCom `finish: true`) will
+/// receive this via `Channel::finish_stream()`.
+async fn finish_flush_to_channel(
+    channel: &Arc<dyn Channel>,
+    chat_id: &str,
+    text: &str,
+    message_id: &mut Option<String>,
+    no_edit_support: &mut bool,
+) {
+    do_flush(channel, chat_id, text, message_id, no_edit_support, true).await;
+}
+
+async fn do_flush(
+    channel: &Arc<dyn Channel>,
+    chat_id: &str,
+    text: &str,
+    message_id: &mut Option<String>,
+    no_edit_support: &mut bool,
+    finish: bool,
+) {
     if let Some(mid) = message_id.as_ref() {
-        // Edit existing message
-        if let Err(e) = channel.edit_message(chat_id, mid, text).await {
+        let result = if finish {
+            channel.finish_stream(chat_id, mid, text).await
+        } else {
+            channel.edit_message(chat_id, mid, text).await
+        };
+        if let Err(e) = result {
             warn!("stream edit failed: {e}");
         }
     } else {
@@ -373,6 +404,13 @@ async fn flush_to_channel(
         };
         match channel.send_with_id(&msg).await {
             Ok(Some(mid)) => {
+                // If this is also the final flush (only one chunk total),
+                // finalize the stream immediately.
+                if finish {
+                    if let Err(e) = channel.finish_stream(chat_id, &mid, text).await {
+                        warn!("stream finish failed: {e}");
+                    }
+                }
                 *message_id = Some(mid);
             }
             Ok(None) => {
