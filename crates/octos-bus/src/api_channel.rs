@@ -56,6 +56,8 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    /// Track last sent content per chat_id for delta computation.
+    last_content: Arc<Mutex<HashMap<String, String>>>,
     sessions: Arc<Mutex<SessionManager>>,
 }
 
@@ -71,6 +73,7 @@ impl ApiChannel {
             auth_token,
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            last_content: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         }
     }
@@ -128,6 +131,8 @@ impl Channel for ApiChannel {
                 let _ = tx.send(done.to_string());
                 // Remove sender to close the receiver → SSE stream ends
                 pending.remove(&msg.chat_id);
+                // Clear delta tracking for this chat
+                self.last_content.lock().await.remove(&msg.chat_id);
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
                 // The gateway streams accumulated text (not deltas), so the web
@@ -146,6 +151,8 @@ impl Channel for ApiChannel {
     }
 
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        // Reset delta tracking — new message stream starts fresh
+        self.last_content.lock().await.remove(&msg.chat_id);
         self.send(msg).await?;
         // Return a dummy ID so the stream forwarder uses edit_message() for
         // subsequent updates instead of calling send_with_id() again.
@@ -163,13 +170,30 @@ impl Channel for ApiChannel {
         }
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
-            // Send as "replace" event — the web client replaces the current text
-            // instead of appending. This matches the Telegram edit_message pattern.
-            let event = serde_json::json!({
-                "type": "replace",
-                "text": new_content,
-            });
-            let _ = tx.send(event.to_string());
+            let mut last = self.last_content.lock().await;
+            let prev = last.get(chat_id).map(|s| s.as_str()).unwrap_or("");
+
+            // If new content starts with the previous content, send only the delta.
+            // This avoids re-rendering the entire message on each streaming update.
+            if !prev.is_empty() && new_content.starts_with(prev) {
+                let delta = &new_content[prev.len()..];
+                if !delta.is_empty() {
+                    let event = serde_json::json!({
+                        "type": "token",
+                        "text": delta,
+                    });
+                    let _ = tx.send(event.to_string());
+                }
+            } else {
+                // Content changed non-incrementally (tool progress replaced, etc.)
+                // Send full replacement.
+                let event = serde_json::json!({
+                    "type": "replace",
+                    "text": new_content,
+                });
+                let _ = tx.send(event.to_string());
+            }
+            last.insert(chat_id.to_string(), new_content.to_string());
         }
         Ok(())
     }
