@@ -506,16 +506,35 @@ impl ToolRegistry {
             }
         }
 
-        if self
-            .deferred
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(name)
+        // Auto-activate deferred tools on first use — no need for the LLM
+        // to call activate_tools first. This prevents the retry loop where
+        // the LLM keeps calling a deferred tool and getting errors.
         {
-            eyre::bail!(
-                "tool '{}' is deferred; call activate_tools to activate it first",
-                name
-            );
+            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            if deferred.contains(name) {
+                drop(deferred);
+                // Find which group this tool belongs to and activate the whole group
+                let group = policy::TOOL_GROUPS
+                    .iter()
+                    .find(|g| g.tools.contains(&name))
+                    .map(|g| g.name);
+                if let Some(group_name) = group {
+                    let activated = self.activate(group_name);
+                    tracing::info!(
+                        tool = name,
+                        group = group_name,
+                        activated = %activated.join(", "),
+                        "auto-activated deferred tool on first use"
+                    );
+                } else {
+                    // Not in any group — activate individually
+                    let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+                    deferred.remove(name);
+                    drop(deferred);
+                    self.invalidate_cache_shared();
+                    tracing::info!(tool = name, "auto-activated deferred tool (no group)");
+                }
+            }
         }
 
         // Reject oversized arguments (1 MB limit).
