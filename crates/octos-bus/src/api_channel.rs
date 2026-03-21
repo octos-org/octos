@@ -98,6 +98,7 @@ impl Channel for ApiChannel {
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
             .route("/sessions/{id}", delete(handle_delete_session))
+            .route("/files/{*path}", get(handle_file_download))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -133,16 +134,37 @@ impl Channel for ApiChannel {
                 pending.remove(&msg.chat_id);
                 drop(pending); // release lock before acquiring last_content
                 self.last_content.lock().await.remove(&msg.chat_id);
+            } else if !msg.media.is_empty() {
+                // File message — send file paths so web client can download
+                for file_path in &msg.media {
+                    let filename = std::path::Path::new(file_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    info!(
+                        chat_id = %msg.chat_id,
+                        file = %file_path,
+                        filename = %filename,
+                        "sending file SSE event"
+                    );
+                    let event = serde_json::json!({
+                        "type": "file",
+                        "path": file_path,
+                        "filename": filename,
+                        "caption": msg.content,
+                    });
+                    let send_ok = tx.send(event.to_string()).is_ok();
+                    if !send_ok {
+                        info!(chat_id = %msg.chat_id, "file SSE send failed — client disconnected");
+                    }
+                }
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
-                // The gateway streams accumulated text (not deltas), so the web
-                // client should replace rather than append.
                 let event = serde_json::json!({
                     "type": "replace",
                     "text": msg.content,
                 });
                 if tx.send(event.to_string()).is_err() {
-                    // Client disconnected — clean up
                     pending.remove(&msg.chat_id);
                 }
             }
@@ -233,14 +255,22 @@ async fn handle_chat(
         .session_id
         .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
 
-    // Create per-request SSE channel. If a previous request for this session
-    // is still streaming, reuse its sender — don't create a new stream.
-    // This prevents response loss when the user sends multiple messages rapidly.
+    // Create per-request SSE channel. If a previous request is still streaming
+    // AND alive, reuse it. Otherwise, replace the stale sender.
     let rx = {
         let mut pending = state.pending.lock().await;
+        let stale = if let Some(old_tx) = pending.get(&session_id) {
+            // Test if the receiver is still alive by sending a keepalive
+            old_tx.send(serde_json::json!({"type":"keepalive"}).to_string()).is_err()
+        } else {
+            false
+        };
+        if stale {
+            info!(session = %session_id, "removing stale SSE sender");
+            pending.remove(&session_id);
+        }
         if pending.contains_key(&session_id) {
-            // Previous stream still open — send message but don't create new SSE.
-            // The response will arrive on the existing stream.
+            // Previous stream still active — queue on existing
             None
         } else {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -379,6 +409,61 @@ async fn handle_delete_session(
     match sess.clear(&key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// GET /files/*path — download a file produced by write_file/send_file.
+async fn handle_file_download(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    let file_path = std::path::Path::new(&path);
+
+    // Security: only serve files from known safe directories
+    let canonical = match std::fs::canonicalize(file_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+    };
+
+    // Must be under home dir or /tmp
+    let home = std::env::var("HOME").unwrap_or_default();
+    let allowed = canonical.starts_with(&home) || canonical.starts_with("/tmp");
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "access denied").into_response();
+    }
+
+    match tokio::fs::read(&canonical).await {
+        Ok(bytes) => {
+            let filename = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+
+            let content_type = if filename.ends_with(".md") {
+                "text/markdown; charset=utf-8"
+            } else if filename.ends_with(".html") {
+                "text/html; charset=utf-8"
+            } else if filename.ends_with(".json") {
+                "application/json"
+            } else if filename.ends_with(".pdf") {
+                "application/pdf"
+            } else {
+                "application/octet-stream"
+            };
+
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", content_type),
+                    (
+                        "content-disposition",
+                        &format!("inline; filename=\"{filename}\""),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "file not found").into_response(),
     }
 }
 

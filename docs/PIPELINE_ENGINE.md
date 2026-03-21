@@ -5,8 +5,10 @@
 ## Overview
 
 The pipeline engine executes multi-step research workflows defined as DOT graphs.
-The **session-level LLM** is the architect — it designs the pipeline, picks models,
-writes prompts, and assigns tools for each node. Sub-agents execute their assigned
+The **session-level LLM** is the architect — it designs the pipeline structure,
+writes prompts, and assigns tools for each node. **Model selection is handled
+automatically** by the `pipeline-guard` hook using QoS scores from
+`model_catalog.json` (see `docs/QOS_MODEL_CATALOG.md`). Sub-agents execute their assigned
 tasks with no knowledge of the broader pipeline.
 
 ```
