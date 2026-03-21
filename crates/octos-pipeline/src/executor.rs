@@ -98,7 +98,14 @@ pub struct ExecutorConfig {
 /// names for the same concept (task/query/topic/angle/description).
 #[derive(Debug, Clone, Deserialize)]
 struct DynamicTask {
-    #[serde(alias = "query", alias = "topic", alias = "angle", alias = "description", alias = "search", alias = "instruction")]
+    #[serde(
+        alias = "query",
+        alias = "topic",
+        alias = "angle",
+        alias = "description",
+        alias = "search",
+        alias = "instruction"
+    )]
     task: String,
     #[serde(default, alias = "name", alias = "title")]
     label: Option<String>,
@@ -163,14 +170,15 @@ async fn plan_dynamic_tasks(
             timestamp: chrono::Utc::now(),
         },
         Message {
-        role: MessageRole::User,
-        content: prompt,
-        media: vec![],
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-        timestamp: chrono::Utc::now(),
-    }];
+            role: MessageRole::User,
+            content: prompt,
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        },
+    ];
 
     let config = ChatConfig {
         max_tokens: Some(4096),
@@ -211,7 +219,9 @@ async fn plan_dynamic_tasks(
             );
             let arr: Vec<serde_json::Map<String, serde_json::Value>> =
                 serde_json::from_str(json_str).map_err(|e| {
-                    eyre::eyre!("failed to parse planning JSON as array of objects: {e}\nJSON: {preview}")
+                    eyre::eyre!(
+                        "failed to parse planning JSON as array of objects: {e}\nJSON: {preview}"
+                    )
                 })?;
             arr.into_iter()
                 .filter_map(|obj| {
@@ -384,16 +394,20 @@ fn resolve_search_result_files(content: &str) -> String {
             .collect();
 
         for candidate in path_candidates {
-            let clean = candidate.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '_' && c != '-' && c != '.');
+            let clean = candidate.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '/' && c != '_' && c != '-' && c != '.'
+            });
             let path = Path::new(clean);
 
             // Try reading _search_results.md from the directory
             let search_results_path = if path.is_dir() {
                 path.join("_search_results.md")
-            } else if path.file_name().map(|f| f == "_search_results.md").unwrap_or(false) {
+            } else if path
+                .file_name()
+                .map(|f| f == "_search_results.md")
+                .unwrap_or(false)
+            {
                 path.to_path_buf()
-            } else if path.is_dir() {
-                path.join("_search_results.md")
             } else {
                 continue;
             };
@@ -410,7 +424,9 @@ fn resolve_search_result_files(content: &str) -> String {
                         } else {
                             file_content
                         };
-                        if !appended.iter().any(|p: &String| p == &search_results_path.to_string_lossy().to_string()) {
+                        if !appended.iter().any(|p: &String| {
+                            p == &search_results_path.to_string_lossy().to_string()
+                        }) {
                             appended.push(search_results_path.to_string_lossy().to_string());
                             result.push_str(&format!(
                                 "\n\n--- Search results from {} ---\n{}",
@@ -435,8 +451,14 @@ fn resolve_search_result_files(content: &str) -> String {
                 .collect();
             // Sort by modified time, newest first
             dirs.sort_by(|a, b| {
-                b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                    .cmp(&a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+                b.metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .cmp(
+                        &a.metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    )
             });
             // Read up to 8 most recent _search_results.md
             for dir in dirs.iter().take(8) {
@@ -957,11 +979,17 @@ impl PipelineExecutor {
 
                 // Resolve worker model pool. If model contains commas,
                 // it's a pool of models for round-robin distribution across workers.
-                let model_str = node.model.as_deref()
+                let model_str = node
+                    .model
+                    .as_deref()
                     .or(graph.default_model.as_deref())
                     .unwrap_or("");
                 let model_pool: Vec<&str> = if model_str.contains(',') {
-                    model_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+                    model_str
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect()
                 } else {
                     vec![model_str]
                 };

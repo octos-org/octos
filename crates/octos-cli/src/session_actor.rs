@@ -475,12 +475,11 @@ impl ActorFactory {
                     .iter()
                     .find(|g| g.name == name)
                 {
-                    tool_names.extend(info.tools.iter().map(|s| *s));
+                    tool_names.extend(info.tools.iter().copied());
                 }
             }
             let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
-            system_prompt
-                .push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
+            system_prompt.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
         }
 
         // Per-session cancellation flag: shared with the agent so that
@@ -1608,7 +1607,11 @@ impl SessionActor {
                 agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
             )
             .await;
-            eprintln!("[DEBUG] agent_task finished in {}ms, ok={}", start.elapsed().as_millis(), result.is_ok());
+            eprintln!(
+                "[DEBUG] agent_task finished in {}ms, ok={}",
+                start.elapsed().as_millis(),
+                result.is_ok()
+            );
             (result, start.elapsed())
         });
 
@@ -1768,7 +1771,9 @@ impl SessionActor {
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
         match &agent_result {
-            Ok(Ok(cr)) => info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages"),
+            Ok(Ok(cr)) => {
+                info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages")
+            }
             Ok(Err(e)) => warn!(session = %self.session_key, error = %e, "agent returned error"),
             Err(e) => warn!(session = %self.session_key, error = %e, "agent timed out"),
         }
@@ -2287,7 +2292,11 @@ impl SessionActor {
         )
         .await;
         let llm_latency = llm_start.elapsed();
-        eprintln!("[DEBUG] process_inbound: agent returned in {}ms, ok={}", llm_latency.as_millis(), result.is_ok());
+        eprintln!(
+            "[DEBUG] process_inbound: agent returned in {}ms, ok={}",
+            llm_latency.as_millis(),
+            result.is_ok()
+        );
 
         // Feed latency to responsiveness observer
         self.responsiveness.record(llm_latency);

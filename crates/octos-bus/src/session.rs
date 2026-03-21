@@ -171,7 +171,11 @@ impl SessionManager {
         }
 
         // 2. Per-user layout: data/users/{base_key}/sessions/{topic}.jsonl
-        let users_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).join("users");
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
         if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
             for user_entry in user_entries.flatten() {
                 let user_path = user_entry.path();
@@ -339,7 +343,11 @@ impl SessionManager {
             let encoded_base = encode_path_component(base_key);
             let topic = key.topic().unwrap_or("default");
             let encoded_topic = encode_path_component(topic);
-            let users_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).join("users");
+            let users_dir = self
+                .sessions_dir
+                .parent()
+                .unwrap_or(&self.sessions_dir)
+                .join("users");
             let per_user_path = users_dir
                 .join(&encoded_base)
                 .join("sessions")

@@ -5,7 +5,7 @@ use eyre::{Result, bail};
 use uuid::Uuid;
 
 use super::Executable;
-use crate::tenant::{TenantConfig, TenantStore, TenantStatus, render_frpc_config};
+use crate::tenant::{TenantConfig, TenantStatus, TenantStore, render_frpc_config};
 
 /// Admin commands for tenant and tunnel management.
 #[derive(Debug, Args)]
@@ -82,8 +82,8 @@ impl Executable for AdminCommand {
             AdminAction::CreateTenant {
                 name,
                 domain,
-                server,
-                port,
+                server: _,
+                port: _,
                 local_port,
                 auth_token: auth_token_arg,
                 data_dir,
@@ -98,8 +98,9 @@ impl Executable for AdminCommand {
 
                 let ssh_port = store.next_ssh_port()?;
                 let tunnel_token = Uuid::new_v4().to_string();
-                let auth_token = auth_token_arg
-                    .unwrap_or_else(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+                let auth_token = auth_token_arg.unwrap_or_else(|| {
+                    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+                });
                 let now = chrono::Utc::now();
 
                 let tenant = TenantConfig {

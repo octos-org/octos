@@ -99,10 +99,7 @@ impl Tool for ActivateToolsTool {
 
             let mut tools: Vec<String> = Vec::new();
             for (name, _desc, _count) in &groups {
-                if let Some(info) = super::policy::TOOL_GROUPS
-                    .iter()
-                    .find(|g| g.name == *name)
-                {
+                if let Some(info) = super::policy::TOOL_GROUPS.iter().find(|g| g.name == *name) {
                     for t in info.tools {
                         tools.push((*t).to_string());
                     }
@@ -153,9 +150,7 @@ impl Tool for ActivateToolsTool {
 
         if all_activated.is_empty() {
             Ok(ToolResult {
-                output: format!(
-                    "No tools matched. Call activate_tools with no arguments to see available tools."
-                ),
+                output: "No tools matched. Call activate_tools with no arguments to see available tools.".to_string(),
                 success: false,
                 ..Default::default()
             })

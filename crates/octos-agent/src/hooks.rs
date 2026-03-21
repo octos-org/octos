@@ -355,7 +355,8 @@ impl HookExecutor {
                                     error = %e,
                                     "hook exit 2 but stdout is not valid JSON, treating as error"
                                 );
-                                last_error = Some(format!("hook modified output not valid JSON: {e}"));
+                                last_error =
+                                    Some(format!("hook modified output not valid JSON: {e}"));
                             }
                         }
                     } else {

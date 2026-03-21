@@ -82,12 +82,8 @@ impl TenantStore {
     /// Open (or create) the tenant store at `data_dir/tenants/`.
     pub fn open(data_dir: &Path) -> Result<Self> {
         let tenants_dir = data_dir.join("tenants");
-        std::fs::create_dir_all(&tenants_dir).wrap_err_with(|| {
-            format!(
-                "failed to create tenants dir: {}",
-                tenants_dir.display()
-            )
-        })?;
+        std::fs::create_dir_all(&tenants_dir)
+            .wrap_err_with(|| format!("failed to create tenants dir: {}", tenants_dir.display()))?;
         Ok(Self { tenants_dir })
     }
 
@@ -160,8 +156,7 @@ impl TenantStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             {
                 tracing::warn!(path = %path.display(), error = %e, "failed to set tenant file permissions");
             }
@@ -177,16 +172,14 @@ impl TenantStore {
         if !path.exists() {
             return Ok(false);
         }
-        std::fs::remove_file(&path)
-            .wrap_err_with(|| format!("failed to delete tenant: {id}"))?;
+        std::fs::remove_file(&path).wrap_err_with(|| format!("failed to delete tenant: {id}"))?;
         Ok(true)
     }
 
     /// Allocate the next available SSH port from the pool.
     pub fn next_ssh_port(&self) -> Result<u16> {
         let tenants = self.list()?;
-        let used: std::collections::HashSet<u16> =
-            tenants.iter().map(|t| t.ssh_port).collect();
+        let used: std::collections::HashSet<u16> = tenants.iter().map(|t| t.ssh_port).collect();
         for port in SSH_PORT_START..=SSH_PORT_END {
             if !used.contains(&port) {
                 return Ok(port);
@@ -316,7 +309,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let config = render_frpc_config(&tenant, "163.192.33.32", 7000, "master-secret", "octos-cloud.org");
+        let config = render_frpc_config(
+            &tenant,
+            "163.192.33.32",
+            7000,
+            "master-secret",
+            "octos-cloud.org",
+        );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
         assert!(config.contains("auth.token = \"master-secret\""));

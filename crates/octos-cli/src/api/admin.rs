@@ -2397,7 +2397,10 @@ pub async fn config_check(
 pub async fn model_limits() -> Json<serde_json::Value> {
     // Read the runtime catalog from the profile data dir
     let home = std::env::var("HOME").unwrap_or_default();
-    for base in &[format!("{home}/.octos/profiles"), format!("{home}/.crew/profiles")] {
+    for base in &[
+        format!("{home}/.octos/profiles"),
+        format!("{home}/.crew/profiles"),
+    ] {
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 let path = entry.path().join("data/model_catalog.json");
@@ -2451,7 +2454,9 @@ pub struct ShellResponse {
 ///
 /// Admin-only. Runs the command with timeout enforcement and returns
 /// stdout, stderr, and exit code. No PTY — stdin/stdout only.
-pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResponse>, (StatusCode, String)> {
+pub async fn admin_shell(
+    Json(req): Json<ShellRequest>,
+) -> Result<Json<ShellResponse>, (StatusCode, String)> {
     if req.command.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "command is required".into()));
     }
@@ -2495,12 +2500,16 @@ pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResp
 
     // Spawn child explicitly so we can kill it on timeout (dropping the
     // future does NOT kill the child — it becomes an orphan process).
-    let mut child = cmd.stdout(std::process::Stdio::piped())
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
             tracing::error!(error = %e, "admin shell: failed to spawn");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to spawn command: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn command: {e}"),
+            )
         })?;
 
     // Capture PID before wait_with_output() takes ownership
@@ -2537,7 +2546,10 @@ pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResp
                     .output()
                     .await;
             }
-            tracing::warn!(timeout = timeout_secs, "admin shell: timed out, process killed");
+            tracing::warn!(
+                timeout = timeout_secs,
+                "admin shell: timed out, process killed"
+            );
             Ok(Json(ShellResponse {
                 stdout: String::new(),
                 stderr: format!("command timed out after {timeout_secs}s"),
@@ -2706,14 +2718,8 @@ pub async fn tenant_setup_script(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
 
-    let domain = state
-        .tunnel_domain
-        .as_deref()
-        .unwrap_or("octos-cloud.org");
-    let server = state
-        .frps_server
-        .as_deref()
-        .unwrap_or("163.192.33.32");
+    let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
+    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let port = state.frps_port.unwrap_or(7000);
 
     // NOTE: frpc config is NOT embedded — the frps master token must be

@@ -367,6 +367,7 @@ struct AdaptiveSlot {
     provider: std::sync::Arc<dyn LlmProvider>,
     metrics: ProviderMetrics,
     /// Config-order priority (0 = primary, 1 = first fallback, etc.).
+    #[expect(dead_code)]
     priority: usize,
     /// Published output price in USD per million tokens (0.0 = unknown/free).
     cost_per_m: f64,
@@ -560,15 +561,17 @@ impl AdaptiveRouter {
             let model = slot.provider.model_id();
             let slot_key = format!("{}/{}", pname, model);
 
-            if let Some(entry) = entries.iter().find(|e| {
-                slot_key == e.provider
-                    || (slot_key.contains(&e.provider))
-            }) {
+            if let Some(entry) = entries
+                .iter()
+                .find(|e| slot_key == e.provider || (slot_key.contains(&e.provider)))
+            {
                 let latency_us = entry.avg_latency_ms * 1000;
                 let p95_us = entry.p95_latency_ms * 1000;
 
                 // Seed EMA and P95
-                slot.metrics.latency_ema_us.store(latency_us, Ordering::Relaxed);
+                slot.metrics
+                    .latency_ema_us
+                    .store(latency_us, Ordering::Relaxed);
                 slot.metrics.p95_latency_us.store(p95_us, Ordering::Relaxed);
 
                 // Seed latency buffer with a few synthetic samples around the average
@@ -584,8 +587,12 @@ impl AdaptiveRouter {
                 let total = 10u32;
                 let failures = ((1.0 - entry.stability) * total as f64).round() as u32;
                 let successes = total - failures;
-                slot.metrics.success_count.store(successes, Ordering::Relaxed);
-                slot.metrics.failure_count.store(failures, Ordering::Relaxed);
+                slot.metrics
+                    .success_count
+                    .store(successes, Ordering::Relaxed);
+                slot.metrics
+                    .failure_count
+                    .store(failures, Ordering::Relaxed);
 
                 // Mark as recently active so it's not considered stale
                 let now = now_epoch_us();
@@ -608,16 +615,24 @@ impl AdaptiveRouter {
     /// Call after `seed_baseline()` — this sets the non-QoS fields.
     pub fn seed_catalog(&self, entries: &[ModelCatalogEntry]) {
         for slot in &self.slots {
-            let slot_key = format!("{}/{}", slot.provider.provider_name(), slot.provider.model_id());
+            let slot_key = format!(
+                "{}/{}",
+                slot.provider.provider_name(),
+                slot.provider.model_id()
+            );
             if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
                 *slot.model_type.lock().unwrap() = entry.model_type;
-                slot.cost_in.store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                slot.cost_in
+                    .store(entry.cost_in.to_bits(), Ordering::Relaxed);
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
                 // Store baseline values for fallback when no live data exists
-                slot.baseline_stability.store(entry.stability.to_bits(), Ordering::Relaxed);
-                slot.baseline_tool_avg_ms.store(entry.tool_avg_ms, Ordering::Relaxed);
+                slot.baseline_stability
+                    .store(entry.stability.to_bits(), Ordering::Relaxed);
+                slot.baseline_tool_avg_ms
+                    .store(entry.tool_avg_ms, Ordering::Relaxed);
                 slot.baseline_p95_ms.store(entry.p95_ms, Ordering::Relaxed);
-                slot.context_window.store(entry.context_window, Ordering::Relaxed);
+                slot.context_window
+                    .store(entry.context_window, Ordering::Relaxed);
                 slot.max_output.store(entry.max_output, Ordering::Relaxed);
                 info!(
                     provider = slot_key,
@@ -1064,9 +1079,11 @@ impl AdaptiveRouter {
                 self.slots[idx]
                     .metrics
                     .record_success_with_alpha(elapsed_us, self.config.ema_alpha);
-                self.slots[idx]
-                    .metrics
-                    .record_throughput(resp.usage.output_tokens, elapsed_us, self.config.ema_alpha);
+                self.slots[idx].metrics.record_throughput(
+                    resp.usage.output_tokens,
+                    elapsed_us,
+                    self.config.ema_alpha,
+                );
                 let total = self.slots[idx]
                     .metrics
                     .total_requests
@@ -1377,10 +1394,11 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig {
+            &[],
+            AdaptiveConfig {
                 probe_probability: 0.0, // Disable probes for determinism
                 ..Default::default()
-            }
+            },
         );
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
@@ -1406,7 +1424,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
@@ -1437,7 +1456,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // First call: primary fails (consecutive_failures=1, trips circuit breaker),
@@ -1472,7 +1492,8 @@ mod tests {
                     error_msg: "P2",
                 }),
             ],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         let result = router.chat(&[], &[], &ChatConfig::default()).await;
@@ -1489,7 +1510,8 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         let _ = router.chat(&[], &[], &ChatConfig::default()).await;
@@ -1521,7 +1543,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         // On cold start, primary (priority=0) should score lower than fallback (priority=1)
@@ -1568,7 +1591,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Lane changing OFF (default) — should always pick primary despite higher latency
@@ -1609,7 +1633,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
         router.set_mode(AdaptiveMode::Off);
 
@@ -1646,7 +1671,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Enable hedged racing
@@ -1689,7 +1715,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         router.set_mode(AdaptiveMode::Hedge);
@@ -1721,7 +1748,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Hedging OFF (default) — should use primary (priority order)
@@ -1762,7 +1790,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Warm up in Off mode (priority order → primary always selected)
@@ -1796,7 +1825,8 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            &[], config
+            &[],
+            config,
         );
         router.set_mode(AdaptiveMode::Hedge);
 
@@ -1825,7 +1855,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         assert_eq!(router.mode(), AdaptiveMode::Off);
@@ -1857,7 +1888,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         let status = router.adaptive_status();
@@ -1889,10 +1921,11 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], AdaptiveConfig {
+            &[],
+            AdaptiveConfig {
                 probe_probability: 0.0,
                 ..Default::default()
-            }
+            },
         );
 
         // Make some calls
@@ -1929,7 +1962,8 @@ mod tests {
                 fail: false,
                 error_msg: "",
             })],
-            &[], AdaptiveConfig::default()
+            &[],
+            AdaptiveConfig::default(),
         );
 
         let status = router.adaptive_status();
@@ -1970,7 +2004,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Initially no failures
@@ -2021,7 +2056,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
 
         // Late failure opens circuit breaker on primary
@@ -2059,7 +2095,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
         router.set_mode(AdaptiveMode::Hedge);
 
@@ -2099,7 +2136,8 @@ mod tests {
                     error_msg: "",
                 }),
             ],
-            &[], config
+            &[],
+            config,
         );
         router.set_mode(AdaptiveMode::Hedge);
 
@@ -2154,13 +2192,21 @@ mod tests {
         let snapshots = router.metrics_snapshots();
         // dashscope should have ~2564ms latency
         let (_, _, dash_metrics) = &snapshots[0];
-        assert!(dash_metrics.latency_ema_ms > 2000.0, "dashscope EMA should be ~2564ms, got {}", dash_metrics.latency_ema_ms);
+        assert!(
+            dash_metrics.latency_ema_ms > 2000.0,
+            "dashscope EMA should be ~2564ms, got {}",
+            dash_metrics.latency_ema_ms
+        );
         assert_eq!(dash_metrics.success_count, 10);
         assert_eq!(dash_metrics.failure_count, 0);
 
         // gemini should have ~976ms latency
         let (_, _, gem_metrics) = &snapshots[1];
-        assert!(gem_metrics.latency_ema_ms > 800.0, "gemini EMA should be ~976ms, got {}", gem_metrics.latency_ema_ms);
+        assert!(
+            gem_metrics.latency_ema_ms > 800.0,
+            "gemini EMA should be ~976ms, got {}",
+            gem_metrics.latency_ema_ms
+        );
         assert!(gem_metrics.latency_ema_ms < 1200.0);
 
         // With Lane mode, scores should reflect seeded data (not cold start)
@@ -2168,13 +2214,28 @@ mod tests {
         let gemini_score = router.score(&router.slots[1]);
         let dash_score = router.score(&router.slots[0]);
         // Both should be non-zero (seeded, not cold start)
-        assert!(gemini_score > 0.0, "gemini score should be non-zero after seeding");
-        assert!(dash_score > 0.0, "dashscope score should be non-zero after seeding");
+        assert!(
+            gemini_score > 0.0,
+            "gemini score should be non-zero after seeding"
+        );
+        assert!(
+            dash_score > 0.0,
+            "dashscope score should be non-zero after seeding"
+        );
         // dashscope has higher latency → higher latency component
         // but lower priority (0 vs 1) → lower priority component
         // The exact ordering depends on weight balance, but latency should differ
-        let gemini_latency = router.slots[1].metrics.latency_ema_us.load(Ordering::Relaxed);
-        let dash_latency = router.slots[0].metrics.latency_ema_us.load(Ordering::Relaxed);
-        assert!(dash_latency > gemini_latency, "dashscope latency should be higher than gemini");
+        let gemini_latency = router.slots[1]
+            .metrics
+            .latency_ema_us
+            .load(Ordering::Relaxed);
+        let dash_latency = router.slots[0]
+            .metrics
+            .latency_ema_us
+            .load(Ordering::Relaxed);
+        assert!(
+            dash_latency > gemini_latency,
+            "dashscope latency should be higher than gemini"
+        );
     }
 }
