@@ -159,9 +159,17 @@ pub struct EpisodeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey(pub String);
 
+/// Synthetic profile ID used for main-profile session isolation.
+pub const MAIN_PROFILE_ID: &str = "_main";
+
 impl SessionKey {
     pub fn new(channel: &str, chat_id: &str) -> Self {
         Self(format!("{channel}:{chat_id}"))
+    }
+
+    /// Create a session key with an explicit profile dimension.
+    pub fn with_profile(profile_id: &str, channel: &str, chat_id: &str) -> Self {
+        Self(format!("{profile_id}:{channel}:{chat_id}"))
     }
 
     /// Create a session key with a topic suffix (e.g., `telegram:12345#research`).
@@ -171,6 +179,15 @@ impl SessionKey {
             Self::new(channel, chat_id)
         } else {
             Self(format!("{channel}:{chat_id}#{topic}"))
+        }
+    }
+
+    /// Create a profiled session key with an optional topic suffix.
+    pub fn with_profile_topic(profile_id: &str, channel: &str, chat_id: &str, topic: &str) -> Self {
+        if topic.is_empty() {
+            Self::with_profile(profile_id, channel, chat_id)
+        } else {
+            Self(format!("{profile_id}:{channel}:{chat_id}#{topic}"))
         }
     }
 
@@ -184,16 +201,59 @@ impl SessionKey {
         self.0.split_once('#').map(|(_, t)| t)
     }
 
+    fn split_base_key(&self) -> (Option<&str>, &str, &str) {
+        let base = self.base_key();
+        let mut parts = base.splitn(3, ':');
+        let first = parts.next().unwrap_or("");
+        let second = parts.next().unwrap_or("");
+        let third = parts.next();
+
+        if let Some(rest) = third {
+            if !is_channel_name(first) && is_channel_name(second) {
+                (Some(first), second, rest)
+            } else {
+                (None, first, &base[first.len() + 1..])
+            }
+        } else {
+            (None, first, second)
+        }
+    }
+
+    /// Profile ID when the key is in `{profile}:{channel}:{chat_id}` form.
+    pub fn profile_id(&self) -> Option<&str> {
+        self.split_base_key().0
+    }
+
     /// Channel name: `"telegram:12345#foo"` → `"telegram"`.
     pub fn channel(&self) -> &str {
-        self.base_key().split(':').next().unwrap_or("")
+        self.split_base_key().1
     }
 
     /// Chat ID: `"telegram:12345#foo"` → `"12345"`.
     pub fn chat_id(&self) -> &str {
-        let base = self.base_key();
-        base.split_once(':').map(|(_, id)| id).unwrap_or(base)
+        self.split_base_key().2
     }
+}
+
+fn is_channel_name(value: &str) -> bool {
+    matches!(
+        value,
+        "api"
+            | "cli"
+            | "discord"
+            | "email"
+            | "feishu"
+            | "matrix"
+            | "qq-bot"
+            | "slack"
+            | "system"
+            | "telegram"
+            | "test"
+            | "twilio"
+            | "wecom"
+            | "wecom-bot"
+            | "whatsapp"
+    )
 }
 
 impl std::fmt::Display for SessionKey {
@@ -309,6 +369,51 @@ mod tests {
         assert_eq!(key.topic(), None);
         assert_eq!(key.channel(), "whatsapp");
         assert_eq!(key.chat_id(), "abc");
+    }
+
+    #[test]
+    fn test_session_key_with_profile() {
+        let key = SessionKey::with_profile("weather", "matrix", "!room:localhost");
+        assert_eq!(key.0, "weather:matrix:!room:localhost");
+        assert_eq!(key.profile_id(), Some("weather"));
+        assert_eq!(key.base_key(), "weather:matrix:!room:localhost");
+        assert_eq!(key.channel(), "matrix");
+        assert_eq!(key.chat_id(), "!room:localhost");
+    }
+
+    #[test]
+    fn test_session_key_with_profile_and_topic() {
+        let key = SessionKey::with_profile_topic("weather", "matrix", "!room:localhost", "ops");
+        assert_eq!(key.0, "weather:matrix:!room:localhost#ops");
+        assert_eq!(key.profile_id(), Some("weather"));
+        assert_eq!(key.base_key(), "weather:matrix:!room:localhost");
+        assert_eq!(key.topic(), Some("ops"));
+        assert_eq!(key.channel(), "matrix");
+        assert_eq!(key.chat_id(), "!room:localhost");
+    }
+
+    #[test]
+    fn test_session_key_with_profile_supports_qq_bot_channel() {
+        let key = SessionKey::with_profile("weather", "qq-bot", "group:123");
+        assert_eq!(key.profile_id(), Some("weather"));
+        assert_eq!(key.channel(), "qq-bot");
+        assert_eq!(key.chat_id(), "group:123");
+    }
+
+    #[test]
+    fn test_session_key_legacy_shape_has_no_profile() {
+        let key = SessionKey::new("telegram", "12345");
+        assert_eq!(key.profile_id(), None);
+        assert_eq!(key.channel(), "telegram");
+        assert_eq!(key.chat_id(), "12345");
+    }
+
+    #[test]
+    fn test_session_key_legacy_chat_id_with_colon_stays_legacy() {
+        let key = SessionKey::new("discord", "guild:123");
+        assert_eq!(key.profile_id(), None);
+        assert_eq!(key.channel(), "discord");
+        assert_eq!(key.chat_id(), "guild:123");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
 use octos_bus::{ActiveSessionStore, Channel};
-use octos_core::{OutboundMessage, SessionKey};
+use octos_core::{METADATA_SENDER_USER_ID, OutboundMessage, SessionKey};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
@@ -133,6 +133,7 @@ async fn is_session_active(
 /// `active_sessions` + `session_key` — used to check if this session is currently
 /// active before sending/editing channel messages. When inactive, all direct
 /// channel operations are skipped to prevent cross-session message leaks.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stream_forwarder(
     mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
     channel: Arc<dyn Channel>,
@@ -141,6 +142,7 @@ pub async fn run_stream_forwarder(
     status_msg_id: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
     session_key: SessionKey,
+    sender_user_id: Option<String>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -210,6 +212,7 @@ pub async fn run_stream_forwarder(
                             &visible,
                             &mut message_id,
                             &mut no_edit_support,
+                            sender_user_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -249,6 +252,7 @@ pub async fn run_stream_forwarder(
                         &buffer,
                         &mut message_id,
                         &mut no_edit_support,
+                        sender_user_id.as_deref(),
                     )
                     .await;
                     last_edit = Instant::now();
@@ -271,6 +275,7 @@ pub async fn run_stream_forwarder(
                             &buffer,
                             &mut message_id,
                             &mut no_edit_support,
+                            sender_user_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -301,6 +306,7 @@ pub async fn run_stream_forwarder(
                             &buffer,
                             &mut message_id,
                             &mut no_edit_support,
+                            sender_user_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -332,6 +338,7 @@ pub async fn run_stream_forwarder(
                         &status_text,
                         &mut message_id,
                         &mut no_edit_support,
+                        sender_user_id.as_deref(),
                     )
                     .await;
                     last_edit = Instant::now();
@@ -353,6 +360,7 @@ pub async fn run_stream_forwarder(
                             &buffer,
                             &mut message_id,
                             &mut no_edit_support,
+                            sender_user_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -405,8 +413,18 @@ async fn flush_to_channel(
     text: &str,
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
+    sender_user_id: Option<&str>,
 ) {
-    do_flush(channel, chat_id, text, message_id, no_edit_support, false).await;
+    do_flush(
+        channel,
+        chat_id,
+        text,
+        message_id,
+        no_edit_support,
+        false,
+        sender_user_id,
+    )
+    .await;
 }
 
 /// Send the final streaming chunk, signaling the stream is complete.
@@ -420,7 +438,16 @@ async fn finish_flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
 ) {
-    do_flush(channel, chat_id, text, message_id, no_edit_support, true).await;
+    do_flush(
+        channel,
+        chat_id,
+        text,
+        message_id,
+        no_edit_support,
+        true,
+        None,
+    )
+    .await;
 }
 
 async fn do_flush(
@@ -430,6 +457,7 @@ async fn do_flush(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
     finish: bool,
+    sender_user_id: Option<&str>,
 ) {
     if let Some(mid) = message_id.as_ref() {
         let result = if finish {
@@ -448,7 +476,9 @@ async fn do_flush(
             content: text.to_string(),
             reply_to: None,
             media: vec![],
-            metadata: serde_json::json!({}),
+            metadata: sender_user_id
+                .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
+                .unwrap_or_else(|| serde_json::json!({})),
         };
         match channel.send_with_id(&msg).await {
             Ok(Some(mid)) => {
@@ -476,6 +506,41 @@ async fn do_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
+    use tokio::sync::{Mutex, mpsc};
+
+    #[derive(Default)]
+    struct MockChannel {
+        sent: Arc<Mutex<Vec<OutboundMessage>>>,
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn start(&self, _inbound_tx: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, msg: &OutboundMessage) -> eyre::Result<()> {
+            self.sent.lock().await.push(msg.clone());
+            Ok(())
+        }
+
+        async fn send_with_id(&self, msg: &OutboundMessage) -> eyre::Result<Option<String>> {
+            self.sent.lock().await.push(msg.clone());
+            Ok(Some("$stream-1".to_string()))
+        }
+
+        fn supports_edit(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn should_clear_buffer_on_reset_event() {
@@ -512,6 +577,34 @@ mod tests {
         assert_eq!(
             strip_think_from_buffer("Hello <think>still thinking"),
             "Hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_stream_message_with_sender_user_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        flush_to_channel(
+            &channel,
+            "!room:localhost",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            Some("@bot_mybot:localhost"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent.first().expect("stream message should be sent");
+        assert_eq!(
+            first
+                .metadata
+                .get(METADATA_SENDER_USER_ID)
+                .and_then(|v| v.as_str()),
+            Some("@bot_mybot:localhost")
         );
     }
 }

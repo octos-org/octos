@@ -179,6 +179,14 @@ pub fn markdown_to_telegram_html(input: &str) -> String {
     result
 }
 
+/// Convert markdown text to Matrix-compatible HTML.
+///
+/// Matrix HTML requires `<br>` for line breaks (plain `\n` is ignored in
+/// `formatted_body`). This reuses the Telegram converter and swaps newlines.
+pub fn markdown_to_matrix_html(input: &str) -> String {
+    markdown_to_telegram_html(input).replace('\n', "<br>")
+}
+
 /// Check if a line is a horizontal rule (---, ***, ___ with 3+ chars).
 fn is_horizontal_rule(line: &str) -> bool {
     let trimmed = line.trim();
