@@ -147,7 +147,8 @@ fn stream_tts_to_wav(
     {
         use std::io::Read;
         let mut reader = resp;
-        reader.read_to_end(&mut buf)
+        reader
+            .read_to_end(&mut buf)
             .map_err(|e| format!("Failed to read TTS response: {e}"))?;
     }
     let bytes = buf;
@@ -283,7 +284,10 @@ fn handle_transcribe(input_json: &str) {
     // Send file as multipart form data (compatible with all ominix-api versions)
     let file_bytes = match std::fs::read(&input.audio_path) {
         Ok(b) => b,
-        Err(e) => fail(&format!("failed to read audio file '{}': {e}", input.audio_path)),
+        Err(e) => fail(&format!(
+            "failed to read audio file '{}': {e}",
+            input.audio_path
+        )),
     };
     let filename = std::path::Path::new(&input.audio_path)
         .file_name()
@@ -380,7 +384,8 @@ fn handle_synthesize(input_json: &str) {
 
     // Always save to OCTOS_WORK_DIR (inside profile data_dir) so send_file
     // can access the file. Ignore LLM's output_path to avoid sandbox violations.
-    let filename = input.output_path
+    let filename = input
+        .output_path
         .as_deref()
         .and_then(|p| Path::new(p).file_name())
         .map(|n| n.to_string_lossy().to_string())
@@ -466,7 +471,16 @@ fn handle_synthesize(input_json: &str) {
 fn try_convert_to_mp3(wav_path: &str) -> String {
     let mp3_path = wav_path.replace(".wav", ".mp3");
     let result = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i", wav_path, "-codec:a", "libmp3lame", "-q:a", "2", &mp3_path])
+        .args([
+            "-y",
+            "-i",
+            wav_path,
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            &mp3_path,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

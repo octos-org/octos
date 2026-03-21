@@ -361,7 +361,10 @@ pub async fn session_messages(
     // Proxy to gateway
     if let Some(pm) = &state.process_manager {
         if let Some((_profile_id, port)) = pm.first_api_port().await {
-            let path = format!("/sessions/{id}/messages?limit={}&offset={}", params.limit, params.offset);
+            let path = format!(
+                "/sessions/{id}/messages?limit={}&offset={}",
+                params.limit, params.offset
+            );
             return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
         }
     }
@@ -415,7 +418,10 @@ pub async fn upload(
     // Determine upload directory
     let upload_dir = std::env::temp_dir().join("octos-uploads");
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to create upload dir: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create upload dir: {e}"),
+        )
     })?;
 
     let mut paths = Vec::new();
@@ -444,21 +450,33 @@ pub async fn upload(
             .collect::<String>();
 
         let data = field.bytes().await.map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("failed to read field: {e}"))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read field: {e}"),
+            )
         })?;
 
         if data.len() as u64 > MAX_FILE_SIZE {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("file exceeds {MAX_FILE_SIZE} byte limit")));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("file exceeds {MAX_FILE_SIZE} byte limit"),
+            ));
         }
         total_size += data.len() as u64;
         if total_size > MAX_TOTAL_SIZE {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, "total upload exceeds 100MB".into()));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "total upload exceeds 100MB".into(),
+            ));
         }
 
         // Unique prefix to avoid collisions
         let dest = upload_dir.join(format!("{}_{safe_name}", uuid::Uuid::now_v7()));
         tokio::fs::write(&dest, &data).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write file: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to write file: {e}"),
+            )
         })?;
 
         tracing::info!(path = %dest.display(), size = data.len(), "file uploaded");
@@ -473,9 +491,7 @@ pub async fn upload(
 }
 
 /// GET /api/files/:filename -- serve uploaded files for display/download.
-pub async fn serve_file(
-    axum::extract::Path(filename): axum::extract::Path<String>,
-) -> Response {
+pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<String>) -> Response {
     let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
     let upload_dir = std::env::temp_dir().join("octos-uploads");
     let path = upload_dir.join(&safe_name);

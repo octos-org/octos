@@ -148,17 +148,14 @@ impl ProviderRouter {
             }
         }
 
-        providers
-            .get(prefix_key)
-            .cloned()
-            .ok_or_else(|| {
-                let available: Vec<&String> = providers.keys().collect();
-                eyre::eyre!(
-                    "no provider registered for key '{}' (available: {:?})",
-                    prefixed_model,
-                    available
-                )
-            })
+        providers.get(prefix_key).cloned().ok_or_else(|| {
+            let available: Vec<&String> = providers.keys().collect();
+            eyre::eyre!(
+                "no provider registered for key '{}' (available: {:?})",
+                prefixed_model,
+                available
+            )
+        })
     }
 
     /// List all registered provider keys.
@@ -247,7 +244,11 @@ impl ProviderRouter {
     pub fn record_failure(&self, key: &str) {
         let mut cooldowns = self.cooldowns.write().unwrap_or_else(|e| e.into_inner());
         cooldowns.insert(key.to_string(), std::time::Instant::now());
-        tracing::info!(model = key, cooldown_secs = self.cooldown_duration.as_secs(), "model entered cooldown");
+        tracing::info!(
+            model = key,
+            cooldown_secs = self.cooldown_duration.as_secs(),
+            "model entered cooldown"
+        );
     }
 
     /// Check if a model is currently in cooldown.

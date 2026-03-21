@@ -99,10 +99,7 @@ impl Tool for ActivateToolsTool {
 
             let mut tools: Vec<String> = Vec::new();
             for (name, _desc, _count) in &groups {
-                if let Some(info) = super::policy::TOOL_GROUPS
-                    .iter()
-                    .find(|g| g.name == *name)
-                {
+                if let Some(info) = super::policy::TOOL_GROUPS.iter().find(|g| g.name == *name) {
                     for t in info.tools {
                         tools.push((*t).to_string());
                     }

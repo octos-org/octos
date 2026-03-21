@@ -87,8 +87,14 @@ impl RunPipelineTool {
                     // Log the full DOT for debugging parse failures
                     let dot_preview = if trimmed.len() > 500 {
                         let mut end = 500;
-                        while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
-                        format!("{}...(truncated at {} bytes)", &trimmed[..end], trimmed.len())
+                        while !trimmed.is_char_boundary(end) && end > 0 {
+                            end -= 1;
+                        }
+                        format!(
+                            "{}...(truncated at {} bytes)",
+                            &trimmed[..end],
+                            trimmed.len()
+                        )
                     } else {
                         trimmed.to_string()
                     };

@@ -604,7 +604,9 @@ fn page_slug(url: &Url, index: usize) -> String {
     };
     let truncated = if slug.len() > 80 {
         let mut end = 80;
-        while !slug.is_char_boundary(end) && end > 0 { end -= 1; }
+        while !slug.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
         &slug[..end]
     } else {
         &slug

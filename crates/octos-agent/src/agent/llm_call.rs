@@ -102,8 +102,7 @@ impl Agent {
                         self.llm.report_late_failure();
                         warn!(
                             attempts = Self::LLM_RETRY_MAX + 1,
-                            reason,
-                            "streaming retries exhausted, trying non-streaming fallback"
+                            reason, "streaming retries exhausted, trying non-streaming fallback"
                         );
 
                         // Non-streaming call triggers FallbackProvider's full fallback chain

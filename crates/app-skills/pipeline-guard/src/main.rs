@@ -301,25 +301,51 @@ fn pick_models(catalog: &ModelCatalog) -> Option<ModelPicks> {
     // Sort both pools by score ascending (lower = better), cheaper tiebreak
     let mut strong_sorted = strong_models.clone();
     strong_sorted.sort_by(|a, b| {
-        a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cost_out.partial_cmp(&b.cost_out).unwrap_or(std::cmp::Ordering::Equal))
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.cost_out
+                    .partial_cmp(&b.cost_out)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
     let mut fast_sorted = fast_models.clone();
     fast_sorted.sort_by(|a, b| {
-        a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cost_out.partial_cmp(&b.cost_out).unwrap_or(std::cmp::Ordering::Equal))
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.cost_out
+                    .partial_cmp(&b.cost_out)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
-    let strong_pool: Vec<String> = strong_sorted.iter().map(|e| e.model_key().to_string()).collect();
-    let fast_pool: Vec<String> = fast_sorted.iter().map(|e| e.model_key().to_string()).collect();
+    let strong_pool: Vec<String> = strong_sorted
+        .iter()
+        .map(|e| e.model_key().to_string())
+        .collect();
+    let fast_pool: Vec<String> = fast_sorted
+        .iter()
+        .map(|e| e.model_key().to_string())
+        .collect();
 
     // Fall back to each other if one pool is empty
     if strong_pool.is_empty() && fast_pool.is_empty() {
         return None;
     }
-    let strong_pool = if strong_pool.is_empty() { fast_pool.clone() } else { strong_pool };
-    let fast_pool = if fast_pool.is_empty() { strong_pool.clone() } else { fast_pool };
+    let strong_pool = if strong_pool.is_empty() {
+        fast_pool.clone()
+    } else {
+        strong_pool
+    };
+    let fast_pool = if fast_pool.is_empty() {
+        strong_pool.clone()
+    } else {
+        fast_pool
+    };
 
     // Random start so concurrent pipelines get different models.
     // Use PID to differentiate — each pipeline hook runs as a separate process.
@@ -427,10 +453,12 @@ fn validate_dot(dot: &str) -> DotValidation {
     let node_set: HashSet<&str> = v.nodes.iter().map(|s| s.as_str()).collect();
     for (src, dst) in &v.edges {
         if !node_set.contains(src.as_str()) {
-            v.errors.push(format!("edge source '{src}' is not a defined node"));
+            v.errors
+                .push(format!("edge source '{src}' is not a defined node"));
         }
         if !node_set.contains(dst.as_str()) {
-            v.errors.push(format!("edge target '{dst}' is not a defined node"));
+            v.errors
+                .push(format!("edge target '{dst}' is not a defined node"));
         }
     }
 
@@ -544,7 +572,9 @@ fn get_attr(dot: &str, node_name: &str, attr: &str) -> Option<String> {
 
 fn main() {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).unwrap_or_default();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .unwrap_or_default();
 
     let payload: HookPayload = match serde_json::from_str(&input) {
         Ok(p) => p,
