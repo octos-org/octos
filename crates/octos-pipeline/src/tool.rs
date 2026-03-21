@@ -72,34 +72,6 @@ impl RunPipelineTool {
 
     /// Build a model catalog string for the LLM, showing each model's key,
     /// output capacity, context window, and cost.
-    fn build_model_catalog(&self) -> String {
-        let router = match &self.provider_router {
-            Some(r) => r,
-            None => return String::new(),
-        };
-        let models = router.list_models_with_meta();
-        if models.is_empty() {
-            return String::new();
-        }
-        let mut lines = Vec::new();
-        for m in &models {
-            let max_out_k = m.max_output_tokens / 1000;
-            let ctx_k = m.context_window / 1000;
-            let mut line = format!(
-                "- '{}': {} ({}), {}k output, {}k context",
-                m.key, m.model_id, m.provider_name, max_out_k, ctx_k,
-            );
-            if let Some(ref cost) = m.cost_info {
-                line.push_str(&format!(", {cost}"));
-            }
-            if let Some(ref desc) = m.description {
-                line.push_str(&format!(". {desc}"));
-            }
-            lines.push(line);
-        }
-        lines.join("\n")
-    }
-
     /// Resolve pipeline with fallback: try inline DOT first, if it fails to parse,
     /// try as a named pipeline. This handles cases where the LLM produces slightly
     /// malformed DOT — the pre-built pipeline still works as a safety net.
@@ -112,7 +84,18 @@ impl RunPipelineTool {
             match crate::parser::parse_dot(trimmed) {
                 Ok(_) => return Ok(pipeline_str.to_string()),
                 Err(parse_err) => {
-                    tracing::warn!("inline DOT parse failed, trying named fallback: {parse_err}");
+                    // Log the full DOT for debugging parse failures
+                    let dot_preview = if trimmed.len() > 500 {
+                        let mut end = 500;
+                        while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
+                        format!("{}...(truncated at {} bytes)", &trimmed[..end], trimmed.len())
+                    } else {
+                        trimmed.to_string()
+                    };
+                    tracing::warn!(
+                        dot = %dot_preview,
+                        "inline DOT parse failed, trying named fallback: {parse_err}"
+                    );
                     // Try to extract a pipeline name hint from the DOT (e.g. "digraph deep_research")
                     if let Some(name) = trimmed
                         .strip_prefix("digraph ")
@@ -130,6 +113,7 @@ impl RunPipelineTool {
                         }
                     }
                     // No fallback found — return the original parse error
+                    tracing::error!(dot = %dot_preview, "no fallback available, returning parse error");
                     return Err(parse_err.wrap_err("inline DOT parse failed with no fallback"));
                 }
             }
@@ -176,93 +160,18 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        // Build model catalog for the LLM to reference when writing DOT graphs
-        let model_catalog = self.build_model_catalog();
-
         let adaptive_hints = include_str!("prompts/adaptive_hints.txt");
         let node_attrs = include_str!("prompts/node_attrs.txt");
+        let example = include_str!("prompts/example_dot.txt");
 
-        // Build example DOT using actual model keys when available
-        let (search_model, strong_model, synth_model, synth_max_output) =
-            if let Some(ref router) = self.provider_router {
-                let metas = router.list_models_with_meta();
-                if !metas.is_empty() {
-                    // Find cheapest/fastest for search, strongest for analysis,
-                    // highest max_output for synthesis
-                    let mut best_search = &metas[0];
-                    let mut best_strong = &metas[0];
-                    for m in &metas {
-                        // Prefer lower max_output as "cheaper/faster" for search
-                        if m.max_output_tokens < best_search.max_output_tokens {
-                            best_search = m;
-                        }
-                        // Prefer higher context window as "stronger"
-                        if m.context_window > best_strong.context_window {
-                            best_strong = m;
-                        }
-                    }
-                    // For synthesis: pick highest max_output, but exclude the
-                    // search model so we don't reuse a cheap/fast model for
-                    // long-form generation.
-                    let mut best_synth = &metas[0];
-                    for m in &metas {
-                        if m.key == best_search.key {
-                            continue;
-                        }
-                        if best_synth.key == best_search.key
-                            || m.max_output_tokens > best_synth.max_output_tokens
-                        {
-                            best_synth = m;
-                        }
-                    }
-                    (
-                        best_search.key.clone(),
-                        best_strong.key.clone(),
-                        best_synth.key.clone(),
-                        best_synth.max_output_tokens.to_string(),
-                    )
-                } else {
-                    (
-                        "cheap".into(),
-                        "strong".into(),
-                        "strong".into(),
-                        "16384".into(),
-                    )
-                }
-            } else {
-                (
-                    "cheap".into(),
-                    "strong".into(),
-                    "strong".into(),
-                    "16384".into(),
-                )
-            };
-
-        let example = include_str!("prompts/example_dot.txt")
-            .replace("{search_model}", &search_model)
-            .replace("{strong_model}", &strong_model)
-            .replace("{synth_model}", &synth_model)
-            .replace("{synth_max_output}", &synth_max_output);
-
-        let pipeline_desc = if model_catalog.is_empty() {
-            format!(
-                "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
-                 {node_attrs}\n\n\
-                 {adaptive_hints}\n\n\
-                 {example}"
-            )
-        } else {
-            format!(
-                "Inline DOT graph. ALWAYS write a custom digraph — do NOT use pre-built pipeline names.\n\n\
-                 Available models (use model=\"key\" in DOT nodes):\n{model_catalog}\n\n\
-                 Model strategy: use cheap/fast models for search nodes, \
-                 pick the model with highest max output for synthesize/report nodes, \
-                 set max_output_tokens to match that model's capacity.\n\n\
-                 {node_attrs}\n\n\
-                 {adaptive_hints}\n\n\
-                 {example}"
-            )
-        };
+        let pipeline_desc = format!(
+            "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
+             Do NOT specify model= attributes — the system selects optimal models automatically.\n\
+             Focus on writing good prompts, choosing tools, and structuring the pipeline.\n\n\
+             {node_attrs}\n\n\
+             {adaptive_hints}\n\n\
+             {example}"
+        );
 
         serde_json::json!({
             "type": "object",

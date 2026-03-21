@@ -117,7 +117,11 @@ impl CodergenHandler {
                         "pipeline node provider resolved with fallbacks"
                     );
                 }
-                Ok(octos_llm::FallbackProvider::wrap_if_needed(primary, fallbacks))
+                Ok(octos_llm::FallbackProvider::wrap_with_router(
+                    primary,
+                    fallbacks,
+                    router.clone(),
+                ))
             }
             (Some(model_key), None) => {
                 warn!(
@@ -192,12 +196,18 @@ impl Handler for CodergenHandler {
             None => "Complete the task given to you.".to_string(),
         };
 
-        // Create and run the agent
+        // Create and run the agent.
+        // When max_output_tokens is not set in the DOT graph, use the
+        // provider's actual max output capability instead of the global
+        // default (4096) which truncates long-form synthesis.
+        let max_tokens = node
+            .max_output_tokens
+            .or_else(|| Some(provider.max_output_tokens()));
         let config = octos_agent::AgentConfig {
             max_iterations: 30,
             max_timeout: node.timeout_secs.map(Duration::from_secs),
             save_episodes: false,
-            chat_max_tokens: node.max_output_tokens,
+            chat_max_tokens: max_tokens,
             ..Default::default()
         };
 

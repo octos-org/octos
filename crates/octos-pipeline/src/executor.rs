@@ -402,7 +402,11 @@ fn resolve_search_result_files(content: &str) -> String {
                 match std::fs::read_to_string(&search_results_path) {
                     Ok(file_content) if !file_content.is_empty() => {
                         let preview = if file_content.len() > 50000 {
-                            format!("{}...(truncated)", &file_content[..50000])
+                            let mut end = 50000;
+                            while !file_content.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            format!("{}...(truncated)", &file_content[..end])
                         } else {
                             file_content
                         };
@@ -441,7 +445,12 @@ fn resolve_search_result_files(content: &str) -> String {
                     if let Ok(file_content) = std::fs::read_to_string(&sr) {
                         if !file_content.is_empty() && file_content.len() > 100 {
                             let preview = if file_content.len() > 50000 {
-                                format!("{}...(truncated)", &file_content[..50000])
+                                // Find a valid char boundary near 50000 bytes
+                                let mut end = 50000;
+                                while !file_content.is_char_boundary(end) && end > 0 {
+                                    end -= 1;
+                                }
+                                format!("{}...(truncated)", &file_content[..end])
                             } else {
                                 file_content
                             };
@@ -479,6 +488,33 @@ impl PipelineExecutor {
     ) -> Result<PipelineResult> {
         // Parse and validate
         let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+
+        // ── Pipeline start: log graph structure ──
+        let node_summary: Vec<String> = graph
+            .nodes
+            .values()
+            .map(|n| {
+                let model = n.model.as_deref().unwrap_or("default");
+                let tools = n.tools.join(",");
+                format!(
+                    "  {} [model={}, handler={:?}, tools={}]",
+                    n.id, model, n.handler, tools
+                )
+            })
+            .collect();
+        let edge_summary: Vec<String> = graph
+            .edges
+            .iter()
+            .map(|e| format!("  {} -> {}", e.source, e.target))
+            .collect();
+        info!(
+            nodes = graph.nodes.len(),
+            edges = graph.edges.len(),
+            "pipeline start\n{}\n{}",
+            node_summary.join("\n"),
+            edge_summary.join("\n")
+        );
+
         let diags = validate::validate(&graph);
 
         for diag in &diags {
@@ -508,9 +544,51 @@ impl PipelineExecutor {
         let start_node = validate::find_start_node(&graph)
             .ok_or_else(|| eyre::eyre!("no start node found in pipeline"))?;
 
+        info!(start_node = %start_node, "pipeline executing");
+
+        let pipeline_start = Instant::now();
+
         // Execute graph
-        self.execute_graph(&graph, &handlers, &start_node, user_input, variables)
-            .await
+        let result = self
+            .execute_graph(&graph, &handlers, &start_node, user_input, variables)
+            .await;
+
+        // ── Pipeline end: log summary ──
+        let total_ms = pipeline_start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(r) => {
+                let node_results: Vec<String> = r
+                    .node_summaries
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "  {} ({}): {} {}ms {}+{} tokens",
+                            n.node_id,
+                            n.model.as_deref().unwrap_or("default"),
+                            if n.success { "Pass" } else { "FAIL" },
+                            n.duration_ms,
+                            n.token_usage.input_tokens,
+                            n.token_usage.output_tokens,
+                        )
+                    })
+                    .collect();
+                info!(
+                    duration_ms = total_ms,
+                    nodes = r.node_summaries.len(),
+                    "pipeline complete\n{}",
+                    node_results.join("\n")
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    duration_ms = total_ms,
+                    error = %e,
+                    "pipeline failed"
+                );
+            }
+        }
+
+        result
     }
 
     fn build_handlers(&self) -> HandlerRegistry {
@@ -877,8 +955,26 @@ impl PipelineExecutor {
                     "You are a research specialist.\n\n{task}\n\nUse the available tools to find relevant information. Include ALL URLs and source references.",
                 );
 
-                // Resolve worker model
-                let worker_model = node.model.clone().or_else(|| graph.default_model.clone());
+                // Resolve worker model pool. If model contains commas,
+                // it's a pool of models for round-robin distribution across workers.
+                let model_str = node.model.as_deref()
+                    .or(graph.default_model.as_deref())
+                    .unwrap_or("");
+                let model_pool: Vec<&str> = if model_str.contains(',') {
+                    model_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+                } else {
+                    vec![model_str]
+                };
+                if model_pool.len() > 1 {
+                    info!(
+                        node = %node.id,
+                        pool_size = model_pool.len(),
+                        models = model_str,
+                        "worker model pool: distributing {} workers across {} models",
+                        tasks.len(),
+                        model_pool.len(),
+                    );
+                }
 
                 let mut synthetic_nodes: Vec<(String, PipelineNode)> = Vec::new();
                 for (i, task) in tasks.iter().enumerate() {
@@ -888,6 +984,9 @@ impl PipelineExecutor {
                         .label
                         .clone()
                         .unwrap_or_else(|| format!("Task {}", i + 1));
+
+                    // Round-robin model from pool
+                    let worker_model = Some(model_pool[i % model_pool.len()].to_string());
 
                     synthetic_nodes.push((
                         task_id.clone(),
@@ -1090,17 +1189,7 @@ impl PipelineExecutor {
                 node_with_prompt.model = graph.default_model.clone();
             }
 
-            let ctx = HandlerContext {
-                input: input_text,
-                completed: completed.clone(),
-                working_dir: self.config.working_dir.clone(),
-            };
-
-            // Update status words for this sequential node
-            if let Some(ref bridge) = self.config.status_bridge {
-                let label = node.label.as_deref().unwrap_or(&node.id);
-                bridge.set_words(vec![label.to_string()]);
-            }
+            let input_bytes = input_text.len();
 
             let seq_label = node.label.as_deref().unwrap_or(&node.id);
             report_progress(&format!("{seq_label}: running..."));
@@ -1109,8 +1198,21 @@ impl PipelineExecutor {
                 node = %node.id,
                 handler = ?node.handler,
                 model = ?node_with_prompt.model,
+                input_bytes,
+                tools = ?node.tools,
                 "executing pipeline node"
             );
+
+            // Update status words for this sequential node
+            if let Some(ref bridge) = self.config.status_bridge {
+                bridge.set_words(vec![seq_label.to_string()]);
+            }
+
+            let ctx = HandlerContext {
+                input: input_text,
+                completed: completed.clone(),
+                working_dir: self.config.working_dir.clone(),
+            };
 
             let node_start = Instant::now();
 
@@ -1128,10 +1230,12 @@ impl PipelineExecutor {
 
             info!(
                 node = %node.id,
+                model = ?node_with_prompt.model,
                 status = ?outcome.status,
                 duration_ms,
                 tokens_in = outcome.token_usage.input_tokens,
                 tokens_out = outcome.token_usage.output_tokens,
+                output_chars = outcome.content.len(),
                 "node completed"
             );
 
