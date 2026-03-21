@@ -59,6 +59,14 @@ pub struct ProviderRouter {
     active_key: RwLock<Option<String>>,
     /// Metadata about each registered sub-provider (for LLM-visible tool schemas).
     metadata: RwLock<HashMap<String, SubProviderMeta>>,
+    /// Cooldown timestamps: model_key → last failure time.
+    /// Models in cooldown are skipped by compatible_fallbacks().
+    cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// Cooldown duration (default 60s). After this, a failed model is eligible again.
+    cooldown_duration: std::time::Duration,
+    /// QoS scores from model_catalog.json: model_key → (ds_output * stability).
+    /// Used to sort fallbacks by quality instead of just max_output_tokens.
+    qos_scores: RwLock<HashMap<String, f64>>,
 }
 
 impl ProviderRouter {
@@ -68,6 +76,9 @@ impl ProviderRouter {
             providers: RwLock::new(HashMap::new()),
             active_key: RwLock::new(None),
             metadata: RwLock::new(HashMap::new()),
+            cooldowns: RwLock::new(HashMap::new()),
+            cooldown_duration: std::time::Duration::from_secs(60),
+            qos_scores: RwLock::new(HashMap::new()),
         }
     }
 
@@ -107,21 +118,47 @@ impl ProviderRouter {
     pub fn resolve(&self, prefixed_model: &str) -> Result<Arc<dyn LlmProvider>> {
         let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
 
-        // Try exact match first (supports keys like "moonshotai/kimi-k2.5")
+        // Try exact match first (supports compound keys like "minimaxai/minimax-m2.5")
         if let Some(provider) = providers.get(prefixed_model) {
             return Ok(provider.clone());
         }
 
-        // Fall back to prefix/model split
-        let key = match prefixed_model.split_once('/') {
+        // Try case-insensitive exact match
+        for (key, provider) in providers.iter() {
+            if key.eq_ignore_ascii_case(prefixed_model) {
+                return Ok(provider.clone());
+            }
+        }
+
+        // Fall back to prefix/model split (e.g. "openai/gpt-4o" → lookup "openai")
+        let prefix_key = match prefixed_model.split_once('/') {
             Some((k, _model)) => k,
             None => prefixed_model,
         };
 
+        if let Some(provider) = providers.get(prefix_key) {
+            return Ok(provider.clone());
+        }
+
+        // Last resort: check if any registered key ends with the requested model
+        // Handles "minimax-m2.5" matching registered "minimaxai/minimax-m2.5"
+        for (key, provider) in providers.iter() {
+            if key.ends_with(prefixed_model) || prefixed_model.ends_with(key.as_str()) {
+                return Ok(provider.clone());
+            }
+        }
+
         providers
-            .get(key)
+            .get(prefix_key)
             .cloned()
-            .ok_or_else(|| eyre::eyre!("no provider registered for key '{prefixed_model}'"))
+            .ok_or_else(|| {
+                let available: Vec<&String> = providers.keys().collect();
+                eyre::eyre!(
+                    "no provider registered for key '{}' (available: {:?})",
+                    prefixed_model,
+                    available
+                )
+            })
     }
 
     /// List all registered provider keys.
@@ -205,16 +242,44 @@ impl ProviderRouter {
             .collect()
     }
 
+    /// Record a provider failure — puts it in cooldown for `cooldown_duration`.
+    /// Called by FallbackProvider when a provider errors.
+    pub fn record_failure(&self, key: &str) {
+        let mut cooldowns = self.cooldowns.write().unwrap_or_else(|e| e.into_inner());
+        cooldowns.insert(key.to_string(), std::time::Instant::now());
+        tracing::info!(model = key, cooldown_secs = self.cooldown_duration.as_secs(), "model entered cooldown");
+    }
+
+    /// Check if a model is currently in cooldown.
+    pub fn is_cooled_down(&self, key: &str) -> bool {
+        let cooldowns = self.cooldowns.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(failed_at) = cooldowns.get(key) {
+            failed_at.elapsed() < self.cooldown_duration
+        } else {
+            false
+        }
+    }
+
+    /// Seed scores from model_catalog.json's `score` field for fallback ranking.
+    /// Lower score = better (same as AdaptiveRouter).
+    pub fn seed_qos_scores(&self, entries: &[(String, f64)]) {
+        let mut scores = self.qos_scores.write().unwrap_or_else(|e| e.into_inner());
+        for (key, score) in entries {
+            scores.insert(key.clone(), *score);
+            if let Some((_, model)) = key.split_once('/') {
+                scores.insert(model.to_string(), *score);
+            }
+        }
+    }
+
     /// Find fallback providers compatible with the given key's output capacity.
-    /// Returns providers with max_output_tokens >= the requested model's,
-    /// sorted by max_output_tokens descending (best fallback first).
-    /// Excludes the requested key itself.
+    /// Sorted by QoS score (best first), excludes cooled-down models and self.
     pub fn compatible_fallbacks(&self, key: &str) -> Vec<Arc<dyn LlmProvider>> {
         let metadata = self.metadata.read().unwrap_or_else(|e| e.into_inner());
         let providers = self.providers.read().unwrap_or_else(|e| e.into_inner());
+        let qos = self.qos_scores.read().unwrap_or_else(|e| e.into_inner());
 
-        // Resolve the actual metadata key: try exact match, then prefix-split
-        // (mirrors resolve() logic so we find the right entry)
+        // Resolve the actual metadata key
         let resolved_key = if metadata.contains_key(key) {
             key.to_string()
         } else {
@@ -228,15 +293,22 @@ impl ProviderRouter {
             .map(|m| m.max_output_tokens)
             .unwrap_or(0);
 
-        // Exclude the resolved key (not the raw key) to avoid falling back to self
-        let mut candidates: Vec<(&str, u32)> = metadata
+        // Exclude self and cooled-down models
+        let mut candidates: Vec<(&str, f64)> = metadata
             .iter()
-            .filter(|(k, m)| k.as_str() != resolved_key && m.max_output_tokens >= min_output)
-            .map(|(k, m)| (k.as_str(), m.max_output_tokens))
+            .filter(|(k, m)| {
+                k.as_str() != resolved_key
+                    && m.max_output_tokens >= min_output
+                    && !self.is_cooled_down(k)
+            })
+            .map(|(k, _)| {
+                let score = qos.get(k.as_str()).copied().unwrap_or(0.0);
+                (k.as_str(), score)
+            })
             .collect();
 
-        // Sort by max_output descending (best fallback first)
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by score ascending (lower = better, best fallback first)
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         candidates
             .into_iter()

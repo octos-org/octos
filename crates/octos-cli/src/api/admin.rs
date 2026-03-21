@@ -2393,11 +2393,30 @@ pub async fn config_check(
     })))
 }
 
-/// GET /api/admin/model-limits — returns model output token limits from model_limits.json.
+/// GET /api/admin/model-limits — returns model catalog (runtime source of truth).
 pub async fn model_limits() -> Json<serde_json::Value> {
-    let raw = octos_llm::context::MODEL_LIMITS_JSON;
-    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-    Json(value)
+    // Read the runtime catalog from the profile data dir
+    let home = std::env::var("HOME").unwrap_or_default();
+    for base in &[format!("{home}/.octos/profiles"), format!("{home}/.crew/profiles")] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("data/model_catalog.json");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                        return Json(value);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback to shared catalog
+    let shared = format!("{home}/.octos/model_catalog.json");
+    if let Ok(content) = std::fs::read_to_string(&shared) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            return Json(value);
+        }
+    }
+    Json(serde_json::json!({"models": []}))
 }
 
 // ── Admin Shell API ─────────────────────────────────────────────────

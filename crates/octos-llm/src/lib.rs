@@ -38,8 +38,9 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, MetricsSnapshot, SharedMetrics,
-    SharedPolicy, SharedProviderMetrics, StatusCallback,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry,
+    MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy,
+    SharedProviderMetrics, StatusCallback,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};

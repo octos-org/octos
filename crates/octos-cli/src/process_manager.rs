@@ -640,12 +640,12 @@ impl ProcessManager {
         None
     }
 
-    /// Read provider QoS metrics for a profile from its data_dir/provider_metrics.json.
+    /// Read provider QoS metrics for a profile from its data_dir/model_catalog.json.
     /// Returns `None` if the file doesn't exist or can't be parsed.
     pub async fn read_metrics(&self, profile_id: &str) -> Option<serde_json::Value> {
         let profile = self.profile_store.get(profile_id).ok()??;
         let data_dir = self.profile_store.resolve_data_dir(&profile);
-        let path = data_dir.join("provider_metrics.json");
+        let path = data_dir.join("model_catalog.json");
         let content = tokio::fs::read_to_string(&path).await.ok()?;
         serde_json::from_str(&content).ok()
     }

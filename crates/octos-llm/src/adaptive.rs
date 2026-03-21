@@ -125,6 +125,8 @@ struct ProviderMetrics {
     total_requests: AtomicU32,
     /// Circular buffer for p95 computation.
     latency_samples: Mutex<LatencySamples>,
+    /// Throughput EMA: output tokens per second. Task-normalized performance.
+    throughput_ema: AtomicU64, // stored as f64 bits
 }
 
 impl ProviderMetrics {
@@ -139,7 +141,28 @@ impl ProviderMetrics {
             last_request_us: AtomicU64::new(0),
             total_requests: AtomicU32::new(0),
             latency_samples: Mutex::new(LatencySamples::new()),
+            throughput_ema: AtomicU64::new(0),
         }
+    }
+
+    /// Record throughput (output tokens per second) with EMA smoothing.
+    fn record_throughput(&self, output_tokens: u32, latency_us: u64, alpha: f64) {
+        if latency_us == 0 || output_tokens == 0 {
+            return;
+        }
+        let tps = output_tokens as f64 / (latency_us as f64 / 1_000_000.0);
+        let prev = f64::from_bits(self.throughput_ema.load(Ordering::Relaxed));
+        let new_val = if prev == 0.0 {
+            tps
+        } else {
+            alpha * tps + (1.0 - alpha) * prev
+        };
+        self.throughput_ema
+            .store(new_val.to_bits(), Ordering::Relaxed);
+    }
+
+    fn throughput(&self) -> f64 {
+        f64::from_bits(self.throughput_ema.load(Ordering::Relaxed))
     }
 
     fn record_success_with_alpha(&self, latency_us: u64, alpha: f64) {
@@ -226,6 +249,82 @@ pub struct MetricsSnapshot {
     pub error_rate: f64,
 }
 
+/// Baseline benchmark data for pre-seeding the adaptive router.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineEntry {
+    /// Provider key, e.g. "gemini/gemini-2.5-flash" or "dashscope/qwen3.5-plus".
+    pub provider: String,
+    /// Average latency in microseconds at max tool count.
+    pub avg_latency_ms: u64,
+    /// P95 latency in microseconds at max tool count.
+    pub p95_latency_ms: u64,
+    /// Stability score (0.0 to 1.0).
+    pub stability: f64,
+    /// Output cost in USD per million tokens (0.0 = unknown/free).
+    #[serde(default)]
+    pub cost_per_m_output: f64,
+}
+
+/// Model capability type for routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelType {
+    /// High-quality output, thorough analysis (>4000 tokens in deep search).
+    Strong,
+    /// Low latency, quick responses (<50s deep search or <1s tool call).
+    Fast,
+}
+
+impl std::fmt::Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelType::Strong => write!(f, "STRONG"),
+            ModelType::Fast => write!(f, "FAST"),
+        }
+    }
+}
+
+/// Unified model catalog entry — single source of truth for model metadata + live QoS.
+///
+/// Static fields (type, cost, ds_output) are loaded from `model_catalog.json`.
+/// Dynamic fields (stability, tool_avg_ms, p95_ms, score) are updated by the QoS scanner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    /// Provider/model key, e.g. "minimax/MiniMax-M2.7".
+    pub provider: String,
+    /// Model capability type.
+    #[serde(rename = "type")]
+    pub model_type: ModelType,
+    /// Tool call stability (0.0 to 1.0). Updated by QoS scanner.
+    pub stability: f64,
+    /// Average tool call latency in ms. Updated by QoS scanner.
+    pub tool_avg_ms: u64,
+    /// P95 tool call latency in ms. Updated by QoS scanner.
+    pub p95_ms: u64,
+    /// Composite QoS score (lower = better). Updated by QoS scanner.
+    pub score: f64,
+    /// Input cost in USD per million tokens.
+    pub cost_in: f64,
+    /// Output cost in USD per million tokens.
+    pub cost_out: f64,
+    /// Deep search output token count (quality indicator). 0 = not evaluated.
+    #[serde(default)]
+    pub ds_output: u64,
+    /// Context window size in tokens. 0 = unknown.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Maximum output tokens. 0 = unknown.
+    #[serde(default)]
+    pub max_output: u64,
+}
+
+/// Full model catalog with timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QosCatalog {
+    pub updated_at: String,
+    pub models: Vec<ModelCatalogEntry>,
+}
+
 /// Adaptive routing policy parameters for observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedPolicy {
@@ -271,6 +370,22 @@ struct AdaptiveSlot {
     priority: usize,
     /// Published output price in USD per million tokens (0.0 = unknown/free).
     cost_per_m: f64,
+    /// Model capability type (Strong/Fast). Set from catalog seed.
+    model_type: Mutex<ModelType>,
+    /// Input cost in USD per million tokens. Set from catalog seed.
+    cost_in: AtomicU64,
+    /// Deep search output quality (token count). Set from catalog seed.
+    ds_output: AtomicU64,
+    /// Baseline stability from system catalog (used when no live data yet).
+    baseline_stability: AtomicU64,
+    /// Baseline tool_avg_ms from system catalog.
+    baseline_tool_avg_ms: AtomicU64,
+    /// Baseline p95_ms from system catalog.
+    baseline_p95_ms: AtomicU64,
+    /// Context window size in tokens.
+    context_window: AtomicU64,
+    /// Maximum output tokens.
+    max_output: AtomicU64,
 }
 
 /// Adaptive routing mode — mutually exclusive strategies.
@@ -366,6 +481,14 @@ impl AdaptiveRouter {
                 metrics: ProviderMetrics::new(),
                 priority: i,
                 cost_per_m: costs.get(i).copied().unwrap_or(0.0),
+                model_type: Mutex::new(ModelType::Fast), // default, overridden by catalog seed
+                cost_in: AtomicU64::new(0),
+                ds_output: AtomicU64::new(0),
+                baseline_stability: AtomicU64::new(0),
+                baseline_tool_avg_ms: AtomicU64::new(0),
+                baseline_p95_ms: AtomicU64::new(0),
+                context_window: AtomicU64::new(0),
+                max_output: AtomicU64::new(0),
             })
             .collect();
         Self {
@@ -420,6 +543,156 @@ impl AdaptiveRouter {
     pub fn set_qos_ranking(&self, enabled: bool) {
         self.qos_ranking.store(enabled, Ordering::Relaxed);
         info!(enabled, "QoS quality ranking toggled");
+    }
+
+    /// Pre-seed metrics from benchmark baseline data so the router starts
+    /// with informed scores instead of cold-start heuristics.
+    ///
+    /// Each entry is matched by `provider_name/model_id` (e.g. "gemini/gemini-2.5-flash").
+    /// Matching uses substring: if the slot's `provider_name()` contains the entry's
+    /// provider prefix AND `model_id()` contains the entry's model suffix, it matches.
+    ///
+    /// Seeded data uses a small synthetic sample count (10 success, N failure)
+    /// so that real traffic quickly dominates via EMA.
+    pub fn seed_baseline(&self, entries: &[BaselineEntry]) {
+        for slot in &self.slots {
+            let pname = slot.provider.provider_name();
+            let model = slot.provider.model_id();
+            let slot_key = format!("{}/{}", pname, model);
+
+            if let Some(entry) = entries.iter().find(|e| {
+                slot_key == e.provider
+                    || (slot_key.contains(&e.provider))
+            }) {
+                let latency_us = entry.avg_latency_ms * 1000;
+                let p95_us = entry.p95_latency_ms * 1000;
+
+                // Seed EMA and P95
+                slot.metrics.latency_ema_us.store(latency_us, Ordering::Relaxed);
+                slot.metrics.p95_latency_us.store(p95_us, Ordering::Relaxed);
+
+                // Seed latency buffer with a few synthetic samples around the average
+                if let Ok(mut samples) = slot.metrics.latency_samples.lock() {
+                    for _ in 0..5 {
+                        samples.push(latency_us);
+                    }
+                    samples.push(p95_us); // one high sample for p95
+                }
+
+                // Seed success/failure counts based on stability score
+                // Use small counts (10 total) so real traffic dominates quickly
+                let total = 10u32;
+                let failures = ((1.0 - entry.stability) * total as f64).round() as u32;
+                let successes = total - failures;
+                slot.metrics.success_count.store(successes, Ordering::Relaxed);
+                slot.metrics.failure_count.store(failures, Ordering::Relaxed);
+
+                // Mark as recently active so it's not considered stale
+                let now = now_epoch_us();
+                slot.metrics.last_success_us.store(now, Ordering::Relaxed);
+                slot.metrics.last_request_us.store(now, Ordering::Relaxed);
+                slot.metrics.total_requests.store(total, Ordering::Relaxed);
+
+                info!(
+                    provider = slot_key,
+                    latency_ms = entry.avg_latency_ms,
+                    p95_ms = entry.p95_latency_ms,
+                    stability = format!("{:.0}%", entry.stability * 100.0),
+                    "seeded baseline metrics"
+                );
+            }
+        }
+    }
+
+    /// Seed static catalog fields (type, cost, ds_output) from a model catalog file.
+    /// Call after `seed_baseline()` — this sets the non-QoS fields.
+    pub fn seed_catalog(&self, entries: &[ModelCatalogEntry]) {
+        for slot in &self.slots {
+            let slot_key = format!("{}/{}", slot.provider.provider_name(), slot.provider.model_id());
+            if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
+                *slot.model_type.lock().unwrap() = entry.model_type;
+                slot.cost_in.store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
+                // Store baseline values for fallback when no live data exists
+                slot.baseline_stability.store(entry.stability.to_bits(), Ordering::Relaxed);
+                slot.baseline_tool_avg_ms.store(entry.tool_avg_ms, Ordering::Relaxed);
+                slot.baseline_p95_ms.store(entry.p95_ms, Ordering::Relaxed);
+                slot.context_window.store(entry.context_window, Ordering::Relaxed);
+                slot.max_output.store(entry.max_output, Ordering::Relaxed);
+                info!(
+                    provider = slot_key,
+                    model_type = %entry.model_type,
+                    cost_in = entry.cost_in,
+                    cost_out = entry.cost_out,
+                    ds_output = entry.ds_output,
+                    "seeded catalog entry"
+                );
+            }
+        }
+    }
+
+    /// Export the unified model catalog with live QoS blended into baseline data.
+    /// Uses EMA blending: as more live data accumulates, it gradually replaces the baseline.
+    /// Formula: blended = baseline * (1 - weight) + live * weight
+    /// Weight grows with sample count: weight = min(1.0, total_calls / 10.0)
+    /// This ensures cold-start providers keep their benchmark values while active
+    /// providers smoothly transition to real-world metrics.
+    pub fn export_model_catalog(&self) -> QosCatalog {
+        let models: Vec<ModelCatalogEntry> = self
+            .slots
+            .iter()
+            .map(|s| {
+                let snap = s.metrics.snapshot();
+                let total = snap.success_count + snap.failure_count;
+
+                let baseline_stab = f64::from_bits(s.baseline_stability.load(Ordering::Relaxed));
+                let baseline_avg = s.baseline_tool_avg_ms.load(Ordering::Relaxed) as f64;
+                let baseline_p95 = s.baseline_p95_ms.load(Ordering::Relaxed) as f64;
+
+                // EMA blending weight: 0.0 at cold start, ramps to 1.0 after 10 calls
+                let weight = (total as f64 / 10.0).min(1.0);
+
+                let live_stab = if total > 0 {
+                    snap.success_count as f64 / total as f64
+                } else {
+                    baseline_stab
+                };
+                let live_avg = if snap.latency_ema_ms > 0.0 {
+                    snap.latency_ema_ms
+                } else {
+                    baseline_avg
+                };
+                let live_p95 = if snap.p95_latency_ms > 0.0 {
+                    snap.p95_latency_ms
+                } else {
+                    baseline_p95
+                };
+
+                // Blend: baseline * (1 - weight) + live * weight
+                let stability = baseline_stab * (1.0 - weight) + live_stab * weight;
+                let tool_avg_ms = (baseline_avg * (1.0 - weight) + live_avg * weight) as u64;
+                let p95_ms = (baseline_p95 * (1.0 - weight) + live_p95 * weight) as u64;
+
+                ModelCatalogEntry {
+                    provider: format!("{}/{}", s.provider.provider_name(), s.provider.model_id()),
+                    model_type: *s.model_type.lock().unwrap(),
+                    stability,
+                    tool_avg_ms,
+                    p95_ms,
+                    score: self.score(s),
+                    cost_in: f64::from_bits(s.cost_in.load(Ordering::Relaxed)),
+                    cost_out: s.cost_per_m,
+                    ds_output: s.ds_output.load(Ordering::Relaxed),
+                    context_window: s.context_window.load(Ordering::Relaxed),
+                    max_output: s.max_output.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+
+        QosCatalog {
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            models,
+        }
     }
 
     /// Get the name of the currently selected provider (most recent selection).
@@ -509,31 +782,62 @@ impl AdaptiveRouter {
     }
 
     /// Score a provider. Lower is better.
+    ///
+    /// Four factors:
+    ///   - **Stability** (35%): blended baseline + live error rate. Does it complete reliably?
+    ///   - **Quality** (30%): catalog ds_output × stability. Does it produce good output?
+    ///   - **Throughput** (20%): output tokens per second. Task-normalized speed.
+    ///     Raw latency is NOT used — it depends on task complexity, not provider quality.
+    ///   - **Cost** (15%): normalized output cost. Cheaper is better when quality is similar.
     fn score(&self, slot: &AdaptiveSlot) -> f64 {
         let total = slot.metrics.success_count.load(Ordering::Relaxed)
             + slot.metrics.failure_count.load(Ordering::Relaxed);
 
-        // Cold start: no data yet → use priority + cost
-        if total == 0 {
-            let norm_priority = slot.priority as f64 / self.slots.len() as f64;
-            return self.config.weight_priority * norm_priority
-                + self.config.weight_cost * self.norm_cost(slot);
-        }
+        // EMA blend weight: 0.0 at cold start → 1.0 after 10 calls
+        let weight = (total as f64 / 10.0).min(1.0);
 
-        // Normalized latency: ema / threshold (capped at 2.0)
-        let ema_ms = slot.metrics.latency_ema_us.load(Ordering::Relaxed) as f64 / 1000.0;
-        let norm_latency = (ema_ms / self.config.latency_threshold_ms as f64).min(2.0);
+        // ── Stability (35%) ──
+        let baseline_stab = f64::from_bits(slot.baseline_stability.load(Ordering::Relaxed));
+        let live_err_rate = slot.metrics.error_rate();
+        let baseline_err = 1.0 - baseline_stab;
+        let blended_err = baseline_err * (1.0 - weight) + live_err_rate * weight;
 
-        // Error rate (0..1)
-        let err_rate = slot.metrics.error_rate();
+        // ── Quality (30%) ──
+        let ds = slot.ds_output.load(Ordering::Relaxed) as f64;
+        let quality = ds * baseline_stab;
+        let max_quality = self
+            .slots
+            .iter()
+            .map(|s| {
+                let d = s.ds_output.load(Ordering::Relaxed) as f64;
+                let st = f64::from_bits(s.baseline_stability.load(Ordering::Relaxed));
+                d * st
+            })
+            .fold(0.0_f64, f64::max);
+        let norm_quality = if max_quality > 0.0 {
+            1.0 - (quality / max_quality)
+        } else {
+            0.5
+        };
 
-        // Priority score (0..1 based on config order)
-        let norm_priority = slot.priority as f64 / self.slots.len().max(1) as f64;
+        // ── Throughput (20%) ──
+        // Tokens per second — higher is better. Invert for lower-is-better score.
+        let throughput = slot.metrics.throughput();
+        let max_throughput = self
+            .slots
+            .iter()
+            .map(|s| s.metrics.throughput())
+            .fold(0.0_f64, f64::max);
+        let norm_throughput = if max_throughput > 0.0 && throughput > 0.0 {
+            1.0 - (throughput / max_throughput)
+        } else {
+            0.5 // No data yet — neutral
+        };
 
-        self.config.weight_latency * norm_latency
-            + self.config.weight_error_rate * err_rate
-            + self.config.weight_priority * norm_priority
-            + self.config.weight_cost * self.norm_cost(slot)
+        // ── Cost (15%) ──
+        let norm_cost = self.norm_cost(slot);
+
+        0.35 * blended_err + 0.30 * norm_quality + 0.20 * norm_throughput + 0.15 * norm_cost
     }
 
     /// Select provider index and whether this is a probe request.
@@ -756,10 +1060,13 @@ impl AdaptiveRouter {
         let elapsed_us = start.elapsed().as_micros() as u64;
 
         match &result {
-            Ok(_) => {
+            Ok(resp) => {
                 self.slots[idx]
                     .metrics
                     .record_success_with_alpha(elapsed_us, self.config.ema_alpha);
+                self.slots[idx]
+                    .metrics
+                    .record_throughput(resp.usage.output_tokens, elapsed_us, self.config.ema_alpha);
                 let total = self.slots[idx]
                     .metrics
                     .total_requests
@@ -972,7 +1279,7 @@ impl LlmProvider for AdaptiveRouter {
     }
 
     fn export_metrics(&self) -> Option<serde_json::Value> {
-        serde_json::to_value(self.export_shared_metrics()).ok()
+        serde_json::to_value(self.export_model_catalog()).ok()
     }
 
     fn report_late_failure(&self) {
@@ -1800,5 +2107,74 @@ mod tests {
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         // deepseek is faster, so it wins the race
         assert_eq!(resp.content.as_deref(), Some("from-deepseek"));
+    }
+
+    #[test]
+    fn test_seed_baseline() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "dashscope",
+                    model: "qwen3.5-plus",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "gemini",
+                    model: "gemini-2.5-flash",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[0.688, 0.60],
+            AdaptiveConfig::default(),
+        );
+
+        let baseline = vec![
+            BaselineEntry {
+                provider: "dashscope/qwen3.5-plus".into(),
+                avg_latency_ms: 2564,
+                p95_latency_ms: 3560,
+                stability: 1.0,
+                cost_per_m_output: 0.688,
+            },
+            BaselineEntry {
+                provider: "gemini/gemini-2.5-flash".into(),
+                avg_latency_ms: 976,
+                p95_latency_ms: 1090,
+                stability: 1.0,
+                cost_per_m_output: 0.60,
+            },
+        ];
+
+        router.seed_baseline(&baseline);
+
+        let snapshots = router.metrics_snapshots();
+        // dashscope should have ~2564ms latency
+        let (_, _, dash_metrics) = &snapshots[0];
+        assert!(dash_metrics.latency_ema_ms > 2000.0, "dashscope EMA should be ~2564ms, got {}", dash_metrics.latency_ema_ms);
+        assert_eq!(dash_metrics.success_count, 10);
+        assert_eq!(dash_metrics.failure_count, 0);
+
+        // gemini should have ~976ms latency
+        let (_, _, gem_metrics) = &snapshots[1];
+        assert!(gem_metrics.latency_ema_ms > 800.0, "gemini EMA should be ~976ms, got {}", gem_metrics.latency_ema_ms);
+        assert!(gem_metrics.latency_ema_ms < 1200.0);
+
+        // With Lane mode, scores should reflect seeded data (not cold start)
+        router.set_mode(AdaptiveMode::Lane);
+        let gemini_score = router.score(&router.slots[1]);
+        let dash_score = router.score(&router.slots[0]);
+        // Both should be non-zero (seeded, not cold start)
+        assert!(gemini_score > 0.0, "gemini score should be non-zero after seeding");
+        assert!(dash_score > 0.0, "dashscope score should be non-zero after seeding");
+        // dashscope has higher latency → higher latency component
+        // but lower priority (0 vs 1) → lower priority component
+        // The exact ordering depends on weight balance, but latency should differ
+        let gemini_latency = router.slots[1].metrics.latency_ema_us.load(Ordering::Relaxed);
+        let dash_latency = router.slots[0].metrics.latency_ema_us.load(Ordering::Relaxed);
+        assert!(dash_latency > gemini_latency, "dashscope latency should be higher than gemini");
     }
 }
