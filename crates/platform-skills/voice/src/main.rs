@@ -75,9 +75,9 @@ fn api_base_url() -> String {
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        // No global timeout — streaming PCM chunks keep the connection alive.
-        // Per-request timeouts are set where needed.
-        .connect_timeout(Duration::from_secs(5))
+        // Generous connect timeout — ominix may be busy processing another request.
+        .connect_timeout(Duration::from_secs(30))
+        // No request timeout — TTS streaming can take minutes for long text.
         .build()
         .expect("failed to build HTTP client")
 }
@@ -133,9 +133,15 @@ fn stream_tts_to_wav(
         .unwrap_or("")
         .to_string();
 
-    let bytes = resp
-        .bytes()
-        .map_err(|e| format!("Failed to read TTS response: {e}"))?;
+    // Read response in streaming chunks to avoid timeout on large audio
+    let mut buf = Vec::new();
+    {
+        use std::io::Read;
+        let mut reader = resp;
+        reader.read_to_end(&mut buf)
+            .map_err(|e| format!("Failed to read TTS response: {e}"))?;
+    }
+    let bytes = buf;
 
     if bytes.is_empty() {
         return Err("TTS returned empty response".to_string());
@@ -418,8 +424,9 @@ fn handle_synthesize(input_json: &str) {
             fail(&format!("Failed to write {output_path}: {e}"));
         }
         let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
+        let final_path = try_convert_to_mp3(&output_path);
         succeed(&format!(
-            "Generated audio (voice profile '{speaker}'): {output_path} ({duration_secs:.1}s, {} bytes). Use send_file to deliver it to the user.",
+            "Generated audio (voice profile '{speaker}'): {final_path} ({duration_secs:.1}s, {} bytes). Use send_file to deliver it to the user.",
             wav_bytes.len()
         ));
     }
@@ -434,11 +441,32 @@ fn handle_synthesize(input_json: &str) {
         Path::new(&output_path),
     ) {
         Ok((size, duration_secs)) => {
+            // Try converting to MP3 if ffmpeg is available
+            let final_path = try_convert_to_mp3(&output_path);
             succeed(&format!(
-                "Generated audio: {output_path} ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
+                "Generated audio: {final_path} ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
             ));
         }
         Err(e) => fail(&e),
+    }
+}
+
+/// Try to convert WAV to MP3 using ffmpeg. Returns the MP3 path on success,
+/// or the original WAV path if ffmpeg is not available.
+fn try_convert_to_mp3(wav_path: &str) -> String {
+    let mp3_path = wav_path.replace(".wav", ".mp3");
+    let result = std::process::Command::new("ffmpeg")
+        .args(["-y", "-i", wav_path, "-codec:a", "libmp3lame", "-q:a", "2", &mp3_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            // Remove WAV, return MP3
+            let _ = std::fs::remove_file(wav_path);
+            mp3_path
+        }
+        _ => wav_path.to_string(),
     }
 }
 
