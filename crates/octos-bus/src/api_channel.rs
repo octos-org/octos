@@ -347,6 +347,9 @@ struct PaginationParams {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// "full" to read from disk (complete history), default reads from memory (compacted for LLM).
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -383,6 +386,42 @@ async fn handle_session_messages(
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
     let key = SessionKey::new("api", &id);
+
+    // source=full reads the append-only JSONL file (complete history).
+    // Default reads from in-memory (may be compacted for LLM context).
+    if params.source.as_deref() == Some("full") {
+        let sess = state.sessions.lock().await;
+        let path = sess.session_path(&key);
+        drop(sess);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let messages: Vec<MessageInfo> = content
+                    .lines()
+                    .filter_map(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                        let role = v.get("role")?.as_str()?;
+                        let content = v.get("content")?.as_str().unwrap_or("");
+                        let timestamp = v
+                            .get("timestamp")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        Some(MessageInfo {
+                            role: role.to_string(),
+                            content: content.to_string(),
+                            timestamp: timestamp.to_string(),
+                        })
+                    })
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+                return Json(messages).into_response();
+            }
+            Err(_) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+        }
+    }
+
     let mut sess = state.sessions.lock().await;
     let session = sess.get_or_create(&key);
     let messages: Vec<MessageInfo> = session
