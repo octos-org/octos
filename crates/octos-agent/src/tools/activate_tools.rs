@@ -186,8 +186,8 @@ mod tests {
 
         let result = tool.execute(&serde_json::json!({})).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("group:web"));
-        assert!(result.output.contains("Web search"));
+        assert!(result.output.contains("web_search"));
+        assert!(result.output.contains("web_fetch"));
     }
 
     #[tokio::test]
