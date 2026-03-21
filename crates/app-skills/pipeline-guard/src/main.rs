@@ -213,7 +213,7 @@ fn load_catalog() -> Option<ModelCatalog> {
             profile_models.iter().any(|pm| {
                 pm == model_key
                     || pm.ends_with(model_key)
-                    || model_key.ends_with(pm.split('/').last().unwrap_or(pm))
+                    || model_key.ends_with(pm.split('/').next_back().unwrap_or(pm))
             })
         })
         .collect();
@@ -285,6 +285,7 @@ fn pick_models(catalog: &ModelCatalog) -> Option<ModelPicks> {
 
     // Best model = lowest score (score is lower-is-better from AdaptiveRouter).
     // Tiebreak: cheaper wins.
+    #[allow(dead_code)]
     fn best_of<'a>(models: &[&'a CatalogEntry]) -> Option<&'a CatalogEntry> {
         models.iter().copied().min_by(|a, b| {
             a.score

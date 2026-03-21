@@ -616,15 +616,12 @@ async fn web_search(
         }));
     }
 
-    let results = match tokio::time::timeout(
+    let results = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         futures::future::join_all(handles),
     )
     .await
-    {
-        Ok(r) => r,
-        Err(_) => Vec::new(),
-    };
+    .unwrap_or_default();
 
     // Pick the best result (richest successful output)
     let mut successful: Vec<(String, SearchResult)> = results
@@ -695,15 +692,12 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
         }));
     }
 
-    let results = match tokio::time::timeout(
+    let results = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         futures::future::join_all(handles),
     )
     .await
-    {
-        Ok(r) => r,
-        Err(_) => Vec::new(),
-    };
+    .unwrap_or_default();
 
     let mut successful: Vec<(String, SearchResult)> = results
         .into_iter()
