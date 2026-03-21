@@ -8,7 +8,7 @@ mod skills_handler;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Args;
@@ -19,14 +19,14 @@ use octos_bus::{
     ActiveSessionStore, ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager,
     create_bus, validate_topic_name,
 };
-use octos_core::{OutboundMessage, SessionKey};
+use octos_core::{MAIN_PROFILE_ID, OutboundMessage, SessionKey};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore};
-use tracing::{info, warn};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tracing::{error, info, warn};
 
 use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
@@ -34,11 +34,14 @@ use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::session_actor::{
-    ActorFactory, ActorRegistry, DispatchParams, SnapshotToolRegistryFactory,
+    ActorFactory, ActorRegistry, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
+    ToolRegistryFactory,
 };
 use crate::status_layers::StatusComposer;
 
 // Re-export for use by prompt module
+#[cfg(feature = "matrix")]
+use async_trait::async_trait;
 pub(crate) use prompt::build_system_prompt;
 #[cfg(any(
     feature = "telegram",
@@ -50,10 +53,44 @@ pub(crate) use prompt::build_system_prompt;
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
+    feature = "matrix",
     feature = "qq-bot",
     feature = "wechat"
 ))]
 use prompt::settings_str;
+
+#[cfg(all(feature = "matrix", test))]
+const MATRIX_CHANNEL_TYPE: &str = "matrix";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_HOMESERVER: &str = "homeserver";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_AS_TOKEN: &str = "as_token";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_HS_TOKEN: &str = "hs_token";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_SERVER_NAME: &str = "server_name";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_SENDER_LOCALPART: &str = "sender_localpart";
+#[cfg(feature = "matrix")]
+const MATRIX_SETTING_USER_PREFIX: &str = "user_prefix";
+#[cfg(feature = "matrix")]
+const MATRIX_DEFAULT_HOMESERVER: &str = "http://localhost:6167";
+#[cfg(feature = "matrix")]
+const MATRIX_DEFAULT_SERVER_NAME: &str = "localhost";
+#[cfg(feature = "matrix")]
+const MATRIX_DEFAULT_SENDER_LOCALPART: &str = "bot";
+#[cfg(feature = "matrix")]
+const MATRIX_DEFAULT_USER_PREFIX: &str = "bot_";
+#[cfg(feature = "matrix")]
+const MATRIX_DEFAULT_PORT: u16 = 8009;
+#[cfg(feature = "matrix")]
+const MATRIX_MISSING_TOKENS_ERROR: &str =
+    "matrix channel requires settings.as_token and settings.hs_token";
+#[cfg(feature = "matrix")]
+const MATRIX_BOT_USER_ID_ENV_KEY: &str = "OCTOS_MATRIX_BOT_USER_ID";
+
+/// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
+type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>);
 
 /// Run as a persistent gateway daemon.
 #[derive(Debug, Args)]
@@ -117,6 +154,550 @@ pub struct GatewayCommand {
     /// Octos home directory for ProfileStore access (used by managed gateways).
     #[arg(long, hide = true)]
     pub octos_home: Option<PathBuf>,
+}
+
+#[cfg(feature = "matrix")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatrixChannelSettings {
+    homeserver: String,
+    as_token: String,
+    hs_token: String,
+    server_name: String,
+    sender_localpart: String,
+    user_prefix: String,
+    port: u16,
+    allowed_senders: Vec<String>,
+}
+
+#[cfg(feature = "matrix")]
+impl MatrixChannelSettings {
+    fn from_entry(entry: &crate::config::ChannelEntry) -> Result<Self> {
+        let homeserver = settings_str(
+            &entry.settings,
+            MATRIX_SETTING_HOMESERVER,
+            MATRIX_DEFAULT_HOMESERVER,
+        );
+        let as_token = settings_str(&entry.settings, MATRIX_SETTING_AS_TOKEN, "");
+        let hs_token = settings_str(&entry.settings, MATRIX_SETTING_HS_TOKEN, "");
+        if as_token.is_empty() || hs_token.is_empty() {
+            eyre::bail!(MATRIX_MISSING_TOKENS_ERROR);
+        }
+
+        let port = match entry.settings.get("port").and_then(|v| v.as_u64()) {
+            Some(raw) => u16::try_from(raw)
+                .map_err(|_| eyre::eyre!("matrix channel port out of range: {raw}"))?,
+            None => MATRIX_DEFAULT_PORT,
+        };
+
+        Ok(Self {
+            homeserver,
+            as_token,
+            hs_token,
+            server_name: settings_str(
+                &entry.settings,
+                MATRIX_SETTING_SERVER_NAME,
+                MATRIX_DEFAULT_SERVER_NAME,
+            ),
+            sender_localpart: settings_str(
+                &entry.settings,
+                MATRIX_SETTING_SENDER_LOCALPART,
+                MATRIX_DEFAULT_SENDER_LOCALPART,
+            ),
+            user_prefix: settings_str(
+                &entry.settings,
+                MATRIX_SETTING_USER_PREFIX,
+                MATRIX_DEFAULT_USER_PREFIX,
+            ),
+            port,
+            allowed_senders: entry.allowed_senders.clone(),
+        })
+    }
+
+    fn build_channel(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        data_dir: &std::path::Path,
+    ) -> Arc<octos_bus::MatrixChannel> {
+        Arc::new(
+            octos_bus::MatrixChannel::new(
+                &self.homeserver,
+                &self.as_token,
+                &self.hs_token,
+                &self.server_name,
+                &self.sender_localpart,
+                &self.user_prefix,
+                self.port,
+                shutdown,
+            )
+            .with_admin_allowed_senders(self.allowed_senders.clone())
+            .with_bot_router(data_dir),
+        )
+    }
+}
+
+#[cfg(feature = "matrix")]
+fn get_or_create_matrix_channel(
+    matrix_channel: &mut Option<Arc<octos_bus::MatrixChannel>>,
+    settings: &MatrixChannelSettings,
+    shutdown: &Arc<AtomicBool>,
+    data_dir: &std::path::Path,
+) -> Arc<octos_bus::MatrixChannel> {
+    if let Some(channel) = matrix_channel.clone() {
+        channel
+    } else {
+        let channel = settings.build_channel(shutdown.clone(), data_dir);
+        *matrix_channel = Some(channel.clone());
+        channel
+    }
+}
+
+#[cfg(feature = "matrix")]
+fn register_matrix_channel(
+    channel_mgr: &mut ChannelManager,
+    matrix_channel: &mut Option<Arc<octos_bus::MatrixChannel>>,
+    settings: &MatrixChannelSettings,
+    shutdown: &Arc<AtomicBool>,
+    data_dir: &std::path::Path,
+) -> Arc<octos_bus::MatrixChannel> {
+    let channel = get_or_create_matrix_channel(matrix_channel, settings, shutdown, data_dir);
+    channel_mgr.register(channel.clone());
+    channel
+}
+
+fn resolve_dispatch_profile_id(
+    target_profile_id: Option<&str>,
+    profile_store: Option<&crate::profiles::ProfileStore>,
+) -> Result<Option<String>> {
+    let Some(profile_id) = target_profile_id.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let Some(store) = profile_store else {
+        warn!(
+            profile_id = %profile_id,
+            "profile store unavailable; routing target profile to main profile"
+        );
+        return Ok(None);
+    };
+
+    match store.get(profile_id) {
+        Ok(Some(_)) => Ok(Some(profile_id.to_string())),
+        Ok(None) => {
+            warn!(
+                profile_id = %profile_id,
+                "target profile not found; routing message to main profile"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            warn!(
+                profile_id = %profile_id,
+                %error,
+                "failed to load target profile; routing message to main profile"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn build_profiled_session_key(
+    profile_id: Option<&str>,
+    channel: &str,
+    chat_id: &str,
+    topic: &str,
+) -> SessionKey {
+    let effective_profile_id = profile_id.unwrap_or(MAIN_PROFILE_ID);
+    SessionKey::with_profile_topic(effective_profile_id, channel, chat_id, topic)
+}
+
+fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
+    let model = config.model.clone();
+    let base_url = config.base_url.clone();
+    let provider_name = config
+        .provider
+        .clone()
+        .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
+        .unwrap_or_else(|| "anthropic".to_string());
+
+    use super::chat::create_provider;
+    let base_provider = create_provider(&provider_name, config, model, base_url)?;
+    let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
+
+    let llm: Arc<dyn LlmProvider> = if no_retry {
+        base_provider
+    } else if config.fallback_models.is_empty() {
+        Arc::new(RetryProvider::new(base_provider))
+    } else {
+        let mut providers: Vec<Arc<dyn LlmProvider>> =
+            vec![Arc::new(RetryProvider::new(base_provider))];
+        let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
+        for fallback in &config.fallback_models {
+            let fallback_config = if fallback.api_key_env.is_some() {
+                let mut cloned = config.clone();
+                cloned.api_key_env = fallback.api_key_env.clone();
+                cloned
+            } else {
+                config.clone()
+            };
+            match super::chat::create_provider_with_api_type(
+                &fallback.provider,
+                &fallback_config,
+                fallback.model.clone(),
+                fallback.base_url.clone(),
+                fallback.api_type.as_deref(),
+            ) {
+                Ok(provider) => {
+                    providers.push(Arc::new(RetryProvider::new(provider)));
+                    costs.push(fallback.cost_per_m.unwrap_or(0.0));
+                }
+                Err(error) => {
+                    warn!(
+                        provider = %fallback.provider,
+                        %error,
+                        "skipping profiled fallback provider"
+                    );
+                }
+            }
+        }
+
+        if providers.len() > 1 {
+            let adaptive_config = config
+                .adaptive_routing
+                .as_ref()
+                .map(AdaptiveConfig::from)
+                .unwrap_or_default();
+            let routing_config = config.adaptive_routing.as_ref();
+            let mode = routing_config
+                .map(|value| value.mode.into())
+                .unwrap_or(octos_llm::AdaptiveMode::Lane);
+            let qos_ranking = routing_config
+                .map(|value| value.qos_ranking)
+                .unwrap_or(true);
+            let router = Arc::new(
+                AdaptiveRouter::new(providers, &costs, adaptive_config)
+                    .with_adaptive_config(mode, qos_ranking),
+            );
+            adaptive_router_ref = Some(router.clone());
+            router
+        } else {
+            Arc::new(ProviderChain::new(providers))
+        }
+    };
+
+    Ok((llm, provider_name, adaptive_router_ref))
+}
+
+struct ProfileActorFactoryBuilder {
+    profile_store: Arc<crate::profiles::ProfileStore>,
+    base_data_dir: PathBuf,
+    project_dir: PathBuf,
+    tool_config: Arc<octos_agent::ToolConfigStore>,
+    memory: Arc<EpisodeStore>,
+    memory_store: Arc<MemoryStore>,
+    agent_config: AgentConfig,
+    session_mgr: Arc<Mutex<SessionManager>>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    spawn_inbound_tx: mpsc::Sender<octos_core::InboundMessage>,
+    cron_service: Arc<CronService>,
+    tool_registry_factory: Arc<dyn ToolRegistryFactory + Send + Sync>,
+    pipeline_factory: Option<Arc<dyn PipelineToolFactory + Send + Sync>>,
+    max_history: Arc<AtomicUsize>,
+    session_timeout_secs: u64,
+    shutdown: Arc<AtomicBool>,
+    cwd: PathBuf,
+    provider_policy: Option<octos_agent::ToolPolicy>,
+    worker_prompt: Option<String>,
+    provider_router: Option<Arc<ProviderRouter>>,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
+    pending_messages: PendingMessages,
+    queue_mode: crate::config::QueueMode,
+    plugin_prompt_fragments: Vec<String>,
+    no_retry: bool,
+}
+
+impl ProfileActorFactoryBuilder {
+    async fn build(&self, profile_id: &str) -> Result<ActorFactory> {
+        let profile = self
+            .profile_store
+            .get(profile_id)?
+            .ok_or_else(|| eyre::eyre!("target profile '{profile_id}' not found"))?;
+        let effective_profile =
+            crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
+        let profile_config = crate::profiles::config_from_profile(&effective_profile, None, None);
+        let (llm, _provider_name, adaptive_router) =
+            build_llm_stack(&profile_config, self.no_retry)?;
+        let llm_for_compaction = llm.clone();
+
+        let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
+        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
+        if profile_data_dir != self.project_dir {
+            if let Some(parent_id) = effective_profile.parent_id.as_deref() {
+                if let Some(parent) = self.profile_store.get(parent_id)? {
+                    extra_skills_dirs.push(self.profile_store.resolve_data_dir(&parent));
+                }
+            }
+            extra_skills_dirs.push(self.project_dir.clone());
+        }
+
+        let mut skills_loader = if profile_data_dir != self.project_dir {
+            let mut loader = SkillsLoader::new(&profile_data_dir);
+            for dir in &extra_skills_dirs {
+                loader.add_skills_dir(dir);
+            }
+            loader
+        } else {
+            SkillsLoader::new(&self.project_dir)
+        };
+        skills_loader.add_skills_path(
+            self.project_dir
+                .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR),
+        );
+
+        let mut system_prompt = if effective_profile.config.admin_mode {
+            if let Some(custom_prompt) = effective_profile.config.gateway.system_prompt.as_deref() {
+                custom_prompt.to_string()
+            } else {
+                let compiled = include_str!("../../prompts/admin_default.txt");
+                super::load_prompt("admin", compiled)
+            }
+        } else {
+            build_system_prompt(
+                effective_profile.config.gateway.system_prompt.as_deref(),
+                &profile_data_dir,
+                &self.project_dir,
+                &self.memory_store,
+                &skills_loader,
+                &self.tool_config,
+            )
+            .await
+        };
+        for fragment in &self.plugin_prompt_fragments {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(fragment);
+        }
+
+        let hooks = if effective_profile.config.hooks.is_empty() {
+            None
+        } else {
+            Some(Arc::new(HookExecutor::new(
+                effective_profile.config.hooks.clone(),
+            )))
+        };
+
+        Ok(ActorFactory {
+            agent_config: self.agent_config.clone(),
+            llm: llm.clone(),
+            llm_for_compaction,
+            memory: self.memory.clone(),
+            system_prompt: Arc::new(std::sync::RwLock::new(system_prompt)),
+            hooks,
+            hook_context_template: Some(HookContext {
+                session_id: None,
+                profile_id: Some(profile_id.to_string()),
+            }),
+            data_dir: self.base_data_dir.clone(),
+            session_mgr: self.session_mgr.clone(),
+            out_tx: self.out_tx.clone(),
+            spawn_inbound_tx: self.spawn_inbound_tx.clone(),
+            cron_service: Some(self.cron_service.clone()),
+            tool_registry_factory: self.tool_registry_factory.clone(),
+            pipeline_factory: self.pipeline_factory.clone(),
+            max_history: self.max_history.clone(),
+            idle_timeout: Duration::from_secs(crate::session_actor::DEFAULT_IDLE_TIMEOUT_SECS),
+            session_timeout: Duration::from_secs(self.session_timeout_secs),
+            shutdown: self.shutdown.clone(),
+            cwd: self.cwd.clone(),
+            sandbox_config: effective_profile.config.sandbox.clone(),
+            provider_policy: self.provider_policy.clone(),
+            worker_prompt: self.worker_prompt.clone(),
+            provider_router: self.provider_router.clone(),
+            embedder: create_embedder(&profile_config)
+                .map(|embedder| embedder as Arc<dyn octos_llm::EmbeddingProvider>),
+            active_sessions: self.active_sessions.clone(),
+            pending_messages: self.pending_messages.clone(),
+            queue_mode: self.queue_mode,
+            adaptive_router,
+            memory_store: Some(self.memory_store.clone()),
+        })
+    }
+}
+
+// ── Gateway Bot Manager ─────────────────────────────────────────────────────
+
+/// Bot lifecycle manager for slash commands in Matrix rooms.
+///
+/// Operates inside the running gateway (async context), uses `MatrixChannel`
+/// directly for virtual user registration (no HTTP round-trip to self).
+#[cfg(feature = "matrix")]
+struct GatewayBotManager {
+    store: Arc<crate::profiles::ProfileStore>,
+    channel: Arc<octos_bus::MatrixChannel>,
+    parent_profile_id: String,
+}
+
+#[cfg(feature = "matrix")]
+#[async_trait]
+impl octos_bus::BotManager for GatewayBotManager {
+    async fn create_bot(
+        &self,
+        username: &str,
+        name: &str,
+        system_prompt: Option<&str>,
+    ) -> eyre::Result<String> {
+        use crate::profiles::GatewaySettings;
+
+        // Validate username
+        if username.is_empty()
+            || !username
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            eyre::bail!(
+                "username `{username}` is invalid — only lowercase letters, digits, and underscores are allowed"
+            );
+        }
+
+        let parent = self
+            .store
+            .get(&self.parent_profile_id)?
+            .ok_or_else(|| eyre::eyre!("parent profile '{}' not found", self.parent_profile_id))?;
+
+        let (server_name, user_prefix) = parent
+            .config
+            .channels
+            .iter()
+            .find_map(|ch| {
+                if let crate::profiles::ChannelCredentials::Matrix {
+                    server_name,
+                    user_prefix,
+                    ..
+                } = ch
+                {
+                    Some((server_name.clone(), user_prefix.clone()))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| eyre::eyre!("parent profile has no Matrix channel"))?;
+
+        let matrix_user_id = format!("@{user_prefix}{username}:{server_name}");
+
+        // Step 1: Create sub-account
+        // Use username (ASCII slug) for profile ID generation, then set display name separately.
+        let gateway = GatewaySettings {
+            system_prompt: system_prompt.map(str::to_string),
+            ..Default::default()
+        };
+        let mut sub =
+            self.store
+                .create_sub_account(&self.parent_profile_id, username, vec![], gateway)?;
+        sub.name = name.to_string();
+        sub.config.env_vars.insert(
+            MATRIX_BOT_USER_ID_ENV_KEY.to_string(),
+            matrix_user_id.clone(),
+        );
+        sub.updated_at = chrono::Utc::now();
+        self.store.save(&sub)?;
+
+        // Step 2: Register virtual user + route via MatrixChannel
+        if let Err(e) = self.channel.register_bot(&matrix_user_id, &sub.id).await {
+            // Rollback
+            if let Err(delete_error) = self.store.delete(&sub.id) {
+                warn!(
+                    profile_id = %sub.id,
+                    error = %delete_error,
+                    "failed to roll back Matrix bot profile after registration failure"
+                );
+            }
+            eyre::bail!("Failed to register Matrix user: {e}");
+        }
+
+        Ok(format!(
+            "Bot **{name}** created successfully!\n\
+             \n\
+             - Matrix ID: `{matrix_user_id}`\n\
+             - Profile ID: `{}`\n\
+             \n\
+             You can now send a direct message to `{matrix_user_id}` to start chatting.",
+            sub.id
+        ))
+    }
+
+    async fn delete_bot(&self, matrix_user_id: &str) -> eyre::Result<String> {
+        // Protect the BotFather itself from deletion
+        let botfather_user_id = self.channel.bot_user_id();
+        if matrix_user_id == botfather_user_id {
+            eyre::bail!("the BotFather bot (`{botfather_user_id}`) cannot be deleted");
+        }
+
+        // Look up profile from bot router
+        let profile_id = self
+            .channel
+            .bot_router()
+            .route(matrix_user_id)
+            .await
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "bot `{matrix_user_id}` not found — use `/listbots` to see registered bots"
+                )
+            })?;
+
+        // Protect parent profile from deletion
+        if profile_id == self.parent_profile_id {
+            eyre::bail!("the parent profile cannot be deleted");
+        }
+
+        let profile = self
+            .store
+            .get(&profile_id)?
+            .ok_or_else(|| eyre::eyre!("profile `{profile_id}` no longer exists"))?;
+
+        if !self.store.delete(&profile_id)? {
+            eyre::bail!("profile `{profile_id}` no longer exists");
+        }
+
+        if let Err(error) = self.channel.unregister_bot(matrix_user_id).await {
+            self.store.save(&profile).wrap_err_with(|| {
+                format!(
+                    "failed to unregister bot `{matrix_user_id}` and failed to restore profile `{profile_id}`"
+                )
+            })?;
+            return Err(error.wrap_err(format!(
+                "failed to unregister bot `{matrix_user_id}`; profile `{profile_id}` restored"
+            )));
+        }
+
+        Ok(format!(
+            "Bot `{matrix_user_id}` deleted (profile `{profile_id}` removed)."
+        ))
+    }
+
+    async fn list_bots(&self) -> eyre::Result<String> {
+        let botfather_id = self.channel.bot_user_id();
+        let mut lines = vec![
+            "**Registered bots:**\n".to_string(),
+            format!("• **BotFather** `{botfather_id}`"),
+        ];
+
+        let routes = self.channel.bot_router().list_routes().await;
+        let mut sorted: Vec<_> = routes.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (matrix_id, profile_id) in &sorted {
+            let name = self
+                .store
+                .get(profile_id)
+                .ok()
+                .flatten()
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            if name.is_empty() {
+                lines.push(format!("• `{matrix_id}`"));
+            } else {
+                lines.push(format!("• **{name}** `{matrix_id}`"));
+            }
+        }
+        Ok(lines.join("\n"))
+    }
 }
 
 impl Executable for GatewayCommand {
@@ -371,24 +952,21 @@ impl GatewayCommand {
             std::env::set_var("OCTOS_DATA_DIR", &data_dir);
         }
 
-        // Open ProfileStore for /account commands (if octos-home is available)
+        // Open ProfileStore for /account commands and bot management.
+        // Derive octos_home from: --octos-home flag > data_dir (which already
+        // resolves --data-dir > $OCTOS_HOME > ~/.octos).
+        let effective_octos_home = self.octos_home.clone().unwrap_or_else(|| data_dir.clone());
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
-            if let Some(ref octos_home) = self.octos_home {
-                crate::profiles::ProfileStore::open(octos_home)
-                    .ok()
-                    .map(Arc::new)
-            } else {
-                None
-            };
+            crate::profiles::ProfileStore::open(&effective_octos_home)
+                .ok()
+                .map(Arc::new);
 
         // Export OCTOS_HOME and OCTOS_PROFILE_ID so plugin tools (e.g. account-manager)
         // can access the profile store and know which profile is running.
         // SAFETY: gateway is single-threaded at this point (before tokio tasks spawn).
         #[allow(unsafe_code)]
         unsafe {
-            if let Some(ref octos_home) = self.octos_home {
-                std::env::set_var("OCTOS_HOME", octos_home);
-            }
+            std::env::set_var("OCTOS_HOME", &effective_octos_home);
             if let Some(ref pid) = profile_id {
                 std::env::set_var("OCTOS_PROFILE_ID", pid);
             }
@@ -577,6 +1155,10 @@ impl GatewayCommand {
         // resolve storage relative to the correct profile, not the gateway root.
         plugin_env.push(("OCTOS_DATA_DIR".to_string(), data_dir.to_string_lossy().to_string()));
         plugin_env.push(("OCTOS_VOICE_DIR".to_string(), data_dir.join("voice_profiles").to_string_lossy().to_string()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        #[cfg(feature = "matrix")]
+        let mut matrix_channel: Option<Arc<octos_bus::MatrixChannel>> = None;
 
         let mut tools;
         let mut plugin_result;
@@ -586,14 +1168,17 @@ impl GatewayCommand {
             tools = ToolRegistry::new();
 
             // Register admin API tools (calls REST API on octos serve)
-            let serve_url = std::env::var("OCTOS_SERVE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            let serve_url_env = std::env::var("OCTOS_SERVE_URL").ok();
+            let serve_url = serve_url_env
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
             let admin_token = std::env::var("OCTOS_ADMIN_TOKEN").unwrap_or_default();
             let admin_ctx = Arc::new(octos_agent::AdminApiContext {
                 http: reqwest::Client::new(),
                 serve_url,
                 admin_token,
             });
+
             octos_agent::register_admin_api_tools(&mut tools, admin_ctx);
 
             // Session-specific tools (cron, message, send_file) are created
@@ -994,9 +1579,6 @@ impl GatewayCommand {
             ..Default::default()
         };
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-
         let llm_for_compaction = llm.clone();
 
         // Build hook executor and context template (merge config + skill hooks)
@@ -1092,7 +1674,7 @@ impl GatewayCommand {
             agent_config,
             llm: llm.clone(),
             llm_for_compaction: llm_for_compaction.clone(),
-            memory,
+            memory: memory.clone(),
             system_prompt: system_prompt.clone(),
             hooks,
             hook_context_template,
@@ -1119,6 +1701,36 @@ impl GatewayCommand {
             adaptive_router: adaptive_router_ref,
             memory_store: Some(memory_store.clone()),
         };
+        let profile_factory_builder =
+            profile_store
+                .as_ref()
+                .map(|store| ProfileActorFactoryBuilder {
+                    profile_store: store.clone(),
+                    base_data_dir: data_dir.clone(),
+                    project_dir: project_dir.clone(),
+                    tool_config: tool_config.clone(),
+                    memory: memory.clone(),
+                    memory_store: memory_store.clone(),
+                    agent_config: actor_factory.agent_config.clone(),
+                    session_mgr: session_mgr.clone(),
+                    out_tx: out_tx.clone(),
+                    spawn_inbound_tx: actor_factory.spawn_inbound_tx.clone(),
+                    cron_service: cron_service.clone(),
+                    tool_registry_factory: actor_factory.tool_registry_factory.clone(),
+                    pipeline_factory: actor_factory.pipeline_factory.clone(),
+                    max_history: max_history.clone(),
+                    session_timeout_secs,
+                    shutdown: shutdown.clone(),
+                    cwd: cwd.clone(),
+                    provider_policy: actor_factory.provider_policy.clone(),
+                    worker_prompt: actor_factory.worker_prompt.clone(),
+                    provider_router: actor_factory.provider_router.clone(),
+                    active_sessions: active_sessions.clone(),
+                    pending_messages: pending_messages.clone(),
+                    queue_mode: gw_config.queue_mode,
+                    plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
+                    no_retry: self.no_retry,
+                });
 
         // Start config watcher for hot-reload
         let watch_paths = {
@@ -1400,6 +2012,17 @@ impl GatewayCommand {
                         shutdown.clone(),
                     )));
                 }
+                #[cfg(feature = "matrix")]
+                "matrix" => {
+                    let settings = MatrixChannelSettings::from_entry(entry)?;
+                    let _ = register_matrix_channel(
+                        &mut channel_mgr,
+                        &mut matrix_channel,
+                        &settings,
+                        &shutdown,
+                        &data_dir,
+                    );
+                }
                 #[cfg(feature = "qq-bot")]
                 "qq-bot" => {
                     let app_id = settings_str(&entry.settings, "app_id", "");
@@ -1455,6 +2078,24 @@ impl GatewayCommand {
             .and_then(|e| e.allowed_senders.first())
             .cloned()
             .unwrap_or_default();
+
+        // Attach bot manager to Matrix channel for slash command handling
+        #[cfg(feature = "matrix")]
+        if admin_mode {
+            if let Some(ref channel) = matrix_channel {
+                if let Some(ref store) = profile_store {
+                    let bot_mgr = Arc::new(GatewayBotManager {
+                        store: store.clone(),
+                        channel: channel.clone(),
+                        parent_profile_id: profile_id
+                            .clone()
+                            .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
+                    });
+                    channel.set_bot_manager(bot_mgr);
+                    info!("matrix slash commands enabled (/createbot, /deletebot, /listbots)");
+                }
+            }
+        }
 
         // Start channels and dispatcher
         eprintln!("[gateway] starting channels");
@@ -1555,6 +2196,7 @@ impl GatewayCommand {
             out_tx.clone(),
             pending_messages.clone(),
         );
+        let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
 
         // Drop the original out_tx — factory and registry hold their own clones.
         // This ensures the outbound channel closes properly when actors shut down.
@@ -1681,9 +2323,39 @@ impl GatewayCommand {
                 (inbound.channel.clone(), inbound.chat_id.clone())
             };
 
-            // Resolve session key with active topic
-            let base_session_key = inbound.session_key();
-            let base_key_str = base_session_key.0.clone();
+            let target_profile = inbound
+                .metadata
+                .get("target_profile_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut dispatch_profile_id =
+                resolve_dispatch_profile_id(target_profile.as_deref(), profile_store.as_deref())?;
+            if let Some(ref pid) = dispatch_profile_id {
+                if !actor_registry.has_profile_factory(pid) {
+                    if let Some(ref builder) = profile_factory_builder {
+                        match builder.build(pid).await {
+                            Ok(factory) => {
+                                actor_registry.register_profile_factory(pid.clone(), factory)
+                            }
+                            Err(error) => {
+                                error!(profile_id = %pid, %error, "failed to build profiled actor factory; falling back to main profile");
+                                dispatch_profile_id = None;
+                            }
+                        }
+                    } else {
+                        dispatch_profile_id = None;
+                    }
+                }
+            }
+
+            // Resolve session key with active topic, isolated per effective profile.
+            let base_session_key = build_profiled_session_key(
+                dispatch_profile_id.as_deref(),
+                &inbound.channel,
+                &inbound.chat_id,
+                "",
+            );
+            let base_key_str = base_session_key.base_key().to_string();
             let session_key = {
                 let store = active_sessions.read().await;
                 store.resolve_session_key(&base_key_str)
@@ -1737,8 +2409,12 @@ impl GatewayCommand {
                     info!(session = %label, "session switched via inline keyboard");
 
                     // Flush any buffered messages from the target session
-                    let target_key =
-                        SessionKey::with_topic(&inbound.channel, &inbound.chat_id, topic);
+                    let target_key = build_profiled_session_key(
+                        dispatch_profile_id.as_deref(),
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        topic,
+                    );
                     actor_registry.flush_pending(&target_key.to_string()).await;
                     continue;
                 }
@@ -1817,7 +2493,12 @@ impl GatewayCommand {
                         .await;
 
                     // Flush any buffered messages from this session
-                    let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
+                    let target_key = build_profiled_session_key(
+                        dispatch_profile_id.as_deref(),
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        "",
+                    );
                     actor_registry.flush_pending(&target_key.to_string()).await;
                 } else if let Err(reason) = validate_topic_name(name) {
                     let _ = agent_handle
@@ -1835,7 +2516,12 @@ impl GatewayCommand {
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
 
                     // Show last 2 messages as context preview
-                    let new_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
+                    let new_key = build_profiled_session_key(
+                        dispatch_profile_id.as_deref(),
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        name,
+                    );
                     let preview = {
                         let mut mgr = session_mgr.lock().await;
                         let session = mgr.get_or_create(&new_key);
@@ -1913,8 +2599,12 @@ impl GatewayCommand {
                             .await;
 
                         // Flush any buffered messages from the target session
-                        let target_key =
-                            SessionKey::with_topic(&inbound.channel, &inbound.chat_id, &topic);
+                        let target_key = build_profiled_session_key(
+                            dispatch_profile_id.as_deref(),
+                            &inbound.channel,
+                            &inbound.chat_id,
+                            &topic,
+                        );
                         actor_registry.flush_pending(&target_key.to_string()).await;
                     }
                     Ok(None) => {
@@ -1945,7 +2635,12 @@ impl GatewayCommand {
                         ))
                         .await;
                 } else {
-                    let del_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
+                    let del_key = build_profiled_session_key(
+                        dispatch_profile_id.as_deref(),
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        name,
+                    );
                     match session_mgr.lock().await.clear(&del_key).await {
                         Ok(()) => {
                             active_sessions
@@ -2043,18 +2738,66 @@ impl GatewayCommand {
                 status_indicators.get(&reply_channel).cloned()
             };
 
+            let (prompt_override, dispatch_sender_uid) = if let Some(ref pid) = dispatch_profile_id
+            {
+                let prompt = if actor_registry.has_profile_factory(pid) {
+                    None
+                } else if !profile_prompt_cache.contains_key(pid.as_str()) {
+                    let loaded = if let Some(ref store) = profile_store {
+                        match store.get(pid) {
+                            Ok(Some(p)) => Some(p.config.gateway.system_prompt),
+                            Ok(None) => {
+                                warn!(profile_id = %pid, "target profile not found");
+                                None
+                            }
+                            Err(e) => {
+                                warn!(profile_id = %pid, error = %e, "failed to load profile");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let prompt_val = loaded.flatten();
+                    profile_prompt_cache.insert(pid.clone(), prompt_val.clone());
+                    prompt_val
+                } else {
+                    profile_prompt_cache.get(pid.as_str()).cloned().flatten()
+                };
+
+                #[cfg(feature = "matrix")]
+                let sender_uid = if let Some(ref mc) = matrix_channel {
+                    let uid = mc.bot_router().reverse_route(pid).await;
+                    tracing::debug!(profile_id = %pid, sender_uid = ?uid, "resolved sender_user_id for profile");
+                    uid
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "matrix"))]
+                let sender_uid: Option<String> = None;
+
+                (prompt, sender_uid)
+            } else {
+                (None, None)
+            };
+
             // Dispatch to per-session actor (creates one if needed)
+            tracing::debug!(
+                dispatch_profile_id = ?dispatch_profile_id,
+                dispatch_sender_uid = ?dispatch_sender_uid,
+                "dispatching to actor"
+            );
             actor_registry
-                .dispatch(DispatchParams {
+                .dispatch(crate::session_actor::DispatchParams {
                     message: inbound,
                     image_media,
                     session_key,
                     reply_channel: &reply_channel,
                     reply_chat_id: &reply_chat_id,
                     status_indicator,
-                    profile_id: None,
-                    system_prompt_override: None,
-                    sender_user_id: None,
+                    profile_id: dispatch_profile_id.as_deref(),
+                    system_prompt_override: prompt_override,
+                    sender_user_id: dispatch_sender_uid,
                 })
                 .await;
 
@@ -2268,4 +3011,233 @@ fn build_plugin_env(config: &crate::config::Config, provider_name: &str) -> Vec<
     }
 
     env
+}
+
+#[cfg(all(test, feature = "matrix"))]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use octos_bus::BotManager;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig {
+                gateway: crate::profiles::GatewaySettings {
+                    system_prompt: system_prompt.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn matrix_entry(settings: serde_json::Value) -> crate::config::ChannelEntry {
+        crate::config::ChannelEntry {
+            channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            allowed_senders: Vec::new(),
+            settings,
+        }
+    }
+
+    #[test]
+    fn matrix_channel_settings_use_defaults() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-token",
+            MATRIX_SETTING_HS_TOKEN: "hs-token",
+        }));
+
+        let settings = MatrixChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(settings.homeserver, MATRIX_DEFAULT_HOMESERVER);
+        assert_eq!(settings.server_name, MATRIX_DEFAULT_SERVER_NAME);
+        assert_eq!(settings.sender_localpart, MATRIX_DEFAULT_SENDER_LOCALPART);
+        assert_eq!(settings.user_prefix, MATRIX_DEFAULT_USER_PREFIX);
+        assert_eq!(settings.port, MATRIX_DEFAULT_PORT);
+        assert!(settings.allowed_senders.is_empty());
+    }
+
+    #[test]
+    fn matrix_channel_settings_copy_allowed_senders() {
+        let entry = crate::config::ChannelEntry {
+            channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            allowed_senders: vec!["@alice:localhost".into(), "@bob:localhost".into()],
+            settings: serde_json::json!({
+                MATRIX_SETTING_AS_TOKEN: "as-token",
+                MATRIX_SETTING_HS_TOKEN: "hs-token",
+            }),
+        };
+
+        let settings = MatrixChannelSettings::from_entry(&entry).unwrap();
+
+        assert_eq!(
+            settings.allowed_senders,
+            vec!["@alice:localhost".to_string(), "@bob:localhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn matrix_channel_settings_require_tokens() {
+        let entry = matrix_entry(serde_json::json!({}));
+
+        let err = MatrixChannelSettings::from_entry(&entry).unwrap_err();
+
+        assert!(err.to_string().contains(MATRIX_MISSING_TOKENS_ERROR));
+    }
+
+    #[test]
+    fn matrix_channel_settings_reject_out_of_range_port() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-token",
+            MATRIX_SETTING_HS_TOKEN: "hs-token",
+            "port": 70000,
+        }));
+
+        let err = MatrixChannelSettings::from_entry(&entry).unwrap_err();
+
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn test_gateway_registers_matrix_channel() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-token",
+            MATRIX_SETTING_HS_TOKEN: "hs-token",
+        }));
+        let settings = MatrixChannelSettings::from_entry(&entry).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut channel_mgr = ChannelManager::new();
+        let mut matrix_channel = None;
+
+        let channel = register_matrix_channel(
+            &mut channel_mgr,
+            &mut matrix_channel,
+            &settings,
+            &shutdown,
+            data_dir.path(),
+        );
+
+        assert!(channel_mgr.get_channel(MATRIX_CHANNEL_TYPE).is_some());
+        assert!(matrix_channel.is_some());
+        assert!(Arc::ptr_eq(
+            &channel,
+            matrix_channel
+                .as_ref()
+                .expect("matrix channel should be cached")
+        ));
+    }
+
+    #[test]
+    fn test_dispatch_unknown_profile_falls_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&make_profile("weather", Some("weather prompt")))
+            .unwrap();
+
+        let resolved = resolve_dispatch_profile_id(Some("missing-profile"), Some(&store)).unwrap();
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_dispatch_known_profile_keeps_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&make_profile("weather", Some("weather prompt")))
+            .unwrap();
+
+        let resolved = resolve_dispatch_profile_id(Some("weather"), Some(&store)).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("weather"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_bot_keeps_route_when_profile_delete_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let mut parent = make_profile("botfather", None);
+        parent
+            .config
+            .channels
+            .push(crate::profiles::ChannelCredentials::Matrix {
+                homeserver: "http://localhost:6167".to_string(),
+                as_token: "as-token".to_string(),
+                hs_token: "hs-token".to_string(),
+                server_name: "localhost".to_string(),
+                sender_localpart: "bot".to_string(),
+                user_prefix: "bot_".to_string(),
+                port: MATRIX_DEFAULT_PORT,
+                allowed_senders: vec![],
+            });
+        store.save(&parent).unwrap();
+
+        let mut sub = make_profile("botfather--weatherbot", None);
+        sub.parent_id = Some(parent.id.clone());
+        store.save(&sub).unwrap();
+
+        let channel = Arc::new(
+            octos_bus::MatrixChannel::new(
+                "http://localhost:6167",
+                "as-token",
+                "hs-token",
+                "localhost",
+                "bot",
+                "bot_",
+                6166,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_bot_router(dir.path()),
+        );
+        channel
+            .bot_router()
+            .register("@bot_weatherbot:localhost", &sub.id)
+            .await
+            .unwrap();
+
+        let profiles_dir = dir.path().join("profiles");
+        let original_mode = std::fs::metadata(&profiles_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let mut perms = std::fs::metadata(&profiles_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&profiles_dir, perms).unwrap();
+
+        let manager = GatewayBotManager {
+            store: store.clone(),
+            channel: channel.clone(),
+            parent_profile_id: parent.id.clone(),
+        };
+
+        let result = manager.delete_bot("@bot_weatherbot:localhost").await;
+
+        let mut restore = std::fs::metadata(&profiles_dir).unwrap().permissions();
+        restore.set_mode(original_mode);
+        std::fs::set_permissions(&profiles_dir, restore).unwrap();
+
+        assert!(
+            result.is_err(),
+            "delete should fail when profile cannot be removed"
+        );
+        assert_eq!(
+            channel
+                .bot_router()
+                .route("@bot_weatherbot:localhost")
+                .await,
+            Some(sub.id.clone()),
+            "route should remain registered when profile deletion fails"
+        );
+    }
 }
