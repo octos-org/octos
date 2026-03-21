@@ -265,16 +265,28 @@ fn handle_transcribe(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "Chinese".to_string());
 
-    // ominix-api accepts file paths (starting with '/') or base64 in the "file" field
-    let body = json!({
-        "file": input.audio_path,
-        "language": language,
-        "response_format": "verbose_json"
-    });
+    // Send file as multipart form data (compatible with all ominix-api versions)
+    let file_bytes = match std::fs::read(&input.audio_path) {
+        Ok(b) => b,
+        Err(e) => fail(&format!("failed to read audio file '{}': {e}", input.audio_path)),
+    };
+    let filename = std::path::Path::new(&input.audio_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "audio.wav".to_string());
+
+    let file_part = reqwest::blocking::multipart::Part::bytes(file_bytes)
+        .file_name(filename)
+        .mime_str("audio/wav")
+        .unwrap();
+    let form = reqwest::blocking::multipart::Form::new()
+        .part("file", file_part)
+        .text("language", language)
+        .text("response_format", "verbose_json");
 
     let resp = match client
         .post(format!("{base_url}/v1/audio/transcriptions"))
-        .json(&body)
+        .multipart(form)
         .send()
     {
         Ok(r) => r,
