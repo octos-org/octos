@@ -21,8 +21,8 @@ use octos_bus::{
 };
 use octos_core::{OutboundMessage, SessionKey};
 use octos_llm::{
-    AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, ProviderRouter, RetryProvider,
-    SwappableProvider,
+    AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
+    RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -286,6 +286,70 @@ impl GatewayCommand {
         // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
         let data_dir = super::resolve_data_dir(self.data_dir)?;
 
+        // Seed adaptive router with baseline benchmark data (if available)
+        if let Some(ref router) = adaptive_router_ref {
+            // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
+            let baseline_candidates = [
+                data_dir.join("provider_baseline.json"),
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".octos/provider_baseline.json"),
+            ];
+            let mut baseline_loaded = false;
+            for baseline_path in &baseline_candidates {
+                if let Ok(json) = std::fs::read_to_string(baseline_path) {
+                    match serde_json::from_str::<Vec<BaselineEntry>>(&json) {
+                        Ok(entries) => {
+                            router.seed_baseline(&entries);
+                            info!(
+                                path = %baseline_path.display(),
+                                entries = entries.len(),
+                                "loaded provider baseline"
+                            );
+                            baseline_loaded = true;
+                            break;
+                        }
+                        Err(e) => warn!(error = %e, path = %baseline_path.display(), "failed to parse provider_baseline.json"),
+                    }
+                }
+            }
+            if !baseline_loaded {
+                info!("no provider_baseline.json found, using cold-start scoring");
+            }
+
+            // Seed static catalog fields (type, cost, ds_output) from model_catalog.json
+            // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
+            let catalog_candidates = [
+                data_dir.join("model_catalog.json"),
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".octos/model_catalog.json"),
+            ];
+            for catalog_path in &catalog_candidates {
+                if let Ok(json) = std::fs::read_to_string(catalog_path) {
+                    if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
+                        router.seed_catalog(&catalog.models);
+                        // Seed the global runtime catalog for context.rs lookups
+                        let ctx_entries: Vec<(String, u64, u64)> = catalog.models.iter()
+                            .map(|m| (m.provider.clone(), m.context_window, m.max_output))
+                            .collect();
+                        octos_llm::context::seed_from_catalog(&ctx_entries);
+                        // Seed pricing catalog
+                        let price_entries: Vec<(String, f64, f64)> = catalog.models.iter()
+                            .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
+                            .collect();
+                        octos_llm::pricing::seed_pricing_catalog(&price_entries);
+                        info!(
+                            path = %catalog_path.display(),
+                            models = catalog.models.len(),
+                            "loaded model catalog"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         // Expose data_dir to skill binaries (e.g. mofa-fm voice storage)
         // SAFETY: called before spawning any threads; single-threaded at this point
         #[allow(unsafe_code)]
@@ -316,18 +380,16 @@ impl GatewayCommand {
             }
         }
 
-        // Spawn periodic metrics exporter (writes provider_metrics.json every 30s)
-        if llm.export_metrics().is_some() {
-            let metrics_llm = llm.clone();
-            let metrics_path = data_dir.join("provider_metrics.json");
+        // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
+        if let Some(ref router) = adaptive_router_ref {
+            let metrics_router = router.clone();
+            let catalog_path = data_dir.join("model_catalog.json");
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    if let Some(value) = metrics_llm.export_metrics() {
-                        if let Ok(json) = serde_json::to_string_pretty(&value) {
-                            let _ = tokio::fs::write(&metrics_path, json).await;
-                        }
+                    if let Ok(json) = serde_json::to_string_pretty(&metrics_router.export_model_catalog()) {
+                        let _ = tokio::fs::write(&catalog_path, &json).await;
                     }
                 }
             });
@@ -674,13 +736,10 @@ impl GatewayCommand {
                     // LLM sees the actual model (e.g. "kimi-k2.5") not the API
                     // provider type (e.g. "openai").
                     let primary_key = model_id.clone();
-                    let primary_desc = octos_llm::context::model_description(&primary_key)
-                        .map(|d| format!("Primary model. {d}"))
-                        .unwrap_or_else(|| "Primary model".into());
                     router.register_with_full_meta(
                         &primary_key,
                         llm.clone(),
-                        Some(primary_desc),
+                        Some("Primary model".into()),
                         None,
                         None,
                     );
@@ -690,12 +749,16 @@ impl GatewayCommand {
                     let mut key_counts: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
                     for fb in &config.fallback_models {
-                        let fb_config = if fb.api_key_env.is_some() {
+                        let fb_config = {
                             let mut c = config.clone();
-                            c.api_key_env = fb.api_key_env.clone();
+                            if fb.api_key_env.is_some() {
+                                c.api_key_env = fb.api_key_env.clone();
+                            } else if fb.provider != config.provider.as_deref().unwrap_or("") {
+                                // Different provider — clear primary's api_key_env so the
+                                // registry resolves the correct env var (e.g. OPENAI_API_KEY)
+                                c.api_key_env = None;
+                            }
                             c
-                        } else {
-                            config.clone()
                         };
                         match super::chat::create_provider_with_api_type(
                             &fb.provider,
@@ -716,11 +779,10 @@ impl GatewayCommand {
                                 };
                                 *count += 1;
 
-                                let fb_desc = octos_llm::context::model_description(&key);
                                 router.register_with_full_meta(
                                     &key,
                                     Arc::new(RetryProvider::new(p)),
-                                    fb_desc,
+                                    None,
                                     None,
                                     None,
                                 );
@@ -749,6 +811,26 @@ impl GatewayCommand {
                 octos_agent::DEFAULT_WORKER_PROMPT,
             ));
             provider_router_for_factory = provider_router.clone();
+
+            // Seed QoS scores on the router for fallback ranking
+            if let Some(ref router) = provider_router {
+                let catalog_path = data_dir.join("pipeline_models.json");
+                let system_catalog = dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".octos/model_catalog.json");
+                for path in &[catalog_path, system_catalog] {
+                    if let Ok(json) = std::fs::read_to_string(path) {
+                        if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
+                            let score_entries: Vec<(String, f64)> = catalog.models.iter()
+                                .map(|m| (m.provider.clone(), m.score))
+                                .collect();
+                            router.seed_qos_scores(&score_entries);
+                            info!(models = score_entries.len(), "seeded scores for fallback ranking");
+                            break;
+                        }
+                    }
+                }
+            }
 
             // Skill management tool (install/remove/search skills for this profile)
             tools.register(octos_agent::ManageSkillsTool::new(data_dir.join("skills")));
@@ -804,7 +886,7 @@ impl GatewayCommand {
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
                     memory: mem_c,
-                    cwd: cwd_c,
+                    cwd: data_c.clone(), // Pipeline writes to data_dir, not process cwd
                     data_dir: data_c,
                     policy: policy_c,
                     plugin_dirs: plugins_c,

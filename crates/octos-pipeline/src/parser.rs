@@ -39,8 +39,12 @@ impl<'a> DotParser<'a> {
             .wrap_err("expected 'digraph' keyword")?;
         self.skip_ws();
 
-        // Parse graph name
-        let id = self.parse_identifier().wrap_err("expected graph name")?;
+        // Parse optional graph name (LLMs sometimes write `digraph {` without a name)
+        let id = if self.peek() == Some('{') {
+            "pipeline".to_string()
+        } else {
+            self.parse_identifier().wrap_err("expected graph name or '{'")?
+        };
         self.skip_ws();
 
         // Parse opening brace
@@ -123,6 +127,16 @@ impl<'a> DotParser<'a> {
         // Check for edge: `->` means this is an edge
         if self.try_str("->") {
             let _ = self.parse_edge_chain(graph, first_id)?;
+        } else if self.peek() == Some('=') {
+            // Bare graph attribute: `rankdir=LR;` — skip it
+            self.advance(); // consume '='
+            self.skip_ws();
+            // Consume the value (identifier or quoted string)
+            if self.peek() == Some('"') {
+                let _ = self.parse_quoted_string()?;
+            } else {
+                let _ = self.parse_identifier().ok();
+            }
         } else {
             // Node declaration
             let attrs = if self.peek() == Some('[') {
@@ -420,8 +434,10 @@ impl<'a> DotParser<'a> {
                 }
             }
 
-            // Skip line comments
-            if self.input[self.pos..].starts_with("//") {
+            // Skip line comments (// and # — LLMs often use # for comments)
+            if self.input[self.pos..].starts_with("//")
+                || self.input[self.pos..].starts_with('#')
+            {
                 while let Some(c) = self.peek() {
                     self.advance();
                     if c == '\n' {

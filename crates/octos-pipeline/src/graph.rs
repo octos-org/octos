@@ -194,7 +194,7 @@ pub fn validate_pipeline_id(id: &str) -> eyre::Result<()> {
     if id.len() > 128 {
         eyre::bail!(
             "pipeline identifier too long (max 128 chars): {}",
-            &id[..32]
+            id.chars().take(32).collect::<String>()
         );
     }
     if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {

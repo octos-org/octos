@@ -60,6 +60,10 @@ impl Agent {
             || msg.contains("503")
             || msg.contains("1305")
             || msg.contains("rate limit")
+            || msg.contains("decoding response")
+            || msg.contains("stream error")
+            || msg.contains("connection reset")
+            || msg.contains("broken pipe")
     }
 }
 

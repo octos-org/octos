@@ -1166,16 +1166,12 @@ impl SessionActor {
 
     /// `/reset` — reset session state for test isolation.
     ///
-    /// Resets queue mode to default (collect), adaptive mode to off,
-    /// and clears conversation history for the current session.
+    /// Resets queue mode to default (collect) and clears conversation
+    /// history for the current session. Does NOT touch the adaptive
+    /// router — that's a gateway-level shared resource.
     async fn handle_reset_command(&mut self) {
         // Reset queue mode to default
         self.queue_mode = QueueMode::default();
-
-        // Reset adaptive routing to off
-        if let Some(ref router) = self.adaptive_router {
-            router.set_mode(AdaptiveMode::Off);
-        }
 
         // Clear conversation history
         {

@@ -602,7 +602,13 @@ fn page_slug(url: &Url, index: usize) -> String {
         path.replace('/', "_")
             .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_")
     };
-    let truncated = if slug.len() > 80 { &slug[..80] } else { &slug };
+    let truncated = if slug.len() > 80 {
+        let mut end = 80;
+        while !slug.is_char_boundary(end) && end > 0 { end -= 1; }
+        &slug[..end]
+    } else {
+        &slug
+    };
     format!("{:03}_{truncated}", index)
 }
 

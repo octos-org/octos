@@ -780,7 +780,11 @@ async fn tavily_search(
 
     if !status.is_success() {
         return SearchResult {
-            output: format!("Tavily HTTP {status}: {}", &text[..text.len().min(200)]),
+            output: format!("Tavily HTTP {status}: {}", {
+                let mut end = text.len().min(200);
+                while !text.is_char_boundary(end) && end > 0 { end -= 1; }
+                &text[..end]
+            }),
             success: false,
         };
     }

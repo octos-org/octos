@@ -127,6 +127,9 @@ impl LlmProvider for AnthropicProvider {
             .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+            ))
             .json(&request)
             .send()
             .await

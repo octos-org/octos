@@ -296,6 +296,9 @@ impl LlmProvider for OpenAIProvider {
                 format!("Bearer {}", self.api_key.expose_secret()),
             )
             .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+            ))
             .json(&request)
             .send()
             .await
