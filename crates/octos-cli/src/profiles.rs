@@ -268,6 +268,13 @@ pub enum ChannelCredentials {
         #[serde(default = "default_wecom_bot_secret_env")]
         secret_env: String,
     },
+    #[serde(rename = "qq-bot")]
+    QQBot {
+        #[serde(default)]
+        app_id: String,
+        #[serde(default = "default_qq_bot_secret_env")]
+        client_secret_env: String,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -317,6 +324,9 @@ fn default_api_port() -> u16 {
 }
 fn default_wecom_bot_secret_env() -> String {
     "WECOM_BOT_SECRET".into()
+}
+fn default_qq_bot_secret_env() -> String {
+    "QQ_BOT_CLIENT_SECRET".into()
 }
 
 /// Gateway-specific settings.
@@ -855,6 +865,13 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             "settings": {
                 "bot_id": bot_id,
                 "secret_env": secret_env,
+            }
+        }),
+        ChannelCredentials::QQBot { app_id, client_secret_env } => serde_json::json!({
+            "type": "qq-bot",
+            "settings": {
+                "app_id": app_id,
+                "client_secret_env": client_secret_env,
             }
         }),
     }
