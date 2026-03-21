@@ -93,10 +93,14 @@ pub struct ExecutorConfig {
 }
 
 /// A single planned sub-task from the LLM planner.
+///
+/// Accepts multiple field name variants because different LLMs use different
+/// names for the same concept (task/query/topic/angle/description).
 #[derive(Debug, Clone, Deserialize)]
 struct DynamicTask {
+    #[serde(alias = "query", alias = "topic", alias = "angle", alias = "description", alias = "search", alias = "instruction")]
     task: String,
-    #[serde(default)]
+    #[serde(default, alias = "name", alias = "title")]
     label: Option<String>,
 }
 
@@ -137,9 +141,28 @@ async fn plan_dynamic_tasks(
     user_input: &str,
     max_tasks: u32,
 ) -> Result<(Vec<DynamicTask>, TokenUsage)> {
-    let prompt = format!("{planning_prompt}\n\nUser query: {user_input}");
+    let prompt = format!(
+        "{planning_prompt}\n\nUser query: {user_input}\n\n\
+         IMPORTANT: Respond with ONLY a JSON array of tasks. No explanation, \
+         no markdown, no code fences. Example format:\n\
+         [{{\"task\": \"search for X\", \"label\": \"Label\"}}, \
+         {{\"task\": \"search for Y\", \"label\": \"Label\"}}]\n\
+         Generate up to {max_tasks} tasks."
+    );
 
-    let messages = vec![Message {
+    let messages = vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are a research planner. Output ONLY a JSON array. \
+                      No other text."
+                .to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        },
+        Message {
         role: MessageRole::User,
         content: prompt,
         media: vec![],
@@ -150,7 +173,7 @@ async fn plan_dynamic_tasks(
     }];
 
     let config = ChatConfig {
-        max_tokens: Some(2000),
+        max_tokens: Some(4096),
         ..Default::default()
     };
 
@@ -169,11 +192,48 @@ async fn plan_dynamic_tasks(
         &content
     };
 
-    let json_str = extract_json_array(text)
-        .ok_or_else(|| eyre::eyre!("no JSON array found in planning response"))?;
+    let json_str = extract_json_array(text).ok_or_else(|| {
+        let preview: String = text.chars().take(200).collect();
+        eyre::eyre!("no JSON array found in planning response: {preview}")
+    })?;
 
-    let tasks: Vec<DynamicTask> =
-        serde_json::from_str(json_str).wrap_err("failed to parse planning response as JSON")?;
+    // Try strict parsing first, then fall back to extracting any string values
+    let tasks: Vec<DynamicTask> = match serde_json::from_str(json_str) {
+        Ok(tasks) => tasks,
+        Err(strict_err) => {
+            // Fallback: parse as array of generic objects, extract task from
+            // the first string field (regardless of field name)
+            let preview: String = json_str.chars().take(200).collect();
+            tracing::warn!(
+                error = %strict_err,
+                json_preview = %preview,
+                "strict DynamicTask parse failed, trying flexible extraction"
+            );
+            let arr: Vec<serde_json::Map<String, serde_json::Value>> =
+                serde_json::from_str(json_str).map_err(|e| {
+                    eyre::eyre!("failed to parse planning JSON as array of objects: {e}\nJSON: {preview}")
+                })?;
+            arr.into_iter()
+                .filter_map(|obj| {
+                    // Find the first string field as "task", second as "label"
+                    let mut strings: Vec<String> = obj
+                        .values()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if strings.is_empty() {
+                        return None;
+                    }
+                    let task = strings.remove(0);
+                    let label = if strings.is_empty() {
+                        None
+                    } else {
+                        Some(strings.remove(0))
+                    };
+                    Some(DynamicTask { task, label })
+                })
+                .collect()
+        }
+    };
 
     let tasks: Vec<DynamicTask> = tasks.into_iter().take(max_tasks as usize).collect();
     Ok((tasks, usage))
@@ -296,7 +356,117 @@ fn process_worker_results(
     }
 
     let merged_content = merged_parts.join("\n\n---\n\n");
+
+    // Resolve file references: if workers saved results to disk and output
+    // directory paths, read the _search_results.md files and inline their
+    // content. This ensures the converge node gets actual data, not just paths.
+    let merged_content = resolve_search_result_files(&merged_content);
+
     (merged_content, any_error, summaries, total_tokens, outcomes)
+}
+
+/// Scan merged worker output for research directory paths and inline
+/// the `_search_results.md` file contents. Workers may output paths like
+/// "Results saved to: ./research/topic-slug/" — we find those directories
+/// and read their summary files so downstream nodes get actual content.
+fn resolve_search_result_files(content: &str) -> String {
+    use std::path::Path;
+
+    let mut result = content.to_string();
+    let mut appended = Vec::new();
+
+    // Find research directories referenced in the content
+    for line in content.lines() {
+        // Look for paths to research directories
+        let path_candidates: Vec<&str> = line
+            .split_whitespace()
+            .filter(|w| w.contains("/research/") || w.contains("_search_results"))
+            .collect();
+
+        for candidate in path_candidates {
+            let clean = candidate.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '_' && c != '-' && c != '.');
+            let path = Path::new(clean);
+
+            // Try reading _search_results.md from the directory
+            let search_results_path = if path.is_dir() {
+                path.join("_search_results.md")
+            } else if path.file_name().map(|f| f == "_search_results.md").unwrap_or(false) {
+                path.to_path_buf()
+            } else if path.is_dir() {
+                path.join("_search_results.md")
+            } else {
+                continue;
+            };
+
+            if search_results_path.exists() {
+                match std::fs::read_to_string(&search_results_path) {
+                    Ok(file_content) if !file_content.is_empty() => {
+                        let preview = if file_content.len() > 50000 {
+                            let mut end = 50000;
+                            while !file_content.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            format!("{}...(truncated)", &file_content[..end])
+                        } else {
+                            file_content
+                        };
+                        if !appended.iter().any(|p: &String| p == &search_results_path.to_string_lossy().to_string()) {
+                            appended.push(search_results_path.to_string_lossy().to_string());
+                            result.push_str(&format!(
+                                "\n\n--- Search results from {} ---\n{}",
+                                search_results_path.display(),
+                                preview
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Also scan the working directory for recent research directories
+    if appended.is_empty() {
+        // Fallback: if no paths found in content, look for research dirs in cwd
+        if let Ok(entries) = std::fs::read_dir("research") {
+            let mut dirs: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            // Sort by modified time, newest first
+            dirs.sort_by(|a, b| {
+                b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .cmp(&a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH))
+            });
+            // Read up to 8 most recent _search_results.md
+            for dir in dirs.iter().take(8) {
+                let sr = dir.path().join("_search_results.md");
+                if sr.exists() {
+                    if let Ok(file_content) = std::fs::read_to_string(&sr) {
+                        if !file_content.is_empty() && file_content.len() > 100 {
+                            let preview = if file_content.len() > 50000 {
+                                // Find a valid char boundary near 50000 bytes
+                                let mut end = 50000;
+                                while !file_content.is_char_boundary(end) && end > 0 {
+                                    end -= 1;
+                                }
+                                format!("{}...(truncated)", &file_content[..end])
+                            } else {
+                                file_content
+                            };
+                            result.push_str(&format!(
+                                "\n\n--- Search results from {} ---\n{}",
+                                sr.display(),
+                                preview
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// The main pipeline executor.
@@ -318,6 +488,33 @@ impl PipelineExecutor {
     ) -> Result<PipelineResult> {
         // Parse and validate
         let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+
+        // ── Pipeline start: log graph structure ──
+        let node_summary: Vec<String> = graph
+            .nodes
+            .values()
+            .map(|n| {
+                let model = n.model.as_deref().unwrap_or("default");
+                let tools = n.tools.join(",");
+                format!(
+                    "  {} [model={}, handler={:?}, tools={}]",
+                    n.id, model, n.handler, tools
+                )
+            })
+            .collect();
+        let edge_summary: Vec<String> = graph
+            .edges
+            .iter()
+            .map(|e| format!("  {} -> {}", e.source, e.target))
+            .collect();
+        info!(
+            nodes = graph.nodes.len(),
+            edges = graph.edges.len(),
+            "pipeline start\n{}\n{}",
+            node_summary.join("\n"),
+            edge_summary.join("\n")
+        );
+
         let diags = validate::validate(&graph);
 
         for diag in &diags {
@@ -347,9 +544,51 @@ impl PipelineExecutor {
         let start_node = validate::find_start_node(&graph)
             .ok_or_else(|| eyre::eyre!("no start node found in pipeline"))?;
 
+        info!(start_node = %start_node, "pipeline executing");
+
+        let pipeline_start = Instant::now();
+
         // Execute graph
-        self.execute_graph(&graph, &handlers, &start_node, user_input, variables)
-            .await
+        let result = self
+            .execute_graph(&graph, &handlers, &start_node, user_input, variables)
+            .await;
+
+        // ── Pipeline end: log summary ──
+        let total_ms = pipeline_start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(r) => {
+                let node_results: Vec<String> = r
+                    .node_summaries
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "  {} ({}): {} {}ms {}+{} tokens",
+                            n.node_id,
+                            n.model.as_deref().unwrap_or("default"),
+                            if n.success { "Pass" } else { "FAIL" },
+                            n.duration_ms,
+                            n.token_usage.input_tokens,
+                            n.token_usage.output_tokens,
+                        )
+                    })
+                    .collect();
+                info!(
+                    duration_ms = total_ms,
+                    nodes = r.node_summaries.len(),
+                    "pipeline complete\n{}",
+                    node_results.join("\n")
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    duration_ms = total_ms,
+                    error = %e,
+                    "pipeline failed"
+                );
+            }
+        }
+
+        result
     }
 
     fn build_handlers(&self) -> HandlerRegistry {
@@ -716,8 +955,26 @@ impl PipelineExecutor {
                     "You are a research specialist.\n\n{task}\n\nUse the available tools to find relevant information. Include ALL URLs and source references.",
                 );
 
-                // Resolve worker model
-                let worker_model = node.model.clone().or_else(|| graph.default_model.clone());
+                // Resolve worker model pool. If model contains commas,
+                // it's a pool of models for round-robin distribution across workers.
+                let model_str = node.model.as_deref()
+                    .or(graph.default_model.as_deref())
+                    .unwrap_or("");
+                let model_pool: Vec<&str> = if model_str.contains(',') {
+                    model_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+                } else {
+                    vec![model_str]
+                };
+                if model_pool.len() > 1 {
+                    info!(
+                        node = %node.id,
+                        pool_size = model_pool.len(),
+                        models = model_str,
+                        "worker model pool: distributing {} workers across {} models",
+                        tasks.len(),
+                        model_pool.len(),
+                    );
+                }
 
                 let mut synthetic_nodes: Vec<(String, PipelineNode)> = Vec::new();
                 for (i, task) in tasks.iter().enumerate() {
@@ -727,6 +984,9 @@ impl PipelineExecutor {
                         .label
                         .clone()
                         .unwrap_or_else(|| format!("Task {}", i + 1));
+
+                    // Round-robin model from pool
+                    let worker_model = Some(model_pool[i % model_pool.len()].to_string());
 
                     synthetic_nodes.push((
                         task_id.clone(),
@@ -929,17 +1189,7 @@ impl PipelineExecutor {
                 node_with_prompt.model = graph.default_model.clone();
             }
 
-            let ctx = HandlerContext {
-                input: input_text,
-                completed: completed.clone(),
-                working_dir: self.config.working_dir.clone(),
-            };
-
-            // Update status words for this sequential node
-            if let Some(ref bridge) = self.config.status_bridge {
-                let label = node.label.as_deref().unwrap_or(&node.id);
-                bridge.set_words(vec![label.to_string()]);
-            }
+            let input_bytes = input_text.len();
 
             let seq_label = node.label.as_deref().unwrap_or(&node.id);
             report_progress(&format!("{seq_label}: running..."));
@@ -948,8 +1198,21 @@ impl PipelineExecutor {
                 node = %node.id,
                 handler = ?node.handler,
                 model = ?node_with_prompt.model,
+                input_bytes,
+                tools = ?node.tools,
                 "executing pipeline node"
             );
+
+            // Update status words for this sequential node
+            if let Some(ref bridge) = self.config.status_bridge {
+                bridge.set_words(vec![seq_label.to_string()]);
+            }
+
+            let ctx = HandlerContext {
+                input: input_text,
+                completed: completed.clone(),
+                working_dir: self.config.working_dir.clone(),
+            };
 
             let node_start = Instant::now();
 
@@ -967,10 +1230,12 @@ impl PipelineExecutor {
 
             info!(
                 node = %node.id,
+                model = ?node_with_prompt.model,
                 status = ?outcome.status,
                 duration_ms,
                 tokens_in = outcome.token_usage.input_tokens,
                 tokens_out = outcome.token_usage.output_tokens,
+                output_chars = outcome.content.len(),
                 "node completed"
             );
 

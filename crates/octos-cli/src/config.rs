@@ -136,6 +136,9 @@ pub struct FallbackModel {
     /// API protocol type: "openai" or "anthropic". Overrides provider default.
     #[serde(default)]
     pub api_type: Option<String>,
+    /// Published output price in USD per million tokens (for cost-aware routing).
+    #[serde(default)]
+    pub cost_per_m: Option<f64>,
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.
@@ -336,6 +339,19 @@ pub struct AdaptiveRoutingConfig {
     /// Default: false.
     #[serde(default)]
     pub qos_ranking: bool,
+
+    /// Scoring weight for latency (0..1). Default: 0.3.
+    #[serde(default = "default_weight_latency")]
+    pub weight_latency: f64,
+    /// Scoring weight for error rate (0..1). Default: 0.3.
+    #[serde(default = "default_weight_error_rate")]
+    pub weight_error_rate: f64,
+    /// Scoring weight for config priority order (0..1). Default: 0.2.
+    #[serde(default = "default_weight_priority")]
+    pub weight_priority: f64,
+    /// Scoring weight for published token cost (0..1). Default: 0.2.
+    #[serde(default = "default_weight_cost")]
+    pub weight_cost: f64,
 }
 
 impl Default for AdaptiveRoutingConfig {
@@ -349,6 +365,10 @@ impl Default for AdaptiveRoutingConfig {
             failure_threshold: default_failure_threshold(),
             mode: AdaptiveRoutingMode::Off,
             qos_ranking: false,
+            weight_latency: default_weight_latency(),
+            weight_error_rate: default_weight_error_rate(),
+            weight_priority: default_weight_priority(),
+            weight_cost: default_weight_cost(),
         }
     }
 }
@@ -361,6 +381,10 @@ impl From<&AdaptiveRoutingConfig> for octos_llm::AdaptiveConfig {
             error_rate_threshold: c.error_rate_threshold,
             probe_probability: c.probe_probability,
             probe_interval_secs: c.probe_interval_secs,
+            weight_latency: c.weight_latency,
+            weight_error_rate: c.weight_error_rate,
+            weight_priority: c.weight_priority,
+            weight_cost: c.weight_cost,
             ..Default::default()
         }
     }
@@ -380,6 +404,18 @@ fn default_probe_interval_secs() -> u64 {
 }
 fn default_failure_threshold() -> u32 {
     3
+}
+fn default_weight_latency() -> f64 {
+    0.3
+}
+fn default_weight_error_rate() -> f64 {
+    0.3
+}
+fn default_weight_priority() -> f64 {
+    0.2
+}
+fn default_weight_cost() -> f64 {
+    0.2
 }
 
 /// Monitor configuration for watchdog auto-restart and alerts.

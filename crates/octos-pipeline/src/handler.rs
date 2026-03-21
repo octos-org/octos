@@ -100,9 +100,29 @@ impl CodergenHandler {
     }
 
     /// Resolve LLM provider for a node, following SpawnTool pattern.
+    ///
+    /// When a model is explicitly specified and a `ProviderRouter` is available,
+    /// the resolved provider is wrapped with capability-compatible fallbacks.
+    /// This ensures that if the primary model times out or errors, the pipeline
+    /// automatically falls back to another provider with sufficient max_output_tokens.
     fn resolve_provider(&self, model: Option<&str>) -> Result<Arc<dyn LlmProvider>> {
         match (model, &self.provider_router) {
-            (Some(model_key), Some(router)) => router.resolve(model_key),
+            (Some(model_key), Some(router)) => {
+                let primary = router.resolve(model_key)?;
+                let fallbacks = router.compatible_fallbacks(model_key);
+                if !fallbacks.is_empty() {
+                    info!(
+                        model = model_key,
+                        fallback_count = fallbacks.len(),
+                        "pipeline node provider resolved with fallbacks"
+                    );
+                }
+                Ok(octos_llm::FallbackProvider::wrap_with_router(
+                    primary,
+                    fallbacks,
+                    router.clone(),
+                ))
+            }
             (Some(model_key), None) => {
                 warn!(
                     model = model_key,
@@ -141,10 +161,29 @@ impl Handler for CodergenHandler {
             }
         }
 
-        let policy = octos_agent::ToolPolicy {
-            allow: node.tools.clone(),
-            deny: vec!["spawn".into(), "run_pipeline".into()],
-            ..Default::default()
+        // Filter out empty tool names (from tools="" in DOT)
+        let allowed: Vec<String> = node
+            .tools
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .cloned()
+            .collect();
+
+        // If tools="" was specified (explicit empty), remove ALL tools
+        // so the agent does text-only processing (no tool calls).
+        let has_tools_attr = !node.tools.is_empty();
+        let policy = if has_tools_attr && allowed.is_empty() {
+            // Explicit tools="" → deny everything
+            octos_agent::ToolPolicy {
+                deny: vec!["*".into()],
+                ..Default::default()
+            }
+        } else {
+            octos_agent::ToolPolicy {
+                allow: allowed,
+                deny: vec!["spawn".into(), "run_pipeline".into()],
+                ..Default::default()
+            }
         };
         tools.apply_policy(&policy);
         if let Some(ref pp) = self.provider_policy {
@@ -157,12 +196,18 @@ impl Handler for CodergenHandler {
             None => "Complete the task given to you.".to_string(),
         };
 
-        // Create and run the agent
+        // Create and run the agent.
+        // When max_output_tokens is not set in the DOT graph, use the
+        // provider's actual max output capability instead of the global
+        // default (4096) which truncates long-form synthesis.
+        let max_tokens = node
+            .max_output_tokens
+            .or_else(|| Some(provider.max_output_tokens()));
         let config = octos_agent::AgentConfig {
             max_iterations: 30,
             max_timeout: node.timeout_secs.map(Duration::from_secs),
             save_episodes: false,
-            chat_max_tokens: node.max_output_tokens,
+            chat_max_tokens: max_tokens,
             ..Default::default()
         };
 

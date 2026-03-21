@@ -1,0 +1,2 @@
+Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), prompt, tools, timeout_secs, goal_gate, label.
+For dynamic_parallel: converge, worker_prompt, max_tasks.

@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Octos Cloud - Your Own AI Agent, Running at Home</title>
+    <meta name="description" content="Self-host a powerful AI coding agent on your Mac Mini. Private, always-on, accessible from anywhere via secure tunnel.">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F419;</text></svg>">
+    <style>
+        /* --- Theme variables --- */
+        :root {
+            --bg: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a26;
+            --bg-section: rgba(99,102,241,0.03);
+            --border: #1e1e2e;
+            --text: #e4e4ef;
+            --text-dim: #8888a0;
+            --nav-bg: rgba(10,10,15,0.85);
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --accent-glow: rgba(99,102,241,0.15);
+            --green: #34d399;
+            --orange: #fb923c;
+            --pink: #f472b6;
+            --code-comment: #555570;
+            --input-bg: #1a1a26;
+        }
+        [data-theme="light"] {
+            --bg: #f8f9fc;
+            --bg-card: #ffffff;
+            --bg-card-hover: #f0f1f5;
+            --bg-section: rgba(99,102,241,0.04);
+            --border: #e2e4ea;
+            --text: #1a1a2e;
+            --text-dim: #6b6b80;
+            --nav-bg: rgba(248,249,252,0.9);
+            --accent: #4f46e5;
+            --accent-light: #6366f1;
+            --accent-glow: rgba(79,70,229,0.1);
+            --green: #059669;
+            --orange: #ea580c;
+            --pink: #db2777;
+            --code-comment: #9ca3af;
+            --input-bg: #f0f1f5;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        /* --- Nav --- */
+        nav {
+            position: fixed; top: 0; width: 100%; z-index: 100;
+            background: var(--nav-bg);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+            transition: background 0.3s;
+        }
+        .nav-inner {
+            max-width: 1100px; margin: 0 auto; padding: 0 24px;
+            height: 64px; display: flex; align-items: center; justify-content: space-between;
+        }
+        .logo {
+            display: flex; align-items: center; gap: 10px;
+            font-size: 20px; font-weight: 700; text-decoration: none; color: var(--text);
+        }
+        .logo-icon { font-size: 28px; }
+        .nav-links { display: flex; gap: 24px; align-items: center; }
+        .nav-links a {
+            color: var(--text-dim); text-decoration: none; font-size: 14px;
+            font-weight: 500; transition: color 0.2s;
+        }
+        .nav-links a:hover { color: var(--text); }
+        .nav-toggle {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 16px;
+            color: var(--text); transition: all 0.2s;
+        }
+        .nav-toggle:hover { border-color: var(--accent); }
+        .btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 20px; border-radius: 8px; font-size: 14px;
+            font-weight: 600; text-decoration: none; transition: all 0.2s;
+            cursor: pointer; border: none;
+        }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-primary:hover { background: var(--accent-light); box-shadow: 0 0 24px var(--accent-glow); }
+        .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+        .btn-ghost:hover { border-color: var(--accent); background: var(--accent-glow); }
+
+        /* --- Hero --- */
+        .hero { padding: 160px 24px 100px; text-align: center; position: relative; }
+        .hero::before {
+            content: ''; position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+            width: 600px; height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+        .hero-badge {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 6px 16px; border-radius: 100px;
+            border: 1px solid var(--border); background: var(--bg-card);
+            font-size: 13px; color: var(--text-dim); margin-bottom: 32px;
+        }
+        .hero-badge .dot {
+            width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        h1 {
+            font-size: clamp(36px,6vw,64px); font-weight: 800;
+            line-height: 1.1; letter-spacing: -0.03em; margin-bottom: 24px; position: relative;
+        }
+        h1 .gradient {
+            background: linear-gradient(135deg, var(--accent-light), var(--pink));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        }
+        .hero-sub {
+            font-size: 18px; color: var(--text-dim); max-width: 560px;
+            margin: 0 auto 40px; line-height: 1.7;
+        }
+        .hero-actions { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+
+        /* --- Sections --- */
+        section { padding: 80px 24px; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .section-label {
+            font-size: 13px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 0.08em; color: var(--accent-light); margin-bottom: 12px;
+        }
+        h2 { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 16px; }
+        .section-desc { color: var(--text-dim); font-size: 16px; max-width: 520px; margin-bottom: 48px; }
+        .features-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;
+        }
+        .feature-card {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 28px; transition: all 0.25s;
+        }
+        .feature-card:hover {
+            background: var(--bg-card-hover); border-color: rgba(99,102,241,0.3);
+            transform: translateY(-2px);
+        }
+        .feature-icon { font-size: 28px; margin-bottom: 16px; }
+        .feature-card h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+        .feature-card p { font-size: 14px; color: var(--text-dim); line-height: 1.6; }
+
+        /* --- Steps --- */
+        .steps {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px; counter-reset: step;
+        }
+        .step {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 28px 24px; counter-increment: step;
+        }
+        .step::before {
+            content: counter(step);
+            display: flex; align-items: center; justify-content: center;
+            width: 36px; height: 36px; border-radius: 10px;
+            background: var(--accent-glow); border: 1px solid rgba(99,102,241,0.3);
+            color: var(--accent-light); font-size: 15px; font-weight: 700; margin-bottom: 16px;
+        }
+        .step h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+        .step p { font-size: 14px; color: var(--text-dim); line-height: 1.6; }
+
+        /* --- Registration form --- */
+        .register-box {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 16px; padding: 40px; margin-top: 48px; max-width: 480px;
+        }
+        .register-box.center { margin-left: auto; margin-right: auto; }
+        .register-box h3 { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+        .register-box .subtitle { color: var(--text-dim); font-size: 14px; margin-bottom: 24px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; font-size: 13px; font-weight: 600;
+            margin-bottom: 6px; color: var(--text-dim);
+        }
+        .form-row { display: flex; gap: 8px; }
+        .form-input {
+            width: 100%; padding: 10px 14px; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--input-bg);
+            color: var(--text); font-size: 14px; outline: none; transition: border 0.2s;
+        }
+        .form-input:focus { border-color: var(--accent); }
+        .form-input::placeholder { color: var(--text-dim); opacity: 0.6; }
+        .btn-send-code {
+            white-space: nowrap; padding: 10px 16px; border-radius: 8px;
+            background: var(--bg-card-hover); border: 1px solid var(--border);
+            color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-send-code:hover { border-color: var(--accent); color: var(--accent-light); }
+        .btn-send-code:disabled { opacity: 0.5; cursor: not-allowed; }
+        .form-hint { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+        .form-submit { width: 100%; margin-top: 8px; padding: 12px; font-size: 15px; }
+        .register-result {
+            display: none; margin-top: 20px; padding: 16px;
+            border-radius: 10px; background: rgba(52,211,153,0.08);
+            border: 1px solid rgba(52,211,153,0.2);
+        }
+        .register-result .token { font-family: monospace; font-weight: 700; color: var(--green); word-break: break-all; }
+
+        /* --- Arch diagram --- */
+        .arch-diagram {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 40px; margin-top: 40px; text-align: center;
+        }
+        .arch-diagram pre {
+            font-family: 'SF Mono','Fira Code',monospace; font-size: 13px;
+            line-height: 1.7; color: var(--text-dim); display: inline-block; text-align: left;
+        }
+        .arch-diagram .hl { color: var(--accent-light); }
+        .arch-diagram .gr { color: var(--green); }
+        .arch-diagram .or { color: var(--orange); }
+
+        /* --- Channels --- */
+        .channels-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 24px; }
+        .channel-badge {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 8px 16px; border-radius: 8px;
+            background: var(--bg-card); border: 1px solid var(--border);
+            font-size: 14px; color: var(--text);
+        }
+
+        /* --- Code block --- */
+        .code-block {
+            background: var(--bg-card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 24px; margin-top: 40px; overflow-x: auto;
+        }
+        .code-block pre {
+            font-family: 'SF Mono','Fira Code','Cascadia Code',monospace;
+            font-size: 13px; line-height: 1.8; color: var(--text-dim);
+        }
+        .code-block .comment { color: var(--code-comment); }
+        .code-block .cmd { color: var(--green); }
+        .code-block .flag { color: var(--orange); }
+        .code-block .output { color: var(--accent-light); }
+
+        /* --- CTA --- */
+        .cta { text-align: center; padding: 100px 24px; }
+        .cta h2 { font-size: 36px; margin-bottom: 16px; }
+        .cta p { color: var(--text-dim); font-size: 16px; margin-bottom: 32px; }
+
+        /* --- Footer --- */
+        footer {
+            border-top: 1px solid var(--border); padding: 32px 24px;
+            text-align: center; color: var(--text-dim); font-size: 13px;
+        }
+        footer a { color: var(--accent-light); text-decoration: none; }
+
+        /* --- i18n: hide inactive lang --- */
+        [data-lang="zh"] { display: none; }
+        [data-active-lang="zh"] [data-lang="zh"] { display: initial; }
+        [data-active-lang="zh"] [data-lang="en"] { display: none; }
+        /* block-level lang switch */
+        div[data-lang="zh"], p[data-lang="zh"], span[data-lang="zh"],
+        h1[data-lang="zh"], h2[data-lang="zh"], h3[data-lang="zh"] { display: none; }
+        [data-active-lang="zh"] div[data-lang="zh"],
+        [data-active-lang="zh"] p[data-lang="zh"],
+        [data-active-lang="zh"] span[data-lang="zh"],
+        [data-active-lang="zh"] h1[data-lang="zh"],
+        [data-active-lang="zh"] h2[data-lang="zh"],
+        [data-active-lang="zh"] h3[data-lang="zh"] { display: block; }
+        [data-active-lang="zh"] div[data-lang="en"],
+        [data-active-lang="zh"] p[data-lang="en"],
+        [data-active-lang="zh"] span[data-lang="en"],
+        [data-active-lang="zh"] h1[data-lang="en"],
+        [data-active-lang="zh"] h2[data-lang="en"],
+        [data-active-lang="zh"] h3[data-lang="en"] { display: none; }
+        /* inline spans inside shared parents */
+        [data-active-lang="zh"] span[data-lang="zh"] { display: inline; }
+        [data-active-lang="zh"] span[data-lang="en"] { display: none; }
+
+        /* --- Responsive --- */
+        @media (max-width: 640px) {
+            .nav-links { gap: 12px; }
+            .nav-links a.hide-mobile { display: none; }
+            .hero { padding: 120px 16px 60px; }
+            .features-grid, .steps { grid-template-columns: 1fr; }
+            .register-box { padding: 24px; }
+        }
+    </style>
+</head>
+<body data-active-lang="en">
+
+<!-- Nav -->
+<nav>
+    <div class="nav-inner">
+        <a href="/" class="logo">
+            <span class="logo-icon">&#x1F419;</span>
+            <span>Octos Cloud</span>
+        </a>
+        <div class="nav-links">
+            <a href="#features" class="hide-mobile">
+                <span data-lang="en">Features</span><span data-lang="zh">功能</span>
+            </a>
+            <a href="#get-started">
+                <span data-lang="en">Get Started</span><span data-lang="zh">开始使用</span>
+            </a>
+            <a href="#architecture" class="hide-mobile">
+                <span data-lang="en">Architecture</span><span data-lang="zh">架构</span>
+            </a>
+            <button class="nav-toggle" onclick="toggleLang()" id="langBtn" title="Switch language">EN/中</button>
+            <button class="nav-toggle" onclick="toggleTheme()" id="themeBtn" title="Toggle theme">&#x2600;&#xFE0F;</button>
+        </div>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+    <div class="hero-badge">
+        <span class="dot"></span>
+        <span data-lang="en">Open source &middot; Self-hosted &middot; Private</span>
+        <span data-lang="zh">开源 &middot; 自托管 &middot; 隐私优先</span>
+    </div>
+    <h1 data-lang="en">Adopt a Little Octopus,<br><span class="gradient">Safe, Smart &amp; Yours Alone</span></h1>
+    <h1 data-lang="zh">送你一只小章鱼<br><span class="gradient">安全、智慧、只属于你</span></h1>
+    <p class="hero-sub" data-lang="en">
+        Octos is a Rust-native AI agent that lives on your Mac Mini.
+        Private, always-on, accessible from anywhere through Telegram, Feishu,
+        WhatsApp, or the web&mdash;no cloud subscription required.
+    </p>
+    <p class="hero-sub" data-lang="zh">
+        Octos 是一个 Rust 原生 AI 智能体，住在你自己的 Mac Mini 里。
+        数据私有、全天候在线，通过 Telegram、飞书、WhatsApp 或网页随时随地访问，无需云端订阅。
+    </p>
+    <div class="hero-actions">
+        <a href="#get-started" class="btn btn-primary">
+            <span data-lang="en">Get Started Free</span>
+            <span data-lang="zh">免费注册</span>
+        </a>
+        <a href="https://github.com/octos-org/octos" class="btn btn-ghost" target="_blank">GitHub</a>
+    </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+    <div class="container">
+        <div class="section-label">
+            <span data-lang="en">Features</span><span data-lang="zh">核心功能</span>
+        </div>
+        <h2 data-lang="en">Everything you need in an AI agent</h2>
+        <h2 data-lang="zh">AI 智能体所需的一切</h2>
+        <p class="section-desc" data-lang="en">
+            A complete agent framework with tool use, memory, multi-provider failover,
+            and messaging channels&mdash;all in a single binary.
+        </p>
+        <p class="section-desc" data-lang="zh">
+            完整的智能体框架：工具调用、持久记忆、多模型自动切换、多渠道消息接入，全部集成在一个二进制文件中。
+        </p>
+
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F9E0;</div>
+                <h3 data-lang="en">Multi-Provider LLM</h3>
+                <h3 data-lang="zh">多模型供应商</h3>
+                <p data-lang="en">12+ LLM providers with automatic failover. OpenAI, Anthropic, Gemini, Moonshot, DeepSeek, and more.</p>
+                <p data-lang="zh">支持 12+ 大模型供应商，自动故障切换。OpenAI、Anthropic、Gemini、月之暗面、DeepSeek 等。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F6E0;&#xFE0F;</div>
+                <h3 data-lang="en">Tool System</h3>
+                <h3 data-lang="zh">工具系统</h3>
+                <p data-lang="en">Shell, file I/O, web search, browser automation. Sandboxed execution with configurable policies. Extend with MCP servers.</p>
+                <p data-lang="zh">Shell 命令、文件读写、网页搜索、浏览器自动化。沙箱隔离执行，可配置策略，支持 MCP 扩展。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4AC;</div>
+                <h3 data-lang="en">Messaging Channels</h3>
+                <h3 data-lang="zh">消息渠道</h3>
+                <p data-lang="en">Telegram, Feishu, WhatsApp, SMS, Discord, Slack, WeChat, email, web chat. All channels, one agent.</p>
+                <p data-lang="zh">Telegram、飞书、WhatsApp、短信、Discord、Slack、企业微信、邮件、网页聊天。一个智能体，全渠道接入。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4BE;</div>
+                <h3 data-lang="en">Persistent Memory</h3>
+                <h3 data-lang="zh">持久化记忆</h3>
+                <p data-lang="en">Hybrid BM25 + vector search over history. Episode store for task summaries. Your agent remembers.</p>
+                <p data-lang="zh">BM25 + 向量混合搜索，任务摘要存储。跨会话记忆，智能体越用越懂你。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F310;</div>
+                <h3 data-lang="en">Admin Dashboard</h3>
+                <h3 data-lang="zh">管理面板</h3>
+                <p data-lang="en">Web control panel for profiles, channels, API keys, and gateways. Monitor, logs, restart.</p>
+                <p data-lang="zh">Web 管理面板，管理配置文件、渠道、API 密钥和网关进程。实时监控、日志查看、一键重启。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F512;</div>
+                <h3 data-lang="en">Private & Secure</h3>
+                <h3 data-lang="zh">私密安全</h3>
+                <p data-lang="en">Runs on your hardware. Data never leaves your machine. Sandboxed execution, SSRF protection.</p>
+                <p data-lang="zh">运行在你自己的硬件上，数据永不离开你的设备。沙箱执行、SSRF 防护，安全可控。</p>
+            </div>
+        </div>
+
+        <div class="channels-row" style="margin-top: 40px;">
+            <span class="channel-badge">Telegram</span>
+            <span class="channel-badge"><span data-lang="en">Feishu/Lark</span><span data-lang="zh">飞书</span></span>
+            <span class="channel-badge">WhatsApp</span>
+            <span class="channel-badge"><span data-lang="en">SMS</span><span data-lang="zh">短信</span></span>
+            <span class="channel-badge"><span data-lang="en">Email</span><span data-lang="zh">邮件</span></span>
+            <span class="channel-badge"><span data-lang="en">Web Chat</span><span data-lang="zh">网页聊天</span></span>
+            <span class="channel-badge">Discord</span>
+            <span class="channel-badge"><span data-lang="en">WeChat Work</span><span data-lang="zh">企业微信</span></span>
+        </div>
+    </div>
+</section>
+
+<!-- Get Started -->
+<section id="get-started" style="background: var(--bg-section);">
+    <div class="container">
+        <div class="section-label">
+            <span data-lang="en">Cloud Onboarding</span><span data-lang="zh">云端入驻</span>
+        </div>
+        <h2 data-lang="en">Up and running in 4 steps</h2>
+        <h2 data-lang="zh">四步开始使用</h2>
+        <p class="section-desc" data-lang="en">
+            Register an account, name your node, bootstrap your Mac Mini,
+            and your private AI dashboard is live.
+        </p>
+        <p class="section-desc" data-lang="zh">
+            注册账号、命名节点、配置 Mac Mini，你的私有 AI 面板即刻上线。
+        </p>
+
+        <div class="steps">
+            <div class="step">
+                <h3 data-lang="en">Register Account</h3>
+                <h3 data-lang="zh">注册账号</h3>
+                <p data-lang="en">Sign up with your email. We send a one-time code to verify&mdash;no password needed.</p>
+                <p data-lang="zh">使用邮箱注册，我们发送一次性验证码确认身份，无需设置密码。</p>
+            </div>
+            <div class="step">
+                <h3 data-lang="en">Name Your Node</h3>
+                <h3 data-lang="zh">命名节点</h3>
+                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token and tunnel credentials.</p>
+                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统自动生成认证令牌和隧道凭证。</p>
+            </div>
+            <div class="step">
+                <h3 data-lang="en">Setup Mac Mini</h3>
+                <h3 data-lang="zh">配置 Mac Mini</h3>
+                <p data-lang="en">Run the one-line setup command on your Mac Mini. It installs octos, configures the tunnel, and starts all services.</p>
+                <p data-lang="zh">在你的 Mac Mini 上运行一行安装命令，自动安装 octos、配置隧道并启动所有服务。</p>
+            </div>
+            <div class="step">
+                <h3 data-lang="en">Go Live</h3>
+                <h3 data-lang="zh">上线运行</h3>
+                <p data-lang="en">Your dashboard is live at your subdomain. Add API keys, connect channels, start chatting with your AI agent.</p>
+                <p data-lang="zh">面板即刻上线。添加 API 密钥、接入消息渠道，开始与你的 AI 智能体对话。</p>
+            </div>
+        </div>
+
+        <!-- Registration Form -->
+        <div class="register-box center" id="registerBox">
+            <h3 data-lang="en">Create Your Octos Cloud Account</h3>
+            <h3 data-lang="zh">创建 Octos Cloud 账号</h3>
+            <p class="subtitle" data-lang="en">Free registration. One email, one node, your own AI.</p>
+            <p class="subtitle" data-lang="zh">免费注册。一个邮箱，一个节点，你自己的 AI。</p>
+
+            <form id="registerForm" onsubmit="return handleRegister(event)">
+                <!-- Step 1: Email -->
+                <div id="formStep1">
+                    <div class="form-group">
+                        <label>
+                            <span data-lang="en">Email Address</span>
+                            <span data-lang="zh">邮箱地址</span>
+                        </label>
+                        <div class="form-row">
+                            <input type="email" class="form-input" id="regEmail" placeholder="you@example.com" required>
+                            <button type="button" class="btn-send-code" id="sendCodeBtn" onclick="sendCode()">
+                                <span data-lang="en">Send Code</span>
+                                <span data-lang="zh">发送验证码</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <span data-lang="en">Verification Code</span>
+                            <span data-lang="zh">验证码</span>
+                        </label>
+                        <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
+                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email.</p>
+                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。</p>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <span data-lang="en">Node Name</span>
+                            <span data-lang="zh">节点名称</span>
+                        </label>
+                        <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
+                        <p class="form-hint">
+                            <span data-lang="en">Lowercase letters, numbers, hyphens. This becomes <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="zh">小写字母、数字、连字符。将成为 <b>{name}.octos-cloud.org</b></span>
+                        </p>
+                    </div>
+                    <button type="submit" class="btn btn-primary form-submit">
+                        <span data-lang="en">Register &amp; Get Token</span>
+                        <span data-lang="zh">注册并获取令牌</span>
+                    </button>
+                </div>
+            </form>
+
+            <!-- Result -->
+            <div class="register-result" id="registerResult">
+                <p style="margin-bottom: 12px;">
+                    <span data-lang="en">Your Octos Cloud account is ready!</span>
+                    <span data-lang="zh">你的 Octos Cloud 账号已创建！</span>
+                </p>
+                <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
+                    <span data-lang="en">Dashboard URL</span><span data-lang="zh">面板地址</span>
+                </p>
+                <p style="margin-bottom: 12px;"><b id="resultUrl"></b></p>
+                <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
+                    <span data-lang="en">Auth Token (save this!)</span><span data-lang="zh">认证令牌（请妥善保存！）</span>
+                </p>
+                <p class="token" id="resultToken"></p>
+                <p style="margin-top: 16px; font-size: 13px; color: var(--text-dim);">
+                    <span data-lang="en">Run this on your Mac Mini to set up:</span>
+                    <span data-lang="zh">在你的 Mac Mini 上运行以下命令完成配置：</span>
+                </p>
+                <div style="background: var(--bg); border-radius: 8px; padding: 12px; margin-top: 8px; overflow-x: auto;">
+                    <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
+                </div>
+            </div>
+        </div>
+        <!-- Installation code block -->
+        <div class="code-block">
+            <pre><span class="comment" data-lang="en"># After registration, you'll get a setup command. Run it on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，你会获得一条安装命令。在你的 Mac Mini 上运行：</span>
+
+<span class="cmd">curl -fsSL</span> https://octos-cloud.org/api/admin/tenants/alice/setup-script <span class="cmd">| bash</span>
+
+<span class="output">  ==> Setting up octos tunnel for alice.octos-cloud.org
+  ==> Installing frpc...         frpc installed
+  ==> Writing frpc config...     /etc/frp/frpc.toml
+  ==> Starting services...       launchd service loaded (io.octos.frpc)
+  ==> Done!</span>
+
+<span class="comment" data-lang="en"># Or use the full bootstrap script (installs octos + frpc + dashboard):</span><span class="comment" data-lang="zh"># 或使用完整安装脚本（安装 octos + frpc + 管理面板）：</span>
+
+<span class="cmd">./scripts/frp/bootstrap-tenant.sh</span> alice cloud@10.0.1.50 <span class="flag">--password</span> ****
+
+<span class="output">  ==> Building octos (release, all features)...
+  ==> Uploading binaries...      10 binaries uploaded
+  ==> Installing frpc...         frpc v0.61.1
+  ==> Writing frpc config...     tunnel configured
+  ==> Starting services...       launchd services started
+  ==> Verifying...
+      octos serve: RUNNING on port 8080
+      frpc:        RUNNING
+      tunnel:      CONNECTED</span>
+
+<span class="comment" data-lang="en"># Your dashboard is live!</span><span class="comment" data-lang="zh"># 你的面板已上线！</span>
+<span class="cmd">open</span> https://alice.octos-cloud.org</pre>
+        </div>
+    </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture">
+    <div class="container">
+        <div class="section-label">
+            <span data-lang="en">Architecture</span><span data-lang="zh">架构</span>
+        </div>
+        <h2 data-lang="en">How it connects</h2>
+        <h2 data-lang="zh">连接方式</h2>
+        <p class="section-desc" data-lang="en">
+            Your Mac Mini connects outbound to our relay. No port forwarding or public IP needed.
+        </p>
+        <p class="section-desc" data-lang="zh">
+            你的 Mac Mini 主动向中继服务器建立出站连接，无需端口转发或公网 IP。
+        </p>
+
+        <div class="arch-diagram">
+            <pre>
+  <span class="gr">Internet</span>
+     |
+     v
+  <span class="hl">Caddy</span>  (octos-cloud.org, SSL)
+     |
+     v
+  <span class="hl">frps</span>   (<span data-lang="en">tunnel relay</span><span data-lang="zh">隧道中继</span>)
+     |         |         |
+     v         v         v
+  <span class="or">alice</span>     <span class="or">bob</span>       <span class="or">carol</span>
+     |         |         |
+     v         v         v
+  <span class="gr">Mini:8080</span> <span class="gr">Mini:8080</span> <span class="gr">Mini:8080</span>
+     |         |         |
+     v         v         v
+  Telegram  <span data-lang="en">Feishu</span><span data-lang="zh">飞书</span>   WhatsApp</pre>
+        </div>
+
+        <div class="features-grid" style="margin-top: 40px;">
+            <div class="feature-card">
+                <div class="feature-icon">&#x26A1;</div>
+                <h3 data-lang="en">Rust-Native Performance</h3>
+                <h3 data-lang="zh">Rust 原生性能</h3>
+                <p data-lang="en">Single ~30MB binary. Starts in milliseconds. Hundreds of concurrent sessions, minimal memory.</p>
+                <p data-lang="zh">单个 ~30MB 二进制文件，毫秒级启动，支持数百并发会话，内存占用极低。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F504;</div>
+                <h3 data-lang="en">Auto-Failover</h3>
+                <h3 data-lang="zh">自动故障切换</h3>
+                <p data-lang="en">Primary + fallback providers. 401/403 failover, 429/5xx retry then failover. Always online.</p>
+                <p data-lang="zh">主备模型供应商配置。401/403 自动切换，429/5xx 先重试再切换。确保永远在线。</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F4CB;</div>
+                <h3 data-lang="en">Multi-Profile</h3>
+                <h3 data-lang="zh">多配置文件</h3>
+                <p data-lang="en">Multiple agent profiles per machine, each with own provider, channels, and data. Fully isolated.</p>
+                <p data-lang="zh">一台设备运行多个智能体配置，各自独立的模型、渠道和数据目录，完全隔离。</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="cta">
+    <h2 data-lang="en">Ready to adopt your own Octos?</h2>
+    <h2 data-lang="zh">准备好拥有你自己的 Octos 了吗？</h2>
+    <p data-lang="en">Private AI agent on your Mac Mini, accessible from anywhere.</p>
+    <p data-lang="zh">运行在你 Mac Mini 上的私有 AI 智能体，随时随地可达。</p>
+    <div class="hero-actions">
+        <a href="#get-started" class="btn btn-primary">
+            <span data-lang="en">Register Now</span><span data-lang="zh">立即注册</span>
+        </a>
+        <a href="https://github.com/octos-org/octos" class="btn btn-ghost" target="_blank">GitHub</a>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer>
+    <p>&copy; 2026 Octos Cloud &middot; Built with Rust &middot; <a href="https://github.com/octos-org/octos">Open Source</a></p>
+</footer>
+
+<script>
+// --- Theme toggle ---
+function toggleTheme() {
+    const html = document.documentElement;
+    const current = html.getAttribute('data-theme');
+    const next = current === 'light' ? 'dark' : 'light';
+    html.setAttribute('data-theme', next === 'dark' ? '' : 'light');
+    if (next === 'dark') html.removeAttribute('data-theme');
+    document.getElementById('themeBtn').textContent = next === 'light' ? '\u{1F319}' : '\u{2600}\u{FE0F}';
+    localStorage.setItem('theme', next);
+}
+// Restore saved theme
+(function() {
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+        document.getElementById('themeBtn').textContent = '\u{1F319}';
+    }
+})();
+
+// --- Language toggle ---
+function toggleLang() {
+    const body = document.body;
+    const current = body.getAttribute('data-active-lang');
+    const next = current === 'en' ? 'zh' : 'en';
+    body.setAttribute('data-active-lang', next);
+    document.documentElement.lang = next;
+    localStorage.setItem('lang', next);
+}
+(function() {
+    const saved = localStorage.getItem('lang');
+    if (saved === 'zh') {
+        document.body.setAttribute('data-active-lang', 'zh');
+        document.documentElement.lang = 'zh';
+    }
+})();
+
+// --- Send verification code ---
+let codeTimer = null;
+async function sendCode() {
+    const email = document.getElementById('regEmail').value.trim();
+    if (!email || !email.includes('@')) {
+        alert(document.body.getAttribute('data-active-lang') === 'zh'
+            ? '请输入有效的邮箱地址' : 'Please enter a valid email address');
+        return;
+    }
+    const btn = document.getElementById('sendCodeBtn');
+    btn.disabled = true;
+    let sec = 60;
+    btn.textContent = sec + 's';
+    codeTimer = setInterval(() => {
+        sec--;
+        btn.textContent = sec + 's';
+        if (sec <= 0) {
+            clearInterval(codeTimer);
+            btn.disabled = false;
+            btn.innerHTML = document.body.getAttribute('data-active-lang') === 'zh'
+                ? '发送验证码' : 'Send Code';
+        }
+    }, 1000);
+
+    try {
+        const res = await fetch('/api/auth/send-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+        });
+        if (!res.ok) {
+            const msg = await res.text();
+            alert('Error: ' + msg);
+        }
+    } catch (e) {
+        // API may not be wired yet — silently continue for demo
+        console.log('send-code:', e.message);
+    }
+}
+
+// --- Register ---
+async function handleRegister(e) {
+    e.preventDefault();
+    const email = document.getElementById('regEmail').value.trim();
+    const code = document.getElementById('regCode').value.trim();
+    const node = document.getElementById('regNode').value.trim().toLowerCase();
+
+    if (!email || !code || !node) return false;
+
+    try {
+        // Step 1: Verify OTP
+        const verifyRes = await fetch('/api/auth/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, code })
+        });
+
+        if (!verifyRes.ok) {
+            const msg = await verifyRes.text();
+            alert(document.body.getAttribute('data-active-lang') === 'zh'
+                ? '验证失败: ' + msg : 'Verification failed: ' + msg);
+            return false;
+        }
+
+        const session = await verifyRes.json();
+        const token = session.token || session.session_token || '';
+
+        // Step 2: Create tenant
+        const tenantRes = await fetch('/api/admin/tenants', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify({ name: node })
+        });
+
+        if (!tenantRes.ok) {
+            const msg = await tenantRes.text();
+            alert(document.body.getAttribute('data-active-lang') === 'zh'
+                ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
+            return false;
+        }
+
+        const tenant = await tenantRes.json();
+
+        // Show result
+        document.getElementById('formStep1').style.display = 'none';
+        const result = document.getElementById('registerResult');
+        result.style.display = 'block';
+        document.getElementById('resultUrl').textContent = 'https://' + tenant.subdomain + '.octos-cloud.org';
+        document.getElementById('resultToken').textContent = tenant.auth_token;
+        document.getElementById('resultCmd').textContent =
+            'curl -fsSL https://octos-cloud.org/api/admin/tenants/' + tenant.id + '/setup-script | bash';
+
+    } catch (e) {
+        const isZh = document.body.getAttribute('data-active-lang') === 'zh';
+        alert(isZh
+            ? '注册服务暂不可用，请稍后重试。'
+            : 'Registration service unavailable. Please try again later.');
+    }
+    return false;
+}
+</script>
+
+</body>
+</html>

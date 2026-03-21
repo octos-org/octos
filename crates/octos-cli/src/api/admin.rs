@@ -2393,9 +2393,601 @@ pub async fn config_check(
     })))
 }
 
-/// GET /api/admin/model-limits — returns model output token limits from model_limits.json.
+/// GET /api/admin/model-limits — returns model catalog (runtime source of truth).
 pub async fn model_limits() -> Json<serde_json::Value> {
-    let raw = octos_llm::context::MODEL_LIMITS_JSON;
-    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
-    Json(value)
+    // Read the runtime catalog from the profile data dir
+    let home = std::env::var("HOME").unwrap_or_default();
+    for base in &[format!("{home}/.octos/profiles"), format!("{home}/.crew/profiles")] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path().join("data/model_catalog.json");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                        return Json(value);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback to shared catalog
+    let shared = format!("{home}/.octos/model_catalog.json");
+    if let Ok(content) = std::fs::read_to_string(&shared) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            return Json(value);
+        }
+    }
+    Json(serde_json::json!({"models": []}))
+}
+
+// ── Admin Shell API ─────────────────────────────────────────────────
+
+/// Maximum command length (1MB).
+const MAX_SHELL_COMMAND_LEN: usize = 1_048_576;
+
+/// Default shell timeout in seconds.
+const DEFAULT_SHELL_TIMEOUT: u64 = 30;
+
+/// Maximum shell timeout in seconds.
+const MAX_SHELL_TIMEOUT: u64 = 600;
+
+#[derive(Deserialize)]
+pub struct ShellRequest {
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ShellResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+/// POST /api/admin/shell — execute a shell command on the server.
+///
+/// Admin-only. Runs the command with timeout enforcement and returns
+/// stdout, stderr, and exit code. No PTY — stdin/stdout only.
+pub async fn admin_shell(Json(req): Json<ShellRequest>) -> Result<Json<ShellResponse>, (StatusCode, String)> {
+    if req.command.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "command is required".into()));
+    }
+    if req.command.len() > MAX_SHELL_COMMAND_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("command exceeds {}KB limit", MAX_SHELL_COMMAND_LEN / 1024),
+        ));
+    }
+
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT)
+        .clamp(1, MAX_SHELL_TIMEOUT);
+
+    // Determine working directory
+    let cwd = req.cwd.as_deref().unwrap_or(".");
+    let cwd_path = std::path::Path::new(cwd);
+    if !cwd_path.exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("working directory does not exist: {cwd}"),
+        ));
+    }
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(&req.command).current_dir(cwd_path);
+
+    // Sanitize environment — remove dangerous env vars
+    for var in octos_agent::sandbox::BLOCKED_ENV_VARS {
+        cmd.env_remove(var);
+    }
+
+    let cmd_preview = octos_core::truncated_utf8(&req.command, 200, "...");
+    tracing::info!(
+        command = %cmd_preview,
+        cwd = %cwd,
+        timeout = timeout_secs,
+        "admin shell: executing"
+    );
+
+    // Spawn child explicitly so we can kill it on timeout (dropping the
+    // future does NOT kill the child — it becomes an orphan process).
+    let mut child = cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            tracing::error!(error = %e, "admin shell: failed to spawn");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to spawn command: {e}"))
+        })?;
+
+    // Capture PID before wait_with_output() takes ownership
+    let child_pid = child.id();
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            tracing::info!(exit_code, "admin shell: complete");
+            Ok(Json(ShellResponse {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code,
+                timed_out: false,
+            }))
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "admin shell: failed to execute");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to execute command: {e}"),
+            ))
+        }
+        Err(_) => {
+            // Kill the child process on timeout
+            if let Some(pid) = child_pid {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output()
+                    .await;
+            }
+            tracing::warn!(timeout = timeout_secs, "admin shell: timed out, process killed");
+            Ok(Json(ShellResponse {
+                stdout: String::new(),
+                stderr: format!("command timed out after {timeout_secs}s"),
+                exit_code: -1,
+                timed_out: true,
+            }))
+        }
+    }
+}
+
+// ── Tenant tunnel management ────────────────────────────────────────
+
+/// Tenant summary without secrets (for list responses).
+#[derive(Serialize)]
+pub struct TenantSummary {
+    pub id: String,
+    pub name: String,
+    pub subdomain: String,
+    pub ssh_port: u16,
+    pub local_port: u16,
+    pub status: crate::tenant::TenantStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::tenant::TenantConfig> for TenantSummary {
+    fn from(t: crate::tenant::TenantConfig) -> Self {
+        Self {
+            id: t.id,
+            name: t.name,
+            subdomain: t.subdomain,
+            ssh_port: t.ssh_port,
+            local_port: t.local_port,
+            status: t.status,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+        }
+    }
+}
+
+/// GET /api/admin/tenants — list all tunnel tenants (secrets masked).
+pub async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<TenantSummary>>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenants = store
+        .list()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(tenants.into_iter().map(TenantSummary::from).collect()))
+}
+
+/// GET /api/admin/tenants/{id} — get a single tenant.
+pub async fn get_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenant = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
+    Ok(Json(tenant))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTenantRequest {
+    pub name: String,
+    #[serde(default = "default_local_port")]
+    pub local_port: u16,
+}
+
+fn default_local_port() -> u16 {
+    8080
+}
+
+/// POST /api/admin/tenants — create a new tunnel tenant.
+pub async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateTenantRequest>,
+) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    // Check for duplicate
+    if store
+        .get(&req.name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("tenant '{}' already exists", req.name),
+        ));
+    }
+
+    let ssh_port = store
+        .next_ssh_port()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    let tenant = crate::tenant::TenantConfig {
+        id: req.name.clone(),
+        name: req.name.clone(),
+        subdomain: req.name.clone(),
+        tunnel_token: uuid::Uuid::new_v4().to_string(),
+        ssh_port,
+        local_port: req.local_port,
+        auth_token: format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        status: crate::tenant::TenantStatus::Pending,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .save(&tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(tenant))
+}
+
+/// DELETE /api/admin/tenants/{id} — delete a tenant.
+pub async fn delete_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let deleted = store
+        .delete(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")));
+    }
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("tenant '{id}' deleted")),
+    }))
+}
+
+/// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
+/// installs octos + frpc on a fresh Mac Mini.
+pub async fn tenant_setup_script(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<String, (StatusCode, String)> {
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+    let tenant = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
+
+    let domain = state
+        .tunnel_domain
+        .as_deref()
+        .unwrap_or("octos-cloud.org");
+    let server = state
+        .frps_server
+        .as_deref()
+        .unwrap_or("163.192.33.32");
+    let port = state.frps_port.unwrap_or(7000);
+
+    // NOTE: frpc config is NOT embedded — the frps master token must be
+    // provided as FRPS_TOKEN env var or argument when running the setup script.
+
+    // Generate a self-contained setup script
+    let script = format!(
+        r#"#!/usr/bin/env bash
+# Auto-generated setup script for tenant: {name}
+# Subdomain: {subdomain}.{domain}
+# SSH tunnel port: {ssh_port}
+#
+# Usage: curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash
+set -euo pipefail
+
+SUBDOMAIN="{subdomain}"
+FRPS_SERVER="{server}"
+FRPS_PORT={port}
+LOCAL_PORT={local_port}
+SSH_PORT={ssh_port}
+DOMAIN="{domain}"
+
+# frps auth token — must be provided as env var or argument
+FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
+if [ -z "$FRPS_TOKEN" ]; then
+    echo "ERROR: frps auth token required."
+    echo "Usage: FRPS_TOKEN=<token> bash setup.sh"
+    echo "   or: bash setup.sh <token>"
+    exit 1
+fi
+
+echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
+
+# ── Install frpc ──────────────────────────────────────────────────────
+FRPC_VERSION="0.61.1"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  FRP_ARCH="amd64" ;;
+    aarch64|arm64) FRP_ARCH="arm64" ;;
+    *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+esac
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+if [ ! -f /usr/local/bin/frpc ]; then
+    echo "    Installing frpc v${{FRPC_VERSION}}..."
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    TARBALL="frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}.tar.gz"
+    curl -fsSL -o "$TMPDIR/$TARBALL" \
+        "https://github.com/fatedier/frp/releases/download/v${{FRPC_VERSION}}/$TARBALL"
+    tar -xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
+    sudo install -m 0755 "$TMPDIR/frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}/frpc" /usr/local/bin/frpc
+    echo "    frpc installed"
+else
+    echo "    frpc already installed"
+fi
+
+# ── Write frpc config ────────────────────────────────────────────────
+sudo mkdir -p /etc/frp
+sudo tee /etc/frp/frpc.toml > /dev/null << FRPC_EOF
+serverAddr = "$FRPS_SERVER"
+serverPort = $FRPS_PORT
+auth.method = "token"
+auth.token = "$FRPS_TOKEN"
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "${{SUBDOMAIN}}-web"
+type = "http"
+localPort = $LOCAL_PORT
+customDomains = ["${{SUBDOMAIN}}.$DOMAIN"]
+
+[[proxies]]
+name = "${{SUBDOMAIN}}-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = $SSH_PORT
+FRPC_EOF
+echo "    frpc config written to /etc/frp/frpc.toml"
+
+# ── Create launchd service (macOS) or systemd service (Linux) ────────
+if [ "$OS" = "darwin" ]; then
+    PLIST_PATH="$HOME/Library/LaunchAgents/io.octos.frpc.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST_PATH" << PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frpc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/frpc</string>
+        <string>-c</string>
+        <string>/etc/frp/frpc.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/frpc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/frpc.log</string>
+</dict>
+</plist>
+PLIST_EOF
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    launchctl load "$PLIST_PATH"
+    echo "    launchd service loaded (io.octos.frpc)"
+else
+    sudo tee /etc/systemd/system/frpc.service > /dev/null << SYSTEMD_EOF
+[Unit]
+Description=frpc tunnel client for octos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable frpc
+    sudo systemctl restart frpc
+    echo "    systemd service started (frpc)"
+fi
+
+# ── Verify tunnel ────────────────────────────────────────────────────
+echo ""
+echo "==> Tunnel setup complete!"
+echo "    Dashboard: https://${{SUBDOMAIN}}.${{DOMAIN}}"
+echo "    SSH:       ssh -p ${{SSH_PORT}} $(whoami)@${{DOMAIN}}"
+echo ""
+echo "    Waiting 5s for tunnel to establish..."
+sleep 5
+if curl -sf --max-time 5 "http://localhost:${{LOCAL_PORT}}/api/status" > /dev/null 2>&1; then
+    echo "    Local octos is running on port ${{LOCAL_PORT}}"
+else
+    echo "    NOTE: octos serve is not running on port ${{LOCAL_PORT}} yet"
+    echo "    Start it with: octos serve --port ${{LOCAL_PORT}}"
+fi
+"#,
+        name = tenant.name,
+        subdomain = tenant.subdomain,
+        domain = domain,
+        server = server,
+        port = port,
+        local_port = tenant.local_port,
+        ssh_port = tenant.ssh_port,
+        id = tenant.id,
+    );
+
+    Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_request_deserialize_minimal() {
+        let json = r#"{"command": "echo hello"}"#;
+        let req: ShellRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "echo hello");
+        assert!(req.cwd.is_none());
+        assert!(req.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn shell_request_deserialize_full() {
+        let json = r#"{"command": "ls", "cwd": "/tmp", "timeout_secs": 60}"#;
+        let req: ShellRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, "ls");
+        assert_eq!(req.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(req.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn shell_response_serialize() {
+        let resp = ShellResponse {
+            stdout: "hello\n".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["stdout"], "hello\n");
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["timed_out"], false);
+    }
+
+    #[test]
+    fn shell_constants() {
+        assert_eq!(MAX_SHELL_COMMAND_LEN, 1_048_576);
+        assert_eq!(DEFAULT_SHELL_TIMEOUT, 30);
+        assert_eq!(MAX_SHELL_TIMEOUT, 600);
+    }
+
+    #[tokio::test]
+    async fn shell_echo_command() {
+        let req = ShellRequest {
+            command: "echo hello".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.stdout.trim(), "hello");
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.timed_out);
+    }
+
+    #[tokio::test]
+    async fn shell_empty_command_rejected() {
+        let req = ShellRequest {
+            command: String::new(),
+            cwd: None,
+            timeout_secs: None,
+        };
+        let err = admin_shell(Json(req)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shell_bad_cwd_rejected() {
+        let req = ShellRequest {
+            command: "echo hi".into(),
+            cwd: Some("/nonexistent/path/xyz".into()),
+            timeout_secs: None,
+        };
+        let err = admin_shell(Json(req)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shell_captures_stderr() {
+        let req = ShellRequest {
+            command: "echo err >&2".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.stderr.trim(), "err");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn shell_nonzero_exit_code() {
+        let req = ShellRequest {
+            command: "exit 42".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(5),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert_eq!(result.exit_code, 42);
+    }
+
+    #[tokio::test]
+    async fn shell_timeout() {
+        let req = ShellRequest {
+            command: "sleep 10".into(),
+            cwd: Some("/tmp".into()),
+            timeout_secs: Some(1),
+        };
+        let result = admin_shell(Json(req)).await.unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, -1);
+    }
 }

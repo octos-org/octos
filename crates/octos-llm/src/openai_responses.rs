@@ -206,12 +206,36 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     input
 }
 
+/// Normalize a tool_call_id for the OpenAI Responses API.
+///
+/// The Responses API requires IDs to begin with `fc_` (not `call_`).
+/// The agent's message_repair normalizes all IDs to `call_` prefix for
+/// Chat Completions compatibility. This second stage rewrites `call_` → `fc_`
+/// specifically for the Responses API format.
+fn normalize_call_id(id: &str) -> String {
+    // Responses API requires `fc_` prefix on function_call item IDs.
+    // `call_` prefix works for Chat Completions but NOT Responses API.
+    if id.starts_with("fc_") {
+        return id.to_string();
+    }
+    // Strip any existing prefix and re-prefix with `fc_`
+    let stripped = id
+        .strip_prefix("call_")
+        .or_else(|| id.strip_prefix("call_function_"))
+        .or_else(|| id.strip_prefix("toolu_"))
+        .or_else(|| id.strip_prefix("chatcmpl-"))
+        .unwrap_or(id);
+    format!("fc_{stripped}")
+}
+
 /// Append one or more Responses API input items for a message.
 ///
 /// The Responses API requires `function_call` to be a top-level input item,
 /// NOT nested inside an assistant message's content array (which only accepts
 /// `output_text` and `refusal`). So an assistant message with tool calls is
 /// split into: an assistant message (text only) + separate function_call items.
+///
+/// All tool_call_ids are normalized to `call_` prefix for Responses API compat.
 fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
     match msg.role {
         MessageRole::System => {
@@ -237,10 +261,11 @@ fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
             // Emit each tool call as a top-level function_call item
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
+                    let cid = normalize_call_id(&tc.id);
                     out.push(serde_json::json!({
                         "type": "function_call",
-                        "id": &tc.id,
-                        "call_id": &tc.id,
+                        "id": &cid,
+                        "call_id": &cid,
                         "name": &tc.name,
                         "arguments": tc.arguments.to_string(),
                     }));
@@ -248,7 +273,8 @@ fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
             }
         }
         MessageRole::Tool => {
-            let call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+            let raw_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+            let call_id = normalize_call_id(raw_id);
             out.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id,

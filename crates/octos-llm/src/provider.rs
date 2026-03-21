@@ -89,7 +89,9 @@ pub(crate) fn truncate_error_body(body: &str) -> String {
 /// Default LLM request timeout in seconds.
 /// 120s accommodates long multi-tool chains and reasoning-heavy models.
 /// Connect timeout (10s) ensures fast failover when a provider is unreachable.
-pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
+/// Default LLM request timeout in seconds (for non-streaming requests).
+/// Streaming responses should disable this and use per-chunk timeout instead.
+pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 300;
 /// Default LLM connect timeout in seconds.
 /// Reduced from 30s: if a provider can't connect in 10s, fail over sooner.
 pub const DEFAULT_LLM_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -98,11 +100,14 @@ pub const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
 /// Default embedding connect timeout in seconds.
 pub const DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS: u64 = 15;
 
-/// Build a `reqwest::Client` with the given timeout values (in seconds).
-pub fn build_http_client(timeout_secs: u64, connect_timeout_secs: u64) -> reqwest::Client {
+/// Build a `reqwest::Client` with connect timeout only.
+/// No request-level timeout — streaming responses can run indefinitely.
+/// Non-streaming callers should set per-request `.timeout()` explicitly.
+/// Streaming callers rely on per-chunk timeout in consume_stream (30s).
+pub fn build_http_client(_timeout_secs: u64, connect_timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
         .expect("failed to build HTTP client")
 }

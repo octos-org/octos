@@ -242,6 +242,9 @@ pub enum HookResult {
     Allow,
     /// A before-hook denied the operation.
     Deny(String),
+    /// A before-hook modified the tool arguments (exit code 2, stdout = new args JSON).
+    /// Like Claude Agent SDK's `updatedInput` pattern.
+    Modified(serde_json::Value),
     /// A hook encountered an error (does not block).
     Error(String),
 }
@@ -332,6 +335,38 @@ impl HookExecutor {
                     );
                     warn!("{}", msg);
                     last_error = Some(msg);
+                }
+                Ok((2, stdout)) => {
+                    // Exit 2 = modified args (before-hooks only).
+                    // Stdout contains the modified tool arguments as JSON.
+                    if matches!(event, HookEvent::BeforeToolCall) {
+                        self.failures[i].store(0, Ordering::Relaxed);
+                        match serde_json::from_str::<serde_json::Value>(&stdout) {
+                            Ok(modified_args) => {
+                                tracing::info!(
+                                    hook_command = ?hook.command,
+                                    "hook modified tool arguments"
+                                );
+                                return HookResult::Modified(modified_args);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    hook_command = ?hook.command,
+                                    error = %e,
+                                    "hook exit 2 but stdout is not valid JSON, treating as error"
+                                );
+                                last_error = Some(format!("hook modified output not valid JSON: {e}"));
+                            }
+                        }
+                    } else {
+                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        let msg = format!(
+                            "hook {:?} exited with code 2 on non-before-tool event ({}/{})",
+                            hook.command, new_count, self.failure_threshold
+                        );
+                        warn!("{}", msg);
+                        last_error = Some(msg);
+                    }
                 }
                 Ok((code, _stdout)) => {
                     let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;

@@ -24,6 +24,9 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub stream: bool,
+    /// File paths from prior `/api/upload` call.
+    #[serde(default)]
+    pub media: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +50,7 @@ pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatReques
                 port,
                 &req.message,
                 req.session_id.as_deref(),
+                &req.media,
             )
             .await;
         }
@@ -278,28 +282,36 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
-pub async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<SessionInfo>>, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let sess = sessions.lock().await;
-    let list = sess
-        .list_sessions()
-        .into_iter()
-        .filter_map(|(id, count)| {
-            // Only return API sessions, stripping the "api:" prefix so the
-            // frontend can use the raw chat_id with other endpoints.
-            let chat_id = id.strip_prefix("api:")?;
-            Some(SessionInfo {
-                id: chat_id.to_string(),
-                message_count: count,
+pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Response {
+    // If local sessions available, use them directly
+    if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        let list: Vec<SessionInfo> = sess
+            .list_sessions()
+            .into_iter()
+            .filter_map(|(id, count)| {
+                let chat_id = id.strip_prefix("api:")?;
+                Some(SessionInfo {
+                    id: chat_id.to_string(),
+                    message_count: count,
+                })
             })
-        })
-        .collect();
-    Ok(Json(list))
+            .collect();
+        return Json(list).into_response();
+    }
+
+    // Proxy to gateway if available
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            return super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sessions not available".to_string(),
+    )
+        .into_response()
 }
 
 /// GET /api/sessions/:id/messages -- get session history.
@@ -321,31 +333,40 @@ pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
-) -> Result<Json<Vec<MessageInfo>>, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let limit = params.limit.min(500);
-    let offset = params.offset.min(10_000);
-    let fetch_count = offset
-        .checked_add(limit)
-        .ok_or((StatusCode::BAD_REQUEST, "invalid pagination".into()))?;
-    let key = SessionKey::new("api", &id);
-    let mut sess = sessions.lock().await;
-    let session = sess.get_or_create(&key);
-    let messages = session
-        .get_history(fetch_count)
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|m| MessageInfo {
-            role: m.role.to_string(),
-            content: m.content.clone(),
-            timestamp: m.timestamp.to_rfc3339(),
-        })
-        .collect();
-    Ok(Json(messages))
+) -> Response {
+    if let Some(sessions) = &state.sessions {
+        let limit = params.limit.min(500);
+        let offset = params.offset.min(10_000);
+        let fetch_count = match offset.checked_add(limit) {
+            Some(n) => n,
+            None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
+        };
+        let key = SessionKey::new("api", &id);
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&key);
+        let messages: Vec<MessageInfo> = session
+            .get_history(fetch_count)
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| MessageInfo {
+                role: m.role.to_string(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.to_rfc3339(),
+            })
+            .collect();
+        return Json(messages).into_response();
+    }
+
+    // Proxy to gateway
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            let path = format!("/sessions/{id}/messages?limit={}&offset={}", params.limit, params.offset);
+            return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
 }
 
 #[derive(Serialize)]
@@ -359,18 +380,142 @@ pub struct MessageInfo {
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-    let key = SessionKey::new("api", &id);
-    let mut sess = sessions.lock().await;
-    sess.clear(&key).await.map_err(|e| {
-        tracing::error!(error = %e, "delete session failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+) -> Response {
+    if let Some(sessions) = &state.sessions {
+        let key = SessionKey::new("api", &id);
+        let mut sess = sessions.lock().await;
+        return match sess.clear(&key).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "delete session failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+    }
+
+    // Proxy to gateway
+    if let Some(pm) = &state.process_manager {
+        if let Some((_profile_id, port)) = pm.first_api_port().await {
+            let path = format!("/sessions/{id}");
+            return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
+}
+
+/// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
+///
+/// Accepts multipart/form-data with one or more `file` fields.
+/// Returns JSON array of server-side file paths.
+pub async fn upload(
+    State(state): State<Arc<AppState>>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    // Determine upload directory
+    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to create upload dir: {e}"))
     })?;
-    Ok(StatusCode::NO_CONTENT)
+
+    let mut paths = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut total_size: u64 = 0;
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB per file
+    const MAX_TOTAL_SIZE: u64 = 100 * 1024 * 1024; // 100MB total
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        // Only process fields that have a filename (skip non-file fields)
+        let filename = match field.file_name() {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        // Skip duplicate filenames (browser may send the same file twice)
+        if !seen_names.insert(filename.clone()) {
+            let _ = field.bytes().await; // drain to avoid blocking
+            continue;
+        }
+
+        // Sanitize filename — strip path separators
+        let safe_name = filename
+            .replace(['/', '\\', '\0'], "_")
+            .chars()
+            .take(200)
+            .collect::<String>();
+
+        let data = field.bytes().await.map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("failed to read field: {e}"))
+        })?;
+
+        if data.len() as u64 > MAX_FILE_SIZE {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("file exceeds {MAX_FILE_SIZE} byte limit")));
+        }
+        total_size += data.len() as u64;
+        if total_size > MAX_TOTAL_SIZE {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "total upload exceeds 100MB".into()));
+        }
+
+        // Unique prefix to avoid collisions
+        let dest = upload_dir.join(format!("{}_{safe_name}", uuid::Uuid::now_v7()));
+        tokio::fs::write(&dest, &data).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write file: {e}"))
+        })?;
+
+        tracing::info!(path = %dest.display(), size = data.len(), "file uploaded");
+        paths.push(dest.to_string_lossy().to_string());
+    }
+
+    if paths.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no files in request".into()));
+    }
+
+    Ok(Json(paths))
+}
+
+/// GET /api/files/:filename -- serve uploaded files for display/download.
+pub async fn serve_file(
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Response {
+    let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
+    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    let path = upload_dir.join(&safe_name);
+
+    if !path.exists() || !path.starts_with(&upload_dir) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => d,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // Detect content type from extension
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("pdf") => "application/pdf",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    };
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("content-type", content_type.parse().unwrap());
+    headers.insert(
+        "content-disposition",
+        format!("inline; filename=\"{safe_name}\"").parse().unwrap(),
+    );
+
+    (StatusCode::OK, headers, data).into_response()
 }
 
 /// GET /api/status -- server status.

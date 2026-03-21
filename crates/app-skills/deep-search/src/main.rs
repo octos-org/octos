@@ -568,68 +568,262 @@ async fn web_search(
     count: u8,
     engine: Option<&str>,
 ) -> SearchResult {
+    // If a specific engine is requested, use it directly
     if let Some(eng) = engine {
-        match eng {
-            "brave" => {
-                if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
-                    let r = brave_search(client, query, count, &api_key).await;
-                    if r.success && !r.output.contains("No results found") {
-                        return r;
-                    }
-                }
-            }
-            "you" => {
-                if let Ok(api_key) = std::env::var("YDC_API_KEY") {
-                    let r = you_search(client, query, count, &api_key).await;
-                    if r.success && !r.output.contains("No results found") {
-                        return r;
-                    }
-                }
-            }
-            "perplexity" => {
-                if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
-                    if !api_key.is_empty() {
-                        let r = perplexity_search(client, query, &api_key).await;
-                        if r.success && !r.output.contains("No results found") {
-                            return r;
-                        }
-                    }
-                }
-            }
-            _ => {}
+        if eng == "all" {
+            // Fire ALL engines in parallel — use sparingly (high resource cost)
+            return parallel_all_engines(client, query, count).await;
         }
-    }
-
-    // Default priority: Perplexity first (best for deep research), then DDG, Brave, You.com
-    if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
-        if !api_key.is_empty() {
-            let r = perplexity_search(client, query, &api_key).await;
-            if r.success && !r.output.contains("No results found") {
-                return r;
-            }
-        }
-    }
-
-    let ddg = ddg_search(client, query, count).await;
-    if ddg.success && !ddg.output.contains("No results found") {
-        return ddg;
-    }
-
-    if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
-        let r = brave_search(client, query, count, &api_key).await;
-        if r.success && !r.output.contains("No results found") {
+        if let Some(r) = try_engine(client, query, count, eng).await {
             return r;
         }
     }
 
-    if let Ok(api_key) = std::env::var("YDC_API_KEY") {
-        let r = you_search(client, query, count, &api_key).await;
-        if r.success && !r.output.contains("No results found") {
-            return r;
+    // Default: race top 2 available engines in parallel.
+    // Gives redundancy + speed without the resource explosion of fire-all.
+    // Priority: tavily > perplexity > brave > duckduckgo
+    let mut available: Vec<&str> = Vec::new();
+    if std::env::var("TAVILY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("tavily");
+    }
+    if std::env::var("PERPLEXITY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("perplexity");
+    }
+    if std::env::var("BRAVE_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+        available.push("brave");
+    }
+    available.push("duckduckgo"); // always available (free)
+
+    // Race top 2
+    let top2: Vec<&str> = available.into_iter().take(2).collect();
+    let mut handles = Vec::new();
+    for eng in &top2 {
+        let c = client.clone();
+        let q = query.to_string();
+        let cnt = count;
+        let name = eng.to_string();
+        handles.push(tokio::spawn(async move {
+            (name.clone(), try_engine(&c, &q, cnt, &name).await)
+        }));
+    }
+
+    let results = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures::future::join_all(handles),
+    ).await {
+        Ok(r) => r,
+        Err(_) => Vec::new(),
+    };
+
+    // Pick the best result (richest successful output)
+    let mut successful: Vec<(String, SearchResult)> = results
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|(name, opt)| opt.map(|r| (name, r)))
+        .collect();
+
+    if successful.is_empty() {
+        return SearchResult {
+            output: format!("No results found from any search engine for: {query}"),
+            success: false,
+        };
+    }
+
+    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    let mut primary = successful.remove(0);
+
+    // Append runner-up if it has substantial unique content
+    if let Some((name, other)) = successful.first() {
+        if other.output.len() > 200 {
+            primary.1.output.push_str(&format!("\n\n--- Also from {name} ---\n"));
+            primary.1.output.push_str(&other.output);
         }
     }
 
-    ddg
+    primary.1
+}
+
+/// Fire ALL available engines in parallel and merge results.
+/// Use sparingly — with many concurrent workers this creates hundreds of connections.
+async fn parallel_all_engines(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+) -> SearchResult {
+    let mut handles = Vec::new();
+
+    if let Ok(k) = std::env::var("TAVILY_API_KEY") {
+        if !k.is_empty() {
+            let c = client.clone();
+            let q = query.to_string();
+            handles.push(tokio::spawn(async move { ("tavily", tavily_search(&c, &q, count, &k).await) }));
+        }
+    }
+    if let Ok(k) = std::env::var("PERPLEXITY_API_KEY") {
+        if !k.is_empty() {
+            let c = client.clone();
+            let q = query.to_string();
+            handles.push(tokio::spawn(async move { ("perplexity", perplexity_search(&c, &q, &k).await) }));
+        }
+    }
+    if let Ok(k) = std::env::var("BRAVE_API_KEY") {
+        let c = client.clone();
+        let q = query.to_string();
+        handles.push(tokio::spawn(async move { ("brave", brave_search(&c, &q, count, &k).await) }));
+    }
+    {
+        let c = client.clone();
+        let q = query.to_string();
+        handles.push(tokio::spawn(async move { ("duckduckgo", ddg_search(&c, &q, count).await) }));
+    }
+
+    let results = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        futures::future::join_all(handles),
+    ).await {
+        Ok(r) => r,
+        Err(_) => Vec::new(),
+    };
+
+    let mut successful: Vec<(String, SearchResult)> = results
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter(|(_, r)| r.success && !r.output.contains("No results found"))
+        .map(|(n, r)| (n.to_string(), r))
+        .collect();
+
+    if successful.is_empty() {
+        return SearchResult {
+            output: format!("No results from any engine for: {query}"),
+            success: false,
+        };
+    }
+
+    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    let mut primary = successful.remove(0);
+    for (name, other) in &successful {
+        if other.output.len() > 100 {
+            primary.1.output.push_str(&format!("\n\n--- Additional ({name}) ---\n"));
+            primary.1.output.push_str(&other.output);
+        }
+    }
+    primary.1
+}
+
+/// Try a specific search engine by name.
+async fn try_engine(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    engine: &str,
+) -> Option<SearchResult> {
+    let r = match engine {
+        "tavily" => {
+            let key = std::env::var("TAVILY_API_KEY").ok()?;
+            tavily_search(client, query, count, &key).await
+        }
+        "perplexity" => {
+            let key = std::env::var("PERPLEXITY_API_KEY").ok()?;
+            perplexity_search(client, query, &key).await
+        }
+        "brave" => {
+            let key = std::env::var("BRAVE_API_KEY").ok()?;
+            brave_search(client, query, count, &key).await
+        }
+        "you" => {
+            let key = std::env::var("YDC_API_KEY").ok()?;
+            you_search(client, query, count, &key).await
+        }
+        "duckduckgo" => ddg_search(client, query, count).await,
+        _ => return None,
+    };
+    if r.success && !r.output.contains("No results found") {
+        Some(r)
+    } else {
+        None
+    }
+}
+
+/// Tavily AI-optimized search.
+async fn tavily_search(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    api_key: &str,
+) -> SearchResult {
+    let body = serde_json::json!({
+        "api_key": api_key,
+        "query": query,
+        "max_results": count.min(10),
+        "include_answer": true,
+        "include_raw_content": false,
+    });
+
+    let response = match client
+        .post("https://api.tavily.com/search")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return SearchResult {
+                output: format!("Tavily error: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return SearchResult {
+            output: format!("Tavily HTTP {status}: {}", {
+                let mut end = text.len().min(200);
+                while !text.is_char_boundary(end) && end > 0 { end -= 1; }
+                &text[..end]
+            }),
+            success: false,
+        };
+    }
+
+    let data: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return SearchResult {
+                output: format!("Tavily parse error: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    let mut output = String::new();
+
+    // Include AI-generated answer if available
+    if let Some(answer) = data["answer"].as_str() {
+        if !answer.is_empty() {
+            output.push_str("**AI Summary:**\n");
+            output.push_str(answer);
+            output.push_str("\n\n");
+        }
+    }
+
+    // Include search results
+    if let Some(results) = data["results"].as_array() {
+        for (i, r) in results.iter().enumerate() {
+            let title = r["title"].as_str().unwrap_or("Untitled");
+            let url = r["url"].as_str().unwrap_or("");
+            let content = r["content"].as_str().unwrap_or("");
+            output.push_str(&format!("{}. [{}]({})\n{}\n\n", i + 1, title, url, content));
+        }
+    }
+
+    SearchResult {
+        output,
+        success: true,
+    }
 }
 
 // ---------------------------------------------------------------------------

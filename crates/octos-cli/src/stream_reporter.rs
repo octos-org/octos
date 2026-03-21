@@ -28,6 +28,8 @@ pub enum StreamProgressEvent {
     ToolProgress { name: String, message: String },
     /// LLM call status update (retry progress, provider switching).
     LlmStatus { message: String },
+    /// A file was written/modified by a tool.
+    FileWritten { path: String },
     /// Reset the streaming buffer (e.g. before an LLM retry so partial
     /// text from a failed attempt doesn't get concatenated with the retry).
     BufferReset,
@@ -64,6 +66,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 StreamProgressEvent::ToolProgress { name, message }
             }
             ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
+            ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             _ => return,
         };
@@ -143,13 +146,36 @@ pub async fn run_stream_forwarder(
     let mut message_id: Option<String> = None;
     let mut last_edit = Instant::now() - EDIT_THROTTLE; // allow immediate first edit
     let mut first_chunk = true;
+    let mut last_chunk_iteration: u32 = 0;
     // When true, the channel doesn't support send_with_id (returned None),
     // so we stop streaming edits and let the final reply go through out_tx.
     let mut no_edit_support = false;
 
     while let Some(event) = rx.recv().await {
         match event {
-            StreamProgressEvent::Chunk { text, .. } => {
+            StreamProgressEvent::Chunk { text, iteration } => {
+                // When a new LLM iteration starts streaming, clear tool progress
+                // markers from the buffer so the final response is clean.
+                // This prevents testers from capturing "✓ shell ✓ read_file..."
+                // as the response when the LLM hasn't started its reply yet.
+                if iteration > last_chunk_iteration {
+                    last_chunk_iteration = iteration;
+                    // Remove tool progress lines (✓/✗/⚙ markers and 📄 notifications)
+                    let cleaned: Vec<&str> = buffer
+                        .lines()
+                        .filter(|line| {
+                            let trimmed = line.trim();
+                            !trimmed.starts_with("✓ ")
+                                && !trimmed.starts_with("✗ ")
+                                && !trimmed.starts_with("⚙ ")
+                                && !trimmed.starts_with("📄 ")
+                        })
+                        .collect();
+                    buffer = cleaned.join("\n");
+                    if buffer.trim().is_empty() {
+                        buffer.clear();
+                    }
+                }
                 if first_chunk {
                     first_chunk = false;
                     // Cancel the "✦ Thinking..." status indicator
@@ -308,6 +334,28 @@ pub async fn run_stream_forwarder(
                     )
                     .await;
                     last_edit = Instant::now();
+                }
+            }
+            StreamProgressEvent::FileWritten { path } => {
+                // Show file-saved notification immediately so the user knows
+                // the file was written even if the final LLM response is slow.
+                let filename = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or(path);
+                if !buffer.is_empty() {
+                    buffer.push_str(&format!("\n📄 Saved `{filename}`"));
+                    if is_session_active(&session_key, &active_sessions).await {
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &buffer,
+                            &mut message_id,
+                            &mut no_edit_support,
+                        )
+                        .await;
+                        last_edit = Instant::now();
+                    }
                 }
             }
             StreamProgressEvent::BufferReset => {

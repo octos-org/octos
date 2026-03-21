@@ -106,6 +106,9 @@ impl LlmProvider for GeminiProvider {
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", self.api_key.expose_secret())
+            .timeout(std::time::Duration::from_secs(
+                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+            ))
             .json(&request)
             .send()
             .await

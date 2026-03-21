@@ -147,39 +147,88 @@ impl SessionManager {
 
     /// List all sessions (ID + message count) from disk.
     ///
+    /// Scans both the legacy flat layout (`sessions/*.jsonl`) and the per-user
+    /// layout (`users/{base_key}/sessions/{topic}.jsonl`).
     /// Counts lines efficiently using `BufRead` to avoid loading entire files.
     pub fn list_sessions(&self) -> Vec<(String, usize)> {
+        let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
+
+        // 1. Legacy flat layout: data/sessions/*.jsonl
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                     if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        // Skip oversized files to avoid OOM in listing
-                        let too_large = path
-                            .metadata()
-                            .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
-                            .unwrap_or(false);
-                        let count = if too_large {
-                            0
-                        } else {
-                            // Count lines without reading the whole file into a String
-                            std::fs::File::open(&path)
-                                .ok()
-                                .map(|f| {
-                                    use std::io::BufRead;
-                                    std::io::BufReader::new(f).lines().count()
-                                })
-                                .unwrap_or(0)
-                        };
-                        // Decode percent-encoded filename back to session key
+                        let count = Self::count_lines(&path);
                         let decoded = Self::decode_filename(name);
-                        result.push((decoded, count));
+                        if seen.insert(decoded.clone()) {
+                            result.push((decoded, count));
+                        }
                     }
                 }
             }
         }
+
+        // 2. Per-user layout: data/users/{base_key}/sessions/{topic}.jsonl
+        let users_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).join("users");
+        if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
+            for user_entry in user_entries.flatten() {
+                let user_path = user_entry.path();
+                if !user_path.is_dir() {
+                    continue;
+                }
+                let base_key_encoded = match user_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let base_key = Self::decode_filename(base_key_encoded);
+                let sessions_subdir = user_path.join("sessions");
+                if let Ok(session_files) = std::fs::read_dir(&sessions_subdir) {
+                    for file_entry in session_files.flatten() {
+                        let file_path = file_entry.path();
+                        if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                            continue;
+                        }
+                        let topic_encoded = match file_path.file_stem().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let topic = Self::decode_filename(topic_encoded);
+                        // Reconstruct the full session key
+                        let session_key = if topic == "default" {
+                            base_key.clone()
+                        } else {
+                            format!("{base_key}#{topic}")
+                        };
+                        let count = Self::count_lines(&file_path);
+                        if seen.insert(session_key.clone()) {
+                            result.push((session_key, count));
+                        }
+                    }
+                }
+            }
+        }
+
         result
+    }
+
+    /// Count lines in a JSONL session file, skipping oversized files.
+    fn count_lines(path: &Path) -> usize {
+        let too_large = path
+            .metadata()
+            .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
+            .unwrap_or(false);
+        if too_large {
+            return 0;
+        }
+        std::fs::File::open(path)
+            .ok()
+            .map(|f| {
+                use std::io::BufRead;
+                std::io::BufReader::new(f).lines().count()
+            })
+            .unwrap_or(0)
     }
 
     /// Load a session from disk (read-only). Returns None if not found.
@@ -277,8 +326,30 @@ impl SessionManager {
     }
 
     /// Load a session from its JSONL file.
+    ///
+    /// Checks the legacy flat layout first, then the per-user directory layout.
     fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
         let path = self.session_path(key);
+
+        // If not found in flat layout, try per-user layout
+        let path = if path.exists() {
+            path
+        } else {
+            let base_key = key.base_key();
+            let encoded_base = encode_path_component(base_key);
+            let topic = key.topic().unwrap_or("default");
+            let encoded_topic = encode_path_component(topic);
+            let users_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).join("users");
+            let per_user_path = users_dir
+                .join(&encoded_base)
+                .join("sessions")
+                .join(format!("{encoded_topic}.jsonl"));
+            if per_user_path.exists() {
+                per_user_path
+            } else {
+                return None;
+            }
+        };
 
         // Guard against oversized files to prevent OOM
         if let Ok(meta) = std::fs::metadata(&path) {

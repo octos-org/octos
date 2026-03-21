@@ -72,34 +72,6 @@ impl RunPipelineTool {
 
     /// Build a model catalog string for the LLM, showing each model's key,
     /// output capacity, context window, and cost.
-    fn build_model_catalog(&self) -> String {
-        let router = match &self.provider_router {
-            Some(r) => r,
-            None => return String::new(),
-        };
-        let models = router.list_models_with_meta();
-        if models.is_empty() {
-            return String::new();
-        }
-        let mut lines = Vec::new();
-        for m in &models {
-            let max_out_k = m.max_output_tokens / 1000;
-            let ctx_k = m.context_window / 1000;
-            let mut line = format!(
-                "- '{}': {} ({}), {}k max output, {}k context",
-                m.key, m.model_id, m.provider_name, max_out_k, ctx_k,
-            );
-            if let Some(ref cost) = m.cost_info {
-                line.push_str(&format!(", {cost}"));
-            }
-            if let Some(ref desc) = m.description {
-                line.push_str(&format!(". {desc}"));
-            }
-            lines.push(line);
-        }
-        lines.join("\n")
-    }
-
     /// Resolve pipeline with fallback: try inline DOT first, if it fails to parse,
     /// try as a named pipeline. This handles cases where the LLM produces slightly
     /// malformed DOT — the pre-built pipeline still works as a safety net.
@@ -112,7 +84,18 @@ impl RunPipelineTool {
             match crate::parser::parse_dot(trimmed) {
                 Ok(_) => return Ok(pipeline_str.to_string()),
                 Err(parse_err) => {
-                    tracing::warn!("inline DOT parse failed, trying named fallback: {parse_err}");
+                    // Log the full DOT for debugging parse failures
+                    let dot_preview = if trimmed.len() > 500 {
+                        let mut end = 500;
+                        while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
+                        format!("{}...(truncated at {} bytes)", &trimmed[..end], trimmed.len())
+                    } else {
+                        trimmed.to_string()
+                    };
+                    tracing::warn!(
+                        dot = %dot_preview,
+                        "inline DOT parse failed, trying named fallback: {parse_err}"
+                    );
                     // Try to extract a pipeline name hint from the DOT (e.g. "digraph deep_research")
                     if let Some(name) = trimmed
                         .strip_prefix("digraph ")
@@ -130,6 +113,7 @@ impl RunPipelineTool {
                         }
                     }
                     // No fallback found — return the original parse error
+                    tracing::error!(dot = %dot_preview, "no fallback available, returning parse error");
                     return Err(parse_err.wrap_err("inline DOT parse failed with no fallback"));
                 }
             }
@@ -176,110 +160,18 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        // Build model catalog for the LLM to reference when writing DOT graphs
-        let model_catalog = self.build_model_catalog();
+        let adaptive_hints = include_str!("prompts/adaptive_hints.txt");
+        let node_attrs = include_str!("prompts/node_attrs.txt");
+        let example = include_str!("prompts/example_dot.txt");
 
-        let adaptive_hints = "\
-Adapt the pipeline to the query:\n\
-- Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics\n\
-- Cross-language: ALWAYS include English search angles for broader coverage. \
-Also add search angles in languages relevant to the topic's origin \
-(e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, \
-Korean for K-pop, Chinese for Chinese education). This finds primary sources others miss.\n\
-- Search tools: use deep_search for web research, deep_crawl for specific sites, read_file to read results\n\
-- Synthesize: MUST set max_output_tokens high enough for the expected report length (default 4096 truncates long reports)\n\
-- Match report language to query language\n\
-- For comparative research, add extra search angles per alternative\n\
-- For technical topics, include angles for official docs, GitHub repos, and benchmarks";
-
-        let node_attrs = "\
-Node attributes: handler (codergen|shell|gate|noop|dynamic_parallel|parallel), \
-prompt, model, max_output_tokens (default 4096), context_window, tools, timeout_secs, goal_gate, label.\n\
-For dynamic_parallel: converge, worker_prompt, planner_model, max_tasks.";
-
-        // Build example DOT using actual model keys when available
-        let (search_model, strong_model, synth_model, synth_max_output) =
-            if let Some(ref router) = self.provider_router {
-                let metas = router.list_models_with_meta();
-                if !metas.is_empty() {
-                    // Find cheapest/fastest for search, strongest for analysis,
-                    // highest max_output for synthesis
-                    let mut best_search = &metas[0];
-                    let mut best_strong = &metas[0];
-                    let mut best_synth = &metas[0];
-                    for m in &metas {
-                        // Prefer lower max_output as "cheaper/faster" for search
-                        if m.max_output_tokens < best_search.max_output_tokens {
-                            best_search = m;
-                        }
-                        // Prefer higher context window as "stronger"
-                        if m.context_window > best_strong.context_window {
-                            best_strong = m;
-                        }
-                        // Prefer highest max_output for synthesis
-                        if m.max_output_tokens > best_synth.max_output_tokens {
-                            best_synth = m;
-                        }
-                    }
-                    (
-                        best_search.key.clone(),
-                        best_strong.key.clone(),
-                        best_synth.key.clone(),
-                        best_synth.max_output_tokens.to_string(),
-                    )
-                } else {
-                    (
-                        "cheap".into(),
-                        "strong".into(),
-                        "strong".into(),
-                        "16384".into(),
-                    )
-                }
-            } else {
-                (
-                    "cheap".into(),
-                    "strong".into(),
-                    "strong".into(),
-                    "16384".into(),
-                )
-            };
-
-        let example = format!(
-            "\
-Example:\n\
-digraph research {{\n  \
-  plan_and_search [handler=\"dynamic_parallel\", converge=\"analyze\", \
-prompt=\"Generate 4-6 research angles covering different aspects. Include both Chinese and English angles for cross-language coverage.\", \
-worker_prompt=\"You are a research specialist. {{task}}. Use deep_search, then read_file to read _search_results.md and top sources. Include ALL URLs and quotes.\", \
-model=\"{search_model}\", planner_model=\"{strong_model}\", tools=\"deep_search,read_file\", max_tasks=\"8\", timeout_secs=\"600\"]\n  \
-  analyze [prompt=\"Cross-reference findings from all search agents. Preserve ALL data points, URLs, quotes. Organize by subtopic.\", \
-model=\"{strong_model}\", tools=\"read_file\", timeout_secs=\"300\"]\n  \
-  synthesize [prompt=\"Write a comprehensive, well-structured report. Include citations with URLs. Save using write_file. Match the query language.\", \
-model=\"{synth_model}\", max_output_tokens=\"{synth_max_output}\", tools=\"write_file\", goal_gate=\"true\", timeout_secs=\"600\"]\n  \
-  plan_and_search -> analyze\n  \
-  analyze -> synthesize\n\
-}}"
+        let pipeline_desc = format!(
+            "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
+             Do NOT specify model= attributes — the system selects optimal models automatically.\n\
+             Focus on writing good prompts, choosing tools, and structuring the pipeline.\n\n\
+             {node_attrs}\n\n\
+             {adaptive_hints}\n\n\
+             {example}"
         );
-
-        let pipeline_desc = if model_catalog.is_empty() {
-            format!(
-                "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
-                 {node_attrs}\n\n\
-                 {adaptive_hints}\n\n\
-                 {example}"
-            )
-        } else {
-            format!(
-                "Inline DOT graph. ALWAYS write a custom digraph — do NOT use pre-built pipeline names.\n\n\
-                 Available models (use model=\"key\" in DOT nodes):\n{model_catalog}\n\n\
-                 Model strategy: use cheap/fast models for search nodes, \
-                 pick the model with highest max output for synthesize/report nodes, \
-                 set max_output_tokens to match that model's capacity.\n\n\
-                 {node_attrs}\n\n\
-                 {adaptive_hints}\n\n\
-                 {example}"
-            )
-        };
 
         serde_json::json!({
             "type": "object",

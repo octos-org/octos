@@ -11,6 +11,7 @@ mod config;
 pub mod context;
 mod context_override;
 pub mod embedding;
+mod fallback;
 mod failover;
 pub mod pricing;
 mod provider;
@@ -37,14 +38,16 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, MetricsSnapshot, SharedMetrics,
-    SharedPolicy, SharedProviderMetrics, StatusCallback,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry,
+    MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy,
+    SharedProviderMetrics, StatusCallback,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
 pub use context_override::ContextWindowOverride;
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
 pub use error::{LlmError, LlmErrorKind};
+pub use fallback::FallbackProvider;
 pub use failover::ProviderChain;
 pub use high_level::LlmClient;
 pub use middleware::{LlmMiddleware, MiddlewareStack};

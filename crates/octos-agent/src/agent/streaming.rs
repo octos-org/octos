@@ -47,11 +47,23 @@ impl Agent {
         let mut usage = octos_llm::TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
 
+        // Per-chunk timeout: if no SSE event arrives within 30s, the stream
+        // is likely stalled (connection alive but provider stopped sending).
+        // Normal chunk intervals are <1s; thinking models may pause up to ~15s
+        // before the first token. 30s gives ample margin while catching stalls
+        // much faster than the previous behavior (hung indefinitely).
+        const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         loop {
             let event = tokio::select! {
                 event = stream.next() => event,
                 _ = self.wait_for_shutdown() => {
                     warn!("shutdown received during streaming");
+                    break;
+                }
+                _ = tokio::time::sleep(CHUNK_TIMEOUT) => {
+                    warn!("stream chunk timeout after {}s — provider may be stalled",
+                        CHUNK_TIMEOUT.as_secs());
                     break;
                 }
             };

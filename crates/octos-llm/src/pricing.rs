@@ -10,6 +10,46 @@ pub struct ModelPricing {
     pub output_per_million: f64,
 }
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Cached pricing from runtime catalog.
+static PRICING_CATALOG: RwLock<Option<HashMap<String, ModelPricing>>> = RwLock::new(None);
+
+/// Seed pricing from model_catalog.json entries.
+/// Called at startup alongside context::seed_from_catalog().
+pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
+    let mut map = HashMap::new();
+    for (key, cost_in, cost_out) in entries {
+        if *cost_in > 0.0 || *cost_out > 0.0 {
+            let pricing = ModelPricing {
+                input_per_million: *cost_in,
+                output_per_million: *cost_out,
+            };
+            map.insert(key.clone(), pricing);
+            if let Some(model) = key.split('/').last() {
+                map.insert(model.to_string(), pricing);
+            }
+        }
+    }
+    *PRICING_CATALOG.write().unwrap() = Some(map);
+}
+
+fn catalog_pricing(model_id: &str) -> Option<ModelPricing> {
+    let guard = PRICING_CATALOG.read().ok()?;
+    let map = guard.as_ref()?;
+    let m = model_id.to_lowercase();
+    if let Some(p) = map.get(&m) {
+        return Some(*p);
+    }
+    for (key, p) in map {
+        if m.contains(key) || key.contains(&m) {
+            return Some(*p);
+        }
+    }
+    None
+}
+
 impl ModelPricing {
     /// Calculate cost for given token counts.
     pub fn cost(&self, input_tokens: u32, output_tokens: u32) -> f64 {
@@ -18,8 +58,14 @@ impl ModelPricing {
     }
 }
 
-/// Look up pricing for a model. Returns None for unknown/local models.
+/// Look up pricing for a model. Checks the runtime catalog first,
+/// falls back to hardcoded defaults for models not in the catalog.
 pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
+    // Check runtime catalog first (populated from model_catalog.json)
+    if let Some(pricing) = catalog_pricing(model_id) {
+        return Some(pricing);
+    }
+    // Fallback to hardcoded defaults for models not in catalog
     let m = model_id.to_lowercase();
 
     // Anthropic

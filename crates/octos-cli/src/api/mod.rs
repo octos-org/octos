@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
+use crate::tenant::TenantStore;
 use crate::user_store::UserStore;
 
 /// Shared application state for API handlers.
@@ -56,4 +57,12 @@ pub struct AppState {
     pub alerts_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Persistent sysinfo instance for accurate CPU metrics across polls.
     pub sysinfo: tokio::sync::Mutex<sysinfo::System>,
+    /// Tenant store for tunnel management.
+    pub tenant_store: Option<Arc<TenantStore>>,
+    /// Tunnel domain (e.g. "octos-cloud.org").
+    pub tunnel_domain: Option<String>,
+    /// frps server address for tunnel config generation.
+    pub frps_server: Option<String>,
+    /// frps control port.
+    pub frps_port: Option<u16>,
 }

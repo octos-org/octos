@@ -1,0 +1,20 @@
+Adapt the pipeline to the query:
+- Write ALL node prompts yourself based on the user's specific question — do NOT copy the example prompts verbatim
+- Each node prompt should describe the ROLE and GOAL, not which tools to use (the agent discovers tools from its tool spec)
+- Tailor the synthesize prompt to the research type: scientific analysis, news investigation, fact-check, market report, etc.
+- Search strategy: deep_search supports multiple engines via search_engine parameter:
+  * 'perplexity' — AI-powered, best quality, returns synthesized answers with citations (paid per call)
+  * 'tavily' — AI-optimized, fast, good factual queries (1000 free/month, then paid)
+  * 'brave' — free, fast, good general purpose
+  * 'duckduckgo' — free but slow/unreliable
+  * omit search_engine → races top 2 engines in parallel, picks richest result (good default)
+  * 'all' → fires ALL engines in parallel (max coverage, use sparingly on 1-2 key angles)
+  Most workers should omit search_engine (default top-2 racing is fast and reliable).
+- Search angles: 3-4 for simple topics, 5-8 for complex/multi-faceted topics
+- Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)
+- Data flow: search results are automatically collected and passed to the analyze node as input. Workers do NOT need to output paths — the system reads _search_results.md files automatically.
+- Analyze nodes receive all search findings as input. Give tools="read_file,deep_crawl" so the analyzer can investigate specific sources deeper if needed.
+- Synthesize nodes receive the analysis as input. Give tools="write_file" to save the final report.
+- Match report language to query language
+- Timeouts: synthesize=900s, search=600s, analyze=300s
+- CRITICAL: ALL node prompts MUST include this instruction: 'Report ONLY what you found in the search results. If search returned no relevant information, say so explicitly. NEVER fabricate data, quotes, statistics, or events.'

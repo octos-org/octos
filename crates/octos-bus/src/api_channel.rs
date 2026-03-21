@@ -16,14 +16,15 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{delete, get, post};
 use chrono::Utc;
 use eyre::Result;
-use octos_core::{InboundMessage, OutboundMessage};
-use serde::Deserialize;
+use octos_core::{InboundMessage, OutboundMessage, SessionKey};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
+use crate::SessionManager;
 use crate::channel::Channel;
 
 /// Shared state for the API channel's HTTP handlers.
@@ -32,6 +33,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
+    sessions: Arc<Mutex<SessionManager>>,
 }
 
 /// Request body for POST /chat.
@@ -40,6 +42,9 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// File paths from prior upload.
+    #[serde(default)]
+    media: Vec<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -51,15 +56,25 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    /// Track last sent content per chat_id for delta computation.
+    last_content: Arc<Mutex<HashMap<String, String>>>,
+    sessions: Arc<Mutex<SessionManager>>,
 }
 
 impl ApiChannel {
-    pub fn new(port: u16, auth_token: Option<String>, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        port: u16,
+        auth_token: Option<String>,
+        shutdown: Arc<AtomicBool>,
+        sessions: Arc<Mutex<SessionManager>>,
+    ) -> Self {
         Self {
             port,
             auth_token,
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            last_content: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
         }
     }
 }
@@ -75,10 +90,15 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
+            sessions: self.sessions.clone(),
         };
 
         let app = Router::new()
             .route("/chat", post(handle_chat))
+            .route("/sessions", get(handle_list_sessions))
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .route("/sessions/{id}", delete(handle_delete_session))
+            .route("/files/{*path}", get(handle_file_download))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -112,16 +132,39 @@ impl Channel for ApiChannel {
                 let _ = tx.send(done.to_string());
                 // Remove sender to close the receiver → SSE stream ends
                 pending.remove(&msg.chat_id);
+                drop(pending); // release lock before acquiring last_content
+                self.last_content.lock().await.remove(&msg.chat_id);
+            } else if !msg.media.is_empty() {
+                // File message — send file paths so web client can download
+                for file_path in &msg.media {
+                    let filename = std::path::Path::new(file_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    info!(
+                        chat_id = %msg.chat_id,
+                        file = %file_path,
+                        filename = %filename,
+                        "sending file SSE event"
+                    );
+                    let event = serde_json::json!({
+                        "type": "file",
+                        "path": file_path,
+                        "filename": filename,
+                        "caption": msg.content,
+                    });
+                    let send_ok = tx.send(event.to_string()).is_ok();
+                    if !send_ok {
+                        info!(chat_id = %msg.chat_id, "file SSE send failed — client disconnected");
+                    }
+                }
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
-                // The gateway streams accumulated text (not deltas), so the web
-                // client should replace rather than append.
                 let event = serde_json::json!({
                     "type": "replace",
                     "text": msg.content,
                 });
                 if tx.send(event.to_string()).is_err() {
-                    // Client disconnected — clean up
                     pending.remove(&msg.chat_id);
                 }
             }
@@ -130,6 +173,8 @@ impl Channel for ApiChannel {
     }
 
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        // Reset delta tracking — new message stream starts fresh
+        self.last_content.lock().await.remove(&msg.chat_id);
         self.send(msg).await?;
         // Return a dummy ID so the stream forwarder uses edit_message() for
         // subsequent updates instead of calling send_with_id() again.
@@ -147,15 +192,36 @@ impl Channel for ApiChannel {
         }
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
-            // Send as "replace" event — the web client replaces the current text
-            // instead of appending. This matches the Telegram edit_message pattern.
-            let event = serde_json::json!({
-                "type": "replace",
-                "text": new_content,
-            });
-            let _ = tx.send(event.to_string());
+            let mut last = self.last_content.lock().await;
+            let prev = last.get(chat_id).map(|s| s.as_str()).unwrap_or("");
+
+            // If new content starts with the previous content, send only the delta.
+            // This avoids re-rendering the entire message on each streaming update.
+            if !prev.is_empty() && new_content.starts_with(prev) {
+                let delta = &new_content[prev.len()..];
+                if !delta.is_empty() {
+                    let event = serde_json::json!({
+                        "type": "token",
+                        "text": delta,
+                    });
+                    let _ = tx.send(event.to_string());
+                }
+            } else {
+                // Content changed non-incrementally (tool progress replaced, etc.)
+                // Send full replacement.
+                let event = serde_json::json!({
+                    "type": "replace",
+                    "text": new_content,
+                });
+                let _ = tx.send(event.to_string());
+            }
+            last.insert(chat_id.to_string(), new_content.to_string());
         }
         Ok(())
+    }
+
+    fn supports_edit(&self) -> bool {
+        true
     }
 
     fn max_message_length(&self) -> usize {
@@ -189,14 +255,29 @@ async fn handle_chat(
         .session_id
         .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
 
-    // Create per-request channel for SSE events
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-
-    // Register sender so ApiChannel.send() can route outbound messages here
-    {
+    // Create per-request SSE channel. If a previous request is still streaming
+    // AND alive, reuse it. Otherwise, replace the stale sender.
+    let rx = {
         let mut pending = state.pending.lock().await;
-        pending.insert(session_id.clone(), tx);
-    }
+        let stale = if let Some(old_tx) = pending.get(&session_id) {
+            // Test if the receiver is still alive by sending a keepalive
+            old_tx.send(serde_json::json!({"type":"keepalive"}).to_string()).is_err()
+        } else {
+            false
+        };
+        if stale {
+            info!(session = %session_id, "removing stale SSE sender");
+            pending.remove(&session_id);
+        }
+        if pending.contains_key(&session_id) {
+            // Previous stream still active — queue on existing
+            None
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            pending.insert(session_id.clone(), tx);
+            Some(rx)
+        }
+    };
 
     // Build and send InboundMessage to the gateway bus
     let inbound = InboundMessage {
@@ -205,7 +286,7 @@ async fn handle_chat(
         chat_id: session_id.clone(),
         content: req.message,
         timestamp: Utc::now(),
-        media: vec![],
+        media: req.media,
         metadata: serde_json::json!({}),
         message_id: None,
     };
@@ -219,6 +300,15 @@ async fn handle_chat(
         )
             .into_response();
     }
+
+    // If no new SSE stream (previous one still active), return queued acknowledgment
+    let Some(rx) = rx else {
+        return Json(serde_json::json!({
+            "status": "queued",
+            "message": "Message queued — response will arrive on the existing stream"
+        }))
+        .into_response();
+    };
 
     // Return SSE stream that forwards events from the unbounded receiver
     let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -236,9 +326,155 @@ async fn handle_chat(
         .into_response()
 }
 
+// ── Session REST endpoints ───────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SessionInfo {
+    id: String,
+    message_count: usize,
+}
+
+#[derive(Serialize)]
+struct MessageInfo {
+    role: String,
+    content: String,
+    timestamp: String,
+}
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_limit() -> usize {
+    100
+}
+
+/// GET /sessions — list all API sessions.
+async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
+    let sess = state.sessions.lock().await;
+    let list: Vec<SessionInfo> = sess
+        .list_sessions()
+        .into_iter()
+        .filter_map(|(id, count)| {
+            let chat_id = id.strip_prefix("api:")?;
+            Some(SessionInfo {
+                id: chat_id.to_string(),
+                message_count: count,
+            })
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+/// GET /sessions/:id/messages — get session message history.
+async fn handle_session_messages(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
+) -> Response {
+    let limit = params.limit.min(500);
+    let offset = params.offset.min(10_000);
+    let fetch_count = match offset.checked_add(limit) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
+    };
+    let key = SessionKey::new("api", &id);
+    let mut sess = state.sessions.lock().await;
+    let session = sess.get_or_create(&key);
+    let messages: Vec<MessageInfo> = session
+        .get_history(fetch_count)
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|m| MessageInfo {
+            role: m.role.to_string(),
+            content: m.content.clone(),
+            timestamp: m.timestamp.to_rfc3339(),
+        })
+        .collect();
+    Json(messages).into_response()
+}
+
+/// DELETE /sessions/:id — delete a session.
+async fn handle_delete_session(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let key = SessionKey::new("api", &id);
+    let mut sess = state.sessions.lock().await;
+    match sess.clear(&key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// GET /files/*path — download a file produced by write_file/send_file.
+async fn handle_file_download(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    let file_path = std::path::Path::new(&path);
+
+    // Security: only serve files from known safe directories
+    let canonical = match std::fs::canonicalize(file_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+    };
+
+    // Must be under home dir or /tmp
+    let home = std::env::var("HOME").unwrap_or_default();
+    let allowed = canonical.starts_with(&home) || canonical.starts_with("/tmp");
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "access denied").into_response();
+    }
+
+    match tokio::fs::read(&canonical).await {
+        Ok(bytes) => {
+            let filename = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+
+            let content_type = if filename.ends_with(".md") {
+                "text/markdown; charset=utf-8"
+            } else if filename.ends_with(".html") {
+                "text/html; charset=utf-8"
+            } else if filename.ends_with(".json") {
+                "application/json"
+            } else if filename.ends_with(".pdf") {
+                "application/pdf"
+            } else {
+                "application/octet-stream"
+            };
+
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", content_type),
+                    (
+                        "content-disposition",
+                        &format!("inline; filename=\"{filename}\""),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "file not found").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sessions() -> Arc<Mutex<SessionManager>> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()))
+    }
 
     #[test]
     fn chat_request_deserialize() {
@@ -257,19 +493,19 @@ mod tests {
 
     #[test]
     fn api_channel_name() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         assert_eq!(ch.name(), "api");
     }
 
     #[test]
     fn api_channel_max_message_length() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
 
     #[tokio::test]
     async fn send_to_pending_client() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -294,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_completion_closes_stream() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -322,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_unknown_chat_is_noop() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)));
+        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
         let msg = OutboundMessage {
             channel: "api".into(),
             chat_id: "nonexistent".into(),

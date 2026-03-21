@@ -1,0 +1,109 @@
+{
+  "updated_at": "2026-03-20T03:00:00Z",
+  "models": [
+    {
+      "provider": "minimax/MiniMax-M2.7",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 1807,
+      "p95_ms": 2370,
+      "score": 0.0,
+      "cost_in": 0.15,
+      "cost_out": 1.50,
+      "ds_output": 7848,
+      "context_window": 200000,
+      "max_output": 131072
+    },
+    {
+      "provider": "nvidia/minimax-m2.5",
+      "type": "fast",
+      "stability": 0.73,
+      "tool_avg_ms": 893,
+      "p95_ms": 1456,
+      "score": 0.0,
+      "cost_in": 0.00,
+      "cost_out": 0.00,
+      "ds_output": 5624,
+      "context_window": 200000,
+      "max_output": 196608
+    },
+    {
+      "provider": "zai/glm-5",
+      "type": "strong",
+      "stability": 0.97,
+      "tool_avg_ms": 3719,
+      "p95_ms": 5146,
+      "score": 0.0,
+      "cost_in": 1.00,
+      "cost_out": 4.00,
+      "ds_output": 5344,
+      "context_window": 200000,
+      "max_output": 128000
+    },
+    {
+      "provider": "deepseek/deepseek-chat",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 3422,
+      "p95_ms": 3549,
+      "score": 0.0,
+      "cost_in": 0.14,
+      "cost_out": 0.28,
+      "ds_output": 4266,
+      "context_window": 128000,
+      "max_output": 8000
+    },
+    {
+      "provider": "nvidia/kimi-k2.5",
+      "type": "strong",
+      "stability": 0.93,
+      "tool_avg_ms": 6757,
+      "p95_ms": 18121,
+      "score": 0.0,
+      "cost_in": 0.00,
+      "cost_out": 0.00,
+      "ds_output": 4198,
+      "context_window": 262144,
+      "max_output": 65535
+    },
+    {
+      "provider": "dashscope/qwen3.5-plus",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 2564,
+      "p95_ms": 3560,
+      "score": 0.0,
+      "cost_in": 0.80,
+      "cost_out": 2.00,
+      "ds_output": 3088,
+      "context_window": 1000000,
+      "max_output": 65536
+    },
+    {
+      "provider": "gemini/gemini-2.5-flash",
+      "type": "fast",
+      "stability": 1.0,
+      "tool_avg_ms": 976,
+      "p95_ms": 1090,
+      "score": 0.0,
+      "cost_in": 0.15,
+      "cost_out": 0.60,
+      "ds_output": 3162,
+      "context_window": 1048576,
+      "max_output": 65535
+    },
+    {
+      "provider": "openai/gpt-4.1-mini",
+      "type": "fast",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "cost_in": 0.40,
+      "cost_out": 1.60,
+      "ds_output": 2603,
+      "context_window": 1000000,
+      "max_output": 32768
+    }
+  ]
+}

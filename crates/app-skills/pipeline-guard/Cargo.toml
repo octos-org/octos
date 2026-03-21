@@ -1,0 +1,13 @@
+[package]
+name = "pipeline-guard"
+version = "0.1.0"
+edition = "2021"
+description = "Hook binary that validates and fixes run_pipeline DOT graphs before execution"
+
+[[bin]]
+name = "pipeline-guard"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

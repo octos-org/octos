@@ -145,7 +145,7 @@ impl ChatCommand {
                     .map(AdaptiveConfig::from)
                     .unwrap_or_default();
                 tracing::info!("adaptive routing enabled ({} providers)", providers.len());
-                Arc::new(AdaptiveRouter::new(providers, adaptive_config))
+                Arc::new(AdaptiveRouter::new(providers, &[], adaptive_config))
             } else {
                 Arc::new(ProviderChain::new(providers))
             }

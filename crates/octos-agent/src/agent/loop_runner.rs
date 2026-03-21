@@ -11,8 +11,8 @@ use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::message_repair::{
-    normalize_system_messages, repair_message_order, repair_tool_pairs, sanitize_tool_call_id,
-    synthesize_missing_tool_results, truncate_old_tool_results,
+    normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,
+    sanitize_tool_call_id, synthesize_missing_tool_results, truncate_old_tool_results,
 };
 use super::{Agent, ConversationResponse, TokenTracker};
 use crate::loop_detect::LoopDetector;
@@ -116,6 +116,18 @@ impl Agent {
             }
 
             iteration += 1;
+
+            // LRU tool management: tick iteration counter and auto-evict idle tools
+            self.tools.tick();
+            let evicted = self.tools.auto_evict();
+            if !evicted.is_empty() {
+                tracing::info!(
+                    evicted = %evicted.join(", "),
+                    count = evicted.len(),
+                    "auto-evicted idle tools"
+                );
+            }
+
             let tools_spec = self.tools.specs();
             self.trim_to_context_window(&mut messages);
             normalize_system_messages(&mut messages);
@@ -123,6 +135,7 @@ impl Agent {
             repair_tool_pairs(&mut messages);
             synthesize_missing_tool_results(&mut messages);
             truncate_old_tool_results(&mut messages);
+            normalize_tool_call_ids(&mut messages);
 
             if iteration == 1 && tools_spec.len() > 25 {
                 tracing::warn!(
@@ -302,8 +315,19 @@ impl Agent {
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
+                // LRU tool management
+                self.tools.tick();
+                let evicted = self.tools.auto_evict();
+                if !evicted.is_empty() {
+                    tracing::info!(
+                        evicted = %evicted.join(", "),
+                        "auto-evicted idle tools in task"
+                    );
+                }
+
                 let tools_spec = self.tools.specs();
                 self.trim_to_context_window(&mut messages);
+                normalize_tool_call_ids(&mut messages);
 
                 let (response, _streamed) = self
                     .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)

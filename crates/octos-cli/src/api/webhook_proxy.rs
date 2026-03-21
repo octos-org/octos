@@ -154,11 +154,13 @@ pub async fn api_chat_proxy(
     port: u16,
     message: &str,
     session_id: Option<&str>,
+    media: &[String],
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
         "message": message,
         "session_id": session_id,
+        "media": media,
     });
 
     let resp = match state
@@ -202,6 +204,47 @@ pub async fn api_chat_proxy(
             &format!("failed to build SSE response: {e}"),
         ),
     }
+}
+
+/// Proxy a GET request to the gateway's API channel.
+pub async fn api_get_proxy(state: &AppState, port: u16, path: &str) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state.http_client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API GET proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = resp.bytes().await.unwrap_or_default();
+    let mut response = (status, body.to_vec()).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    response
+}
+
+/// Proxy a DELETE request to the gateway's API channel.
+pub async fn api_delete_proxy(state: &AppState, port: u16, path: &str) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state.http_client.delete(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API DELETE proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    status.into_response()
 }
 
 /// Return a JSON error response so Feishu/Lark doesn't complain about non-JSON.

@@ -6,7 +6,7 @@ use eyre::Result;
 use octos_core::Message;
 use octos_core::TokenUsage;
 use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::Agent;
 use crate::hooks::{HookEvent, HookPayload, HookResult};
@@ -91,9 +91,9 @@ impl Agent {
                     }
 
                     if attempt == Self::LLM_RETRY_MAX {
-                        // All retries exhausted with empty/filtered response -- report
-                        // failure to the adaptive router so it can failover, then
-                        // return error.
+                        // All streaming retries exhausted. Try one final non-streaming
+                        // call — this goes through FallbackProvider.chat() which tries
+                        // all fallback providers, not just the primary.
                         let reason = if response.stop_reason == StopReason::ContentFiltered {
                             "content filtered by safety/moderation"
                         } else {
@@ -103,8 +103,26 @@ impl Agent {
                         warn!(
                             attempts = Self::LLM_RETRY_MAX + 1,
                             reason,
-                            "LLM returned empty response after all retries, triggering failover"
+                            "streaming retries exhausted, trying non-streaming fallback"
                         );
+
+                        // Non-streaming call triggers FallbackProvider's full fallback chain
+                        match self.llm.chat(messages, tools_spec, config).await {
+                            Ok(fallback_resp) if !Self::is_retriable_response(&fallback_resp) => {
+                                info!("non-streaming fallback succeeded");
+                                let mut fallback_resp = fallback_resp;
+                                fallback_resp.usage.input_tokens += retry_usage.input_tokens;
+                                fallback_resp.usage.output_tokens += retry_usage.output_tokens;
+                                return Ok((fallback_resp, false));
+                            }
+                            Ok(_) => {
+                                warn!("non-streaming fallback also returned empty response");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "non-streaming fallback failed");
+                            }
+                        }
+
                         return Err(eyre::eyre!(
                             "LLM returned empty response after {} retries: {}",
                             Self::LLM_RETRY_MAX + 1,
@@ -171,8 +189,28 @@ impl Agent {
                         });
                         last_error = Some(e);
                         tokio::time::sleep(delay).await;
+                    } else if attempt == Self::LLM_RETRY_MAX {
+                        // Stream retries exhausted — try non-streaming with full fallback chain
+                        self.llm.report_late_failure();
+                        warn!(
+                            error = %e,
+                            "stream retries exhausted, trying non-streaming fallback"
+                        );
+                        match self.llm.chat(messages, tools_spec, config).await {
+                            Ok(resp) if !Self::is_retriable_response(&resp) => {
+                                info!("non-streaming fallback succeeded after stream failures");
+                                return Ok((resp, false));
+                            }
+                            Ok(_) => {
+                                warn!("non-streaming fallback also returned empty");
+                            }
+                            Err(fb_err) => {
+                                warn!(error = %fb_err, "non-streaming fallback also failed");
+                            }
+                        }
+                        return Err(e);
                     } else {
-                        // Non-retryable error or last attempt -- propagate
+                        // Non-retryable error -- propagate immediately
                         return Err(e);
                     }
                 }

@@ -111,6 +111,11 @@ impl GatewayDispatcher {
                 .await
                 .switch_to(base_key_str, name)
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
+
+            // Ensure the session exists in SessionManager so /sessions can list it.
+            let new_key = SessionKey(format!("{base_key_str}#{name}"));
+            self.session_mgr.lock().await.get_or_create(&new_key);
+
             let _ = self
                 .out_tx
                 .send(make_reply(
