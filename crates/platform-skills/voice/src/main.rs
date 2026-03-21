@@ -70,7 +70,16 @@ fn api_base_url() -> String {
             }
         }
     }
-    "http://localhost:8080".to_string()
+    "http://localhost:9090".to_string()
+}
+
+/// Clone URL: separate ominix instance with Base model for voice cloning.
+/// Falls back to the main API URL if not set.
+fn clone_base_url() -> String {
+    if let Ok(url) = std::env::var("OMINIX_CLONE_URL") {
+        return url.trim_end_matches('/').to_string();
+    }
+    api_base_url()
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -414,8 +423,9 @@ fn handle_synthesize(input_json: &str) {
             "language": language
         });
 
-        // Clone path returns WAV (has reference_audio → wants_wav=true in API)
-        let wav_bytes = match stream_tts_to_wav(&client, &base_url, &body) {
+        // Clone uses the Base model server (OMINIX_CLONE_URL)
+        let clone_url = clone_base_url();
+        let wav_bytes = match stream_tts_to_wav(&client, &clone_url, &body) {
             Ok(b) => b,
             Err(e) => fail(&format!("TTS (clone) failed: {e}")),
         };
