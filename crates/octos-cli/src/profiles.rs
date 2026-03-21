@@ -867,7 +867,10 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "secret_env": secret_env,
             }
         }),
-        ChannelCredentials::QQBot { app_id, client_secret_env } => serde_json::json!({
+        ChannelCredentials::QQBot {
+            app_id,
+            client_secret_env,
+        } => serde_json::json!({
             "type": "qq-bot",
             "settings": {
                 "app_id": app_id,
