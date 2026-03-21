@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc -b",
     "build": "tsc -b && vite build",
+    "build:embedded": "VITE_BASE_PATH=/admin/ VITE_OUT_DIR=../crates/crew-cli/static/admin npm run build",
     "preview": "vite preview"
   },
   "dependencies": {

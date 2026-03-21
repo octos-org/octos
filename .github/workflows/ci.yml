@@ -9,6 +9,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard deps
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Dashboard typecheck
+        working-directory: dashboard
+        run: npm run typecheck
+
+      - name: Dashboard build
+        working-directory: dashboard
+        run: npm run build
+
+      - name: Verify embedded dashboard assets are up to date
+        run: |
+          ./scripts/build-dashboard.sh
+          if [ -n "$(git status --porcelain -- crates/octos-cli/static/admin)" ]; then
+            echo "Embedded dashboard assets are out of date. Run ./scripts/build-dashboard.sh and commit changes."
+            git status --short -- crates/octos-cli/static/admin
+            exit 1
+          fi
+
   check:
     runs-on: macos-14
     steps:
@@ -64,4 +96,4 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
-          cargo test -p octos-agent --test security_sandbox -- --nocapture
+          cargo test -p crew-agent --test security_sandbox -- --nocapture

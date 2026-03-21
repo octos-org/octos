@@ -405,6 +405,7 @@ impl AuthManager {
 }
 
 /// Generate a 6-digit numeric OTP code.
+#[cfg(feature = "api")]
 fn generate_otp_code() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -412,13 +413,26 @@ fn generate_otp_code() -> String {
     format!("{code:06}")
 }
 
+#[cfg(not(feature = "api"))]
+fn generate_otp_code() -> String {
+    // Deterministic fallback — OTP is only meaningful with the API server.
+    "000000".to_string()
+}
+
 /// Generate a 32-byte hex session token.
+#[cfg(feature = "api")]
 fn generate_session_token() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     hex_encode(&bytes)
+}
+
+#[cfg(not(feature = "api"))]
+fn generate_session_token() -> String {
+    // Deterministic fallback — sessions are only meaningful with the API server.
+    hex_encode(&[0u8; 32])
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -447,6 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "api")]
     fn test_generate_otp_code() {
         let code = generate_otp_code();
         assert_eq!(code.len(), 6);
@@ -456,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "api")]
     fn test_generate_session_token() {
         let token = generate_session_token();
         assert_eq!(token.len(), 64);

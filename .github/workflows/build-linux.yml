@@ -28,7 +28,7 @@ jobs:
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Build octos CLI
-        run: cargo build --release -p octos-cli --features "api,telegram,feishu,twilio,wecom"
+        run: cargo build --release -p octos-cli --features "api,telegram,discord,feishu,twilio,wecom,wecom-bot"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
