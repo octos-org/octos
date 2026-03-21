@@ -191,10 +191,19 @@ impl Handler for CodergenHandler {
         }
 
         // Build system prompt from node prompt template
-        let system_prompt = match &node.prompt {
+        let mut system_prompt = match &node.prompt {
             Some(p) => p.clone(),
             None => "Complete the task given to you.".to_string(),
         };
+
+        // If the node has write_file tool, instruct the agent to save the report
+        if node.tools.iter().any(|t| t == "write_file") {
+            system_prompt.push_str(
+                "\n\nIMPORTANT: You MUST save your complete report using the write_file tool. \
+                 Choose a descriptive filename. Do NOT just return the report as text — \
+                 save it as a file so it can be sent to the user.",
+            );
+        }
 
         // Create and run the agent.
         // When max_output_tokens is not set in the DOT graph, use the
