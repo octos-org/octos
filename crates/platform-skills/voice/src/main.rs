@@ -363,9 +363,23 @@ fn handle_synthesize(input_json: &str) {
         fail(&e);
     }
 
-    let output_path = input
-        .output_path
-        .unwrap_or_else(|| format!("/tmp/octos_tts_{}.wav", timestamp()));
+    // Always save to OCTOS_WORK_DIR (inside profile data_dir) so send_file
+    // can access the file. Ignore LLM's output_path to avoid sandbox violations.
+    let filename = input.output_path
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("tts_{}.wav", timestamp()));
+    let output_path = if let Ok(work_dir) = std::env::var("OCTOS_WORK_DIR") {
+        let dir = Path::new(&work_dir);
+        let _ = std::fs::create_dir_all(dir);
+        dir.join(&filename).to_string_lossy().to_string()
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir.join(&filename).to_string_lossy().to_string(),
+            Err(_) => format!("/tmp/{filename}"),
+        }
+    };
 
     if let Some(parent) = Path::new(&output_path).parent() {
         if !parent.exists() {
