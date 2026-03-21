@@ -150,9 +150,7 @@ impl Tool for ActivateToolsTool {
 
         if all_activated.is_empty() {
             Ok(ToolResult {
-                output: format!(
-                    "No tools matched. Call activate_tools with no arguments to see available tools."
-                ),
+                output: "No tools matched. Call activate_tools with no arguments to see available tools.".to_string(),
                 success: false,
                 ..Default::default()
             })

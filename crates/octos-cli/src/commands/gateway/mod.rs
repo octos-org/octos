@@ -859,7 +859,7 @@ impl GatewayCommand {
             {
                 let llm_c = llm.clone();
                 let mem_c = memory.clone();
-                let cwd_c = cwd.clone();
+                let _cwd_c = cwd.clone();
                 let data_c = data_dir.clone();
                 let policy_c = tools.provider_policy().cloned();
                 let plugins_c = plugin_dirs.clone();

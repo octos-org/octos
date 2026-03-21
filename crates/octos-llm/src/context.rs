@@ -34,7 +34,7 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
                 max_output: *max_out,
             },
         );
-        if let Some(model) = key.split('/').last() {
+        if let Some(model) = key.split('/').next_back() {
             map.insert(
                 model.to_string(),
                 CatalogModel {

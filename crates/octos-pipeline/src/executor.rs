@@ -408,8 +408,6 @@ fn resolve_search_result_files(content: &str) -> String {
                 .unwrap_or(false)
             {
                 path.to_path_buf()
-            } else if path.is_dir() {
-                path.join("_search_results.md")
             } else {
                 continue;
             };

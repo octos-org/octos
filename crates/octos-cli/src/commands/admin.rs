@@ -82,8 +82,8 @@ impl Executable for AdminCommand {
             AdminAction::CreateTenant {
                 name,
                 domain,
-                server,
-                port,
+                server: _,
+                port: _,
                 local_port,
                 auth_token: auth_token_arg,
                 data_dir,

@@ -475,7 +475,7 @@ impl ActorFactory {
                     .iter()
                     .find(|g| g.name == name)
                 {
-                    tool_names.extend(info.tools.iter().map(|s| *s));
+                    tool_names.extend(info.tools.iter().copied());
                 }
             }
             let template = include_str!("../../octos-agent/src/prompts/deferred_tools.txt");
