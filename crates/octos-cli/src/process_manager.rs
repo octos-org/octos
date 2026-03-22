@@ -879,7 +879,9 @@ impl ProcessManager {
         }
         drop(bridges);
 
-        let ws_port = 3201u16; // Fixed port for now
+        let bridges2 = self.bridges.read().await;
+        let ws_port = self.allocate_wechat_port(&bridges2);
+        drop(bridges2);
 
         // Resolve token from profile env_vars
         let token_env = profile.config.channels.iter().find_map(|ch| {
@@ -1052,6 +1054,13 @@ impl ProcessManager {
 
     /// Allocate the next available port pair for a bridge.
     /// Checks both the in-memory bridge map and actual port availability.
+
+    fn allocate_wechat_port(&self, bridges: &HashMap<String, BridgeProcess>) -> u16 {
+        let used: std::collections::HashSet<u16> = bridges.values().map(|b| b.ws_port).collect();
+        let mut port = 3201u16;
+        while used.contains(&port) || !port_available(port) { port += 1; }
+        port
+    }
     fn allocate_bridge_ports(&self, bridges: &HashMap<String, BridgeProcess>) -> (u16, u16) {
         let used_ports: std::collections::HashSet<u16> =
             bridges.values().map(|b| b.ws_port).collect();
