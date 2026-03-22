@@ -76,6 +76,10 @@ pub struct GatewayCommand {
     #[arg(long, hide = true)]
     pub bridge_url: Option<String>,
 
+    /// Internal: managed WeChat bridge WebSocket URL.
+    #[arg(long, hide = true)]
+    pub wechat_bridge_url: Option<String>,
+
     /// Override Feishu webhook port (used by managed gateways).
     #[arg(long, hide = true)]
     pub feishu_port: Option<u16>,
@@ -1399,7 +1403,8 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "wechat")]
                 "wechat" => {
-                    let bridge_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
+                    let default_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
+                    let bridge_url = self.wechat_bridge_url.as_deref().unwrap_or(&default_url);
                     channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
                         &bridge_url,
                         entry.allowed_senders.clone(),

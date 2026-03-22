@@ -963,9 +963,27 @@ mod tests {
 
 /// GET /api/my/profile/wechat/qr-start
 pub async fn my_wechat_qr_start(
-    State(_state): State<Arc<AppState>>,
-    axum::Extension(_identity): axum::Extension<AuthIdentity>,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Check if ProcessManager has a bridge with QR info
+    if let Some(pm) = state.process_manager.as_ref() {
+        let ps = state.profile_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
+        let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps)
+            .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
+        let key = format!("{}-wechat", profile_id);
+        if let Some(info) = pm.bridge_qr(&key).await {
+            if let Some(ref qr_url) = info.qr {
+                return Ok(Json(serde_json::json!({
+                    "qrcode_url": qr_url,
+                    "session_key": "",
+                    "bridge_managed": true
+                })));
+            }
+        }
+    }
+
+    // Fallback: direct QR fetch
     let client = reqwest::Client::new();
     let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
     let resp = client
