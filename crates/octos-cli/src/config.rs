@@ -807,6 +807,7 @@ impl Config {
                 "wecom",
                 "wecom-bot",
                 "qq-bot",
+                "wechat",
             ];
             for ch in &gw.channels {
                 if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {

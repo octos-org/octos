@@ -48,7 +48,8 @@ pub(crate) use prompt::build_system_prompt;
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
-    feature = "qq-bot"
+    feature = "qq-bot",
+    feature = "wechat"
 ))]
 use prompt::settings_str;
 
@@ -1392,6 +1393,15 @@ impl GatewayCommand {
                     channel_mgr.register(Arc::new(octos_bus::QQBotChannel::new(
                         &app_id,
                         &client_secret,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "wechat")]
+                "wechat" => {
+                    let bridge_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
+                    channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
+                        &bridge_url,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
                     )));

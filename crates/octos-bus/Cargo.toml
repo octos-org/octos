@@ -18,6 +18,7 @@ twilio = ["axum"]
 wecom = ["axum"]
 wecom-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
 qq-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
+wechat = ["tokio-tungstenite"]
 email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 [dependencies]

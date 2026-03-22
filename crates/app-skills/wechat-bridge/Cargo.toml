@@ -1,0 +1,16 @@
+[package]
+name = "wechat-bridge"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wechat-bridge"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }

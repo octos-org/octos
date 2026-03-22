@@ -8,6 +8,7 @@ import WhatsAppTab from '../../components/tabs/WhatsAppTab'
 import FeishuTab from '../../components/tabs/FeishuTab'
 import WeComBotTab from '../../components/tabs/WeComBotTab'
 import QQBotTab from '../../components/tabs/QQBotTab'
+import WeChatTab from "../../components/tabs/WeChatTab"
 
 const TABS = [
   { key: 'telegram', label: 'Telegram' },
@@ -15,7 +16,8 @@ const TABS = [
   { key: 'whatsapp', label: 'WhatsApp' },
   { key: 'feishu', label: 'Feishu' },
   { key: 'wecom-bot', label: 'WeCom' },
-  { key: 'qq-bot', label: 'QQ Bot' },
+  { key: "qq-bot", label: "QQ Bot" },
+  { key: "wechat", label: "WeChat" },
 ]
 
 export default function MessagingPage() {
@@ -46,6 +48,7 @@ export default function MessagingPage() {
           {activeTab === 'feishu' && <FeishuTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'wecom-bot' && <WeComBotTab config={config} onChange={setConfig} />}
           {activeTab === 'qq-bot' && <QQBotTab config={config} onChange={setConfig} />}
+          {activeTab === "wechat" && <WeChatTab config={config} onChange={setConfig} />}
         </div>
         <SaveFooter onSave={save} saving={saving} />
       </div>
