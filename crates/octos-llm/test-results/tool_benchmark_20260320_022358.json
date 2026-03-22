@@ -1,0 +1,282 @@
+[
+  {
+    "provider": "gemini/gemini-2.5-flash",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1015,
+        "p95_latency_ms": 1181
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1013,
+        "p95_latency_ms": 1127
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 990,
+        "p95_latency_ms": 1192
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1323,
+        "p95_latency_ms": 1934
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 968,
+        "p95_latency_ms": 1168
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 976,
+        "p95_latency_ms": 1090
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "gemini/gemini-2.5-flash-lite",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 675,
+        "p95_latency_ms": 997
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 488,
+        "p95_latency_ms": 552
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 451,
+        "p95_latency_ms": 519
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 591,
+        "p95_latency_ms": 993
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 525,
+        "p95_latency_ms": 548
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 492,
+        "p95_latency_ms": 544
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "openai/gpt-4o",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1250,
+        "p95_latency_ms": 1593
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1325,
+        "p95_latency_ms": 2441
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 549,
+        "p95_latency_ms": 650
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 950,
+        "p95_latency_ms": 1368
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 735,
+        "p95_latency_ms": 1237
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 720,
+        "p95_latency_ms": 919
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "openai/gpt-4o-mini",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 789,
+        "p95_latency_ms": 1363
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 745,
+        "p95_latency_ms": 826
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 676,
+        "p95_latency_ms": 711
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 940,
+        "p95_latency_ms": 1492
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 779,
+        "p95_latency_ms": 884
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 772,
+        "p95_latency_ms": 815
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  }
+]

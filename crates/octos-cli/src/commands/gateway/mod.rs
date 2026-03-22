@@ -33,7 +33,9 @@ use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
-use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
+use crate::session_actor::{
+    ActorFactory, ActorRegistry, DispatchParams, SnapshotToolRegistryFactory,
+};
 use crate::status_layers::StatusComposer;
 
 // Re-export for use by prompt module
@@ -2016,14 +2018,17 @@ impl GatewayCommand {
 
             // Dispatch to per-session actor (creates one if needed)
             actor_registry
-                .dispatch(
-                    inbound,
+                .dispatch(DispatchParams {
+                    message: inbound,
                     image_media,
                     session_key,
-                    &reply_channel,
-                    &reply_chat_id,
+                    reply_channel: &reply_channel,
+                    reply_chat_id: &reply_chat_id,
                     status_indicator,
-                )
+                    profile_id: None,
+                    system_prompt_override: None,
+                    sender_user_id: None,
+                })
                 .await;
 
             // Periodically reap dead actors to free resources

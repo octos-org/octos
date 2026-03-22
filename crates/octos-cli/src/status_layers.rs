@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use octos_agent::TokenTracker;
 use octos_bus::Channel;
-use octos_core::OutboundMessage;
+use octos_core::{METADATA_SENDER_USER_ID, OutboundMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tracing::warn;
@@ -298,6 +298,7 @@ impl StatusComposer {
         tracker: Arc<TokenTracker>,
         voice_transcript: Option<String>,
         user_config: &UserStatusConfig,
+        sender_user_id: Option<String>,
     ) -> ComposerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let status_msg_id = Arc::new(Mutex::new(None::<String>));
@@ -360,6 +361,7 @@ impl StatusComposer {
                 voice_transcript,
                 metrics_visible,
                 provider_visible,
+                sender_user_id,
             )
             .await;
         });
@@ -564,13 +566,16 @@ async fn run_compose_loop(
     voice_transcript: Option<String>,
     metrics_visible: bool,
     provider_visible: bool,
+    sender_user_id: Option<String>,
 ) {
     let start = Instant::now();
     let mut last_edit = Instant::now() - EDIT_THROTTLE;
     let mut last_composed = String::new();
 
     // Immediately send typing indicator
-    let _ = channel.send_typing(&chat_id).await;
+    let _ = channel
+        .send_typing_as(&chat_id, sender_user_id.as_deref())
+        .await;
 
     // Wait 2 seconds before sending a visible status message
     for _ in 0..4 {
@@ -589,7 +594,9 @@ async fn run_compose_loop(
             if cancelled.load(Ordering::Acquire) {
                 return;
             }
-            let _ = channel.send_typing(&chat_id).await;
+            let _ = channel
+                .send_typing_as(&chat_id, sender_user_id.as_deref())
+                .await;
         }
     }
 
@@ -610,7 +617,9 @@ async fn run_compose_loop(
 
         // Send typing indicator every 5 seconds
         if tick % 5 == 0 {
-            let _ = channel.send_typing(&chat_id).await;
+            let _ = channel
+                .send_typing_as(&chat_id, sender_user_id.as_deref())
+                .await;
         }
 
         // Rotate operation words on their interval
@@ -658,7 +667,10 @@ async fn run_compose_loop(
                     content: composed.clone(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({}),
+                    metadata: sender_user_id
+                        .as_ref()
+                        .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
+                        .unwrap_or_else(|| serde_json::json!({})),
                 };
                 match channel.send_with_id(&msg).await {
                     Ok(Some(mid)) => {
@@ -777,6 +789,54 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
+    use tokio::sync::{Mutex, mpsc};
+
+    #[derive(Default)]
+    struct MockChannel {
+        sent: Arc<Mutex<Vec<OutboundMessage>>>,
+        typing_senders: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn start(&self, _inbound_tx: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, msg: &OutboundMessage) -> eyre::Result<()> {
+            self.sent.lock().await.push(msg.clone());
+            Ok(())
+        }
+
+        async fn send_with_id(&self, msg: &OutboundMessage) -> eyre::Result<Option<String>> {
+            self.sent.lock().await.push(msg.clone());
+            Ok(Some("$status-1".to_string()))
+        }
+
+        async fn send_typing_as(
+            &self,
+            _chat_id: &str,
+            sender_user_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.typing_senders
+                .lock()
+                .await
+                .push(sender_user_id.map(str::to_string));
+            Ok(())
+        }
+
+        fn supports_edit(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn should_compose_visible_layers_in_priority_order() {
@@ -889,6 +949,60 @@ mod tests {
 
         let composed = compose_message(&layers, true, true, Some("what about today"));
         assert!(composed.contains("🎙 what about today"));
+    }
+
+    #[tokio::test]
+    async fn should_send_status_message_with_sender_user_id() {
+        let channel = Arc::new(MockChannel::default());
+        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
+        let tracker = Arc::new(TokenTracker::new());
+
+        let handle = composer.start(
+            "!room:localhost".to_string(),
+            "hello",
+            tracker,
+            None,
+            &UserStatusConfig::default(),
+            Some("@bot_mybot:localhost".to_string()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(3300)).await;
+        handle.cancelled.store(true, Ordering::Release);
+
+        let sent = channel.sent.lock().await;
+        let first = sent.first().expect("status message should be sent");
+        assert_eq!(
+            first
+                .metadata
+                .get(METADATA_SENDER_USER_ID)
+                .and_then(|v| v.as_str()),
+            Some("@bot_mybot:localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_typing_with_sender_user_id() {
+        let channel = Arc::new(MockChannel::default());
+        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
+        let tracker = Arc::new(TokenTracker::new());
+
+        let handle = composer.start(
+            "!room:localhost".to_string(),
+            "hello",
+            tracker,
+            None,
+            &UserStatusConfig::default(),
+            Some("@bot_mybot:localhost".to_string()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.cancelled.store(true, Ordering::Release);
+
+        let typing = channel.typing_senders.lock().await;
+        assert_eq!(
+            typing.first().and_then(|v| v.as_deref()),
+            Some("@bot_mybot:localhost")
+        );
     }
 
     #[test]

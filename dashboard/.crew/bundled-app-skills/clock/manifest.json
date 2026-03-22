@@ -1,0 +1,24 @@
+{
+  "name": "clock",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "Get current date and time in any timezone worldwide",
+  "timeout_secs": 5,
+  "requires_network": false,
+  "tools": [
+    {
+      "name": "get_time",
+      "description": "Get the current date and time. Optionally specify a timezone (e.g. 'Europe/Stockholm', 'US/Eastern', 'Asia/Shanghai', 'UTC'). Returns formatted date, time, timezone offset, and day of week.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "description": "IANA timezone name (e.g. 'Europe/Stockholm', 'Asia/Tokyo', 'US/Pacific', 'UTC'). Default: server local time."
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}
