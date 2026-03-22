@@ -80,6 +80,10 @@ impl RunPipelineTool {
         let is_inline = trimmed.starts_with("digraph ") || trimmed.starts_with("digraph{");
 
         if is_inline {
+            // Sanitize common LLM DOT mistakes before parsing
+            let sanitized = sanitize_dot(trimmed);
+            let trimmed = sanitized.as_str();
+
             // Validate inline DOT parses correctly
             match crate::parser::parse_dot(trimmed) {
                 Ok(_) => return Ok(pipeline_str.to_string()),
@@ -87,8 +91,14 @@ impl RunPipelineTool {
                     // Log the full DOT for debugging parse failures
                     let dot_preview = if trimmed.len() > 500 {
                         let mut end = 500;
-                        while !trimmed.is_char_boundary(end) && end > 0 { end -= 1; }
-                        format!("{}...(truncated at {} bytes)", &trimmed[..end], trimmed.len())
+                        while !trimmed.is_char_boundary(end) && end > 0 {
+                            end -= 1;
+                        }
+                        format!(
+                            "{}...(truncated at {} bytes)",
+                            &trimmed[..end],
+                            trimmed.len()
+                        )
                     } else {
                         trimmed.to_string()
                     };
@@ -274,4 +284,31 @@ impl Tool for RunPipelineTool {
             ..Default::default()
         })
     }
+}
+
+/// Sanitize common LLM DOT mistakes that would cause parse failures.
+fn sanitize_dot(dot: &str) -> String {
+    let mut result = dot.to_string();
+
+    // Fix: digraph{ → digraph {
+    if result.contains("digraph{") {
+        result = result.replace("digraph{", "digraph pipeline {");
+    }
+
+    // Fix: digraph { (no name) → digraph pipeline {
+    // The parser now handles this, but belt-and-suspenders
+    if result.starts_with("digraph {") || result.starts_with("digraph  {") {
+        result = result.replacen("digraph", "digraph pipeline", 1);
+    }
+
+    // Fix: markdown code fences around DOT
+    if result.starts_with("```") {
+        // Strip ```dot or ```graphviz or ``` prefix/suffix
+        let lines: Vec<&str> = result.lines().collect();
+        let start = if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) { 1 } else { 0 };
+        let end = if lines.last().map(|l| l.trim() == "```").unwrap_or(false) { lines.len() - 1 } else { lines.len() };
+        result = lines[start..end].join("\n");
+    }
+
+    result
 }

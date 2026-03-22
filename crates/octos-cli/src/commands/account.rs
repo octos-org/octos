@@ -479,5 +479,6 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
         ChannelCredentials::Api { .. } => "api",
         ChannelCredentials::WeComBot { .. } => "wecom-bot",
         ChannelCredentials::Matrix { .. } => "matrix",
+        ChannelCredentials::QQBot { .. } => "qq-bot",
     }
 }

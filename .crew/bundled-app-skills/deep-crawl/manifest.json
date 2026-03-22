@@ -1,0 +1,37 @@
+{
+  "name": "deep-crawl",
+  "version": "1.0.0",
+  "description": "Recursively crawl a website using headless Chrome (CDP). Renders JavaScript, follows same-origin links via BFS, extracts text from each page, and saves results to disk.",
+  "author": "hagency",
+  "requires_bins": ["google-chrome"],
+  "tools": [
+    {
+      "name": "deep_crawl",
+      "description": "Recursively crawl a website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS, extracts text from each page, and saves results to disk. Ideal for JS-rendered SPAs and documentation sites.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Starting URL to crawl"
+          },
+          "max_depth": {
+            "type": "integer",
+            "description": "Maximum link-following depth (range: 1-10, default: 3)",
+            "default": 3
+          },
+          "max_pages": {
+            "type": "integer",
+            "description": "Maximum number of pages to crawl (range: 1-200, default: 50)",
+            "default": 50
+          },
+          "path_prefix": {
+            "type": "string",
+            "description": "Only follow links under this path prefix (e.g. /docs/)"
+          }
+        },
+        "required": ["url"]
+      }
+    }
+  ]
+}

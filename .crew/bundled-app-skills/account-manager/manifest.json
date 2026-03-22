@@ -1,0 +1,63 @@
+{
+  "name": "account-manager",
+  "version": "1.1.0",
+  "author": "hagency",
+  "description": "Manage sub-accounts under the current profile",
+  "tools": [
+    {
+      "name": "manage_account",
+      "description": "Manage sub-accounts under the current profile. Sub-accounts share the parent's LLM provider and API keys but have their own data directory, memory, skills, and messaging channels. Supports creating, updating, listing, deleting, starting, stopping, and restarting sub-accounts.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["list", "create", "update", "delete", "info", "start", "stop", "restart"],
+            "description": "Action to perform. 'update' changes config on an existing sub-account. 'start'/'stop' enable/disable the gateway. 'restart' restarts a running gateway."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name for the sub-account (required for 'create', optional for 'update'/'info' to resolve ID)."
+          },
+          "sub_account_id": {
+            "type": "string",
+            "description": "ID of the sub-account (required for 'update', 'delete', 'info', 'start', 'stop', 'restart'). Format: parent-id--slug, e.g. 'dspfac--work-bot'."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "System prompt for the sub-account. Used with 'create' or 'update'. Set to empty string to clear."
+          },
+          "telegram_token": {
+            "type": "string",
+            "description": "Telegram bot token. Used with 'create' or 'update' to add/replace a Telegram channel."
+          },
+          "telegram_senders": {
+            "type": "string",
+            "description": "Comma-separated Telegram user IDs allowed to interact with the bot. Used with 'update' to restrict access. Example: '5460262597,123456789'."
+          },
+          "whatsapp": {
+            "type": "boolean",
+            "description": "Enable (true) or disable (false) WhatsApp channel. Used with 'update'."
+          },
+          "feishu_app_id": {
+            "type": "string",
+            "description": "Feishu/Lark app ID. Used with 'update' to add/configure a Feishu channel."
+          },
+          "feishu_app_secret": {
+            "type": "string",
+            "description": "Feishu/Lark app secret. Used with 'update' to add/configure a Feishu channel."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable or disable the sub-account. Used with 'update'. For convenience, use 'start'/'stop' actions instead."
+          },
+          "enable": {
+            "type": "boolean",
+            "description": "Whether to auto-enable the sub-account after creation. Default: false. Only used with 'create'."
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  ]
+}

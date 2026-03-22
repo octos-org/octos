@@ -34,6 +34,24 @@ impl Agent {
         mut stream: ChatStream,
         iteration: u32,
     ) -> Result<(ChatResponse, bool)> {
+        self.consume_stream_inner(stream, iteration, 0).await
+    }
+
+    pub(super) async fn consume_stream_with_input_estimate(
+        &self,
+        stream: ChatStream,
+        iteration: u32,
+        input_tokens_estimate: u32,
+    ) -> Result<(ChatResponse, bool)> {
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate).await
+    }
+
+    async fn consume_stream_inner(
+        &self,
+        mut stream: ChatStream,
+        iteration: u32,
+        input_tokens_estimate: u32,
+    ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
         self.reporter().report(ProgressEvent::Response {
             content: String::new(),
@@ -47,23 +65,34 @@ impl Agent {
         let mut usage = octos_llm::TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
 
-        // Per-chunk timeout: if no SSE event arrives within 30s, the stream
-        // is likely stalled (connection alive but provider stopped sending).
-        // Normal chunk intervals are <1s; thinking models may pause up to ~15s
-        // before the first token. 30s gives ample margin while catching stalls
-        // much faster than the previous behavior (hung indefinitely).
-        const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        // Adaptive stream timeout:
+        // - TTFT (first token): generous — models need time to process large
+        //   inputs before generating. Scales with input: base 30s + 1s per 1K
+        //   input tokens, capped at 180s.
+        // - Inter-chunk: once streaming starts, chunks arrive every <1s.
+        //   If no chunk for 30s after first token, the stream is stalled.
+        let ttft_secs = (30 + input_tokens_estimate as u64 / 1000).min(180);
+        let mut got_first_chunk = false;
 
         loop {
+            let timeout = if got_first_chunk {
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::from_secs(ttft_secs)
+            };
+
             let event = tokio::select! {
                 event = stream.next() => event,
                 _ = self.wait_for_shutdown() => {
                     warn!("shutdown received during streaming");
                     break;
                 }
-                _ = tokio::time::sleep(CHUNK_TIMEOUT) => {
-                    warn!("stream chunk timeout after {}s — provider may be stalled",
-                        CHUNK_TIMEOUT.as_secs());
+                _ = tokio::time::sleep(timeout) => {
+                    if got_first_chunk {
+                        warn!("stream inter-chunk timeout after 30s — provider stalled");
+                    } else {
+                        warn!("stream TTFT timeout after {ttft_secs}s (input_estimate={input_tokens_estimate})");
+                    }
                     break;
                 }
             };
@@ -76,9 +105,11 @@ impl Agent {
 
             match event {
                 StreamEvent::ReasoningDelta(delta) => {
+                    got_first_chunk = true;
                     reasoning.push_str(&delta);
                 }
                 StreamEvent::TextDelta(delta) => {
+                    got_first_chunk = true;
                     self.reporter().report(ProgressEvent::StreamChunk {
                         text: delta.clone(),
                         iteration,

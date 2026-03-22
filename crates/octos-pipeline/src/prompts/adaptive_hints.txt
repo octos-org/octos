@@ -14,6 +14,7 @@ Adapt the pipeline to the query:
 - Cross-language: ALWAYS include English search angles. Add angles in languages relevant to the topic's origin (e.g. Persian/Arabic for Iran events, Japanese for Japanese tech, German for EU policy, Chinese for Chinese topics)
 - Data flow: search results are automatically collected and passed to the analyze node as input. Workers do NOT need to output paths — the system reads _search_results.md files automatically.
 - Analyze nodes receive all search findings as input. Give tools="read_file,deep_crawl" so the analyzer can investigate specific sources deeper if needed.
+  The analyze prompt MUST instruct: 'Strip any residual HTML tags, navigation text, cookie notices, and web page boilerplate from the source material. Extract only the substantive content — facts, quotes, data, and analysis. Output clean, structured text for the synthesis stage.'
 - Synthesize nodes receive the analysis as input. Give tools="write_file" to save the final report.
 - Match report language to query language
 - Timeouts: synthesize=900s, search=600s, analyze=300s

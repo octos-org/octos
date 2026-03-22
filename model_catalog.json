@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-03-20T03:00:00Z",
+  "updated_at": "2026-03-22T06:00:00Z",
   "models": [
     {
       "provider": "minimax/MiniMax-M2.7",
@@ -15,19 +15,6 @@
       "max_output": 131072
     },
     {
-      "provider": "nvidia/minimax-m2.5",
-      "type": "fast",
-      "stability": 0.73,
-      "tool_avg_ms": 893,
-      "p95_ms": 1456,
-      "score": 0.0,
-      "cost_in": 0.00,
-      "cost_out": 0.00,
-      "ds_output": 5624,
-      "context_window": 200000,
-      "max_output": 196608
-    },
-    {
       "provider": "zai/glm-5",
       "type": "strong",
       "stability": 0.97,
@@ -41,6 +28,32 @@
       "max_output": 128000
     },
     {
+      "provider": "zai/glm-5-turbo",
+      "type": "fast",
+      "stability": 0.97,
+      "tool_avg_ms": 1500,
+      "p95_ms": 2500,
+      "score": 0.0,
+      "cost_in": 0.50,
+      "cost_out": 2.00,
+      "ds_output": 4800,
+      "context_window": 200000,
+      "max_output": 128000
+    },
+    {
+      "provider": "moonshot/kimi-k2.5",
+      "type": "strong",
+      "stability": 0.93,
+      "tool_avg_ms": 6757,
+      "p95_ms": 18121,
+      "score": 0.0,
+      "cost_in": 0.60,
+      "cost_out": 2.40,
+      "ds_output": 4198,
+      "context_window": 262144,
+      "max_output": 65535
+    },
+    {
       "provider": "deepseek/deepseek-chat",
       "type": "strong",
       "stability": 1.0,
@@ -52,19 +65,6 @@
       "ds_output": 4266,
       "context_window": 128000,
       "max_output": 8000
-    },
-    {
-      "provider": "nvidia/kimi-k2.5",
-      "type": "strong",
-      "stability": 0.93,
-      "tool_avg_ms": 6757,
-      "p95_ms": 18121,
-      "score": 0.0,
-      "cost_in": 0.00,
-      "cost_out": 0.00,
-      "ds_output": 4198,
-      "context_window": 262144,
-      "max_output": 65535
     },
     {
       "provider": "dashscope/qwen3.5-plus",

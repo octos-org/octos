@@ -75,6 +75,7 @@ const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/Applications", // macOS apps (for tool binaries)
     "/private/tmp",
     "/private/var/folders",
+    "/private/var/select", // macOS shell init (e.g. /private/var/select/sh)
     "/tmp",
     "/var/tmp",
     "/etc", // system config (needed for DNS resolution, etc.)
@@ -298,6 +299,24 @@ impl Sandbox for MacosSandbox {
             "(deny network*)"
         };
 
+        // Resolve cwd to its real path (macOS /tmp → /private/tmp symlink).
+        // SBPL subpath rules operate on real paths, so if cwd is /tmp/foo the
+        // rule must use /private/tmp/foo or writes will be denied.
+        let real_cwd = std::fs::canonicalize(cwd)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| cwd_escaped.to_string());
+        // Validate the resolved path too
+        if real_cwd
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+        {
+            tracing::error!("resolved cwd contains SBPL metacharacters, refusing to execute");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("echo 'sandbox error: resolved cwd contains invalid characters' >&2; exit 1");
+            return cmd;
+        }
+
         // Build file-read rules: global if no read_allow_paths, restricted otherwise
         let read_rules = if self.read_allow_paths.is_empty() {
             "(allow file-read*)".to_string()
@@ -305,10 +324,15 @@ impl Sandbox for MacosSandbox {
             let mut rules = Vec::new();
             // dyld needs to stat "/" during process startup (macOS Sequoia+).
             rules.push("(allow file-read* (literal \"/\"))".to_string());
-            // Always allow reading the workspace
+            // Allow stat()/lstat() globally — needed for getcwd(), realpath(),
+            // and traversing parent directories of allowed subpaths. This only
+            // permits metadata operations (file size, permissions, existence);
+            // file-read-data (actual content reads) still requires subpath rules.
+            rules.push("(allow file-read-metadata)".to_string());
+            // Always allow reading the workspace (use canonical path for SBPL)
             rules.push(format!(
                 "(allow file-read* (subpath \"{cwd}\"))",
-                cwd = cwd_escaped
+                cwd = real_cwd
             ));
             // Add configured read paths — validate each for SBPL metacharacters
             // to prevent sandbox profile injection (same check as cwd above).
@@ -332,24 +356,6 @@ impl Sandbox for MacosSandbox {
             }
             rules.join("\n")
         };
-
-        // Resolve cwd to its real path (macOS /tmp → /private/tmp symlink).
-        // SBPL subpath rules operate on real paths, so if cwd is /tmp/foo the
-        // rule must use /private/tmp/foo or writes will be denied.
-        let real_cwd = std::fs::canonicalize(cwd)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| cwd_escaped.to_string());
-        // Validate the resolved path too
-        if real_cwd
-            .bytes()
-            .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
-        {
-            tracing::error!("resolved cwd contains SBPL metacharacters, refusing to execute");
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg("echo 'sandbox error: resolved cwd contains invalid characters' >&2; exit 1");
-            return cmd;
-        }
 
         let profile = format!(
             r#"(version 1)
@@ -1202,11 +1208,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn should_restrict_reads_when_read_paths_configured() {
+        // Use a real temp dir so canonicalize works (macOS /tmp → /private/tmp)
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
         let sb = MacosSandbox {
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
         };
-        let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
+        let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -1221,10 +1235,17 @@ mod tests {
             !profile.contains("(allow file-read*)\n"),
             "should not have global file-read*"
         );
-        // Should contain workspace read
+        // Should contain file-read-metadata for path traversal
         assert!(
-            profile.contains(r#"(allow file-read* (subpath "/tmp/test"))"#),
-            "should allow reading workspace"
+            profile.contains("(allow file-read-metadata)"),
+            "should allow file-read-metadata globally"
+        );
+        // Should contain workspace read (using canonical path)
+        assert!(
+            profile.contains(&format!(
+                r#"(allow file-read* (subpath "{real_cwd}"))"#
+            )),
+            "should allow reading workspace at canonical path, profile:\n{profile}"
         );
         // Should contain custom path
         assert!(
@@ -1398,21 +1419,33 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let cwd = tmp.path();
 
-        // Create a file outside cwd that should be unreadable
-        let outside = tempfile::tempdir().expect("create outside dir");
-        let secret_file = outside.path().join("secret.txt");
+        // Place the secret file under the user's HOME directory, which is NOT
+        // in DEFAULT_READ_ALLOW_PATHS. Using tempfile::tempdir() would put it
+        // under /private/var/folders which IS allowed, defeating the test.
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let secret_dir = std::path::PathBuf::from(&home).join(".sandbox_test_tmp");
+        std::fs::create_dir_all(&secret_dir).expect("create secret dir");
+        let secret_file = secret_dir.join("secret.txt");
         std::fs::write(&secret_file, "top-secret-data").expect("write secret");
 
         let sb = MacosSandbox {
             allow_network: false,
-            // Only allow reads from cwd + system paths — NOT outside dir
+            // Only allow reads from cwd + system paths — NOT home dir
             read_allow_paths: vec!["/nonexistent/path".to_string()],
         };
-        let cmd_str = format!("cat {} 2>&1; echo exit=$?", secret_file.display());
+        // Use the canonical path so SBPL matches correctly
+        let real_secret = std::fs::canonicalize(&secret_file)
+            .unwrap_or_else(|_| secret_file.clone());
+        let cmd_str = format!("cat {} 2>&1; echo exit=$?", real_secret.display());
         let mut cmd = sb.wrap_command(&cmd_str, cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&secret_dir);
+
         // The cat should fail — the secret file is outside allowed read paths
+        // (file-read-metadata allows stat but not content reads)
         assert!(
             !stdout.contains("top-secret-data"),
             "sandbox should block reading files outside allowed paths, got: {stdout}"

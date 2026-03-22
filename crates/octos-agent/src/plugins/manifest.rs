@@ -96,7 +96,7 @@ pub struct SkillPrompts {
 }
 
 /// A tool definition within a plugin manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PluginToolDef {
     /// Tool name (must be unique across all plugins).
     pub name: String,

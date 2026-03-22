@@ -27,7 +27,7 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
                 output_per_million: *cost_out,
             };
             map.insert(key.clone(), pricing);
-            if let Some(model) = key.split('/').last() {
+            if let Some(model) = key.split('/').next_back() {
                 map.insert(model.to_string(), pricing);
             }
         }

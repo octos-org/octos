@@ -262,7 +262,9 @@ async fn handle_chat(
         let mut pending = state.pending.lock().await;
         let stale = if let Some(old_tx) = pending.get(&session_id) {
             // Test if the receiver is still alive by sending a keepalive
-            old_tx.send(serde_json::json!({"type":"keepalive"}).to_string()).is_err()
+            old_tx
+                .send(serde_json::json!({"type":"keepalive"}).to_string())
+                .is_err()
         } else {
             false
         };
@@ -402,10 +404,7 @@ async fn handle_session_messages(
                         let v: serde_json::Value = serde_json::from_str(line).ok()?;
                         let role = v.get("role")?.as_str()?;
                         let content = v.get("content")?.as_str().unwrap_or("");
-                        let timestamp = v
-                            .get("timestamp")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
                         Some(MessageInfo {
                             role: role.to_string(),
                             content: content.to_string(),
@@ -453,9 +452,7 @@ async fn handle_delete_session(
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
-async fn handle_file_download(
-    axum::extract::Path(path): axum::extract::Path<String>,
-) -> Response {
+async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
     let file_path = std::path::Path::new(&path);
 
     // Security: only serve files from known safe directories
@@ -508,12 +505,14 @@ async fn handle_file_download(
 }
 
 /// POST /upload — upload files for use in chat media field.
-async fn handle_upload(
-    mut multipart: axum::extract::Multipart,
-) -> Response {
+async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
     let upload_dir = std::env::temp_dir().join("octos-uploads");
     if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir failed: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir failed: {e}"),
+        )
+            .into_response();
     }
 
     let mut paths = Vec::new();
@@ -530,7 +529,9 @@ async fn handle_upload(
 
         let data = match field.bytes().await {
             Ok(d) => d,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("read failed: {e}")).into_response(),
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("read failed: {e}")).into_response();
+            }
         };
 
         if data.len() > 50 * 1024 * 1024 {
@@ -539,7 +540,11 @@ async fn handle_upload(
 
         let dest = upload_dir.join(&safe_name);
         if let Err(e) = tokio::fs::write(&dest, &data).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write failed: {e}"),
+            )
+                .into_response();
         }
         paths.push(dest.to_string_lossy().to_string());
     }
@@ -573,19 +578,34 @@ mod tests {
 
     #[test]
     fn api_channel_name() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
         assert_eq!(ch.name(), "api");
     }
 
     #[test]
     fn api_channel_max_message_length() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
 
     #[tokio::test]
     async fn send_to_pending_client() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -610,7 +630,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_completion_closes_stream() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -638,7 +663,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_unknown_chat_is_noop() {
-        let ch = ApiChannel::new(8091, None, Arc::new(AtomicBool::new(false)), test_sessions());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
         let msg = OutboundMessage {
             channel: "api".into(),
             chat_id: "nonexistent".into(),

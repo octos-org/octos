@@ -252,8 +252,14 @@ fn test_skills_search_registry() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("mofa-skills"), "registry should contain mofa-skills package");
-    assert!(stdout.contains("mofa-org/mofa-skills"), "should show install command");
+    assert!(
+        stdout.contains("mofa-skills"),
+        "registry should contain mofa-skills package"
+    );
+    assert!(
+        stdout.contains("mofa-org/mofa-skills"),
+        "should show install command"
+    );
 }
 
 /// Search registry for a non-existent skill.

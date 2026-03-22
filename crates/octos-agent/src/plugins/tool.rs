@@ -72,6 +72,20 @@ impl PluginTool {
         self.timeout = timeout;
         self
     }
+
+    /// Create a copy of this plugin tool with a different work directory.
+    /// Used to give each user session its own workspace for plugin output.
+    pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
+        Self {
+            plugin_name: self.plugin_name.clone(),
+            tool_def: self.tool_def.clone(),
+            executable: self.executable.clone(),
+            blocked_env: self.blocked_env.clone(),
+            extra_env: self.extra_env.clone(),
+            work_dir: Some(work_dir),
+            timeout: self.timeout,
+        }
+    }
 }
 
 #[async_trait]
@@ -101,6 +115,10 @@ impl Tool for PluginTool {
             }
         }
         schema
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
