@@ -46,7 +46,7 @@ export default function QQBotTab({ config, onChange }: Props) {
         <p className="font-medium text-gray-300">QQ Bot (Official API v2)</p>
         <p>Connect your gateway to QQ as an official bot via WebSocket. The bot responds to @mentions in QQ groups and channels.</p>
         <ol className="list-decimal list-inside space-y-0.5 text-gray-500">
-          <li>Go to the <a href="https://open.qq.com/bot/" target="_blank" rel="noopener" className="text-accent hover:underline">QQ Open Platform</a> and create a bot application</li>
+          <li>Go to the <a href="https://q.qq.com/qqbot/openclaw/" target="_blank" rel="noopener" className="text-accent hover:underline">QQ Open Platform</a> and create a bot application</li>
           <li>Copy the <strong>AppID</strong> from the bot details page</li>
           <li>Generate and copy the <strong>ClientSecret</strong> (save it immediately &mdash; it cannot be viewed again)</li>
           <li>Add the bot to your target QQ groups or channels</li>

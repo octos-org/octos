@@ -160,19 +160,13 @@ pub async fn maybe_compact_with_config(
     compacted.push(summary_msg);
     compacted.extend(recent);
 
-    // Replace in-memory state and rewrite to disk atomically.
-    // rewrite() uses write-then-rename, so disk is safe on crash.
-    // We swap messages so we can restore on rewrite failure.
+    // Replace in-memory state only — the LLM sees the compacted context.
+    // Do NOT rewrite the disk file — it stays append-only so the full
+    // conversation history is preserved for the UI and future reference.
     let session = session_mgr.get_or_create(key);
-    let original_messages = std::mem::replace(&mut session.messages, compacted);
+    let _original_count = session.messages.len();
+    session.messages = compacted;
     session.updated_at = Utc::now();
-
-    if let Err(e) = session_mgr.rewrite(key).await {
-        // Restore original messages on disk write failure
-        let session = session_mgr.get_or_create(key);
-        session.messages = original_messages;
-        return Err(e);
-    }
 
     debug!(
         session = %key,
@@ -291,19 +285,17 @@ pub async fn maybe_compact_handle(
     compacted.push(summary_msg);
     compacted.extend(recent);
 
-    let original_messages = std::mem::replace(&mut handle.session_mut().messages, compacted);
+    // Replace in-memory state only — the LLM sees the compacted context.
+    // Do NOT rewrite the disk file — it stays append-only so the full
+    // conversation history is preserved for the UI.
+    handle.session_mut().messages = compacted;
     handle.session_mut().updated_at = Utc::now();
-
-    if let Err(e) = handle.rewrite().await {
-        handle.session_mut().messages = original_messages;
-        return Err(e);
-    }
 
     debug!(
         session = %key,
         before = total,
         after = config.keep_recent + 1,
-        "session compacted (handle)"
+        "session compacted in-memory (disk unchanged)"
     );
 
     Ok(true)

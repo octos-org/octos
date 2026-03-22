@@ -99,6 +99,7 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}/messages", get(handle_session_messages))
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
+            .route("/upload", post(handle_upload))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -349,6 +350,9 @@ struct PaginationParams {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// "full" to read from disk (complete history), default reads from memory (compacted for LLM).
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -385,6 +389,39 @@ async fn handle_session_messages(
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
     let key = SessionKey::new("api", &id);
+
+    // source=full reads the append-only JSONL file (complete history).
+    // Default reads from in-memory (may be compacted for LLM context).
+    if params.source.as_deref() == Some("full") {
+        let sess = state.sessions.lock().await;
+        let path = sess.session_path(&key);
+        drop(sess);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let messages: Vec<MessageInfo> = content
+                    .lines()
+                    .filter_map(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                        let role = v.get("role")?.as_str()?;
+                        let content = v.get("content")?.as_str().unwrap_or("");
+                        let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+                        Some(MessageInfo {
+                            role: role.to_string(),
+                            content: content.to_string(),
+                            timestamp: timestamp.to_string(),
+                        })
+                    })
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+                return Json(messages).into_response();
+            }
+            Err(_) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+        }
+    }
+
     let mut sess = state.sessions.lock().await;
     let session = sess.get_or_create(&key);
     let messages: Vec<MessageInfo> = session
@@ -465,6 +502,54 @@ async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<Str
         }
         Err(_) => (StatusCode::NOT_FOUND, "file not found").into_response(),
     }
+}
+
+/// POST /upload — upload files for use in chat media field.
+async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
+    let upload_dir = std::env::temp_dir().join("octos-uploads");
+    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir failed: {e}"),
+        )
+            .into_response();
+    }
+
+    let mut paths = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let filename = match field.file_name() {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        let safe_name = filename
+            .replace(['/', '\\', '\0'], "_")
+            .chars()
+            .take(200)
+            .collect::<String>();
+
+        let data = match field.bytes().await {
+            Ok(d) => d,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("read failed: {e}")).into_response();
+            }
+        };
+
+        if data.len() > 50 * 1024 * 1024 {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "file exceeds 50MB").into_response();
+        }
+
+        let dest = upload_dir.join(&safe_name);
+        if let Err(e) = tokio::fs::write(&dest, &data).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write failed: {e}"),
+            )
+                .into_response();
+        }
+        paths.push(dest.to_string_lossy().to_string());
+    }
+
+    Json(paths).into_response()
 }
 
 #[cfg(test)]

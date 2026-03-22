@@ -81,6 +81,8 @@ pub struct QQBotChannel {
     http_client: Client,
     access_token: Arc<Mutex<Option<TokenState>>>,
     session_state: Arc<Mutex<Option<SessionState>>>,
+    /// Track which chat_ids are C2C (private) conversations.
+    c2c_chats: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Monotonically increasing message sequence for replies.
     msg_seq: AtomicU64,
 }
@@ -98,6 +100,7 @@ impl QQBotChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            c2c_chats: Arc::new(std::sync::Mutex::new(HashSet::new())),
             http_client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -193,7 +196,7 @@ impl QQBotChannel {
         let resp = self
             .http_client
             .get(format!("{API_BASE}/gateway"))
-            .header("Authorization", format!("QQBotAccessToken {token}"))
+            .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .wrap_err("QQBot: failed to fetch gateway URL")?;
@@ -236,7 +239,7 @@ impl QQBotChannel {
         let resp = self
             .http_client
             .post(format!("{API_BASE}/v2/groups/{group_openid}/messages"))
-            .header("Authorization", format!("QQBotAccessToken {token}"))
+            .header("Authorization", format!("QQBot {token}"))
             .json(&body)
             .send()
             .await
@@ -255,6 +258,51 @@ impl QQBotChannel {
         }
 
         debug!(group_openid, seq, "QQBot: message sent");
+        Ok(())
+    }
+
+    /// Send a reply to a user via C2C (private message) REST API.
+    async fn send_c2c_message(
+        &self,
+        user_openid: &str,
+        content: &str,
+        msg_id: Option<&str>,
+    ) -> Result<()> {
+        let token = self.get_access_token().await?;
+        let seq = self.msg_seq.fetch_add(1, Ordering::Relaxed);
+
+        let mut body = json!({
+            "content": content,
+            "msg_type": 0,
+            "msg_seq": seq,
+        });
+
+        if let Some(mid) = msg_id {
+            body["msg_id"] = json!(mid);
+        }
+
+        let resp = self
+            .http_client
+            .post(format!("{API_BASE}/v2/users/{user_openid}/messages"))
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("QQBot: failed to send C2C message")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            warn!(
+                status = %status,
+                body = %err_body,
+                user_openid,
+                "QQBot: send C2C message failed"
+            );
+            bail!("QQBot: send C2C message failed ({status})");
+        }
+
+        debug!(user_openid, seq, "QQBot: C2C message sent");
         Ok(())
     }
 
@@ -307,6 +355,56 @@ impl QQBotChannel {
         })
     }
 
+    /// Parse a C2C_MESSAGE_CREATE event into an InboundMessage.
+    fn parse_c2c_message(&self, data: &Value) -> Option<InboundMessage> {
+        let msg_id = data["id"].as_str().unwrap_or_default();
+        let user_openid = data
+            .get("author")
+            .and_then(|a| a.get("id").or_else(|| a.get("user_openid")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let content = data["content"].as_str().unwrap_or_default().trim();
+
+        if content.is_empty() {
+            return None;
+        }
+
+        if !msg_id.is_empty() && self.dedup_check(msg_id) {
+            debug!(msg_id, "QQBot: dedup filtered C2C message");
+            return None;
+        }
+
+        if !self.check_allowed(user_openid) {
+            debug!(user_openid, "QQBot: C2C sender not allowed");
+            return None;
+        }
+
+        info!(msg_id, user_openid, "QQBot: parsed C2C message");
+
+        // Remember this chat_id as a C2C conversation
+        if let Ok(mut set) = self.c2c_chats.lock() {
+            set.insert(user_openid.to_string());
+        }
+
+        let metadata = json!({
+            "qq_bot": {
+                "msg_id": msg_id,
+                "user_openid": user_openid,
+            }
+        });
+
+        Some(InboundMessage {
+            channel: "qq-bot".into(),
+            sender_id: user_openid.to_string(),
+            chat_id: user_openid.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata,
+            message_id: Some(msg_id.to_string()),
+        })
+    }
+
     /// Build a TLS connector for the WebSocket connection.
     fn make_tls_connector() -> Result<tokio_tungstenite::Connector> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -345,9 +443,7 @@ impl QQBotChannel {
         let sink = Arc::new(Mutex::new(sink));
 
         // Process frames — Hello will trigger Identify
-        let result = self.process_frames(stream, sink.clone(), inbound_tx).await;
-
-        result
+        self.process_frames(stream, sink.clone(), inbound_tx).await
     }
 
     /// Process WebSocket frames (Hello, Dispatch, Heartbeat ACK, etc.).
@@ -421,7 +517,7 @@ impl QQBotChannel {
                                                 let resume = json!({
                                                     "op": 6,
                                                     "d": {
-                                                        "token": format!("QQBotAccessToken {token}"),
+                                                        "token": format!("QQBot {token}"),
                                                         "session_id": state.session_id,
                                                         "seq": state.seq,
                                                     }
@@ -438,7 +534,7 @@ impl QQBotChannel {
                                                 let identify = json!({
                                                     "op": 2,
                                                     "d": {
-                                                        "token": format!("QQBotAccessToken {token}"),
+                                                        "token": format!("QQBot {token}"),
                                                         "intents": INTENTS,
                                                         "shard": [0, 1],
                                                     }
@@ -498,8 +594,14 @@ impl QQBotChannel {
                                                     }
                                                 }
                                                 "C2C_MESSAGE_CREATE" => {
-                                                    // Private message — could be handled similarly
-                                                    debug!(event_type, "QQBot: C2C message (not yet supported)");
+                                                    if let Some(data) = frame.get("d") {
+                                                        if let Some(inbound) = self.parse_c2c_message(data) {
+                                                            if inbound_tx.send(inbound).await.is_err() {
+                                                                error!("QQBot: inbound_tx dropped");
+                                                                bail!("inbound channel closed");
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 other => {
                                                     debug!(event = other, "QQBot: unhandled event");
@@ -623,8 +725,19 @@ impl Channel for QQBotChannel {
             .and_then(|q| q.get("msg_id"))
             .and_then(|v| v.as_str());
 
-        self.send_group_message(&msg.chat_id, &msg.content, msg_id)
-            .await?;
+        let is_c2c = self
+            .c2c_chats
+            .lock()
+            .map(|s| s.contains(&msg.chat_id))
+            .unwrap_or(false);
+
+        if is_c2c {
+            self.send_c2c_message(&msg.chat_id, &msg.content, msg_id)
+                .await?;
+        } else {
+            self.send_group_message(&msg.chat_id, &msg.content, msg_id)
+                .await?;
+        }
 
         if !msg.media.is_empty() {
             warn!(
@@ -661,6 +774,7 @@ mod tests {
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            c2c_chats: Arc::new(std::sync::Mutex::new(HashSet::new())),
             http_client: Client::new(),
             access_token: Arc::new(Mutex::new(None)),
             session_state: Arc::new(Mutex::new(None)),

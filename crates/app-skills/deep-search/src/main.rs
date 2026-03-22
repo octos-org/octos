@@ -1260,7 +1260,23 @@ fn html_to_text(html: &str) -> String {
                 }
                 scraper::Node::Element(el) => {
                     let tag = el.name();
-                    if tag == "script" || tag == "style" || tag == "noscript" {
+                    // Skip non-content elements entirely
+                    if matches!(
+                        tag,
+                        "script"
+                            | "style"
+                            | "noscript"
+                            | "nav"
+                            | "footer"
+                            | "aside"
+                            | "iframe"
+                            | "svg"
+                            | "form"
+                    ) {
+                        continue;
+                    }
+                    // Skip elements with boilerplate class/id hints
+                    if is_boilerplate_element(el) {
                         continue;
                     }
                     let is_block = matches!(
@@ -1321,6 +1337,75 @@ fn html_to_text(html: &str) -> String {
             prev_newline = false;
             prev_space = false;
             result.push(ch);
+        }
+    }
+    let trimmed = result.trim().to_string();
+    clean_boilerplate(&trimmed)
+}
+
+/// Check if an HTML element is likely boilerplate based on class/id/role.
+fn is_boilerplate_element(el: &scraper::node::Element) -> bool {
+    let class = el.attr("class").unwrap_or("");
+    let id = el.attr("id").unwrap_or("");
+    let role = el.attr("role").unwrap_or("");
+    if matches!(role, "navigation" | "banner" | "complementary" | "contentinfo") {
+        return true;
+    }
+    let combined = format!("{class} {id}").to_lowercase();
+    combined.contains("cookie")
+        || combined.contains("consent")
+        || combined.contains("gdpr")
+        || combined.contains("advertisement")
+        || combined.contains("ad-slot")
+        || combined.contains("sidebar")
+        || combined.contains("side-bar")
+        || combined.contains("newsletter")
+        || combined.contains("subscribe")
+        || combined.contains("popup")
+        || combined.contains("modal")
+        || combined.contains("overlay")
+        || combined.contains("share-button")
+        || combined.contains("social-share")
+        || combined.contains("related-post")
+        || combined.contains("comment")
+        || combined.contains("breadcrumb")
+        || combined.contains("pagination")
+        || combined.contains("menu")
+        || combined.contains("toolbar")
+}
+
+/// Remove common boilerplate noise lines from extracted text.
+fn clean_boilerplate(text: &str) -> String {
+    let noise: &[&str] = &[
+        "accept all cookies", "accept cookies", "cookie policy", "cookie settings",
+        "we use cookies", "this website uses cookies", "privacy policy",
+        "terms of service", "terms and conditions", "sign up for our newsletter",
+        "subscribe to our newsletter", "follow us on", "share this article",
+        "share on facebook", "share on twitter", "advertisement",
+        "skip to content", "skip to main content", "back to top",
+        "loading...", "please enable javascript",
+    ];
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            if t.len() < 3 {
+                return t.is_empty();
+            }
+            let lower = t.to_lowercase();
+            !noise.iter().any(|p| lower.contains(p))
+        })
+        .collect();
+    let mut result = String::with_capacity(text.len());
+    let mut blank_count = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 { result.push('\n'); }
+        } else {
+            blank_count = 0;
+            result.push_str(line);
+            result.push('\n');
         }
     }
     result.trim().to_string()
