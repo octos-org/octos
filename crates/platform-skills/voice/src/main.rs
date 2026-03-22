@@ -1,7 +1,7 @@
 //! Voice platform skill binary (ASR/TTS/model management) via ominix-api.
 //!
 //! Protocol: `./main <tool_name>` with JSON on stdin, JSON on stdout.
-//! Requires OMINIX_API_URL environment variable (default: http://localhost:8080).
+//! Auto-discovers ominix-api via OMINIX_API_URL, ~/.ominix/api_url, or default http://localhost:9090.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -73,14 +73,6 @@ fn api_base_url() -> String {
     "http://localhost:9090".to_string()
 }
 
-/// Clone URL: separate ominix instance with Base model for voice cloning.
-/// Falls back to the main API URL if not set.
-fn clone_base_url() -> String {
-    if let Ok(url) = std::env::var("OMINIX_CLONE_URL") {
-        return url.trim_end_matches('/').to_string();
-    }
-    api_base_url()
-}
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
@@ -113,15 +105,15 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     wav
 }
 
-/// Call TTS API with streaming PCM, collect all bytes, return WAV data.
-/// Streaming avoids timeout issues — chunks flow continuously.
-fn stream_tts_to_wav(
+/// Call a TTS endpoint, collect all bytes, return WAV data.
+/// Auto-detects PCM vs WAV response and wraps PCM in a WAV header.
+fn fetch_tts_wav(
     client: &reqwest::blocking::Client,
-    base_url: &str,
+    url: &str,
     body: &serde_json::Value,
 ) -> Result<Vec<u8>, String> {
     let resp = client
-        .post(format!("{base_url}/v1/audio/speech"))
+        .post(url)
         .json(body)
         .send()
         .map_err(|e| format!("TTS request failed: {e}"))?;
@@ -303,8 +295,9 @@ fn handle_transcribe(input_json: &str) {
         .text("language", language)
         .text("response_format", "verbose_json");
 
+    // Use model-specific ASR endpoint (Qwen3-ASR)
     let resp = match client
-        .post(format!("{base_url}/v1/audio/transcriptions"))
+        .post(format!("{base_url}/v1/audio/asr/qwen3"))
         .multipart(form)
         .send()
     {
@@ -356,7 +349,8 @@ fn synthesize_segment(
         "language": language
     });
 
-    let wav_bytes = stream_tts_to_wav(client, base_url, &body)?;
+    let url = format!("{base_url}/v1/audio/tts/qwen3?format=wav");
+    let wav_bytes = fetch_tts_wav(client, &url, &body)?;
 
     std::fs::write(output_path, &wav_bytes)
         .map_err(|e| format!("Failed to write {}: {e}", output_path.display()))?;
@@ -415,22 +409,15 @@ fn handle_synthesize(input_json: &str) {
 
     // Check if speaker is a saved voice profile — if so, use clone mode
     if let Some(profile_path) = resolve_voice_profile(&speaker) {
-        let ref_bytes = match std::fs::read(&profile_path) {
-            Ok(b) => b,
-            Err(e) => fail(&format!("Failed to read voice profile '{}': {e}", speaker)),
-        };
-        use base64::Engine;
-        let ref_b64 = base64::engine::general_purpose::STANDARD.encode(&ref_bytes);
-
         let body = json!({
             "input": input.text,
-            "reference_audio": ref_b64,
+            "reference_audio": profile_path.to_string_lossy(),
             "language": language
         });
 
-        // Clone uses the Base model server (OMINIX_CLONE_URL)
-        let clone_url = clone_base_url();
-        let wav_bytes = match stream_tts_to_wav(&client, &clone_url, &body) {
+        // Clone via model-specific endpoint (Base model with x-vector)
+        let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
+        let wav_bytes = match fetch_tts_wav(&client, &clone_url, &body) {
             Ok(b) => b,
             Err(e) => fail(&format!("TTS (clone) failed: {e}")),
         };
@@ -534,15 +521,6 @@ fn handle_voice_clone(input_json: &str) {
         fail(&e);
     }
 
-    // Read and base64-encode the reference audio
-    let ref_bytes = match std::fs::read(ref_path) {
-        Ok(b) => b,
-        Err(e) => fail(&format!("Failed to read reference audio: {e}")),
-    };
-
-    use base64::Engine;
-    let ref_b64 = base64::engine::general_purpose::STANDARD.encode(&ref_bytes);
-
     let output_path = input
         .output_path
         .unwrap_or_else(|| format!("/tmp/octos_clone_{}.wav", timestamp()));
@@ -560,12 +538,13 @@ fn handle_voice_clone(input_json: &str) {
 
     let body = json!({
         "input": input.text,
-        "reference_audio": ref_b64,
+        "reference_audio": input.reference_audio,
         "language": language
     });
 
-    // Clone path returns WAV (reference_audio triggers wants_wav in API)
-    let wav_bytes = match stream_tts_to_wav(&client, &base_url, &body) {
+    // Clone via model-specific endpoint (Base model with x-vector)
+    let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
+    let wav_bytes = match fetch_tts_wav(&client, &clone_url, &body) {
         Ok(b) => b,
         Err(e) => fail(&format!("Voice clone failed: {e}")),
     };

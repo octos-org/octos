@@ -34,28 +34,24 @@ struct SynthesizeInput {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Resolve URL for a specific ominix-api service.
-/// 3-process architecture: ASR on :8081, preset TTS on :8082, clone TTS on :8083.
-/// Falls back to OMINIX_API_URL for single-process setups.
-fn asr_url() -> String {
-    std::env::var("OMINIX_ASR_URL")
-        .unwrap_or_else(|_| "http://localhost:8081".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn tts_url() -> String {
-    std::env::var("OMINIX_TTS_URL")
-        .unwrap_or_else(|_| "http://localhost:8082".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn clone_url() -> String {
-    std::env::var("OMINIX_CLONE_URL")
-        .unwrap_or_else(|_| "http://localhost:8083".to_string())
-        .trim_end_matches('/')
-        .to_string()
+/// Resolve the ominix-api base URL. Checks in order:
+///   1. OMINIX_API_URL env var
+///   2. ~/.ominix/api_url discovery file
+///   3. Default http://localhost:9090
+fn ominix_base_url() -> String {
+    if let Ok(url) = std::env::var("OMINIX_API_URL") {
+        return url.trim_end_matches('/').to_string();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let discovery = Path::new(&home).join(".ominix").join("api_url");
+        if let Ok(url) = std::fs::read_to_string(&discovery) {
+            let url = url.trim();
+            if !url.is_empty() {
+                return url.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "http://localhost:9090".to_string()
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -137,9 +133,9 @@ fn handle_transcribe(input_json: &str) {
         }
     }
 
-    let asr = asr_url();
+    let base_url = ominix_base_url();
     let client = http_client();
-    if let Err(e) = check_health(&client, &asr) {
+    if let Err(e) = check_health(&client, &base_url) {
         fail(&e);
     }
 
@@ -151,8 +147,9 @@ fn handle_transcribe(input_json: &str) {
         "response_format": "verbose_json"
     });
 
+    // Use model-specific ASR endpoint (Qwen3-ASR)
     let resp = match client
-        .post(format!("{asr}/v1/audio/transcriptions"))
+        .post(format!("{base_url}/v1/audio/asr/qwen3"))
         .json(&body)
         .send()
     {
@@ -200,8 +197,9 @@ fn handle_synthesize(input_json: &str) {
         fail("'text' must not be empty");
     }
 
+    let base_url = ominix_base_url();
     let client = http_client();
-    if let Err(e) = check_health(&client, &asr_url()) {
+    if let Err(e) = check_health(&client, &base_url) {
         fail(&e);
     }
 
@@ -228,7 +226,7 @@ fn handle_synthesize(input_json: &str) {
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
     let (endpoint, body) = if let Some(ref ref_audio) = input.reference_audio {
-        // Voice cloning → clone port directly (Base model)
+        // Voice cloning → /v1/audio/tts/clone (Base model, x-vector)
         let ref_path = Path::new(ref_audio);
         if !ref_path.exists() {
             fail(&format!("Reference audio not found: {ref_audio}"));
@@ -237,7 +235,7 @@ fn handle_synthesize(input_json: &str) {
             fail(&format!("Not a file: {ref_audio}"));
         }
         (
-            format!("{}/v1/audio/speech/clone", clone_url()),
+            format!("{base_url}/v1/audio/tts/clone?format=wav"),
             json!({
                 "input": input.text,
                 "reference_audio": ref_audio,
@@ -245,10 +243,10 @@ fn handle_synthesize(input_json: &str) {
             }),
         )
     } else {
-        // Preset voice → TTS port directly (CustomVoice model)
+        // Preset voice → /v1/audio/tts/qwen3 (CustomVoice model)
         let speaker = input.speaker.unwrap_or_else(|| "vivian".to_string());
         (
-            format!("{}/v1/audio/speech", tts_url()),
+            format!("{base_url}/v1/audio/tts/qwen3?format=wav"),
             json!({
                 "input": input.text,
                 "voice": speaker,
