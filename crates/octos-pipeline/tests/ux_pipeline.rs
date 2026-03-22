@@ -48,10 +48,7 @@ fn dashscope() -> Option<Arc<dyn LlmProvider>> {
     ))
 }
 
-async fn make_config(
-    provider: Arc<dyn LlmProvider>,
-    dir: &TempDir,
-) -> ExecutorConfig {
+async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorConfig {
     let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
     ExecutorConfig {
         default_provider: provider,
@@ -94,22 +91,38 @@ async fn test_01_deepseek_connectivity() {
     };
 
     let resp = provider
-        .chat(&[msg], &[], &ChatConfig { max_tokens: Some(32), ..Default::default() })
+        .chat(
+            &[msg],
+            &[],
+            &ChatConfig {
+                max_tokens: Some(32),
+                ..Default::default()
+            },
+        )
         .await;
 
     match &resp {
         Ok(r) => {
             let text = r.content.as_deref().unwrap_or("");
-            println!("[connectivity] {} | {} | {}in/{}out",
-                elapsed_str(start), text.trim(),
-                r.usage.input_tokens, r.usage.output_tokens);
-            assert!(text.to_uppercase().contains("PONG"), "expected PONG: {text}");
+            println!(
+                "[connectivity] {} | {} | {}in/{}out",
+                elapsed_str(start),
+                text.trim(),
+                r.usage.input_tokens,
+                r.usage.output_tokens
+            );
+            assert!(
+                text.to_uppercase().contains("PONG"),
+                "expected PONG: {text}"
+            );
         }
         Err(e) => {
-            panic!("[connectivity] FAILED after {} — {e}\n\
+            panic!(
+                "[connectivity] FAILED after {} — {e}\n\
                     This is a network/auth error BEFORE any pipeline logic.\n\
                     Check: API key valid? DNS resolves? Firewall? Rate limit?",
-                elapsed_str(start));
+                elapsed_str(start)
+            );
         }
     }
 }
@@ -137,14 +150,24 @@ async fn test_01_dashscope_connectivity() {
     };
 
     let resp = provider
-        .chat(&[msg], &[], &ChatConfig { max_tokens: Some(32), ..Default::default() })
+        .chat(
+            &[msg],
+            &[],
+            &ChatConfig {
+                max_tokens: Some(32),
+                ..Default::default()
+            },
+        )
         .await;
 
     match &resp {
         Ok(r) => {
             let text = r.content.as_deref().unwrap_or("");
             println!("[dashscope] {} | {}", elapsed_str(start), text.trim());
-            assert!(text.to_uppercase().contains("PONG"), "expected PONG: {text}");
+            assert!(
+                text.to_uppercase().contains("PONG"),
+                "expected PONG: {text}"
+            );
         }
         Err(e) => {
             panic!("[dashscope] FAILED after {} — {e}", elapsed_str(start));
@@ -175,10 +198,17 @@ async fn test_02_single_node_noop() {
 
     match result {
         Ok(r) => {
-            println!("[single-noop] {} | success={} | output='{}'",
-                elapsed_str(start), r.success, r.output.chars().take(100).collect::<String>());
+            println!(
+                "[single-noop] {} | success={} | output='{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.chars().take(100).collect::<String>()
+            );
             assert!(r.success);
-            assert!(r.output.contains("hello world"), "noop should pass input through");
+            assert!(
+                r.output.contains("hello world"),
+                "noop should pass input through"
+            );
         }
         Err(e) => panic!("[single-noop] FAILED: {e}"),
     }
@@ -198,14 +228,20 @@ async fn test_02_single_node_codergen() {
     "#;
 
     let start = Instant::now();
-    let result = executor.run(dot, "What is the capital of France?", &vars()).await;
+    let result = executor
+        .run(dot, "What is the capital of France?", &vars())
+        .await;
 
     match result {
         Ok(r) => {
-            println!("[single-codergen] {} | success={} | {}+{} tokens | '{}'",
-                elapsed_str(start), r.success,
-                r.token_usage.input_tokens, r.token_usage.output_tokens,
-                r.output.trim().chars().take(120).collect::<String>());
+            println!(
+                "[single-codergen] {} | success={} | {}+{} tokens | '{}'",
+                elapsed_str(start),
+                r.success,
+                r.token_usage.input_tokens,
+                r.token_usage.output_tokens,
+                r.output.trim().chars().take(120).collect::<String>()
+            );
             assert!(r.success, "pipeline should succeed");
             assert!(
                 r.output.to_lowercase().contains("paris"),
@@ -214,10 +250,12 @@ async fn test_02_single_node_codergen() {
             );
         }
         Err(e) => {
-            panic!("[single-codergen] FAILED after {} — {e}\n\
+            panic!(
+                "[single-codergen] FAILED after {} — {e}\n\
                     If this is a network error, test_01 should also fail.\n\
                     If test_01 passes but this fails, the issue is in CodergenHandler or Agent loop.",
-                elapsed_str(start));
+                elapsed_str(start)
+            );
         }
     }
 }
@@ -240,8 +278,12 @@ async fn test_02_single_node_shell() {
 
     match result {
         Ok(r) => {
-            println!("[single-shell] {} | success={} | '{}'",
-                elapsed_str(start), r.success, r.output.trim());
+            println!(
+                "[single-shell] {} | success={} | '{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.trim()
+            );
             assert!(r.success);
             assert!(r.output.contains("HELLO_FROM_SHELL"));
         }
@@ -274,15 +316,28 @@ async fn test_03_two_node_chain() {
 
     match result {
         Ok(r) => {
-            println!("[two-node] {} | success={} | {} nodes | {}+{} tokens",
-                elapsed_str(start), r.success, r.node_summaries.len(),
-                r.token_usage.input_tokens, r.token_usage.output_tokens);
+            println!(
+                "[two-node] {} | success={} | {} nodes | {}+{} tokens",
+                elapsed_str(start),
+                r.success,
+                r.node_summaries.len(),
+                r.token_usage.input_tokens,
+                r.token_usage.output_tokens
+            );
             for s in &r.node_summaries {
-                println!("  - {} ({}): {}ms, {}+{} tokens",
-                    s.node_id, s.model.as_deref().unwrap_or("default"),
-                    s.duration_ms, s.token_usage.input_tokens, s.token_usage.output_tokens);
+                println!(
+                    "  - {} ({}): {}ms, {}+{} tokens",
+                    s.node_id,
+                    s.model.as_deref().unwrap_or("default"),
+                    s.duration_ms,
+                    s.token_usage.input_tokens,
+                    s.token_usage.output_tokens
+                );
             }
-            println!("  output: '{}'", r.output.trim().chars().take(100).collect::<String>());
+            println!(
+                "  output: '{}'",
+                r.output.trim().chars().take(100).collect::<String>()
+            );
             assert!(r.success);
             assert_eq!(r.node_summaries.len(), 2, "should have 2 node summaries");
         }
@@ -313,9 +368,12 @@ async fn test_03_three_node_chain_with_gate() {
 
     match result {
         Ok(r) => {
-            println!("[gated-chain] {} | success={} | output='{}'",
-                elapsed_str(start), r.success,
-                r.output.trim().chars().take(100).collect::<String>());
+            println!(
+                "[gated-chain] {} | success={} | output='{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.trim().chars().take(100).collect::<String>()
+            );
             assert!(r.success);
             // step1 says "4", step3 doubles to "8"
             // The key test is that all 3 nodes ran and passed
@@ -348,9 +406,12 @@ async fn test_03_conditional_branching() {
 
     match result {
         Ok(r) => {
-            println!("[branching] {} | success={} | output='{}'",
-                elapsed_str(start), r.success,
-                r.output.trim().chars().take(100).collect::<String>());
+            println!(
+                "[branching] {} | success={} | output='{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.trim().chars().take(100).collect::<String>()
+            );
             assert!(r.success);
             // The pipeline correctly branched to math_branch
             // Output may contain "45" or the classify result — either means branching worked
@@ -379,15 +440,21 @@ async fn test_04_variable_substitution() {
     "#;
 
     let mut variables = vars();
-    variables.insert("user_name".into(), serde_json::Value::String("Alice".into()));
+    variables.insert(
+        "user_name".into(),
+        serde_json::Value::String("Alice".into()),
+    );
 
     let start = Instant::now();
     let result = executor.run(dot, "say hello", &variables).await;
 
     match result {
         Ok(r) => {
-            println!("[vars] {} | '{}'", elapsed_str(start),
-                r.output.trim().chars().take(100).collect::<String>());
+            println!(
+                "[vars] {} | '{}'",
+                elapsed_str(start),
+                r.output.trim().chars().take(100).collect::<String>()
+            );
             assert!(r.success);
             assert!(
                 r.output.to_lowercase().contains("alice"),
@@ -422,7 +489,11 @@ async fn test_05_node_writes_file() {
 
     match result {
         Ok(r) => {
-            println!("[file-write] {} | success={}", elapsed_str(start), r.success);
+            println!(
+                "[file-write] {} | success={}",
+                elapsed_str(start),
+                r.success
+            );
             let output_path = dir.path().join("output.txt");
             if output_path.exists() {
                 let contents = std::fs::read_to_string(&output_path).unwrap();
@@ -462,9 +533,12 @@ async fn test_05_node_reads_file() {
 
     match result {
         Ok(r) => {
-            println!("[file-read] {} | success={} | '{}'",
-                elapsed_str(start), r.success,
-                r.output.trim().chars().take(100).collect::<String>());
+            println!(
+                "[file-read] {} | success={} | '{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.trim().chars().take(100).collect::<String>()
+            );
             assert!(r.success);
             assert!(r.output.contains("42"), "should extract 42: {}", r.output);
         }
@@ -492,14 +566,21 @@ async fn test_05_write_then_read_chain() {
 
     match result {
         Ok(r) => {
-            println!("[write-read] {} | success={} | nodes={}",
-                elapsed_str(start), r.success, r.node_summaries.len());
+            println!(
+                "[write-read] {} | success={} | nodes={}",
+                elapsed_str(start),
+                r.success,
+                r.node_summaries.len()
+            );
             assert!(r.success);
             assert_eq!(r.node_summaries.len(), 2);
             let report_path = dir.path().join("report.md");
             assert!(report_path.exists(), "report.md should exist");
             let contents = std::fs::read_to_string(&report_path).unwrap();
-            println!("[write-read] report.md: '{}'", contents.trim().chars().take(200).collect::<String>());
+            println!(
+                "[write-read] report.md: '{}'",
+                contents.trim().chars().take(200).collect::<String>()
+            );
         }
         Err(e) => panic!("[write-read] FAILED: {e}"),
     }
@@ -532,7 +613,11 @@ async fn test_06_send_file_basic() {
         .await
         .unwrap();
 
-    assert!(result.success, "send_file should succeed: {}", result.output);
+    assert!(
+        result.success,
+        "send_file should succeed: {}",
+        result.output
+    );
 
     let msg = rx.recv().await.unwrap();
     assert_eq!(msg.channel, "telegram");
@@ -540,7 +625,10 @@ async fn test_06_send_file_basic() {
     assert_eq!(msg.content, "Here is your report");
     assert_eq!(msg.media.len(), 1);
     assert_eq!(msg.media[0], path);
-    println!("[send-file] OK: sent {} to {}:{}", msg.media[0], msg.channel, msg.chat_id);
+    println!(
+        "[send-file] OK: sent {} to {}:{}",
+        msg.media[0], msg.channel, msg.chat_id
+    );
 }
 
 #[tokio::test]
@@ -550,8 +638,7 @@ async fn test_06_send_file_multiple_types() {
 
     let dir = TempDir::new().unwrap();
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
-    let tool = SendFileTool::with_context(tx, "feishu", "group456")
-        .with_base_dir(dir.path());
+    let tool = SendFileTool::with_context(tx, "feishu", "group456").with_base_dir(dir.path());
 
     // Test various file types
     let files = vec![
@@ -576,7 +663,10 @@ async fn test_06_send_file_multiple_types() {
         assert!(result.success, "should send {name}: {}", result.output);
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.media.len(), 1);
-        println!("[send-file-types] OK: {name} → {}:{}", msg.channel, msg.chat_id);
+        println!(
+            "[send-file-types] OK: {name} → {}:{}",
+            msg.channel, msg.chat_id
+        );
     }
 }
 
@@ -596,7 +686,11 @@ async fn test_06_send_file_nonexistent() {
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.output.contains("not found"), "should report not found: {}", result.output);
+    assert!(
+        result.output.contains("not found"),
+        "should report not found: {}",
+        result.output
+    );
     println!("[send-file-404] OK: correctly rejected nonexistent file");
 }
 
@@ -613,8 +707,7 @@ async fn test_06_send_file_sandbox_escape() {
     std::fs::write(&secret, r#"{"api_key": "sk-secret"}"#).unwrap();
 
     let (tx, _rx) = mpsc::channel::<OutboundMessage>(16);
-    let tool = SendFileTool::with_context(tx, "telegram", "chat123")
-        .with_base_dir(sandbox.path());
+    let tool = SendFileTool::with_context(tx, "telegram", "chat123").with_base_dir(sandbox.path());
 
     // Try absolute path escape
     let result = tool
@@ -623,7 +716,10 @@ async fn test_06_send_file_sandbox_escape() {
         }))
         .await
         .unwrap();
-    assert!(!result.success, "should block absolute path outside sandbox");
+    assert!(
+        !result.success,
+        "should block absolute path outside sandbox"
+    );
     println!("[sandbox-abs] OK: blocked {}", result.output);
 
     // Try path traversal escape
@@ -655,7 +751,11 @@ async fn test_06_send_file_no_context() {
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.output.contains("No target"), "should say no target: {}", result.output);
+    assert!(
+        result.output.contains("No target"),
+        "should say no target: {}",
+        result.output
+    );
     println!("[send-file-no-ctx] OK: correctly rejected without context");
 }
 
@@ -683,7 +783,10 @@ async fn test_07_inbound_message_carries_media() {
     assert_eq!(msg.media.len(), 2);
     assert_eq!(msg.media[0], "/tmp/media/photo.jpg");
     assert_eq!(msg.media[1], "/tmp/media/document.pdf");
-    println!("[inbound-media] OK: {} media items in message", msg.media.len());
+    println!(
+        "[inbound-media] OK: {} media items in message",
+        msg.media.len()
+    );
 }
 
 #[tokio::test]
@@ -719,7 +822,10 @@ async fn test_07_inbound_message_no_media_defaults_empty() {
         "timestamp": "2024-01-01T00:00:00Z"
     }"#;
     let msg: InboundMessage = serde_json::from_str(json).unwrap();
-    assert!(msg.media.is_empty(), "missing media field should default to empty vec");
+    assert!(
+        msg.media.is_empty(),
+        "missing media field should default to empty vec"
+    );
     println!("[inbound-no-media] OK: defaults to empty");
 }
 
@@ -769,8 +875,11 @@ async fn test_09_shell_timeout() {
     match result {
         Ok(r) => {
             // Shell handler should timeout and return Error status
-            assert!(!r.success || r.output.to_lowercase().contains("timeout"),
-                "should timeout: {}", r.output);
+            assert!(
+                !r.success || r.output.to_lowercase().contains("timeout"),
+                "should timeout: {}",
+                r.output
+            );
             assert!(
                 elapsed.as_secs() < 15,
                 "should complete in <15s (timeout=3s), took {}s",
@@ -849,10 +958,17 @@ async fn test_11_mixed_handlers() {
 
     match result {
         Ok(r) => {
-            println!("[mixed] {} | success={} | nodes={}",
-                elapsed_str(start), r.success, r.node_summaries.len());
+            println!(
+                "[mixed] {} | success={} | nodes={}",
+                elapsed_str(start),
+                r.success,
+                r.node_summaries.len()
+            );
             for s in &r.node_summaries {
-                println!("  - {}: {}ms, success={}", s.node_id, s.duration_ms, s.success);
+                println!(
+                    "  - {}: {}ms, success={}",
+                    s.node_id, s.duration_ms, s.success
+                );
             }
             assert!(r.success);
             assert!(r.node_summaries.len() >= 3, "should execute all 3 nodes");
@@ -890,8 +1006,12 @@ async fn test_12_node_failure_propagation() {
 
     match result {
         Ok(r) => {
-            println!("[fail-prop] {} | success={} | output='{}'",
-                elapsed_str(start), r.success, r.output.trim());
+            println!(
+                "[fail-prop] {} | success={} | output='{}'",
+                elapsed_str(start),
+                r.success,
+                r.output.trim()
+            );
             // step1 fails, step2 may or may not run depending on edge selection
             // But output should NOT contain SHOULD_NOT_REACH if error propagates
             if !r.success {
@@ -922,7 +1042,10 @@ async fn test_13_malformed_dot_error() {
     let bad_dot = "this is not valid DOT";
     let result = executor.run(bad_dot, "test", &vars()).await;
     assert!(result.is_err(), "should reject malformed DOT");
-    println!("[bad-dot] OK: rejected malformed DOT: {}", result.unwrap_err());
+    println!(
+        "[bad-dot] OK: rejected malformed DOT: {}",
+        result.unwrap_err()
+    );
 }
 
 #[tokio::test]
@@ -936,7 +1059,10 @@ async fn test_13_empty_graph_error() {
     let result = executor.run(empty_dot, "test", &vars()).await;
     // Either error or empty output is acceptable
     match result {
-        Ok(r) => println!("[empty-graph] OK: success={}, output='{}'", r.success, r.output),
+        Ok(r) => println!(
+            "[empty-graph] OK: success={}, output='{}'",
+            r.success, r.output
+        ),
         Err(e) => println!("[empty-graph] OK: rejected empty graph: {e}"),
     }
 }
@@ -966,21 +1092,41 @@ async fn test_14_token_accumulation() {
 
     match result {
         Ok(r) => {
-            println!("[tokens] {} | total: {}+{} tokens",
+            println!(
+                "[tokens] {} | total: {}+{} tokens",
                 elapsed_str(start),
-                r.token_usage.input_tokens, r.token_usage.output_tokens);
+                r.token_usage.input_tokens,
+                r.token_usage.output_tokens
+            );
             for s in &r.node_summaries {
-                println!("  - {}: {}+{} tokens",
-                    s.node_id, s.token_usage.input_tokens, s.token_usage.output_tokens);
+                println!(
+                    "  - {}: {}+{} tokens",
+                    s.node_id, s.token_usage.input_tokens, s.token_usage.output_tokens
+                );
             }
             // Total should be sum of both nodes
-            let sum_input: u32 = r.node_summaries.iter().map(|s| s.token_usage.input_tokens).sum();
-            let sum_output: u32 = r.node_summaries.iter().map(|s| s.token_usage.output_tokens).sum();
-            assert_eq!(r.token_usage.input_tokens, sum_input,
-                "total input tokens should equal sum of node tokens");
-            assert_eq!(r.token_usage.output_tokens, sum_output,
-                "total output tokens should equal sum of node tokens");
-            assert!(r.token_usage.input_tokens > 0, "should have used some tokens");
+            let sum_input: u32 = r
+                .node_summaries
+                .iter()
+                .map(|s| s.token_usage.input_tokens)
+                .sum();
+            let sum_output: u32 = r
+                .node_summaries
+                .iter()
+                .map(|s| s.token_usage.output_tokens)
+                .sum();
+            assert_eq!(
+                r.token_usage.input_tokens, sum_input,
+                "total input tokens should equal sum of node tokens"
+            );
+            assert_eq!(
+                r.token_usage.output_tokens, sum_output,
+                "total output tokens should equal sum of node tokens"
+            );
+            assert!(
+                r.token_usage.input_tokens > 0,
+                "should have used some tokens"
+            );
             println!("[tokens] OK: token accounting correct");
         }
         Err(e) => panic!("[tokens] FAILED: {e}"),
@@ -1013,28 +1159,44 @@ async fn test_15_research_pipeline_simple() {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         executor.run(dot, "What is Rust programming language?", &vars()),
-    ).await;
+    )
+    .await;
 
     match result {
         Ok(Ok(r)) => {
-            println!("[research] {} | success={} | nodes={} | {}+{} tokens",
-                elapsed_str(start), r.success, r.node_summaries.len(),
-                r.token_usage.input_tokens, r.token_usage.output_tokens);
+            println!(
+                "[research] {} | success={} | nodes={} | {}+{} tokens",
+                elapsed_str(start),
+                r.success,
+                r.node_summaries.len(),
+                r.token_usage.input_tokens,
+                r.token_usage.output_tokens
+            );
             for s in &r.node_summaries {
-                println!("  - {} ({}): {}ms, {}+{} tokens, success={}",
-                    s.node_id, s.model.as_deref().unwrap_or("default"),
-                    s.duration_ms, s.token_usage.input_tokens,
-                    s.token_usage.output_tokens, s.success);
+                println!(
+                    "  - {} ({}): {}ms, {}+{} tokens, success={}",
+                    s.node_id,
+                    s.model.as_deref().unwrap_or("default"),
+                    s.duration_ms,
+                    s.token_usage.input_tokens,
+                    s.token_usage.output_tokens,
+                    s.success
+                );
             }
             // Check files were created
             let facts = dir.path().join("facts.md");
             let report = dir.path().join("report.md");
-            println!("[research] facts.md exists={} report.md exists={}",
-                facts.exists(), report.exists());
+            println!(
+                "[research] facts.md exists={} report.md exists={}",
+                facts.exists(),
+                report.exists()
+            );
             if report.exists() {
                 let content = std::fs::read_to_string(&report).unwrap();
-                println!("[research] report preview: '{}'",
-                    content.chars().take(200).collect::<String>());
+                println!(
+                    "[research] report preview: '{}'",
+                    content.chars().take(200).collect::<String>()
+                );
             }
         }
         Ok(Err(e)) => {
@@ -1047,7 +1209,9 @@ async fn test_15_research_pipeline_simple() {
             panic!("research pipeline failed: {e}");
         }
         Err(_) => {
-            panic!("[research] TIMED OUT after 300s — likely stuck in agent loop or waiting for LLM");
+            panic!(
+                "[research] TIMED OUT after 300s — likely stuck in agent loop or waiting for LLM"
+            );
         }
     }
 }
@@ -1076,8 +1240,12 @@ async fn test_16_goal_gate_early_exit() {
 
     match result {
         Ok(r) => {
-            println!("[goal-gate] {} | success={} | nodes={}",
-                elapsed_str(start), r.success, r.node_summaries.len());
+            println!(
+                "[goal-gate] {} | success={} | nodes={}",
+                elapsed_str(start),
+                r.success,
+                r.node_summaries.len()
+            );
             assert!(r.success, "goal gate should mark pipeline as success");
             // The unreachable node should not execute (goal_gate exits early)
             let ran_unreachable = r.node_summaries.iter().any(|s| s.node_id == "unreachable");
@@ -1117,13 +1285,22 @@ async fn test_17_node_summaries_complete() {
 
     match result {
         Ok(r) => {
-            println!("[summaries] {} | {} nodes", elapsed_str(start), r.node_summaries.len());
+            println!(
+                "[summaries] {} | {} nodes",
+                elapsed_str(start),
+                r.node_summaries.len()
+            );
             for s in &r.node_summaries {
-                println!("  - id='{}' label='{}' model={:?} duration={}ms success={}",
-                    s.node_id, s.label, s.model, s.duration_ms, s.success);
+                println!(
+                    "  - id='{}' label='{}' model={:?} duration={}ms success={}",
+                    s.node_id, s.label, s.model, s.duration_ms, s.success
+                );
             }
             assert_eq!(r.node_summaries.len(), 3, "should have 3 node summaries");
-            assert!(r.node_summaries.iter().all(|s| s.success), "all nodes should succeed");
+            assert!(
+                r.node_summaries.iter().all(|s| s.success),
+                "all nodes should succeed"
+            );
             // noop handlers complete in 0ms, which is expected
             println!("[summaries] OK");
         }
@@ -1152,23 +1329,36 @@ async fn test_18_write_file_produces_output() {
     "#;
 
     let start = Instant::now();
-    let result = executor.run(dot, "generate research report and save it", &vars()).await;
+    let result = executor
+        .run(dot, "generate research report and save it", &vars())
+        .await;
 
     match result {
         Ok(r) => {
-            println!("[write-confirm] {} | success={} | output_len={}",
-                elapsed_str(start), r.success, r.output.len());
-            println!("[write-confirm] output: '{}'",
-                r.output.trim().chars().take(200).collect::<String>());
+            println!(
+                "[write-confirm] {} | success={} | output_len={}",
+                elapsed_str(start),
+                r.success,
+                r.output.len()
+            );
+            println!(
+                "[write-confirm] output: '{}'",
+                r.output.trim().chars().take(200).collect::<String>()
+            );
 
             // The key assertion: the pipeline must produce non-empty output
             // This catches the bug where write_file succeeds but no reply is sent
             assert!(r.success, "pipeline should succeed");
-            assert!(!r.output.trim().is_empty(),
-                "BUG: write_file completed but pipeline output is empty (no confirmation reply)");
+            assert!(
+                !r.output.trim().is_empty(),
+                "BUG: write_file completed but pipeline output is empty (no confirmation reply)"
+            );
 
             let report = dir.path().join("research_report.md");
-            assert!(report.exists(), "research_report.md should have been created");
+            assert!(
+                report.exists(),
+                "research_report.md should have been created"
+            );
             println!("[write-confirm] OK: file written and output produced");
         }
         Err(e) => panic!("[write-confirm] FAILED: {e}"),
@@ -1192,7 +1382,11 @@ async fn test_19_uploaded_file_readable_by_agent() {
 
     // Create file as if it was uploaded
     let uploaded = dir.path().join("sample.txt");
-    std::fs::write(&uploaded, "这是一段中文测试文本。\nThis is English text.\nLine 3.").unwrap();
+    std::fs::write(
+        &uploaded,
+        "这是一段中文测试文本。\nThis is English text.\nLine 3.",
+    )
+    .unwrap();
 
     let config = make_config(deepseek(), &dir).await;
     let executor = PipelineExecutor::new(config);
@@ -1208,9 +1402,15 @@ async fn test_19_uploaded_file_readable_by_agent() {
 
     match result {
         Ok(r) => {
-            println!("[uploaded-read] {} | success={}", elapsed_str(start), r.success);
-            println!("[uploaded-read] output: '{}'",
-                r.output.trim().chars().take(200).collect::<String>());
+            println!(
+                "[uploaded-read] {} | success={}",
+                elapsed_str(start),
+                r.success
+            );
+            println!(
+                "[uploaded-read] output: '{}'",
+                r.output.trim().chars().take(200).collect::<String>()
+            );
             assert!(r.success);
             // Agent should be able to read the file and report on its contents
             let lower = r.output.to_lowercase();
@@ -1233,7 +1433,11 @@ async fn test_19_translate_uploaded_file() {
     // Simulate the exact failing scenario from test report (scene 23, TV-02):
     // User uploads sample.txt, then asks "translate this file to English"
     let uploaded = dir.path().join("sample.txt");
-    std::fs::write(&uploaded, "今天天气很好。\n我喜欢编程。\nRust 是一门很棒的语言。").unwrap();
+    std::fs::write(
+        &uploaded,
+        "今天天气很好。\n我喜欢编程。\nRust 是一门很棒的语言。",
+    )
+    .unwrap();
 
     let config = make_config(deepseek(), &dir).await;
     let executor = PipelineExecutor::new(config);
@@ -1245,7 +1449,9 @@ async fn test_19_translate_uploaded_file() {
     "#;
 
     let start = Instant::now();
-    let result = executor.run(dot, "translate the uploaded file to English", &vars()).await;
+    let result = executor
+        .run(dot, "translate the uploaded file to English", &vars())
+        .await;
 
     match result {
         Ok(r) => {
@@ -1255,18 +1461,24 @@ async fn test_19_translate_uploaded_file() {
             let translated = dir.path().join("translated.txt");
             if translated.exists() {
                 let content = std::fs::read_to_string(&translated).unwrap();
-                println!("[translate] translated.txt: '{}'",
-                    content.trim().chars().take(200).collect::<String>());
+                println!(
+                    "[translate] translated.txt: '{}'",
+                    content.trim().chars().take(200).collect::<String>()
+                );
                 // Should contain English translations
                 let lower = content.to_lowercase();
                 assert!(
-                    lower.contains("weather") || lower.contains("programming") || lower.contains("rust"),
+                    lower.contains("weather")
+                        || lower.contains("programming")
+                        || lower.contains("rust"),
                     "translation should contain English words: {}",
                     content.chars().take(300).collect::<String>()
                 );
                 println!("[translate] OK: file translated successfully");
             } else {
-                panic!("[translate] BUG: translated.txt was not created — agent lost file reference");
+                panic!(
+                    "[translate] BUG: translated.txt was not created — agent lost file reference"
+                );
             }
         }
         Err(e) => panic!("[translate] FAILED: {e}"),
@@ -1292,8 +1504,7 @@ async fn test_20_send_file_after_write() {
 
     // Step 2: SendFileTool delivers it via relative path (how pipelines typically reference files)
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
-    let tool = SendFileTool::with_context(tx, "telegram", "user123")
-        .with_base_dir(dir.path());
+    let tool = SendFileTool::with_context(tx, "telegram", "user123").with_base_dir(dir.path());
 
     let result = tool
         .execute(&serde_json::json!({
@@ -1310,7 +1521,11 @@ async fn test_20_send_file_after_write() {
     assert_eq!(msg.chat_id, "user123");
     assert_eq!(msg.content, "Here is your presentation");
     assert_eq!(msg.media.len(), 1);
-    assert!(msg.media[0].contains("deck.pptx"), "media should reference pptx: {}", msg.media[0]);
+    assert!(
+        msg.media[0].contains("deck.pptx"),
+        "media should reference pptx: {}",
+        msg.media[0]
+    );
     println!("[send-after-write] OK: file written by pipeline, sent via SendFileTool");
 }
 
@@ -1337,8 +1552,7 @@ async fn test_21_send_multiple_files() {
     }
 
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
-    let tool = SendFileTool::with_context(tx, "feishu", "group789")
-        .with_base_dir(dir.path());
+    let tool = SendFileTool::with_context(tx, "feishu", "group789").with_base_dir(dir.path());
 
     for (name, _) in &files {
         let result = tool
@@ -1457,8 +1671,7 @@ async fn test_23_send_large_file() {
     std::fs::write(&large_file, &data).unwrap();
 
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
-    let tool = SendFileTool::with_context(tx, "telegram", "chat123")
-        .with_base_dir(dir.path());
+    let tool = SendFileTool::with_context(tx, "telegram", "chat123").with_base_dir(dir.path());
 
     let result = tool
         .execute(&serde_json::json!({
@@ -1468,14 +1681,22 @@ async fn test_23_send_large_file() {
         .await
         .unwrap();
 
-    assert!(result.success, "should handle large file: {}", result.output);
+    assert!(
+        result.success,
+        "should handle large file: {}",
+        result.output
+    );
     let msg = rx.recv().await.unwrap();
     assert_eq!(msg.media.len(), 1);
 
     // Verify the file at the media path is still intact
     let sent_path = &msg.media[0];
     let sent_size = std::fs::metadata(sent_path).unwrap().len();
-    assert_eq!(sent_size, 5_000_000, "file should be 5MB, got {}B", sent_size);
+    assert_eq!(
+        sent_size, 5_000_000,
+        "file should be 5MB, got {}B",
+        sent_size
+    );
     println!("[large-file] OK: 5MB file queued for delivery");
 }
 
@@ -1511,11 +1732,18 @@ async fn test_24_parallel_file_isolation() {
 
     match result {
         Ok(r) => {
-            println!("[parallel-files] {} | success={}", elapsed_str(start), r.success);
+            println!(
+                "[parallel-files] {} | success={}",
+                elapsed_str(start),
+                r.success
+            );
             let file_a = dir.path().join("file_a.txt");
             let file_b = dir.path().join("file_b.txt");
-            println!("[parallel-files] file_a exists={} file_b exists={}",
-                file_a.exists(), file_b.exists());
+            println!(
+                "[parallel-files] file_a exists={} file_b exists={}",
+                file_a.exists(),
+                file_b.exists()
+            );
             if file_a.exists() && file_b.exists() {
                 let a = std::fs::read_to_string(&file_a).unwrap();
                 let b = std::fs::read_to_string(&file_b).unwrap();

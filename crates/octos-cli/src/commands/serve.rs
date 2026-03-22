@@ -258,9 +258,7 @@ impl ServeCommand {
                 .map(Arc::new),
             tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
             frps_server: std::env::var("FRPS_SERVER").ok(),
-            frps_port: std::env::var("FRPS_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok()),
+            frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
         });
 
         // Auto-start enabled profiles

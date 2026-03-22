@@ -310,7 +310,9 @@ impl GatewayCommand {
                             baseline_loaded = true;
                             break;
                         }
-                        Err(e) => warn!(error = %e, path = %baseline_path.display(), "failed to parse provider_baseline.json"),
+                        Err(e) => {
+                            warn!(error = %e, path = %baseline_path.display(), "failed to parse provider_baseline.json")
+                        }
                     }
                 }
             }
@@ -331,12 +333,16 @@ impl GatewayCommand {
                     if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
                         router.seed_catalog(&catalog.models);
                         // Seed the global runtime catalog for context.rs lookups
-                        let ctx_entries: Vec<(String, u64, u64)> = catalog.models.iter()
+                        let ctx_entries: Vec<(String, u64, u64)> = catalog
+                            .models
+                            .iter()
                             .map(|m| (m.provider.clone(), m.context_window, m.max_output))
                             .collect();
                         octos_llm::context::seed_from_catalog(&ctx_entries);
                         // Seed pricing catalog
-                        let price_entries: Vec<(String, f64, f64)> = catalog.models.iter()
+                        let price_entries: Vec<(String, f64, f64)> = catalog
+                            .models
+                            .iter()
                             .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
                             .collect();
                         octos_llm::pricing::seed_pricing_catalog(&price_entries);
@@ -389,7 +395,9 @@ impl GatewayCommand {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    if let Ok(json) = serde_json::to_string_pretty(&metrics_router.export_model_catalog()) {
+                    if let Ok(json) =
+                        serde_json::to_string_pretty(&metrics_router.export_model_catalog())
+                    {
                         let _ = tokio::fs::write(&catalog_path, &json).await;
                     }
                 }
@@ -822,11 +830,16 @@ impl GatewayCommand {
                 for path in &[catalog_path, system_catalog] {
                     if let Ok(json) = std::fs::read_to_string(path) {
                         if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
-                            let score_entries: Vec<(String, f64)> = catalog.models.iter()
+                            let score_entries: Vec<(String, f64)> = catalog
+                                .models
+                                .iter()
                                 .map(|m| (m.provider.clone(), m.score))
                                 .collect();
                             router.seed_qos_scores(&score_entries);
-                            info!(models = score_entries.len(), "seeded scores for fallback ranking");
+                            info!(
+                                models = score_entries.len(),
+                                "seeded scores for fallback ranking"
+                            );
                             break;
                         }
                     }
@@ -846,7 +859,7 @@ impl GatewayCommand {
             {
                 let llm_c = llm.clone();
                 let mem_c = memory.clone();
-                let cwd_c = cwd.clone();
+                let _cwd_c = cwd.clone();
                 let data_c = data_dir.clone();
                 let policy_c = tools.provider_policy().cloned();
                 let plugins_c = plugin_dirs.clone();

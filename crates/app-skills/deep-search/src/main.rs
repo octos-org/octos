@@ -583,13 +583,22 @@ async fn web_search(
     // Gives redundancy + speed without the resource explosion of fire-all.
     // Priority: tavily > perplexity > brave > duckduckgo
     let mut available: Vec<&str> = Vec::new();
-    if std::env::var("TAVILY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+    if std::env::var("TAVILY_API_KEY")
+        .ok()
+        .is_some_and(|k| !k.is_empty())
+    {
         available.push("tavily");
     }
-    if std::env::var("PERPLEXITY_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+    if std::env::var("PERPLEXITY_API_KEY")
+        .ok()
+        .is_some_and(|k| !k.is_empty())
+    {
         available.push("perplexity");
     }
-    if std::env::var("BRAVE_API_KEY").ok().is_some_and(|k| !k.is_empty()) {
+    if std::env::var("BRAVE_API_KEY")
+        .ok()
+        .is_some_and(|k| !k.is_empty())
+    {
         available.push("brave");
     }
     available.push("duckduckgo"); // always available (free)
@@ -607,13 +616,12 @@ async fn web_search(
         }));
     }
 
-    let results = match tokio::time::timeout(
+    let results = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         futures::future::join_all(handles),
-    ).await {
-        Ok(r) => r,
-        Err(_) => Vec::new(),
-    };
+    )
+    .await
+    .unwrap_or_default();
 
     // Pick the best result (richest successful output)
     let mut successful: Vec<(String, SearchResult)> = results
@@ -635,7 +643,10 @@ async fn web_search(
     // Append runner-up if it has substantial unique content
     if let Some((name, other)) = successful.first() {
         if other.output.len() > 200 {
-            primary.1.output.push_str(&format!("\n\n--- Also from {name} ---\n"));
+            primary
+                .1
+                .output
+                .push_str(&format!("\n\n--- Also from {name} ---\n"));
             primary.1.output.push_str(&other.output);
         }
     }
@@ -645,45 +656,48 @@ async fn web_search(
 
 /// Fire ALL available engines in parallel and merge results.
 /// Use sparingly — with many concurrent workers this creates hundreds of connections.
-async fn parallel_all_engines(
-    client: &reqwest::Client,
-    query: &str,
-    count: u8,
-) -> SearchResult {
+async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) -> SearchResult {
     let mut handles = Vec::new();
 
     if let Ok(k) = std::env::var("TAVILY_API_KEY") {
         if !k.is_empty() {
             let c = client.clone();
             let q = query.to_string();
-            handles.push(tokio::spawn(async move { ("tavily", tavily_search(&c, &q, count, &k).await) }));
+            handles.push(tokio::spawn(async move {
+                ("tavily", tavily_search(&c, &q, count, &k).await)
+            }));
         }
     }
     if let Ok(k) = std::env::var("PERPLEXITY_API_KEY") {
         if !k.is_empty() {
             let c = client.clone();
             let q = query.to_string();
-            handles.push(tokio::spawn(async move { ("perplexity", perplexity_search(&c, &q, &k).await) }));
+            handles.push(tokio::spawn(async move {
+                ("perplexity", perplexity_search(&c, &q, &k).await)
+            }));
         }
     }
     if let Ok(k) = std::env::var("BRAVE_API_KEY") {
         let c = client.clone();
         let q = query.to_string();
-        handles.push(tokio::spawn(async move { ("brave", brave_search(&c, &q, count, &k).await) }));
+        handles.push(tokio::spawn(async move {
+            ("brave", brave_search(&c, &q, count, &k).await)
+        }));
     }
     {
         let c = client.clone();
         let q = query.to_string();
-        handles.push(tokio::spawn(async move { ("duckduckgo", ddg_search(&c, &q, count).await) }));
+        handles.push(tokio::spawn(async move {
+            ("duckduckgo", ddg_search(&c, &q, count).await)
+        }));
     }
 
-    let results = match tokio::time::timeout(
+    let results = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         futures::future::join_all(handles),
-    ).await {
-        Ok(r) => r,
-        Err(_) => Vec::new(),
-    };
+    )
+    .await
+    .unwrap_or_default();
 
     let mut successful: Vec<(String, SearchResult)> = results
         .into_iter()
@@ -703,7 +717,10 @@ async fn parallel_all_engines(
     let mut primary = successful.remove(0);
     for (name, other) in &successful {
         if other.output.len() > 100 {
-            primary.1.output.push_str(&format!("\n\n--- Additional ({name}) ---\n"));
+            primary
+                .1
+                .output
+                .push_str(&format!("\n\n--- Additional ({name}) ---\n"));
             primary.1.output.push_str(&other.output);
         }
     }
@@ -782,7 +799,9 @@ async fn tavily_search(
         return SearchResult {
             output: format!("Tavily HTTP {status}: {}", {
                 let mut end = text.len().min(200);
-                while !text.is_char_boundary(end) && end > 0 { end -= 1; }
+                while !text.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
                 &text[..end]
             }),
             success: false,
