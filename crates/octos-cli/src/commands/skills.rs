@@ -1262,7 +1262,7 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                 if let Some(info) = manifest.binaries.get(&key) {
                     println!("  Downloading binary for {} from manifest...", key.cyan());
                     if download_binary_from_url(dir, &info.url, info.sha256.as_deref())? {
-                        // Also install to ~/.cargo/bin/ for PATH access
+                        // Log installation
                         install_main_to_cargo_bin(dir, &manifest.name);
                         return Ok(());
                     }
@@ -1314,7 +1314,7 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     }
 
     // Copy the built binary to 'main' for PluginLoader to find,
-    // and also install to ~/.cargo/bin/ so it's available as a CLI command.
+    // Copy built binary to skill dir as `main` for plugin loader discovery.
     let target_dir = dir.join("target").join("release");
     if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
         for line in cargo_toml.lines() {
@@ -1333,7 +1333,7 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                                 std::fs::Permissions::from_mode(0o755),
                             )?;
                         }
-                        // Also install to ~/.cargo/bin/ for PATH access
+                        // Log installation
                         install_main_to_cargo_bin(dir, name);
                         println!("  {} Built and installed binary '{}'", "OK".green(), name);
                         break;
@@ -1412,31 +1412,20 @@ fn maybe_npm_install(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy the `main` binary from a skill directory to `~/.cargo/bin/{name}` for PATH access.
+/// Log that the binary was installed in the skill directory.
+/// Previously this copied to ~/.cargo/bin/ which is global and shared
+/// across profiles. Skills should be self-contained in their directory.
 fn install_main_to_cargo_bin(dir: &Path, name: &str) {
     let main_path = dir.join("main");
     if !main_path.exists() {
         return;
     }
-    if let Some(home) = dirs::home_dir() {
-        let cargo_bin = home.join(".cargo").join("bin");
-        if cargo_bin.is_dir() {
-            let dest = cargo_bin.join(name);
-            if std::fs::copy(&main_path, &dest).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-                }
-                println!(
-                    "  {} Installed '{}' to {}",
-                    "OK".green(),
-                    name,
-                    cargo_bin.display()
-                );
-            }
-        }
-    }
+    println!(
+        "  {} Installed '{}' to {}",
+        "OK".green(),
+        name,
+        dir.display()
+    );
 }
 
 fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
