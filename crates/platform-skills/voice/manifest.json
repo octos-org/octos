@@ -8,7 +8,7 @@
   "tools": [
     {
       "name": "voice_transcribe",
-      "description": "Transcribe an audio file to text using OminiX ASR (Qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
+      "description": "Transcribe an audio file to text using Qwen3-ASR (POST /v1/audio/asr/qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -26,7 +26,7 @@
     },
     {
       "name": "voice_synthesize",
-      "description": "Synthesize speech from text using OminiX TTS (Qwen3). Produces a WAV audio file. Use this when the user asks for a voice reply or text-to-speech. After generating, use send_file to deliver the audio to the user.",
+      "description": "Synthesize speech from text using Qwen3-TTS (POST /v1/audio/tts/qwen3). Produces a WAV audio file. Use this when the user asks for a voice reply or text-to-speech. After generating, use send_file to deliver the audio to the user.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -52,7 +52,7 @@
     },
     {
       "name": "voice_clone",
-      "description": "Clone a voice from a reference audio sample (3-10 seconds) and synthesize new speech in that voice. Uses ECAPA-TDNN x-vector speaker embedding extraction. Requires the Base TTS model (not CustomVoice). After generating, use send_file to deliver the audio. IMPORTANT: When the user sends a voice sample for cloning, always ask what name they want for this voice profile, then set save_as to save it for future use.",
+      "description": "Clone a voice from a reference audio sample (3-10 seconds) and synthesize new speech in that voice via POST /v1/audio/tts/clone. Uses ECAPA-TDNN x-vector speaker embedding. Requires the Base TTS model (not CustomVoice). After generating, use send_file to deliver the audio. IMPORTANT: When the user sends a voice sample for cloning, always ask what name they want for this voice profile, then set save_as to save it for future use.",
       "input_schema": {
         "type": "object",
         "properties": {
