@@ -50,7 +50,8 @@ pub(crate) use prompt::build_system_prompt;
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
-    feature = "qq-bot"
+    feature = "qq-bot",
+    feature = "wechat"
 ))]
 use prompt::settings_str;
 
@@ -76,6 +77,10 @@ pub struct GatewayCommand {
     /// Override WhatsApp bridge URL (used by managed gateways).
     #[arg(long, hide = true)]
     pub bridge_url: Option<String>,
+
+    /// Internal: managed WeChat bridge WebSocket URL.
+    #[arg(long, hide = true)]
+    pub wechat_bridge_url: Option<String>,
 
     /// Override Feishu webhook port (used by managed gateways).
     #[arg(long, hide = true)]
@@ -1397,6 +1402,16 @@ impl GatewayCommand {
                     channel_mgr.register(Arc::new(octos_bus::QQBotChannel::new(
                         &app_id,
                         &client_secret,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "wechat")]
+                "wechat" => {
+                    let default_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
+                    let bridge_url = self.wechat_bridge_url.as_deref().unwrap_or(&default_url);
+                    channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
+                        &bridge_url,
                         entry.allowed_senders.clone(),
                         shutdown.clone(),
                     )));

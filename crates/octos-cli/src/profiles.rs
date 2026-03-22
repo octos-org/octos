@@ -289,6 +289,13 @@ pub enum ChannelCredentials {
         #[serde(default = "default_qq_bot_secret_env")]
         client_secret_env: String,
     },
+    #[serde(rename = "wechat")]
+    WeChat {
+        #[serde(default = "default_wechat_token_env")]
+        token_env: String,
+        #[serde(default = "default_wechat_base_url")]
+        base_url: String,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -350,6 +357,12 @@ fn default_matrix_port() -> u16 {
 }
 fn default_qq_bot_secret_env() -> String {
     "QQ_BOT_CLIENT_SECRET".into()
+}
+fn default_wechat_token_env() -> String {
+    "WECHAT_BOT_TOKEN".into()
+}
+fn default_wechat_base_url() -> String {
+    "https://ilinkai.weixin.qq.com".into()
 }
 
 /// Gateway-specific settings.
@@ -922,6 +935,16 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "client_secret_env": client_secret_env,
             }
         }),
+        ChannelCredentials::WeChat {
+            token_env,
+            base_url,
+        } => serde_json::json!({
+            "type": "wechat",
+            "settings": {
+                "token_env": token_env,
+                "base_url": base_url,
+            }
+        }),
     }
 }
 
@@ -1069,7 +1092,6 @@ mod tests {
                     max_history: Some(50),
                     ..Default::default()
                 },
-                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),

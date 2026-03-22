@@ -6144,6 +6144,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wechat-bridge"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+]
+
+[[package]]
 name = "which"
 version = "7.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

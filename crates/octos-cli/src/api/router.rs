@@ -82,6 +82,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_whatsapp_qr),
         )
         .route(
+            "/api/my/profile/wechat/qr-start",
+            get(auth_handlers::my_wechat_qr_start),
+        )
+        .route(
+            "/api/my/profile/wechat/qr-poll",
+            post(auth_handlers::my_wechat_qr_poll),
+        )
+        .route(
             "/api/my/profile/metrics",
             get(auth_handlers::my_provider_metrics),
         )
@@ -129,6 +137,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/profiles/{id}/whatsapp/qr",
             get(admin::whatsapp_qr),
+        )
+        .route(
+            "/api/admin/profiles/{id}/wechat/qr-start",
+            get(admin::wechat_qr_start),
+        )
+        .route(
+            "/api/admin/profiles/{id}/wechat/qr-poll",
+            post(admin::wechat_qr_poll),
         )
         .route("/api/admin/test-provider", post(admin::test_provider))
         .route("/api/admin/start-all", post(admin::start_all))

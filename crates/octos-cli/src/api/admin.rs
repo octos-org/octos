@@ -2341,6 +2341,7 @@ pub async fn config_check(
             crate::profiles::ChannelCredentials::WeComBot { .. } => "wecom-bot",
             crate::profiles::ChannelCredentials::Matrix { .. } => "matrix",
             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
+            crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
         })
         .collect();
 
@@ -2998,4 +2999,124 @@ mod tests {
         assert!(result.timed_out);
         assert_eq!(result.exit_code, -1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// WeChat QR Login
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct WeChatQrStartResponse {
+    pub qrcode_url: String,
+    pub session_key: String,
+}
+
+/// GET /api/admin/profiles/{id}/wechat/qr-start
+pub async fn wechat_qr_start(
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+) -> Result<Json<WeChatQrStartResponse>, (StatusCode, String)> {
+    let client = reqwest::Client::new();
+    let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to fetch QR: {e}")))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid QR response: {e}")))?;
+    let qrcode = body["qrcode"]
+        .as_str()
+        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode field".into()))?
+        .to_string();
+    let qrcode_url = body["qrcode_img_content"]
+        .as_str()
+        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode_img_content".into()))?
+        .to_string();
+
+    Ok(Json(WeChatQrStartResponse {
+        qrcode_url,
+        session_key: qrcode,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct WeChatQrPollRequest {
+    pub session_key: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct WeChatQrPollResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
+}
+
+/// POST /api/admin/profiles/{id}/wechat/qr-poll
+pub async fn wechat_qr_poll(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<WeChatQrPollRequest>,
+) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(40))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let encoded_key: String = req.session_key.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+            c.to_string()
+        } else {
+            format!("%{:02X}", c as u32)
+        }
+    }).collect();
+    let url = format!(
+        "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
+        encoded_key
+    );
+    let resp = client
+        .get(&url)
+        .header("iLink-App-ClientVersion", "1")
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                return (StatusCode::OK, "".into());
+            }
+            (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
+        })?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid poll response: {e}")))?;
+
+    let status = body["status"].as_str().unwrap_or("wait").to_string();
+
+    if status == "confirmed" {
+        let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
+        let bot_id = body["ilink_bot_id"].as_str().unwrap_or_default().to_string();
+
+        // Save token to profile
+        if !bot_token.is_empty() {
+            if let Some(pm) = state.process_manager.as_ref() {
+                let store = pm.profile_store();
+                std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+            }
+        }
+
+        return Ok(Json(WeChatQrPollResponse {
+            status,
+            bot_token: Some(bot_token),
+            bot_id: Some(bot_id),
+        }));
+    }
+
+    Ok(Json(WeChatQrPollResponse {
+        status,
+        bot_token: None,
+        bot_id: None,
+    }))
 }
