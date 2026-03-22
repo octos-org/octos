@@ -158,6 +158,56 @@ fn fetch_tts_wav(
     Ok(pcm_to_wav(&bytes, 24000))
 }
 
+/// Send a voice clone request as multipart form with raw WAV bytes.
+fn fetch_clone_wav(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    audio_bytes: Vec<u8>,
+    input: &str,
+    language: &str,
+) -> Result<Vec<u8>, String> {
+    use reqwest::blocking::multipart::{Form, Part};
+    let form = Form::new()
+        .text("input", input.to_string())
+        .text("language", language.to_string())
+        .part(
+            "reference_audio",
+            Part::bytes(audio_bytes)
+                .file_name("ref.wav")
+                .mime_str("audio/wav")
+                .unwrap(),
+        );
+
+    let resp = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("Clone request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let resp_text = resp.text().unwrap_or_default();
+        return Err(format!(
+            "Clone error (HTTP {status}): {}",
+            truncate(&resp_text, 200)
+        ));
+    }
+
+    let mut buf = Vec::new();
+    {
+        use std::io::Read;
+        let mut reader = resp;
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Failed to read clone response: {e}"))?;
+    }
+
+    if buf.is_empty() {
+        return Err("Clone returned empty response".to_string());
+    }
+    Ok(buf)
+}
+
 fn check_health(client: &reqwest::blocking::Client, base_url: &str) -> Result<(), String> {
     match client
         .get(format!("{base_url}/health"))
@@ -204,9 +254,16 @@ fn timestamp() -> u64 {
         .as_secs()
 }
 
-/// Per-profile voice profiles directory: `$OCTOS_DATA_DIR/voice_profiles/`.
+/// Per-user voice profiles directory: `$OCTOS_WORK_DIR/voice_profiles/`.
+/// Falls back to `$OCTOS_DATA_DIR/voice_profiles/` for backwards compat.
 /// Each saved profile is a raw audio file named `{name}.wav`.
 fn voice_profiles_dir() -> Option<PathBuf> {
+    // Prefer OCTOS_WORK_DIR (per-user workspace inside the agent sandbox)
+    // so the agent can see voice_profiles/ via glob/list_dir.
+    if let Ok(d) = std::env::var("OCTOS_WORK_DIR") {
+        return Some(Path::new(&d).join("voice_profiles"));
+    }
+    // Fallback to OCTOS_DATA_DIR (profile-level, outside sandbox)
     std::env::var("OCTOS_DATA_DIR")
         .ok()
         .map(|d| Path::new(&d).join("voice_profiles"))
@@ -273,7 +330,7 @@ fn handle_transcribe(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "Chinese".to_string());
 
-    // Send file as multipart form data (compatible with all ominix-api versions)
+    // Read audio file and base64-encode it (ominix-api expects JSON with base64 `file` field)
     let file_bytes = match std::fs::read(&input.audio_path) {
         Ok(b) => b,
         Err(e) => fail(&format!(
@@ -281,24 +338,19 @@ fn handle_transcribe(input_json: &str) {
             input.audio_path
         )),
     };
-    let filename = std::path::Path::new(&input.audio_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "audio.wav".to_string());
+    use base64::Engine;
+    let file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
 
-    let file_part = reqwest::blocking::multipart::Part::bytes(file_bytes)
-        .file_name(filename)
-        .mime_str("audio/wav")
-        .unwrap();
-    let form = reqwest::blocking::multipart::Form::new()
-        .part("file", file_part)
-        .text("language", language)
-        .text("response_format", "verbose_json");
+    let body = serde_json::json!({
+        "file": file_b64,
+        "language": language,
+        "response_format": "verbose_json"
+    });
 
     // Use model-specific ASR endpoint (Qwen3-ASR)
     let resp = match client
         .post(format!("{base_url}/v1/audio/asr/qwen3"))
-        .multipart(form)
+        .json(&body)
         .send()
     {
         Ok(r) => r,
@@ -409,15 +461,14 @@ fn handle_synthesize(input_json: &str) {
 
     // Check if speaker is a saved voice profile — if so, use clone mode
     if let Some(profile_path) = resolve_voice_profile(&speaker) {
-        let body = json!({
-            "input": input.text,
-            "reference_audio": profile_path.to_string_lossy(),
-            "language": language
-        });
+        let ref_bytes = match std::fs::read(&profile_path) {
+            Ok(b) => b,
+            Err(e) => fail(&format!("Failed to read voice profile '{}': {e}", speaker)),
+        };
 
-        // Clone via model-specific endpoint (Base model with x-vector)
+        // Clone via model-specific endpoint (multipart with raw WAV)
         let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
-        let wav_bytes = match fetch_tts_wav(&client, &clone_url, &body) {
+        let wav_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
             Ok(b) => b,
             Err(e) => fail(&format!("TTS (clone) failed: {e}")),
         };
@@ -536,15 +587,15 @@ fn handle_voice_clone(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
-    let body = json!({
-        "input": input.text,
-        "reference_audio": input.reference_audio,
-        "language": language
-    });
+    // Read reference audio (raw bytes, sent as multipart to ominix-api)
+    let ref_bytes = match std::fs::read(&input.reference_audio) {
+        Ok(b) => b,
+        Err(e) => fail(&format!("Failed to read reference audio '{}': {e}", input.reference_audio)),
+    };
 
-    // Clone via model-specific endpoint (Base model with x-vector)
+    // Clone via model-specific endpoint (multipart with raw WAV)
     let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
-    let wav_bytes = match fetch_tts_wav(&client, &clone_url, &body) {
+    let wav_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
         Ok(b) => b,
         Err(e) => fail(&format!("Voice clone failed: {e}")),
     };

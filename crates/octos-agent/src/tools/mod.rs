@@ -900,6 +900,27 @@ impl ToolRegistry {
         registry
     }
 
+    /// Re-bind all plugin tools to a new work directory.
+    ///
+    /// Creates copies of each `PluginTool` with the given work_dir so that
+    /// per-session output (e.g. voice profiles) lands inside the user's
+    /// workspace where the agent's sandboxed tools can access it.
+    pub fn rebind_plugin_work_dirs(&mut self, work_dir: &Path) {
+        use crate::plugins::PluginTool;
+        let replacements: Vec<_> = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                tool.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|pt| (name.clone(), pt.clone_with_work_dir(work_dir.to_path_buf())))
+            })
+            .collect();
+        for (name, new_tool) in replacements {
+            self.tools.insert(name, Arc::new(new_tool));
+        }
+    }
+
     /// Re-register builtin configurable tools with a ToolConfigStore.
     ///
     /// Tools already registered by `with_builtins_and_sandbox()` are replaced
