@@ -52,11 +52,11 @@ impl Tool for ActivateToolsTool {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names to activate (e.g. [\"save_memory\", \"recall_memory\"]). Omit to list available tools."
+                    "description": "Tool names to activate (e.g. [\"fm_tts\", \"voice_synthesize\"]). Call with no args to list available deferred tools."
                 },
                 "group": {
                     "type": "string",
-                    "description": "Alternatively, a group name to activate all tools in it (e.g. 'group:memory'). Prefer using 'tools' array for precise control."
+                    "description": "Alternatively, a group name to activate all tools in it (e.g. 'group:memory')."
                 }
             }
         })
@@ -186,8 +186,8 @@ mod tests {
 
         let result = tool.execute(&serde_json::json!({})).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("group:web"));
-        assert!(result.output.contains("Web search"));
+        assert!(result.output.contains("web_search"));
+        assert!(result.output.contains("web_fetch"));
     }
 
     #[tokio::test]

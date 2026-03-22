@@ -565,7 +565,10 @@ impl GatewayCommand {
 
         // Build env vars to inject into plugin processes so skills can route
         // API calls through the configured provider/gateway (e.g. r9s.ai).
-        let plugin_env = build_plugin_env(&config, &provider_name);
+        let mut plugin_env = build_plugin_env(&config, &provider_name);
+        // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
+        // resolve storage relative to the correct profile, not the gateway root.
+        plugin_env.push(("OCTOS_DATA_DIR".to_string(), data_dir.to_string_lossy().to_string()));
 
         let mut tools;
         let mut plugin_result;

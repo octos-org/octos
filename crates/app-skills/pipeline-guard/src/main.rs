@@ -285,7 +285,7 @@ fn pick_models(catalog: &ModelCatalog) -> Option<ModelPicks> {
 
     // Best model = lowest score (score is lower-is-better from AdaptiveRouter).
     // Tiebreak: cheaper wins.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     fn best_of<'a>(models: &[&'a CatalogEntry]) -> Option<&'a CatalogEntry> {
         models.iter().copied().min_by(|a, b| {
             a.score

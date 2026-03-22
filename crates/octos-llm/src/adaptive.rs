@@ -367,7 +367,7 @@ struct AdaptiveSlot {
     provider: std::sync::Arc<dyn LlmProvider>,
     metrics: ProviderMetrics,
     /// Config-order priority (0 = primary, 1 = first fallback, etc.).
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     priority: usize,
     /// Published output price in USD per million tokens (0.0 = unknown/free).
     cost_per_m: f64,
