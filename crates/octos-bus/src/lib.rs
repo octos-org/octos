@@ -62,7 +62,7 @@ pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
 #[cfg(feature = "matrix")]
-pub use matrix_channel::{BotManager, BotRouter, MatrixChannel};
+pub use matrix_channel::{BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel};
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;
 #[cfg(feature = "wechat")]

@@ -165,6 +165,8 @@ impl octos_bus::BotManager for GatewayBotManager {
         username: &str,
         name: &str,
         system_prompt: Option<&str>,
+        sender: &str,
+        visibility: octos_bus::BotVisibility,
     ) -> eyre::Result<String> {
         use crate::profiles::GatewaySettings;
 
@@ -218,7 +220,11 @@ impl octos_bus::BotManager for GatewayBotManager {
         sub.updated_at = chrono::Utc::now();
         self.store.save(&sub)?;
 
-        if let Err(e) = self.channel.register_bot(&matrix_user_id, &sub.id).await {
+        if let Err(e) = self
+            .channel
+            .register_bot_owned(&matrix_user_id, &sub.id, sender, visibility)
+            .await
+        {
             if let Err(delete_error) = self.store.delete(&sub.id) {
                 warn!(
                     profile_id = %sub.id,
@@ -229,33 +235,50 @@ impl octos_bus::BotManager for GatewayBotManager {
             eyre::bail!("Failed to register Matrix user: {e}");
         }
 
+        let visibility_label = match visibility {
+            octos_bus::BotVisibility::Public => "public",
+            octos_bus::BotVisibility::Private => "private",
+        };
+
         Ok(format!(
             "Bot **{name}** created successfully!\n\
              \n\
              - Matrix ID: `{matrix_user_id}`\n\
              - Profile ID: `{}`\n\
+             - Visibility: `{visibility_label}`\n\
              \n\
              You can now send a direct message to `{matrix_user_id}` to start chatting.",
             sub.id
         ))
     }
 
-    async fn delete_bot(&self, matrix_user_id: &str) -> eyre::Result<String> {
+    async fn delete_bot(&self, matrix_user_id: &str, sender: &str) -> eyre::Result<String> {
         let botfather_user_id = self.channel.bot_user_id();
         if matrix_user_id == botfather_user_id {
             eyre::bail!("the BotFather bot (`{botfather_user_id}`) cannot be deleted");
         }
 
-        let profile_id = self
+        let entry = self
             .channel
             .bot_router()
-            .route(matrix_user_id)
+            .get_entry(matrix_user_id)
             .await
             .ok_or_else(|| {
                 eyre::eyre!(
                     "bot `{matrix_user_id}` not found — use `/listbots` to see registered bots"
                 )
             })?;
+        if !self.channel.is_operator_sender(sender) {
+            if entry.owner.is_empty() {
+                eyre::bail!(
+                    "bot `{matrix_user_id}` is a legacy bot and can only be deleted by an operator"
+                );
+            }
+            if entry.owner != sender {
+                eyre::bail!("You can only delete bots you created.");
+            }
+        }
+        let profile_id = entry.profile_id;
 
         if profile_id == self.parent_profile_id {
             eyre::bail!("the parent profile cannot be deleted");
@@ -286,30 +309,61 @@ impl octos_bus::BotManager for GatewayBotManager {
         ))
     }
 
-    async fn list_bots(&self) -> eyre::Result<String> {
-        let botfather_id = self.channel.bot_user_id();
-        let mut lines = vec![
-            "**Registered bots:**\n".to_string(),
-            format!("• **BotFather** `{botfather_id}`"),
-        ];
+    async fn list_bots(&self, sender: &str) -> eyre::Result<String> {
+        let mut public_lines = Vec::new();
+        let mut private_lines = Vec::new();
 
-        let routes = self.channel.bot_router().list_routes().await;
-        let mut sorted: Vec<_> = routes.into_iter().collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        for (matrix_id, profile_id) in &sorted {
-            let name = self
+        let mut entries = self.channel.bot_router().list_entries().await;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (matrix_id, entry) in entries {
+            let display_name = self
                 .store
-                .get(profile_id)
+                .get(&entry.profile_id)
                 .ok()
                 .flatten()
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
-            if name.is_empty() {
-                lines.push(format!("• `{matrix_id}`"));
-            } else {
-                lines.push(format!("• **{name}** `{matrix_id}`"));
+                .map(|p| {
+                    if p.name.is_empty() {
+                        format!("`{matrix_id}`")
+                    } else {
+                        format!("**{}** `{matrix_id}`", p.name)
+                    }
+                })
+                .unwrap_or_else(|| format!("`{matrix_id}`"));
+
+            match entry.visibility {
+                octos_bus::BotVisibility::Public => {
+                    let suffix = if entry.owner == sender { " (yours)" } else { "" };
+                    if entry.owner.is_empty() && self.channel.is_operator_sender(sender) {
+                        public_lines.push(format!("• {display_name} [legacy-ownerless]{suffix}"));
+                    } else {
+                        public_lines.push(format!("• {display_name}{suffix}"));
+                    }
+                }
+                octos_bus::BotVisibility::Private => {
+                    if entry.owner == sender {
+                        private_lines.push(format!("• {display_name}"));
+                    }
+                }
             }
         }
-        Ok(lines.join("\n"))
+
+        let mut output = Vec::new();
+        if !public_lines.is_empty() {
+            output.push("**Public bots:**".to_string());
+            output.extend(public_lines);
+        }
+        if !private_lines.is_empty() {
+            if !output.is_empty() {
+                output.push(String::new());
+            }
+            output.push("**Your private bots:**".to_string());
+            output.extend(private_lines);
+        }
+        if output.is_empty() {
+            output.push("No bots available.".to_string());
+        }
+
+        Ok(output.join("\n"))
     }
 }

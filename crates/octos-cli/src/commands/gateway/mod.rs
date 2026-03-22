@@ -2888,7 +2888,12 @@ mod tests {
         );
         channel
             .bot_router()
-            .register("@bot_weatherbot:localhost", &sub.id)
+            .register_entry(
+                "@bot_weatherbot:localhost",
+                &sub.id,
+                "@alice:localhost",
+                octos_bus::BotVisibility::Private,
+            )
             .await
             .unwrap();
 
@@ -2907,7 +2912,9 @@ mod tests {
             parent_profile_id: parent.id.clone(),
         };
 
-        let result = manager.delete_bot("@bot_weatherbot:localhost").await;
+        let result = manager
+            .delete_bot("@bot_weatherbot:localhost", "@alice:localhost")
+            .await;
 
         let mut restore = std::fs::metadata(&profiles_dir).unwrap().permissions();
         restore.set_mode(original_mode);
@@ -2924,6 +2931,147 @@ mod tests {
                 .await,
             Some(sub.id.clone()),
             "route should remain registered when profile deletion fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_bot_rejects_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let mut parent = make_profile("botfather", None);
+        parent
+            .config
+            .channels
+            .push(crate::profiles::ChannelCredentials::Matrix {
+                homeserver: "http://localhost:6167".to_string(),
+                as_token: "as-token".to_string(),
+                hs_token: "hs-token".to_string(),
+                server_name: "localhost".to_string(),
+                sender_localpart: "bot".to_string(),
+                user_prefix: "bot_".to_string(),
+                port: MATRIX_DEFAULT_PORT,
+                allowed_senders: vec![],
+            });
+        store.save(&parent).unwrap();
+
+        let mut sub = make_profile("botfather--weatherbot", None);
+        sub.parent_id = Some(parent.id.clone());
+        store.save(&sub).unwrap();
+
+        let channel = Arc::new(
+            octos_bus::MatrixChannel::new(
+                "http://localhost:6167",
+                "as-token",
+                "hs-token",
+                "localhost",
+                "bot",
+                "bot_",
+                6166,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_bot_router(dir.path()),
+        );
+        channel
+            .bot_router()
+            .register_entry(
+                "@bot_weatherbot:localhost",
+                &sub.id,
+                "@alice:localhost",
+                octos_bus::BotVisibility::Public,
+            )
+            .await
+            .unwrap();
+
+        let manager = GatewayBotManager {
+            store: store.clone(),
+            channel: channel.clone(),
+            parent_profile_id: parent.id.clone(),
+        };
+
+        let result = manager
+            .delete_bot("@bot_weatherbot:localhost", "@mallory:localhost")
+            .await;
+
+        let err = result.expect_err("non-owner delete should fail");
+        assert!(
+            err.to_string().contains("only delete bots you created"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            channel
+                .bot_router()
+                .route("@bot_weatherbot:localhost")
+                .await,
+            Some(sub.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_bot_allows_operator_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open(dir.path()).unwrap());
+        let mut parent = make_profile("botfather", None);
+        parent
+            .config
+            .channels
+            .push(crate::profiles::ChannelCredentials::Matrix {
+                homeserver: "http://localhost:6167".to_string(),
+                as_token: "as-token".to_string(),
+                hs_token: "hs-token".to_string(),
+                server_name: "localhost".to_string(),
+                sender_localpart: "bot".to_string(),
+                user_prefix: "bot_".to_string(),
+                port: MATRIX_DEFAULT_PORT,
+                allowed_senders: vec!["@admin:localhost".to_string()],
+            });
+        store.save(&parent).unwrap();
+
+        let mut sub = make_profile("botfather--weatherbot", None);
+        sub.parent_id = Some(parent.id.clone());
+        store.save(&sub).unwrap();
+
+        let channel = Arc::new(
+            octos_bus::MatrixChannel::new(
+                "http://localhost:6167",
+                "as-token",
+                "hs-token",
+                "localhost",
+                "bot",
+                "bot_",
+                6166,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_admin_allowed_senders(vec!["@admin:localhost".to_string()])
+            .with_bot_router(dir.path()),
+        );
+        channel
+            .bot_router()
+            .register_entry(
+                "@bot_weatherbot:localhost",
+                &sub.id,
+                "@alice:localhost",
+                octos_bus::BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+
+        let manager = GatewayBotManager {
+            store: store.clone(),
+            channel: channel.clone(),
+            parent_profile_id: parent.id.clone(),
+        };
+
+        let result = manager
+            .delete_bot("@bot_weatherbot:localhost", "@admin:localhost")
+            .await;
+
+        assert!(result.is_ok(), "operator override should succeed: {result:?}");
+        assert_eq!(
+            channel
+                .bot_router()
+                .route("@bot_weatherbot:localhost")
+                .await,
+            None
         );
     }
 }

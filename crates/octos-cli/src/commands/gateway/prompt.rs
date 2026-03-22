@@ -92,6 +92,7 @@ pub async fn build_system_prompt(
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
+    feature = "matrix",
     feature = "qq-bot",
     feature = "wechat"
 ))]

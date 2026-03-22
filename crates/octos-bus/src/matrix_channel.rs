@@ -38,6 +38,7 @@ const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
+const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 #[cfg(not(test))]
@@ -60,16 +61,32 @@ pub trait BotManager: Send + Sync {
         username: &str,
         name: &str,
         system_prompt: Option<&str>,
+        sender: &str,
+        visibility: BotVisibility,
     ) -> Result<String>;
 
     /// Delete a bot by Matrix user ID. Returns a status message.
-    async fn delete_bot(&self, matrix_user_id: &str) -> Result<String>;
+    async fn delete_bot(&self, matrix_user_id: &str, sender: &str) -> Result<String>;
 
     /// List all registered bots. Returns a formatted list.
-    async fn list_bots(&self) -> Result<String>;
+    async fn list_bots(&self, sender: &str) -> Result<String>;
 }
 
 // ── Bot Router ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotEntry {
+    pub profile_id: String,
+    pub owner: String,
+    pub visibility: BotVisibility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BotVisibility {
+    Public,
+    Private,
+}
 
 /// Routes Matrix virtual user IDs to octos profile IDs.
 /// Thread-safe, supports dynamic registration/unregistration.
@@ -78,7 +95,7 @@ pub trait BotManager: Send + Sync {
 /// room, `add_room_bot()` records the mapping so incoming messages in that room
 /// can be routed to the correct profile without requiring an @mention.
 pub struct BotRouter {
-    routes: Arc<RwLock<HashMap<String, String>>>, // matrix_user_id -> profile_id
+    routes: Arc<RwLock<HashMap<String, BotEntry>>>, // matrix_user_id -> metadata
     room_bots: Arc<RwLock<HashMap<String, HashSet<String>>>>, // room_id -> profile_ids
     persist_path: Option<PathBuf>,
     room_persist_path: Option<PathBuf>,
@@ -112,9 +129,27 @@ impl BotRouter {
     /// Register a mapping from a Matrix user ID to a profile ID.
     /// Persists the updated mapping to disk if a persist path is configured.
     pub async fn register(&self, matrix_user_id: &str, profile_id: &str) -> Result<()> {
+        self.register_entry(matrix_user_id, profile_id, "", BotVisibility::Public)
+            .await
+    }
+
+    pub async fn register_entry(
+        &self,
+        matrix_user_id: &str,
+        profile_id: &str,
+        owner: &str,
+        visibility: BotVisibility,
+    ) -> Result<()> {
         let _guard = self.update_lock.lock().await;
         let mut next_routes = self.routes.read().await.clone();
-        next_routes.insert(matrix_user_id.to_string(), profile_id.to_string());
+        next_routes.insert(
+            matrix_user_id.to_string(),
+            BotEntry {
+                profile_id: profile_id.to_string(),
+                owner: owner.to_string(),
+                visibility,
+            },
+        );
         self.persist(&next_routes)?;
         let mut routes = self.routes.write().await;
         *routes = next_routes;
@@ -136,6 +171,11 @@ impl BotRouter {
     /// Look up the profile ID for a given Matrix user ID.
     pub async fn route(&self, matrix_user_id: &str) -> Option<String> {
         let routes = self.routes.read().await;
+        routes.get(matrix_user_id).map(|entry| entry.profile_id.clone())
+    }
+
+    pub async fn get_entry(&self, matrix_user_id: &str) -> Option<BotEntry> {
+        let routes = self.routes.read().await;
         routes.get(matrix_user_id).cloned()
     }
 
@@ -144,24 +184,46 @@ impl BotRouter {
         let routes = self.routes.read().await;
         routes
             .iter()
-            .find(|(_, pid)| pid.as_str() == profile_id)
+            .find(|(_, entry)| entry.profile_id.as_str() == profile_id)
             .map(|(uid, _)| uid.clone())
     }
 
     /// Load routes from a JSON file. Returns an empty map on any error.
-    fn load(path: &std::path::Path) -> HashMap<String, String> {
-        match std::fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        }
+    fn load(path: &std::path::Path) -> HashMap<String, BotEntry> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(_) => return HashMap::new(),
+        };
+        let raw: HashMap<String, Value> = match serde_json::from_str(&data) {
+            Ok(raw) => raw,
+            Err(_) => return HashMap::new(),
+        };
+        raw.into_iter()
+            .filter_map(|(matrix_user_id, value)| {
+                if let Some(profile_id) = value.as_str() {
+                    Some((
+                        matrix_user_id,
+                        BotEntry {
+                            profile_id: profile_id.to_string(),
+                            owner: String::new(),
+                            visibility: BotVisibility::Public,
+                        },
+                    ))
+                } else {
+                    serde_json::from_value(value)
+                        .ok()
+                        .map(|entry| (matrix_user_id, entry))
+                }
+            })
+            .collect()
     }
 
     /// Find a profile ID by scanning message text for any registered bot mention.
     pub async fn route_by_mention(&self, text: &str) -> Option<String> {
         let routes = self.routes.read().await;
-        for (bot_user_id, profile_id) in routes.iter() {
+        for (bot_user_id, entry) in routes.iter() {
             if contains_exact_matrix_user_id_mention(text, bot_user_id) {
-                return Some(profile_id.clone());
+                return Some(entry.profile_id.clone());
             }
         }
         None
@@ -237,12 +299,20 @@ impl BotRouter {
     /// Return all user_id → profile_id mappings.
     pub async fn list_routes(&self) -> Vec<(String, String)> {
         let routes = self.routes.read().await;
+        routes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.profile_id.clone()))
+            .collect()
+    }
+
+    pub async fn list_entries(&self) -> Vec<(String, BotEntry)> {
+        let routes = self.routes.read().await;
         routes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
     /// Atomically persist routes to disk (write to temp file, then rename).
     /// Serializes under lock, then releases before file I/O.
-    fn persist(&self, routes: &HashMap<String, String>) -> Result<()> {
+    fn persist(&self, routes: &HashMap<String, BotEntry>) -> Result<()> {
         let Some(ref path) = self.persist_path else {
             return Ok(());
         };
@@ -387,7 +457,6 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
-    admin_allowed_senders: HashSet<String>,
 }
 
 fn error_json_response(
@@ -427,18 +496,7 @@ pub struct MatrixChannel {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: std::sync::OnceLock<Arc<dyn BotManager>>,
-    /// Allowed Matrix user IDs for bot-management slash commands.
-    ///
-    /// Matrix appservices authenticate the homeserver with `hs_token`, but the
-    /// *human* identity for a room message only exists inside the event payload
-    /// as `sender`. That means admin slash commands cannot rely on transport-
-    /// level auth alone; after the homeserver is trusted, we still need an
-    /// in-room user allowlist to decide who may create, delete, or list bots.
-    ///
-    /// We intentionally scope this to management commands only. Regular chat
-    /// traffic continues to route normally, while `/createbot`, `/deletebot`,
-    /// and `/listbots` require an explicit `allowed_senders` entry in the
-    /// Matrix channel config. Empty means "management disabled by default".
+    /// Operator override users for break-glass bot management.
     admin_allowed_senders: HashSet<String>,
     /// Bounded FIFO of event_id → sender_user_id so edit_message can reuse the correct identity
     /// without growing unbounded over a long-lived gateway process.
@@ -485,6 +543,10 @@ impl MatrixChannel {
         self
     }
 
+    pub fn is_operator_sender(&self, sender: &str) -> bool {
+        self.admin_allowed_senders.contains(sender)
+    }
+
     /// Configure a `BotRouter` with persistence at `{data_dir}/matrix-bot-routes.json`.
     pub fn with_bot_router(mut self, data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("matrix-bot-routes.json");
@@ -507,11 +569,24 @@ impl MatrixChannel {
 
     /// Register a bot mapping and provision the Matrix virtual user on the homeserver.
     pub async fn register_bot(&self, matrix_user_id: &str, profile_id: &str) -> Result<()> {
+        self.register_bot_owned(matrix_user_id, profile_id, "", BotVisibility::Public)
+            .await
+    }
+
+    pub async fn register_bot_owned(
+        &self,
+        matrix_user_id: &str,
+        profile_id: &str,
+        owner: &str,
+        visibility: BotVisibility,
+    ) -> Result<()> {
         let localpart = managed_localpart(matrix_user_id, &self.server_name).ok_or_else(|| {
             eyre::eyre!("invalid Matrix user ID for this homeserver: {matrix_user_id}")
         })?;
         self.register_user(localpart).await?;
-        self.bot_router.register(matrix_user_id, profile_id).await?;
+        self.bot_router
+            .register_entry(matrix_user_id, profile_id, owner, visibility)
+            .await?;
         self.registered_users
             .write()
             .await
@@ -923,6 +998,42 @@ async fn handle_transaction(
                             );
                             continue;
                         };
+                        let inviter = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(entry) = state.bot_router.get_entry(state_key).await {
+                            if entry.visibility == BotVisibility::Private && inviter != entry.owner {
+                                if let Err(e) = join_room_via_appservice(
+                                    &state.http,
+                                    &state.homeserver,
+                                    &state.as_token,
+                                    room_id,
+                                    state_key,
+                                )
+                                .await
+                                {
+                                    warn!(txn_id, room_id, invited_user = state_key, error = %e, "failed to join room for private bot rejection");
+                                } else {
+                                    if let Err(e) = send_text_to_room_as(
+                                        &state,
+                                        room_id,
+                                        "This is a private bot. Only its owner can chat with it.",
+                                        state_key,
+                                    )
+                                    .await
+                                    {
+                                        warn!(txn_id, room_id, invited_user = state_key, error = %e, "failed to send private bot rejection");
+                                    }
+                                    let _ = leave_room_via_appservice(
+                                        &state.http,
+                                        &state.homeserver,
+                                        &state.as_token,
+                                        room_id,
+                                        state_key,
+                                    )
+                                    .await;
+                                }
+                                continue;
+                            }
+                        }
                         match register_user_via_appservice(
                             &state.http,
                             &state.homeserver,
@@ -1033,6 +1144,36 @@ async fn handle_transaction(
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
         }
 
+        if let Some(profile_id) = metadata
+            .get(METADATA_TARGET_PROFILE_ID)
+            .and_then(|value| value.as_str())
+        {
+            if let Some(matrix_user_id) = state.bot_router.reverse_route(profile_id).await {
+                metadata[METADATA_TARGET_MATRIX_USER_ID] = json!(matrix_user_id);
+            }
+        }
+
+        if let Some(target_user_id) = metadata
+            .get(METADATA_TARGET_MATRIX_USER_ID)
+            .and_then(|value| value.as_str())
+        {
+            if let Some(entry) = state.bot_router.get_entry(target_user_id).await {
+                if entry.visibility == BotVisibility::Private && sender != entry.owner {
+                    if let Err(e) = send_text_to_room_as(
+                        &state,
+                        room_id,
+                        "This is a private bot. Only its owner can chat with it.",
+                        target_user_id,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, room_id, target_user_id, "failed to send private bot message rejection");
+                    }
+                    continue;
+                }
+            }
+        }
+
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
@@ -1074,49 +1215,32 @@ async fn handle_slash_command(
     let command = parts.next().unwrap_or("");
     let args_str = parts.next().unwrap_or("").trim();
 
-    if requires_admin_authorization(command) {
-        if state.admin_allowed_senders.is_empty() {
-            return Some(
-                "Bot management commands are disabled until the Matrix channel config sets `allowed_senders`."
-                    .to_string(),
-            );
-        }
-        if !state.admin_allowed_senders.contains(sender) {
-            return Some("You are not allowed to manage bots in this gateway.".to_string());
-        }
-    }
-
     match command {
-        "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str).await),
-        "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str).await),
-        "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref()).await),
+        "/createbot" => Some(dispatch_createbot(bot_manager.as_ref(), args_str, sender).await),
+        "/deletebot" => Some(dispatch_deletebot(bot_manager.as_ref(), args_str, sender).await),
+        "/listbots" | "/listbot" => Some(dispatch_listbots(bot_manager.as_ref(), sender).await),
         "/bothelp" => Some(SLASH_HELP.to_string()),
         _ => None,
     }
 }
 
-fn requires_admin_authorization(command: &str) -> bool {
-    matches!(
-        command,
-        "/createbot" | "/deletebot" | "/listbots" | "/listbot"
-    )
-}
-
 const SLASH_HELP: &str = "\
 **Bot management commands:**
 
-• `/createbot <username> <display_name> [--prompt \"system prompt\"]`
+• `/createbot <username> <display_name> [--public|--private] [--prompt \"system prompt\"]`
+• Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
-• `/listbots`
+• `/listbots` (public bots + your private bots)
 • `/bothelp`";
 
-async fn dispatch_createbot(mgr: &dyn BotManager, args: &str) -> String {
+async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
-        return "Please provide at least a username.\n\nUsage: `/createbot <username> <display_name> [--prompt \"system prompt\"]`\n\nExample: `/createbot weather Weather Bot --prompt \"You are a weather assistant\"`"
+        return "Please provide at least a username.\n\nUsage: `/createbot <username> <display_name> [--public|--private] [--prompt \"system prompt\"]`\n\nExample: `/createbot weather Weather Bot --public --prompt \"You are a weather assistant\"`"
             .to_string();
     }
 
-    let (main_args, system_prompt) = extract_prompt_flag(args);
+    let (args, visibility) = extract_visibility_flag(args);
+    let (main_args, system_prompt) = extract_prompt_flag(&args);
     let mut tokens = main_args.split_whitespace();
     let Some(username) = tokens.next() else {
         return "Please provide a username.".to_string();
@@ -1129,7 +1253,13 @@ async fn dispatch_createbot(mgr: &dyn BotManager, args: &str) -> String {
     };
 
     match mgr
-        .create_bot(username, &name, system_prompt.as_deref())
+        .create_bot(
+            username,
+            &name,
+            system_prompt.as_deref(),
+            sender,
+            visibility.unwrap_or(BotVisibility::Private),
+        )
         .await
     {
         Ok(msg) => msg,
@@ -1137,7 +1267,7 @@ async fn dispatch_createbot(mgr: &dyn BotManager, args: &str) -> String {
     }
 }
 
-async fn dispatch_deletebot(mgr: &dyn BotManager, args: &str) -> String {
+async fn dispatch_deletebot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
         return "Please provide the Matrix user ID to delete.\n\n\
                 Usage: `/deletebot <matrix_user_id>`\n\n\
@@ -1145,17 +1275,36 @@ async fn dispatch_deletebot(mgr: &dyn BotManager, args: &str) -> String {
             .to_string();
     }
     let matrix_user_id = args.split_whitespace().next().unwrap_or(args);
-    match mgr.delete_bot(matrix_user_id).await {
+    match mgr.delete_bot(matrix_user_id, sender).await {
         Ok(msg) => msg,
         Err(e) => format!("Could not delete bot: {e}"),
     }
 }
 
-async fn dispatch_listbots(mgr: &dyn BotManager) -> String {
-    match mgr.list_bots().await {
+async fn dispatch_listbots(mgr: &dyn BotManager, sender: &str) -> String {
+    match mgr.list_bots(sender).await {
         Ok(msg) => msg,
         Err(e) => format!("Could not list bots: {e}"),
     }
+}
+
+fn extract_visibility_flag(args: &str) -> (String, Option<BotVisibility>) {
+    for (flag, visibility) in [
+        ("--public", BotVisibility::Public),
+        ("--private", BotVisibility::Private),
+    ] {
+        if let Some(idx) = args.find(flag) {
+            let before = args[..idx].trim();
+            let after = args[idx + flag.len()..].trim();
+            return match (before.is_empty(), after.is_empty()) {
+                (true, true) => (String::new(), Some(visibility)),
+                (true, false) => (after.to_string(), Some(visibility)),
+                (false, true) => (before.to_string(), Some(visibility)),
+                (false, false) => (format!("{before} {after}"), Some(visibility)),
+            };
+        }
+    }
+    (args.trim().to_string(), None)
 }
 
 /// Extract `--prompt "..."` from the argument string.
@@ -1191,12 +1340,21 @@ fn extract_prompt_flag(args: &str) -> (String, Option<String>) {
 
 /// Send a text message to a Matrix room using the appservice bot identity.
 async fn send_text_to_room(state: &AppserviceState, room_id: &str, text: &str) -> Result<()> {
+    send_text_to_room_as(state, room_id, text, &state.bot_user_id).await
+}
+
+async fn send_text_to_room_as(
+    state: &AppserviceState,
+    room_id: &str,
+    text: &str,
+    user_id: &str,
+) -> Result<()> {
     let txn_id = uuid::Uuid::now_v7().to_string();
     let path = format!(
         "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
         percent_encode_path(room_id),
         percent_encode_path(&txn_id),
-        percent_encode_path(&state.bot_user_id),
+        percent_encode_path(user_id),
     );
     let url = format!("{}{}", state.homeserver, path);
     let formatted_body = markdown_to_matrix_html(text);
@@ -1356,7 +1514,6 @@ impl Channel for MatrixChannel {
             dedup: self.dedup.clone(),
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
-            admin_allowed_senders: self.admin_allowed_senders.clone(),
         };
 
         let app = Router::new()
@@ -1654,7 +1811,6 @@ mod tests {
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: None,
-            admin_allowed_senders: HashSet::new(),
         }
     }
 
@@ -1729,6 +1885,10 @@ mod tests {
             )
             .route(
                 "/_matrix/client/v3/rooms/{room_id}/join",
+                any(capture_homeserver_request),
+            )
+            .route(
+                "/_matrix/client/v3/rooms/{room_id}/leave",
                 any(capture_homeserver_request),
             )
             .route(
@@ -2352,6 +2512,68 @@ mod tests {
 
         channel.stop().await.unwrap();
         channel_task.await.unwrap();
+        homeserver_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_private_bot_invite_rejected_for_non_owner() {
+        let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.homeserver = homeserver;
+
+        let router = BotRouter::new(None);
+        router
+            .register_entry(
+                "@octos_private:localhost",
+                "main--private",
+                "@owner:localhost",
+                BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state.clone());
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.member",
+                "sender": "@mallory:localhost",
+                "room_id": "!room123:localhost",
+                "state_key": "@octos_private:localhost",
+                "content": {
+                    "membership": "invite"
+                }
+            }]
+        });
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-private-invite?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        wait_for_request_count(&requests, 3).await;
+        let requests = requests.lock().await;
+        assert!(requests.iter().any(|req| req.path.ends_with("/join")));
+        assert!(requests.iter().any(|req| req.path.contains("/send/")));
+        assert!(requests.iter().any(|req| req.path.ends_with("/leave")));
+        assert_eq!(
+            state.bot_router.route_by_room("!room123:localhost").await,
+            None,
+            "private bot should not persist room mapping for non-owner invite"
+        );
+
         homeserver_handle.abort();
     }
 
@@ -3073,6 +3295,53 @@ mod tests {
         assert_eq!(result, Some("profile-a".to_string()));
     }
 
+    #[test]
+    fn test_bot_visibility_serializes_lowercase() {
+        let public_json = serde_json::to_string(&BotVisibility::Public).unwrap();
+        assert_eq!(public_json, "\"public\"");
+
+        let private_json = serde_json::to_string(&BotVisibility::Private).unwrap();
+        assert_eq!(private_json, "\"private\"");
+    }
+
+    #[tokio::test]
+    async fn test_bot_router_loads_old_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("matrix-bot-routes.json");
+        std::fs::write(&path, r#"{"@bot_weather:localhost":"main--weather"}"#).unwrap();
+
+        let router = BotRouter::new(Some(path));
+        let entry = router
+            .get_entry("@bot_weather:localhost")
+            .await
+            .expect("legacy route should load");
+
+        assert_eq!(entry.profile_id, "main--weather");
+        assert_eq!(entry.owner, "");
+        assert_eq!(entry.visibility, BotVisibility::Public);
+    }
+
+    #[tokio::test]
+    async fn test_bot_router_loads_new_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("matrix-bot-routes.json");
+        std::fs::write(
+            &path,
+            r#"{"@bot_weather:localhost":{"profile_id":"main--weather","owner":"@alice:localhost","visibility":"public"}}"#,
+        )
+        .unwrap();
+
+        let router = BotRouter::new(Some(path));
+        let entry = router
+            .get_entry("@bot_weather:localhost")
+            .await
+            .expect("new-format route should load");
+
+        assert_eq!(entry.profile_id, "main--weather");
+        assert_eq!(entry.owner, "@alice:localhost");
+        assert_eq!(entry.visibility, BotVisibility::Public);
+    }
+
     #[tokio::test]
     async fn test_matrix_register_bot_registers_user_and_route() {
         let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
@@ -3724,6 +3993,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_private_bot_message_blocked_for_non_owner() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+        state.homeserver = homeserver;
+
+        let router = BotRouter::new(None);
+        router
+            .register_entry(
+                "@octos_private:localhost",
+                "main--private",
+                "@owner:localhost",
+                BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!private:localhost", "main--private")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@mallory:localhost",
+                "room_id": "!private:localhost",
+                "event_id": "$private1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello private bot"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-private-msg?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "non-owner message should not be forwarded to the agent"
+        );
+
+        wait_for_request_count(&requests, 1).await;
+        let requests = requests.lock().await;
+        assert!(requests.iter().any(|req| {
+            req.path.contains("/send/")
+                && req
+                    .query
+                    .as_deref()
+                    .is_some_and(|q| q.contains("user_id=%40octos_private%3Alocalhost"))
+        }));
+
+        homeserver_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_private_bot_message_allowed_for_owner() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let mut state = make_test_state(inbound_tx);
+
+        let router = BotRouter::new(None);
+        router
+            .register_entry(
+                "@octos_private:localhost",
+                "main--private",
+                "@owner:localhost",
+                BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+        router
+            .add_room_bot("!private:localhost", "main--private")
+            .await
+            .unwrap();
+        state.bot_router = Arc::new(router);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@owner:localhost",
+                "room_id": "!private:localhost",
+                "event_id": "$private-owner",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello private bot"
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-private-owner?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().expect("owner message should be forwarded");
+        assert_eq!(
+            msg.metadata
+                .get(METADATA_TARGET_PROFILE_ID)
+                .and_then(|v| v.as_str()),
+            Some("main--private")
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_transaction_mention_priority() {
         use axum::body::Body;
         use axum::http::Request;
@@ -4000,6 +4407,28 @@ mod tests {
         assert!(prompt.is_none());
     }
 
+    #[test]
+    fn test_extract_visibility_flag_public() {
+        let (args, visibility) =
+            extract_visibility_flag("weather Weather Bot --public --prompt \"hello\"");
+        assert_eq!(args, "weather Weather Bot --prompt \"hello\"");
+        assert_eq!(visibility, Some(BotVisibility::Public));
+    }
+
+    #[test]
+    fn test_extract_visibility_flag_private() {
+        let (args, visibility) = extract_visibility_flag("weather Weather Bot --private");
+        assert_eq!(args, "weather Weather Bot");
+        assert_eq!(visibility, Some(BotVisibility::Private));
+    }
+
+    #[test]
+    fn test_extract_visibility_flag_missing() {
+        let (args, visibility) = extract_visibility_flag("weather Weather Bot");
+        assert_eq!(args, "weather Weather Bot");
+        assert_eq!(visibility, None);
+    }
+
     #[tokio::test]
     async fn test_slash_command_not_intercepted_without_bot_manager() {
         let (tx, _rx) = mpsc::channel(1);
@@ -4027,9 +4456,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result =
             handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
@@ -4042,9 +4468,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result = handle_slash_command(
             &state,
@@ -4059,13 +4482,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slash_command_createbot_defaults_private() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/createbot weather Weather Bot",
+        )
+        .await;
+
+        let msg = result.expect("createbot should be intercepted");
+        assert!(msg.contains("mock create"), "got: {msg}");
+        assert!(msg.contains("Private"), "expected default private visibility: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_slash_command_createbot_with_public_visibility() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut state = make_test_state(tx);
+        state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+
+        let result = handle_slash_command(
+            &state,
+            "@alice:localhost",
+            "!room:localhost",
+            "/createbot weather Weather Bot --public",
+        )
+        .await;
+
+        let msg = result.expect("createbot should be intercepted");
+        assert!(msg.contains("mock create"), "got: {msg}");
+        assert!(msg.contains("Public"), "expected public visibility: {msg}");
+    }
+
+    #[tokio::test]
     async fn test_slash_command_deletebot() {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result = handle_slash_command(
             &state,
@@ -4083,9 +4541,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result =
             handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/createbot").await;
@@ -4098,9 +4553,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result =
             handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/deletebot").await;
@@ -4113,9 +4565,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let mut state = make_test_state(tx);
         state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
 
         let result =
             handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbot").await;
@@ -4137,44 +4586,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_slash_command_rejects_unauthorized_sender() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-        state
-            .admin_allowed_senders
-            .insert("@alice:localhost".to_string());
-
-        let result =
-            handle_slash_command(&state, "@mallory:localhost", "!room:localhost", "/listbots")
-                .await;
-
-        assert_eq!(
-            result.as_deref(),
-            Some("You are not allowed to manage bots in this gateway.")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_slash_command_rejects_when_admin_allowlist_is_empty() {
-        let (tx, _rx) = mpsc::channel(1);
-        let mut state = make_test_state(tx);
-        state.bot_manager = Some(Arc::new(MockBotManager));
-
-        let result =
-            handle_slash_command(&state, "@alice:localhost", "!room:localhost", "/listbots").await;
-
-        assert_eq!(
-            result.as_deref(),
-            Some(
-                "Bot management commands are disabled until the Matrix channel config sets `allowed_senders`."
-            )
-        );
-    }
-
     /// Mock BotManager for testing slash command dispatch.
     struct MockBotManager;
+
+    #[derive(Default)]
+    struct RecordingBotManager;
 
     #[async_trait]
     impl BotManager for MockBotManager {
@@ -4183,13 +4599,37 @@ mod tests {
             username: &str,
             name: &str,
             _system_prompt: Option<&str>,
+            _sender: &str,
+            visibility: BotVisibility,
         ) -> Result<String> {
-            Ok(format!("mock create: {username} ({name})"))
+            Ok(format!("mock create: {username} ({name}) {visibility:?}"))
         }
-        async fn delete_bot(&self, matrix_user_id: &str) -> Result<String> {
+        async fn delete_bot(&self, matrix_user_id: &str, _sender: &str) -> Result<String> {
             Ok(format!("mock delete: {matrix_user_id}"))
         }
-        async fn list_bots(&self) -> Result<String> {
+        async fn list_bots(&self, _sender: &str) -> Result<String> {
+            Ok("mock list: no bots".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl BotManager for RecordingBotManager {
+        async fn create_bot(
+            &self,
+            username: &str,
+            name: &str,
+            _system_prompt: Option<&str>,
+            _sender: &str,
+            visibility: BotVisibility,
+        ) -> Result<String> {
+            Ok(format!("mock create: {username} ({name}) {visibility:?}"))
+        }
+
+        async fn delete_bot(&self, matrix_user_id: &str, _sender: &str) -> Result<String> {
+            Ok(format!("mock delete: {matrix_user_id}"))
+        }
+
+        async fn list_bots(&self, _sender: &str) -> Result<String> {
             Ok("mock list: no bots".to_string())
         }
     }
