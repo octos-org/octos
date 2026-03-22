@@ -160,6 +160,17 @@ else
     echo "    Features: (none — CLI only)"
 fi
 
+# ── Build dashboard ──────────────────────────────────────────────────
+if [ -n "$CLI_FEATURES" ] && [[ "$CLI_FEATURES" == *"api"* ]]; then
+    section "Building admin dashboard"
+    if command -v npm &>/dev/null; then
+        (cd "$ROOT/dashboard" && npm install && npm run build)
+        ok "dashboard built to crates/crew-cli/static/admin/"
+    else
+        err "npm not found. Required to build the admin dashboard. Install Node.js first."
+    fi
+fi
+
 # ── Build ─────────────────────────────────────────────────────────────
 section "Building octos"
 
