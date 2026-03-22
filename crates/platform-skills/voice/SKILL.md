@@ -25,13 +25,39 @@ Voice profiles are **private per user/profile** — stored in the profile's own 
 The skill auto-discovers the ominix-api server URL via (in priority order):
 1. `OMINIX_API_URL` environment variable
 2. Discovery file `~/.ominix/api_url` (written by ominix-api on startup)
-3. Default: `http://localhost:8080`
+3. Default: `http://localhost:9090`
+
+## Checking Available Models
+
+Use `list_models` to see what's installed. The response includes an `endpoints` array for each model, telling you which URL to use:
+
+```json
+{"data": [
+  {"id": "qwen3-asr", "type": "asr", "endpoints": ["/v1/audio/asr/qwen3"]},
+  {"id": "Qwen3-TTS-CustomVoice-8bit", "type": "qwen3_tts", "endpoints": ["/v1/audio/tts/qwen3"]},
+  {"id": "Qwen3-TTS-Base-8bit", "type": "qwen3_tts", "endpoints": ["/v1/audio/tts/clone"]}
+]}
+```
+
+If a model you need is missing, use `download_model` then `load_model` to install it.
+
+## API Endpoints
+
+| Function | Endpoint | Model |
+|---|---|---|
+| Preset TTS | `POST /v1/audio/tts/qwen3` | Qwen3-TTS CustomVoice |
+| Voice Clone | `POST /v1/audio/tts/clone` | Qwen3-TTS Base (ECAPA-TDNN x-vector) |
+| GPT-SoVITS | `POST /v1/audio/tts/sovits` | GPT-SoVITS (legacy) |
+| Qwen3-ASR | `POST /v1/audio/asr/qwen3` | Qwen3-ASR encoder-decoder |
+| Paraformer | `POST /v1/audio/asr/paraformer` | Paraformer CTC-based |
+
+TTS and ASR run on separate threads — they do not block each other.
 
 ## Tools
 
 ### voice_transcribe
 
-Transcribe an audio file to text. Supports WAV, OGG, MP3, FLAC, M4A.
+Transcribe an audio file to text via Qwen3-ASR. Supports WAV, OGG, MP3, FLAC, M4A.
 
 ```json
 {"audio_path": "/tmp/voice.ogg", "language": "Chinese"}

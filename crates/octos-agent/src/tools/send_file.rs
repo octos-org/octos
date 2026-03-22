@@ -135,12 +135,16 @@ impl Tool for SendFileTool {
 
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
+        // /tmp/ is always allowed since skills commonly write output there.
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
+            let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
-                    if !canonical_path.starts_with(&canonical_base) {
+                    if !canonical_path.starts_with(&canonical_base)
+                        && !canonical_path.starts_with(&tmp_dir)
+                    {
                         return Ok(ToolResult {
                             output: format!(
                                 "Error: File path is outside the allowed directory: {}",
@@ -321,19 +325,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_base_dir_blocks_outside_path() {
-        let base = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        // Use a nested tempdir so the "outside" file is NOT under /tmp/ directly.
+        // /tmp/ is always allowed, so we need a base inside a subdirectory
+        // and an outside file in a sibling subdirectory.
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("allowed");
+        let outside_dir = root.path().join("forbidden");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
 
-        // Create a file outside the base dir
-        let outside_file = outside.path().join("secret.txt");
+        let outside_file = outside_dir.join("secret.txt");
         std::fs::write(&outside_file, "secret data").unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(&base);
 
         let result = tool
             .execute(&serde_json::json!({
                 "file_path": outside_file.to_string_lossy().to_string()
+            }))
+            .await
+            .unwrap();
+
+        // File is under /tmp/ (allowed), so it should succeed
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_blocks_non_tmp_outside_path() {
+        let base = tempfile::tempdir().unwrap();
+
+        let (tx, _rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        // /etc/hostname exists on most systems and is outside both base_dir and /tmp/
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": "/etc/hostname"
             }))
             .await
             .unwrap();
@@ -421,19 +449,12 @@ mod tests {
     #[tokio::test]
     async fn test_base_dir_blocks_traversal() {
         let base = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let secret = outside.path().join("secret.txt");
-        std::fs::write(&secret, "secret").unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
-        // Try path traversal via ../
-        let traversal = format!(
-            "{}/../../{}",
-            base.path().display(),
-            secret.to_string_lossy()
-        );
+        // Try path traversal to /etc/hostname (outside both base_dir and /tmp/)
+        let traversal = format!("{}/../../../etc/hostname", base.path().display());
         let result = tool
             .execute(&serde_json::json!({"file_path": traversal}))
             .await

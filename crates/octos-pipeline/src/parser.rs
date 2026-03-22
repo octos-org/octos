@@ -43,7 +43,8 @@ impl<'a> DotParser<'a> {
         let id = if self.peek() == Some('{') {
             "pipeline".to_string()
         } else {
-            self.parse_identifier().wrap_err("expected graph name or '{'")?
+            self.parse_identifier()
+                .wrap_err("expected graph name or '{'")?
         };
         self.skip_ws();
 
@@ -435,9 +436,7 @@ impl<'a> DotParser<'a> {
             }
 
             // Skip line comments (// and # — LLMs often use # for comments)
-            if self.input[self.pos..].starts_with("//")
-                || self.input[self.pos..].starts_with('#')
-            {
+            if self.input[self.pos..].starts_with("//") || self.input[self.pos..].starts_with('#') {
                 while let Some(c) = self.peek() {
                     self.advance();
                     if c == '\n' {

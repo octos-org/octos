@@ -27,15 +27,21 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
     let mut map = HashMap::new();
     for (key, ctx, max_out) in entries {
         // Store by full key ("dashscope/qwen3.5-plus") and by model name alone ("qwen3.5-plus")
-        map.insert(key.clone(), CatalogModel {
-            context_window: *ctx,
-            max_output: *max_out,
-        });
-        if let Some(model) = key.split('/').last() {
-            map.insert(model.to_string(), CatalogModel {
+        map.insert(
+            key.clone(),
+            CatalogModel {
                 context_window: *ctx,
                 max_output: *max_out,
-            });
+            },
+        );
+        if let Some(model) = key.split('/').next_back() {
+            map.insert(
+                model.to_string(),
+                CatalogModel {
+                    context_window: *ctx,
+                    max_output: *max_out,
+                },
+            );
         }
     }
     *CATALOG.write().unwrap() = Some(map);

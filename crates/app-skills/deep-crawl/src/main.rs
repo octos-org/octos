@@ -464,12 +464,14 @@ async fn evaluate_js(
     }
 }
 
-/// Extract innerText from the page.
+/// Extract innerText from the page, stripping boilerplate elements.
 async fn extract_text(ws: &mut WsStream, session_id: &str) -> Result<String, String> {
+    // Remove nav, footer, aside, cookie banners, ads before extracting text.
+    // This runs in the browser so we get clean content without boilerplate.
     let text = evaluate_js(
         ws,
         session_id,
-        "document.body ? document.body.innerText : ''",
+        "(function(){if(!document.body)return '';var c=document.body.cloneNode(true);c.querySelectorAll('nav,footer,aside,[role=navigation],[role=banner],[role=complementary],[role=contentinfo],[class*=cookie],[class*=consent],[class*=gdpr],[class*=sidebar],[class*=newsletter],[class*=advertisement],[id*=cookie],[id*=consent],[id*=sidebar],[class*=popup],[class*=modal],[class*=overlay],iframe,svg,form,script,style,noscript').forEach(function(e){e.remove()});return c.innerText||'';})()",
     )
     .await?;
     Ok(truncate_string(text, MAX_PAGE_TEXT_CHARS))
@@ -604,7 +606,9 @@ fn page_slug(url: &Url, index: usize) -> String {
     };
     let truncated = if slug.len() > 80 {
         let mut end = 80;
-        while !slug.is_char_boundary(end) && end > 0 { end -= 1; }
+        while !slug.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
         &slug[..end]
     } else {
         &slug

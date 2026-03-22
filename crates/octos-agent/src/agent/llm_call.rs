@@ -47,9 +47,14 @@ impl Agent {
         for attempt in 0..=Self::LLM_RETRY_MAX {
             let call_start = Instant::now();
             // Try the full LLM call (stream creation + consumption)
+            // Estimate input tokens from message bytes (rough: ~4 chars per token
+            // for English, ~1.5 for CJK). Use bytes/3 as a conservative estimate.
+            let input_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
+            let input_estimate = (input_bytes / 3) as u32;
+
             let call_result = async {
                 let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
-                self.consume_stream(stream, iteration).await
+                self.consume_stream_with_input_estimate(stream, iteration, input_estimate).await
             }
             .await;
 
@@ -102,8 +107,7 @@ impl Agent {
                         self.llm.report_late_failure();
                         warn!(
                             attempts = Self::LLM_RETRY_MAX + 1,
-                            reason,
-                            "streaming retries exhausted, trying non-streaming fallback"
+                            reason, "streaming retries exhausted, trying non-streaming fallback"
                         );
 
                         // Non-streaming call triggers FallbackProvider's full fallback chain

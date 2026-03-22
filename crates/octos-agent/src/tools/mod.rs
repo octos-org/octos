@@ -900,6 +900,27 @@ impl ToolRegistry {
         registry
     }
 
+    /// Re-bind all plugin tools to a new work directory.
+    ///
+    /// Creates copies of each `PluginTool` with the given work_dir so that
+    /// per-session output (e.g. voice profiles) lands inside the user's
+    /// workspace where the agent's sandboxed tools can access it.
+    pub fn rebind_plugin_work_dirs(&mut self, work_dir: &Path) {
+        use crate::plugins::PluginTool;
+        let replacements: Vec<_> = self
+            .tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                tool.as_any()
+                    .downcast_ref::<PluginTool>()
+                    .map(|pt| (name.clone(), pt.clone_with_work_dir(work_dir.to_path_buf())))
+            })
+            .collect();
+        for (name, new_tool) in replacements {
+            self.tools.insert(name, Arc::new(new_tool));
+        }
+    }
+
     /// Re-register builtin configurable tools with a ToolConfigStore.
     ///
     /// Tools already registered by `with_builtins_and_sandbox()` are replaced
@@ -1367,16 +1388,29 @@ mod lifecycle_tests {
 
         // Base tools should still be active
         let active = active_tool_names(&reg);
-        assert!(active.contains(&"read_file".to_string()), "base tool read_file must survive");
-        assert!(active.contains(&"write_file".to_string()), "base tool write_file must survive");
+        assert!(
+            active.contains(&"read_file".to_string()),
+            "base tool read_file must survive"
+        );
+        assert!(
+            active.contains(&"write_file".to_string()),
+            "base tool write_file must survive"
+        );
 
         // Evicted tools should be in deferred
         let deferred = deferred_tool_names(&reg);
         for name in &evicted {
-            assert!(deferred.contains(name), "{name} should be deferred after eviction");
+            assert!(
+                deferred.contains(name),
+                "{name} should be deferred after eviction"
+            );
         }
 
-        println!("After eviction — active: {}, deferred: {}", active.len(), deferred.len());
+        println!(
+            "After eviction — active: {}, deferred: {}",
+            active.len(),
+            deferred.len()
+        );
         assert!(active.len() <= 3, "should be at or under threshold");
     }
 
@@ -1404,7 +1438,10 @@ mod lifecycle_tests {
         );
 
         let active = active_tool_names(&reg);
-        assert!(active.contains(&"shell".to_string()), "shell must remain active");
+        assert!(
+            active.contains(&"shell".to_string()),
+            "shell must remain active"
+        );
     }
 
     // ── Scenario 3: Deferred tool activated then used ───────────────
@@ -1519,7 +1556,7 @@ mod lifecycle_tests {
 
     #[test]
     fn no_eviction_when_under_threshold() {
-        let mut reg = make_registry(100, 1);  // Very high threshold
+        let mut reg = make_registry(100, 1); // Very high threshold
 
         for _ in 0..5 {
             reg.tick();
@@ -1555,7 +1592,11 @@ mod lifecycle_tests {
         }
         let active = active_tool_names(&reg);
         let deferred = deferred_tool_names(&reg);
-        println!("After turn 4 — active: {}, deferred: {}", active.len(), deferred.len());
+        println!(
+            "After turn 4 — active: {}, deferred: {}",
+            active.len(),
+            deferred.len()
+        );
 
         println!("\n=== Turn 5: Need shell again — re-activate ===");
         if deferred.contains(&"shell".to_string()) {
@@ -1565,8 +1606,15 @@ mod lifecycle_tests {
         reg.tick();
         reg.record_usage("shell");
         let active = active_tool_names(&reg);
-        println!("Active after re-activation ({}): {:?}", active.len(), active);
-        assert!(active.contains(&"shell".to_string()), "shell should be active again");
+        println!(
+            "Active after re-activation ({}): {:?}",
+            active.len(),
+            active
+        );
+        assert!(
+            active.contains(&"shell".to_string()),
+            "shell should be active again"
+        );
 
         println!("\n=== Turn 6-8: Use shell, others go idle ===");
         for i in 6..=8 {
@@ -1580,7 +1628,11 @@ mod lifecycle_tests {
         }
         let active = active_tool_names(&reg);
         let deferred = deferred_tool_names(&reg);
-        println!("\nFinal state — active: {}, deferred: {}", active.len(), deferred.len());
+        println!(
+            "\nFinal state — active: {}, deferred: {}",
+            active.len(),
+            deferred.len()
+        );
         println!("Active: {:?}", active);
         println!("Deferred: {:?}", deferred);
 

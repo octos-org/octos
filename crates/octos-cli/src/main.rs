@@ -19,11 +19,11 @@ pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
 pub mod profiles;
-pub mod tenant;
 pub mod session_actor;
 pub mod status_indicator;
 pub mod status_layers;
 pub mod stream_reporter;
+pub mod tenant;
 pub mod tools;
 #[cfg(feature = "api")]
 pub mod updater;

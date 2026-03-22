@@ -442,10 +442,19 @@ impl WeComBotChannel {
                                         "aibot_event_callback" => {
                                             info!("WeComBot: event frame: {}", serde_json::to_string(&frame).unwrap_or_default());
                                             if let Some(body) = frame.get("body") {
+                                                // Event type can be a string or nested object:
+                                                //   "event": "disconnected_event"       (old format)
+                                                //   "event": {"eventtype": "..."}        (new format)
                                                 let event = body.get("event")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("unknown");
-                                                info!(event, "WeComBot: event callback");
+                                                    .and_then(|v| {
+                                                        v.as_str().map(String::from).or_else(|| {
+                                                            v.get("eventtype")
+                                                                .and_then(|et| et.as_str())
+                                                                .map(String::from)
+                                                        })
+                                                    })
+                                                    .unwrap_or_else(|| "unknown".to_string());
+                                                info!(event = %event, "WeComBot: event callback");
 
                                                 if event == "disconnected_event" {
                                                     warn!("WeComBot: displaced by another connection");
