@@ -46,6 +46,12 @@ impl InboundMessage {
     }
 }
 
+/// Metadata key for the Matrix sender user ID (appservice identity assertion).
+///
+/// Set by the outbound forwarder when a profile has a dedicated bot user;
+/// consumed by `MatrixChannel::send_with_id()` for appservice identity assertion.
+pub const METADATA_SENDER_USER_ID: &str = "sender_user_id";
+
 #[cfg(test)]
 mod tests {
     use super::*;

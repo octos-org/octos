@@ -45,6 +45,12 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Send a typing/composing indicator as a specific sender identity when supported.
+    /// Default: falls back to `send_typing()`.
+    async fn send_typing_as(&self, chat_id: &str, _sender_user_id: Option<&str>) -> Result<()> {
+        self.send_typing(chat_id).await
+    }
+
     /// Send a "listening" / recording-voice indicator (for voice transcription).
     /// Falls back to typing indicator by default.
     async fn send_listening(&self, chat_id: &str) -> Result<()> {

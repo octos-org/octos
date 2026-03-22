@@ -33,7 +33,9 @@ use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
-use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
+use crate::session_actor::{
+    ActorFactory, ActorRegistry, DispatchParams, SnapshotToolRegistryFactory,
+};
 use crate::status_layers::StatusComposer;
 
 // Re-export for use by prompt module
@@ -570,7 +572,10 @@ impl GatewayCommand {
 
         // Build env vars to inject into plugin processes so skills can route
         // API calls through the configured provider/gateway (e.g. r9s.ai).
-        let plugin_env = build_plugin_env(&config, &provider_name);
+        let mut plugin_env = build_plugin_env(&config, &provider_name);
+        // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
+        // resolve storage relative to the correct profile, not the gateway root.
+        plugin_env.push(("OCTOS_DATA_DIR".to_string(), data_dir.to_string_lossy().to_string()));
 
         let mut tools;
         let mut plugin_result;
@@ -2028,14 +2033,17 @@ impl GatewayCommand {
 
             // Dispatch to per-session actor (creates one if needed)
             actor_registry
-                .dispatch(
-                    inbound,
+                .dispatch(DispatchParams {
+                    message: inbound,
                     image_media,
                     session_key,
-                    &reply_channel,
-                    &reply_chat_id,
+                    reply_channel: &reply_channel,
+                    reply_chat_id: &reply_chat_id,
                     status_indicator,
-                )
+                    profile_id: None,
+                    system_prompt_override: None,
+                    sender_user_id: None,
+                })
                 .await;
 
             // Periodically reap dead actors to free resources

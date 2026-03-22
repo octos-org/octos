@@ -42,7 +42,7 @@ jobs:
           fi
 
   check:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

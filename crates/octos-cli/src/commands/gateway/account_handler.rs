@@ -58,6 +58,7 @@ pub async fn handle_account_command(
                             crate::profiles::ChannelCredentials::Twilio { .. } => "twilio",
                             crate::profiles::ChannelCredentials::Api { .. } => "api",
                             crate::profiles::ChannelCredentials::WeComBot { .. } => "wecom-bot",
+                            crate::profiles::ChannelCredentials::Matrix { .. } => "matrix",
                             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
                             crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
                         })

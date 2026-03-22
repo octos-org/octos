@@ -141,8 +141,19 @@ fn handle_transcribe(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "Chinese".to_string());
 
+    // Read audio file and base64-encode it (ominix-api expects base64 in `file` field)
+    let file_bytes = match std::fs::read(&input.audio_path) {
+        Ok(b) => b,
+        Err(e) => fail(&format!(
+            "failed to read audio file '{}': {e}",
+            input.audio_path
+        )),
+    };
+    use base64::Engine;
+    let file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
+
     let body = json!({
-        "file": input.audio_path,
+        "file": file_b64,
         "language": language,
         "response_format": "verbose_json"
     });
@@ -225,8 +236,8 @@ fn handle_synthesize(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
-    let (endpoint, body) = if let Some(ref ref_audio) = input.reference_audio {
-        // Voice cloning → /v1/audio/tts/clone (Base model, x-vector)
+    let resp = if let Some(ref ref_audio) = input.reference_audio {
+        // Voice cloning → /v1/audio/tts/clone (Base model, x-vector, multipart)
         let ref_path = Path::new(ref_audio);
         if !ref_path.exists() {
             fail(&format!("Reference audio not found: {ref_audio}"));
@@ -234,30 +245,39 @@ fn handle_synthesize(input_json: &str) {
         if !ref_path.is_file() {
             fail(&format!("Not a file: {ref_audio}"));
         }
-        (
-            format!("{base_url}/v1/audio/tts/clone?format=wav"),
-            json!({
-                "input": input.text,
-                "reference_audio": ref_audio,
-                "language": language
-            }),
-        )
+        let ref_bytes = match std::fs::read(ref_path) {
+            Ok(b) => b,
+            Err(e) => fail(&format!("Failed to read reference audio: {e}")),
+        };
+        use reqwest::blocking::multipart::{Form, Part};
+        let form = Form::new()
+            .text("input", input.text.clone())
+            .text("language", language.clone())
+            .part(
+                "reference_audio",
+                Part::bytes(ref_bytes)
+                    .file_name("ref.wav")
+                    .mime_str("audio/wav")
+                    .unwrap(),
+            );
+        let endpoint = format!("{base_url}/v1/audio/tts/clone?format=wav");
+        match client.post(&endpoint).multipart(form).send() {
+            Ok(r) => r,
+            Err(e) => fail(&format!("Clone request failed: {e}")),
+        }
     } else {
-        // Preset voice → /v1/audio/tts/qwen3 (CustomVoice model)
+        // Preset voice → /v1/audio/tts/qwen3 (CustomVoice model, JSON)
         let speaker = input.speaker.unwrap_or_else(|| "vivian".to_string());
-        (
-            format!("{base_url}/v1/audio/tts/qwen3?format=wav"),
-            json!({
-                "input": input.text,
-                "voice": speaker,
-                "language": language
-            }),
-        )
-    };
-
-    let resp = match client.post(&endpoint).json(&body).send() {
-        Ok(r) => r,
-        Err(e) => fail(&format!("TTS request failed: {e}")),
+        let endpoint = format!("{base_url}/v1/audio/tts/qwen3?format=wav");
+        let body = json!({
+            "input": input.text,
+            "voice": speaker,
+            "language": language
+        });
+        match client.post(&endpoint).json(&body).send() {
+            Ok(r) => r,
+            Err(e) => fail(&format!("TTS request failed: {e}")),
+        }
     };
 
     let status = resp.status();

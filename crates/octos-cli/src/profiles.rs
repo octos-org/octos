@@ -268,6 +268,20 @@ pub enum ChannelCredentials {
         #[serde(default = "default_wecom_bot_secret_env")]
         secret_env: String,
     },
+    Matrix {
+        homeserver: String,
+        as_token: String,
+        hs_token: String,
+        server_name: String,
+        #[serde(default = "default_matrix_sender_localpart")]
+        sender_localpart: String,
+        #[serde(default = "default_matrix_user_prefix")]
+        user_prefix: String,
+        #[serde(default = "default_matrix_port")]
+        port: u16,
+        #[serde(default)]
+        allowed_senders: Vec<String>,
+    },
     #[serde(rename = "qq-bot")]
     QQBot {
         #[serde(default)]
@@ -331,6 +345,15 @@ fn default_api_port() -> u16 {
 }
 fn default_wecom_bot_secret_env() -> String {
     "WECOM_BOT_SECRET".into()
+}
+fn default_matrix_sender_localpart() -> String {
+    "bot".into()
+}
+fn default_matrix_user_prefix() -> String {
+    "bot_".into()
+}
+fn default_matrix_port() -> u16 {
+    8009
 }
 fn default_qq_bot_secret_env() -> String {
     "QQ_BOT_CLIENT_SECRET".into()
@@ -878,6 +901,28 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             "settings": {
                 "bot_id": bot_id,
                 "secret_env": secret_env,
+            }
+        }),
+        ChannelCredentials::Matrix {
+            homeserver,
+            as_token,
+            hs_token,
+            server_name,
+            sender_localpart,
+            user_prefix,
+            port,
+            allowed_senders,
+        } => serde_json::json!({
+            "type": "matrix",
+            "allowed_senders": allowed_senders,
+            "settings": {
+                "homeserver": homeserver,
+                "as_token": as_token,
+                "hs_token": hs_token,
+                "server_name": server_name,
+                "sender_localpart": sender_localpart,
+                "user_prefix": user_prefix,
+                "port": port,
             }
         }),
         ChannelCredentials::QQBot {
@@ -1738,5 +1783,26 @@ mod tests {
             loaded.config.env_vars["API_KEY"], "keychain:",
             "empty value must not overwrite keychain marker"
         );
+    }
+
+    #[test]
+    fn test_matrix_channel_credentials_roundtrip() {
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "homeserver": "http://localhost:6167",
+            "as_token": "test-as-token",
+            "hs_token": "test-hs-token",
+            "server_name": "localhost"
+        }))
+        .unwrap();
+
+        let json = serde_json::to_value(&channel).unwrap();
+        assert_eq!(json["homeserver"], "http://localhost:6167");
+        assert_eq!(json["as_token"], "test-as-token");
+        assert_eq!(json["hs_token"], "test-hs-token");
+        assert_eq!(json["server_name"], "localhost");
+        assert_eq!(json["sender_localpart"], "bot");
+        assert_eq!(json["user_prefix"], "bot_");
+        assert_eq!(json["port"], 8009);
     }
 }

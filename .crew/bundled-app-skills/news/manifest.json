@@ -1,0 +1,30 @@
+{
+  "name": "news",
+  "version": "1.0.0",
+  "description": "Fetches raw news headlines and article content from Google News, Hacker News, Yahoo News, Substack, and Medium.",
+  "author": "hagency",
+  "tools": [
+    {
+      "name": "news_fetch",
+      "description": "Fetch raw news headlines and full article content from multiple sources. Returns structured text with headlines by category and deep-fetched article content. Does NOT summarize or synthesize -- the agent should do that. Categories: politics, world/international, business/commerce, technology/tech, science, entertainment/social, health, sports.",
+      "entrypoint": "target/release/news_fetch",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "News categories to fetch. Empty array or omitted = all categories. Options: politics, world, international, business, commerce, technology, tech, science, entertainment, social, health, sports"
+          },
+          "language": {
+            "type": "string",
+            "enum": ["zh", "en"],
+            "description": "Language hint passed through to the output (default: 'zh'). The tool always fetches English sources; this field tells the agent what language to use for synthesis."
+          }
+        }
+      }
+    }
+  ]
+}

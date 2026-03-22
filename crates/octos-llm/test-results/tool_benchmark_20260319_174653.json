@@ -1,0 +1,632 @@
+[
+  {
+    "provider": "dashscope/qwen3.5-plus",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2200,
+        "p95_latency_ms": 3006
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2382,
+        "p95_latency_ms": 2451
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2448,
+        "p95_latency_ms": 2612
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2893,
+        "p95_latency_ms": 3298
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2532,
+        "p95_latency_ms": 2736
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2874,
+        "p95_latency_ms": 3179
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "deepseek/deepseek-chat",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3345,
+        "p95_latency_ms": 3622
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3652,
+        "p95_latency_ms": 4014
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 4011,
+        "p95_latency_ms": 4995
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3780,
+        "p95_latency_ms": 4349
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3658,
+        "p95_latency_ms": 3965
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3515,
+        "p95_latency_ms": 3761
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "gemini/gemini-2.5-flash",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1022,
+        "p95_latency_ms": 1123
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1191,
+        "p95_latency_ms": 2025
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1073,
+        "p95_latency_ms": 1642
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1013,
+        "p95_latency_ms": 1248
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1108,
+        "p95_latency_ms": 1691
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 977,
+        "p95_latency_ms": 1053
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "gemini/gemini-2.5-flash-lite",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 460,
+        "p95_latency_ms": 525
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 451,
+        "p95_latency_ms": 511
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 458,
+        "p95_latency_ms": 566
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 606,
+        "p95_latency_ms": 766
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 532,
+        "p95_latency_ms": 607
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 506,
+        "p95_latency_ms": 715
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "nvidia/qwen3.5-397b",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 2811,
+        "p95_latency_ms": 4308
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3693,
+        "p95_latency_ms": 5859
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 6871,
+        "p95_latency_ms": 12186
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 5444,
+        "p95_latency_ms": 9795
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 4342,
+        "p95_latency_ms": 9180
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3537,
+        "p95_latency_ms": 6251
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "nvidia/deepseek-v3.2",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 13547,
+        "p95_latency_ms": 22429
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 46298,
+        "p95_latency_ms": 83975
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 13102,
+        "p95_latency_ms": 24692
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 21335,
+        "p95_latency_ms": 66081
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 14675,
+        "p95_latency_ms": 45279
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 18294,
+        "p95_latency_ms": 39018
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  },
+  {
+    "provider": "nvidia/kimi-k2.5",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 4,
+        "empty_responses": 0,
+        "errors": 1,
+        "response_rate": 0.8,
+        "avg_latency_ms": 3514,
+        "p95_latency_ms": 4653
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3431,
+        "p95_latency_ms": 6546
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 5516,
+        "p95_latency_ms": 10001
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 15190,
+        "p95_latency_ms": 54753
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 3342,
+        "p95_latency_ms": 6073
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 4,
+        "empty_responses": 0,
+        "errors": 1,
+        "response_rate": 0.8,
+        "avg_latency_ms": 14634,
+        "p95_latency_ms": 45005
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 25,
+    "overall_score": 0.9333333333333332
+  },
+  {
+    "provider": "nvidia/minimax-m2.5",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 757,
+        "p95_latency_ms": 920
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 4,
+        "empty_responses": 0,
+        "errors": 1,
+        "response_rate": 0.8,
+        "avg_latency_ms": 614,
+        "p95_latency_ms": 724
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1340,
+        "p95_latency_ms": 3018
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 4,
+        "empty_responses": 0,
+        "errors": 1,
+        "response_rate": 0.8,
+        "avg_latency_ms": 865,
+        "p95_latency_ms": 1345
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 721,
+        "p95_latency_ms": 950
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 4,
+        "empty_responses": 0,
+        "errors": 1,
+        "response_rate": 0.8,
+        "avg_latency_ms": 3535,
+        "p95_latency_ms": 9326
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 25,
+    "overall_score": 0.8999999999999999
+  },
+  {
+    "provider": "moonshot/kimi-k2.5",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 0,
+        "empty_responses": 0,
+        "errors": 5,
+        "response_rate": 0.0,
+        "avg_latency_ms": 0,
+        "p95_latency_ms": 0
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 5,
+    "max_tools_90pct": 0,
+    "overall_score": 0.0
+  }
+]

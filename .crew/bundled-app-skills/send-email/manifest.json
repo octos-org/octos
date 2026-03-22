@@ -1,0 +1,57 @@
+{
+  "name": "send-email",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "Send emails via SMTP or Feishu/Lark Mail API",
+  "tools": [
+    {
+      "name": "send_email",
+      "description": "Send an email to a recipient. Supports plain text and optional HTML body. Uses SMTP or Feishu/Lark as the delivery backend.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Recipient email address"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Email subject line"
+          },
+          "body": {
+            "type": "string",
+            "description": "Email body content. Plain text by default, or HTML if the html flag is set to true."
+          },
+          "provider": {
+            "type": "string",
+            "enum": ["smtp", "feishu"],
+            "description": "Email provider to use. If omitted, auto-detected from environment variables (SMTP_HOST for SMTP, LARK_APP_ID for Feishu)."
+          },
+          "html": {
+            "type": "boolean",
+            "description": "When true, treat the body as HTML content. Default is false (plain text)."
+          },
+          "attachments": {
+            "type": "array",
+            "description": "File attachments to include (SMTP only). Each item specifies a file path and optional display name.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute file path to the attachment"
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Display name for the attachment (defaults to the file name)"
+                }
+              },
+              "required": ["path"]
+            }
+          }
+        },
+        "required": ["to", "subject", "body"]
+      }
+    }
+  ]
+}

@@ -13,7 +13,10 @@ use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolR
 use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
-use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
+use octos_core::{
+    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
+    OutboundMessage, SessionKey,
+};
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
@@ -26,6 +29,42 @@ use tracing::{debug, info, warn};
 use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+
+/// Parameters for dispatching an inbound message to a session actor.
+pub struct DispatchParams<'a> {
+    pub message: InboundMessage,
+    pub image_media: Vec<String>,
+    pub session_key: SessionKey,
+    pub reply_channel: &'a str,
+    pub reply_chat_id: &'a str,
+    pub status_indicator: Option<Arc<StatusComposer>>,
+    pub profile_id: Option<&'a str>,
+    pub system_prompt_override: Option<String>,
+    pub sender_user_id: Option<String>,
+}
+
+/// Parameters for spawning a new session actor.
+struct SpawnParams<'a> {
+    session_key: SessionKey,
+    channel: &'a str,
+    chat_id: &'a str,
+    semaphore: Arc<Semaphore>,
+    status_indicator: Option<Arc<StatusComposer>>,
+    system_prompt_override: Option<String>,
+    sender_user_id: Option<String>,
+}
+
+/// Parameters for the outbound message forwarder task.
+struct ForwarderParams {
+    proxy_rx: mpsc::Receiver<OutboundMessage>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    session_key: SessionKey,
+    channel: String,
+    chat_id: String,
+    active_sessions: Arc<RwLock<ActiveSessionStore>>,
+    pending_messages: PendingMessages,
+    sender_user_id: Option<String>,
+}
 
 /// Default actor inbox capacity.
 const ACTOR_INBOX_SIZE: usize = 32;
@@ -42,6 +81,12 @@ const MAX_PENDING_PER_SESSION: usize = 50;
 /// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
+
+fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
+    sender_user_id
+        .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
+        .unwrap_or_else(|| serde_json::json!({}))
+}
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
@@ -71,6 +116,12 @@ pub struct ActorHandle {
     pub tx: mpsc::Sender<ActorMessage>,
     pub created_at: Instant,
     join_handle: JoinHandle<()>,
+    /// Profile system prompt override — preserved for respawn on actor death.
+    system_prompt_override: Option<String>,
+    /// Sender user ID for outbound identity assertion — preserved for respawn.
+    sender_user_id: Option<String>,
+    /// Profile-specific factory cache key for respawn after actor death.
+    factory_profile_id: Option<String>,
 }
 
 impl ActorHandle {
@@ -85,7 +136,8 @@ impl ActorHandle {
 /// Manages the lifecycle of session actors.
 pub struct ActorRegistry {
     actors: HashMap<String, ActorHandle>,
-    factory: ActorFactory,
+    factory: Arc<ActorFactory>,
+    profile_factories: HashMap<String, Arc<ActorFactory>>,
     semaphore: Arc<Semaphore>,
     out_tx: mpsc::Sender<OutboundMessage>,
     pending_messages: PendingMessages,
@@ -100,24 +152,58 @@ impl ActorRegistry {
     ) -> Self {
         Self {
             actors: HashMap::new(),
-            factory,
+            factory: Arc::new(factory),
+            profile_factories: HashMap::new(),
             semaphore,
             out_tx,
             pending_messages,
         }
     }
 
-    /// Route an inbound message to the correct actor, creating one if needed.
-    pub async fn dispatch(
+    pub fn register_profile_factory(
         &mut self,
-        message: InboundMessage,
-        image_media: Vec<String>,
-        session_key: SessionKey,
-        reply_channel: &str,
-        reply_chat_id: &str,
-        status_indicator: Option<Arc<StatusComposer>>,
+        profile_id: impl Into<String>,
+        factory: ActorFactory,
     ) {
-        let key_str = session_key.to_string();
+        self.profile_factories
+            .insert(profile_id.into(), Arc::new(factory));
+    }
+
+    pub fn has_profile_factory(&self, profile_id: &str) -> bool {
+        self.profile_factories.contains_key(profile_id)
+    }
+
+    fn actor_key(session_key: &SessionKey, profile_id: Option<&str>) -> String {
+        if session_key.profile_id().is_some() {
+            session_key.to_string()
+        } else {
+            format!("{}:{}", profile_id.unwrap_or(MAIN_PROFILE_ID), session_key)
+        }
+    }
+
+    fn resolve_factory(&self, profile_id: Option<&str>) -> (Arc<ActorFactory>, Option<String>) {
+        if let Some(profile_id) = profile_id {
+            if let Some(factory) = self.profile_factories.get(profile_id) {
+                return (factory.clone(), Some(profile_id.to_string()));
+            }
+        }
+        (self.factory.clone(), None)
+    }
+
+    /// Route an inbound message to the correct actor, creating one if needed.
+    pub async fn dispatch(&mut self, params: DispatchParams<'_>) {
+        let DispatchParams {
+            message,
+            image_media,
+            session_key,
+            reply_channel,
+            reply_chat_id,
+            status_indicator,
+            profile_id,
+            system_prompt_override,
+            sender_user_id,
+        } = params;
+        let key_str = Self::actor_key(&session_key, profile_id);
 
         // If actor exists but has finished (idle-timeout/panic), remove it
         if let Some(handle) = self.actors.get(&key_str) {
@@ -128,19 +214,25 @@ impl ActorRegistry {
 
         // Create actor if needed
         if !self.actors.contains_key(&key_str) {
-            let (tx, join_handle) = self.factory.spawn(
-                session_key.clone(),
-                reply_channel,
-                reply_chat_id,
-                self.semaphore.clone(),
-                status_indicator.clone(),
-            );
+            let (factory, factory_profile_id) = self.resolve_factory(profile_id);
+            let (tx, join_handle) = factory.spawn(SpawnParams {
+                session_key: session_key.clone(),
+                channel: reply_channel,
+                chat_id: reply_chat_id,
+                semaphore: self.semaphore.clone(),
+                status_indicator: status_indicator.clone(),
+                system_prompt_override: system_prompt_override.clone(),
+                sender_user_id: sender_user_id.clone(),
+            });
             self.actors.insert(
                 key_str.clone(),
                 ActorHandle {
                     tx,
                     created_at: Instant::now(),
                     join_handle,
+                    system_prompt_override,
+                    sender_user_id: sender_user_id.clone(),
+                    factory_profile_id,
                 },
             );
         }
@@ -163,7 +255,7 @@ impl ActorRegistry {
                         content: "⏳ Still processing, your message is queued...".to_string(),
                         reply_to: None,
                         media: vec![],
-                        metadata: serde_json::json!({}),
+                        metadata: system_notice_metadata(sender_user_id.as_deref()),
                     })
                     .await;
                 // Now block until space is available
@@ -171,15 +263,31 @@ impl ActorRegistry {
                 let _ = handle.tx.send(actor_msg).await;
             }
             Err(mpsc::error::TrySendError::Closed(actor_msg)) => {
-                // Actor died — remove and create a new one
-                self.actors.remove(&key_str);
-                let (tx, join_handle) = self.factory.spawn(
+                // Actor died — retrieve profile overrides, then respawn
+                let dead = self.actors.remove(&key_str);
+                let (prompt_override, uid_override, factory_profile_id) = dead
+                    .map(|h| {
+                        (
+                            h.system_prompt_override,
+                            h.sender_user_id,
+                            h.factory_profile_id,
+                        )
+                    })
+                    .unwrap_or((None, None, None));
+                let factory = factory_profile_id
+                    .as_deref()
+                    .and_then(|pid| self.profile_factories.get(pid))
+                    .cloned()
+                    .unwrap_or_else(|| self.factory.clone());
+                let (tx, join_handle) = factory.spawn(SpawnParams {
                     session_key,
-                    reply_channel,
-                    reply_chat_id,
-                    self.semaphore.clone(),
+                    channel: reply_channel,
+                    chat_id: reply_chat_id,
+                    semaphore: self.semaphore.clone(),
                     status_indicator,
-                );
+                    system_prompt_override: prompt_override.clone(),
+                    sender_user_id: uid_override.clone(),
+                });
                 let _ = tx.send(actor_msg).await;
                 self.actors.insert(
                     key_str,
@@ -187,10 +295,19 @@ impl ActorRegistry {
                         tx,
                         created_at: Instant::now(),
                         join_handle,
+                        system_prompt_override: prompt_override,
+                        sender_user_id: uid_override,
+                        factory_profile_id,
                     },
                 );
             }
         }
+    }
+
+    /// Returns the dispatch keys of all active actors (for testing).
+    #[cfg(test)]
+    pub fn actor_keys(&self) -> Vec<String> {
+        self.actors.keys().cloned().collect()
     }
 
     /// Remove actors whose tasks have completed.
@@ -207,8 +324,15 @@ impl ActorRegistry {
 
     /// Cancel a specific session actor.
     pub async fn cancel(&self, session_key: &str) {
-        if let Some(handle) = self.actors.get(session_key) {
-            let _ = handle.tx.send(ActorMessage::Cancel).await;
+        let scoped_suffix = format!(":{session_key}");
+        let handles: Vec<_> = self
+            .actors
+            .iter()
+            .filter(|(key, _)| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .map(|(_, handle)| handle.tx.clone())
+            .collect();
+        for tx in handles {
+            let _ = tx.send(ActorMessage::Cancel).await;
         }
     }
 
@@ -361,14 +485,16 @@ impl ToolRegistryFactory for SnapshotToolRegistryFactory {
 
 impl ActorFactory {
     /// Spawn a new session actor, returning its inbox sender and join handle.
-    fn spawn(
-        &self,
-        session_key: SessionKey,
-        channel: &str,
-        chat_id: &str,
-        semaphore: Arc<Semaphore>,
-        status_indicator: Option<Arc<StatusComposer>>,
-    ) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
+    fn spawn(&self, params: SpawnParams<'_>) -> (mpsc::Sender<ActorMessage>, JoinHandle<()>) {
+        let SpawnParams {
+            session_key,
+            channel,
+            chat_id,
+            semaphore,
+            status_indicator,
+            system_prompt_override,
+            sender_user_id,
+        } = params;
         let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
 
         // Create a per-session proxy channel. ALL outbound messages from this
@@ -406,6 +532,10 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
+        // Re-bind plugin tools so OCTOS_WORK_DIR points to the user workspace.
+        // This lets plugins (e.g. voice skill) store per-user data (voice profiles)
+        // inside the sandbox where the agent's tools can see them.
+        tools.rebind_plugin_work_dirs(&user_workspace);
         tools.register(message_tool);
         tools.register(send_file_tool);
 
@@ -462,11 +592,12 @@ impl ActorFactory {
         // Build per-session Agent
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
-        let mut system_prompt = self
-            .system_prompt
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
+            self.system_prompt
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
         if has_deferred {
             let groups = tools.deferred_groups();
             let mut tool_names = Vec::new();
@@ -527,6 +658,7 @@ impl ActorFactory {
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
             status_indicator,
+            sender_user_id: sender_user_id.clone(),
             user_status_config,
             data_dir: self.data_dir.clone(),
             max_history: self.max_history.clone(),
@@ -552,15 +684,16 @@ impl ActorFactory {
         let fwd_pending = self.pending_messages.clone();
         let fwd_channel = channel.to_string();
         let fwd_chat_id = chat_id.to_string();
-        tokio::spawn(outbound_forwarder(
+        tokio::spawn(outbound_forwarder(ForwarderParams {
             proxy_rx,
-            fwd_out_tx,
-            fwd_session_key,
-            fwd_channel,
-            fwd_chat_id,
-            fwd_active,
-            fwd_pending,
-        ));
+            out_tx: fwd_out_tx,
+            session_key: fwd_session_key,
+            channel: fwd_channel,
+            chat_id: fwd_chat_id,
+            active_sessions: fwd_active,
+            pending_messages: fwd_pending,
+            sender_user_id,
+        }));
 
         let join_handle = tokio::spawn(actor.run());
 
@@ -571,20 +704,32 @@ impl ActorFactory {
 
 /// Forwarding task: reads from the session's proxy channel and either delivers
 /// messages directly (if this session is active) or buffers them.
-async fn outbound_forwarder(
-    mut proxy_rx: mpsc::Receiver<OutboundMessage>,
-    out_tx: mpsc::Sender<OutboundMessage>,
-    session_key: SessionKey,
-    channel: String,
-    chat_id: String,
-    active_sessions: Arc<RwLock<ActiveSessionStore>>,
-    pending_messages: PendingMessages,
-) {
+async fn outbound_forwarder(params: ForwarderParams) {
+    let ForwarderParams {
+        mut proxy_rx,
+        out_tx,
+        session_key,
+        channel,
+        chat_id,
+        active_sessions,
+        pending_messages,
+        sender_user_id,
+    } = params;
     let my_topic = session_key.topic().unwrap_or("").to_string();
     let base_key = session_key.base_key().to_string();
     let key_str = session_key.to_string();
 
-    while let Some(msg) = proxy_rx.recv().await {
+    while let Some(mut msg) = proxy_rx.recv().await {
+        // Inject sender_user_id into outbound metadata so the channel
+        // sends as the correct virtual user (appservice identity assertion).
+        if let Some(ref uid) = sender_user_id {
+            if let Some(obj) = msg.metadata.as_object_mut() {
+                obj.insert(
+                    METADATA_SENDER_USER_ID.to_string(),
+                    serde_json::Value::String(uid.clone()),
+                );
+            }
+        }
         let active_topic = active_sessions
             .read()
             .await
@@ -628,7 +773,7 @@ async fn outbound_forwarder(
                         content: format!("📌 {topic_label} finished. /s {topic_label} to view."),
                         reply_to: None,
                         media: vec![],
-                        metadata: serde_json::json!({}),
+                        metadata: system_notice_metadata(sender_user_id.as_deref()),
                     })
                     .await;
             }
@@ -655,6 +800,7 @@ struct SessionActor {
     out_tx: mpsc::Sender<OutboundMessage>,
 
     status_indicator: Option<Arc<StatusComposer>>,
+    sender_user_id: Option<String>,
     /// Per-user status configuration (greeting, visibility toggles, custom layers).
     user_status_config: UserStatusConfig,
     /// Data directory for persisting user configs.
@@ -1516,6 +1662,7 @@ impl SessionActor {
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
+                self.sender_user_id.clone(),
             )
         });
 
@@ -1560,6 +1707,7 @@ impl SessionActor {
                     status_msg_id,
                     Arc::clone(&self.active_sessions),
                     self.session_key.clone(),
+                    self.sender_user_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -2006,6 +2154,7 @@ impl SessionActor {
         let overflow_reply_to = msg.message_id.clone();
         let session_timeout = self.session_timeout;
         let status_indicator = self.status_indicator.clone();
+        let sender_user_id = self.sender_user_id.clone();
         let user_status_config = self.user_status_config.clone();
         let history = pre_primary_history.to_vec();
         let active_sessions = self.active_sessions.clone();
@@ -2038,6 +2187,7 @@ impl SessionActor {
                     Arc::clone(&tracker),
                     None,
                     &user_status_config,
+                    sender_user_id.clone(),
                 )
             });
 
@@ -2060,6 +2210,7 @@ impl SessionActor {
                     status_msg_id,
                     active_sessions.clone(),
                     session_key.clone(),
+                    sender_user_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -2223,6 +2374,7 @@ impl SessionActor {
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
+                self.sender_user_id.clone(),
             )
         });
 
@@ -2268,6 +2420,7 @@ impl SessionActor {
                     status_msg_id,
                     Arc::clone(&self.active_sessions),
                     self.session_key.clone(),
+                    self.sender_user_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -2691,6 +2844,7 @@ mod tests {
             )),
             out_tx,
             status_indicator: None,
+            sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
@@ -2776,6 +2930,7 @@ mod tests {
             )),
             out_tx,
             status_indicator: None,
+            sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
             data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
@@ -3478,5 +3633,301 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    // ── Track B: dispatch profile routing tests ────────────────────────────
+
+    /// Helper: create an ActorRegistry with a minimal ActorFactory for dispatch tests.
+    async fn setup_dispatch_registry(
+        dir: &tempfile::TempDir,
+    ) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
+        let provider: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "test",
+            (0..20)
+                .map(|_| (Duration::from_millis(100), make_response("ok")))
+                .collect(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        let (spawn_tx, _spawn_rx) = mpsc::channel(32);
+
+        let factory = ActorFactory {
+            agent_config: AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            },
+            llm: provider.clone(),
+            llm_for_compaction: provider.clone(),
+            memory,
+            system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
+            hooks: None,
+            hook_context_template: None,
+            data_dir: dir.path().to_path_buf(),
+            session_mgr,
+            out_tx: out_tx.clone(),
+            spawn_inbound_tx: spawn_tx,
+            cron_service: None,
+            tool_registry_factory: Arc::new(SnapshotToolRegistryFactory::new(tools)),
+            pipeline_factory: None,
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cwd: dir.path().to_path_buf(),
+            sandbox_config: octos_agent::SandboxConfig::default(),
+            provider_policy: None,
+            worker_prompt: None,
+            provider_router: None,
+            embedder: None,
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            pending_messages: Arc::new(Mutex::new(HashMap::new())),
+            queue_mode: QueueMode::Followup,
+            adaptive_router: None,
+            memory_store: None,
+        };
+
+        let registry = ActorRegistry::new(
+            factory,
+            Arc::new(Semaphore::new(10)),
+            out_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        (registry, out_rx)
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_routes_by_profile_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+        let sk = SessionKey::new("matrix", "!room:localhost");
+        let msg = InboundMessage {
+            channel: "matrix".to_string(),
+            sender_id: "user1".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        registry
+            .dispatch(DispatchParams {
+                message: msg,
+                image_media: vec![],
+                session_key: sk.clone(),
+                reply_channel: "matrix",
+                reply_chat_id: "!room:localhost",
+                status_indicator: None,
+                profile_id: Some("weather"),
+                system_prompt_override: Some("You are a weather bot".to_string()),
+                sender_user_id: Some("@octos_weather:localhost".to_string()),
+            })
+            .await;
+
+        let keys = registry.actor_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].starts_with("weather:"),
+            "dispatch key should start with profile_id, got: {}",
+            keys[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_routes_to_default_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+        let sk = SessionKey::new("matrix", "!room:localhost");
+        let msg = InboundMessage {
+            channel: "matrix".to_string(),
+            sender_id: "user1".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        registry
+            .dispatch(DispatchParams {
+                message: msg,
+                image_media: vec![],
+                session_key: sk,
+                reply_channel: "matrix",
+                reply_chat_id: "!room:localhost",
+                status_indicator: None,
+                profile_id: None,
+                system_prompt_override: None,
+                sender_user_id: None,
+            })
+            .await;
+
+        let keys = registry.actor_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].starts_with("_main:"),
+            "dispatch key should start with _main when no profile_id, got: {}",
+            keys[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_profile_and_main_create_separate_actors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+        let sk = SessionKey::new("matrix", "!room:localhost");
+
+        let msg1 = InboundMessage {
+            channel: "matrix".to_string(),
+            sender_id: "user1".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "hello weather".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+        registry
+            .dispatch(DispatchParams {
+                message: msg1,
+                image_media: vec![],
+                session_key: sk.clone(),
+                reply_channel: "matrix",
+                reply_chat_id: "!room:localhost",
+                status_indicator: None,
+                profile_id: Some("weather"),
+                system_prompt_override: None,
+                sender_user_id: None,
+            })
+            .await;
+
+        let msg2 = InboundMessage {
+            channel: "matrix".to_string(),
+            sender_id: "user1".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "hello main".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+        registry
+            .dispatch(DispatchParams {
+                message: msg2,
+                image_media: vec![],
+                session_key: sk,
+                reply_channel: "matrix",
+                reply_chat_id: "!room:localhost",
+                status_indicator: None,
+                profile_id: None,
+                system_prompt_override: None,
+                sender_user_id: None,
+            })
+            .await;
+
+        let keys = registry.actor_keys();
+        assert_eq!(
+            keys.len(),
+            2,
+            "different profile_ids should create separate actors, got keys: {:?}",
+            keys
+        );
+        assert!(
+            keys.iter().any(|k| k.starts_with("weather:")),
+            "should have weather-prefixed actor"
+        );
+        assert!(
+            keys.iter().any(|k| k.starts_with("_main:")),
+            "should have _main-prefixed actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_matches_profile_scoped_actor_by_session_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut registry, _rx) = setup_dispatch_registry(&dir).await;
+
+        let sk = SessionKey::new("matrix", "!room:localhost");
+        let msg = InboundMessage {
+            channel: "matrix".to_string(),
+            sender_id: "user1".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "hello weather".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+        registry
+            .dispatch(DispatchParams {
+                message: msg,
+                image_media: vec![],
+                session_key: sk.clone(),
+                reply_channel: "matrix",
+                reply_chat_id: "!room:localhost",
+                status_indicator: None,
+                profile_id: Some("weather"),
+                system_prompt_override: None,
+                sender_user_id: Some("@octos_weather:localhost".to_string()),
+            })
+            .await;
+
+        registry.cancel(&sk.to_string()).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        registry.reap_dead_actors();
+
+        assert!(
+            registry.actor_keys().is_empty(),
+            "cancel should stop the profiled actor when called with the bare session key"
+        );
+    }
+
+    #[test]
+    fn test_sender_metadata_for_system_notice_includes_virtual_user() {
+        let metadata = system_notice_metadata(Some("@octos_weather:localhost"));
+
+        assert_eq!(
+            metadata
+                .get(METADATA_SENDER_USER_ID)
+                .and_then(|v| v.as_str()),
+            Some("@octos_weather:localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_profile_session_keys_are_persisted_separately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let weather_key = SessionKey::with_profile("weather", "matrix", "!room:localhost");
+        let news_key = SessionKey::with_profile("news", "matrix", "!room:localhost");
+
+        let mut weather = SessionHandle::open(dir.path(), &weather_key);
+        weather
+            .add_message(Message::user("weather message"))
+            .await
+            .unwrap();
+
+        let mut news = SessionHandle::open(dir.path(), &news_key);
+        news.add_message(Message::user("news message"))
+            .await
+            .unwrap();
+
+        let weather = SessionHandle::open(dir.path(), &weather_key);
+        let news = SessionHandle::open(dir.path(), &news_key);
+
+        assert_eq!(weather.get_history(10).len(), 1);
+        assert_eq!(news.get_history(10).len(), 1);
+        assert_eq!(weather.get_history(10)[0].content, "weather message");
+        assert_eq!(news.get_history(10)[0].content, "news message");
     }
 }
