@@ -406,6 +406,10 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
+        // Re-bind plugin tools so OCTOS_WORK_DIR points to the user workspace.
+        // This lets plugins (e.g. voice skill) store per-user data (voice profiles)
+        // inside the sandbox where the agent's tools can see them.
+        tools.rebind_plugin_work_dirs(&user_workspace);
         tools.register(message_tool);
         tools.register(send_file_tool);
 

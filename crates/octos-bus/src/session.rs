@@ -272,7 +272,7 @@ impl SessionManager {
     ///
     /// Truncates encoded name to 200 chars to stay within the 255-byte
     /// filesystem filename limit (reserving space for ".jsonl" suffix).
-    fn session_path(&self, key: &SessionKey) -> PathBuf {
+    pub fn session_path(&self, key: &SessionKey) -> PathBuf {
         Self::session_path_static(&self.sessions_dir, key)
     }
 

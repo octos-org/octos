@@ -806,6 +806,7 @@ impl Config {
                 "twilio",
                 "wecom",
                 "wecom-bot",
+                "qq-bot",
             ];
             for ch in &gw.channels {
                 if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {
