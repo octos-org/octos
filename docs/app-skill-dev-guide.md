@@ -1,5 +1,7 @@
 # Octos App Skill Development Guide
 
+[English](app-skill-dev-guide.md) | [中文](app-skill-dev-guide-zh.md)
+
 This guide covers everything you need to build, register, and deploy a new app skill for octos.
 
 ---
