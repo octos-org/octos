@@ -1236,7 +1236,7 @@ const SLASH_HELP: &str = "\
 • `/listbots` (public bots + your private bots)
 • `/bothelp`
 
-**Note:** I am BotFather — I only manage bots. To chat with AI, create your own bot with `/createbot` and invite it to a new room.";
+**Tip:** I'm BotFather — you can chat with me directly, or create your own bot with `/createbot` for a dedicated AI assistant.";
 
 async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
