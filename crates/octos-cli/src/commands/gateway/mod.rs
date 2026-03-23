@@ -42,6 +42,8 @@ use crate::session_actor::{
 use crate::status_layers::StatusComposer;
 
 // Re-export for use by prompt module
+#[cfg(feature = "matrix")]
+use matrix_integration::*;
 pub(crate) use prompt::build_system_prompt;
 #[cfg(any(
     feature = "telegram",
@@ -58,8 +60,6 @@ pub(crate) use prompt::build_system_prompt;
     feature = "wechat"
 ))]
 use prompt::settings_str;
-#[cfg(feature = "matrix")]
-use matrix_integration::*;
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>);
@@ -277,6 +277,10 @@ struct ProfileActorFactoryBuilder {
     queue_mode: crate::config::QueueMode,
     plugin_prompt_fragments: Vec<String>,
     no_retry: bool,
+    /// Plugin env vars for building normal-mode tool registries for child bots.
+    plugin_env: Vec<(String, String)>,
+    /// Sandbox config for child bot tool registries.
+    sandbox_config: octos_agent::SandboxConfig,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -348,6 +352,54 @@ impl ProfileActorFactoryBuilder {
             )))
         };
 
+        // Child bots with admin_mode=false need a full normal-mode tool registry
+        // (web_search, web_fetch, browser, plugins, etc.) instead of the parent's
+        // admin-only snapshot.
+        let tool_registry_factory: Arc<dyn ToolRegistryFactory + Send + Sync> =
+            if effective_profile.config.admin_mode {
+                self.tool_registry_factory.clone()
+            } else {
+                let mut sandbox_config = self.sandbox_config.clone();
+                if sandbox_config.read_allow_paths.is_empty() {
+                    sandbox_config
+                        .read_allow_paths
+                        .push(self.project_dir.to_string_lossy().into_owned());
+                }
+                let sandbox = octos_agent::create_sandbox(&sandbox_config);
+                let mut tools =
+                    ToolRegistry::with_builtins_and_sandbox(&profile_data_dir, sandbox);
+                tools.inject_tool_config(self.tool_config.clone());
+
+                // Load plugins
+                let plugin_work_dir = profile_data_dir.join("skill-output");
+                let mut plugin_dirs =
+                    crate::config::Config::plugin_dirs_from_project(&self.project_dir);
+                let profile_skills = profile_data_dir.join("skills");
+                if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
+                    plugin_dirs.insert(0, profile_skills);
+                }
+                // Include parent profile skills dir so child bots can use parent's skills
+                for dir in &extra_skills_dirs {
+                    let skills = dir.join("skills");
+                    if skills.exists() && !plugin_dirs.contains(&skills) {
+                        plugin_dirs.push(skills);
+                    }
+                }
+                if !plugin_dirs.is_empty() {
+                    match octos_agent::PluginLoader::load_into_with_work_dir(
+                        &mut tools,
+                        &plugin_dirs,
+                        &self.plugin_env,
+                        Some(&plugin_work_dir),
+                    ) {
+                        Ok(_result) => {}
+                        Err(e) => warn!(profile_id, "child bot plugin loading failed: {e}"),
+                    }
+                }
+
+                Arc::new(SnapshotToolRegistryFactory::new(tools))
+            };
+
         Ok(ActorFactory {
             agent_config: self.agent_config.clone(),
             llm: llm.clone(),
@@ -364,7 +416,7 @@ impl ProfileActorFactoryBuilder {
             out_tx: self.out_tx.clone(),
             spawn_inbound_tx: self.spawn_inbound_tx.clone(),
             cron_service: Some(self.cron_service.clone()),
-            tool_registry_factory: self.tool_registry_factory.clone(),
+            tool_registry_factory,
             pipeline_factory: self.pipeline_factory.clone(),
             max_history: self.max_history.clone(),
             idle_timeout: Duration::from_secs(crate::session_actor::DEFAULT_IDLE_TIMEOUT_SECS),
@@ -1416,6 +1468,8 @@ impl GatewayCommand {
                     queue_mode: gw_config.queue_mode,
                     plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
                     no_retry: self.no_retry,
+                    plugin_env: plugin_env.clone(),
+                    sandbox_config: sandbox_config.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1729,7 +1783,8 @@ impl GatewayCommand {
                 }
                 #[cfg(feature = "wechat")]
                 "wechat" => {
-                    let default_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
+                    let default_url =
+                        settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
                     let bridge_url = self.wechat_bridge_url.as_deref().unwrap_or(&default_url);
                     channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
                         &bridge_url,
@@ -3065,7 +3120,10 @@ mod tests {
             .delete_bot("@bot_weatherbot:localhost", "@admin:localhost")
             .await;
 
-        assert!(result.is_ok(), "operator override should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "operator override should succeed: {result:?}"
+        );
         assert_eq!(
             channel
                 .bot_router()
