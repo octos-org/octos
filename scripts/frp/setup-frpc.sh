@@ -75,18 +75,22 @@ if [ -f /usr/local/bin/frpc ]; then
     echo "    frpc already installed (version: ${CURRENT})"
 else
     echo "    Downloading frpc v${FRPC_VERSION}..."
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
+    FRP_TMPDIR=$(mktemp -d /tmp/frpc-install.XXXXXX)
+    trap 'rm -rf "$FRP_TMPDIR"' EXIT
 
     TARBALL="frp_${FRPC_VERSION}_${OS}_${FRP_ARCH}.tar.gz"
     URL="https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/${TARBALL}"
-    curl -fsSL -o "${TMPDIR}/${TARBALL}" "$URL"
-    tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
-    sudo install -m 0755 "${TMPDIR}/frp_${FRPC_VERSION}_${OS}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
+    curl -fsSL -o "${FRP_TMPDIR}/${TARBALL}" "$URL"
+    tar -xzf "${FRP_TMPDIR}/${TARBALL}" -C "$FRP_TMPDIR"
+    echo "    (sudo is needed to install frpc to /usr/local/bin)"
+    sudo mkdir -p /usr/local/bin
+    sudo cp "${FRP_TMPDIR}/frp_${FRPC_VERSION}_${OS}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
+    sudo chmod 0755 /usr/local/bin/frpc
     echo "    frpc installed to /usr/local/bin/frpc"
 fi
 
 # ── Write frpc config ────────────────────────────────────────────────
+echo "    (sudo is needed to write config to /etc/frp)"
 sudo mkdir -p /etc/frp
 sudo tee /etc/frp/frpc.toml > /dev/null << EOF
 # frpc config for ${SUBDOMAIN}.${TUNNEL_DOMAIN}
@@ -119,11 +123,12 @@ EOF
 echo "    Config written to /etc/frp/frpc.toml"
 
 # ── Create service ───────────────────────────────────────────────────
+echo "    (sudo is needed to install the frpc system service)"
 if [ "$OS" = "darwin" ]; then
-    # macOS: launchd plist
-    PLIST_PATH="$HOME/Library/LaunchAgents/io.octos.frpc.plist"
-    mkdir -p "$HOME/Library/LaunchAgents"
-    cat > "$PLIST_PATH" << 'PLIST_EOF'
+    # macOS: LaunchDaemon (runs as root, survives logout)
+    PLIST_PATH="/Library/LaunchDaemons/io.octos.frpc.plist"
+
+    sudo tee "$PLIST_PATH" > /dev/null << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -141,16 +146,23 @@ if [ "$OS" = "darwin" ]; then
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/frpc.log</string>
+    <string>/var/log/frpc.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/frpc.log</string>
+    <string>/var/log/frpc.log</string>
 </dict>
 </plist>
 PLIST_EOF
 
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    launchctl load "$PLIST_PATH"
-    echo "    launchd service loaded (io.octos.frpc)"
+    sudo chown root:wheel "$PLIST_PATH"
+    sudo chmod 644 "$PLIST_PATH"
+
+    # Also clean up legacy LaunchAgent if present
+    launchctl unload "$HOME/Library/LaunchAgents/io.octos.frpc.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/io.octos.frpc.plist"
+
+    sudo launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    sudo launchctl load "$PLIST_PATH"
+    echo "    LaunchDaemon loaded (io.octos.frpc)"
 else
     # Linux: systemd
     sudo tee /etc/systemd/system/frpc.service > /dev/null << SYSTEMD_EOF

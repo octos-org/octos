@@ -1,42 +1,149 @@
 #!/usr/bin/env bash
 # setup-caddy.sh — Install Caddy on VPS as reverse proxy to frps vhost.
-# Uses standard Caddy (no plugins). HTTP-only or auto HTTPS via Let's Encrypt
-# HTTP challenge (requires port 80 + DNS A records pointing to VPS).
+# Supports HTTP-only mode (default) or HTTPS with wildcard certs via DNS challenge.
 # Idempotent: safe to re-run.
 #
 # Usage:
-#   TUNNEL_DOMAIN=octos-cloud.org ./setup-caddy.sh
+#   ./setup-caddy.sh                                    # HTTP only
+#   ./setup-caddy.sh --https --dns-provider cloudflare  # HTTPS with wildcard certs
 #
 # Environment:
 #   TUNNEL_DOMAIN         (optional) Base domain (default: octos-cloud.org)
 #   FRPS_VHOST_HTTP_PORT  (optional) frps HTTP vhost port (default: 8080)
+#   CF_API_TOKEN          (required for --dns-provider cloudflare)
+#   STATIC_ROOT           (optional) Path to landing page files (default: /var/www/octos-cloud)
+#
+# DNS Providers:
+#   cloudflare   — requires CF_API_TOKEN (Zone:DNS:Edit)
+#   route53      — requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+#   digitalocean — requires DO_AUTH_TOKEN
+#   godaddy      — requires GODADDY_API_KEY + GODADDY_API_SECRET
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-octos-cloud.org}"
 FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8080}"
+STATIC_ROOT="${STATIC_ROOT:-/var/www/octos-cloud}"
+ENABLE_HTTPS=false
+DNS_PROVIDER=""
+
+# ── Parse arguments ───────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --https)        ENABLE_HTTPS=true; shift ;;
+        --dns-provider) DNS_PROVIDER="$2"; shift 2 ;;
+        --domain)       TUNNEL_DOMAIN="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '2,23s/^# //p' "$0"
+            exit 0
+            ;;
+        *)              echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# Validate HTTPS requirements
+if [ "$ENABLE_HTTPS" = true ] && [ -z "$DNS_PROVIDER" ]; then
+    echo "ERROR: --https requires --dns-provider <provider>"
+    echo "Supported: cloudflare, route53, digitalocean, godaddy"
+    exit 1
+fi
 
 echo "==> Setting up Caddy for ${TUNNEL_DOMAIN}"
+echo "    Mode: $([ "$ENABLE_HTTPS" = true ] && echo "HTTPS (DNS: ${DNS_PROVIDER})" || echo "HTTP only")"
 
-# ── Install Caddy (standard binary, no plugins needed) ────────────────
-if command -v caddy &>/dev/null; then
-    echo "    Caddy already installed: $(caddy version)"
-else
-    echo "    Installing Caddy..."
+# ── Detect architecture ──────────────────────────────────────────────
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  CADDY_ARCH="amd64" ;;
+    aarch64) CADDY_ARCH="arm64" ;;
+    arm64)   CADDY_ARCH="arm64" ;;
+    *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
 
-    # Use Caddy's download API for a standard build
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64)  CADDY_ARCH="amd64" ;;
-        aarch64) CADDY_ARCH="arm64" ;;
-        arm64)   CADDY_ARCH="arm64" ;;
-        *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+# ── Map DNS provider to Caddy plugin ─────────────────────────────────
+DNS_PLUGIN=""
+DNS_ENV_LINE=""
+DNS_CONFIG_BLOCK=""
+if [ "$ENABLE_HTTPS" = true ]; then
+    case "$DNS_PROVIDER" in
+        cloudflare)
+            DNS_PLUGIN="github.com/caddy-dns/cloudflare"
+            [ -z "${CF_API_TOKEN:-}" ] && { echo "ERROR: CF_API_TOKEN not set"; exit 1; }
+            DNS_ENV_LINE="Environment=CF_API_TOKEN=${CF_API_TOKEN}"
+            DNS_CONFIG_BLOCK="dns cloudflare {env.CF_API_TOKEN}"
+            ;;
+        route53)
+            DNS_PLUGIN="github.com/caddy-dns/route53"
+            [ -z "${AWS_ACCESS_KEY_ID:-}" ] && { echo "ERROR: AWS_ACCESS_KEY_ID not set"; exit 1; }
+            [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] && { echo "ERROR: AWS_SECRET_ACCESS_KEY not set"; exit 1; }
+            DNS_ENV_LINE="Environment=AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}\nEnvironment=AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+            DNS_CONFIG_BLOCK="dns route53"
+            ;;
+        digitalocean)
+            DNS_PLUGIN="github.com/caddy-dns/digitalocean"
+            [ -z "${DO_AUTH_TOKEN:-}" ] && { echo "ERROR: DO_AUTH_TOKEN not set"; exit 1; }
+            DNS_ENV_LINE="Environment=DO_AUTH_TOKEN=${DO_AUTH_TOKEN}"
+            DNS_CONFIG_BLOCK="dns digitalocean {env.DO_AUTH_TOKEN}"
+            ;;
+        godaddy)
+            DNS_PLUGIN="github.com/caddy-dns/godaddy"
+            [ -z "${GODADDY_API_KEY:-}" ] && { echo "ERROR: GODADDY_API_KEY not set"; exit 1; }
+            [ -z "${GODADDY_API_SECRET:-}" ] && { echo "ERROR: GODADDY_API_SECRET not set"; exit 1; }
+            DNS_ENV_LINE="Environment=GODADDY_API_KEY=${GODADDY_API_KEY}\nEnvironment=GODADDY_API_SECRET=${GODADDY_API_SECRET}"
+            DNS_CONFIG_BLOCK="dns godaddy {env.GODADDY_API_KEY} {env.GODADDY_API_SECRET}"
+            ;;
+        *)
+            echo "ERROR: Unsupported DNS provider: $DNS_PROVIDER"
+            echo "Supported: cloudflare, route53, digitalocean, godaddy"
+            exit 1
+            ;;
     esac
+fi
 
-    curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}" -o /tmp/caddy
-    sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
-    rm -f /tmp/caddy
+# ── Install Caddy ────────────────────────────────────────────────────
+install_caddy() {
+    if [ "$ENABLE_HTTPS" = true ]; then
+        # Build custom Caddy with DNS plugin using xcaddy
+        echo "    Building Caddy with ${DNS_PROVIDER} DNS plugin..."
+        if ! command -v xcaddy &>/dev/null; then
+            if command -v go &>/dev/null; then
+                go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+            else
+                echo "ERROR: xcaddy requires Go. Install Go first: https://go.dev/dl/"
+                exit 1
+            fi
+        fi
+        XCADDY=$(command -v xcaddy)
+        "$XCADDY" build --with "$DNS_PLUGIN" --output /tmp/caddy
+        sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
+        rm -f /tmp/caddy
+    else
+        # Standard Caddy binary (no plugins needed)
+        echo "    Downloading standard Caddy..."
+        curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}" -o /tmp/caddy
+        sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
+        rm -f /tmp/caddy
+    fi
+}
+
+NEEDS_INSTALL=false
+if ! command -v caddy &>/dev/null; then
+    NEEDS_INSTALL=true
+elif [ "$ENABLE_HTTPS" = true ]; then
+    # Check if existing Caddy has the DNS plugin
+    if ! caddy list-modules 2>/dev/null | grep -q "dns.providers.${DNS_PROVIDER}"; then
+        echo "    Existing Caddy missing ${DNS_PROVIDER} DNS module, rebuilding..."
+        NEEDS_INSTALL=true
+    else
+        echo "    Caddy already has ${DNS_PROVIDER} DNS module"
+    fi
+else
+    echo "    Caddy already installed: $(caddy version)"
+fi
+
+if [ "$NEEDS_INSTALL" = true ]; then
+    install_caddy
 fi
 
 # Give caddy permission to bind low ports without root
@@ -44,20 +151,84 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/caddy 2>/dev/null || true
 
 echo "    Caddy: $(caddy version)"
 
+# ── Create static root for landing page ───────────────────────────────
+sudo mkdir -p "$STATIC_ROOT"
+
 # ── Write Caddyfile ───────────────────────────────────────────────────
 sudo mkdir -p /etc/caddy
-sudo tee /etc/caddy/Caddyfile > /dev/null << EOF
-# Caddyfile — managed by setup-caddy.sh
-# Reverse-proxies HTTP to frps vhost port.
-# For HTTPS: point A records for *.${TUNNEL_DOMAIN} to this VPS,
-# then change :80 to the domain and Caddy auto-provisions Let's Encrypt certs.
 
-:80 {
+if [ "$ENABLE_HTTPS" = true ]; then
+    sudo tee /etc/caddy/Caddyfile > /dev/null << EOF
+# Caddyfile — managed by setup-caddy.sh
+# HTTPS with wildcard cert via ${DNS_PROVIDER} DNS challenge.
+
+# Main site: landing page + API fallback
+www.${TUNNEL_DOMAIN}, ${TUNNEL_DOMAIN} {
+    handle / {
+        root * ${STATIC_ROOT}
+        file_server
+    }
+    handle {
+        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+    }
+}
+
+# Tenant subdomains: HTTPS with wildcard cert
+*.${TUNNEL_DOMAIN} {
+    tls {
+        ${DNS_CONFIG_BLOCK}
+    }
     reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT} {
         header_up Host {host}
     }
 }
+
+# HTTP fallback: redirect tenants to HTTPS, proxy others to frps
+:80 {
+    @tenant {
+        not header_regexp Host ^(www\.)?${TUNNEL_DOMAIN//./\\.}\$
+        not header_regexp Host ^[0-9]
+    }
+    handle @tenant {
+        redir https://{host}{uri} permanent
+    }
+    handle {
+        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+    }
+}
 EOF
+else
+    sudo tee /etc/caddy/Caddyfile > /dev/null << EOF
+# Caddyfile — managed by setup-caddy.sh
+# HTTP-only mode. To enable HTTPS, re-run with:
+#   ./setup-caddy.sh --https --dns-provider cloudflare
+
+www.${TUNNEL_DOMAIN}, ${TUNNEL_DOMAIN} {
+    handle / {
+        root * ${STATIC_ROOT}
+        file_server
+    }
+    handle {
+        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+    }
+}
+
+:80 {
+    @tenant {
+        not header_regexp Host ^(www\.)?${TUNNEL_DOMAIN//./\\.}\$
+        not header_regexp Host ^[0-9]
+    }
+    handle @tenant {
+        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT} {
+            header_up Host {host}
+        }
+    }
+    handle {
+        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+    }
+}
+EOF
+fi
 
 echo "    Wrote Caddyfile to /etc/caddy/Caddyfile"
 
@@ -86,6 +257,7 @@ LimitNOFILE=65536
 
 Environment=XDG_DATA_HOME=/var/lib/caddy/data
 Environment=XDG_CONFIG_HOME=/var/lib/caddy/config
+$([ -n "$DNS_ENV_LINE" ] && echo -e "$DNS_ENV_LINE" || true)
 
 [Install]
 WantedBy=multi-user.target
@@ -95,12 +267,33 @@ sudo systemctl daemon-reload
 sudo systemctl enable caddy
 sudo systemctl restart caddy
 
+# ── Validate Caddyfile ────────────────────────────────────────────────
+echo ""
+echo "==> Validating Caddyfile..."
+if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+    echo "    Caddyfile is valid"
+else
+    echo "    WARNING: Caddyfile validation failed. Check /etc/caddy/Caddyfile"
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────
+VPS_IP=$(curl -s ifconfig.me 2>/dev/null || echo "<VPS_IP>")
+
+echo ""
 echo "==> Caddy is running"
-echo "    Listening on :80 → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
+if [ "$ENABLE_HTTPS" = true ]; then
+    echo "    HTTPS: *.${TUNNEL_DOMAIN} → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
+    echo "    DNS challenge: ${DNS_PROVIDER}"
+    echo "    Certs: auto-provisioned via Let's Encrypt"
+else
+    echo "    HTTP: :80 → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
+fi
 echo ""
-echo "==> DNS: Point these A records to $(curl -s ifconfig.me):"
-echo "    A     ${TUNNEL_DOMAIN}"
-echo "    A     *.${TUNNEL_DOMAIN}"
-echo ""
-echo "==> To enable HTTPS later, edit /etc/caddy/Caddyfile:"
-echo "    Replace ':80' with '*.${TUNNEL_DOMAIN}' and Caddy will auto-provision certs"
+echo "==> DNS: Point these A records to ${VPS_IP}:"
+echo "    A     ${TUNNEL_DOMAIN}       → ${VPS_IP}"
+echo "    A     *.${TUNNEL_DOMAIN}     → ${VPS_IP}"
+if [ "$ENABLE_HTTPS" = false ]; then
+    echo ""
+    echo "==> To enable HTTPS, re-run:"
+    echo "    CF_API_TOKEN=<token> ./setup-caddy.sh --https --dns-provider cloudflare"
+fi
