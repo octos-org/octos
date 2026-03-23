@@ -171,7 +171,9 @@ impl BotRouter {
     /// Look up the profile ID for a given Matrix user ID.
     pub async fn route(&self, matrix_user_id: &str) -> Option<String> {
         let routes = self.routes.read().await;
-        routes.get(matrix_user_id).map(|entry| entry.profile_id.clone())
+        routes
+            .get(matrix_user_id)
+            .map(|entry| entry.profile_id.clone())
     }
 
     pub async fn get_entry(&self, matrix_user_id: &str) -> Option<BotEntry> {
@@ -1000,7 +1002,8 @@ async fn handle_transaction(
                         };
                         let inviter = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
                         if let Some(entry) = state.bot_router.get_entry(state_key).await {
-                            if entry.visibility == BotVisibility::Private && inviter != entry.owner {
+                            if entry.visibility == BotVisibility::Private && inviter != entry.owner
+                            {
                                 if let Err(e) = join_room_via_appservice(
                                     &state.http,
                                     &state.homeserver,
@@ -1231,7 +1234,9 @@ const SLASH_HELP: &str = "\
 • Missing visibility defaults to `private`
 • `/deletebot <matrix_user_id>`
 • `/listbots` (public bots + your private bots)
-• `/bothelp`";
+• `/bothelp`
+
+**Note:** I am BotFather — I only manage bots. To chat with AI, create your own bot with `/createbot` and invite it to a new room.";
 
 async fn dispatch_createbot(mgr: &dyn BotManager, args: &str, sender: &str) -> String {
     if args.is_empty() {
@@ -2557,7 +2562,9 @@ mod tests {
             .method("PUT")
             .uri("/_matrix/app/v1/transactions/txn-private-invite?access_token=test_token")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_string(&body).unwrap(),
+            ))
             .unwrap();
 
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
@@ -4121,7 +4128,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let msg = inbound_rx.try_recv().expect("owner message should be forwarded");
+        let msg = inbound_rx
+            .try_recv()
+            .expect("owner message should be forwarded");
         assert_eq!(
             msg.metadata
                 .get(METADATA_TARGET_PROFILE_ID)
@@ -4497,7 +4506,10 @@ mod tests {
 
         let msg = result.expect("createbot should be intercepted");
         assert!(msg.contains("mock create"), "got: {msg}");
-        assert!(msg.contains("Private"), "expected default private visibility: {msg}");
+        assert!(
+            msg.contains("Private"),
+            "expected default private visibility: {msg}"
+        );
     }
 
     #[tokio::test]
