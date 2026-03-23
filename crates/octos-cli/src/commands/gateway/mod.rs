@@ -322,24 +322,15 @@ impl ProfileActorFactoryBuilder {
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
 
-        let mut system_prompt = if effective_profile.config.admin_mode {
-            if let Some(custom_prompt) = effective_profile.config.gateway.system_prompt.as_deref() {
-                custom_prompt.to_string()
-            } else {
-                let compiled = include_str!("../../prompts/admin_default.txt");
-                super::load_prompt("admin", compiled)
-            }
-        } else {
-            build_system_prompt(
-                effective_profile.config.gateway.system_prompt.as_deref(),
-                &profile_data_dir,
-                &self.project_dir,
-                &self.memory_store,
-                &skills_loader,
-                &self.tool_config,
-            )
-            .await
-        };
+        let mut system_prompt = build_system_prompt(
+            effective_profile.config.gateway.system_prompt.as_deref(),
+            &profile_data_dir,
+            &self.project_dir,
+            &self.memory_store,
+            &skills_loader,
+            &self.tool_config,
+        )
+        .await;
         for fragment in &self.plugin_prompt_fragments {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(fragment);
@@ -349,9 +340,9 @@ impl ProfileActorFactoryBuilder {
         let mut worker_prompt = self.worker_prompt.clone();
         let mut provider_router = self.provider_router.clone();
 
-        // Child bots with admin_mode=false need a full normal-mode tool registry
-        // (web_search, web_fetch, browser, plugins, etc.) instead of the parent's
-        // admin-only snapshot.
+        // Child bots with admin_mode=true reuse the parent's tool registry snapshot
+        // (which already has full tools + admin API). Child bots with admin_mode=false
+        // build their own fresh registry (full tools, no admin API).
         let tool_registry_factory: Arc<dyn ToolRegistryFactory + Send + Sync> = if effective_profile
             .config
             .admin_mode
@@ -1084,12 +1075,12 @@ impl GatewayCommand {
         // by the ActorFactory to eliminate the set_context() race condition.
 
         // Store config needed for per-session tool creation
-        let mut provider_policy_for_factory: Option<octos_agent::ToolPolicy> = None;
-        let mut worker_prompt_for_factory: Option<String> = None;
-        let mut provider_router_for_factory: Option<Arc<ProviderRouter>> = None;
-        let mut pipeline_factory: Option<
+        let provider_policy_for_factory: Option<octos_agent::ToolPolicy>;
+        let worker_prompt_for_factory: Option<String>;
+        let provider_router_for_factory: Option<Arc<ProviderRouter>>;
+        let pipeline_factory: Option<
             Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
-        > = None;
+        >;
 
         // Build env vars to inject into plugin processes so skills can route
         // API calls through the configured provider/gateway (e.g. r9s.ai).
@@ -1106,55 +1097,8 @@ impl GatewayCommand {
         let mut tools;
         let mut plugin_result;
         let mut sandbox_config = config.sandbox.clone();
-        if admin_mode {
-            // Admin mode: register only admin API tools
-            tools = ToolRegistry::new();
-
-            // Register admin API tools (calls REST API on octos serve)
-            let serve_url_env = std::env::var("OCTOS_SERVE_URL").ok();
-            let serve_url = serve_url_env
-                .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-            let admin_token = std::env::var("OCTOS_ADMIN_TOKEN").unwrap_or_default();
-            let admin_ctx = Arc::new(octos_agent::AdminApiContext {
-                http: reqwest::Client::new(),
-                serve_url,
-                admin_token,
-            });
-
-            octos_agent::register_admin_api_tools(&mut tools, admin_ctx);
-
-            // Session-specific tools (cron, message, send_file) are created
-            // per-session by the ActorFactory — not registered in base registry.
-
-            // Shell tool for direct server access (diagnostics, troubleshooting)
-            tools.register(octos_agent::ShellTool::new(&cwd));
-
-            // Memory bank tools
-            tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
-            tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
-
-            // Load only admin-relevant plugins (not all bundled skills)
-            let admin_skills: &[&str] = &["send-email", "account-manager"];
-            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
-            for skill_name in admin_skills {
-                let skill_dir = bundled_dir.join(skill_name);
-                if skill_dir.exists() {
-                    match octos_agent::PluginLoader::load_plugin(&skill_dir, &plugin_env) {
-                        Ok((plugin_tools, _extras)) => {
-                            for t in plugin_tools {
-                                tools.register(t);
-                            }
-                        }
-                        Err(e) => warn!("admin plugin {skill_name} failed: {e}"),
-                    }
-                }
-            }
-
-            plugin_result = octos_agent::PluginLoadResult::default();
-            info!("admin mode: registered admin API + shell + memory + plugin tools");
-        } else {
-            // Normal mode: full tool registration
+        {
+            // Full tool registration for all modes.
             // Populate read_allow_paths so the shell sandbox restricts reads to
             // this profile's data_dir (via cwd) + shared octos home (project_dir).
             // Without this, macOS SBPL defaults to (allow file-read*) which lets
@@ -1468,26 +1412,33 @@ impl GatewayCommand {
             ));
         }
 
-        // Build system prompt — admin mode uses a built-in admin prompt
-        let system_prompt = if admin_mode {
-            let custom = gw_config.system_prompt.as_deref();
-            if let Some(custom_prompt) = custom {
-                custom_prompt.to_string()
-            } else {
-                let compiled = include_str!("../../prompts/admin_default.txt");
-                super::load_prompt("admin", compiled)
-            }
-        } else {
-            build_system_prompt(
-                gw_config.system_prompt.as_deref(),
-                &data_dir,
-                &project_dir,
-                &memory_store,
-                &skills_loader,
-                &tool_config,
-            )
-            .await
-        };
+        // admin_mode adds admin API tools on top of the full tool set
+        // (profile management, server diagnostics via REST).
+        if admin_mode {
+            let serve_url_env = std::env::var("OCTOS_SERVE_URL").ok();
+            let serve_url = serve_url_env
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+            let admin_token = std::env::var("OCTOS_ADMIN_TOKEN").unwrap_or_default();
+            let admin_ctx = Arc::new(octos_agent::AdminApiContext {
+                http: reqwest::Client::new(),
+                serve_url,
+                admin_token,
+            });
+            octos_agent::register_admin_api_tools(&mut tools, admin_ctx);
+            info!("admin mode: added admin API tools on top of full tool set");
+        }
+
+        // Build system prompt (always the full prompt with persona, memory, skills)
+        let system_prompt = build_system_prompt(
+            gw_config.system_prompt.as_deref(),
+            &data_dir,
+            &project_dir,
+            &memory_store,
+            &skills_loader,
+            &tool_config,
+        )
+        .await;
 
         // Append skill prompt fragments
         let system_prompt = if plugin_result.prompt_fragments.is_empty() {

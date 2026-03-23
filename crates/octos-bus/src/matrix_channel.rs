@@ -1177,16 +1177,6 @@ async fn handle_transaction(
             }
         }
 
-        // Redirect non-command messages that target BotFather or have no
-        // routable child-bot target. Without this, the admin-only LLM gives
-        // poor answers to general questions (e.g. "查询油价").
-        if should_redirect_to_botfather(&state.bot_manager, &state.bot_user_id, &metadata) {
-            if let Err(e) = send_text_to_room(&state, room_id, BOTFATHER_REDIRECT_MSG).await {
-                warn!(error = %e, room_id, "failed to send BotFather redirect");
-            }
-            continue;
-        }
-
         let inbound = InboundMessage {
             channel: CHANNEL_NAME.into(),
             sender_id: sender.to_string(),
@@ -1205,40 +1195,6 @@ async fn handle_transaction(
     }
 
     (StatusCode::OK, "{}").into_response()
-}
-
-// ── BotFather redirect for non-command messages ─────────────────────────────
-
-const BOTFATHER_REDIRECT_MSG: &str = "\
-I'm BotFather — I only handle bot management commands.
-
-Type `/bothelp` for commands, or create your own AI bot with `/createbot`.";
-
-/// Returns `true` if a non-command message should be answered with a static
-/// redirect instead of being forwarded to the LLM agent.
-///
-/// This fires when BotFather management mode is active (`bot_manager` is set)
-/// and the message either:
-/// - has no routable target (no bot in the room / no @mention), or
-/// - explicitly targets BotFather's own Matrix user ID.
-fn should_redirect_to_botfather(
-    bot_manager: &Option<Arc<dyn BotManager>>,
-    bot_user_id: &str,
-    metadata: &Value,
-) -> bool {
-    if bot_manager.is_none() {
-        return false;
-    }
-    let target_uid = metadata
-        .get(METADATA_TARGET_MATRIX_USER_ID)
-        .and_then(|v| v.as_str());
-    let target_pid = metadata
-        .get(METADATA_TARGET_PROFILE_ID)
-        .and_then(|v| v.as_str());
-    match target_uid {
-        Some(uid) => uid == bot_user_id,
-        None => target_pid.is_none(),
-    }
 }
 
 // ── Slash command handling ───────────────────────────────────────────────────
@@ -4639,52 +4595,6 @@ mod tests {
         assert!(
             result.is_none(),
             "unknown slash commands should pass through to agent"
-        );
-    }
-
-    #[test]
-    fn test_should_redirect_to_botfather_when_no_target_and_bot_manager_set() {
-        let mgr: Option<Arc<dyn BotManager>> = Some(Arc::new(MockBotManager));
-        let metadata = json!({});
-        assert!(
-            should_redirect_to_botfather(&mgr, "@bot:localhost", &metadata),
-            "unrouted messages should redirect when BotFather mode is active"
-        );
-    }
-
-    #[test]
-    fn test_should_not_redirect_when_bot_manager_absent() {
-        let mgr: Option<Arc<dyn BotManager>> = None;
-        let metadata = json!({});
-        assert!(
-            !should_redirect_to_botfather(&mgr, "@bot:localhost", &metadata),
-            "should not redirect when bot_manager is not set"
-        );
-    }
-
-    #[test]
-    fn test_should_redirect_when_target_is_botfather() {
-        let mgr: Option<Arc<dyn BotManager>> = Some(Arc::new(MockBotManager));
-        let metadata = json!({
-            METADATA_TARGET_MATRIX_USER_ID: "@bot:localhost",
-            METADATA_TARGET_PROFILE_ID: "parent-profile",
-        });
-        assert!(
-            should_redirect_to_botfather(&mgr, "@bot:localhost", &metadata),
-            "messages explicitly targeting BotFather should redirect"
-        );
-    }
-
-    #[test]
-    fn test_should_not_redirect_when_target_is_child_bot() {
-        let mgr: Option<Arc<dyn BotManager>> = Some(Arc::new(MockBotManager));
-        let metadata = json!({
-            METADATA_TARGET_MATRIX_USER_ID: "@bot_weather:localhost",
-            METADATA_TARGET_PROFILE_ID: "child-profile",
-        });
-        assert!(
-            !should_redirect_to_botfather(&mgr, "@bot:localhost", &metadata),
-            "messages targeting a child bot should NOT redirect"
         );
     }
 
