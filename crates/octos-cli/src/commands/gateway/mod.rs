@@ -5,7 +5,7 @@ mod adapters;
 #[cfg(feature = "matrix")]
 mod matrix_integration;
 mod prompt;
-mod session_ui;
+pub(crate) mod session_ui;
 mod skills_handler;
 
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager,
-    create_bus, validate_topic_name,
+    create_bus,
 };
 use octos_core::{MAIN_PROFILE_ID, OutboundMessage, SessionKey};
 use octos_llm::{
@@ -150,7 +150,7 @@ fn resolve_dispatch_profile_id(
     }
 }
 
-fn build_profiled_session_key(
+pub(crate) fn build_profiled_session_key(
     profile_id: Option<&str>,
     channel: &str,
     chat_id: &str,
@@ -1788,6 +1788,14 @@ impl GatewayCommand {
         );
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
 
+        // Create session command dispatcher (testable extraction of /new, /s, /sessions, /back, /delete)
+        let mut session_dispatcher = crate::gateway_dispatcher::GatewayDispatcher::new(
+            session_mgr.clone(),
+            active_sessions.clone(),
+            pending_messages.clone(),
+            out_tx.clone(),
+        );
+
         // Drop the original out_tx — factory and registry hold their own clones.
         // This ensures the outbound channel closes properly when actors shut down.
         drop(out_tx);
@@ -1938,6 +1946,9 @@ impl GatewayCommand {
                 }
             }
 
+            // Update dispatcher's profile ID for this message.
+            session_dispatcher.dispatch_profile_id = dispatch_profile_id.clone();
+
             // Resolve session key with active topic, isolated per effective profile.
             let base_session_key = build_profiled_session_key(
                 dispatch_profile_id.as_deref(),
@@ -1970,42 +1981,19 @@ impl GatewayCommand {
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
-                // Session switch callback: "s:topic" or "s:" for default
-                if let Some(topic) = callback_data.strip_prefix("s:") {
-                    active_sessions
-                        .write()
+                if let Some(crate::gateway_dispatcher::DispatchResult::Handled) =
+                    session_dispatcher
+                        .handle_session_callback(
+                            &callback_data,
+                            callback_message_id.as_deref(),
+                            &inbound,
+                            &reply_channel,
+                            &reply_chat_id,
+                            &base_key_str,
+                            Some(&channel_mgr),
+                        )
                         .await
-                        .switch_to(&base_key_str, topic)
-                        .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-
-                    // Rebuild keyboard with updated active marker
-                    let entries = session_mgr.lock().await.list_user_sessions(&base_key_str);
-                    let keyboard = session_ui::build_session_keyboard(&entries, topic);
-                    let text = session_ui::build_session_text(&entries, topic);
-
-                    // Edit the picker message in-place
-                    if let Some(ref mid) = callback_message_id {
-                        if let Some(ch) = channel_mgr.get_channel(&reply_channel) {
-                            if let Err(e) = ch
-                                .edit_message_with_metadata(&reply_chat_id, mid, &text, &keyboard)
-                                .await
-                            {
-                                warn!("failed to edit session picker: {e}");
-                            }
-                        }
-                    }
-
-                    let label = if topic.is_empty() { "(default)" } else { topic };
-                    info!(session = %label, "session switched via inline keyboard");
-
-                    // Flush any buffered messages from the target session
-                    let target_key = build_profiled_session_key(
-                        dispatch_profile_id.as_deref(),
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        topic,
-                    );
-                    actor_registry.flush_pending(&target_key.to_string()).await;
+                {
                     continue;
                 }
 
@@ -2017,244 +2005,19 @@ impl GatewayCommand {
 
             let cmd = inbound.content.trim();
 
-            // Handle /new command — clear current session or create named session
-            if cmd == "/new" || cmd.starts_with("/new ") {
-                let name = cmd.strip_prefix("/new").unwrap_or("").trim();
-                if name.is_empty() {
-                    // Clear current session (existing behavior)
-                    match session_mgr.lock().await.clear(&session_key).await {
-                        Ok(()) => {
-                            let _ = agent_handle
-                                .send_outbound(make_reply(
-                                    &reply_channel,
-                                    &reply_chat_id,
-                                    "Session cleared.",
-                                ))
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("session clear failed: {e}");
-                        }
-                    }
-                } else {
-                    // Create/switch to named session
-                    if let Err(reason) = validate_topic_name(name) {
-                        let _ = agent_handle
-                            .send_outbound(make_reply(
-                                &reply_channel,
-                                &reply_chat_id,
-                                format!("Invalid session name: {reason}"),
-                            ))
-                            .await;
-                    } else {
-                        active_sessions
-                            .write()
-                            .await
-                            .switch_to(&base_key_str, name)
-                            .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-
-                        // Ensure the session file exists on disk so /sessions can list it.
-                        session_mgr.lock().await.touch_user_session(&base_key_str, name);
-
-                        let _ = agent_handle
-                            .send_outbound(make_reply(
-                                &reply_channel,
-                                &reply_chat_id,
-                                format!("Switched to session: {name}"),
-                            ))
-                            .await;
-                    }
-                }
-                continue;
-            }
-
-            // Handle /s command — switch to a named session
-            if cmd == "/s" || cmd.starts_with("/s ") {
-                let name = cmd.strip_prefix("/s").unwrap_or("").trim();
-                if name.is_empty() {
-                    // Switch to default session
-                    active_sessions
-                        .write()
-                        .await
-                        .switch_to(&base_key_str, "")
-                        .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-                    let _ = agent_handle
-                        .send_outbound(make_reply(
-                            &reply_channel,
-                            &reply_chat_id,
-                            "Switched to default session.",
-                        ))
-                        .await;
-
-                    // Flush any buffered messages from this session
-                    let target_key = build_profiled_session_key(
-                        dispatch_profile_id.as_deref(),
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        "",
-                    );
-                    actor_registry.flush_pending(&target_key.to_string()).await;
-                } else if let Err(reason) = validate_topic_name(name) {
-                    let _ = agent_handle
-                        .send_outbound(make_reply(
-                            &reply_channel,
-                            &reply_chat_id,
-                            format!("Invalid session name: {reason}"),
-                        ))
-                        .await;
-                } else {
-                    active_sessions
-                        .write()
-                        .await
-                        .switch_to(&base_key_str, name)
-                        .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-
-                    // Show last 2 messages as context preview
-                    let new_key = build_profiled_session_key(
-                        dispatch_profile_id.as_deref(),
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        name,
-                    );
-                    let preview = {
-                        let mut mgr = session_mgr.lock().await;
-                        let session = mgr.get_or_create(&new_key);
-                        let history = session.get_history(2);
-                        if history.is_empty() {
-                            String::new()
-                        } else {
-                            let mut lines = String::from("\n---\n");
-                            for m in history {
-                                let role = m.role.as_str();
-                                let text: String = m.content.chars().take(100).collect();
-                                lines.push_str(&format!("[{role}] {text}\n"));
-                            }
-                            lines
-                        }
-                    };
-
-                    let _ = agent_handle
-                        .send_outbound(make_reply(
-                            &reply_channel,
-                            &reply_chat_id,
-                            format!("Switched to session: {name}{preview}"),
-                        ))
-                        .await;
-
-                    // Flush any buffered messages from this session
-                    actor_registry.flush_pending(&new_key.to_string()).await;
-                }
-                continue;
-            }
-
-            // Handle /sessions command — list all sessions with inline keyboard
-            if cmd == "/sessions" {
-                let entries = session_mgr.lock().await.list_user_sessions(&base_key_str);
-                let active_topic = active_sessions
-                    .read()
+            // Dispatch session lifecycle commands (/new, /s, /sessions, /back, /delete)
+            if let crate::gateway_dispatcher::DispatchResult::Handled =
+                session_dispatcher
+                    .try_dispatch_session_command(
+                        cmd,
+                        &inbound,
+                        &session_key,
+                        &reply_channel,
+                        &reply_chat_id,
+                        &base_key_str,
+                    )
                     .await
-                    .get_active_topic(&base_key_str)
-                    .to_string();
-
-                if entries.is_empty() {
-                    let _ = agent_handle
-                        .send_outbound(make_reply(
-                            &reply_channel,
-                            &reply_chat_id,
-                            "No sessions found. Use /new <name> to create one.",
-                        ))
-                        .await;
-                } else {
-                    let keyboard = session_ui::build_session_keyboard(&entries, &active_topic);
-                    let text = session_ui::build_session_text(&entries, &active_topic);
-                    let mut msg = make_reply(&reply_channel, &reply_chat_id, text);
-                    msg.metadata = keyboard;
-                    let _ = agent_handle.send_outbound(msg).await;
-                }
-                continue;
-            }
-
-            // Handle /back (or /b) command — switch to previous session
-            if cmd == "/back" || cmd == "/b" {
-                let result = active_sessions.write().await.go_back(&base_key_str);
-                match result {
-                    Ok(Some(topic)) => {
-                        let label = if topic.is_empty() {
-                            "(default)".to_string()
-                        } else {
-                            topic.clone()
-                        };
-                        let _ = agent_handle
-                            .send_outbound(make_reply(
-                                &reply_channel,
-                                &reply_chat_id,
-                                format!("Switched back to session: {label}"),
-                            ))
-                            .await;
-
-                        // Flush any buffered messages from the target session
-                        let target_key = build_profiled_session_key(
-                            dispatch_profile_id.as_deref(),
-                            &inbound.channel,
-                            &inbound.chat_id,
-                            &topic,
-                        );
-                        actor_registry.flush_pending(&target_key.to_string()).await;
-                    }
-                    Ok(None) => {
-                        let _ = agent_handle
-                            .send_outbound(make_reply(
-                                &reply_channel,
-                                &reply_chat_id,
-                                "No previous session to switch to.",
-                            ))
-                            .await;
-                    }
-                    Err(e) => {
-                        warn!("go_back failed: {e}");
-                    }
-                }
-                continue;
-            }
-
-            // Handle /delete command — delete a named session
-            if cmd.starts_with("/delete ") {
-                let name = cmd.strip_prefix("/delete").unwrap_or("").trim();
-                if name.is_empty() {
-                    let _ = agent_handle
-                        .send_outbound(make_reply(
-                            &reply_channel,
-                            &reply_chat_id,
-                            "Usage: /delete <session-name>",
-                        ))
-                        .await;
-                } else {
-                    let del_key = build_profiled_session_key(
-                        dispatch_profile_id.as_deref(),
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        name,
-                    );
-                    match session_mgr.lock().await.clear(&del_key).await {
-                        Ok(()) => {
-                            active_sessions
-                                .write()
-                                .await
-                                .remove_topic(&base_key_str, name)
-                                .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
-                            let _ = agent_handle
-                                .send_outbound(make_reply(
-                                    &reply_channel,
-                                    &reply_chat_id,
-                                    format!("Deleted session: {name}"),
-                                ))
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("delete session failed: {e}");
-                        }
-                    }
-                }
+            {
                 continue;
             }
 

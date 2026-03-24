@@ -11,7 +11,7 @@ use octos_core::{InboundMessage, OutboundMessage, SessionKey};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
-use crate::commands::gateway::session_ui;
+use crate::commands::gateway::{build_profiled_session_key, session_ui};
 use crate::session_actor::PendingMessages;
 
 // ── Result of dispatching a single inbound message ──────────────────────────
@@ -36,6 +36,8 @@ pub struct GatewayDispatcher {
     pub(crate) active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pub(crate) pending_messages: PendingMessages,
     pub(crate) out_tx: mpsc::Sender<OutboundMessage>,
+    /// Profile ID used for building profiled session keys (None = main profile).
+    pub(crate) dispatch_profile_id: Option<String>,
 }
 
 impl GatewayDispatcher {
@@ -50,7 +52,24 @@ impl GatewayDispatcher {
             active_sessions,
             pending_messages,
             out_tx,
+            dispatch_profile_id: None,
         }
+    }
+
+    /// Set the dispatch profile ID for profiled session key construction.
+    pub fn with_profile_id(mut self, profile_id: Option<String>) -> Self {
+        self.dispatch_profile_id = profile_id;
+        self
+    }
+
+    /// Build a profiled session key for the given channel/chat/topic.
+    fn profiled_key(&self, channel: &str, chat_id: &str, topic: &str) -> SessionKey {
+        build_profiled_session_key(
+            self.dispatch_profile_id.as_deref(),
+            channel,
+            chat_id,
+            topic,
+        )
     }
 
     /// Flush pending (buffered) messages for a session key, delivering them
@@ -154,7 +173,7 @@ impl GatewayDispatcher {
                     "Switched to default session.",
                 ))
                 .await;
-            let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
+            let target_key = self.profiled_key(&inbound.channel, &inbound.chat_id, "");
             self.flush_pending(&target_key.to_string()).await;
         } else if let Err(reason) = validate_topic_name(name) {
             let _ = self
@@ -173,8 +192,7 @@ impl GatewayDispatcher {
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
 
             // Show last 2 messages as context preview
-            let new_key =
-                SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
+            let new_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             let preview = {
                 let mut mgr = self.session_mgr.lock().await;
                 let session = mgr.get_or_create(&new_key);
@@ -278,7 +296,7 @@ impl GatewayDispatcher {
                     .await;
 
                 let target_key =
-                    SessionKey::with_topic(&inbound.channel, &inbound.chat_id, &topic);
+                    self.profiled_key(&inbound.channel, &inbound.chat_id, &topic);
                 self.flush_pending(&target_key.to_string()).await;
             }
             Ok(None) => {
@@ -321,8 +339,7 @@ impl GatewayDispatcher {
                 ))
                 .await;
         } else {
-            let del_key =
-                SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
+            let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             match self.session_mgr.lock().await.clear(&del_key).await {
                 Ok(()) => {
                     self.active_sessions
@@ -399,8 +416,7 @@ impl GatewayDispatcher {
         };
         info!(session = %label, "session switched via inline keyboard");
 
-        let target_key =
-            SessionKey::with_topic(&inbound.channel, &inbound.chat_id, topic);
+        let target_key = self.profiled_key(&inbound.channel, &inbound.chat_id, topic);
         self.flush_pending(&target_key.to_string()).await;
 
         Some(DispatchResult::Handled)
@@ -475,6 +491,7 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
+    use crate::commands::gateway::build_profiled_session_key;
     use crate::session_actor::PendingMessages;
 
     /// Create a test dispatcher with fresh temp dirs and shared pending buffer.
@@ -907,8 +924,8 @@ mod tests {
         let (disp, pending, _tmp) = setup_dispatcher(tx);
         let inbound = make_test_inbound("telegram", "123", "/s research");
 
-        // Pre-populate pending messages for the target session
-        let target_key = SessionKey::with_topic("telegram", "123", "research");
+        // Pre-populate pending messages for the target session (use profiled key)
+        let target_key = build_profiled_session_key(None, "telegram", "123", "research");
         pending.lock().await.insert(
             target_key.to_string(),
             vec![make_reply("telegram", "123", "buffered deep search result")],
@@ -933,8 +950,8 @@ mod tests {
         let (disp, pending, _tmp) = setup_dispatcher(tx);
         let inbound = make_test_inbound("telegram", "123", "");
 
-        // Pre-populate pending messages
-        let target_key = SessionKey::with_topic("telegram", "123", "deep");
+        // Pre-populate pending messages (use profiled key)
+        let target_key = build_profiled_session_key(None, "telegram", "123", "deep");
         pending.lock().await.insert(
             target_key.to_string(),
             vec![make_reply("telegram", "123", "deep search report")],
@@ -972,8 +989,8 @@ mod tests {
             .switch_to("telegram:123", "research")
             .unwrap();
 
-        // Pre-populate pending for default session
-        let default_key = SessionKey::new("telegram", "123");
+        // Pre-populate pending for default session (use profiled key)
+        let default_key = build_profiled_session_key(None, "telegram", "123", "");
         pending.lock().await.insert(
             default_key.to_string(),
             vec![make_reply("telegram", "123", "old pending msg")],

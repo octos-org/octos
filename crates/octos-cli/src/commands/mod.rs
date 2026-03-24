@@ -9,7 +9,7 @@ mod clean;
 mod completions;
 mod cron;
 mod docs;
-mod gateway;
+pub(crate) mod gateway;
 mod init;
 mod office;
 #[cfg(feature = "api")]

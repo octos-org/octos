@@ -11,6 +11,7 @@ pub mod compaction;
 pub mod config;
 pub mod config_watcher;
 pub mod cron_tool;
+pub mod gateway_dispatcher;
 #[cfg(feature = "api")]
 pub mod monitor;
 #[cfg(feature = "api")]
