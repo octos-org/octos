@@ -234,6 +234,7 @@ pub async fn run_stream_forwarder(
                             &visible,
                             &mut message_id,
                             &mut no_edit_support,
+                            sender_user_id.as_deref(),
                         )
                         .await;
                     }
@@ -391,6 +392,7 @@ pub async fn run_stream_forwarder(
                 &visible,
                 &mut message_id,
                 &mut no_edit_support,
+                sender_user_id.as_deref(),
             )
             .await;
         }
@@ -437,7 +439,10 @@ async fn finish_flush_to_channel(
     text: &str,
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
+    sender_user_id: Option<&str>,
 ) {
+    // Preserve the asserted virtual-user identity when the final flush is the
+    // first send; otherwise Matrix falls back to the main bot user.
     do_flush(
         channel,
         chat_id,
@@ -445,7 +450,7 @@ async fn finish_flush_to_channel(
         message_id,
         no_edit_support,
         true,
-        None,
+        sender_user_id,
     )
     .await;
 }
@@ -599,6 +604,34 @@ mod tests {
 
         let sent = mock.sent.lock().await;
         let first = sent.first().expect("stream message should be sent");
+        assert_eq!(
+            first
+                .metadata
+                .get(METADATA_SENDER_USER_ID)
+                .and_then(|v| v.as_str()),
+            Some("@bot_mybot:localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_send_final_stream_message_with_sender_user_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        finish_flush_to_channel(
+            &channel,
+            "!room:localhost",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            Some("@bot_mybot:localhost"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent.first().expect("final stream message should be sent");
         assert_eq!(
             first
                 .metadata

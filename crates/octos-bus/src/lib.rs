@@ -20,6 +20,8 @@ pub mod discord_channel;
 pub mod email_channel;
 #[cfg(feature = "feishu")]
 pub mod feishu_channel;
+#[cfg(feature = "matrix")]
+pub mod matrix_channel;
 #[cfg(feature = "qq-bot")]
 pub mod qq_bot_channel;
 #[cfg(feature = "wechat")]
@@ -59,6 +61,8 @@ pub use discord_channel::DiscordChannel;
 pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
+#[cfg(feature = "matrix")]
+pub use matrix_channel::{BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel};
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;
 #[cfg(feature = "wechat")]

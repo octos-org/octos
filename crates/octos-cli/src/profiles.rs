@@ -1092,6 +1092,7 @@ mod tests {
                     max_history: Some(50),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),

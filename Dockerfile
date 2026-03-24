@@ -57,7 +57,7 @@ COPY . .
 RUN find crates -name '*.rs' -exec touch {} + && \
     cargo build --release --bin octos \
       -p octos-cli \
-      --features api,telegram,discord,slack,whatsapp,feishu,email
+      --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
 
 # ============================================================
 # Stage 2: Minimal runtime image

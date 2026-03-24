@@ -16,7 +16,7 @@ whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum"]
 twilio = ["axum"]
 wecom = ["axum"]
-matrix = []
+matrix = ["axum"]
 wecom-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
 qq-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
 wechat = ["tokio-tungstenite"]
@@ -37,6 +37,8 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+serde_yml = { workspace = true }
+subtle = { workspace = true }
 
 # Optional: channel integrations
 teloxide = { workspace = true, optional = true }
@@ -59,3 +61,4 @@ workspace = true
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+tower = { workspace = true }
