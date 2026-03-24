@@ -576,6 +576,7 @@ impl GatewayCommand {
         // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
         // resolve storage relative to the correct profile, not the gateway root.
         plugin_env.push(("OCTOS_DATA_DIR".to_string(), data_dir.to_string_lossy().to_string()));
+        plugin_env.push(("OCTOS_VOICE_DIR".to_string(), data_dir.join("voice_profiles").to_string_lossy().to_string()));
 
         let mut tools;
         let mut plugin_result;
@@ -662,6 +663,13 @@ impl GatewayCommand {
             let profile_skills = data_dir.join("skills");
             if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
                 plugin_dirs.insert(0, profile_skills);
+            }
+            // Sub-account: also add parent profile's skills dir
+            for dir in &extra_skills_dirs {
+                let parent_skills = dir.join("skills");
+                if parent_skills.exists() && !plugin_dirs.contains(&parent_skills) {
+                    plugin_dirs.push(parent_skills);
+                }
             }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
@@ -1026,6 +1034,10 @@ impl GatewayCommand {
             "send_file",
             "activate_tools",
         ]);
+        // Pin all plugin/skill tools as base so they are never auto-evicted.
+        if !plugin_result.tool_names.is_empty() {
+            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
+        }
 
         // Auto-defer non-core tool groups when tool count is high to prevent
         // overwhelming weaker LLMs (e.g. GLM) that return empty responses

@@ -866,7 +866,7 @@ impl SessionActor {
                                 let _ = self.out_tx.send(OutboundMessage {
                                     channel: self.channel.clone(),
                                     chat_id: self.chat_id.clone(),
-                                    content: "🛑 Cancelled.".to_string(),
+                                    content: octos_core::abort_response(&message.content).to_string(),
                                     reply_to: None,
                                     media: vec![],
                                     metadata: serde_json::json!({}),
@@ -957,6 +957,10 @@ impl SessionActor {
             }
             "/reset" => {
                 self.handle_reset_command().await;
+                true
+            }
+            "/thinking" => {
+                self.handle_thinking_command(&parts[1..]).await;
                 true
             }
             _ => false, // Unknown slash command — pass through to LLM
@@ -1328,6 +1332,45 @@ impl SessionActor {
 
         self.send_reply("Reset: queue=collect, adaptive=off, history cleared.")
             .await;
+    }
+
+    /// `/thinking` — toggle display of model reasoning/thinking content.
+    ///
+    /// Usage:
+    ///   /thinking          — show current state
+    ///   /thinking on       — show thinking content in responses
+    ///   /thinking off      — hide thinking content (default)
+    async fn handle_thinking_command(&mut self, args: &[&str]) {
+        match args.first().copied() {
+            Some("on" | "true" | "1") => {
+                self.user_status_config.show_thinking = true;
+                self.send_reply("💭 Thinking display: **on** — reasoning content will be shown.")
+                    .await;
+            }
+            Some("off" | "false" | "0") => {
+                self.user_status_config.show_thinking = false;
+                self.send_reply("💭 Thinking display: **off** — reasoning content will be hidden.")
+                    .await;
+            }
+            None => {
+                let state = if self.user_status_config.show_thinking {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.send_reply(&format!(
+                    "💭 Thinking display: **{state}**\n\nUsage: `/thinking on` or `/thinking off`"
+                ))
+                .await;
+            }
+            _ => {
+                self.send_reply("Usage: `/thinking on|off`").await;
+            }
+        }
+        let base_key = self.session_key.base_key();
+        if let Err(e) = self.user_status_config.save(&self.data_dir, base_key) {
+            warn!(error = %e, "failed to save user status config");
+        }
     }
 
     /// Send a short reply to the user (for command responses).
@@ -1796,7 +1839,7 @@ impl SessionActor {
                         Some(ActorMessage::Inbound { message, image_media: _ }) => {
                             if octos_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
-                                self.send_reply("🛑 Cancelled.").await;
+                                self.send_reply(octos_core::abort_response(&message.content)).await;
                                 continue;
                             }
                             // Check if this is a slash command — handle inline
@@ -1918,13 +1961,26 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        match &agent_result {
+        let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
-                info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages")
+                info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages");
+                serde_json::json!({
+                    "_completion": true,
+                    "model": format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                    "tokens_in": cr.token_usage.input_tokens,
+                    "tokens_out": cr.token_usage.output_tokens,
+                    "duration_s": llm_latency.as_secs_f64().round() as u64,
+                })
             }
-            Ok(Err(e)) => warn!(session = %self.session_key, error = %e, "agent returned error"),
-            Err(e) => warn!(session = %self.session_key, error = %e, "agent timed out"),
-        }
+            Ok(Err(e)) => {
+                warn!(session = %self.session_key, error = %e, "agent returned error");
+                serde_json::json!({"_completion": true})
+            }
+            Err(e) => {
+                warn!(session = %self.session_key, error = %e, "agent timed out");
+                serde_json::json!({"_completion": true})
+            }
+        };
         match agent_result {
             Ok(Ok(conv_response)) => {
                 // Save tool calls, tool results, and assistant reply to history.
@@ -1956,7 +2012,7 @@ impl SessionActor {
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
-                            reasoning_content: None,
+                            reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -2003,10 +2059,34 @@ impl SessionActor {
                             .to_string()
                     };
 
+                    // Prepend thinking content when show_thinking is enabled
+                    let display_content = if self.user_status_config.show_thinking {
+                        let prefix = format_thinking_prefix(
+                            conv_response.reasoning_content.as_deref(),
+                        );
+                        format!("{prefix}{display_content}")
+                    } else {
+                        display_content
+                    };
+
                     // If overflow was served while this task ran, prepend a
                     // marker so the user knows this is a delayed result.
                     let display_content = if overflow_served {
                         format!("⬆️ Earlier task completed:\n\n{display_content}")
+                    } else {
+                        display_content
+                    };
+
+                    // Append annotation as last line for non-API channels
+                    let display_content = if self.channel != "api" {
+                        if let Some(model) = completion_meta.get("model").and_then(|v| v.as_str()) {
+                            let tok_in = completion_meta.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let tok_out = completion_meta.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let secs = completion_meta.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0);
+                            format!("{display_content}\n\n{}", format_annotation(model, tok_in, tok_out, secs))
+                        } else {
+                            display_content
+                        }
                     } else {
                         display_content
                     };
@@ -2094,7 +2174,7 @@ impl SessionActor {
                     content: String::new(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({"_completion": true}),
+                    metadata: completion_meta,
                 })
                 .await;
         }
@@ -2271,13 +2351,22 @@ impl SessionActor {
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
-                            reasoning_content: None,
+                            reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                         let _ = handle.add_message(final_reply).await;
                     }
 
                     let reply = strip_think_tags(&conv_response.content);
+                    // Prepend thinking content when show_thinking is enabled
+                    let reply = if user_status_config.show_thinking {
+                        let prefix = format_thinking_prefix(
+                            conv_response.reasoning_content.as_deref(),
+                        );
+                        format!("{prefix}{reply}")
+                    } else {
+                        reply
+                    };
                     // Check session activity — if inactive, skip streaming edit
                     // so the reply goes through proxy → pending buffer.
                     let session_active = {
@@ -2505,6 +2594,18 @@ impl SessionActor {
             handle.stop().await;
         }
 
+        // Capture annotation data before match moves result
+        let annotation_data: Option<(String, u32, u32, u64)> = if let Ok(Ok(ref cr)) = result {
+            Some((
+                format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                cr.token_usage.input_tokens,
+                cr.token_usage.output_tokens,
+                llm_latency.as_secs(),
+            ))
+        } else {
+            None
+        };
+
         match result {
             Ok(Ok(conv_response)) => {
                 // Save all messages from the agent (user msg, tool calls, tool
@@ -2538,7 +2639,7 @@ impl SessionActor {
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
-                            reasoning_content: None,
+                            reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -2576,6 +2677,27 @@ impl SessionActor {
                             .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
                             .unwrap_or(&content)
                             .to_string()
+                    };
+
+                    // Prepend thinking content when show_thinking is enabled
+                    let display_content = if self.user_status_config.show_thinking {
+                        let prefix = format_thinking_prefix(
+                            conv_response.reasoning_content.as_deref(),
+                        );
+                        format!("{prefix}{display_content}")
+                    } else {
+                        display_content
+                    };
+
+                    // Append annotation as last line for non-API channels
+                    let display_content = if self.channel != "api" {
+                        if let Some((ref model, tok_in, tok_out, secs)) = annotation_data {
+                            format!("{display_content}\n\n{}", format_annotation(model, tok_in as u64, tok_out as u64, secs))
+                        } else {
+                            display_content
+                        }
+                    } else {
+                        display_content
                     };
 
                     // If stream forwarder already sent a message AND this session
@@ -2668,6 +2790,7 @@ impl SessionActor {
 }
 
 /// Strip `<think>...</think>` blocks that some models embed inline.
+/// Collapses runs of 3+ newlines left behind to avoid blank gaps.
 fn strip_think_tags(s: &str) -> String {
     let mut result = s.to_string();
     while let Some(start) = result.find("<think>") {
@@ -2678,7 +2801,47 @@ fn strip_think_tags(s: &str) -> String {
             break;
         }
     }
+    // Collapse runs of 3+ newlines (left behind after stripping) to double newline
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
     result.trim().to_string()
+}
+
+/// Format token count with K suffix for readability (e.g. 22173 → "22.2K").
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format annotation line: model · tokens in/out · duration
+fn format_annotation(model: &str, tok_in: u64, tok_out: u64, secs: u64) -> String {
+    format!("_{model} · {in_} in · {out_} out · {secs}s_",
+        in_ = fmt_tokens(tok_in),
+        out_ = fmt_tokens(tok_out),
+    )
+}
+
+/// Format reasoning/thinking content for display, prepended to the response.
+/// Truncates long reasoning to avoid flooding the channel.
+fn format_thinking_prefix(reasoning: Option<&str>) -> String {
+    const MAX_THINKING_LEN: usize = 1000;
+    match reasoning {
+        Some(r) if !r.trim().is_empty() => {
+            let trimmed = r.trim();
+            let display = if trimmed.chars().count() > MAX_THINKING_LEN {
+                let truncated: String = trimmed.chars().take(MAX_THINKING_LEN).collect();
+                format!("{truncated}...")
+            } else {
+                trimmed.to_string()
+            };
+            format!("💭 *Thinking:*\n{display}\n\n---\n\n")
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
