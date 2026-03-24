@@ -131,12 +131,38 @@ NEEDS_INSTALL=false
 if ! command -v caddy &>/dev/null; then
     NEEDS_INSTALL=true
 elif [ "$ENABLE_HTTPS" = true ]; then
-    # Check if existing Caddy has the DNS plugin
+    # Check if existing Caddy has the DNS plugin; also verify the token is accepted.
+    # Older module versions reject newer token formats (cfut_/cfat_ prefixes).
     if ! caddy list-modules 2>/dev/null | grep -q "dns.providers.${DNS_PROVIDER}"; then
         echo "    Existing Caddy missing ${DNS_PROVIDER} DNS module, rebuilding..."
         NEEDS_INSTALL=true
     else
-        echo "    Caddy already has ${DNS_PROVIDER} DNS module"
+        echo "    Caddy has ${DNS_PROVIDER} DNS module, verifying token compatibility..."
+        # Write a minimal test Caddyfile to check if the module accepts the token
+        TEST_CADDYFILE=$(mktemp /tmp/caddy-test.XXXXXX)
+        cat > "$TEST_CADDYFILE" << 'TESTEOF'
+*.test.invalid {
+    tls {
+        dns cloudflare __TEST_TOKEN__
+    }
+    respond "ok"
+}
+TESTEOF
+        # Substitute the actual token (from env) for the placeholder
+        case "$DNS_PROVIDER" in
+            cloudflare)    TEST_TOKEN="${CF_API_TOKEN}" ;;
+            digitalocean)  TEST_TOKEN="${DO_AUTH_TOKEN}" ;;
+            route53)       TEST_TOKEN="test" ;;
+            godaddy)       TEST_TOKEN="${GODADDY_API_KEY}" ;;
+        esac
+        sed -i "s|__TEST_TOKEN__|${TEST_TOKEN}|g" "$TEST_CADDYFILE"
+        if caddy validate --config "$TEST_CADDYFILE" 2>&1 | grep -qi "invalid\|error"; then
+            echo "    Module rejects token format, rebuilding with latest version..."
+            NEEDS_INSTALL=true
+        else
+            echo "    Caddy ${DNS_PROVIDER} module is compatible"
+        fi
+        rm -f "$TEST_CADDYFILE"
     fi
 else
     echo "    Caddy already installed: $(caddy version)"
