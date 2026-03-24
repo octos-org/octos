@@ -1,6 +1,7 @@
 //! Gateway command: run as a persistent messaging daemon.
 
 mod account_handler;
+mod adapters;
 #[cfg(feature = "matrix")]
 mod matrix_integration;
 mod prompt;
@@ -18,7 +19,7 @@ use colored::Colorize;
 use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
 use octos_bus::{
-    ActiveSessionStore, ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager,
+    ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager,
     create_bus, validate_topic_name,
 };
 use octos_core::{MAIN_PROFILE_ID, OutboundMessage, SessionKey};
@@ -45,21 +46,6 @@ use crate::status_layers::StatusComposer;
 #[cfg(feature = "matrix")]
 use matrix_integration::*;
 pub(crate) use prompt::build_system_prompt;
-#[cfg(any(
-    feature = "telegram",
-    feature = "discord",
-    feature = "slack",
-    feature = "whatsapp",
-    feature = "email",
-    feature = "feishu",
-    feature = "twilio",
-    feature = "wecom",
-    feature = "wecom-bot",
-    feature = "matrix",
-    feature = "qq-bot",
-    feature = "wechat"
-))]
-use prompt::settings_str;
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>);
@@ -1651,309 +1637,18 @@ impl GatewayCommand {
 
         // Create channel manager and register channels
         let mut channel_mgr = ChannelManager::new();
-        for entry in &gw_config.channels {
-            match entry.channel_type.as_str() {
-                "cli" => {
-                    channel_mgr.register(Arc::new(CliChannel::new(shutdown.clone())));
-                }
-                #[cfg(feature = "telegram")]
-                "telegram" => {
-                    let env = settings_str(&entry.settings, "token_env", "TELEGRAM_BOT_TOKEN");
-                    let token = std::env::var(&env)
-                        .wrap_err_with(|| format!("{env} environment variable not set"))?;
-                    let bot_username = entry
-                        .settings
-                        .get("bot_username")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let require_mention = entry
-                        .settings
-                        .get("require_mention")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let mut tg = octos_bus::TelegramChannel::new(
-                        &token,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                        media_dir.clone(),
-                    );
-                    if require_mention {
-                        tg = tg.with_mention_gating(bot_username);
-                    }
-                    channel_mgr.register(Arc::new(tg));
-                }
-                #[cfg(feature = "discord")]
-                "discord" => {
-                    let env = settings_str(&entry.settings, "token_env", "DISCORD_BOT_TOKEN");
-                    let token = std::env::var(&env)
-                        .wrap_err_with(|| format!("{env} environment variable not set"))?;
-                    channel_mgr.register(Arc::new(octos_bus::DiscordChannel::new(
-                        &token,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                        media_dir.clone(),
-                    )));
-                }
-                #[cfg(feature = "slack")]
-                "slack" => {
-                    let bot_env = settings_str(&entry.settings, "bot_token_env", "SLACK_BOT_TOKEN");
-                    let app_env = settings_str(&entry.settings, "app_token_env", "SLACK_APP_TOKEN");
-                    let bot_token = std::env::var(&bot_env)
-                        .wrap_err_with(|| format!("{bot_env} environment variable not set"))?;
-                    let app_token = std::env::var(&app_env)
-                        .wrap_err_with(|| format!("{app_env} environment variable not set"))?;
-                    channel_mgr.register(Arc::new(octos_bus::SlackChannel::new(
-                        &bot_token,
-                        &app_token,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                        media_dir.clone(),
-                    )));
-                }
-                #[cfg(feature = "whatsapp")]
-                "whatsapp" => {
-                    let url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3001");
-                    channel_mgr.register(Arc::new(octos_bus::WhatsAppChannel::new(
-                        &url,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                        media_dir.clone(),
-                    )));
-                }
-                #[cfg(feature = "email")]
-                "email" => {
-                    let imap_host = settings_str(&entry.settings, "imap_host", "");
-                    let imap_port = entry
-                        .settings
-                        .get("imap_port")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(993) as u16;
-                    let smtp_host = settings_str(&entry.settings, "smtp_host", "");
-                    let smtp_port = entry
-                        .settings
-                        .get("smtp_port")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(465) as u16;
-                    let user_env = settings_str(&entry.settings, "username_env", "EMAIL_USERNAME");
-                    let pass_env = settings_str(&entry.settings, "password_env", "EMAIL_PASSWORD");
-                    let username =
-                        std::env::var(&user_env).wrap_err_with(|| format!("{user_env} not set"))?;
-                    let password =
-                        std::env::var(&pass_env).wrap_err_with(|| format!("{pass_env} not set"))?;
-                    let from_address = settings_str(&entry.settings, "from_address", &username);
-                    let poll_interval = entry
-                        .settings
-                        .get("poll_interval_secs")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(30);
-                    let max_body_chars = entry
-                        .settings
-                        .get("max_body_chars")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(10000) as usize;
-
-                    let email_config = octos_bus::email_channel::EmailConfig {
-                        imap_host,
-                        imap_port,
-                        smtp_host,
-                        smtp_port,
-                        username,
-                        password,
-                        from_address,
-                        poll_interval_secs: poll_interval,
-                        allowed_senders: entry.allowed_senders.clone(),
-                        max_body_chars,
-                    };
-                    channel_mgr.register(Arc::new(octos_bus::EmailChannel::new(
-                        email_config,
-                        shutdown.clone(),
-                    )));
-                }
-                #[cfg(feature = "feishu")]
-                "feishu" | "lark" => {
-                    let id_env = settings_str(&entry.settings, "app_id_env", "FEISHU_APP_ID");
-                    let secret_env =
-                        settings_str(&entry.settings, "app_secret_env", "FEISHU_APP_SECRET");
-                    let region = settings_str(&entry.settings, "region", "cn");
-                    let app_id = std::env::var(&id_env)
-                        .wrap_err_with(|| format!("{id_env} environment variable not set"))?;
-                    let app_secret = std::env::var(&secret_env)
-                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
-                    let mode = settings_str(&entry.settings, "mode", "ws");
-                    let webhook_port: u16 = entry
-                        .settings
-                        .get("webhook_port")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(9321) as u16;
-                    let encrypt_key = entry
-                        .settings
-                        .get("encrypt_key")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let verification_token = entry
-                        .settings
-                        .get("verification_token")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    channel_mgr.register(Arc::new(
-                        octos_bus::FeishuChannel::new(
-                            &app_id,
-                            &app_secret,
-                            entry.allowed_senders.clone(),
-                            shutdown.clone(),
-                            &region,
-                            media_dir.clone(),
-                        )
-                        .with_mode(&mode)
-                        .with_webhook_port(webhook_port)
-                        .with_encrypt_key(encrypt_key)
-                        .with_verification_token(verification_token),
-                    ));
-                }
-                #[cfg(feature = "twilio")]
-                "twilio" => {
-                    let sid_env =
-                        settings_str(&entry.settings, "account_sid_env", "TWILIO_ACCOUNT_SID");
-                    let token_env =
-                        settings_str(&entry.settings, "auth_token_env", "TWILIO_AUTH_TOKEN");
-                    let from_number = settings_str(&entry.settings, "from_number", "");
-                    let account_sid = std::env::var(&sid_env)
-                        .wrap_err_with(|| format!("{sid_env} environment variable not set"))?;
-                    let auth_token = std::env::var(&token_env)
-                        .wrap_err_with(|| format!("{token_env} environment variable not set"))?;
-                    let webhook_port: u16 = entry
-                        .settings
-                        .get("webhook_port")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(8090) as u16;
-                    channel_mgr.register(Arc::new(octos_bus::TwilioChannel::new(
-                        &account_sid,
-                        &auth_token,
-                        &from_number,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                        media_dir.clone(),
-                        webhook_port,
-                    )));
-                }
-                #[cfg(feature = "wecom")]
-                "wecom" => {
-                    let corp_id_env = settings_str(&entry.settings, "corp_id_env", "WECOM_CORP_ID");
-                    let secret_env =
-                        settings_str(&entry.settings, "agent_secret_env", "WECOM_AGENT_SECRET");
-                    let corp_id = std::env::var(&corp_id_env)
-                        .wrap_err_with(|| format!("{corp_id_env} environment variable not set"))?;
-                    let agent_secret = std::env::var(&secret_env)
-                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
-                    let agent_id = settings_str(&entry.settings, "agent_id", "");
-                    let verification_token =
-                        settings_str(&entry.settings, "verification_token", "");
-                    let encoding_aes_key = settings_str(&entry.settings, "encoding_aes_key", "");
-                    let webhook_port: u16 = entry
-                        .settings
-                        .get("webhook_port")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(9322) as u16;
-                    channel_mgr.register(Arc::new(
-                        octos_bus::WeComChannel::new(
-                            &corp_id,
-                            &agent_id,
-                            &agent_secret,
-                            &verification_token,
-                            &encoding_aes_key,
-                            entry.allowed_senders.clone(),
-                            shutdown.clone(),
-                            media_dir.clone(),
-                        )
-                        .with_webhook_port(webhook_port),
-                    ));
-                }
-                #[cfg(feature = "api")]
-                "api" => {
-                    let port: u16 = self.api_port.unwrap_or_else(|| {
-                        entry
-                            .settings
-                            .get("port")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(8091) as u16
-                    });
-                    let auth_token = entry
-                        .settings
-                        .get("auth_token")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    channel_mgr.register(Arc::new(octos_bus::ApiChannel::new(
-                        port,
-                        auth_token,
-                        shutdown.clone(),
-                        session_mgr.clone(),
-                    )));
-                }
-                #[cfg(feature = "wecom-bot")]
-                "wecom-bot" => {
-                    let bot_id = settings_str(&entry.settings, "bot_id", "");
-                    let secret_env =
-                        settings_str(&entry.settings, "secret_env", "WECOM_BOT_SECRET");
-                    let secret = std::env::var(&secret_env)
-                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
-                    if bot_id.is_empty() {
-                        eyre::bail!("wecom-bot channel requires settings.bot_id");
-                    }
-                    channel_mgr.register(Arc::new(octos_bus::WeComBotChannel::new(
-                        &bot_id,
-                        &secret,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                    )));
-                }
+        {
+            let mut reg_ctx = adapters::ChannelRegistrationCtx {
+                shutdown: &shutdown,
+                media_dir: &media_dir,
+                data_dir: &data_dir,
+                session_mgr: &session_mgr,
+                api_port_override: self.api_port,
+                wechat_bridge_url: self.wechat_bridge_url.as_deref(),
                 #[cfg(feature = "matrix")]
-                "matrix" => {
-                    let settings = MatrixChannelSettings::from_entry(entry)?;
-                    let _ = register_matrix_channel(
-                        &mut channel_mgr,
-                        &mut matrix_channel,
-                        &settings,
-                        &shutdown,
-                        &data_dir,
-                    );
-                }
-                #[cfg(feature = "qq-bot")]
-                "qq-bot" => {
-                    let app_id = settings_str(&entry.settings, "app_id", "");
-                    let client_secret_env =
-                        settings_str(&entry.settings, "client_secret_env", "QQ_BOT_CLIENT_SECRET");
-                    let client_secret = std::env::var(&client_secret_env).wrap_err_with(|| {
-                        format!("{client_secret_env} environment variable not set")
-                    })?;
-                    if app_id.is_empty() {
-                        eyre::bail!("qq-bot channel requires settings.app_id");
-                    }
-                    channel_mgr.register(Arc::new(octos_bus::QQBotChannel::new(
-                        &app_id,
-                        &client_secret,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                    )));
-                }
-                #[cfg(feature = "wechat")]
-                "wechat" => {
-                    let default_url =
-                        settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
-                    let bridge_url = self.wechat_bridge_url.as_deref().unwrap_or(&default_url);
-                    channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
-                        &bridge_url,
-                        entry.allowed_senders.clone(),
-                        shutdown.clone(),
-                    )));
-                }
-                other => {
-                    println!(
-                        "{}: channel '{}' not supported, skipping",
-                        "Warning".yellow(),
-                        other
-                    );
-                }
-            }
+                matrix_channel: &mut matrix_channel,
+            };
+            adapters::register_all(&mut channel_mgr, &gw_config.channels, &mut reg_ctx)?;
         }
 
         // Determine default channel and chat_id for cron delivery fallback
