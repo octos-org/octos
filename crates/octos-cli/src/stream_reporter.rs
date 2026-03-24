@@ -79,6 +79,7 @@ const EDIT_THROTTLE: Duration = Duration::from_millis(1000);
 
 /// Strip `<think>...</think>` blocks from streaming buffer.
 /// Handles partial tags (open `<think>` not yet closed) by hiding from that point.
+/// Collapses runs of 3+ newlines left behind to avoid blank gaps.
 fn strip_think_from_buffer(buf: &str) -> String {
     let mut result = String::new();
     let mut rest = buf;
@@ -90,10 +91,17 @@ fn strip_think_from_buffer(buf: &str) -> String {
             rest = &after[end + "</think>".len()..];
         } else {
             // Unclosed <think> — hide everything from here (still streaming)
+            while result.contains("\n\n\n") {
+                result = result.replace("\n\n\n", "\n\n");
+            }
             return result.trim_end().to_string();
         }
     }
     result.push_str(rest);
+    // Collapse runs of 3+ newlines left behind after stripping
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
     result
 }
 
@@ -247,15 +255,18 @@ pub async fn run_stream_forwarder(
                     && is_session_active(&session_key, &active_sessions).await
                 {
                     buffer.push_str(&format!("\n\n⚙ `{name}`..."));
-                    flush_to_channel(
-                        &channel,
-                        &chat_id,
-                        &buffer,
-                        &mut message_id,
-                        &mut no_edit_support,
-                        sender_user_id.as_deref(),
-                    )
-                    .await;
+                    let visible = strip_think_from_buffer(&buffer);
+                    if !visible.is_empty() {
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &visible,
+                            &mut message_id,
+                            &mut no_edit_support,
+                            sender_user_id.as_deref(),
+                        )
+                        .await;
+                    }
                     last_edit = Instant::now();
                 }
             }
@@ -270,15 +281,18 @@ pub async fn run_stream_forwarder(
                         buffer = buffer.replace(&pending, &completed);
                     }
                     if is_session_active(&session_key, &active_sessions).await {
-                        flush_to_channel(
-                            &channel,
-                            &chat_id,
-                            &buffer,
-                            &mut message_id,
-                            &mut no_edit_support,
-                            sender_user_id.as_deref(),
-                        )
-                        .await;
+                        let visible = strip_think_from_buffer(&buffer);
+                        if !visible.is_empty() {
+                            flush_to_channel(
+                                &channel,
+                                &chat_id,
+                                &visible,
+                                &mut message_id,
+                                &mut no_edit_support,
+                                sender_user_id.as_deref(),
+                            )
+                            .await;
+                        }
                         last_edit = Instant::now();
                     }
                 }
@@ -301,15 +315,18 @@ pub async fn run_stream_forwarder(
                     if last_edit.elapsed() >= EDIT_THROTTLE
                         && is_session_active(&session_key, &active_sessions).await
                     {
-                        flush_to_channel(
-                            &channel,
-                            &chat_id,
-                            &buffer,
-                            &mut message_id,
-                            &mut no_edit_support,
-                            sender_user_id.as_deref(),
-                        )
-                        .await;
+                        let visible = strip_think_from_buffer(&buffer);
+                        if !visible.is_empty() {
+                            flush_to_channel(
+                                &channel,
+                                &chat_id,
+                                &visible,
+                                &mut message_id,
+                                &mut no_edit_support,
+                                sender_user_id.as_deref(),
+                            )
+                            .await;
+                        }
                         last_edit = Instant::now();
                     }
                 }
@@ -355,15 +372,18 @@ pub async fn run_stream_forwarder(
                 if !buffer.is_empty() {
                     buffer.push_str(&format!("\n📄 Saved `{filename}`"));
                     if is_session_active(&session_key, &active_sessions).await {
-                        flush_to_channel(
-                            &channel,
-                            &chat_id,
-                            &buffer,
-                            &mut message_id,
-                            &mut no_edit_support,
-                            sender_user_id.as_deref(),
-                        )
-                        .await;
+                        let visible = strip_think_from_buffer(&buffer);
+                        if !visible.is_empty() {
+                            flush_to_channel(
+                                &channel,
+                                &chat_id,
+                                &visible,
+                                &mut message_id,
+                                &mut no_edit_support,
+                                sender_user_id.as_deref(),
+                            )
+                            .await;
+                        }
                         last_edit = Instant::now();
                     }
                 }

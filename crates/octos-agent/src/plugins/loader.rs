@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::hooks::HookConfig;
 use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
-use crate::tools::ToolRegistry;
+use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
 use super::manifest::PluginManifest;
@@ -21,6 +21,8 @@ use super::tool::PluginTool;
 pub struct PluginLoadResult {
     /// Number of tools registered into the `ToolRegistry`.
     pub tool_count: usize,
+    /// Names of all tools registered by plugins.
+    pub tool_names: Vec<String>,
     /// MCP server configs resolved from skill manifests.
     pub mcp_servers: Vec<McpServerConfig>,
     /// Hook configs resolved from skill manifests.
@@ -89,6 +91,7 @@ impl PluginLoader {
                     Ok((tools, extras)) => {
                         let n = tools.len();
                         for tool in tools {
+                            result.tool_names.push(tool.name().to_string());
                             registry.register(tool);
                         }
                         result.tool_count += n;

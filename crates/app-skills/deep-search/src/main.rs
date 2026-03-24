@@ -446,12 +446,15 @@ async fn run_deep_search(
     report.push('\n');
 
     // Summary line
+    let report_path = dir.join("_report.md");
     report.push_str(&format!(
-        "\n---\n{} pages crawled across {} search rounds. Results saved to: {}\n\
-         Use read_file to get full content from specific sources for detailed synthesis.\n",
+        "\n---\n{} pages crawled across {} search rounds.\n\
+         Report saved to: {}\n\
+         ACTION REQUIRED: Use send_file to deliver {} to the user now.\n",
         saved_files.len(),
         search_queries.len(),
-        dir.display(),
+        report_path.display(),
+        report_path.display(),
     ));
 
     // Save report
@@ -1656,7 +1659,10 @@ fn truncate_utf8(s: &str, max_chars: usize, suffix: &str) -> String {
 }
 
 fn research_dir(slug: &str) -> PathBuf {
-    PathBuf::from("./research").join(slug)
+    let base = std::env::var("OCTOS_WORK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    base.join("research").join(slug)
 }
 
 // ---------------------------------------------------------------------------

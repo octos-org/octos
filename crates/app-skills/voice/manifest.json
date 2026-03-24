@@ -44,7 +44,7 @@
           },
           "speaker": {
             "type": "string",
-            "description": "Voice preset: 'vivian' (default), 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee'. Ignored when reference_audio is provided."
+            "description": "Voice name: preset ('vivian', 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee') or a custom cloned voice name (e.g. 'yangmi', 'douwentao'). Custom names auto-resolve to saved voice profiles. Default: 'vivian'. Ignored when reference_audio is provided."
           },
           "reference_audio": {
             "type": "string",

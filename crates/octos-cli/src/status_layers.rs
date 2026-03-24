@@ -165,6 +165,9 @@ pub struct UserStatusConfig {
     /// Transient duration for greeting layer in seconds.
     #[serde(default = "default_greeting_duration")]
     pub greeting_duration_secs: u64,
+    /// Whether to show model thinking/reasoning content in responses.
+    #[serde(default)]
+    pub show_thinking: bool,
 }
 
 fn default_true() -> bool {
@@ -185,6 +188,7 @@ impl Default for UserStatusConfig {
             locale: None,
             custom_layers: Vec::new(),
             greeting_duration_secs: 5,
+            show_thinking: false,
         }
     }
 }
@@ -1087,6 +1091,7 @@ mod tests {
                 content: "😊 Feeling good".to_string(),
             }],
             greeting_duration_secs: 10,
+            show_thinking: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

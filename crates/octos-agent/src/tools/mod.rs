@@ -112,6 +112,11 @@ impl ToolLifecycle {
         self.base_tools = names.into_iter().map(|n| n.into()).collect();
     }
 
+    /// Add more tools to the base set (extends, does not replace).
+    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
+        self.base_tools.extend(names.into_iter().map(|n| n.into()));
+    }
+
     /// Record that a tool was used at the current iteration.
     pub fn record_usage(&mut self, name: &str) {
         self.last_used.insert(name.to_string(), self.iteration);
@@ -424,6 +429,14 @@ impl ToolRegistry {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .set_base_tools(names);
+    }
+
+    /// Add more tool names to the base set (extends, does not replace).
+    pub fn add_base_tools(&mut self, names: impl IntoIterator<Item = impl Into<String>>) {
+        self.lifecycle
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_base_tools(names);
     }
 
     /// Record that a tool was used (called from execute()).
