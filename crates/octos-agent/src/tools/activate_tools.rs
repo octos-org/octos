@@ -1,6 +1,6 @@
 //! Meta-tool for two-tier tool dispatch: activates deferred tool groups on demand.
 
-use std::sync::{OnceLock, Weak};
+use std::sync::Weak;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -12,7 +12,7 @@ use super::{Tool, ToolRegistry, ToolResult};
 /// On first call (or with no arguments), lists available groups.
 /// When called with a group name, activates those tools for subsequent iterations.
 pub struct ActivateToolsTool {
-    registry: OnceLock<Weak<ToolRegistry>>,
+    registry: std::sync::Mutex<Option<Weak<ToolRegistry>>>,
 }
 
 impl Default for ActivateToolsTool {
@@ -24,13 +24,13 @@ impl Default for ActivateToolsTool {
 impl ActivateToolsTool {
     pub fn new() -> Self {
         Self {
-            registry: OnceLock::new(),
+            registry: std::sync::Mutex::new(None),
         }
     }
 
     /// Set the registry back-reference after Arc wrapping.
     pub fn set_registry(&self, weak: Weak<ToolRegistry>) {
-        let _ = self.registry.set(weak);
+        *self.registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(weak);
     }
 }
 
@@ -69,10 +69,11 @@ impl Tool for ActivateToolsTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let registry = self
             .registry
-            .get()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
             .and_then(|w| w.upgrade())
             .ok_or_else(|| eyre::eyre!("tool registry not available"))?;
-
         // Accept either "tools" array or legacy "group" string
         let tool_names: Vec<String> = args
             .get("tools")
