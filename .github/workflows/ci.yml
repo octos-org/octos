@@ -61,6 +61,78 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: activate_tools regression tests
+        run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+  e2e-tool-regression:
+    runs-on: macos-14
+    needs: check
+    # Run on pushes to main or when tool/sandbox/agent files change
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.title, 'tool') ||
+      contains(github.event.pull_request.title, 'sandbox') ||
+      contains(github.event.pull_request.title, 'activate')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check for relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          else
+            FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD 2>/dev/null || echo "")
+          fi
+          if echo "$FILES" | grep -qE '(activate_tools|sandbox|shell\.rs|tools/mod|session_actor|exec_env)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build octos with all features
+        if: steps.changes.outputs.run == 'true'
+        run: cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
+
+      - name: Install Homebrew ffmpeg (macOS)
+        if: steps.changes.outputs.run == 'true'
+        run: brew install ffmpeg
+
+      - name: Start octos serve
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
+          # Wait for server to be ready
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install e2e deps
+        if: steps.changes.outputs.run == 'true'
+        working-directory: e2e
+        run: npm install
+
+      - name: Run e2e tool regression tests
+        if: steps.changes.outputs.run == 'true'
+        working-directory: e2e
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line
+
+      - name: Stop octos serve
+        if: always()
+        run: pkill -f "octos serve" || true
+
   security:
     runs-on: macos-14
     needs: check

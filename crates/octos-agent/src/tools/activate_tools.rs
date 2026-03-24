@@ -28,7 +28,7 @@ impl ActivateToolsTool {
         }
     }
 
-    /// Set the registry back-reference after Arc wrapping.
+    /// Set (or replace) the registry back-reference after Arc wrapping.
     pub fn set_registry(&self, weak: Weak<ToolRegistry>) {
         *self.registry.lock().unwrap_or_else(|e| e.into_inner()) = Some(weak);
     }
