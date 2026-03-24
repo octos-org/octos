@@ -157,28 +157,30 @@ sudo mkdir -p "$STATIC_ROOT"
 # ── Write Caddyfile ───────────────────────────────────────────────────
 sudo mkdir -p /etc/caddy
 
+ESCAPED_DOMAIN="${TUNNEL_DOMAIN//./\\.}"
+
 if [ "$ENABLE_HTTPS" = true ]; then
-    sudo tee /etc/caddy/Caddyfile > /dev/null << EOF
+    sudo tee /etc/caddy/Caddyfile > /dev/null << 'CADDYEOF'
 # Caddyfile — managed by setup-caddy.sh
-# HTTPS with wildcard cert via ${DNS_PROVIDER} DNS challenge.
+# HTTPS with wildcard cert via __DNS_PROVIDER__ DNS challenge.
 
 # Main site: landing page + API fallback
-www.${TUNNEL_DOMAIN}, ${TUNNEL_DOMAIN} {
+www.__DOMAIN__, __DOMAIN__ {
     handle / {
-        root * ${STATIC_ROOT}
+        root * __STATIC_ROOT__
         file_server
     }
     handle {
-        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+        reverse_proxy localhost:__VHOST_PORT__
     }
 }
 
 # Tenant subdomains: HTTPS with wildcard cert
-*.${TUNNEL_DOMAIN} {
+*.__DOMAIN__ {
     tls {
-        ${DNS_CONFIG_BLOCK}
+        __DNS_CONFIG_BLOCK__
     }
-    reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT} {
+    reverse_proxy localhost:__VHOST_PORT__ {
         header_up Host {host}
     }
 }
@@ -186,49 +188,59 @@ www.${TUNNEL_DOMAIN}, ${TUNNEL_DOMAIN} {
 # HTTP fallback: redirect tenants to HTTPS, proxy others to frps
 :80 {
     @tenant {
-        not header_regexp Host ^(www\.)?${TUNNEL_DOMAIN//./\\.}\$
+        not header_regexp Host ^(www\.)?__ESCAPED_DOMAIN__$
         not header_regexp Host ^[0-9]
     }
     handle @tenant {
         redir https://{host}{uri} permanent
     }
     handle {
-        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+        reverse_proxy localhost:__VHOST_PORT__
     }
 }
-EOF
+CADDYEOF
 else
-    sudo tee /etc/caddy/Caddyfile > /dev/null << EOF
+    sudo tee /etc/caddy/Caddyfile > /dev/null << 'CADDYEOF'
 # Caddyfile — managed by setup-caddy.sh
 # HTTP-only mode. To enable HTTPS, re-run with:
 #   ./setup-caddy.sh --https --dns-provider cloudflare
 
-www.${TUNNEL_DOMAIN}, ${TUNNEL_DOMAIN} {
+www.__DOMAIN__, __DOMAIN__ {
     handle / {
-        root * ${STATIC_ROOT}
+        root * __STATIC_ROOT__
         file_server
     }
     handle {
-        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+        reverse_proxy localhost:__VHOST_PORT__
     }
 }
 
 :80 {
     @tenant {
-        not header_regexp Host ^(www\.)?${TUNNEL_DOMAIN//./\\.}\$
+        not header_regexp Host ^(www\.)?__ESCAPED_DOMAIN__$
         not header_regexp Host ^[0-9]
     }
     handle @tenant {
-        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT} {
+        reverse_proxy localhost:__VHOST_PORT__ {
             header_up Host {host}
         }
     }
     handle {
-        reverse_proxy localhost:${FRPS_VHOST_HTTP_PORT}
+        reverse_proxy localhost:__VHOST_PORT__
     }
 }
-EOF
+CADDYEOF
 fi
+
+# Substitute shell variables into the Caddyfile (Caddy placeholders like {host} are preserved)
+sudo sed -i \
+    -e "s|__DOMAIN__|${TUNNEL_DOMAIN}|g" \
+    -e "s|__ESCAPED_DOMAIN__|${ESCAPED_DOMAIN}|g" \
+    -e "s|__VHOST_PORT__|${FRPS_VHOST_HTTP_PORT}|g" \
+    -e "s|__STATIC_ROOT__|${STATIC_ROOT}|g" \
+    -e "s|__DNS_PROVIDER__|${DNS_PROVIDER}|g" \
+    -e "s|__DNS_CONFIG_BLOCK__|${DNS_CONFIG_BLOCK}|g" \
+    /etc/caddy/Caddyfile
 
 echo "    Wrote Caddyfile to /etc/caddy/Caddyfile"
 
