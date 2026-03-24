@@ -2357,6 +2357,10 @@ impl GatewayCommand {
                             .await
                             .switch_to(&base_key_str, name)
                             .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
+
+                        // Ensure the session file exists on disk so /sessions can list it.
+                        session_mgr.lock().await.touch_user_session(&base_key_str, name);
+
                         let _ = agent_handle
                             .send_outbound(make_reply(
                                 &reply_channel,

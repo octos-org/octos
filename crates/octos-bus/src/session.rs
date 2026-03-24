@@ -614,6 +614,52 @@ impl SessionManager {
 
         removed
     }
+
+    /// Ensure a session file exists in the per-user layout so that
+    /// `list_user_sessions` can discover it.  Creates an empty JSONL
+    /// (metadata-only) if the file does not already exist.
+    ///
+    /// `base_key` must match the value passed to `list_user_sessions`
+    /// (e.g. `"_main:telegram:8516089817"` or `"telegram:8516089817"`).
+    pub fn touch_user_session(&self, base_key: &str, topic: &str) {
+        let encoded_base = encode_path_component(base_key);
+        let user_sessions_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+        let _ = std::fs::create_dir_all(&user_sessions_dir);
+
+        let effective_topic = if topic.is_empty() { "default" } else { topic };
+        let encoded_topic = encode_path_component(effective_topic);
+        let path = user_sessions_dir.join(format!("{encoded_topic}.jsonl"));
+
+        if !path.exists() {
+            let session_key_str = if topic.is_empty() {
+                base_key.to_string()
+            } else {
+                format!("{base_key}#{topic}")
+            };
+            let meta = SessionMeta {
+                schema_version: CURRENT_SESSION_SCHEMA,
+                session_key: session_key_str,
+                parent_key: None,
+                topic: if topic.is_empty() {
+                    None
+                } else {
+                    Some(topic.to_string())
+                },
+                summary: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            if let Ok(json) = serde_json::to_string(&meta) {
+                let _ = std::fs::write(&path, format!("{json}\n"));
+            }
+        }
+    }
 }
 
 // ── SessionHandle ──────────────────────────────────────────────────────────
