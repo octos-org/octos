@@ -279,13 +279,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable caddy
 sudo systemctl restart caddy
 
-# ── Validate Caddyfile ────────────────────────────────────────────────
+# ── Verify Caddy is running ──────────────────────────────────────────
 echo ""
-echo "==> Validating Caddyfile..."
-if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
-    echo "    Caddyfile is valid"
+echo "==> Verifying Caddy..."
+sleep 2
+if systemctl is-active --quiet caddy; then
+    echo "    Caddy is running"
 else
-    echo "    WARNING: Caddyfile validation failed. Check /etc/caddy/Caddyfile"
+    echo "    WARNING: Caddy failed to start. Check logs:"
+    echo "    sudo journalctl -u caddy --no-pager -n 20"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────
