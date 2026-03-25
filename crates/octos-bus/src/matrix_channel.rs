@@ -36,6 +36,7 @@ const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
 const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
+const LIVE_MARKER: &str = "org.matrix.msc4357.live";
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
@@ -1592,61 +1593,16 @@ impl Channel for MatrixChannel {
     }
 
     async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
-        // Use the same sender identity that sent the original message.
-        let sender = self
-            .event_senders
-            .read()
-            .await
-            .iter()
-            .rev()
-            .find(|(event_id, _)| event_id == message_id)
-            .map(|(_, sender)| sender.clone())
-            .unwrap_or_else(|| self.bot_user_id.clone());
+        self.send_replace_event(chat_id, message_id, new_content, true).await
+    }
 
-        let txn_id = uuid::Uuid::now_v7().to_string();
-        let url = self.make_api_url(&format!(
-            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
-            percent_encode_path(chat_id),
-            percent_encode_path(&txn_id),
-            percent_encode_path(&sender),
-        ));
-
-        let formatted_body = markdown_to_matrix_html(new_content);
-        let body = json!({
-            "msgtype": MSGTYPE_TEXT,
-            "body": format!("* {new_content}"),
-            "format": HTML_FORMAT,
-            "formatted_body": formatted_body,
-            "m.new_content": {
-                "msgtype": MSGTYPE_TEXT,
-                "body": new_content,
-                "format": HTML_FORMAT,
-                "formatted_body": formatted_body,
-            },
-            "m.relates_to": {
-                "rel_type": REL_TYPE_REPLACE,
-                "event_id": message_id,
-            }
-        });
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&self.as_token)
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("failed to send edit event to Matrix")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let resp_body = resp.text().await.unwrap_or_default();
-            return Err(eyre::eyre!(
-                "Matrix edit_message failed: status={status} body={resp_body}"
-            ));
-        }
-
-        Ok(())
+    async fn finish_stream(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+    ) -> Result<()> {
+        self.send_replace_event(chat_id, message_id, final_content, false).await
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
@@ -1774,6 +1730,75 @@ impl MatrixChannel {
             .to_string();
 
         Ok(event_id)
+    }
+
+    /// Send `m.replace`. When `live`, includes MSC4357 marker for streaming.
+    async fn send_replace_event(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        live: bool,
+    ) -> Result<()> {
+        let sender = self
+            .event_senders
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|(event_id, _)| event_id == message_id)
+            .map(|(_, sender)| sender.clone())
+            .unwrap_or_else(|| self.bot_user_id.clone());
+
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let url = self.make_api_url(&format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
+            percent_encode_path(chat_id),
+            percent_encode_path(&txn_id),
+            percent_encode_path(&sender),
+        ));
+
+        let formatted_body = markdown_to_matrix_html(new_content);
+        let mut body = json!({
+            "msgtype": MSGTYPE_TEXT,
+            "body": format!("* {new_content}"),
+            "format": HTML_FORMAT,
+            "formatted_body": formatted_body,
+            "m.new_content": {
+                "msgtype": MSGTYPE_TEXT,
+                "body": new_content,
+                "format": HTML_FORMAT,
+                "formatted_body": formatted_body,
+            },
+            "m.relates_to": {
+                "rel_type": REL_TYPE_REPLACE,
+                "event_id": message_id,
+            }
+        });
+
+        if live {
+            body[LIVE_MARKER] = json!({});
+            body["m.new_content"][LIVE_MARKER] = json!({});
+        }
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send edit event to Matrix")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(eyre::eyre!(
+                "Matrix replace event failed: status={status} body={resp_body}"
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -2885,6 +2910,67 @@ mod tests {
         assert_eq!(edit_req.body["m.relates_to"]["rel_type"], REL_TYPE_REPLACE);
         assert_eq!(edit_req.body["m.relates_to"]["event_id"], "$event1");
         assert!(edit_req.body["formatted_body"].is_string());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_edit_includes_live_marker() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        ch.edit_message("!room:localhost", "$ev1", "streaming...")
+            .await
+            .unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(req.body[LIVE_MARKER], json!({}));
+        assert_eq!(req.body["m.new_content"][LIVE_MARKER], json!({}));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_finish_stream_omits_live() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        ch.finish_stream("!room:localhost", "$ev1", "final content")
+            .await
+            .unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert!(req.body.get(LIVE_MARKER).is_none());
+        assert!(req.body["m.new_content"].get(LIVE_MARKER).is_none());
+        assert_eq!(req.body["m.new_content"]["body"], "final content");
 
         handle.abort();
     }
