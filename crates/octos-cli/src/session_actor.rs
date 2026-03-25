@@ -505,8 +505,6 @@ impl ActorFactory {
 
         // Per-session tools — they write to proxy_tx, not the real out_tx
         let message_tool = MessageTool::with_context(proxy_tx.clone(), channel, chat_id);
-        let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
-            .with_base_dir(&self.data_dir);
 
         // Build per-user workspace directory for file isolation.
         // Each user's tools are restricted to their own workspace via
@@ -524,6 +522,13 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+
+        // send_file resolves relative paths against user_workspace (same as
+        // write_file/read_file) so the LLM can write+send in one flow.
+        // data_dir is an extra allowed directory for pipeline-generated files.
+        let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
+            .with_base_dir(&user_workspace)
+            .with_extra_allowed_dir(&self.data_dir);
 
         // Create tool registry with cwd-bound tools pointing to the per-user workspace.
         // A fresh sandbox is created per user so the SBPL profile restricts writes
@@ -903,7 +908,28 @@ impl SessionActor {
                             }
                         }
                         Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            self.inject_background_result(&task_label, &content).await;
+                            // Don't notify — the rewrite LLM turn below will
+                            // produce a clean message for the user.
+                            self.inject_background_result(&task_label, &content, false).await;
+                            // Trigger an LLM turn to rewrite the raw report into
+                            // a clean, user-facing format instead of dumping raw output.
+                            let rewrite_msg = octos_core::InboundMessage {
+                                channel: self.channel.clone(),
+                                sender_id: "system".to_string(),
+                                chat_id: self.chat_id.clone(),
+                                content: format!(
+                                    "[REWRITE] The background task \"{task_label}\" has completed. \
+                                     Rewrite the raw report above into a clean, well-structured, \
+                                     readable message for the user. Keep all key findings, data, \
+                                     and citations. Use proper Markdown formatting. \
+                                     Match the language of the original research request."
+                                ),
+                                timestamp: chrono::Utc::now(),
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                                message_id: None,
+                            };
+                            self.process_inbound(rewrite_msg, vec![]).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -1443,7 +1469,7 @@ impl SessionActor {
                             task_label,
                             content,
                         }) => {
-                            self.inject_background_result(&task_label, &content).await;
+                            self.inject_background_result(&task_label, &content, true).await;
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1483,7 +1509,7 @@ impl SessionActor {
                             task_label,
                             content,
                         }) => {
-                            self.inject_background_result(&task_label, &content).await;
+                            self.inject_background_result(&task_label, &content, true).await;
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1502,7 +1528,12 @@ impl SessionActor {
     /// For long results (>1000 chars), the full content is saved to the memory
     /// bank and only a summary is injected into session context.  The agent can
     /// retrieve the full report via `recall_memory("<slug>")`.
-    async fn inject_background_result(&self, task_label: &str, content: &str) {
+    /// Inject a background task result into the conversation context.
+    ///
+    /// When `notify` is true, sends a preview notification directly to the user.
+    /// When false, the caller is responsible for triggering an LLM rewrite turn
+    /// that will produce a clean user-facing message.
+    async fn inject_background_result(&self, task_label: &str, content: &str, notify: bool) {
         const SUMMARY_THRESHOLD: usize = 1000;
         const SUMMARY_CHARS: usize = 800;
 
@@ -1564,18 +1595,21 @@ impl SessionActor {
             }
         }
 
-        // Notify user with preview
-        let _ = self
-            .out_tx
-            .send(OutboundMessage {
-                channel: self.channel.clone(),
-                chat_id: self.chat_id.clone(),
-                content: notification,
-                reply_to: None,
-                media: vec![],
-                metadata: serde_json::json!({}),
-            })
-            .await;
+        if notify {
+            // Send raw preview directly (used when agent is busy and will see
+            // the injected context on its next turn).
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: notification,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                })
+                .await;
+        }
     }
 
     /// Copy media files from their original location (e.g. profile media_dir)
@@ -1742,6 +1776,7 @@ impl SessionActor {
             if channel.supports_edit() {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
                 Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
                     stream_rx,
                     channel,
@@ -1751,6 +1786,7 @@ impl SessionActor {
                     Arc::clone(&self.active_sessions),
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
+                    op_updater,
                 )))
             } else {
                 drop(stream_rx);
@@ -1861,7 +1897,7 @@ impl SessionActor {
                             overflow_served = true;
                         }
                         Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            self.inject_background_result(&task_label, &content).await;
+                            self.inject_background_result(&task_label, &content, true).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -2282,6 +2318,7 @@ impl SessionActor {
                 let fwd_channel = Arc::clone(si.channel());
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
                 Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
                     stream_rx,
                     fwd_channel,
@@ -2291,6 +2328,7 @@ impl SessionActor {
                     active_sessions.clone(),
                     session_key.clone(),
                     sender_user_id.clone(),
+                    op_updater,
                 )))
             } else {
                 drop(stream_rx);
@@ -2501,6 +2539,7 @@ impl SessionActor {
             if channel.supports_edit() {
                 let cancel_status = status_handle.as_ref().map(|h| Arc::clone(&h.cancelled));
                 let status_msg_id = status_handle.as_ref().map(|h| Arc::clone(&h.status_msg_id));
+                let op_updater = status_handle.as_ref().map(|h| h.operation_updater());
                 Some(tokio::spawn(crate::stream_reporter::run_stream_forwarder(
                     stream_rx,
                     channel,
@@ -2510,6 +2549,7 @@ impl SessionActor {
                     Arc::clone(&self.active_sessions),
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
+                    op_updater,
                 )))
             } else {
                 drop(stream_rx);

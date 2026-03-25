@@ -15,9 +15,13 @@ pub struct SendFileTool {
     out_tx: mpsc::Sender<OutboundMessage>,
     default_channel: std::sync::Mutex<String>,
     default_chat_id: std::sync::Mutex<String>,
-    /// Base directory for path validation. If set, file paths must resolve
-    /// under this directory (prevents exfiltrating files from other profiles).
+    /// Base directory for path resolution and validation. Relative paths are
+    /// resolved against this directory. File paths must resolve under this
+    /// directory (prevents exfiltrating files from other profiles).
     base_dir: Option<PathBuf>,
+    /// Additional allowed directories beyond base_dir (e.g. data_dir for
+    /// pipeline-generated files). Absolute paths under these dirs are accepted.
+    extra_allowed_dirs: Vec<PathBuf>,
 }
 
 impl SendFileTool {
@@ -27,6 +31,7 @@ impl SendFileTool {
             default_channel: std::sync::Mutex::new(String::new()),
             default_chat_id: std::sync::Mutex::new(String::new()),
             base_dir: None,
+            extra_allowed_dirs: Vec::new(),
         }
     }
 
@@ -41,12 +46,19 @@ impl SendFileTool {
             default_channel: std::sync::Mutex::new(channel.into()),
             default_chat_id: std::sync::Mutex::new(chat_id.into()),
             base_dir: None,
+            extra_allowed_dirs: Vec::new(),
         }
     }
 
-    /// Set the base directory for file path validation.
+    /// Set the base directory for file path resolution and validation.
     pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.base_dir = Some(dir.into());
+        self
+    }
+
+    /// Add an extra allowed directory (e.g. data_dir for pipeline-generated files).
+    pub fn with_extra_allowed_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.extra_allowed_dirs.push(dir.into());
         self
     }
 
@@ -140,11 +152,19 @@ impl Tool for SendFileTool {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+            let extra_canonical: Vec<PathBuf> = self
+                .extra_allowed_dirs
+                .iter()
+                .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
+                .collect();
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
-                    if !canonical_path.starts_with(&canonical_base)
-                        && !canonical_path.starts_with(&tmp_dir)
-                    {
+                    let allowed = canonical_path.starts_with(&canonical_base)
+                        || canonical_path.starts_with(&tmp_dir)
+                        || extra_canonical
+                            .iter()
+                            .any(|d| canonical_path.starts_with(d));
+                    if !allowed {
                         return Ok(ToolResult {
                             output: format!(
                                 "Error: File path is outside the allowed directory: {}",

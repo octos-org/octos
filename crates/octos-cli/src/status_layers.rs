@@ -438,6 +438,19 @@ impl ComposerHandle {
         }
     }
 
+    /// Return a cheaply-cloneable callback that updates the operation layer.
+    /// Used by the stream forwarder to show tool names during execution.
+    pub fn operation_updater(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let layers = Arc::clone(&self.layers);
+        let notify = Arc::clone(&self.notify);
+        Arc::new(move |text: &str| {
+            if let Some(layer) = find_layer(&layers, layer_id::OPERATION) {
+                layer.set(Some(format!("✦ {text}...")));
+                notify.notify_one();
+            }
+        })
+    }
+
     /// Update the provider layer.
     pub fn set_provider(&self, provider: &str, model: &str) {
         if let Some(layer) = find_layer(&self.layers, layer_id::PROVIDER) {

@@ -151,6 +151,7 @@ pub async fn run_stream_forwarder(
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
     session_key: SessionKey,
     sender_user_id: Option<String>,
+    operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -249,6 +250,10 @@ pub async fn run_stream_forwarder(
                 }
             }
             StreamProgressEvent::ToolStarted { name } => {
+                // Update status bar operation layer with tool name
+                if let Some(ref updater) = operation_updater {
+                    updater(&format!("Running {name}"));
+                }
                 // Flush text before tool status
                 if !no_edit_support
                     && !buffer.is_empty()
