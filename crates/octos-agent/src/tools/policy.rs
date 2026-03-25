@@ -135,7 +135,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:admin",
         description: "Skill management, tool configuration, and model switching",
-        tools: &["manage_skills", "configure_tool", "model_management"],
+        tools: &["manage_skills", "configure_tool", "model_check"],
     },
 ];
 

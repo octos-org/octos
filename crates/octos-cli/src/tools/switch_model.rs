@@ -60,11 +60,11 @@ struct Input {
 #[async_trait]
 impl Tool for SwitchModelTool {
     fn name(&self) -> &str {
-        "model_management"
+        "model_check"
     }
 
     fn description(&self) -> &str {
-        "Manage LLM models. ALWAYS call this tool with action='list' when the user asks \
+        "Check and switch LLM models. ALWAYS call this tool with action='list' when the user asks \
          what models are available — never guess from general knowledge. \
          Use action='list' to show the current model, configured fallbacks, and all \
          available providers with API key status. \
@@ -297,7 +297,7 @@ impl SwitchModelTool {
             old_model = %old_model,
             new_provider = %provider_name,
             new_model = %model_name,
-            "model switched via model_management tool"
+            "model switched via model_check tool"
         );
 
         // Persist to profile JSON if available
