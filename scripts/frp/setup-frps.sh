@@ -52,17 +52,18 @@ if [ -f "${INSTALL_DIR}/frps" ]; then
     fi
 fi
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+FRP_TMPDIR=$(mktemp -d /tmp/frps-install.XXXXXX)
+trap 'rm -rf "$FRP_TMPDIR"' EXIT
 
 TARBALL="frp_${FRPS_VERSION}_${OS}_${FRP_ARCH}.tar.gz"
 URL="https://github.com/fatedier/frp/releases/download/v${FRPS_VERSION}/${TARBALL}"
 
 echo "    Downloading ${URL}"
-curl -fsSL -o "${TMPDIR}/${TARBALL}" "$URL"
-tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
+curl -fsSL -o "${FRP_TMPDIR}/${TARBALL}" "$URL"
+tar -xzf "${FRP_TMPDIR}/${TARBALL}" -C "$FRP_TMPDIR"
 
-sudo install -m 0755 "${TMPDIR}/frp_${FRPS_VERSION}_${OS}_${FRP_ARCH}/frps" "${INSTALL_DIR}/frps"
+sudo cp "${FRP_TMPDIR}/frp_${FRPS_VERSION}_${OS}_${FRP_ARCH}/frps" "${INSTALL_DIR}/frps"
+sudo chmod 0755 "${INSTALL_DIR}/frps"
 echo "    Installed frps to ${INSTALL_DIR}/frps"
 
 # ── Write configuration ───────────────────────────────────────────────

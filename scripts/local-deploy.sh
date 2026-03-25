@@ -11,6 +11,15 @@
 #   --uninstall        Remove binaries and service files
 #   --debug            Build in debug mode (faster, larger binary)
 #   --prefix DIR       Install prefix (default: ~/.cargo/bin)
+#
+# Tunnel options (auto-enabled with --full, set up frpc to connect to VPS relay):
+#   --no-tunnel              Skip frpc tunnel setup even in --full mode
+#   --tenant-name NAME       Tenant subdomain (e.g. "alice")
+#   --frps-token TOKEN       frps auth token
+#   --frps-server ADDR       frps server address (default: 163.192.33.32)
+#   --ssh-port PORT          SSH tunnel remote port (default: 6001)
+#   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
+#   --auth-token TOKEN       Dashboard auth token (default: auto-generated)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,20 +35,38 @@ PROFILE="release"
 PREFIX="${CARGO_HOME:-$HOME/.cargo}/bin"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 
-for arg in "$@"; do
-    case "$arg" in
-        --minimal)     MODE="minimal" ;;
-        --full)        MODE="full" ;;
-        --channels)    shift; CHANNELS="${1:-}" ;;
-        --no-skills)   BUILD_SKILLS=false ;;
-        --no-service)  SETUP_SERVICE=false ;;
-        --uninstall)   UNINSTALL=true ;;
-        --debug)       PROFILE="dev" ;;
-        --prefix)      shift; PREFIX="${1:-$PREFIX}" ;;
+# Tunnel defaults
+SKIP_TUNNEL=false
+TENANT_NAME=""
+FRPS_TOKEN=""
+FRPS_SERVER="163.192.33.32"
+SSH_PORT="6001"
+AUTH_TOKEN=""
+TUNNEL_DOMAIN="octos-cloud.org"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --minimal)       MODE="minimal"; shift ;;
+        --full)          MODE="full"; shift ;;
+        --channels)      CHANNELS="${2:-}"; shift 2 ;;
+        --no-skills)     BUILD_SKILLS=false; shift ;;
+        --no-service)    SETUP_SERVICE=false; shift ;;
+        --uninstall)     UNINSTALL=true; shift ;;
+        --debug)         PROFILE="dev"; shift ;;
+        --prefix)        PREFIX="${2:-$PREFIX}"; shift 2 ;;
+        --no-tunnel)     SKIP_TUNNEL=true; shift ;;
+        --tenant-name)   TENANT_NAME="$2"; shift 2 ;;
+        --frps-token)    FRPS_TOKEN="$2"; shift 2 ;;
+        --frps-server)   FRPS_SERVER="$2"; shift 2 ;;
+        --ssh-port)      SSH_PORT="$2"; shift 2 ;;
+        --auth-token)    AUTH_TOKEN="$2"; shift 2 ;;
+        --domain)        TUNNEL_DOMAIN="$2"; shift 2 ;;
         --help|-h)
-            sed -n '2,14s/^# //p' "$0"
+            sed -n '2,26s/^# //p' "$0"
             exit 0
             ;;
+        *)
+            echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -56,17 +83,21 @@ if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
     # Stop and remove service
+    echo "    (sudo is needed to remove the system service)"
     case "$OS" in
         Darwin)
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
+            # Also clean up legacy LaunchAgent if present
             launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
             rm -f ~/Library/LaunchAgents/io.octos.octos-serve.plist
             ok "launchd service removed"
             ;;
         Linux)
-            systemctl --user stop octos-serve.service 2>/dev/null || true
-            systemctl --user disable octos-serve.service 2>/dev/null || true
-            rm -f ~/.config/systemd/user/octos-serve.service
-            systemctl --user daemon-reload 2>/dev/null || true
+            sudo systemctl stop octos-serve.service 2>/dev/null || true
+            sudo systemctl disable octos-serve.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/octos-serve.service
+            sudo systemctl daemon-reload 2>/dev/null || true
             ok "systemd service removed"
             ;;
     esac
@@ -239,27 +270,53 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
 
     OCTOS_BIN="$PREFIX/octos"
 
+    # Generate auth token if not provided
+    if [ -z "$AUTH_TOKEN" ]; then
+        AUTH_TOKEN=$(openssl rand -hex 32)
+        echo "    Generated auth token: ${AUTH_TOKEN:0:8}..."
+        echo "    (save this — needed to access the dashboard)"
+    fi
+
+    PLIST_LABEL="io.octos.serve"
+
     case "$OS" in
         Darwin)
-            # launchd plist
-            PLIST_DIR="$HOME/Library/LaunchAgents"
-            PLIST_FILE="$PLIST_DIR/io.octos.octos-serve.plist"
-            mkdir -p "$PLIST_DIR"
+            # Clean up any legacy LaunchAgent before installing LaunchDaemon
+            for LEGACY_PLIST in \
+                "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
+                "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist"; do
+                if [ -f "$LEGACY_PLIST" ]; then
+                    launchctl unload "$LEGACY_PLIST" 2>/dev/null || true
+                    rm -f "$LEGACY_PLIST"
+                    ok "removed legacy plist: $(basename "$LEGACY_PLIST")"
+                fi
+            done
+            # launchd daemon (runs as root, survives logout)
+            PLIST_FILE="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
 
-            cat > "$PLIST_FILE" << EOF
+            # Write plist to temp file first, then sudo move it
+            PLIST_TMP=$(mktemp /tmp/io.octos.serve.plist.XXXXXX)
+            cat > "$PLIST_TMP" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.octos.octos-serve</string>
+    <string>${PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>$OCTOS_BIN</string>
         <string>serve</string>
         <string>--port</string>
         <string>8080</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--auth-token</string>
+        <string>$AUTH_TOKEN</string>
     </array>
+    <key>UserName</key>
+    <string>$(whoami)</string>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
@@ -272,25 +329,36 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
     <dict>
         <key>PATH</key>
         <string>$PREFIX:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>OCTOS_HOME</key>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>OCTOS_DATA_DIR</key>
         <string>$DATA_DIR</string>
+        <key>OCTOS_AUTH_TOKEN</key>
+        <string>$AUTH_TOKEN</string>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
 </dict>
 </plist>
 EOF
-            ok "launchd plist written to $PLIST_FILE"
-            echo "    To start:  launchctl load $PLIST_FILE"
-            echo "    To stop:   launchctl unload $PLIST_FILE"
-            echo "    Logs:      tail -f $DATA_DIR/serve.log"
+            echo "    (sudo is needed to install and start the system service)"
+            sudo launchctl unload "$PLIST_FILE" 2>/dev/null || true
+            sudo mv "$PLIST_TMP" "$PLIST_FILE"
+            sudo chown root:wheel "$PLIST_FILE"
+            sudo chmod 644 "$PLIST_FILE"
+            ok "LaunchDaemon plist written to $PLIST_FILE"
+
+            # Start service
+            sudo launchctl load "$PLIST_FILE"
+            ok "octos serve started via launchd"
             ;;
 
         Linux)
-            # systemd user unit
-            UNIT_DIR="$HOME/.config/systemd/user"
-            UNIT_FILE="$UNIT_DIR/octos-serve.service"
-            mkdir -p "$UNIT_DIR"
+            # systemd system unit (runs as current user, survives logout)
+            UNIT_FILE="/etc/systemd/system/octos-serve.service"
 
-            cat > "$UNIT_FILE" << EOF
+            UNIT_TMP=$(mktemp /tmp/octos-serve.service.XXXXXX)
+            cat > "$UNIT_TMP" << EOF
 [Unit]
 Description=octos serve (dashboard + gateway)
 After=network-online.target
@@ -298,28 +366,101 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$OCTOS_BIN serve --port 8080
+User=$(whoami)
+ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN
 Restart=on-failure
 RestartSec=5
-Environment=OCTOS_HOME=$DATA_DIR
+Environment=HOME=$HOME
+Environment=OCTOS_DATA_DIR=$DATA_DIR
+Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=$HOME
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
-            systemctl --user daemon-reload
-            ok "systemd unit written to $UNIT_FILE"
-            echo "    To start:  systemctl --user start octos-serve"
-            echo "    To enable: systemctl --user enable octos-serve"
-            echo "    To stop:   systemctl --user stop octos-serve"
-            echo "    Logs:      journalctl --user -u octos-serve -f"
+            echo "    (sudo is needed to install the system service)"
+            sudo mv "$UNIT_TMP" "$UNIT_FILE"
+            sudo systemctl daemon-reload
+            sudo systemctl enable octos-serve
+            sudo systemctl restart octos-serve
+            ok "octos serve started via systemd"
             ;;
     esac
+
+    # ── Verify octos is responding ────────────────────────────────────
+    section "Verifying octos serve"
+    RETRIES=10
+    while [ $RETRIES -gt 0 ]; do
+        if curl -sf --max-time 2 http://localhost:8080/admin/ > /dev/null 2>&1; then
+            ok "octos serve is running on http://localhost:8080"
+            break
+        fi
+        RETRIES=$((RETRIES - 1))
+        sleep 1
+    done
+    if [ $RETRIES -eq 0 ]; then
+        warn "octos serve did not respond within 10 seconds"
+        echo "    Check logs: tail -f $DATA_DIR/serve.log"
+    fi
 else
     if [ "$SETUP_SERVICE" = true ]; then
         echo ""
         echo "    Service setup skipped (no features enabled — use --full or --channels)"
     fi
+fi
+
+# ── Tunnel setup (optional) ───────────────────────────────────────────
+if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+    section "Tunnel setup — collecting configuration"
+
+    # ── Prompt for missing required inputs ────────────────────────────
+    if [ -z "$TENANT_NAME" ]; then
+        echo ""
+        echo "    Enter the tenant subdomain (e.g. 'alice' for alice.${TUNNEL_DOMAIN}):"
+        printf "    > "
+        read -r TENANT_NAME < /dev/tty
+        [ -z "$TENANT_NAME" ] && err "Tenant name is required for tunnel setup"
+    fi
+
+    if [ -z "$FRPS_TOKEN" ]; then
+        TOKEN_FILE="$HOME/home/orcl-vps/frps-token.txt"
+        if [ -f "$TOKEN_FILE" ]; then
+            FRPS_TOKEN=$(cat "$TOKEN_FILE")
+            echo "    frps token loaded from $TOKEN_FILE"
+        else
+            echo ""
+            echo "    Enter the frps auth token (shared secret from VPS setup):"
+            printf "    > "
+            read -r FRPS_TOKEN < /dev/tty
+            [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
+        fi
+    fi
+
+    # ── Show summary before proceeding ────────────────────────────────
+    section "Tunnel setup — summary"
+    echo ""
+    echo "    Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
+    echo "    frps server:  ${FRPS_SERVER}:7000"
+    echo "    frps token:   ${FRPS_TOKEN:0:8}..."
+    echo "    SSH port:     ${SSH_PORT}"
+    echo "    Local port:   8080"
+    echo ""
+    echo "    Press Enter to continue, or Ctrl+C to abort."
+    read -r < /dev/tty
+
+    # ── Run setup-frpc.sh locally ─────────────────────────────────────
+    section "Setting up frpc tunnel"
+
+    FRPC_ARGS=("$TENANT_NAME" "$FRPS_TOKEN")
+    FRPC_ARGS+=(--server "$FRPS_SERVER")
+    FRPC_ARGS+=(--domain "$TUNNEL_DOMAIN")
+    FRPC_ARGS+=(--local-port 8080)
+    FRPC_ARGS+=(--ssh-port "$SSH_PORT")
+
+    "$SCRIPT_DIR/frp/setup-frpc.sh" "${FRPC_ARGS[@]}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────
@@ -333,7 +474,26 @@ echo "  Next steps:"
 echo "    1. Set your API key:  export ANTHROPIC_API_KEY=sk-..."
 echo "    2. Start chatting:    octos chat"
 if [ -n "$CLI_FEATURES" ]; then
-    echo "    3. Start dashboard:   octos serve"
-    echo "    4. Open browser:      http://localhost:8080/admin/"
+    echo "    3. Open browser:      http://localhost:8080/admin/"
+    echo ""
+    echo "  Auth token:   $AUTH_TOKEN"
+    echo "  Logs:         tail -f $DATA_DIR/serve.log"
+    case "$OS" in
+        Darwin)
+            echo "  Status:       sudo launchctl print system/io.octos.serve"
+            echo "  Stop:         sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist"
+            echo "  Start:        sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist"
+            ;;
+        Linux)
+            echo "  Status:       sudo systemctl status octos-serve"
+            echo "  Stop:         sudo systemctl stop octos-serve"
+            echo "  Start:        sudo systemctl start octos-serve"
+            ;;
+    esac
+fi
+if [ -n "$TENANT_NAME" ]; then
+    echo ""
+    echo "  Tunnel:"
+    echo "    Dashboard: https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
 fi
 echo ""
