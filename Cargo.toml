@@ -146,7 +146,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 mailparse = "0.16"
 
 # Web API (optional)
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8"
 metrics = "0.24"
