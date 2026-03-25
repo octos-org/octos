@@ -79,6 +79,8 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone)]
 pub struct ConversationResponse {
     pub content: String,
+    /// Reasoning/thinking content from thinking models (o1, DeepSeek, kimi, etc.).
+    pub reasoning_content: Option<String>,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,

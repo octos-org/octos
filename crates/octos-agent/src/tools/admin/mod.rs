@@ -178,6 +178,64 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let mut header_end = None;
+        let mut content_length = 0_usize;
+
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before request was fully received");
+            buffer.extend_from_slice(&chunk[..n]);
+
+            if header_end.is_none() {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let headers = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                }
+            }
+
+            if let Some(end) = header_end {
+                if buffer.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8(buffer).unwrap()
+    }
+
+    async fn spawn_json_server(
+        response_body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&response_body).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            request
+        });
+
+        (format!("http://{}", addr), handle)
+    }
 
     #[test]
     fn format_duration_seconds() {

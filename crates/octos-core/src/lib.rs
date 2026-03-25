@@ -14,7 +14,7 @@ mod task;
 mod types;
 mod utils;
 
-pub use abort::is_abort_trigger;
+pub use abort::{abort_response, is_abort_trigger};
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
 pub use message::AgentMessage;

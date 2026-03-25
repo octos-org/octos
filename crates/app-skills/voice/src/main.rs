@@ -3,11 +3,15 @@
 //! Protocol: `./voice-skill <tool_name>` with JSON on stdin, JSON on stdout.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
+
+const PRESET_VOICES: &[&str] = &[
+    "vivian", "serena", "ryan", "aiden", "eric", "dylan", "uncle_fu", "ono_anna", "sohee",
+];
 
 // ── Input types ──────────────────────────────────────────────────────
 
@@ -100,6 +104,28 @@ fn truncate(s: &str, max: usize) -> String {
         let end: String = s.chars().take(max).collect();
         format!("{end}...")
     }
+}
+
+/// Resolve a named voice to a wav file path in the voice_profiles directory.
+/// Checks OCTOS_VOICE_DIR first, then OCTOS_DATA_DIR/voice_profiles.
+fn resolve_named_voice(name: &str) -> Option<PathBuf> {
+    let dirs_to_check: Vec<PathBuf> = [
+        std::env::var("OCTOS_VOICE_DIR").ok().map(PathBuf::from),
+        std::env::var("OCTOS_DATA_DIR")
+            .ok()
+            .map(|d| PathBuf::from(d).join("voice_profiles")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for dir in &dirs_to_check {
+        let path = dir.join(format!("{name}.wav"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn timestamp() -> u64 {
@@ -236,7 +262,29 @@ fn handle_synthesize(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
 
-    let resp = if let Some(ref ref_audio) = input.reference_audio {
+    // Auto-resolve: if speaker is not a preset and no reference_audio given,
+    // check voice_profiles dir for a matching wav file.
+    let resolved_ref = if input.reference_audio.is_none() {
+        if let Some(ref speaker) = input.speaker {
+            let lower = speaker.to_lowercase();
+            if !PRESET_VOICES.contains(&lower.as_str()) {
+                resolve_named_voice(&lower)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let effective_ref: Option<&str> = input
+        .reference_audio
+        .as_deref()
+        .or(resolved_ref.as_ref().map(|p| p.to_str().unwrap_or("")));
+
+    let resp = if let Some(ref_audio) = effective_ref {
         // Voice cloning → /v1/audio/tts/clone (Base model, x-vector, multipart)
         let ref_path = Path::new(ref_audio);
         if !ref_path.exists() {
@@ -305,7 +353,7 @@ fn handle_synthesize(input_json: &str) {
     // 24kHz 16-bit mono = 48000 bytes/sec
     let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
 
-    let mode = if input.reference_audio.is_some() {
+    let mode = if effective_ref.is_some() {
         "cloned voice"
     } else {
         "preset voice"

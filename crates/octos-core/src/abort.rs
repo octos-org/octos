@@ -12,6 +12,22 @@ pub fn is_abort_trigger(text: &str) -> bool {
     ABORT_TRIGGERS.iter().any(|t| normalized == *t)
 }
 
+/// Return a localized cancel response matching the trigger language.
+pub fn abort_response(trigger: &str) -> &'static str {
+    let t = trigger.trim();
+    match t {
+        "停" | "停止" | "取消" | "停下" | "别说了" => "🛑 已取消。",
+        "やめて" | "止めて" | "ストップ" => "🛑 キャンセルしました。",
+        "стоп" | "отмена" | "хватит" => "🛑 Отменено.",
+        "arrête" | "annuler" => "🛑 Annulé.",
+        "detente" | "cancelar" => "🛑 Cancelado.",
+        "रुको" | "बंद करो" => "🛑 रद्द किया गया।",
+        "توقف" | "قف" => "🛑 تم الإلغاء.",
+        "멈춰" | "중지" => "🛑 취소되었습니다.",
+        _ => "🛑 Cancelled.",
+    }
+}
+
 static ABORT_TRIGGERS: &[&str] = &[
     // English — only unambiguous abort words (avoid "wait", "exit", "para"
     // which are too common in normal conversation)
@@ -77,6 +93,16 @@ mod tests {
     fn test_japanese_triggers() {
         assert!(is_abort_trigger("やめて"));
         assert!(is_abort_trigger("ストップ"));
+    }
+
+    #[test]
+    fn test_abort_response_language() {
+        assert_eq!(abort_response("stop"), "🛑 Cancelled.");
+        assert_eq!(abort_response("cancel"), "🛑 Cancelled.");
+        assert_eq!(abort_response("停止"), "🛑 已取消。");
+        assert_eq!(abort_response("取消"), "🛑 已取消。");
+        assert_eq!(abort_response("やめて"), "🛑 キャンセルしました。");
+        assert_eq!(abort_response("멈춰"), "🛑 취소되었습니다.");
     }
 
     #[test]

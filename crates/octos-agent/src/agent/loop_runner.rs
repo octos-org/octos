@@ -108,6 +108,7 @@ impl Agent {
                 let new_start = (1 + history.len()).min(messages.len());
                 return Ok(ConversationResponse {
                     content: stop.message(),
+                    reasoning_content: None,
                     token_usage: total_usage,
                     files_modified,
                     streamed: false,
@@ -213,6 +214,7 @@ impl Agent {
                     let new_start = (1 + history.len()).min(messages.len());
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
+                        reasoning_content: response.reasoning_content.clone(),
                         token_usage: total_usage,
                         files_modified,
                         streamed,
@@ -249,6 +251,7 @@ impl Agent {
                     let new_start = (1 + history.len()).min(messages.len());
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
+                        reasoning_content: response.reasoning_content.clone(),
                         token_usage: total_usage,
                         files_modified,
                         streamed,
@@ -267,6 +270,7 @@ impl Agent {
                              Please rephrase your request.]"
                                 .to_string()
                         }),
+                        reasoning_content: None,
                         token_usage: total_usage,
                         files_modified,
                         streamed,

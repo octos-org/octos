@@ -123,12 +123,14 @@ impl Channel for ApiChannel {
         let mut pending = self.pending.lock().await;
         if let Some(tx) = pending.get(&msg.chat_id) {
             if msg.metadata.get("_completion").is_some() {
-                // Completion signal — send done event and close the stream
+                // Completion signal — send done event with metadata and close the stream
                 let done = serde_json::json!({
                     "type": "done",
                     "content": "",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
+                    "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+                    "tokens_in": msg.metadata.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "tokens_out": msg.metadata.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
                 });
                 let _ = tx.send(done.to_string());
                 // Remove sender to close the receiver → SSE stream ends

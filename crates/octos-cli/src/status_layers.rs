@@ -165,6 +165,9 @@ pub struct UserStatusConfig {
     /// Transient duration for greeting layer in seconds.
     #[serde(default = "default_greeting_duration")]
     pub greeting_duration_secs: u64,
+    /// Whether to show model thinking/reasoning content in responses.
+    #[serde(default)]
+    pub show_thinking: bool,
 }
 
 fn default_true() -> bool {
@@ -185,6 +188,7 @@ impl Default for UserStatusConfig {
             locale: None,
             custom_layers: Vec::new(),
             greeting_duration_secs: 5,
+            show_thinking: false,
         }
     }
 }
@@ -432,6 +436,19 @@ impl ComposerHandle {
             layer.set(Some(format!("✦ {text}...")));
             self.notify.notify_one();
         }
+    }
+
+    /// Return a cheaply-cloneable callback that updates the operation layer.
+    /// Used by the stream forwarder to show tool names during execution.
+    pub fn operation_updater(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let layers = Arc::clone(&self.layers);
+        let notify = Arc::clone(&self.notify);
+        Arc::new(move |text: &str| {
+            if let Some(layer) = find_layer(&layers, layer_id::OPERATION) {
+                layer.set(Some(format!("✦ {text}...")));
+                notify.notify_one();
+            }
+        })
     }
 
     /// Update the provider layer.
@@ -1087,6 +1104,7 @@ mod tests {
                 content: "😊 Feeling good".to_string(),
             }],
             greeting_duration_secs: 10,
+            show_thinking: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

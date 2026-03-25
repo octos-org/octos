@@ -1,0 +1,47 @@
+# Matrix Appservice Registration
+#
+# This file tells the homeserver (e.g. Palpo, Synapse) how to communicate
+# with the octos appservice. Place it in the homeserver's appservice
+# registration directory.
+#
+# octos can auto-generate this file via MatrixChannel::generate_registration(),
+# but you can also create it manually to match your deployment.
+
+# Unique identifier for this appservice (arbitrary, must be unique per homeserver)
+id: octos-matrix-appservice
+
+# URL where the homeserver sends events to the appservice.
+# Must point to the octos gateway's appservice listener (default port 8009).
+url: "http://127.0.0.1:8009"
+
+# Application Service token — used by octos when calling the homeserver API.
+# Must match `as_token` in the octos profile JSON.
+as_token: "CHANGE_ME_generate_a_random_secret"
+
+# Homeserver token — used by the homeserver when pushing events to octos.
+# Must match `hs_token` in the octos profile JSON.
+hs_token: "CHANGE_ME_generate_a_random_secret"
+
+# The localpart of the appservice's main bot user.
+# The full user ID will be @<sender_localpart>:<server_name>.
+# Must match `sender_localpart` in the octos profile JSON.
+sender_localpart: bot
+
+# Whether the homeserver should rate-limit requests from this appservice.
+# Recommended: false (the appservice manages its own rate limiting).
+rate_limited: false
+
+# Namespaces define which users/aliases/rooms this appservice controls.
+namespaces:
+  users:
+    # This regex must cover all virtual users the appservice will create.
+    # Format: @<user_prefix>.*:<server_name>
+    # `exclusive: true` means only this appservice can manage these users.
+    #
+    # The user_prefix and server_name must match the octos profile JSON.
+    # Example: with user_prefix "bot_" and server_name "127.0.0.1:6006",
+    # this regex matches @bot_weather:127.0.0.1:6006, @bot_news:127.0.0.1:6006, etc.
+    - exclusive: true
+      regex: "@bot_.*:127\\.0\\.0\\.1:6006"
+  aliases: []
+  rooms: []

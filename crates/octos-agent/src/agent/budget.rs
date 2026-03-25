@@ -19,7 +19,7 @@ pub(super) enum BudgetStop {
 impl BudgetStop {
     pub(super) fn message(&self) -> String {
         match self {
-            Self::Shutdown => "Interrupted.".into(),
+            Self::Shutdown => String::new(),
             Self::MaxIterations => "Reached max iterations.".into(),
             Self::MaxTokens { used, limit } => {
                 format!("Token budget exceeded ({used} of {limit}).")
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn budget_stop_shutdown_message() {
-        assert_eq!(BudgetStop::Shutdown.message(), "Interrupted.");
+        assert_eq!(BudgetStop::Shutdown.message(), "");
     }
 
     #[test]
@@ -189,6 +189,7 @@ mod tests {
 
         let resp = ConversationResponse {
             content: "test".into(),
+            reasoning_content: None,
             token_usage: octos_core::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,

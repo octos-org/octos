@@ -1,5 +1,7 @@
 # Octos App Skill Development Guide
 
+[English](app-skill-dev-guide.md) | [中文](app-skill-dev-guide-zh.md)
+
 This guide covers everything you need to build, register, and deploy a new app skill for octos.
 
 ---
@@ -769,6 +771,165 @@ scp target/release/weather remote:~/.octos/skills/weather/main
 ```
 
 Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `octos` binary too (they're embedded via `include_str!`).
+
+---
+
+## Installation & Distribution
+
+### Skill Types
+
+| Type | Location | Install Method | Binary | Use Case |
+|------|----------|---------------|--------|----------|
+| **Bundled** | `crates/app-skills/` | Compiled into `octos` binary | Embedded | Core skills shipped with every release |
+| **External** | GitHub repo | `octos skills install user/repo` | Downloaded or built | Community/custom skills |
+| **Profile-local** | `<profile-data>/skills/` | Per-profile install | Self-contained | Tenant-isolated skills |
+
+### Per-Profile Skill Management
+
+Skills are installed per-profile to ensure tenant isolation. Each profile has its own skills directory:
+
+```
+~/.octos/profiles/alice/data/
+  skills/
+    mofa-comic/
+      main              ← binary (self-contained, NOT in ~/.cargo/bin)
+      SKILL.md
+      manifest.json
+      styles/*.toml     ← bundled assets
+    mofa-slides/
+      main
+      SKILL.md
+      manifest.json
+      styles/*.toml
+```
+
+**Important:** Skill binaries stay in their skill directory as `main`. They are NOT copied to `~/.cargo/bin/` or any global location. The plugin loader finds them at `<skill-dir>/main`.
+
+### Install/Remove/List Commands
+
+All surfaces support per-profile operation:
+
+```bash
+# CLI (--profile flag goes BEFORE subcommand)
+octos skills --profile alice install mofa-org/mofa-skills/mofa-comic
+octos skills --profile alice list
+octos skills --profile alice remove mofa-comic
+
+# In-chat (automatically uses current profile)
+/skills install mofa-org/mofa-skills/mofa-comic
+/skills list
+/skills remove mofa-comic
+
+# Admin API
+POST /api/admin/profiles/alice/skills     {"repo": "mofa-org/mofa-skills/mofa-comic"}
+GET  /api/admin/profiles/alice/skills
+DELETE /api/admin/profiles/alice/skills/mofa-comic
+
+# Agent tool (automatically uses current profile)
+manage_skills(action="install", repo="mofa-org/mofa-skills/mofa-comic")
+manage_skills(action="list")
+manage_skills(action="remove", name="mofa-comic")
+manage_skills(action="search", query="comic")
+```
+
+### Skill Loading Priority
+
+The gateway loads skills from multiple directories. First match wins on name conflict:
+
+1. `<profile-data>/skills/` — per-profile (highest priority)
+2. `<project-dir>/skills/` — project-local
+3. `<project-dir>/bundled-skills/` — bundled app-skills
+4. `~/.octos/skills/` — global (lowest priority)
+
+### Publishing to the Registry
+
+External skills are discoverable via the [octos-hub](https://github.com/octos-org/octos-hub) registry.
+
+1. Push your skill repo to GitHub
+2. Add an entry to `registry.json` via PR:
+
+```json
+{
+  "name": "my-skills",
+  "description": "What your skills do",
+  "repo": "your-user/your-repo",
+  "skills": ["skill-a", "skill-b"],
+  "requires": ["git", "cargo"],
+  "tags": ["keyword1", "keyword2"]
+}
+```
+
+3. Users can then find and install your skills:
+
+```bash
+octos skills search keyword1
+octos skills --profile alice install your-user/your-repo/skill-a
+```
+
+### Pre-built Binary Distribution
+
+For faster installs (skip compilation), add a `binaries` section to `manifest.json`:
+
+```json
+{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "binaries": {
+    "darwin-aarch64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-aarch64.tar.gz",
+      "sha256": "abc123..."
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-x86_64.tar.gz",
+      "sha256": "def456..."
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-linux-x86_64.tar.gz",
+      "sha256": "789ghi..."
+    }
+  },
+  "tools": [ ... ]
+}
+```
+
+The installer downloads the matching binary, verifies SHA-256, and extracts to `<skill-dir>/main`. Falls back to `cargo build --release` if no binary is available.
+
+### Environment Variables for Skills
+
+The gateway automatically injects API keys into plugin processes:
+
+- Primary provider's API key (e.g., `DASHSCOPE_API_KEY`)
+- Fallback provider keys (e.g., `GEMINI_API_KEY`, `OPENAI_API_KEY`)
+- Base URLs for non-standard endpoints
+- `OCTOS_DATA_DIR` and `OCTOS_WORK_DIR`
+
+Keys are resolved from the macOS Keychain at gateway startup. Skill binaries receive them as environment variables — no manual export needed.
+
+### Bundled Assets (Styles, Config)
+
+Skills that include asset files (styles, templates, config) should bundle them in the skill directory:
+
+```
+my-skill/
+  main
+  SKILL.md
+  manifest.json
+  styles/
+    default.toml
+    manga.toml
+  templates/
+    report.html
+```
+
+The binary should resolve assets relative to its own executable location:
+
+```rust
+let exe = std::env::current_exe()?;
+let skill_dir = exe.parent().unwrap();
+let styles_dir = skill_dir.join("styles");
+```
+
+**Do NOT** look for assets in the working directory (cwd) — it points to the profile's data dir, not the skill dir.
 
 ---
 

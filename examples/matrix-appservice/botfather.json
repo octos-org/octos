@@ -1,0 +1,29 @@
+{
+  "id": "botfather",
+  "name": "BotFather",
+  "enabled": true,
+  "config": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "admin_mode": true,
+    "channels": [
+      {
+        "type": "matrix",
+        "homeserver": "http://127.0.0.1:6006",
+        "as_token": "CHANGE_ME_generate_a_random_secret",
+        "hs_token": "CHANGE_ME_generate_a_random_secret",
+        "server_name": "127.0.0.1:6006",
+        "sender_localpart": "bot",
+        "user_prefix": "bot_",
+        "port": 8009
+      }
+    ],
+    "gateway": {
+      "max_history": 50,
+      "queue_mode": "followup"
+    }
+  },
+  "created_at": "2026-03-19T00:00:00Z",
+  "updated_at": "2026-03-19T00:00:00Z"
+}
