@@ -2888,72 +2888,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_send_with_id_streaming_has_live() {
+    async fn test_matrix_send_no_live_without_streaming() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
+            &homeserver, "as_token_test", "hs_token_test", "localhost",
+            "octos_bot", "octos_", unused_local_port(),
             Arc::new(AtomicBool::new(false)),
         );
         let msg = OutboundMessage {
-            channel: "matrix".to_string(),
-            chat_id: "!room:localhost".to_string(),
-            content: "first chunk".to_string(),
-            reply_to: None,
-            media: vec![],
-            metadata: json!({"streaming": true}),
-        };
-
-        ch.send_with_id(&msg).await.unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
-            .expect("should have a send request");
-        assert_eq!(req.body[LIVE_MARKER], json!({}));
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_send_with_id_default_no_live() {
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let msg = OutboundMessage {
-            channel: "matrix".to_string(),
-            chat_id: "!room:localhost".to_string(),
-            content: "regular message".to_string(),
-            reply_to: None,
-            media: vec![],
+            channel: "matrix".into(), chat_id: "!room:localhost".into(),
+            content: "regular".into(), reply_to: None, media: vec![],
             metadata: json!({}),
         };
-
         ch.send_with_id(&msg).await.unwrap();
 
         wait_for_request_count(&requests, 1).await;
         let reqs = requests.lock().await;
-        let req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
+        let req = reqs.iter().find(|r| r.path.contains("/send/"))
             .expect("should have a send request");
         assert!(req.body.get(LIVE_MARKER).is_none());
-
         handle.abort();
     }
 
@@ -2990,63 +2943,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_edit_includes_live_marker() {
+    async fn test_matrix_msc4357_lifecycle() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
+            &homeserver, "as_token_test", "hs_token_test", "localhost",
+            "octos_bot", "octos_", unused_local_port(),
             Arc::new(AtomicBool::new(false)),
         );
 
-        ch.edit_message("!room:localhost", "$ev1", "streaming...")
-            .await
-            .unwrap();
+        // Initial streaming message
+        let msg = OutboundMessage {
+            channel: "matrix".into(), chat_id: "!room:localhost".into(),
+            content: "first".into(), reply_to: None, media: vec![],
+            metadata: json!({"streaming": true}),
+        };
+        let eid = ch.send_with_id(&msg).await.unwrap().unwrap();
+        // Intermediate edit
+        ch.edit_message("!room:localhost", &eid, "partial").await.unwrap();
+        // Final
+        ch.finish_stream("!room:localhost", &eid, "done").await.unwrap();
 
-        wait_for_request_count(&requests, 1).await;
+        wait_for_request_count(&requests, 3).await;
         let reqs = requests.lock().await;
-        let req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
-            .expect("should have a send request");
-        assert_eq!(req.body[LIVE_MARKER], json!({}));
-        assert_eq!(req.body["m.new_content"][LIVE_MARKER], json!({}));
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_finish_stream_omits_live() {
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        ch.finish_stream("!room:localhost", "$ev1", "final content")
-            .await
-            .unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let req = reqs
-            .iter()
-            .find(|r| r.path.contains("/send/"))
-            .expect("should have a send request");
-        assert!(req.body.get(LIVE_MARKER).is_none());
-        assert!(req.body["m.new_content"].get(LIVE_MARKER).is_none());
-        assert_eq!(req.body["m.new_content"]["body"], "final content");
-
+        let sends: Vec<_> = reqs.iter()
+            .filter(|r| r.path.contains("/send/"))
+            .collect();
+        assert_eq!(sends.len(), 3);
+        // Initial and edit carry live marker
+        assert_eq!(sends[0].body[LIVE_MARKER], json!({}));
+        assert_eq!(sends[1].body[LIVE_MARKER], json!({}));
+        assert_eq!(sends[1].body["m.new_content"][LIVE_MARKER], json!({}));
+        // Finish omits it
+        assert!(sends[2].body.get(LIVE_MARKER).is_none());
+        assert!(sends[2].body["m.new_content"].get(LIVE_MARKER).is_none());
+        assert_eq!(sends[2].body["m.new_content"]["body"], "done");
         handle.abort();
     }
 
