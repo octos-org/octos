@@ -1573,8 +1573,9 @@ impl Channel for MatrixChannel {
             }
         }
 
+        let live = msg.metadata.get("streaming").and_then(|v| v.as_bool()).unwrap_or(false);
         let event_id = self
-            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id)
+            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id, live)
             .await?;
 
         // Remember which sender sent this event so edit_message can use the same identity.
@@ -1674,6 +1675,7 @@ impl MatrixChannel {
         room_id: &str,
         content: &str,
         sender_user_id: Option<&str>,
+        live: bool,
     ) -> Result<String> {
         let txn_id = uuid::Uuid::now_v7().to_string();
         let effective_sender_user_id = sender_user_id.unwrap_or(&self.bot_user_id);
@@ -1687,12 +1689,15 @@ impl MatrixChannel {
         let url = self.make_api_url(&path);
 
         let formatted_body = markdown_to_matrix_html(content);
-        let body = json!({
+        let mut body = json!({
             "msgtype": MSGTYPE_TEXT,
             "body": content,
             "format": HTML_FORMAT,
             "formatted_body": formatted_body,
         });
+        if live {
+            body[LIVE_MARKER] = json!({});
+        }
 
         let resp = self
             .http
@@ -2878,6 +2883,76 @@ mod tests {
 
         let event_id = ch.send_with_id(&msg).await.unwrap();
         assert_eq!(event_id.as_deref(), Some("$test_event"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_with_id_streaming_has_live() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "first chunk".to_string(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"streaming": true}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(req.body[LIVE_MARKER], json!({}));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_send_with_id_default_no_live() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".to_string(),
+            chat_id: "!room:localhost".to_string(),
+            content: "regular message".to_string(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({}),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert!(req.body.get(LIVE_MARKER).is_none());
 
         handle.abort();
     }

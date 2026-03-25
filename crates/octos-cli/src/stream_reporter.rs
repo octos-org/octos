@@ -502,8 +502,8 @@ async fn do_flush(
             reply_to: None,
             media: vec![],
             metadata: sender_user_id
-                .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
-                .unwrap_or_else(|| serde_json::json!({})),
+                .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid, "streaming": true }))
+                .unwrap_or_else(|| serde_json::json!({ "streaming": true })),
         };
         match channel.send_with_id(&msg).await {
             Ok(Some(mid)) => {
