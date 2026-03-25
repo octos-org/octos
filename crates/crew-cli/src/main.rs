@@ -14,6 +14,7 @@ pub mod cron_tool;
 #[cfg(feature = "api")]
 pub mod monitor;
 pub mod notebook;
+pub mod space;
 #[cfg(feature = "api")]
 pub mod otp;
 pub mod persona_service;

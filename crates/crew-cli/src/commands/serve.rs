@@ -240,6 +240,12 @@ impl ServeCommand {
                 .wrap_err("failed to open notebook store")?,
         );
 
+        // Initialize space store
+        let space_store = Arc::new(
+            crate::space::SpaceStore::open(&data_dir)
+                .wrap_err("failed to open space store")?,
+        );
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -257,6 +263,7 @@ impl ServeCommand {
             alerts_enabled: alerts_flag.clone(),
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
             notebook_store: Some(notebook_store),
+            space_store: Some(space_store),
         });
 
         // Auto-start enabled profiles

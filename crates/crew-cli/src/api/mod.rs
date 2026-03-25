@@ -8,6 +8,7 @@ mod handlers;
 pub mod metrics;
 pub mod notebook_handlers;
 mod router;
+pub mod space_handlers;
 mod sse;
 mod static_files;
 pub mod user_admin;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use crate::notebook::NotebookStore;
 use crate::otp::AuthManager;
+use crate::space::SpaceStore;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
 use crate::user_store::UserStore;
@@ -60,4 +62,6 @@ pub struct AppState {
     pub sysinfo: tokio::sync::Mutex<sysinfo::System>,
     /// Notebook store for MoFa Notebook feature.
     pub notebook_store: Option<Arc<NotebookStore>>,
+    /// Space store for class/course spaces.
+    pub space_store: Option<Arc<SpaceStore>>,
 }

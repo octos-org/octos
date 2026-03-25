@@ -16,6 +16,7 @@ use super::auth_handlers;
 use super::handlers;
 use super::metrics;
 use super::notebook_handlers;
+use super::space_handlers;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
@@ -301,6 +302,53 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/notebooks/{id}/chat",
             post(notebook_handlers::notebook_chat),
+        )
+        // Share routes
+        .route(
+            "/api/notebooks/{id}/share",
+            post(notebook_handlers::share_notebook),
+        )
+        .route(
+            "/api/notebooks/{id}/share",
+            get(notebook_handlers::list_shares),
+        )
+        .route(
+            "/api/notebooks/{id}/share/{share_id}",
+            delete(notebook_handlers::revoke_share),
+        )
+        // Source content (copyright-aware)
+        .route(
+            "/api/notebooks/{id}/sources/{sid}/content",
+            get(notebook_handlers::get_source_content),
+        )
+        // Library routes
+        .route(
+            "/api/library/import",
+            post(notebook_handlers::library_import),
+        )
+        .route(
+            "/api/library/isbn/{isbn}",
+            get(notebook_handlers::isbn_lookup),
+        );
+
+    // Space API routes
+    let space_api = Router::new()
+        .route("/api/spaces", get(space_handlers::list_spaces))
+        .route("/api/spaces", post(space_handlers::create_space))
+        .route("/api/spaces/{id}", get(space_handlers::get_space))
+        .route("/api/spaces/{id}", put(space_handlers::update_space))
+        .route("/api/spaces/{id}", delete(space_handlers::delete_space))
+        .route(
+            "/api/spaces/{id}/members",
+            post(space_handlers::add_member),
+        )
+        .route(
+            "/api/spaces/{id}/members/{uid}",
+            delete(space_handlers::remove_member),
+        )
+        .route(
+            "/api/spaces/{id}/notebooks",
+            post(space_handlers::link_notebook),
         );
 
     // Determine whether auth middleware is needed
@@ -309,7 +357,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Build the authenticated routes
     let protected = if has_auth {
         // Routes requiring user-level auth (user session OR admin token)
-        let user_routes = my_api.merge(chat_api).merge(notebook_api).layer(middleware::from_fn_with_state(
+        let user_routes = my_api.merge(chat_api).merge(notebook_api).merge(space_api).layer(middleware::from_fn_with_state(
             state.clone(),
             user_auth_middleware,
         ));
@@ -323,7 +371,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         user_routes.merge(admin_routes)
     } else {
         // No auth configured — all routes accessible
-        my_api.merge(chat_api).merge(notebook_api).merge(admin_api)
+        my_api.merge(chat_api).merge(notebook_api).merge(space_api).merge(admin_api)
     };
 
     // Webhook proxy routes (unauthenticated — Feishu/Twilio servers can't authenticate)
