@@ -115,6 +115,9 @@ mod tests {
             owner_id: "test-user".to_string(),
             sources: vec![],
             notes: vec![],
+            shared_with: vec![],
+            book_meta: None,
+            copyright_protected: false,
         }
     }
 

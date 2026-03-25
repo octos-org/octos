@@ -25,6 +25,53 @@ pub struct Notebook {
     /// Inline notes (persisted in the same JSON file).
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// Users this notebook is shared with.
+    #[serde(default)]
+    pub shared_with: Vec<Share>,
+    /// Book metadata for library feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub book_meta: Option<BookMeta>,
+    /// When true, raw source content is hidden; only summaries are served.
+    #[serde(default)]
+    pub copyright_protected: bool,
+}
+
+/// A share grant on a notebook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Share {
+    pub id: String,
+    pub email: String,
+    pub role: ShareRole,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Role for a notebook share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareRole {
+    Viewer,
+    Editor,
+}
+
+/// Book metadata for library integration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BookMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isbn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_year: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
 }
 
 /// Type of source material.

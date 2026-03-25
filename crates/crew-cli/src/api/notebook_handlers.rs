@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::notebook::{
-    Chunk, Note, NoteOrigin, Notebook, NotebookStore, Source, SourceStatus, SourceType,
+    BookMeta, Chunk, Note, NoteOrigin, Notebook, NotebookStore, Share, ShareRole, Source,
+    SourceStatus, SourceType,
 };
 
 // Re-export for multipart upload
@@ -51,6 +52,8 @@ pub struct NotebookSummary {
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
     pub owner_id: String,
+    pub copyright_protected: bool,
+    pub book_meta: Option<BookMeta>,
 }
 
 impl From<&Notebook> for NotebookSummary {
@@ -65,6 +68,8 @@ impl From<&Notebook> for NotebookSummary {
             created_at: nb.created_at,
             updated_at: nb.updated_at,
             owner_id: nb.owner_id.clone(),
+            copyright_protected: nb.copyright_protected,
+            book_meta: nb.book_meta.clone(),
         }
     }
 }
@@ -107,6 +112,9 @@ pub async fn create_notebook(
         owner_id: String::new(), // TODO: extract from auth identity
         sources: vec![],
         notes: vec![],
+        shared_with: vec![],
+        book_meta: None,
+        copyright_protected: false,
     };
     store
         .save(&nb)
@@ -260,6 +268,50 @@ fn split_into_chunks(text: &str, target_size: usize) -> Vec<Chunk> {
     final_chunks
 }
 
+/// Fetch URL content and strip HTML tags to plain text.
+async fn fetch_url_content(url: &str) -> Result<String, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read body: {e}"))?;
+    // Strip HTML tags with a simple regex
+    let tag_re = regex::Regex::new(r"<[^>]+>").unwrap();
+    let text = tag_re.replace_all(&body, " ");
+    // Collapse whitespace
+    let ws_re = regex::Regex::new(r"\s+").unwrap();
+    let clean = ws_re.replace_all(&text, " ").trim().to_string();
+    Ok(clean)
+}
+
+/// Extract text from a PDF file using `pdftotext` (poppler).
+/// Falls back to storing the filename as a single chunk if pdftotext is unavailable.
+fn extract_pdf_text(pdf_bytes: &[u8], filename: &str) -> String {
+    // Write bytes to a temp file, shell out to pdftotext
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(t) => t,
+        Err(_) => return filename.to_string(),
+    };
+    if std::io::Write::write_all(&mut std::io::BufWriter::new(tmp.as_file()), pdf_bytes).is_err() {
+        return filename.to_string();
+    }
+    let output = std::process::Command::new("pdftotext")
+        .arg(tmp.path())
+        .arg("-")
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        }
+        _ => {
+            tracing::info!("pdftotext not available, using filename as fallback");
+            filename.to_string()
+        }
+    }
+}
+
 /// GET /api/notebooks/:id/sources
 pub async fn list_sources(
     State(state): State<Arc<AppState>>,
@@ -286,7 +338,12 @@ pub async fn add_source(
         .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
 
     let (content, source_type, filename) = if let Some(url) = &req.url {
-        (url.clone(), SourceType::Url, url.clone())
+        // Fetch URL content and strip HTML tags
+        let fetched = fetch_url_content(url).await.unwrap_or_else(|e| {
+            tracing::warn!(url = %url, error = %e, "failed to fetch URL, storing URL as content");
+            url.clone()
+        });
+        (fetched, SourceType::Url, url.clone())
     } else if let Some(text) = &req.text {
         (
             text.clone(),
@@ -379,7 +436,7 @@ pub async fn upload_source(
         .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
 
     let mut filename = String::from("upload");
-    let mut content = String::new();
+    let mut raw_bytes: Vec<u8> = Vec::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -391,14 +448,15 @@ pub async fn upload_source(
             if let Some(fname) = field.file_name() {
                 filename = fname.to_string();
             }
-            content = field
-                .text()
+            raw_bytes = field
+                .bytes()
                 .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("failed to read file: {e}")))?;
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("failed to read file: {e}")))?
+                .to_vec();
         }
     }
 
-    if content.is_empty() {
+    if raw_bytes.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no file content provided".into()));
     }
 
@@ -411,6 +469,13 @@ pub async fn upload_source(
         SourceType::Pptx
     } else {
         SourceType::Text
+    };
+
+    // Extract text content based on source type
+    let content = if source_type == SourceType::Pdf {
+        extract_pdf_text(&raw_bytes, &filename)
+    } else {
+        String::from_utf8_lossy(&raw_bytes).into_owned()
     };
 
     let chunks = split_into_chunks(&content, 800);
@@ -674,6 +739,302 @@ pub async fn notebook_chat(
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+// ── Sharing API ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ShareRequest {
+    pub email: String,
+    pub role: ShareRole,
+}
+
+/// POST /api/notebooks/:id/share
+pub async fn share_notebook(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ShareRequest>,
+) -> Result<Json<Share>, (StatusCode, String)> {
+    let store = notebook_store(&state)?;
+    let mut nb = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
+
+    let share = Share {
+        id: uuid::Uuid::now_v7().to_string(),
+        email: req.email,
+        role: req.role,
+        created_at: Utc::now(),
+    };
+    nb.shared_with.push(share.clone());
+    nb.updated_at = Utc::now();
+    store
+        .save(&nb)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(share))
+}
+
+/// GET /api/notebooks/:id/share
+pub async fn list_shares(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<Share>>, (StatusCode, String)> {
+    let store = notebook_store(&state)?;
+    let nb = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
+    Ok(Json(nb.shared_with))
+}
+
+/// DELETE /api/notebooks/:id/share/:share_id
+pub async fn revoke_share(
+    State(state): State<Arc<AppState>>,
+    Path((id, share_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = notebook_store(&state)?;
+    let mut nb = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
+
+    let before = nb.shared_with.len();
+    nb.shared_with.retain(|s| s.id != share_id);
+    if nb.shared_with.len() == before {
+        return Err((StatusCode::NOT_FOUND, format!("share {share_id} not found")));
+    }
+    nb.updated_at = Utc::now();
+    store
+        .save(&nb)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ── Copyright-aware source content ──────────────────────────────────
+
+/// GET /api/notebooks/:id/sources/:sid/content — returns chunk content,
+/// but redacts raw text when the notebook is copyright-protected.
+pub async fn get_source_content(
+    State(state): State<Arc<AppState>>,
+    Path((id, sid)): Path<(String, String)>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let store = notebook_store(&state)?;
+    let nb = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("notebook {id} not found")))?;
+
+    let source = nb
+        .sources
+        .iter()
+        .find(|s| s.id == sid)
+        .ok_or((StatusCode::NOT_FOUND, format!("source {sid} not found")))?;
+
+    let chunks: Vec<serde_json::Value> = source
+        .chunks
+        .iter()
+        .map(|c| {
+            if nb.copyright_protected {
+                // Only return a summary (first 100 chars + ellipsis)
+                let summary = if c.content.len() > 100 {
+                    format!("{}...", &c.content[..100])
+                } else {
+                    c.content.clone()
+                };
+                serde_json::json!({
+                    "id": c.id,
+                    "summary": summary,
+                    "start_offset": c.start_offset,
+                    "end_offset": c.end_offset,
+                })
+            } else {
+                serde_json::json!({
+                    "id": c.id,
+                    "content": c.content,
+                    "start_offset": c.start_offset,
+                    "end_offset": c.end_offset,
+                })
+            }
+        })
+        .collect();
+    Ok(Json(chunks))
+}
+
+// ── Library: Batch import ────────────────────────────────────────────
+
+/// POST /api/library/import — multipart CSV with columns: title,author,isbn,classification,file_path
+pub async fn library_import(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<Vec<NotebookSummary>>, (StatusCode, String)> {
+    let store = notebook_store(&state)?;
+
+    let mut csv_content = String::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            csv_content = field
+                .text()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("failed to read CSV: {e}")))?;
+        }
+    }
+
+    if csv_content.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no CSV content provided".into()));
+    }
+
+    let mut created = Vec::new();
+    let now = Utc::now();
+
+    for (i, line) in csv_content.lines().enumerate() {
+        // Skip header
+        if i == 0 {
+            let lower = line.to_lowercase();
+            if lower.contains("title") && lower.contains("author") {
+                continue;
+            }
+        }
+        let cols: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let title = cols[0].to_string();
+        let author = cols.get(1).map(|s| s.to_string());
+        let isbn = cols.get(2).map(|s| s.to_string());
+        let classification = cols.get(3).map(|s| s.to_string());
+        let file_path = cols.get(4).map(|s| s.to_string());
+
+        let book_meta = BookMeta {
+            isbn: isbn.clone().filter(|s| !s.is_empty()),
+            author: author.filter(|s| !s.is_empty()),
+            classification: classification.filter(|s| !s.is_empty()),
+            ..Default::default()
+        };
+
+        let mut nb = Notebook {
+            id: uuid::Uuid::now_v7().to_string(),
+            title,
+            description: String::new(),
+            cover_image: None,
+            source_count: 0,
+            note_count: 0,
+            created_at: now,
+            updated_at: now,
+            owner_id: String::new(),
+            sources: vec![],
+            notes: vec![],
+            shared_with: vec![],
+            book_meta: Some(book_meta),
+            copyright_protected: false,
+        };
+
+        // If file_path provided and it's a PDF, try to add as source
+        if let Some(fp) = file_path.filter(|s| !s.is_empty()) {
+            let content = if fp.ends_with(".pdf") {
+                match std::fs::read(&fp) {
+                    Ok(bytes) => extract_pdf_text(&bytes, &fp),
+                    Err(_) => fp.clone(),
+                }
+            } else {
+                std::fs::read_to_string(&fp).unwrap_or_else(|_| fp.clone())
+            };
+            let chunks = split_into_chunks(&content, 800);
+            let source = Source {
+                id: uuid::Uuid::now_v7().to_string(),
+                notebook_id: nb.id.clone(),
+                source_type: if fp.ends_with(".pdf") {
+                    SourceType::Pdf
+                } else {
+                    SourceType::Text
+                },
+                filename: fp,
+                status: SourceStatus::Ready,
+                error_message: None,
+                chunks,
+                created_at: now,
+            };
+            nb.sources.push(source);
+            nb.source_count = nb.sources.len();
+        }
+
+        store
+            .save(&nb)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        created.push(NotebookSummary::from(&nb));
+    }
+
+    Ok(Json(created))
+}
+
+// ── Library: ISBN lookup ─────────────────────────────────────────────
+
+/// GET /api/library/isbn/:isbn — lookup book info from Open Library.
+pub async fn isbn_lookup(
+    Path(isbn): Path<String>,
+) -> Result<Json<BookMeta>, (StatusCode, String)> {
+    let url = format!(
+        "https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Open Library request failed: {e}")))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to parse response: {e}")))?;
+
+    let key = format!("ISBN:{isbn}");
+    let data = body
+        .get(&key)
+        .ok_or((StatusCode::NOT_FOUND, format!("ISBN {isbn} not found")))?;
+
+    let meta = BookMeta {
+        isbn: Some(isbn),
+        author: data
+            .get("authors")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.as_str())
+            .map(String::from),
+        publisher: data
+            .get("publishers")
+            .and_then(|p| p.as_array())
+            .and_then(|p| p.first())
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .map(String::from),
+        publish_year: data
+            .get("publish_date")
+            .and_then(|d| d.as_str())
+            .and_then(|d| {
+                // Try to extract a 4-digit year
+                d.chars()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .find_map(|w| w.parse::<u16>().ok().filter(|y| *y > 1000))
+            }),
+        subject: data
+            .get("subjects")
+            .and_then(|s| s.as_array())
+            .and_then(|s| s.first())
+            .and_then(|s| s.get("name"))
+            .and_then(|n| n.as_str())
+            .map(String::from),
+        cover_url: data
+            .get("cover")
+            .and_then(|c| c.get("large"))
+            .and_then(|u| u.as_str())
+            .map(String::from),
+        ..Default::default()
+    };
+    Ok(Json(meta))
 }
 
 #[cfg(test)]
