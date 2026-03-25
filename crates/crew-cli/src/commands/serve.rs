@@ -234,6 +234,12 @@ impl ServeCommand {
             (wf, af)
         };
 
+        // Initialize notebook store
+        let notebook_store = Arc::new(
+            crate::notebook::NotebookStore::open(&data_dir)
+                .wrap_err("failed to open notebook store")?,
+        );
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -250,6 +256,7 @@ impl ServeCommand {
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
+            notebook_store: Some(notebook_store),
         });
 
         // Auto-start enabled profiles

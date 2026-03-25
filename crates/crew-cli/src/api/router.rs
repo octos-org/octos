@@ -15,6 +15,7 @@ use super::admin;
 use super::auth_handlers;
 use super::handlers;
 use super::metrics;
+use super::notebook_handlers;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
@@ -242,13 +243,73 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Model limits (from model_limits.json)
         .route("/api/admin/model-limits", get(admin::model_limits));
 
+    // Notebook API routes
+    let notebook_api = Router::new()
+        .route("/api/notebooks", get(notebook_handlers::list_notebooks))
+        .route("/api/notebooks", post(notebook_handlers::create_notebook))
+        .route(
+            "/api/notebooks/{id}",
+            get(notebook_handlers::get_notebook),
+        )
+        .route(
+            "/api/notebooks/{id}",
+            put(notebook_handlers::update_notebook),
+        )
+        .route(
+            "/api/notebooks/{id}",
+            delete(notebook_handlers::delete_notebook),
+        )
+        // Source routes
+        .route(
+            "/api/notebooks/{id}/sources",
+            get(notebook_handlers::list_sources),
+        )
+        .route(
+            "/api/notebooks/{id}/sources",
+            post(notebook_handlers::add_source),
+        )
+        .route(
+            "/api/notebooks/{id}/sources/upload",
+            post(notebook_handlers::upload_source),
+        )
+        .route(
+            "/api/notebooks/{id}/sources/{sid}",
+            get(notebook_handlers::get_source),
+        )
+        .route(
+            "/api/notebooks/{id}/sources/{sid}",
+            delete(notebook_handlers::delete_source),
+        )
+        // Note routes
+        .route(
+            "/api/notebooks/{id}/notes",
+            get(notebook_handlers::list_notes),
+        )
+        .route(
+            "/api/notebooks/{id}/notes",
+            post(notebook_handlers::create_note),
+        )
+        .route(
+            "/api/notebooks/{id}/notes/{nid}",
+            put(notebook_handlers::update_note),
+        )
+        .route(
+            "/api/notebooks/{id}/notes/{nid}",
+            delete(notebook_handlers::delete_note),
+        )
+        // Chat route
+        .route(
+            "/api/notebooks/{id}/chat",
+            post(notebook_handlers::notebook_chat),
+        );
+
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();
 
     // Build the authenticated routes
     let protected = if has_auth {
         // Routes requiring user-level auth (user session OR admin token)
-        let user_routes = my_api.merge(chat_api).layer(middleware::from_fn_with_state(
+        let user_routes = my_api.merge(chat_api).merge(notebook_api).layer(middleware::from_fn_with_state(
             state.clone(),
             user_auth_middleware,
         ));
@@ -262,7 +323,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         user_routes.merge(admin_routes)
     } else {
         // No auth configured — all routes accessible
-        my_api.merge(chat_api).merge(admin_api)
+        my_api.merge(chat_api).merge(notebook_api).merge(admin_api)
     };
 
     // Webhook proxy routes (unauthenticated — Feishu/Twilio servers can't authenticate)

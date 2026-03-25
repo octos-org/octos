@@ -6,6 +6,7 @@ pub mod admin;
 pub mod auth_handlers;
 mod handlers;
 pub mod metrics;
+pub mod notebook_handlers;
 mod router;
 mod sse;
 mod static_files;
@@ -19,6 +20,7 @@ pub use sse::SseBroadcaster;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::notebook::NotebookStore;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
@@ -56,4 +58,6 @@ pub struct AppState {
     pub alerts_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Persistent sysinfo instance for accurate CPU metrics across polls.
     pub sysinfo: tokio::sync::Mutex<sysinfo::System>,
+    /// Notebook store for MoFa Notebook feature.
+    pub notebook_store: Option<Arc<NotebookStore>>,
 }
