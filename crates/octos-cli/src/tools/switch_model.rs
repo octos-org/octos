@@ -60,13 +60,15 @@ struct Input {
 #[async_trait]
 impl Tool for SwitchModelTool {
     fn name(&self) -> &str {
-        "switch_model"
+        "model_management"
     }
 
     fn description(&self) -> &str {
-        "List available LLM providers or switch to a different model at runtime. \
-         Use action='list' to see available providers and current config. \
-         Use action='switch' with a model name to change the active model."
+        "Manage LLM models. ALWAYS call this tool with action='list' when the user asks \
+         what models are available — never guess from general knowledge. \
+         Use action='list' to show the current model, configured fallbacks, and all \
+         available providers with API key status. \
+         Use action='switch' with a model name to change the active model at runtime."
     }
 
     fn tags(&self) -> &[&str] {
@@ -124,16 +126,39 @@ impl SwitchModelTool {
         let (current_provider, current_model) = self.swappable.provider_info();
 
         let mut lines = Vec::new();
-        lines.push(format!("Current model: {current_provider}/{current_model}"));
+        lines.push(format!("## Active Configuration"));
         lines.push(String::new());
-        lines.push("Available providers:".to_string());
+        lines.push(format!("Primary model: {current_provider}/{current_model}"));
 
+        // Configured fallback models (actually available for this profile)
+        if !self.config.fallback_models.is_empty() {
+            lines.push(String::new());
+            lines.push("Fallback models (auto-routed on failure):".to_string());
+            for fb in &self.config.fallback_models {
+                let model = fb.model.as_deref().unwrap_or("default");
+                let key_status = if let Some(ref env_var) = fb.api_key_env {
+                    if std::env::var(env_var).is_ok() {
+                        "ready"
+                    } else {
+                        "needs API key"
+                    }
+                } else {
+                    "ready"
+                };
+                lines.push(format!("  - {}/{} [{}]", fb.provider, model, key_status));
+            }
+        }
+
+        // Other providers that could be switched to
+        lines.push(String::new());
+        lines.push("## Other Providers (can switch to)".to_string());
+        lines.push(String::new());
         for entry in octos_llm::registry::all_entries() {
             let key_status = if let Some(env_var) = entry.api_key_env {
                 if std::env::var(env_var).is_ok() {
                     "ready"
                 } else {
-                    "needs API key"
+                    "no API key"
                 }
             } else {
                 "no key needed"
@@ -144,26 +169,10 @@ impl SwitchModelTool {
                 .map(|m| format!(" (default: {m})"))
                 .unwrap_or_default();
 
-            let aliases = if entry.aliases.is_empty() {
-                String::new()
-            } else {
-                format!(" [aliases: {}]", entry.aliases.join(", "))
-            };
-
             lines.push(format!(
-                "  - {}{} [{}]{}",
-                entry.name, default, key_status, aliases
+                "  - {}{} [{}]",
+                entry.name, default, key_status
             ));
-        }
-
-        // Show configured fallback models
-        if !self.config.fallback_models.is_empty() {
-            lines.push(String::new());
-            lines.push("Configured fallback models:".to_string());
-            for fb in &self.config.fallback_models {
-                let model = fb.model.as_deref().unwrap_or("default");
-                lines.push(format!("  - {}/{}", fb.provider, model));
-            }
         }
 
         Ok(ToolResult {
@@ -288,7 +297,7 @@ impl SwitchModelTool {
             old_model = %old_model,
             new_provider = %provider_name,
             new_model = %model_name,
-            "model switched via switch_model tool"
+            "model switched via model_management tool"
         );
 
         // Persist to profile JSON if available

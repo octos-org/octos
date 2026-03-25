@@ -8,6 +8,7 @@ use octos_memory::MemoryStore;
 use crate::persona_service::PersonaService;
 
 /// Build the system prompt with bootstrap files, memory context, and skills.
+///
 pub async fn build_system_prompt(
     base: Option<&str>,
     data_dir: &Path,
