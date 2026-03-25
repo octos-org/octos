@@ -60,7 +60,7 @@ impl Tool for RecallMemoryTool {
 
         let slug = to_slug(&input.name);
 
-        match self.store.read_entity(&slug).await? {
+        match self.store.read_entity(&slug).await.unwrap_or(None) {
             Some(content) => Ok(ToolResult {
                 output: content,
                 success: true,
