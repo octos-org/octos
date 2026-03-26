@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_stop_typing_on_stop() {
+    async fn test_stop_typing_on_stop() {
         let channel = Arc::new(MockChannel::default());
         let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
         let tracker = Arc::new(TokenTracker::new());

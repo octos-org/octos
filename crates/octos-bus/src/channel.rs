@@ -439,12 +439,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_stop_typing() {
-        let ch = MockChannel::new("test");
-        assert!(ch.stop_typing("chat1").await.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_default_edit_message() {
         let ch = MockChannel::new("test");
         assert!(

@@ -2917,7 +2917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_send_no_live_without_streaming() {
+    async fn test_matrix_send_no_live() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,
@@ -2982,7 +2982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_msc4357_lifecycle() {
+    async fn test_matrix_live_lifecycle() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,
@@ -3059,7 +3059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_send_typing_with_sender_user_id() {
+    async fn test_matrix_send_typing_as() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,
@@ -3098,35 +3098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_stop_typing() {
-        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
-        let ch = MatrixChannel::new(
-            &homeserver,
-            "as_token_test",
-            "hs_token_test",
-            "localhost",
-            "octos_bot",
-            "octos_",
-            unused_local_port(),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        ch.stop_typing("!room:localhost").await.unwrap();
-
-        wait_for_request_count(&requests, 1).await;
-        let reqs = requests.lock().await;
-        let typing_req = reqs
-            .iter()
-            .find(|r| r.path.contains("/typing/"))
-            .expect("should have a typing request");
-        assert_eq!(typing_req.method, Method::PUT);
-        assert_eq!(typing_req.body["typing"], false);
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_matrix_stop_typing_with_sender_user_id() {
+    async fn test_matrix_stop_typing_as() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,

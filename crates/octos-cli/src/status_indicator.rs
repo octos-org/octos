@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_stop_typing_on_stop() {
+    async fn test_stop_typing_on_stop() {
         let channel = Arc::new(StopTypingChannel::default());
         let status_handle = StatusHandle {
             cancelled: Arc::new(AtomicBool::new(false)),
