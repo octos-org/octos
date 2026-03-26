@@ -231,6 +231,14 @@ impl Channel for ApiChannel {
         1_000_000 // No chunking needed for SSE
     }
 
+    async fn send_raw_sse(&self, chat_id: &str, json: &str) -> Result<()> {
+        let pending = self.pending.lock().await;
+        if let Some(tx) = pending.get(chat_id) {
+            let _ = tx.send(json.to_string());
+        }
+        Ok(())
+    }
+
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())

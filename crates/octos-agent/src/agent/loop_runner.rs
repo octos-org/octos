@@ -117,6 +117,8 @@ impl Agent {
             }
 
             iteration += 1;
+            self.reporter()
+                .report(ProgressEvent::Thinking { iteration });
 
             // LRU tool management: tick iteration counter and auto-evict idle tools
             self.tools.tick();
@@ -176,6 +178,10 @@ impl Agent {
                 }
                 Err(e) => return Err(e),
             };
+            self.reporter().report(ProgressEvent::Response {
+                content: response.content.clone().unwrap_or_default(),
+                iteration,
+            });
             {
                 let tool_names: Vec<&str> = response
                     .tool_calls

@@ -121,6 +121,16 @@ pub trait Channel: Send + Sync {
         content.to_string()
     }
 
+    /// Send a raw SSE JSON event to the client (API channel only).
+    ///
+    /// Used by the stream forwarder to inject discrete progress events
+    /// (thinking, tool_start, tool_progress, cost_update) into the SSE
+    /// stream alongside the text-based streaming updates. Non-SSE channels
+    /// (Telegram, Matrix, etc.) ignore this.
+    async fn send_raw_sse(&self, _chat_id: &str, _json: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Add an emoji reaction to a message. Default: no-op.
     async fn react_to_message(
         &self,

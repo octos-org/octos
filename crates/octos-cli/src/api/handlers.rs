@@ -11,6 +11,8 @@ use octos_agent::Agent;
 use octos_core::{AgentId, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
+use axum::http::HeaderMap;
+
 use super::AppState;
 use super::metrics::MetricsReporter;
 use super::sse::ChannelReporter;
@@ -39,21 +41,48 @@ pub struct ChatResponse {
 /// Maximum message length (1MB).
 const MAX_MESSAGE_LEN: usize = 1_048_576;
 
-pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> Response {
-    // If a gateway has an API channel running, proxy the request to it.
-    // This gives the web client access to adaptive routing, queue modes,
-    // multi-provider failover, and all gateway features.
-    if let Some(pm) = &state.process_manager {
-        if let Some((_profile_id, port)) = pm.first_api_port().await {
-            return super::webhook_proxy::api_chat_proxy(
-                &state,
-                port,
-                &req.message,
-                req.session_id.as_deref(),
-                &req.media,
-            )
-            .await;
+/// Resolve API port for a specific profile, or fall back to first available.
+/// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
+async fn resolve_api_port(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(String, u16)> {
+    let pm = state.process_manager.as_ref()?;
+
+    // Check X-Profile-Id header first (set by reverse proxy from subdomain)
+    if let Some(profile_id) = headers
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(port) = pm.api_port(profile_id).await {
+            return Some((profile_id.to_string(), port));
         }
+        tracing::warn!(profile = profile_id, "no API port for requested profile");
+    }
+
+    // Fall back to first available
+    pm.first_api_port().await
+}
+
+pub async fn chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Response {
+    // If a gateway has an API channel running, proxy the request to it.
+    // The gateway's stream forwarder now sends discrete SSE events (thinking,
+    // tool_start, tool_progress, cost_update) via send_raw_sse alongside
+    // the text-based streaming updates.
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        return super::webhook_proxy::api_chat_proxy(
+            &state,
+            port,
+            &req.message,
+            req.session_id.as_deref(),
+            &req.media,
+        )
+        .await;
     }
 
     // No gateway with API channel — use standalone agent
@@ -192,11 +221,12 @@ async fn chat_streaming(
     .with_reporter(reporter);
 
     let message = req.message;
+    let media = req.media;
 
     // Spawn the agent task
     tokio::spawn(async move {
         let result = request_agent
-            .process_message(&message, &history, vec![])
+            .process_message(&message, &history, media)
             .await;
 
         match result {
@@ -216,12 +246,12 @@ async fn chat_streaming(
                     }
                 }
 
-                // Send final done event
+                // Send final done event (field names match what octos-web expects)
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
-                    "input_tokens": response.token_usage.input_tokens,
-                    "output_tokens": response.token_usage.output_tokens,
+                    "tokens_in": response.token_usage.input_tokens,
+                    "tokens_out": response.token_usage.output_tokens,
                 });
                 let _ = tx.send(done.to_string());
             }
@@ -276,42 +306,60 @@ pub async fn chat_stream(
 }
 
 /// GET /api/sessions -- list sessions.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Response {
-    // If local sessions available, use them directly
+pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // Collect sessions from both the standalone store and gateway profiles,
+    // since streaming uses the standalone agent but old sessions may live
+    // in gateway stores.
+    let mut all: Vec<SessionInfo> = Vec::new();
+
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let list: Vec<SessionInfo> = sess
-            .list_sessions()
-            .into_iter()
-            .filter_map(|(id, count)| {
-                let chat_id = id.strip_prefix("api:")?;
-                Some(SessionInfo {
-                    id: chat_id.to_string(),
-                    message_count: count,
-                })
+        all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
+            let chat_id = id.strip_prefix("api:")?;
+            Some(SessionInfo {
+                id: chat_id.to_string(),
+                message_count: count,
             })
-            .collect();
-        return Json(list).into_response();
+        }));
     }
 
-    // Proxy to gateway if available
-    if let Some(pm) = &state.process_manager {
-        if let Some((_profile_id, port)) = pm.first_api_port().await {
-            return super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
+    // Also fetch from gateway if available (old sessions live there)
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
+        if proxy_resp.status().is_success() {
+            if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await
+            {
+                if let Ok(gateway_sessions) =
+                    serde_json::from_slice::<Vec<SessionInfo>>(&body)
+                {
+                    // Merge, dedup by id (standalone wins)
+                    let existing: std::collections::HashSet<String> =
+                        all.iter().map(|s| s.id.clone()).collect();
+                    all.extend(
+                        gateway_sessions
+                            .into_iter()
+                            .filter(|s| !existing.contains(&s.id)),
+                    );
+                }
+            }
         }
     }
 
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".to_string(),
-    )
-        .into_response()
+    if all.is_empty() && state.sessions.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sessions not available".to_string(),
+        )
+            .into_response();
+    }
+
+    Json(all).into_response()
 }
 
 /// GET /api/sessions/:id/messages -- get session history.
@@ -331,12 +379,15 @@ fn default_page_limit() -> usize {
 
 pub async fn session_messages(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    let limit = params.limit.min(500);
+    let offset = params.offset.min(10_000);
+
+    // Try standalone store first
     if let Some(sessions) = &state.sessions {
-        let limit = params.limit.min(500);
-        let offset = params.offset.min(10_000);
         let fetch_count = match offset.checked_add(limit) {
             Some(n) => n,
             None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
@@ -355,18 +406,19 @@ pub async fn session_messages(
                 timestamp: m.timestamp.to_rfc3339(),
             })
             .collect();
-        return Json(messages).into_response();
+        if !messages.is_empty() {
+            return Json(messages).into_response();
+        }
+        // Fall through to gateway for old sessions
     }
 
-    // Proxy to gateway
-    if let Some(pm) = &state.process_manager {
-        if let Some((_profile_id, port)) = pm.first_api_port().await {
-            let path = format!(
-                "/sessions/{id}/messages?limit={}&offset={}",
-                params.limit, params.offset
-            );
-            return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
-        }
+    // Proxy to gateway (old sessions live there)
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!(
+            "/sessions/{id}/messages?limit={}&offset={}",
+            limit, offset
+        );
+        return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
     (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
@@ -382,6 +434,7 @@ pub struct MessageInfo {
 /// DELETE /api/sessions/:id -- delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if let Some(sessions) = &state.sessions {
@@ -397,11 +450,9 @@ pub async fn delete_session(
     }
 
     // Proxy to gateway
-    if let Some(pm) = &state.process_manager {
-        if let Some((_profile_id, port)) = pm.first_api_port().await {
-            let path = format!("/sessions/{id}");
-            return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
-        }
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/sessions/{id}");
+        return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
 
     (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
@@ -560,6 +611,39 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         uptime_secs: uptime.num_seconds(),
         agent_configured: state.agent.is_some(),
     })
+}
+
+/// GET /api/version — public version endpoint (no auth required).
+pub async fn version() -> Json<serde_json::Value> {
+    let version = env!("CARGO_PKG_VERSION");
+    let git_hash = option_env!("OCTOS_GIT_HASH").unwrap_or("");
+    let build_date = option_env!("OCTOS_BUILD_DATE").unwrap_or("");
+    let full = if git_hash.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}+{git_hash}")
+    };
+    Json(serde_json::json!({
+        "service": "octos",
+        "version": full,
+        "build_date": build_date,
+    }))
+}
+
+/// GET /health — public health check (no auth required).
+pub async fn health() -> Json<serde_json::Value> {
+    let version = env!("CARGO_PKG_VERSION");
+    let git_hash = option_env!("OCTOS_GIT_HASH").unwrap_or("");
+    let full = if git_hash.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}+{git_hash}")
+    };
+    Json(serde_json::json!({
+        "status": "healthy",
+        "service": "octos",
+        "version": full,
+    }))
 }
 
 #[cfg(test)]
