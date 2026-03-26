@@ -435,6 +435,13 @@ fn map_anthropic_sse(
                 _ => StopReason::EndTurn,
             };
             let output_tokens = data["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
+            // Some providers (Z.AI) report input_tokens in message_delta instead of
+            // message_start. Use the delta value if it's non-zero.
+            if let Some(t) = data["usage"]["input_tokens"].as_u64() {
+                if t > 0 {
+                    state.input_tokens = t as u32;
+                }
+            }
             vec![
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: state.input_tokens,

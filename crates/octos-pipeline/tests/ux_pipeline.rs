@@ -58,6 +58,7 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         provider_policy: None,
         plugin_dirs: vec![],
         status_bridge: None,
+        shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

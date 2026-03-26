@@ -70,10 +70,16 @@ pub struct CodergenHandler {
     provider_router: Option<Arc<ProviderRouter>>,
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CodergenHandler {
-    pub fn new(llm: Arc<dyn LlmProvider>, memory: Arc<EpisodeStore>, working_dir: PathBuf) -> Self {
+    pub fn new(
+        llm: Arc<dyn LlmProvider>,
+        memory: Arc<EpisodeStore>,
+        working_dir: PathBuf,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             llm,
             memory,
@@ -81,6 +87,7 @@ impl CodergenHandler {
             provider_router: None,
             provider_policy: None,
             plugin_dirs: Vec::new(),
+            shutdown,
         }
     }
 
@@ -223,7 +230,8 @@ impl Handler for CodergenHandler {
         let worker =
             octos_agent::Agent::new(worker_id.clone(), provider, tools, self.memory.clone())
                 .with_config(config)
-                .with_system_prompt(system_prompt);
+                .with_system_prompt(system_prompt)
+                .with_shutdown(self.shutdown.clone());
 
         let task = Task::new(
             TaskKind::Code {
@@ -236,7 +244,15 @@ impl Handler for CodergenHandler {
             },
         );
 
-        info!(node = %node.id, worker = %worker_id, "executing codergen node");
+        info!(
+            node = %node.id,
+            worker = %worker_id,
+            model = node.model.as_deref().unwrap_or("default"),
+            tools = node.tools.join(","),
+            timeout_secs = node.timeout_secs.unwrap_or(0),
+            max_output_tokens = max_tokens.unwrap_or(0),
+            "executing codergen node"
+        );
 
         match worker.run_task(&task).await {
             Ok(result) => Ok(NodeOutcome {

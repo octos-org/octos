@@ -231,6 +231,9 @@ impl Tool for RunPipelineTool {
             .unwrap_or_else(|e| e.into_inner())
             .take();
 
+        // Shutdown signal for cancelling all pipeline workers on timeout/drop.
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
@@ -239,6 +242,7 @@ impl Tool for RunPipelineTool {
             provider_policy: self.provider_policy.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
             status_bridge,
+            shutdown: shutdown.clone(),
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
@@ -249,14 +253,19 @@ impl Tool for RunPipelineTool {
             Duration::from_secs(timeout_secs),
             executor.run(&dot_content, &input.input, &input.variables),
         )
-        .await
-        .map_err(|_| {
-            eyre::eyre!(
-                "pipeline timed out after {}s (timeout_secs={})",
-                timeout_secs,
-                timeout_secs
-            )
-        })??;
+        .await;
+
+        // Signal shutdown to all workers regardless of how we finished
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+
+        let result = result
+            .map_err(|_| {
+                eyre::eyre!(
+                    "pipeline timed out after {}s (timeout_secs={})",
+                    timeout_secs,
+                    timeout_secs
+                )
+            })??;
 
         let summary = result
             .node_summaries

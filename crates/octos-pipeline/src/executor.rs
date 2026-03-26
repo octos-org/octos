@@ -90,6 +90,9 @@ pub struct ExecutorConfig {
     pub plugin_dirs: Vec<PathBuf>,
     /// Optional status bridge for live progress updates to messaging channels.
     pub status_bridge: Option<PipelineStatusBridge>,
+    /// Shared shutdown signal — set to true to cancel all pipeline workers.
+    /// Propagated to each worker agent's shutdown flag.
+    pub shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -620,6 +623,7 @@ impl PipelineExecutor {
             self.config.default_provider.clone(),
             self.config.memory.clone(),
             self.config.working_dir.clone(),
+            self.config.shutdown.clone(),
         )
         .with_provider_policy(self.config.provider_policy.clone())
         .with_plugin_dirs(self.config.plugin_dirs.clone());
@@ -1548,6 +1552,7 @@ mod tests {
             provider_policy: None,
             plugin_dirs: vec![],
             status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
