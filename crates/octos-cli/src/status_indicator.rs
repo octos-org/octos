@@ -173,6 +173,7 @@ impl StatusHandle {
         let chat_id = self.chat_id.clone();
 
         let cleanup = async move {
+            let _ = channel.stop_typing(&chat_id).await;
             let mid = msg_id.lock().await.take();
             if let Some(mid) = mid {
                 if let Err(e) = channel.delete_message(&chat_id, &mid).await {
@@ -519,6 +520,47 @@ mod tests {
         async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct StopTypingChannel {
+        stop_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for StopTypingChannel {
+        fn name(&self) -> &str {
+            "stop-typing"
+        }
+        async fn start(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<octos_core::InboundMessage>,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+            Ok(())
+        }
+        async fn stop_typing(&self, _chat_id: &str) -> eyre::Result<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn should_stop_typing_on_stop() {
+        let channel = Arc::new(StopTypingChannel::default());
+        let status_handle = StatusHandle {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status_msg_id: Arc::new(Mutex::new(None::<String>)),
+            channel: channel.clone(),
+            chat_id: "test_chat".to_string(),
+            join_handle: None,
+        };
+
+        status_handle.stop().await;
+
+        assert_eq!(channel.stop_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Channel where delete_message blocks for 60 seconds (simulates hung API).
