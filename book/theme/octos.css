@@ -14,7 +14,7 @@
 */
 
 /* ============ Light Theme (default) ============ */
-.light {
+.light, html:not(.js) {
   --bg: #F4FAFB;
   --fg: #1A2F38;
   --sidebar-bg: #0B3D4E;
@@ -43,7 +43,7 @@
 }
 
 /* ============ Dark Theme (Ayu-inspired ocean) ============ */
-.ayu, .navy, .coal {
+html.ayu, html.navy, html.coal, .ayu, .navy, .coal {
   --bg: #0A2530;
   --fg: #D4EEF2;
   --sidebar-bg: #071C25;
@@ -147,23 +147,23 @@ code, pre code {
   color: #1A6B7A;
 }
 
-.ayu .content h1,
-.navy .content h1,
-.coal .content h1 {
+html.ayu .content h1,
+html.navy .content h1,
+html.coal .content h1 {
   color: #D4EEF2;
   border-bottom-color: #F27A8A;
 }
 
-.ayu .content h2,
-.navy .content h2,
-.coal .content h2 {
+html.ayu .content h2,
+html.navy .content h2,
+html.coal .content h2 {
   color: #7DD4C0;
   border-bottom-color: #1A4A58;
 }
 
-.ayu .content h3,
-.navy .content h3,
-.coal .content h3 {
+html.ayu .content h3,
+html.navy .content h3,
+html.coal .content h3 {
   color: #7DD4C0;
 }
 
@@ -187,7 +187,7 @@ code, pre code {
   padding: 16px;
 }
 
-.light .content pre {
+html.light .content pre, html:not(.js) .content pre {
   background: #0B3D4E;
   color: #D4EEF2;
 }
@@ -198,7 +198,7 @@ code, pre code {
   font-size: 0.88em;
 }
 
-.light .content code:not(pre code) {
+html.light .content code:not(pre code), html:not(.js) .content code:not(pre code) {
   background: #E8F6F8;
   color: #D4566A;
 }
@@ -220,7 +220,7 @@ code, pre code {
   text-align: left;
 }
 
-.light .content table th {
+html.light .content table th, html:not(.js) .content table th {
   color: #F4FAFB;
 }
 
@@ -271,7 +271,7 @@ code, pre code {
   border-bottom: 1px solid var(--table-border-color);
 }
 
-.light .menu-bar {
+html.light .menu-bar, html:not(.js) .menu-bar {
   background: #FFFFFF;
 }
 
