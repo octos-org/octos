@@ -33,6 +33,7 @@ scripts/deploy.sh
 *.md
 !README.md
 !README-zh.md
+!ORG-README.md
 !CLAUDE.md
 !CHANGELOG.md
 !docs/**/*.md

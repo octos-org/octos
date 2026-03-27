@@ -1,10 +1,18 @@
-# Octos
+# Octos 🐙
 
 > Like an octopus — 9 brains (1 central + 8 in each arm), every arm thinks independently, but they share one brain.
 
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
 31MB static binary. 91 REST endpoints. 14 LLM providers. 14 messaging channels. Multi-tenant. Zero dependencies.
+
+## What is Octos?
+
+Octos is an open-source AI agent platform that turns any LLM into a multi-channel, multi-user intelligent assistant. You deploy a single Rust binary, connect your LLM API keys and messaging channels (Telegram, Discord, Slack, WhatsApp, Email, WeChat, and more), and Octos handles everything else — conversation routing, tool execution, memory, provider failover, and multi-tenant isolation.
+
+Think of it as the **backend operating system for AI agents**. Instead of building a chatbot from scratch for each use case, you configure Octos profiles — each with their own system prompt, model, tools, and channels — and manage them all through a web dashboard or REST API. A small team can run hundreds of specialized AI agents on a single machine.
+
+Octos is built for people who need more than a personal assistant: teams deploying AI for customer support across WhatsApp and Telegram, developers building AI-powered products on top of a REST API, researchers orchestrating multi-step research pipelines with different LLMs at each stage, or families sharing a single AI setup with per-person customization.
 
 ## Why Octos
 
