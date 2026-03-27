@@ -9,6 +9,7 @@
 # Options:
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
 #   --frps-token TOKEN       frps auth token
+#   --frps-token-file FILE   Read frps auth token from FILE
 #   --frps-server ADDR       frps server address (default: 163.192.33.32)
 #   --ssh-port PORT          SSH tunnel remote port (default: 6001)
 #   --auth-token TOKEN       Dashboard auth token (default: auto-generated)
@@ -30,6 +31,7 @@ FRPC_VERSION="0.61.1"
 
 TENANT_NAME=""
 FRPS_TOKEN=""
+FRPS_TOKEN_FILE=""
 FRPS_SERVER="163.192.33.32"
 SSH_PORT="6001"
 AUTH_TOKEN=""
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --tenant-name)   TENANT_NAME="$2"; shift 2 ;;
         --frps-token)    FRPS_TOKEN="$2"; shift 2 ;;
+        --frps-token-file) FRPS_TOKEN_FILE="$2"; shift 2 ;;
         --frps-server)   FRPS_SERVER="$2"; shift 2 ;;
         --ssh-port)      SSH_PORT="$2"; shift 2 ;;
         --auth-token)    AUTH_TOKEN="$2"; shift 2 ;;
@@ -74,7 +77,7 @@ if [ "$RUN_DOCTOR" = true ]; then
     DOCTOR_ISSUES=0
     err() { echo "    FAIL: $1"; DOCTOR_ISSUES=$((DOCTOR_ISSUES + 1)); }
 else
-    err() { echo "    ERROR: $1"; echo ""; echo "    Run with --doctor to diagnose: bash install.sh --doctor"; exit 1; }
+    err() { echo "    ERROR: $1"; echo ""; echo "    Run with --doctor to diagnose:"; echo "      curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --doctor"; exit 1; }
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -92,7 +95,12 @@ if [ "$RUN_DOCTOR" = true ]; then
             ok "version: $("$OCTOS_BIN" --version 2>&1 | head -1)"
         else
             err "binary exists but failed to run"
-            hint "Try: codesign -s - $OCTOS_BIN"
+            if [ "$OS" = "Darwin" ]; then
+                hint "Try: xattr -d com.apple.quarantine $OCTOS_BIN && codesign -s - $OCTOS_BIN"
+            else
+                hint "Try: chmod +x $OCTOS_BIN"
+                hint "Check dependencies: ldd $OCTOS_BIN"
+            fi
             hint "Or re-run install.sh"
         fi
     else
@@ -202,11 +210,13 @@ if [ "$RUN_DOCTOR" = true ]; then
             PLIST="/Library/LaunchDaemons/io.octos.serve.plist"
             if [ -f "$PLIST" ]; then
                 ok "LaunchDaemon plist exists: $PLIST"
-                if sudo launchctl print system/io.octos.serve &>/dev/null 2>&1; then
-                    ok "service is loaded"
+                # Avoid sudo during diagnostics — check if the process is running instead
+                if pgrep -f "octos serve" &>/dev/null; then
+                    ok "service appears loaded (process running)"
                 else
-                    warn "plist exists but service is not loaded"
-                    hint "Load it: sudo launchctl load $PLIST"
+                    warn "plist exists but service does not appear to be running"
+                    hint "Check: sudo launchctl print system/io.octos.serve"
+                    hint "Load:  sudo launchctl load $PLIST"
                 fi
             else
                 warn "no LaunchDaemon plist found"
@@ -495,6 +505,7 @@ if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; };
     case "$ARCH" in
         x86_64)        FRP_ARCH="amd64" ;;
         aarch64|arm64) FRP_ARCH="arm64" ;;
+        *)             err "Unsupported architecture for frpc: $ARCH" ;;
     esac
 
     echo ""
@@ -970,21 +981,24 @@ if [ "$SKIP_TUNNEL" = false ]; then
         fi
     fi
 
-    if [ -z "$FRPS_TOKEN" ]; then
-        TOKEN_FILE="$HOME/home/orcl-vps/frps-token.txt"
-        if [ -f "$TOKEN_FILE" ]; then
-            FRPS_TOKEN=$(cat "$TOKEN_FILE")
-            echo "    frps token loaded from $TOKEN_FILE"
+    if [ -z "$FRPS_TOKEN" ] && [ -n "$FRPS_TOKEN_FILE" ]; then
+        if [ -f "$FRPS_TOKEN_FILE" ]; then
+            FRPS_TOKEN=$(cat "$FRPS_TOKEN_FILE")
+            echo "    frps token loaded from $FRPS_TOKEN_FILE"
         else
-            echo ""
-            echo "    Enter the frps auth token (press Enter to use placeholder):"
-            printf "    > "
-            read -r FRPS_TOKEN < /dev/tty
-            if [ -z "$FRPS_TOKEN" ]; then
-                FRPS_TOKEN="CHANGE_ME"
-                TOKEN_PLACEHOLDER=true
-                warn "Using placeholder token — frpc will not connect until updated"
-            fi
+            err "token file not found: $FRPS_TOKEN_FILE"
+        fi
+    fi
+
+    if [ -z "$FRPS_TOKEN" ]; then
+        echo ""
+        echo "    Enter the frps auth token (press Enter to use placeholder):"
+        printf "    > "
+        read -r FRPS_TOKEN < /dev/tty
+        if [ -z "$FRPS_TOKEN" ]; then
+            FRPS_TOKEN="CHANGE_ME"
+            TOKEN_PLACEHOLDER=true
+            warn "Using placeholder token — frpc will not connect until updated"
         fi
     fi
 
@@ -1190,5 +1204,5 @@ else
     echo "    Start:   sudo systemctl start octos-serve"
 fi
 echo ""
-echo "  Troubleshoot: bash install.sh --doctor"
+echo "  Troubleshoot: curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --doctor"
 echo ""

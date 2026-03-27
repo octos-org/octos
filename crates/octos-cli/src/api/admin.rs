@@ -2762,15 +2762,22 @@ pub async fn tenant_setup_script(
 #   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash -s -- --frps-token <token>
 set -euo pipefail
 
-# frps auth token — must be provided as env var or argument
-FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
+# frps auth token — must be provided as env var, flag, or positional argument
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
+        *)            FRPS_TOKEN="${{FRPS_TOKEN:-$1}}"; shift ;;
+    esac
+done
+FRPS_TOKEN="${{FRPS_TOKEN:-}}"
 if [ -z "$FRPS_TOKEN" ]; then
     echo ""
     echo "ERROR: frps auth token required."
     echo ""
     echo "Usage:"
-    echo "  FRPS_TOKEN=<token> bash setup.sh"
-    echo "  bash setup.sh <token>"
+    echo "  curl ... | FRPS_TOKEN=<token> bash"
+    echo "  curl ... | bash -s -- --frps-token <token>"
+    echo "  curl ... | bash -s -- <token>"
     echo ""
     echo "Your admin should provide this token during onboarding."
     exit 1
