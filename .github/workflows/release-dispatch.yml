@@ -72,5 +72,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          files: octos-bundle-aarch64-apple-darwin.tar.gz
+          files: |
+            octos-bundle-aarch64-apple-darwin.tar.gz
+            scripts/install.sh
           body_path: RELEASE_NOTES.md

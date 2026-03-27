@@ -2747,163 +2747,50 @@ pub async fn tenant_setup_script(
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let port = state.frps_port.unwrap_or(7000);
 
-    // NOTE: frpc config is NOT embedded — the frps master token must be
-    // provided as FRPS_TOKEN env var or argument when running the setup script.
+    // Generate a wrapper script that downloads and runs install.sh with
+    // all tenant-specific values pre-filled. The frps master token must
+    // still be provided by the user for security.
+    let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
 
-    // Generate a self-contained setup script
     let script = format!(
         r#"#!/usr/bin/env bash
-# Auto-generated setup script for tenant: {name}
-# Subdomain: {subdomain}.{domain}
-# SSH tunnel port: {ssh_port}
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh with your tenant configuration pre-filled.
 #
-# Usage: curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash
+# Usage:
+#   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | FRPS_TOKEN=<token> bash
+#   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash -s -- --frps-token <token>
 set -euo pipefail
-
-SUBDOMAIN="{subdomain}"
-FRPS_SERVER="{server}"
-FRPS_PORT={port}
-LOCAL_PORT={local_port}
-SSH_PORT={ssh_port}
-DOMAIN="{domain}"
 
 # frps auth token — must be provided as env var or argument
 FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
 if [ -z "$FRPS_TOKEN" ]; then
+    echo ""
     echo "ERROR: frps auth token required."
-    echo "Usage: FRPS_TOKEN=<token> bash setup.sh"
-    echo "   or: bash setup.sh <token>"
+    echo ""
+    echo "Usage:"
+    echo "  FRPS_TOKEN=<token> bash setup.sh"
+    echo "  bash setup.sh <token>"
+    echo ""
+    echo "Your admin should provide this token during onboarding."
     exit 1
 fi
 
-echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
-
-# ── Install frpc ──────────────────────────────────────────────────────
-FRPC_VERSION="0.61.1"
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)  FRP_ARCH="amd64" ;;
-    aarch64|arm64) FRP_ARCH="arm64" ;;
-    *) echo "Unsupported arch: $ARCH"; exit 1 ;;
-esac
-
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-if [ ! -f /usr/local/bin/frpc ]; then
-    echo "    Installing frpc v${{FRPC_VERSION}}..."
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
-    TARBALL="frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}.tar.gz"
-    curl -fsSL -o "$TMPDIR/$TARBALL" \
-        "https://github.com/fatedier/frp/releases/download/v${{FRPC_VERSION}}/$TARBALL"
-    tar -xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
-    sudo install -m 0755 "$TMPDIR/frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}/frpc" /usr/local/bin/frpc
-    echo "    frpc installed"
-else
-    echo "    frpc already installed"
-fi
-
-# ── Write frpc config ────────────────────────────────────────────────
-sudo mkdir -p /etc/frp
-sudo tee /etc/frp/frpc.toml > /dev/null << FRPC_EOF
-serverAddr = "$FRPS_SERVER"
-serverPort = $FRPS_PORT
-auth.method = "token"
-auth.token = "$FRPS_TOKEN"
-log.to = "/var/log/frpc.log"
-log.level = "info"
-log.maxDays = 7
-
-[[proxies]]
-name = "${{SUBDOMAIN}}-web"
-type = "http"
-localPort = $LOCAL_PORT
-customDomains = ["${{SUBDOMAIN}}.$DOMAIN"]
-
-[[proxies]]
-name = "${{SUBDOMAIN}}-ssh"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 22
-remotePort = $SSH_PORT
-FRPC_EOF
-echo "    frpc config written to /etc/frp/frpc.toml"
-
-# ── Create launchd service (macOS) or systemd service (Linux) ────────
-if [ "$OS" = "darwin" ]; then
-    PLIST_PATH="$HOME/Library/LaunchAgents/io.octos.frpc.plist"
-    mkdir -p "$HOME/Library/LaunchAgents"
-    cat > "$PLIST_PATH" << PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.octos.frpc</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/frpc</string>
-        <string>-c</string>
-        <string>/etc/frp/frpc.toml</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/frpc.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/frpc.log</string>
-</dict>
-</plist>
-PLIST_EOF
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    launchctl load "$PLIST_PATH"
-    echo "    launchd service loaded (io.octos.frpc)"
-else
-    sudo tee /etc/systemd/system/frpc.service > /dev/null << SYSTEMD_EOF
-[Unit]
-Description=frpc tunnel client for octos
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD_EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable frpc
-    sudo systemctl restart frpc
-    echo "    systemd service started (frpc)"
-fi
-
-# ── Verify tunnel ────────────────────────────────────────────────────
-echo ""
-echo "==> Tunnel setup complete!"
-echo "    Dashboard: https://${{SUBDOMAIN}}.${{DOMAIN}}"
-echo "    SSH:       ssh -p ${{SSH_PORT}} $(whoami)@${{DOMAIN}}"
-echo ""
-echo "    Waiting 5s for tunnel to establish..."
-sleep 5
-if curl -sf --max-time 5 "http://localhost:${{LOCAL_PORT}}/api/status" > /dev/null 2>&1; then
-    echo "    Local octos is running on port ${{LOCAL_PORT}}"
-else
-    echo "    NOTE: octos serve is not running on port ${{LOCAL_PORT}} yet"
-    echo "    Start it with: octos serve --port ${{LOCAL_PORT}}"
-fi
+curl -fsSL "{install_url}" | bash -s -- \
+    --tenant-name "{subdomain}" \
+    --frps-token "$FRPS_TOKEN" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}" \
+    --auth-token "{auth_token}"
 "#,
-        name = tenant.name,
         subdomain = tenant.subdomain,
         domain = domain,
         server = server,
-        port = port,
-        local_port = tenant.local_port,
         ssh_port = tenant.ssh_port,
         id = tenant.id,
+        install_url = install_url,
+        auth_token = tenant.auth_token,
     );
 
     Ok(script)

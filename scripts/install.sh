@@ -3,8 +3,8 @@
 # Self-contained: no repo clone, Rust, or Node.js needed.
 #
 # Usage:
-#   curl -fsSL https://octos-cloud.org/install.sh | bash
-#   curl -fsSL https://octos-cloud.org/install.sh | bash -s -- --tenant-name alice --frps-token <token>
+#   curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --tenant-name alice --frps-token <token>
 #
 # Options:
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
@@ -17,6 +17,7 @@
 #   --prefix DIR             Install prefix (default: ~/.octos/bin)
 #   --no-tunnel              Skip frpc tunnel setup
 #   --uninstall              Remove octos and frpc services and binaries
+#   --doctor                 Diagnose installation and service health
 
 set -euo pipefail
 
@@ -35,6 +36,7 @@ AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
 SKIP_TUNNEL=false
 UNINSTALL=false
+RUN_DOCTOR=false
 
 # ── Parse arguments ───────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -49,8 +51,9 @@ while [ $# -gt 0 ]; do
         --prefix)        PREFIX="$2"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
+        --doctor)        RUN_DOCTOR=true; shift ;;
         --help|-h)
-            sed -n '2,20s/^# //p' "$0"
+            sed -n '2,22s/^# //p' "$0"
             exit 0
             ;;
         *)
@@ -64,9 +67,344 @@ ARCH="$(uname -m)"
 section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
-err()     { echo "    ERROR: $1"; exit 1; }
+hint()    { echo "          -> $1"; }
 
-# ── Uninstall ─────────────────────────────────────────────────────────
+# err() exits during install but not during doctor
+if [ "$RUN_DOCTOR" = true ]; then
+    DOCTOR_ISSUES=0
+    err() { echo "    FAIL: $1"; DOCTOR_ISSUES=$((DOCTOR_ISSUES + 1)); }
+else
+    err() { echo "    ERROR: $1"; echo ""; echo "    Run with --doctor to diagnose: bash install.sh --doctor"; exit 1; }
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# ── Doctor mode ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+if [ "$RUN_DOCTOR" = true ]; then
+
+    # ── Binary ───────────────────────────────────────────────────────
+    section "octos binary"
+
+    OCTOS_BIN="$PREFIX/octos"
+    if [ -f "$OCTOS_BIN" ]; then
+        ok "found: $OCTOS_BIN"
+        if "$OCTOS_BIN" --version &>/dev/null; then
+            ok "version: $("$OCTOS_BIN" --version 2>&1 | head -1)"
+        else
+            err "binary exists but failed to run"
+            hint "Try: codesign -s - $OCTOS_BIN"
+            hint "Or re-run install.sh"
+        fi
+    else
+        if command -v octos &>/dev/null; then
+            FOUND="$(command -v octos)"
+            warn "not found at $OCTOS_BIN, but found at $FOUND"
+            hint "Set OCTOS_PREFIX or add $PREFIX to PATH"
+        else
+            err "octos binary not found"
+            hint "Run install.sh to install"
+        fi
+    fi
+
+    # ── Data directory ───────────────────────────────────────────────
+    section "Data directory"
+
+    if [ -d "$DATA_DIR" ]; then
+        ok "found: $DATA_DIR"
+        if [ -f "$DATA_DIR/config.json" ]; then
+            ok "config.json exists"
+        else
+            warn "config.json missing"
+            hint "Run: octos init"
+        fi
+    else
+        err "$DATA_DIR does not exist"
+        hint "Run: octos init --defaults"
+    fi
+
+    # ── octos serve process ──────────────────────────────────────────
+    section "octos serve"
+
+    OCTOS_PID=$(pgrep -f "octos serve" 2>/dev/null | head -1 || true)
+    if [ -n "$OCTOS_PID" ]; then
+        OCTOS_CMD=$(ps -p "$OCTOS_PID" -o args= 2>/dev/null || true)
+        ok "running (PID: $OCTOS_PID)"
+        echo "    CMD: $OCTOS_CMD"
+    else
+        err "octos serve is not running"
+        case "$OS" in
+            Darwin)
+                hint "Start: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist"
+                hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
+                ;;
+            Linux)
+                hint "Start: sudo systemctl start octos-serve"
+                hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
+                ;;
+        esac
+    fi
+
+    # ── Port 8080 ────────────────────────────────────────────────────
+    section "Port 8080"
+
+    PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+    if [ -n "$PORT_OWNER" ]; then
+        PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $1}')
+        PORT_PID=$(echo "$PORT_OWNER" | awk '{print $2}')
+        if echo "$PORT_CMD" | grep -qi octos; then
+            ok "port 8080 held by octos (PID: $PORT_PID)"
+        else
+            err "port 8080 held by $PORT_CMD (PID: $PORT_PID) — not octos"
+            hint "Kill it: kill $PORT_PID"
+            hint "If it respawns, find its LaunchAgent/Daemon:"
+            hint "  grep -rl '$PORT_CMD' ~/Library/LaunchAgents/ /Library/LaunchDaemons/ 2>/dev/null"
+        fi
+    else
+        if [ -n "$OCTOS_PID" ]; then
+            err "octos serve is running but nothing is listening on 8080"
+            hint "Check if it's bound to a different port: ps -p $OCTOS_PID -o args="
+        else
+            warn "nothing listening on port 8080"
+        fi
+    fi
+
+    # ── Admin portal ─────────────────────────────────────────────────
+    section "Admin portal"
+
+    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:8080/admin/ 2>/dev/null || echo "000")
+    case "$HTTP_CODE" in
+        200)
+            ok "http://localhost:8080/admin/ responds 200"
+            ;;
+        000)
+            err "connection failed (server not reachable on localhost:8080)"
+            hint "Check 'octos serve' and 'Port 8080' sections above"
+            ;;
+        401|403)
+            warn "responds $HTTP_CODE (auth required)"
+            hint "Pass auth token: curl -H 'Authorization: Bearer <token>' http://localhost:8080/admin/"
+            ;;
+        404)
+            err "responds 404 (admin route not found)"
+            hint "Binary may be built without 'api' feature. Rebuild with: cargo build --features api"
+            ;;
+        *)
+            warn "responds HTTP $HTTP_CODE"
+            hint "Check logs: tail -20 $DATA_DIR/serve.log"
+            ;;
+    esac
+
+    # ── Service configuration ────────────────────────────────────────
+    section "Service configuration"
+
+    case "$OS" in
+        Darwin)
+            PLIST="/Library/LaunchDaemons/io.octos.serve.plist"
+            if [ -f "$PLIST" ]; then
+                ok "LaunchDaemon plist exists: $PLIST"
+                if sudo launchctl print system/io.octos.serve &>/dev/null 2>&1; then
+                    ok "service is loaded"
+                else
+                    warn "plist exists but service is not loaded"
+                    hint "Load it: sudo launchctl load $PLIST"
+                fi
+            else
+                warn "no LaunchDaemon plist found"
+                hint "Re-run install.sh to set up the service"
+            fi
+
+            # Check for legacy/conflicting plists
+            LEGACY_FOUND=false
+            for p in \
+                "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
+                "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.ominix-api.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.octos-serve.plist"; do
+                if [ -f "$p" ]; then
+                    err "legacy plist found: $p"
+                    hint "Remove: launchctl unload '$p' && rm -f '$p'"
+                    LEGACY_FOUND=true
+                fi
+            done
+            if [ "$LEGACY_FOUND" = false ]; then
+                ok "no legacy/conflicting plists"
+            fi
+            ;;
+
+        Linux)
+            UNIT="/etc/systemd/system/octos-serve.service"
+            if [ -f "$UNIT" ]; then
+                ok "systemd unit exists: $UNIT"
+                if systemctl is-active octos-serve &>/dev/null; then
+                    ok "service is active"
+                else
+                    warn "service is not active"
+                    hint "Start: sudo systemctl start octos-serve"
+                    hint "Check: sudo systemctl status octos-serve"
+                fi
+            else
+                warn "no systemd unit found"
+                hint "Re-run install.sh to set up the service"
+            fi
+            ;;
+    esac
+
+    # ── frpc tunnel ──────────────────────────────────────────────────
+    section "frpc tunnel"
+
+    TENANT=""
+    if [ -f /usr/local/bin/frpc ]; then
+        ok "frpc installed: $(/usr/local/bin/frpc --version 2>/dev/null || echo 'unknown version')"
+    else
+        warn "frpc not installed (tunnel not configured)"
+        hint "Re-run install.sh with tunnel options, or use --no-tunnel if not needed"
+    fi
+
+    FRPC_PID=$(pgrep -x frpc 2>/dev/null || true)
+    if [ -n "$FRPC_PID" ]; then
+        ok "frpc running (PID: $FRPC_PID)"
+    else
+        if [ -f /usr/local/bin/frpc ]; then
+            err "frpc installed but not running"
+            case "$OS" in
+                Darwin)
+                    hint "Start: sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist"
+                    ;;
+                Linux)
+                    hint "Start: sudo systemctl start frpc"
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ -f /etc/frp/frpc.toml ]; then
+        ok "frpc config: /etc/frp/frpc.toml"
+        TENANT=$(grep 'customDomains' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*\["\(.*\)"\].*/\1/')
+        if [ -n "$TENANT" ]; then
+            echo "    Tunnel: https://$TENANT"
+        fi
+        # Check for placeholder values
+        if grep -q 'CHANGE_ME' /etc/frp/frpc.toml 2>/dev/null; then
+            warn "frpc config contains placeholder token (CHANGE_ME)"
+            hint "Update: sudo nano /etc/frp/frpc.toml"
+            hint "Or re-run: bash install.sh --tenant-name <name> --frps-token <token>"
+        fi
+    elif [ -f /usr/local/bin/frpc ]; then
+        warn "frpc installed but no config at /etc/frp/frpc.toml"
+        hint "Re-run install.sh with --tenant-name and --frps-token"
+    fi
+
+    # Check frpc logs for errors
+    if [ -f /var/log/frpc.log ]; then
+        FRPC_ERRORS=$(tail -20 /var/log/frpc.log 2>/dev/null | grep -i "error\|failed\|refused" | tail -3)
+        if [ -n "$FRPC_ERRORS" ]; then
+            warn "recent frpc errors:"
+            echo "$FRPC_ERRORS" | while read -r line; do echo "      $line"; done
+            hint "Full log: tail -50 /var/log/frpc.log"
+        fi
+    fi
+
+    # ── Remote access ────────────────────────────────────────────────
+    section "Remote access"
+
+    ADMIN_OK=false
+    [ "$HTTP_CODE" = "200" ] && ADMIN_OK=true
+
+    FRPC_OK=false
+    [ -n "$FRPC_PID" ] && FRPC_OK=true
+
+    if [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = true ]; then
+        ok "admin portal works locally and frpc tunnel is running"
+        if [ -n "$TENANT" ]; then
+            echo "    Remote URL: https://$TENANT"
+        fi
+    elif [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = false ]; then
+        err "admin portal works locally but frpc is NOT running — remote access is down"
+        if [ ! -f /usr/local/bin/frpc ]; then
+            hint "frpc was never installed. Set up the tunnel:"
+            hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
+        elif [ ! -f /etc/frp/frpc.toml ]; then
+            hint "frpc is installed but not configured"
+            hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
+        else
+            hint "frpc is installed and configured but the process is not running"
+            case "$OS" in
+                Darwin)
+                    if [ -f /Library/LaunchDaemons/io.octos.frpc.plist ]; then
+                        hint "  Start: sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist"
+                    else
+                        hint "  No LaunchDaemon found. Re-run install.sh with tunnel options"
+                    fi
+                    ;;
+                Linux)
+                    hint "  Start: sudo systemctl start frpc"
+                    ;;
+            esac
+        fi
+    elif [ "$ADMIN_OK" = false ]; then
+        err "admin portal is not responding locally — fix octos serve first (see above)"
+        hint "Remote access depends on the local server working first"
+    fi
+
+    # ── Serve logs ───────────────────────────────────────────────────
+    section "Recent serve logs"
+
+    SERVE_LOG="$DATA_DIR/serve.log"
+    if [ -f "$SERVE_LOG" ]; then
+        SERVE_ERRORS=$(tail -30 "$SERVE_LOG" 2>/dev/null | grep -i "error\|panic\|Address already in use" | tail -5)
+        if [ -n "$SERVE_ERRORS" ]; then
+            warn "recent errors in serve.log:"
+            echo "$SERVE_ERRORS" | while read -r line; do echo "      $line"; done
+        else
+            ok "no recent errors in serve.log"
+        fi
+        echo "    Last 3 lines:"
+        tail -3 "$SERVE_LOG" 2>/dev/null | while read -r line; do echo "      $line"; done
+    else
+        warn "serve.log not found at $SERVE_LOG"
+    fi
+
+    # ── Runtime dependencies ─────────────────────────────────────────
+    section "Runtime dependencies"
+
+    command -v git &>/dev/null && ok "git $(git --version | awk '{print $3}')" || warn "git not found"
+    command -v node &>/dev/null && ok "Node.js $(node --version)" || warn "Node.js not found (optional)"
+    command -v ffmpeg &>/dev/null && ok "ffmpeg found" || warn "ffmpeg not found (optional)"
+
+    CHROME_FOUND=false
+    for chrome_bin in "google-chrome" "google-chrome-stable" "chromium-browser" "chromium"; do
+        if command -v "$chrome_bin" &>/dev/null; then
+            ok "Browser: $chrome_bin"
+            CHROME_FOUND=true
+            break
+        fi
+    done
+    if [ "$CHROME_FOUND" = false ] && [ "$OS" = "Darwin" ]; then
+        for app in "/Applications/Google Chrome.app" "/Applications/Chromium.app"; do
+            if [ -d "$app" ]; then
+                ok "Browser: $app"
+                CHROME_FOUND=true
+                break
+            fi
+        done
+    fi
+    [ "$CHROME_FOUND" = false ] && warn "Chromium/Chrome not found (optional)"
+
+    # ── Summary ──────────────────────────────────────────────────────
+    section "Summary"
+    if [ "$DOCTOR_ISSUES" -eq 0 ]; then
+        echo "    All checks passed. Everything looks healthy."
+    else
+        echo "    Found $DOCTOR_ISSUES issue(s). Review the hints above to fix them."
+    fi
+    echo ""
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# ── Uninstall mode ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
@@ -107,6 +445,183 @@ if [ "$UNINSTALL" = true ]; then
     exit 0
 fi
 
+# ══════════════════════════════════════════════════════════════════════
+# ── Tunnel-only update (when octos is already installed) ─────────────
+# ══════════════════════════════════════════════════════════════════════
+# If octos binary exists and user passed --tenant-name or --frps-token,
+# skip the full install and just update the tunnel configuration.
+
+if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; }; then
+    section "Updating tunnel configuration"
+
+    # Fill in missing values from existing frpc config
+    if [ -f /etc/frp/frpc.toml ]; then
+        if [ -z "$TENANT_NAME" ]; then
+            TENANT_NAME=$(grep 'customDomains' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*\["\(.*\)\..*"\].*/\1/')
+            if [ -n "$TENANT_NAME" ]; then
+                ok "tenant name from existing config: $TENANT_NAME"
+            fi
+        fi
+        if [ -z "$FRPS_TOKEN" ]; then
+            FRPS_TOKEN=$(grep 'auth.token' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            if [ -n "$FRPS_TOKEN" ]; then
+                ok "frps token from existing config: ${FRPS_TOKEN:0:8}..."
+            fi
+        fi
+        if [ "$SSH_PORT" = "6001" ]; then
+            EXISTING_SSH_PORT=$(grep 'remotePort' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *//')
+            if [ -n "$EXISTING_SSH_PORT" ] && [ "$EXISTING_SSH_PORT" != "6001" ]; then
+                SSH_PORT="$EXISTING_SSH_PORT"
+                ok "ssh port from existing config: $SSH_PORT"
+            fi
+        fi
+    fi
+
+    # Still missing? Prompt interactively
+    if [ -z "$TENANT_NAME" ]; then
+        echo "    Enter the tenant subdomain (e.g. 'alice' for alice.${TUNNEL_DOMAIN}):"
+        printf "    > "
+        read -r TENANT_NAME < /dev/tty
+        [ -z "$TENANT_NAME" ] && err "Tenant name is required"
+    fi
+    if [ -z "$FRPS_TOKEN" ]; then
+        echo "    Enter the frps auth token:"
+        printf "    > "
+        read -r FRPS_TOKEN < /dev/tty
+        [ -z "$FRPS_TOKEN" ] && err "frps token is required"
+    fi
+
+    # Detect architecture for frpc download
+    case "$ARCH" in
+        x86_64)        FRP_ARCH="amd64" ;;
+        aarch64|arm64) FRP_ARCH="arm64" ;;
+    esac
+
+    echo ""
+    echo "    Tunnel configuration:"
+    echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
+    echo "      frps server:  ${FRPS_SERVER}:7000"
+    echo "      frps token:   ${FRPS_TOKEN:0:8}..."
+    echo "      SSH port:     ${SSH_PORT}"
+
+    # Install frpc if missing
+    if [ ! -f /usr/local/bin/frpc ]; then
+        echo "    Installing frpc v${FRPC_VERSION}..."
+        FRP_OS=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
+        FRP_TARBALL="frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}.tar.gz"
+        FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/${FRP_TARBALL}"
+        FRP_TMP=$(mktemp -d /tmp/frpc-install.XXXXXX)
+        curl -fsSL -o "${FRP_TMP}/${FRP_TARBALL}" "$FRP_URL"
+        tar -xzf "${FRP_TMP}/${FRP_TARBALL}" -C "$FRP_TMP"
+        sudo mkdir -p /usr/local/bin
+        sudo cp "${FRP_TMP}/frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
+        sudo chmod 0755 /usr/local/bin/frpc
+        rm -rf "$FRP_TMP"
+        ok "frpc installed"
+    fi
+
+    # Write frpc config
+    FRPC_CONF_TMP=$(mktemp /tmp/frpc.toml.XXXXXX)
+    cat > "$FRPC_CONF_TMP" << EOF
+serverAddr = "${FRPS_SERVER}"
+serverPort = 7000
+auth.method = "token"
+auth.token = "${FRPS_TOKEN}"
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "${TENANT_NAME}-web"
+type = "http"
+localPort = 8080
+customDomains = ["${TENANT_NAME}.${TUNNEL_DOMAIN}"]
+
+[[proxies]]
+name = "${TENANT_NAME}-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = ${SSH_PORT}
+EOF
+    sudo mkdir -p /etc/frp
+    sudo mv "$FRPC_CONF_TMP" /etc/frp/frpc.toml
+    sudo chmod 644 /etc/frp/frpc.toml
+    ok "frpc config updated"
+
+    # Restart frpc service
+    case "$OS" in
+        Darwin)
+            FRPC_PLIST="/Library/LaunchDaemons/io.octos.frpc.plist"
+            if [ -f "$FRPC_PLIST" ]; then
+                sudo launchctl unload "$FRPC_PLIST" 2>/dev/null || true
+                sudo launchctl load "$FRPC_PLIST"
+            else
+                # Create the plist if it doesn't exist
+                FRPC_PLIST_TMP=$(mktemp /tmp/io.octos.frpc.plist.XXXXXX)
+                cat > "$FRPC_PLIST_TMP" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frpc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/frpc</string>
+        <string>-c</string>
+        <string>/etc/frp/frpc.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/frpc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/frpc.log</string>
+</dict>
+</plist>
+EOF
+                sudo mv "$FRPC_PLIST_TMP" "$FRPC_PLIST"
+                sudo chown root:wheel "$FRPC_PLIST"
+                sudo chmod 644 "$FRPC_PLIST"
+                sudo launchctl load "$FRPC_PLIST"
+            fi
+            ok "frpc restarted via launchd"
+            ;;
+        Linux)
+            if [ -f /etc/systemd/system/frpc.service ]; then
+                sudo systemctl restart frpc
+            else
+                sudo systemctl daemon-reload
+                sudo systemctl enable frpc
+                sudo systemctl start frpc
+            fi
+            ok "frpc restarted via systemd"
+            ;;
+    esac
+
+    # Verify
+    sleep 2
+    if pgrep -x frpc > /dev/null 2>&1; then
+        ok "frpc is running (PID: $(pgrep -x frpc))"
+    else
+        warn "frpc does not appear to be running"
+        echo "    Check logs: tail -f /var/log/frpc.log"
+    fi
+
+    echo ""
+    echo "    Tunnel: https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
+    echo "    SSH:    ssh -p ${SSH_PORT} $(whoami)@${TUNNEL_DOMAIN}"
+    echo ""
+    exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════
+# ── Install mode (default) ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+
 # ── Detect platform ──────────────────────────────────────────────────
 section "Detecting platform"
 
@@ -144,19 +659,20 @@ else
     esac
 fi
 
-# Node.js / npm — needed for skills with package.json (e.g. WhatsApp bridge, pptxgenjs)
+# Node.js / npm
 if command -v node &>/dev/null; then
     ok "Node.js $(node --version)"
 else
-    warn "Node.js not found (recommended for some skills)"
-    echo "    Install from https://nodejs.org or:"
+    warn "Node.js not found"
+    echo "    Enables: WhatsApp bridge, custom skills with package.json, pptxgenjs"
+    echo "    Install:"
     case "$OS" in
         Darwin) echo "      brew install node" ;;
         Linux)  echo "      curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
     esac
 fi
 
-# Chromium / Chrome — needed for browser tool and deep-crawl skill
+# Chromium / Chrome
 CHROME_FOUND=false
 for chrome_bin in "google-chrome" "google-chrome-stable" "chromium-browser" "chromium"; do
     if command -v "$chrome_bin" &>/dev/null; then
@@ -166,7 +682,6 @@ for chrome_bin in "google-chrome" "google-chrome-stable" "chromium-browser" "chr
     fi
 done
 if [ "$CHROME_FOUND" = false ] && [ "$OS" = "Darwin" ]; then
-    # Check macOS app bundles
     for app in "/Applications/Google Chrome.app" "/Applications/Chromium.app"; do
         if [ -d "$app" ]; then
             ok "Browser: $app"
@@ -176,44 +691,78 @@ if [ "$CHROME_FOUND" = false ] && [ "$OS" = "Darwin" ]; then
     done
 fi
 if [ "$CHROME_FOUND" = false ]; then
-    warn "Chromium/Chrome not found (recommended for browser tool and deep-crawl skill)"
+    warn "Chromium/Chrome not found"
+    echo "    Enables: browser tool (web browsing, screenshots), deep-crawl skill"
+    echo "    Install:"
     case "$OS" in
         Darwin) echo "      brew install --cask google-chrome" ;;
         Linux)  echo "      sudo apt-get install -y chromium-browser" ;;
     esac
 fi
 
-# ffmpeg — optional, for media/voice skills
+# ffmpeg
 if command -v ffmpeg &>/dev/null; then
     ok "ffmpeg found"
 else
-    warn "ffmpeg not found (optional: media/voice skills)"
+    warn "ffmpeg not found"
+    echo "    Enables: voice/audio skills, media transcoding"
+    echo "    Install:"
+    case "$OS" in
+        Darwin) echo "      brew install ffmpeg" ;;
+        Linux)  echo "      sudo apt-get install -y ffmpeg" ;;
+    esac
 fi
 
-# ── Resolve release version ──────────────────────────────────────────
+# ── Resolve download source ──────────────────────────────────────────
 section "Resolving release"
 
-if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-    if [ -z "$VERSION" ]; then
-        err "Could not determine latest release. Specify --version explicitly."
+TARBALL="octos-bundle-${TRIPLE}.tar.gz"
+DOWNLOAD_BASE="${OCTOS_DOWNLOAD_URL:-}"
+
+# Auto-detect: check if tarball is next to the script or in the current directory
+if [ -z "$DOWNLOAD_BASE" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    if [ -f "$SCRIPT_DIR/$TARBALL" ]; then
+        DOWNLOAD_BASE="file://$SCRIPT_DIR"
+    elif [ -f "./$TARBALL" ]; then
+        DOWNLOAD_BASE="file://$(pwd)"
     fi
 fi
-ok "version: $VERSION"
+
+if [ -n "$DOWNLOAD_BASE" ]; then
+    # Local file or self-hosted server
+    DOWNLOAD_URL="${DOWNLOAD_BASE}/${TARBALL}"
+    ok "source: $DOWNLOAD_URL"
+else
+    # Default: GitHub Releases
+    if [ "$VERSION" = "latest" ]; then
+        VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+            | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+        if [ -z "$VERSION" ]; then
+            err "Could not determine latest release. Specify --version explicitly."
+        fi
+    fi
+    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${TARBALL}"
+    ok "version: $VERSION"
+fi
 
 # ── Download and install octos ────────────────────────────────────────
 section "Installing octos"
 
-TARBALL="octos-bundle-${TRIPLE}.tar.gz"
-DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${TARBALL}"
-
-echo "    Downloading $TARBALL..."
 INSTALL_TMP=$(mktemp -d /tmp/octos-install.XXXXXX)
 trap 'rm -rf "$INSTALL_TMP"' EXIT
 
-if ! curl -fsSL -o "${INSTALL_TMP}/${TARBALL}" "$DOWNLOAD_URL"; then
-    err "Download failed. Check that release $VERSION has a binary for $TRIPLE."
+if [[ "$DOWNLOAD_URL" == file://* ]]; then
+    LOCAL_PATH="${DOWNLOAD_URL#file://}"
+    echo "    Copying from $LOCAL_PATH..."
+    if ! cp "$LOCAL_PATH" "${INSTALL_TMP}/${TARBALL}"; then
+        err "File not found: $LOCAL_PATH"
+    fi
+else
+    echo "    Downloading $TARBALL..."
+    if ! curl -fsSL -o "${INSTALL_TMP}/${TARBALL}" "$DOWNLOAD_URL"; then
+        err "Download failed. Check that release $VERSION has a binary for $TRIPLE."
+    fi
 fi
 
 tar -xzf "${INSTALL_TMP}/${TARBALL}" -C "$INSTALL_TMP"
@@ -226,12 +775,13 @@ for bin in "$INSTALL_TMP"/*; do
 done
 ok "binaries installed to $PREFIX"
 
-# Sign on macOS
+# Clear quarantine and sign on macOS
 if [ "$OS" = "Darwin" ]; then
     for bin in "$PREFIX"/*; do
+        xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
         codesign -s - "$bin" 2>/dev/null || true
     done
-    ok "binaries signed (ad-hoc)"
+    ok "quarantine cleared and binaries signed (ad-hoc)"
 fi
 
 # Add to PATH if needed
@@ -395,13 +945,29 @@ fi
 if [ "$SKIP_TUNNEL" = false ]; then
     section "Tunnel setup"
 
-    # Prompt for missing inputs
-    if [ -z "$TENANT_NAME" ]; then
+    # Prompt for missing inputs (use placeholders if skipped — frpc still gets installed)
+    TENANT_PLACEHOLDER=false
+    TOKEN_PLACEHOLDER=false
+
+    if [ -z "$TENANT_NAME" ] || [ -z "$FRPS_TOKEN" ]; then
         echo ""
+        echo "    Tunnel setup requires a tenant name, frps token, and SSH port."
+        echo "    If you don't have these yet, register at:"
+        echo "      https://${TUNNEL_DOMAIN}"
+        echo "    You'll receive your setup command with all values pre-filled."
+        echo ""
+    fi
+
+    if [ -z "$TENANT_NAME" ]; then
         echo "    Enter the tenant subdomain (e.g. 'alice' for alice.${TUNNEL_DOMAIN}):"
+        echo "    (press Enter to use placeholder — you can update later)"
         printf "    > "
         read -r TENANT_NAME < /dev/tty
-        [ -z "$TENANT_NAME" ] && err "Tenant name is required for tunnel setup"
+        if [ -z "$TENANT_NAME" ]; then
+            TENANT_NAME="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+            TENANT_PLACEHOLDER=true
+            warn "Using placeholder tenant: $TENANT_NAME"
+        fi
     fi
 
     if [ -z "$FRPS_TOKEN" ]; then
@@ -411,10 +977,14 @@ if [ "$SKIP_TUNNEL" = false ]; then
             echo "    frps token loaded from $TOKEN_FILE"
         else
             echo ""
-            echo "    Enter the frps auth token (provided by your admin):"
+            echo "    Enter the frps auth token (press Enter to use placeholder):"
             printf "    > "
             read -r FRPS_TOKEN < /dev/tty
-            [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
+            if [ -z "$FRPS_TOKEN" ]; then
+                FRPS_TOKEN="CHANGE_ME"
+                TOKEN_PLACEHOLDER=true
+                warn "Using placeholder token — frpc will not connect until updated"
+            fi
         fi
     fi
 
@@ -423,9 +993,27 @@ if [ "$SKIP_TUNNEL" = false ]; then
     echo "    Tunnel configuration:"
     echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "      frps server:  ${FRPS_SERVER}:7000"
-    echo "      frps token:   ${FRPS_TOKEN:0:8}..."
+    if [ "$TOKEN_PLACEHOLDER" = true ]; then
+        echo "      frps token:   CHANGE_ME (placeholder)"
+    else
+        echo "      frps token:   ${FRPS_TOKEN:0:8}..."
+    fi
     echo "      SSH port:     ${SSH_PORT}"
     echo "      Local port:   8080"
+
+    if [ "$TENANT_PLACEHOLDER" = true ] || [ "$TOKEN_PLACEHOLDER" = true ]; then
+        echo ""
+        echo "    frpc will be installed with placeholders. Update the config later:"
+        echo "      sudo nano /etc/frp/frpc.toml"
+        echo "    Then restart frpc:"
+        case "$OS" in
+            Darwin) echo "      sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist && sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist" ;;
+            Linux)  echo "      sudo systemctl restart frpc" ;;
+        esac
+        echo ""
+        echo "    Or re-run: bash install.sh --tenant-name <name> --frps-token <token>"
+    fi
+
     echo ""
     echo "    Press Enter to continue, or Ctrl+C to abort."
     read -r < /dev/tty
@@ -601,4 +1189,6 @@ else
     echo "    Stop:    sudo systemctl stop octos-serve"
     echo "    Start:   sudo systemctl start octos-serve"
 fi
+echo ""
+echo "  Troubleshoot: bash install.sh --doctor"
 echo ""

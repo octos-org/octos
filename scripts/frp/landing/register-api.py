@@ -370,115 +370,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._text_response(403, "you can only access your own tenant's setup script")
                 return
 
-        # Use the tenant's own tunnel_token (per-tenant), NOT the frps master token.
-        # The frps master token must be provided separately during bootstrap.
-        tunnel_token = tenant["tunnel_token"]
+        # Generate a one-liner that downloads and runs install.sh with
+        # all tenant-specific values pre-filled. The frps master token
+        # must still be provided by the user (not embedded in the script
+        # for security — the setup-script endpoint is authenticated but
+        # we don't want the master token in browser-visible responses).
+        install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh"
 
         script = f"""#!/usr/bin/env bash
 # Setup script for {tenant['subdomain']}.{DOMAIN}
-# NOTE: This script configures frpc with a per-tenant token placeholder.
-# You must provide the frps auth token during setup.
+# Downloads and runs install.sh with your tenant configuration pre-filled.
+#
+# Usage:
+#   curl -fsSL https://{DOMAIN}/api/admin/tenants/{tenant_id}/setup-script | FRPS_TOKEN=<token> bash
+#   curl -fsSL https://{DOMAIN}/api/admin/tenants/{tenant_id}/setup-script | bash -s -- --frps-token <token>
 set -euo pipefail
 
-SUBDOMAIN="{tenant['subdomain']}"
-FRPS_SERVER="{FRPS_SERVER}"
-FRPS_PORT=7000
-LOCAL_PORT={tenant['local_port']}
-SSH_PORT={tenant['ssh_port']}
-DOMAIN="{DOMAIN}"
-
-# frps auth token — must be provided as argument or environment variable
+# frps auth token — must be provided as env var or argument
 FRPS_TOKEN="${{FRPS_TOKEN:-${{1:-}}}}"
 if [ -z "$FRPS_TOKEN" ]; then
+    echo ""
     echo "ERROR: frps auth token required."
-    echo "Usage: FRPS_TOKEN=<token> bash setup.sh"
-    echo "   or: bash setup.sh <token>"
+    echo ""
+    echo "Usage:"
+    echo "  FRPS_TOKEN=<token> bash setup.sh"
+    echo "  bash setup.sh <token>"
+    echo ""
+    echo "Your admin should provide this token during onboarding."
     exit 1
 fi
 
-echo "==> Setting up octos tunnel for ${{SUBDOMAIN}}.${{DOMAIN}}"
-
-# Install frpc
-FRPC_VERSION="0.61.1"
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64) FRP_ARCH="amd64" ;;
-    aarch64|arm64) FRP_ARCH="arm64" ;;
-    *) echo "Unsupported: $ARCH"; exit 1 ;;
-esac
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-if [ ! -f /usr/local/bin/frpc ]; then
-    echo "    Installing frpc..."
-    TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
-    curl -fsSL -o "$TMPDIR/frp.tar.gz" \\
-        "https://github.com/fatedier/frp/releases/download/v${{FRPC_VERSION}}/frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}.tar.gz"
-    tar -xzf "$TMPDIR/frp.tar.gz" -C "$TMPDIR"
-    sudo install -m 0755 "$TMPDIR/frp_${{FRPC_VERSION}}_${{OS}}_${{FRP_ARCH}}/frpc" /usr/local/bin/frpc
-fi
-
-# Write config
-sudo mkdir -p /etc/frp
-sudo tee /etc/frp/frpc.toml > /dev/null << FRPCEOF
-serverAddr = "$FRPS_SERVER"
-serverPort = 7000
-auth.method = "token"
-auth.token = "$FRPS_TOKEN"
-log.to = "/var/log/frpc.log"
-log.level = "info"
-log.maxDays = 7
-
-[[proxies]]
-name = "{tenant['subdomain']}-web"
-type = "http"
-localPort = {tenant['local_port']}
-customDomains = ["{tenant['subdomain']}.{DOMAIN}"]
-
-[[proxies]]
-name = "{tenant['subdomain']}-ssh"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 22
-remotePort = {tenant['ssh_port']}
-FRPCEOF
-
-# Create service
-if [ "$OS" = "darwin" ]; then
-    mkdir -p ~/Library/LaunchAgents
-    cat > ~/Library/LaunchAgents/io.octos.frpc.plist << 'PEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-    <key>Label</key><string>io.octos.frpc</string>
-    <key>ProgramArguments</key><array>
-        <string>/usr/local/bin/frpc</string><string>-c</string><string>/etc/frp/frpc.toml</string>
-    </array>
-    <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/frpc.log</string>
-    <key>StandardErrorPath</key><string>/tmp/frpc.log</string>
-</dict></plist>
-PEOF
-    launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/io.octos.frpc.plist
-else
-    sudo tee /etc/systemd/system/frpc.service > /dev/null << 'SEOF'
-[Unit]
-Description=frpc tunnel
-After=network.target
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-SEOF
-    sudo systemctl daemon-reload && sudo systemctl enable frpc && sudo systemctl restart frpc
-fi
-
-echo ""
-echo "==> Done! Dashboard: https://${{SUBDOMAIN}}.${{DOMAIN}}"
-echo "    SSH: ssh -p ${{SSH_PORT}} $(whoami)@${{DOMAIN}}"
+curl -fsSL "{install_url}" | bash -s -- \\
+    --tenant-name "{tenant['subdomain']}" \\
+    --frps-token "$FRPS_TOKEN" \\
+    --ssh-port {tenant['ssh_port']} \\
+    --domain "{DOMAIN}" \\
+    --frps-server "{FRPS_SERVER}" \\
+    --auth-token "{tenant['auth_token']}"
 """
         self._text_response(200, script)
 
