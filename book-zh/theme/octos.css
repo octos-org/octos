@@ -282,25 +282,32 @@ html.light .menu-bar, html:not(.js) .menu-bar {
 }
 
 /* ============ Hide unused theme options ============ */
-#theme-list > button[id="rust"],
-#theme-list > button[id="coal"],
-#theme-list > button[id="navy"] {
-  display: none;
+#mdbook-theme-rust,
+#mdbook-theme-coal,
+#mdbook-theme-navy {
+  display: none !important;
 }
 
-/* Rename "Ayu" to "Dark" visually — via content replacement trick */
-#theme-list > button[id="ayu"] {
-  font-size: 0;
+/* Rename themes visually */
+#mdbook-theme-ayu {
+  font-size: 0 !important;
 }
-#theme-list > button[id="ayu"]::after {
+#mdbook-theme-ayu::after {
   content: "Ocean Dark";
   font-size: 14px;
 }
-#theme-list > button[id="light"] {
-  font-size: 0;
+#mdbook-theme-light {
+  font-size: 0 !important;
 }
-#theme-list > button[id="light"]::after {
+#mdbook-theme-light::after {
   content: "Ocean Light";
+  font-size: 14px;
+}
+#mdbook-theme-default_theme {
+  font-size: 0 !important;
+}
+#mdbook-theme-default_theme::after {
+  content: "Auto";
   font-size: 14px;
 }
 
