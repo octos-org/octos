@@ -155,19 +155,52 @@ if [ "$RUN_DOCTOR" = true ]; then
     # ── Port 8080 ────────────────────────────────────────────────────
     section "Port 8080"
 
-    PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
-    if [ -n "$PORT_OWNER" ]; then
-        PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $1}')
-        PORT_PID=$(echo "$PORT_OWNER" | awk '{print $2}')
+    # Detect port listener using available tool (lsof, ss, or netstat)
+    PORT_CMD=""
+    PORT_PID=""
+    PORT_CHECK_AVAILABLE=false
+    if command -v lsof &>/dev/null; then
+        PORT_CHECK_AVAILABLE=true
+        PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+        if [ -n "$PORT_OWNER" ]; then
+            PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $1}')
+            PORT_PID=$(echo "$PORT_OWNER" | awk '{print $2}')
+        fi
+    elif command -v ss &>/dev/null; then
+        PORT_CHECK_AVAILABLE=true
+        PORT_OWNER=$(ss -tlnp 'sport = :8080' 2>/dev/null | tail -n +2 | head -1 || true)
+        if [ -n "$PORT_OWNER" ]; then
+            # ss output: users:(("octos",pid=1234,fd=5))
+            PORT_CMD=$(echo "$PORT_OWNER" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')
+            PORT_PID=$(echo "$PORT_OWNER" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+        fi
+    elif command -v netstat &>/dev/null; then
+        PORT_CHECK_AVAILABLE=true
+        PORT_OWNER=$(netstat -tlnp 2>/dev/null | grep ':8080 ' | head -1 || true)
+        if [ -n "$PORT_OWNER" ]; then
+            # netstat output: ... 1234/octos
+            PORT_PID=$(echo "$PORT_OWNER" | awk '{print $NF}' | cut -d/ -f1)
+            PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $NF}' | cut -d/ -f2)
+        fi
+    else
+        warn "cannot check port 8080 (none of lsof, ss, or netstat found)"
+        if [ "$OS" = "Linux" ]; then
+            hint "Install one: sudo apt-get install -y iproute2   # provides ss"
+        fi
+    fi
+
+    if [ -n "$PORT_CMD" ]; then
         if echo "$PORT_CMD" | grep -qi octos; then
             ok "port 8080 held by octos (PID: $PORT_PID)"
         else
             err "port 8080 held by $PORT_CMD (PID: $PORT_PID) — not octos"
             hint "Kill it: kill $PORT_PID"
-            hint "If it respawns, find its LaunchAgent/Daemon:"
-            hint "  grep -rl '$PORT_CMD' ~/Library/LaunchAgents/ /Library/LaunchDaemons/ 2>/dev/null"
+            if [ "$OS" = "Darwin" ]; then
+                hint "If it respawns, find its LaunchAgent/Daemon:"
+                hint "  grep -rl '$PORT_CMD' ~/Library/LaunchAgents/ /Library/LaunchDaemons/ 2>/dev/null"
+            fi
         fi
-    else
+    elif [ "$PORT_CHECK_AVAILABLE" = true ]; then
         if [ -n "$OCTOS_PID" ]; then
             err "octos serve is running but nothing is listening on 8080"
             hint "Check if it's bound to a different port: ps -p $OCTOS_PID -o args="
@@ -455,6 +488,15 @@ if [ "$UNINSTALL" = true ]; then
     exit 0
 fi
 
+# ── Resolve --frps-token-file early (before tunnel-only check) ────────
+if [ -z "$FRPS_TOKEN" ] && [ -n "$FRPS_TOKEN_FILE" ]; then
+    if [ -f "$FRPS_TOKEN_FILE" ]; then
+        FRPS_TOKEN=$(cat "$FRPS_TOKEN_FILE")
+    else
+        err "token file not found: $FRPS_TOKEN_FILE"
+    fi
+fi
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Tunnel-only update (when octos is already installed) ─────────────
 # ══════════════════════════════════════════════════════════════════════
@@ -602,13 +644,29 @@ EOF
             ok "frpc restarted via launchd"
             ;;
         Linux)
-            if [ -f /etc/systemd/system/frpc.service ]; then
-                sudo systemctl restart frpc
-            else
+            FRPC_UNIT="/etc/systemd/system/frpc.service"
+            if [ ! -f "$FRPC_UNIT" ]; then
+                # Create the unit file if it doesn't exist
+                FRPC_UNIT_TMP=$(mktemp /tmp/frpc.service.XXXXXX)
+                cat > "$FRPC_UNIT_TMP" << EOF
+[Unit]
+Description=frpc tunnel client for octos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                sudo mv "$FRPC_UNIT_TMP" "$FRPC_UNIT"
                 sudo systemctl daemon-reload
                 sudo systemctl enable frpc
-                sudo systemctl start frpc
             fi
+            sudo systemctl restart frpc
             ok "frpc restarted via systemd"
             ;;
     esac

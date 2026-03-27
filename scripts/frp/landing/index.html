@@ -784,6 +784,7 @@ async function handleRegister(e) {
         document.getElementById('resultCmd').textContent =
             'curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \\\n' +
             '  --tenant-name ' + tenant.subdomain + ' \\\n' +
+            '  --auth-token ' + tenant.auth_token + ' \\\n' +
             '  --ssh-port ' + tenant.ssh_port + ' \\\n' +
             '  --frps-token <YOUR_FRPS_TOKEN>';
 

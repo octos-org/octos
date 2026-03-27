@@ -2745,7 +2745,6 @@ pub async fn tenant_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let port = state.frps_port.unwrap_or(7000);
 
     // Generate a wrapper script that downloads and runs install.sh with
     // all tenant-specific values pre-filled. The frps master token must
