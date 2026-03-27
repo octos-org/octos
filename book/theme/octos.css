@@ -42,8 +42,8 @@
   --color-scheme: light;
 }
 
-/* ============ Dark Theme (Ayu-inspired ocean) ============ */
-html.ayu, html.navy, html.coal, .ayu, .navy, .coal {
+/* ============ Dark Theme (Ayu-inspired ocean) — covers ALL dark themes ============ */
+html.ayu, html.navy, html.coal, html.rust, .ayu, .navy, .coal, .rust {
   --bg: #0A2530;
   --fg: #D4EEF2;
   --sidebar-bg: #071C25;
@@ -279,6 +279,29 @@ html.light .menu-bar, html:not(.js) .menu-bar {
 #searchbar {
   border-radius: 8px;
   padding: 8px 12px;
+}
+
+/* ============ Hide unused theme options ============ */
+#theme-list > button[id="rust"],
+#theme-list > button[id="coal"],
+#theme-list > button[id="navy"] {
+  display: none;
+}
+
+/* Rename "Ayu" to "Dark" visually — via content replacement trick */
+#theme-list > button[id="ayu"] {
+  font-size: 0;
+}
+#theme-list > button[id="ayu"]::after {
+  content: "Ocean Dark";
+  font-size: 14px;
+}
+#theme-list > button[id="light"] {
+  font-size: 0;
+}
+#theme-list > button[id="light"]::after {
+  content: "Ocean Light";
+  font-size: 14px;
 }
 
 /* ============ Mobile ============ */
