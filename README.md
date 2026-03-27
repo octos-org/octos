@@ -1,12 +1,29 @@
 # Octos
 
-> Like an octopus — every arm thinks independently, but they share one brain.
+> Like an octopus — 9 brains (1 central + 8 in each arm), every arm thinks independently, but they share one brain.
 
-Rust-native AI agent framework with multi-channel gateway, 14 LLM providers, web dashboard, and coding automation tools.
+**Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
+
+31MB static binary. 91 REST endpoints. 14 LLM providers. 14 messaging channels. Multi-tenant. Zero dependencies.
+
+## Why Octos
+
+Most agentic systems are single-tenant chat assistants — one user, one model, one conversation at a time. Octos is different:
+
+- **API-first Agentic OS**: 91 REST endpoints (chat, sessions, admin, profiles, skills, metrics, webhooks). Any frontend — web, mobile, CLI, CI/CD — can be built on top. Not locked to a chat window.
+- **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile runs as a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts let parents share config with children.
+- **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Each pipeline node can use a different LLM — cheap models for search, strong models for synthesis. Dynamic parallel fan-out spawns N concurrent workers at runtime.
+- **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge mode races 2 providers simultaneously. Lane mode scores providers by latency/error/quality/cost. Circuit breakers auto-disable degraded providers.
+- **LRU tool deferral**: 15 active tools for fast LLM reasoning, 34+ available on demand. The LLM calls `activate_tools` to load specialized tools mid-conversation. Idle tools auto-evict. No other agentic framework does this.
+- **5 queue modes per session**: Followup (FIFO), Collect (batch), Steer (latest only), Interrupt (cancel current), Speculative (concurrent agent when slow). Users control concurrency behavior in real-time via `/queue`.
+- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp. Background tasks buffer up to 50 messages; switch back and they flush automatically.
+- **3-layer memory**: Long-term (MEMORY.md + entity bank with abstracts, auto-injected), episodic (task outcomes in redb, vector-searchable by working directory), session (JSONL + LLM compaction at 40+ messages).
+- **Native office suite**: PPTX/DOCX/XLSX manipulation via pure Rust (zip + quick-xml). No LibreOffice dependency for basic operations.
+- **Sandbox isolation**: bwrap (Linux) + sandbox-exec (macOS) + Docker. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests. macOS Keychain for key storage. Constant-time token comparison.
 
 ## Documentation / 文档
 
-**[User Guide (English)](docs/user-guide.md)** | **[用户指南 (中文)](docs/user-guide-zh.md)**
+**[User Guide (English)](docs/user-guide.md)** | **[用户指南 (中文)](docs/user-guide-zh.md)** | **[中文 README](README-zh.md)**
 
 Comprehensive guides covering dashboard setup, LLM providers, tool configuration, profile management, bundled skills, platform skills (ASR/TTS), custom skill development, and more.
 
@@ -14,6 +31,7 @@ Comprehensive guides covering dashboard setup, LLM providers, tool configuration
 
 ## Table of Contents
 
+- [Why Octos](#why-octos)
 - [Features](#features)
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
@@ -59,45 +77,103 @@ Comprehensive guides covering dashboard setup, LLM providers, tool configuration
 
 ## Features
 
+### Core Architecture
+- **31MB static binary**: Pure Rust, zero runtime dependencies, builds on Linux x86_64, macOS ARM64, and Docker Alpine
+- **91 REST endpoints**: Full API for chat, sessions, admin, profiles, skills, metrics, webhooks, platform skills — build any UI on top
+- **SSE broadcasting**: Real-time tool events, LLM token streaming, and progress updates to any subscriber
+- **Prometheus + JSON metrics**: CPU, memory, per-provider latency, P95 — production-grade observability
+
+### LLM & Routing
 - **14 LLM providers**: Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Moonshot/Kimi, DashScope/Qwen, MiniMax, Zhipu/GLM, Z.AI, Nvidia NIM, Ollama, vLLM
-- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP), Twilio SMS, WeCom/WeChat Work
-- **Web dashboard**: Multi-user admin panel with per-user profile management, gateway controls, and live log streaming
-- **Email OTP auth**: Larksuite-style email verification code login for the dashboard
-- **OAuth login**: `octos auth login` with PKCE browser flow, device code flow, or paste-token
-- **Provider failover**: Automatic fallback chain across multiple LLM providers
-- **Sub-provider spawning**: Configure multiple LLMs for subagent use with cost/capability metadata
+- **3-layer failover**: RetryProvider (exponential backoff) → ProviderChain (multi-provider with circuit breaker) → AdaptiveRouter (metrics-driven scoring)
+- **Adaptive routing modes**: Off (static), Hedge (race 2 providers, take winner), Lane (score-based: latency 35%, error 30%, quality 20%, cost 15%)
+- **QoS ranking**: Orthogonal quality toggle — combine with any routing mode
+- **Auto-escalation**: Detects slow responses and auto-enables hedge + speculative queue
+- **Provider auto-detect**: `--model gpt-4o` automatically selects OpenAI
+- **Model catalog**: Programmatic discovery with capabilities, costs, and alias-based lookup
+
+### Multi-Tenant & Sub-Accounts
+- **High-density multi-tenancy**: 200+ profiles on 16GB Mac Mini. Each profile is a separate OS process with isolated memory, sessions, and data
+- **Family Plan sub-accounts**: Parent profiles share config with child profiles. `octos account create/start/stop`
+- **Web dashboard**: React SPA with per-user profile management, gateway controls, and live log streaming
+- **Email OTP auth**: Larksuite-style verification code login
+- **OAuth login**: PKCE browser flow, device code flow, or paste-token
+- **Fleet management**: REST API for starting/stopping/monitoring all profiles programmatically
+
+### Channels (14 built-in)
+- **Multi-channel gateway**: CLI, Telegram, Discord, Slack, WhatsApp, Feishu/Lark, Email (IMAP/SMTP), Twilio SMS, WeCom, WeCom Bot, WeChat, Matrix, QQ Bot, API
+- **Session control**: `/new`, `/s <name>`, `/sessions`, `/back`, `/delete` — works in every channel
+- **Pending messages**: Up to 50 messages buffered when session inactive, auto-flushed on switch
+- **Completion notifications**: Background tasks notify when done across sessions
+- **Cross-channel messaging**: Send messages from any channel to any other
+- **Message coalescing**: Channel-aware response splitting (Telegram 4096, Discord 2000, Slack limits)
+- **Media handling**: Auto-download photos, voice, audio, documents from all channels
 - **Vision support**: Send images to vision-capable LLMs (Anthropic, OpenAI, Gemini, OpenRouter)
-- **Voice transcription**: Groq Whisper auto-transcription for voice messages
-- **Media handling**: Auto-download photos, voice, audio, documents from channels
-- **Interactive chat**: Multi-turn conversation with readline history
-- **Single-message mode**: Non-interactive `octos chat --message "..."` for scripting
-- **Memory system**: Episodic memory, daily notes, long-term memory, hybrid BM25+vector search
-- **Skills system**: Markdown-based skills with YAML frontmatter + 6 built-in skills
-- **Sandbox isolation**: bwrap (Linux), sandbox-exec (macOS), Docker with resource limits
+
+### Agent Concurrency (5 Queue Modes)
+- **Followup**: FIFO — one message at a time
+- **Collect** (default): Batch all queued messages into single prompt
+- **Steer**: Keep only the newest message, discard older
+- **Interrupt**: Cancel current agent loop, process new message immediately
+- **Speculative**: Spawn concurrent agent task when slow — user never blocked, both results delivered
+- Per-session control via `/queue` command
+
+### Tools & LRU Deferral
+- **13 built-in tools**: Shell, read/write/edit files, glob, grep, list_dir, web search/fetch, git, browser, code structure
+- **12 agent-level tools**: Activate tools, spawn, deep search, synthesize, save/recall memory, manage skills, configure tools, messaging, cron
+- **8 bundled app-skills**: news, deep-search, deep-crawl, send-email, weather, account-manager, clock, voice
+- **LRU tool deferral**: 15 active max, idle auto-evict after 5 iterations. `activate_tools` loads specialized tools on demand. Unlimited catalog, finite context window.
+- **SafePolicy**: Deny rm -rf, dd, mkfs, fork bomb. Ask on sudo, git push --force
+- **Concurrent execution**: All tool calls run in parallel via `join_all()`
+- **Plugin system**: stdin/stdout JSON protocol — write plugins in any language
+
+### Pipeline Orchestration
+- **DOT-based workflows**: Define pipelines as Graphviz digraph with node attributes
+- **Per-node model selection**: Each node can use a different LLM (cheap for search, strong for synthesis)
+- **Dynamic parallel fan-out**: `DynamicParallel` handler — LLM planner generates N sub-tasks, executed concurrently
+- **Handler types**: LLM, CodeGen, DynamicParallel, Parallel, Converge
+- **Quality gates**: `goal_gate` checks output quality before proceeding
+- **Context fidelity**: Configurable context passing between nodes
+
+### Memory (3-Layer)
+- **Long-term memory**: MEMORY.md + daily notes (YYYY-MM-DD.md) + entity bank (bank/entities/*.md with abstracts). Auto-injected into system prompt
+- **Episodic memory**: Task outcomes (success/failure/blocked) stored in redb with files modified, key decisions. Vector-searchable by working directory
+- **Session memory**: JSONL transcripts with LRU cache (1000 sessions). LLM compaction at 40+ messages (keeps last 10 intact, atomic rewrite)
+- **Hybrid search**: HNSW vector index (16 connections, 10K capacity) + BM25 inverted index. Cosine 0.7 + BM25 0.3 blend
+- **Memory tools**: `save_memory` + `recall_memory` (entity-based, with merge-before-save rule)
+
+### Search
+- **6-provider failover**: Tavily → DuckDuckGo → Exa → Brave → You.com → Perplexity
+- **Deep search**: Parallel multi-query with 8 concurrent workers
+- **Deep research**: DOT pipeline — plan → search → analyze → synthesize (multi-LLM)
+- **Site crawl**: Full-site crawling with depth and page limits
+
+### Security
+- **Sandbox isolation**: bwrap (Linux) + sandbox-exec (macOS) + Docker with resource limits
+- **`deny(unsafe_code)`**: Workspace-wide, compile-time enforced
+- **67 prompt injection tests**: prompt_guard + sanitize modules
+- **macOS Keychain**: Secure key storage via `security` CLI
+- **Constant-time comparison**: `constant_time_eq` + `subtle` crate
 - **Tool policies**: Allow/deny lists, wildcard matching, named groups, provider-specific filtering
-- **Context compaction**: Token-aware message summarization when context window fills
-- **Config hot-reload**: SHA-256 change detection, live system prompt updates
-- **Message coalescing**: Channel-aware response splitting (Telegram/Discord/Slack limits)
-- **MCP integration**: JSON-RPC stdio transport for Model Context Protocol servers
-- **Cron & heartbeat**: Scheduled tasks (interval, one-shot, cron expressions) and periodic background checks
-- **Subagent spawning**: Background agents for long-running tasks
-- **Cross-channel messaging**: Send messages across any connected channel
-- **Provider auto-detect**: Automatically selects provider from model name
-- **Built-in tools**: Shell, file ops, glob, grep, list_dir, web search/fetch, message, spawn, cron, browser (feature-gated)
-- **Plugin system**: Load custom tools from `plugins/` directories
+- **SSRF protection**: Block private IP ranges
+- **Env sanitization**: Block sensitive environment variables
+
+### Voice & Office
+- **TTS**: Qwen3-TTS via voice-skill (voice cloning via reference audio)
+- **ASR**: Qwen3-ASR via ominix-api platform skill
+- **Office tools**: Native PPTX/DOCX/XLSX manipulation (zip + quick-xml) — extract, pack, validate, add slides, accept tracked changes
+- **Installable skills**: mofa-cards, mofa-comic, mofa-infographic, mofa-slides (17 styles, 4K) via octos-hub
+
+### Developer Experience
+- **1,477 tests**: Unit (15s) + integration (5min)
+- **cargo fmt + clippy**: Enforced in CI with `-D warnings`
+- **Typed LLM errors**: Structured hierarchy (rate limit, auth, context overflow) with retryability
+- **LLM middleware**: Composable interceptors (logging, cost tracking, caching)
+- **High-level client**: `generate()`, `generate_object()`, `generate_typed<T>()`, `stream()` APIs
 - **Config migration**: Versioned config with automatic migration
-- **Adaptive routing**: Metrics-driven provider selection with latency tracking and circuit breakers
-- **Self-updater**: Check and install updates via admin API
-- **Pipeline orchestration**: DOT-based multi-step workflow execution with human gates, supervision strategies, context fidelity control, and thread reuse
-- **Office tools**: DOCX/PPTX/XLSX manipulation (extract, pack, validate)
-- **Prompt injection guard**: Detection and sanitization of injection attempts
-- **8 bundled app-skills**: news, deep-search, deep-crawl, send-email, weather, account-manager, clock, ASR
-- **Typed LLM errors**: Structured error hierarchy (rate limit, auth, context overflow) with retryability classification
-- **LLM middleware**: Composable request/response interceptors (logging, cost tracking, caching)
-- **Model catalog**: Programmatic model discovery with capabilities, costs, and alias-based lookup
-- **High-level LLM client**: Ergonomic `generate()`, `generate_object()`, `generate_typed<T>()`, `stream()` APIs
-- **Execution environments**: Abstracted local/Docker command execution with env sanitization
-- **Pure Rust TLS**: No OpenSSL dependency (uses rustls)
+- **Config hot-reload**: SHA-256 change detection, live system prompt updates
+- **MCP integration**: JSON-RPC stdio transport for Model Context Protocol servers
+- **Pure Rust TLS**: No OpenSSL dependency (rustls)
 
 ---
 
@@ -557,7 +633,7 @@ export TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 4. (Optional) Get your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot) and add it to `allowed_senders` to restrict access
 5. Run `octos gateway`
 
-**Features**: Text messages, photo/document/voice/audio download, vision (sends images to LLM), voice transcription (via Groq Whisper), message coalescing (4096 char limit).
+**Features**: Text messages, photo/document/voice/audio download, vision (sends images to LLM), voice transcription (via Qwen3-ASR), message coalescing (4096 char limit).
 
 ---
 

@@ -32,6 +32,7 @@ scripts/deploy.sh
 # Agent research output
 *.md
 !README.md
+!README-zh.md
 !CLAUDE.md
 !CHANGELOG.md
 !docs/**/*.md
