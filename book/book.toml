@@ -13,3 +13,4 @@ preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/octos-org/octos"
 edit-url-template = "https://github.com/octos-org/octos/edit/main/book/src/{path}"
 site-url = "/octos/"
+additional-css = ["theme/octos.css"]

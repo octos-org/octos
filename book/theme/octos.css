@@ -1,0 +1,289 @@
+/* Octos Documentation Theme
+   Ocean blue-green + octopus coral-pink
+   Palette:
+     --ocean-deep:    #0B3D4E   (dark teal, sidebar bg)
+     --ocean-mid:     #1A6B7A   (medium teal, accents)
+     --ocean-light:   #E8F6F8   (light mint, page bg)
+     --ocean-surface: #F4FAFB   (near-white, cards)
+     --coral-pink:    #F27A8A   (octopus pink, primary accent)
+     --coral-warm:    #FF9BAA   (lighter pink, hover)
+     --coral-deep:    #D4566A   (dark pink, active)
+     --sea-foam:      #7DD4C0   (green accent, success)
+     --text-primary:  #1A2F38   (dark ocean text)
+     --text-secondary:#4A6B75   (muted text)
+*/
+
+/* ============ Light Theme (default) ============ */
+.light {
+  --bg: #F4FAFB;
+  --fg: #1A2F38;
+  --sidebar-bg: #0B3D4E;
+  --sidebar-fg: #D4EEF2;
+  --sidebar-active: #F27A8A;
+  --sidebar-non-existant: #4A8A98;
+  --sidebar-spacer: #1A6B7A;
+  --links: #1A6B7A;
+  --inline-code-color: #D4566A;
+  --theme-popup-bg: #E8F6F8;
+  --theme-popup-border: #B8DDE3;
+  --theme-hover: #DCF0F3;
+  --quote-bg: #E8F6F8;
+  --quote-border: #7DD4C0;
+  --table-border-color: #B8DDE3;
+  --table-header-bg: #0B3D4E;
+  --table-alternate-bg: #F4FAFB;
+  --searchbar-border-color: #B8DDE3;
+  --searchbar-bg: #FFFFFF;
+  --searchbar-fg: #1A2F38;
+  --searchbar-shadow-color: rgba(26, 107, 122, 0.1);
+  --searchresults-border-color: #B8DDE3;
+  --searchresults-li-bg: #E8F6F8;
+  --search-mark-bg: #FFD4DB;
+  --color-scheme: light;
+}
+
+/* ============ Dark Theme (Ayu-inspired ocean) ============ */
+.ayu, .navy, .coal {
+  --bg: #0A2530;
+  --fg: #D4EEF2;
+  --sidebar-bg: #071C25;
+  --sidebar-fg: #8CBDC8;
+  --sidebar-active: #F27A8A;
+  --sidebar-non-existant: #3A6A78;
+  --sidebar-spacer: #1A4A58;
+  --links: #7DD4C0;
+  --inline-code-color: #FF9BAA;
+  --theme-popup-bg: #0D2E3A;
+  --theme-popup-border: #1A4A58;
+  --theme-hover: #122F3D;
+  --quote-bg: #0D2E3A;
+  --quote-border: #7DD4C0;
+  --table-border-color: #1A4A58;
+  --table-header-bg: #071C25;
+  --table-alternate-bg: #0D2E3A;
+  --searchbar-border-color: #1A4A58;
+  --searchbar-bg: #0D2E3A;
+  --searchbar-fg: #D4EEF2;
+  --searchbar-shadow-color: rgba(0, 0, 0, 0.3);
+  --searchresults-border-color: #1A4A58;
+  --searchresults-li-bg: #0D2E3A;
+  --search-mark-bg: #D4566A;
+  --color-scheme: dark;
+}
+
+/* ============ Typography ============ */
+:root {
+  --content-max-width: 860px;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+code, pre code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.88em;
+}
+
+.content main {
+  max-width: var(--content-max-width);
+}
+
+/* ============ Sidebar ============ */
+.sidebar {
+  font-size: 0.92em;
+}
+
+.sidebar .sidebar-scrollbox {
+  padding: 10px 20px;
+}
+
+.sidebar ol.chapter li.chapter-item a {
+  color: var(--sidebar-fg);
+  padding: 5px 0;
+  transition: color 0.15s ease;
+}
+
+.sidebar ol.chapter li.chapter-item a:hover {
+  color: #FFFFFF;
+}
+
+.sidebar ol.chapter li.chapter-item a.active {
+  color: var(--sidebar-active);
+  font-weight: 600;
+}
+
+/* Sidebar part titles (User Guide, Operations, Developer Guide) */
+.sidebar .chapter li.part-title {
+  color: var(--sidebar-active);
+  font-weight: 700;
+  font-size: 0.82em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 16px 0 4px;
+  border-top: 1px solid var(--sidebar-spacer);
+  margin-top: 8px;
+}
+
+.sidebar .chapter li.part-title:first-child {
+  border-top: none;
+  margin-top: 0;
+}
+
+/* ============ Content ============ */
+.content h1 {
+  color: #0B3D4E;
+  border-bottom: 3px solid #F27A8A;
+  padding-bottom: 8px;
+}
+
+.content h2 {
+  color: #1A6B7A;
+  border-bottom: 1px solid #B8DDE3;
+  padding-bottom: 4px;
+}
+
+.content h3 {
+  color: #1A6B7A;
+}
+
+.ayu .content h1,
+.navy .content h1,
+.coal .content h1 {
+  color: #D4EEF2;
+  border-bottom-color: #F27A8A;
+}
+
+.ayu .content h2,
+.navy .content h2,
+.coal .content h2 {
+  color: #7DD4C0;
+  border-bottom-color: #1A4A58;
+}
+
+.ayu .content h3,
+.navy .content h3,
+.coal .content h3 {
+  color: #7DD4C0;
+}
+
+/* Links */
+.content a {
+  color: var(--links);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.content a:hover {
+  color: #F27A8A;
+  border-bottom-color: #F27A8A;
+}
+
+/* ============ Code blocks ============ */
+.content pre {
+  border-radius: 8px;
+  border: 1px solid var(--table-border-color);
+  padding: 16px;
+}
+
+.light .content pre {
+  background: #0B3D4E;
+  color: #D4EEF2;
+}
+
+.content code:not(pre code) {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+
+.light .content code:not(pre code) {
+  background: #E8F6F8;
+  color: #D4566A;
+}
+
+/* ============ Tables ============ */
+.content table {
+  border-collapse: collapse;
+  width: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 0.92em;
+}
+
+.content table th {
+  background: var(--table-header-bg);
+  color: #FFFFFF;
+  font-weight: 600;
+  padding: 10px 14px;
+  text-align: left;
+}
+
+.light .content table th {
+  color: #F4FAFB;
+}
+
+.content table td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--table-border-color);
+}
+
+.content table tr:nth-child(even) {
+  background: var(--table-alternate-bg);
+}
+
+/* ============ Blockquotes ============ */
+.content blockquote {
+  border-left: 4px solid #F27A8A;
+  background: var(--quote-bg);
+  padding: 12px 16px;
+  border-radius: 0 8px 8px 0;
+  margin: 16px 0;
+}
+
+/* ============ Navigation buttons ============ */
+.nav-chapters {
+  font-size: 0.9em;
+  transition: color 0.15s ease;
+}
+
+.nav-chapters:hover {
+  color: #F27A8A;
+}
+
+/* ============ Scrollbar (webkit) ============ */
+.sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+  background: #1A6B7A;
+  border-radius: 3px;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover {
+  background: #F27A8A;
+}
+
+/* ============ Top menu bar ============ */
+.menu-bar {
+  border-bottom: 1px solid var(--table-border-color);
+}
+
+.light .menu-bar {
+  background: #FFFFFF;
+}
+
+/* ============ Search ============ */
+#searchbar {
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+/* ============ Mobile ============ */
+@media (max-width: 1080px) {
+  .content main {
+    padding: 16px;
+  }
+}
