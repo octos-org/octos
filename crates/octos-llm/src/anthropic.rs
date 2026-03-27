@@ -556,7 +556,7 @@ mod tests {
         let messages = vec![msg(MessageRole::User, "hi")];
         let config = ChatConfig::default();
         let request = provider.build_request(&messages, &[], &config);
-        assert_eq!(request.max_tokens, 4096);
+        assert_eq!(request.max_tokens, 8192);
     }
 
     // --- SSE mapping tests ---

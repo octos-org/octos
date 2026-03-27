@@ -283,6 +283,21 @@ impl Tool for RunPipelineTool {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Find the report file from this pipeline run's actual files_modified.
+        // The session actor auto-delivers .md files via file_modified on ToolResult,
+        // so no LLM instruction needed.
+        let report_file = result
+            .files_modified
+            .iter()
+            .find(|f| {
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.ends_with(".md") && !name.starts_with("_search")
+            })
+            .cloned();
+        if let Some(ref path) = report_file {
+            tracing::info!(file = %path.display(), "pipeline produced report file");
+        }
+
         Ok(ToolResult {
             output: format!(
                 "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
@@ -290,6 +305,7 @@ impl Tool for RunPipelineTool {
             ),
             success: result.success,
             tokens_used: Some(result.token_usage),
+            file_modified: report_file,
             ..Default::default()
         })
     }

@@ -107,10 +107,13 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Resolve a named voice to a wav file path in the voice_profiles directory.
-/// Checks OCTOS_VOICE_DIR first, then OCTOS_DATA_DIR/voice_profiles.
+/// Checks OCTOS_VOICE_DIR, then OCTOS_WORK_DIR/voice_profiles, then OCTOS_DATA_DIR/voice_profiles.
 fn resolve_named_voice(name: &str) -> Option<PathBuf> {
     let dirs_to_check: Vec<PathBuf> = [
         std::env::var("OCTOS_VOICE_DIR").ok().map(PathBuf::from),
+        std::env::var("OCTOS_WORK_DIR")
+            .ok()
+            .map(|d| PathBuf::from(d).join("voice_profiles")),
         std::env::var("OCTOS_DATA_DIR")
             .ok()
             .map(|d| PathBuf::from(d).join("voice_profiles")),

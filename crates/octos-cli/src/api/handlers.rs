@@ -541,15 +541,34 @@ pub async fn upload(
     Ok(Json(paths))
 }
 
-/// GET /api/files/:filename -- serve uploaded files for display/download.
+/// GET /api/files/:filename -- serve uploaded files and pipeline report files.
 pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<String>) -> Response {
-    let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
-    let upload_dir = std::env::temp_dir().join("octos-uploads");
-    let path = upload_dir.join(&safe_name);
-
-    if !path.exists() || !path.starts_with(&upload_dir) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+    // Try as an absolute path first (for pipeline-generated files)
+    let file_path = std::path::Path::new(&filename);
+    let path = if file_path.is_absolute() {
+        // Security: only serve files under $HOME/.octos or /tmp
+        // (NOT the entire $HOME — prevent reading arbitrary user files)
+        let canonical = match std::fs::canonicalize(file_path) {
+            Ok(p) => p,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let octos_dir = format!("{home}/.octos");
+        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with("/tmp");
+        if !allowed {
+            return (StatusCode::FORBIDDEN, "access denied").into_response();
+        }
+        canonical
+    } else {
+        // Relative path — serve from uploads dir
+        let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
+        let upload_dir = std::env::temp_dir().join("octos-uploads");
+        let path = upload_dir.join(&safe_name);
+        if !path.exists() || !path.starts_with(&upload_dir) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        path
+    };
 
     let data = match tokio::fs::read(&path).await {
         Ok(d) => d,
@@ -575,11 +594,16 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
         _ => "application/octet-stream",
     };
 
+    let display_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.clone());
+
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
     headers.insert(
         "content-disposition",
-        format!("inline; filename=\"{safe_name}\"").parse().unwrap(),
+        format!("inline; filename=\"{display_name}\"").parse().unwrap(),
     );
 
     (StatusCode::OK, headers, data).into_response()

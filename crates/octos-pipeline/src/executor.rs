@@ -36,6 +36,8 @@ pub struct PipelineResult {
     pub token_usage: TokenUsage,
     /// Per-node execution summaries.
     pub node_summaries: Vec<NodeSummary>,
+    /// Files written by pipeline nodes (collected from all node outcomes).
+    pub files_modified: Vec<std::path::PathBuf>,
 }
 
 /// Bridge for pipeline status updates to external systems (e.g., messaging channels).
@@ -115,7 +117,7 @@ struct DynamicTask {
 }
 
 /// Report pipeline progress via the task-local TOOL_CTX reporter (if available).
-fn report_progress(message: &str) {
+pub(crate) fn report_progress(message: &str) {
     if let Ok(ctx) = TOOL_CTX.try_with(|c| c.clone()) {
         ctx.reporter.report(ProgressEvent::ToolProgress {
             name: "run_pipeline".to_string(),
@@ -353,6 +355,7 @@ fn process_worker_results(
                     status: OutcomeStatus::Error,
                     content: format!("Error: {e}"),
                     token_usage: TokenUsage::default(),
+                    files_modified: vec![],
                 };
                 summaries.push(NodeSummary {
                     node_id: task_id.clone(),
@@ -695,6 +698,7 @@ impl PipelineExecutor {
                             success: outcome.status == OutcomeStatus::Pass,
                             token_usage: total_tokens,
                             node_summaries: summaries,
+                            files_modified: vec![],
                         });
                     }
                 }
@@ -858,6 +862,7 @@ impl PipelineExecutor {
                         },
                         content: merged_content,
                         token_usage: TokenUsage::default(),
+                        files_modified: vec![],
                     },
                 );
 
@@ -1159,6 +1164,7 @@ impl PipelineExecutor {
                         },
                         content: merged_content,
                         token_usage: plan_usage,
+                        files_modified: vec![],
                     },
                 );
 
@@ -1301,11 +1307,19 @@ impl PipelineExecutor {
                     goal_node = %node.id,
                     "goal gate passed — pipeline complete"
                 );
+                // Collect all files written by any node in this pipeline
+                let mut all_files: Vec<std::path::PathBuf> = outcome.files_modified.clone();
+                for o in completed.values() {
+                    all_files.extend(o.files_modified.iter().cloned());
+                }
+                all_files.sort();
+                all_files.dedup();
                 return Ok(PipelineResult {
                     output: outcome.content,
                     success: true,
                     token_usage: total_tokens,
                     node_summaries: summaries,
+                    files_modified: all_files,
                 });
             }
 
@@ -1320,6 +1334,7 @@ impl PipelineExecutor {
                     success: false,
                     token_usage: total_tokens,
                     node_summaries: summaries,
+                    files_modified: vec![],
                 });
             }
 
@@ -1346,6 +1361,7 @@ impl PipelineExecutor {
                         success: outcome.status == OutcomeStatus::Pass,
                         token_usage: total_tokens,
                         node_summaries: summaries,
+                        files_modified: vec![],
                     });
                 }
             }
@@ -1508,6 +1524,7 @@ mod tests {
             status: OutcomeStatus::Pass,
             content: String::new(),
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         };
 
         let next = executor.select_next_edge(&graph, "a", &outcome).unwrap();
@@ -1532,6 +1549,7 @@ mod tests {
             status: OutcomeStatus::Pass,
             content: String::new(),
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         };
 
         let next = executor.select_next_edge(&graph, "a", &outcome).unwrap();
@@ -1678,3 +1696,4 @@ mod tests {
         assert!(tasks[0].task.contains("test query"));
     }
 }
+

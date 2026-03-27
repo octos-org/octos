@@ -1,0 +1,15 @@
+{
+  "name": "pipeline-guard",
+  "version": "0.1.0",
+  "description": "Validates DOT graphs and injects optimal model assignments before run_pipeline executes",
+  "timeout_secs": 10,
+  "tools": [],
+  "hooks": [
+    {
+      "event": "before_tool_call",
+      "command": ["main"],
+      "timeout_ms": 10000,
+      "tool_filter": ["run_pipeline"]
+    }
+  ]
+}

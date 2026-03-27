@@ -4,6 +4,14 @@ import { myApi } from '../../api'
 
 const SEARCH_PROVIDERS = [
   {
+    id: 'tavily',
+    key: 'TAVILY_API_KEY',
+    label: 'Tavily',
+    placeholder: 'tvly-...',
+    description: 'AI-optimized search, highest priority provider (1k free/month)',
+    link: 'https://app.tavily.com/home',
+  },
+  {
     id: 'perplexity',
     key: 'PERPLEXITY_API_KEY',
     label: 'Perplexity',

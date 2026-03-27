@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "author": "octos",
   "description": "OminiX voice skill: ASR, TTS, and model management via local Qwen3 models on Apple Silicon",
-  "timeout_secs": 300,
+  "timeout_secs": 600,
   "requires_network": true,
   "tools": [
     {

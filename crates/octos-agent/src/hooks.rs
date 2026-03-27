@@ -416,7 +416,7 @@ impl HookExecutor {
         cmd.args(&expanded_args);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
 
         // Sanitize environment
         for var in BLOCKED_ENV_VARS {
@@ -431,8 +431,9 @@ impl HookExecutor {
             let _ = stdin.shutdown().await;
         }
 
-        // Take stdout handle so we can read it after wait
+        // Take stdout/stderr handles so we can read them after wait
         let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
 
         // Wait with timeout (use wait() instead of wait_with_output() so child isn't consumed)
         let timeout = Duration::from_millis(hook.timeout_ms);
@@ -445,7 +446,28 @@ impl HookExecutor {
                 } else {
                     String::new()
                 };
+                // Log stderr from the hook process (diagnostic output)
+                if let Some(mut handle) = stderr_handle {
+                    let mut buf = Vec::new();
+                    let _ = handle.read_to_end(&mut buf).await;
+                    let stderr = String::from_utf8_lossy(&buf);
+                    for line in stderr.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            tracing::info!(
+                                hook = ?hook.command,
+                                "{line}"
+                            );
+                        }
+                    }
+                }
                 let code = status.code().unwrap_or(2);
+                tracing::info!(
+                    hook = ?hook.command,
+                    exit_code = code,
+                    stdout_len = stdout.len(),
+                    "hook executed"
+                );
                 Ok((code, stdout))
             }
             Ok(Err(e)) => Err(e.into()),

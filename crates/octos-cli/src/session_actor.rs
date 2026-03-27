@@ -2075,6 +2075,36 @@ impl SessionActor {
                     }
                 }
 
+                // Auto-deliver report files produced by the agent (e.g. from run_pipeline).
+                // This ensures the file reaches the user's channel (Telegram, web, etc.)
+                // without relying on the LLM to call send_file within its token budget.
+                for file in &conv_response.files_modified {
+                    if file.extension().and_then(|e| e.to_str()) == Some("md") {
+                        let filename = file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        info!(
+                            session = %self.session_key,
+                            file = %file.display(),
+                            channel = %self.channel,
+                            chat_id = %self.chat_id,
+                            "auto-delivering report file"
+                        );
+                        let file_msg = OutboundMessage {
+                            channel: self.channel.clone(),
+                            chat_id: self.chat_id.clone(),
+                            content: String::new(),
+                            reply_to: None,
+                            media: vec![file.to_string_lossy().into_owned()],
+                            metadata: serde_json::json!({}),
+                        };
+                        if let Err(e) = self.out_tx.send(file_msg).await {
+                            warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");
+                        }
+                    }
+                }
+
                 // Send reply
                 let content = strip_think_tags(&conv_response.content);
                 let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";

@@ -134,9 +134,49 @@ fn fetch_tts_wav(
         .unwrap_or("")
         .to_string();
 
-    // Read response in streaming chunks to avoid timeout on large audio
+    let is_streaming_pcm = content_type.contains("audio/pcm")
+        || resp
+            .headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |v| v.contains("chunked"));
+
+    // Read response with progress — for streaming PCM, report per-chunk progress
+    eprintln!("Receiving TTS audio data...");
     let mut buf = Vec::new();
-    {
+    if is_streaming_pcm {
+        // Pseudo-streaming: ominix-api sends PCM chunks (one per text segment).
+        // Read in small increments so we can report progress as segments arrive.
+        use std::io::Read;
+        let mut reader = resp;
+        let mut chunk_buf = [0u8; 32768]; // 32KB read buffer (~0.34s of 24kHz 16-bit mono)
+        let mut segments = 0u32;
+        let mut last_report = buf.len();
+        loop {
+            match reader.read(&mut chunk_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk_buf[..n]);
+                    // Report progress roughly every 48000 bytes (~1s of audio)
+                    if buf.len() - last_report >= 48000 {
+                        segments += 1;
+                        let duration = buf.len() as f64 / 48000.0;
+                        eprintln!(
+                            "Received {:.1}s of audio ({} bytes)...",
+                            duration,
+                            buf.len()
+                        );
+                        last_report = buf.len();
+                    }
+                }
+                Err(e) => return Err(format!("Failed to read TTS response: {e}")),
+            }
+        }
+        if segments > 0 {
+            let duration = buf.len() as f64 / 48000.0;
+            eprintln!("Audio stream complete: {:.1}s ({} bytes)", duration, buf.len());
+        }
+    } else {
         use std::io::Read;
         let mut reader = resp;
         reader
@@ -144,6 +184,7 @@ fn fetch_tts_wav(
             .map_err(|e| format!("Failed to read TTS response: {e}"))?;
     }
     let bytes = buf;
+    eprintln!("Received {} bytes total", bytes.len());
 
     if bytes.is_empty() {
         return Err("TTS returned empty response".to_string());
@@ -193,14 +234,29 @@ fn fetch_clone_wav(
         ));
     }
 
+    eprintln!("Receiving clone audio data...");
     let mut buf = Vec::new();
     {
         use std::io::Read;
         let mut reader = resp;
-        reader
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("Failed to read clone response: {e}"))?;
+        let mut chunk_buf = [0u8; 32768];
+        let mut last_report = 0usize;
+        loop {
+            match reader.read(&mut chunk_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk_buf[..n]);
+                    if buf.len() - last_report >= 48000 {
+                        let duration = buf.len() as f64 / 48000.0;
+                        eprintln!("Received {:.1}s of audio ({} bytes)...", duration, buf.len());
+                        last_report = buf.len();
+                    }
+                }
+                Err(e) => return Err(format!("Failed to read clone response: {e}")),
+            }
+        }
     }
+    eprintln!("Received {} bytes total", buf.len());
 
     if buf.is_empty() {
         return Err("Clone returned empty response".to_string());
@@ -324,6 +380,7 @@ fn handle_transcribe(input_json: &str) {
 
     let base_url = api_base_url();
     let client = http_client();
+    eprintln!("Checking ominix-api health...");
     if let Err(e) = check_health(&client, &base_url) {
         fail(&e);
     }
@@ -341,6 +398,7 @@ fn handle_transcribe(input_json: &str) {
     use base64::Engine;
     let file_b64 = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
 
+    eprintln!("Transcribing audio ({} bytes)...", file_bytes.len());
     let body = serde_json::json!({
         "file": file_b64,
         "language": language,
@@ -398,10 +456,13 @@ fn synthesize_segment(
     let body = json!({
         "input": text,
         "voice": voice,
-        "language": language
+        "language": language,
+        "response_format": "pcm"
     });
 
-    let url = format!("{base_url}/v1/audio/tts/qwen3?format=wav");
+    // Use streaming PCM mode so ominix-api streams per-sentence chunks
+    // instead of blocking until all text is synthesized.
+    let url = format!("{base_url}/v1/audio/tts/qwen3");
     let wav_bytes = fetch_tts_wav(client, &url, &body)?;
 
     std::fs::write(output_path, &wav_bytes)
@@ -424,6 +485,7 @@ fn handle_synthesize(input_json: &str) {
 
     let base_url = api_base_url();
     let client = http_client();
+    eprintln!("Checking ominix-api health...");
     if let Err(e) = check_health(&client, &base_url) {
         fail(&e);
     }
@@ -461,22 +523,35 @@ fn handle_synthesize(input_json: &str) {
 
     // Check if speaker is a saved voice profile — if so, use clone mode
     if let Some(profile_path) = resolve_voice_profile(&speaker) {
+        eprintln!("Using voice profile '{speaker}' (clone mode)...");
         let ref_bytes = match std::fs::read(&profile_path) {
             Ok(b) => b,
             Err(e) => fail(&format!("Failed to read voice profile '{}': {e}", speaker)),
         };
 
-        // Clone via model-specific endpoint (multipart with raw WAV)
-        let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
-        let wav_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
+        // Clone via model-specific endpoint (multipart with raw WAV).
+        // No ?format=wav → streaming PCM mode for per-sentence chunks.
+        let clone_url = format!("{base_url}/v1/audio/tts/clone");
+        eprintln!("Sending TTS clone request ({} chars of text)...", input.text.len());
+        let raw_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
             Ok(b) => b,
             Err(e) => fail(&format!("TTS (clone) failed: {e}")),
+        };
+        eprintln!("Received {} bytes of audio", raw_bytes.len());
+
+        // Wrap raw PCM in WAV header if needed (streaming mode returns PCM, not WAV)
+        let wav_bytes = if raw_bytes.len() >= 4 && &raw_bytes[..4] == b"RIFF" {
+            raw_bytes
+        } else {
+            pcm_to_wav(&raw_bytes, 24000)
         };
 
         if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
             fail(&format!("Failed to write {output_path}: {e}"));
         }
-        let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
+        let pcm_len = wav_bytes.len().saturating_sub(44);
+        let duration_secs = pcm_len as f64 / 48000.0;
+        eprintln!("Converting to MP3...");
         let final_path = try_convert_to_mp3(&output_path);
         succeed(&format!(
             "Generated audio (voice profile '{speaker}'): {final_path} ({duration_secs:.1}s, {} bytes). Use send_file to deliver it to the user.",
@@ -485,6 +560,7 @@ fn handle_synthesize(input_json: &str) {
     }
 
     // Preset speaker mode
+    eprintln!("Synthesizing with preset voice '{speaker}'...");
     match synthesize_segment(
         &client,
         &base_url,
@@ -494,7 +570,7 @@ fn handle_synthesize(input_json: &str) {
         Path::new(&output_path),
     ) {
         Ok((size, duration_secs)) => {
-            // Try converting to MP3 if ffmpeg is available
+            eprintln!("Converting to MP3...");
             let final_path = try_convert_to_mp3(&output_path);
             succeed(&format!(
                 "Generated audio: {final_path} ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
@@ -593,11 +669,20 @@ fn handle_voice_clone(input_json: &str) {
         Err(e) => fail(&format!("Failed to read reference audio '{}': {e}", input.reference_audio)),
     };
 
-    // Clone via model-specific endpoint (multipart with raw WAV)
-    let clone_url = format!("{base_url}/v1/audio/tts/clone?format=wav");
-    let wav_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
+    // Clone via model-specific endpoint (multipart with raw WAV).
+    // No ?format=wav → streaming PCM mode for per-sentence chunks.
+    eprintln!("Sending voice clone request ({} chars)...", input.text.len());
+    let clone_url = format!("{base_url}/v1/audio/tts/clone");
+    let raw_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
         Ok(b) => b,
         Err(e) => fail(&format!("Voice clone failed: {e}")),
+    };
+
+    // Wrap raw PCM in WAV header if needed (streaming mode returns PCM)
+    let wav_bytes = if raw_bytes.len() >= 4 && &raw_bytes[..4] == b"RIFF" {
+        raw_bytes
+    } else {
+        pcm_to_wav(&raw_bytes, 24000)
     };
 
     if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
@@ -605,7 +690,8 @@ fn handle_voice_clone(input_json: &str) {
     }
 
     // 24kHz 16-bit mono = 48000 bytes/sec
-    let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
+    let pcm_len = wav_bytes.len().saturating_sub(44);
+    let duration_secs = pcm_len as f64 / 48000.0;
 
     // Optionally save the reference audio as a named voice profile
     let save_msg = if let Some(name) = &input.save_as {

@@ -12,8 +12,44 @@ use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
+use octos_agent::progress::{ProgressEvent, ProgressReporter};
+
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
+
+/// Reporter that bridges worker agent events to the parent pipeline's
+/// `report_progress` so they appear in the SSE stream.
+struct PipelineNodeReporter {
+    node_id: String,
+    model: String,
+}
+
+impl ProgressReporter for PipelineNodeReporter {
+    fn report(&self, event: ProgressEvent) {
+        let msg = match &event {
+            ProgressEvent::Thinking { iteration } => {
+                format!("{} [{}]: thinking (iteration {})", self.node_id, self.model, iteration)
+            }
+            ProgressEvent::ToolStarted { name, .. } => {
+                format!("{} [{}]: running {}", self.node_id, self.model, name)
+            }
+            ProgressEvent::ToolCompleted {
+                name,
+                success,
+                duration,
+                ..
+            } => {
+                let status = if *success { "done" } else { "failed" };
+                format!("{}: {} {} ({:.0}s)", self.node_id, name, status, duration.as_secs_f64())
+            }
+            ProgressEvent::StreamDone { iteration } => {
+                format!("{} [{}]: response received (iteration {})", self.node_id, self.model, iteration)
+            }
+            _ => return,
+        };
+        crate::executor::report_progress(&msg);
+    }
+}
 
 /// Context passed to handlers during execution.
 pub struct HandlerContext {
@@ -188,7 +224,7 @@ impl Handler for CodergenHandler {
         } else {
             octos_agent::ToolPolicy {
                 allow: allowed,
-                deny: vec!["spawn".into(), "run_pipeline".into()],
+                deny: vec!["spawn".into(), "run_pipeline".into(), "send_file".into(), "message".into()],
                 ..Default::default()
             }
         };
@@ -203,12 +239,16 @@ impl Handler for CodergenHandler {
             None => "Complete the task given to you.".to_string(),
         };
 
-        // If the node has write_file tool, instruct the agent to save the report
+        // If the node has write_file tool, instruct the agent to save the full report
+        // to a file and return a concise executive summary as text. The file will be
+        // delivered to the user directly; the summary avoids polluting context.
         if node.tools.iter().any(|t| t == "write_file") {
             system_prompt.push_str(
-                "\n\nIMPORTANT: You MUST save your complete report using the write_file tool. \
-                 Choose a descriptive filename. Do NOT just return the report as text — \
-                 save it as a file so it can be sent to the user.",
+                "\n\nIMPORTANT: You MUST do two things:\n\
+                 1. Save your COMPLETE report using the write_file tool (choose a descriptive filename).\n\
+                 2. After saving, return a concise executive summary (key findings, conclusions, \
+                 recommendations) as your final text response — around 1000 words. \
+                 The full report file will be delivered to the user separately.",
             );
         }
 
@@ -227,11 +267,19 @@ impl Handler for CodergenHandler {
             ..Default::default()
         };
 
+        let resolved_model = format!("{}/{}", provider.provider_name(), provider.model_id());
+
+        let reporter: Arc<dyn ProgressReporter> = Arc::new(PipelineNodeReporter {
+            node_id: node.id.clone(),
+            model: resolved_model.clone(),
+        });
+
         let worker =
             octos_agent::Agent::new(worker_id.clone(), provider, tools, self.memory.clone())
                 .with_config(config)
                 .with_system_prompt(system_prompt)
-                .with_shutdown(self.shutdown.clone());
+                .with_shutdown(self.shutdown.clone())
+                .with_reporter(reporter);
 
         let task = Task::new(
             TaskKind::Code {
@@ -243,11 +291,10 @@ impl Handler for CodergenHandler {
                 ..Default::default()
             },
         );
-
         info!(
             node = %node.id,
             worker = %worker_id,
-            model = node.model.as_deref().unwrap_or("default"),
+            resolved_model = %resolved_model,
             tools = node.tools.join(","),
             timeout_secs = node.timeout_secs.unwrap_or(0),
             max_output_tokens = max_tokens.unwrap_or(0),
@@ -255,21 +302,32 @@ impl Handler for CodergenHandler {
         );
 
         match worker.run_task(&task).await {
-            Ok(result) => Ok(NodeOutcome {
-                node_id: node.id.clone(),
-                status: if result.success {
-                    OutcomeStatus::Pass
-                } else {
-                    OutcomeStatus::Fail
-                },
-                content: result.output,
-                token_usage: result.token_usage,
-            }),
+            Ok(result) => {
+                if !result.files_modified.is_empty() {
+                    info!(
+                        node = %node.id,
+                        files = ?result.files_modified.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                        "node wrote files"
+                    );
+                }
+                Ok(NodeOutcome {
+                    node_id: node.id.clone(),
+                    status: if result.success {
+                        OutcomeStatus::Pass
+                    } else {
+                        OutcomeStatus::Fail
+                    },
+                    content: result.output,
+                    token_usage: result.token_usage,
+                    files_modified: result.files_modified,
+                })
+            }
             Err(e) => Ok(NodeOutcome {
                 node_id: node.id.clone(),
                 status: OutcomeStatus::Error,
                 content: format!("Agent error: {e}"),
                 token_usage: TokenUsage::default(),
+                files_modified: vec![],
             }),
         }
     }
@@ -330,6 +388,7 @@ impl Handler for ShellHandler {
                         format!("{stdout}\n--- stderr ---\n{stderr}")
                     },
                     token_usage: TokenUsage::default(),
+                    files_modified: vec![],
                 })
             }
             Ok(Err(e)) => Ok(NodeOutcome {
@@ -337,12 +396,14 @@ impl Handler for ShellHandler {
                 status: OutcomeStatus::Error,
                 content: format!("Shell error: {e}"),
                 token_usage: TokenUsage::default(),
+                files_modified: vec![],
             }),
             Err(_) => Ok(NodeOutcome {
                 node_id: node.id.clone(),
                 status: OutcomeStatus::Error,
                 content: format!("Shell timed out after {}s", timeout.as_secs()),
                 token_usage: TokenUsage::default(),
+                files_modified: vec![],
             }),
         }
     }
@@ -369,6 +430,7 @@ impl Handler for GateHandler {
                 status: OutcomeStatus::Pass,
                 content: ctx.input.clone(),
                 token_usage: TokenUsage::default(),
+                files_modified: vec![],
             });
 
         if cond_str == "true" {
@@ -377,6 +439,7 @@ impl Handler for GateHandler {
                 status: OutcomeStatus::Pass,
                 content: last_outcome.content,
                 token_usage: TokenUsage::default(),
+                files_modified: vec![],
             });
         }
 
@@ -392,6 +455,7 @@ impl Handler for GateHandler {
             },
             content: last_outcome.content,
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         })
     }
 }
@@ -407,6 +471,8 @@ impl Handler for NoopHandler {
             status: OutcomeStatus::Pass,
             content: ctx.input.clone(),
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         })
     }
 }
+

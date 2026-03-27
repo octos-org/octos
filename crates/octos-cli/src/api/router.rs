@@ -316,11 +316,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         metrics_route
     };
 
+    // Public version/health endpoints (no auth required)
+    let version_routes = Router::new()
+        .route("/api/version", get(handlers::version))
+        .route("/health", get(handlers::health));
+
     // Unauthenticated routes (static files + auth endpoints + webhook proxy)
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
-        .merge(webhook_routes);
+        .merge(webhook_routes)
+        .merge(version_routes);
 
     public
         .merge(protected)

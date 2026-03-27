@@ -67,6 +67,11 @@ impl Agent {
                         );
                         match hooks.run(HookEvent::BeforeToolCall, &payload).await {
                             HookResult::Deny(reason) => {
+                                tracing::warn!(
+                                    tool = %tc_name,
+                                    reason = %reason,
+                                    "before_tool_call hook denied"
+                                );
                                 let deny_msg = if reason.is_empty() {
                                     format!("[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.", tc_name)
                                 } else {

@@ -376,7 +376,10 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            let chat_id = id.strip_prefix("api:")?;
+            // Session keys may be "api:{id}" (legacy) or "_main:api:{id}" (per-user layout)
+            let chat_id = id
+                .strip_prefix("api:")
+                .or_else(|| id.strip_prefix("_main:api:"))?;
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -399,14 +402,23 @@ async fn handle_session_messages(
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
     let key = SessionKey::new("api", &id);
+    // Sessions created through the gateway use "_main:api:{id}" as the key
+    let alt_key = SessionKey(format!("_main:api:{id}"));
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
         let path = sess.session_path(&key);
+        let alt_path = sess.session_path(&alt_key);
         drop(sess);
-        match tokio::fs::read_to_string(&path).await {
+        // Try the primary key path first, fall back to the _main: prefixed path
+        let read_path = if tokio::fs::metadata(&path).await.is_ok() {
+            path
+        } else {
+            alt_path
+        };
+        match tokio::fs::read_to_string(&read_path).await {
             Ok(content) => {
                 let messages: Vec<MessageInfo> = content
                     .lines()
@@ -433,9 +445,16 @@ async fn handle_session_messages(
     }
 
     let mut sess = state.sessions.lock().await;
+    // Try primary key first, fall back to _main: prefixed key
     let session = sess.get_or_create(&key);
-    let messages: Vec<MessageInfo> = session
-        .get_history(fetch_count)
+    let history = session.get_history(fetch_count);
+    let use_alt = history.is_empty();
+    let history = if use_alt {
+        sess.get_or_create(&alt_key).get_history(fetch_count).to_vec()
+    } else {
+        history.to_vec()
+    };
+    let messages: Vec<MessageInfo> = history
         .iter()
         .skip(offset)
         .take(limit)
@@ -454,8 +473,12 @@ async fn handle_delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let key = SessionKey::new("api", &id);
+    let alt_key = SessionKey(format!("_main:api:{id}"));
     let mut sess = state.sessions.lock().await;
-    match sess.clear(&key).await {
+    // Try both key formats (legacy api:{id} and per-user _main:api:{id})
+    let r1 = sess.clear(&key).await;
+    let r2 = sess.clear(&alt_key).await;
+    match r1.or(r2) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

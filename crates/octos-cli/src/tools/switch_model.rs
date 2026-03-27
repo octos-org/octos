@@ -254,10 +254,15 @@ impl SwitchModelTool {
             }
         }
 
-        // Build config for provider creation
+        // Build config for provider creation.
+        // Clear api_key_env so get_api_key() falls through to the registry
+        // default for the target provider (e.g. MOONSHOT_API_KEY for moonshot)
+        // instead of reusing the original provider's key env.
         let mut new_config = self.config.clone();
         if let Some(ref env_name) = input.api_key_env {
             new_config.api_key_env = Some(env_name.clone());
+        } else {
+            new_config.api_key_env = None;
         }
 
         // Create the new provider
