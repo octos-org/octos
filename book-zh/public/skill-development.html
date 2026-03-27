@@ -1,0 +1,1080 @@
+<!DOCTYPE HTML>
+<html lang="zh" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>技能开发 - Octos 文档</title>
+
+
+        <!-- Custom HTML head -->
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/octos-80618944.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "searchindex-546dfab1.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-dd287637.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Octos 文档</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/octos-org/octos" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/octos-org/octos/edit/main/book-zh/src/src/skill-development.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="octos-应用技能开发指南"><a class="header" href="#octos-应用技能开发指南">Octos 应用技能开发指南</a></h1>
+<p><a href="app-skill-dev-guide.html">English</a> | <a href="app-skill-dev-guide-zh.html">中文</a></p>
+<p>本指南涵盖了构建、注册和部署 octos 应用技能所需的全部内容。</p>
+<hr>
+<h2 id="架构概览"><a class="header" href="#架构概览">架构概览</a></h2>
+<p>应用技能是一个<strong>独立的可执行二进制文件</strong>，通过简单的 <strong>stdin/stdout JSON 协议</strong>与 octos 网关通信。网关为每次工具调用将技能二进制文件作为子进程启动，通过 stdin 传递 JSON 参数，并从 stdout 读取 JSON 结果。</p>
+<pre><code>User message → LLM → tool_use("get_weather", {"city": "Paris"})
+                         ↓
+              Gateway spawns: ~/.octos/skills/weather/main get_weather
+                         ↓
+              Stdin:  {"city": "Paris"}
+              Stdout: {"output": "Paris, France\nClear sky\n...", "success": true}
+                         ↓
+              LLM sees result → generates natural language response
+</code></pre>
+<hr>
+<h2 id="技能目录结构"><a class="header" href="#技能目录结构">技能目录结构</a></h2>
+<p>每个技能在 <code>crates/app-skills/</code> 下有自己独立的 crate：</p>
+<pre><code>crates/app-skills/my-skill/
+├── Cargo.toml          # Crate 配置，二进制名称
+├── manifest.json       # 工具定义（JSON Schema）
+├── SKILL.md            # 文档 + frontmatter 元数据
+└── src/
+    └── main.rs         # 二进制入口
+</code></pre>
+<p>启动引导后，技能安装在：</p>
+<pre><code>~/.octos/skills/my-skill/
+├── main                # 可执行二进制文件（从 target/ 复制）
+├── manifest.json       # 工具定义
+└── SKILL.md            # 文档
+</code></pre>
+<hr>
+<h2 id="分步指南创建新技能"><a class="header" href="#分步指南创建新技能">分步指南：创建新技能</a></h2>
+<h3 id="1-创建-crate"><a class="header" href="#1-创建-crate">1. 创建 Crate</a></h3>
+<pre><code class="language-bash">mkdir -p crates/app-skills/my-skill/src
+</code></pre>
+<h3 id="2-cargotoml"><a class="header" href="#2-cargotoml">2. Cargo.toml</a></h3>
+<pre><code class="language-toml">[package]
+name = "my-skill"
+version = "1.0.0"
+edition = "2021"
+description = "Short description of what this skill does"
+authors = ["your-name"]
+
+[[bin]]
+name = "my_skill"          # Binary name (used in bundled_app_skills.rs)
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Add other deps as needed:
+# reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
+# chrono = "0.4"
+</code></pre>
+<p><strong>重要：</strong> <code>[[bin]] name</code> 必须与 <code>bundled_app_skills.rs</code> 中的 <code>binary_name</code> 匹配。</p>
+<h3 id="3-manifestjson"><a class="header" href="#3-manifestjson">3. manifest.json</a></h3>
+<p>定义 LLM 可调用的工具。使用 JSON Schema 进行输入验证。</p>
+<pre><code class="language-json">{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "author": "your-name",
+  "description": "What this skill does",
+  "timeout_secs": 15,
+  "requires_network": false,
+  "tools": [
+    {
+      "name": "my_tool",
+      "description": "Clear description for the LLM. What does this tool do? When should it be used?",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "param1": {
+            "type": "string",
+            "description": "What this parameter means"
+          },
+          "param2": {
+            "type": "integer",
+            "description": "Optional numeric parameter (default: 10)"
+          }
+        },
+        "required": ["param1"]
+      }
+    }
+  ]
+}
+</code></pre>
+<p><strong>清单字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>默认值</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>—</td><td>技能标识符</td></tr>
+<tr><td><code>version</code></td><td>是</td><td>—</td><td>语义化版本</td></tr>
+<tr><td><code>author</code></td><td>否</td><td>—</td><td>作者名称</td></tr>
+<tr><td><code>description</code></td><td>否</td><td>—</td><td>可读的描述</td></tr>
+<tr><td><code>timeout_secs</code></td><td>否</td><td>30</td><td>每次工具调用的最大执行时间（1-600）</td></tr>
+<tr><td><code>requires_network</code></td><td>否</td><td>false</td><td>信息性标志</td></tr>
+<tr><td><code>sha256</code></td><td>否</td><td>—</td><td>二进制完整性校验（十六进制哈希）</td></tr>
+<tr><td><code>tools</code></td><td>是</td><td>—</td><td>工具定义数组</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>工具定义字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>工具名称（snake_case，全局唯一）</td></tr>
+<tr><td><code>description</code></td><td>是</td><td>展示给 LLM 的描述 – 明确说明何时使用</td></tr>
+<tr><td><code>input_schema</code></td><td>是</td><td>输入参数的 JSON Schema</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="4-skillmd"><a class="header" href="#4-skillmd">4. SKILL.md</a></h3>
+<p>带有 YAML frontmatter 的文档。LLM 通过阅读它来理解何时以及如何使用该技能。</p>
+<pre><code class="language-markdown">---
+name: my-skill
+description: Short description. Triggers: keyword1, keyword2, 关键词, trigger phrase.
+version: 1.0.0
+author: your-name
+always: false
+---
+
+# My Skill
+
+Detailed description of what this skill does and when to use it.
+
+## Tools
+
+### my_tool
+
+Explain what this tool does with examples.
+
+\```json
+{"param1": "example value", "param2": 5}
+\```
+
+**Parameters:**
+- `param1` (required): What it means
+- `param2` (optional): What it controls. Default: 10
+</code></pre>
+<p><strong>Frontmatter 字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>默认值</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>—</td><td>技能标识符</td></tr>
+<tr><td><code>description</code></td><td>是</td><td>—</td><td>一行描述。在 “Triggers:” 后面添加触发关键词</td></tr>
+<tr><td><code>version</code></td><td>是</td><td>—</td><td>语义化版本</td></tr>
+<tr><td><code>author</code></td><td>否</td><td>—</td><td>作者名称</td></tr>
+<tr><td><code>always</code></td><td>否</td><td><code>false</code></td><td>如果为 <code>true</code>，技能文档始终包含在系统提示中</td></tr>
+<tr><td><code>requires_bins</code></td><td>否</td><td>—</td><td>逗号分隔的二进制文件列表（通过 <code>which</code> 检查是否存在）</td></tr>
+<tr><td><code>requires_env</code></td><td>否</td><td>—</td><td>逗号分隔的环境变量列表（必须已设置）</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>触发关键词</strong>帮助 Agent 决定何时激活该技能。如果用户使用多种语言，请包含多语言的触发词。</p>
+<h3 id="5-srcmainrs"><a class="header" href="#5-srcmainrs">5. src/main.rs</a></h3>
+<p>二进制文件实现 stdin/stdout 协议。</p>
+<p><strong>最小模板：</strong></p>
+<pre class="playground"><code class="language-rust">use std::io::Read;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize)]
+struct MyToolInput {
+    param1: String,
+    #[serde(default = "default_param2")]
+    param2: i32,
+}
+
+fn default_param2() -&gt; i32 { 10 }
+
+fn main() {
+    let args: Vec&lt;String&gt; = std::env::args().collect();
+    let tool_name = args.get(1).map(|s| s.as_str()).unwrap_or("unknown");
+
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&amp;mut buf) {
+        fail(&amp;format!("Failed to read stdin: {e}"));
+    }
+
+    match tool_name {
+        "my_tool" =&gt; handle_my_tool(&amp;buf),
+        _ =&gt; fail(&amp;format!("Unknown tool '{tool_name}'. Expected: my_tool")),
+    }
+}
+
+fn fail(msg: &amp;str) -&gt; ! {
+    println!("{}", json!({"output": msg, "success": false}));
+    std::process::exit(1);
+}
+
+fn handle_my_tool(input_json: &amp;str) {
+    let input: MyToolInput = match serde_json::from_str(input_json) {
+        Ok(v) =&gt; v,
+        Err(e) =&gt; fail(&amp;format!("Invalid input: {e}")),
+    };
+
+    // ... your logic here ...
+
+    let result = format!("Processed {} with param2={}", input.param1, input.param2);
+    println!("{}", json!({"output": result, "success": true}));
+}</code></pre>
+<p><strong>协议规则：</strong></p>
+<ol>
+<li><strong>argv[1]</strong> = 工具名称（例如 <code>get_weather</code>、<code>get_forecast</code>）</li>
+<li><strong>stdin</strong> = 匹配工具 <code>input_schema</code> 的 JSON 对象</li>
+<li><strong>stdout</strong> = JSON 对象，包含：
+<ul>
+<li><code>output</code>（字符串）：人类可读的结果文本</li>
+<li><code>success</code>（布尔值）：成功为 <code>true</code>，失败为 <code>false</code></li>
+</ul>
+</li>
+<li><strong>退出码</strong>：成功为 0，失败为非零</li>
+<li><strong>stderr</strong>：网关会忽略（可用于调试日志）</li>
+</ol>
+<hr>
+<h2 id="注册技能"><a class="header" href="#注册技能">注册技能</a></h2>
+<h3 id="6-添加到工作区"><a class="header" href="#6-添加到工作区">6. 添加到工作区</a></h3>
+<p>在根目录的 <code>Cargo.toml</code> 中添加到 <code>members</code>：</p>
+<pre><code class="language-toml">[workspace]
+members = [
+    # ... existing members ...
+    "crates/app-skills/my-skill",
+]
+</code></pre>
+<h3 id="7-在-bundled_app_skillsrs-中注册"><a class="header" href="#7-在-bundled_app_skillsrs-中注册">7. 在 bundled_app_skills.rs 中注册</a></h3>
+<p>在 <code>crates/octos-agent/src/bundled_app_skills.rs</code> 中添加到 <code>BUNDLED_APP_SKILLS</code>：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub const BUNDLED_APP_SKILLS: &amp;[(&amp;str, &amp;str, &amp;str, &amp;str)] = &amp;[
+    // ... existing skills ...
+    (
+        "my-skill",                                          // dir_name (skill directory name)
+        "my_skill",                                          // binary_name (must match [[bin]] name)
+        include_str!("../../app-skills/my-skill/SKILL.md"),  // embedded docs
+        include_str!("../../app-skills/my-skill/manifest.json"), // embedded manifest
+    ),
+];
+<span class="boring">}</span></code></pre>
+<p><strong>元组格式：</strong> <code>(dir_name, binary_name, skill_md, manifest_json)</code></p>
+<ul>
+<li><code>dir_name</code>：<code>~/.octos/skills/</code> 下的目录名</li>
+<li><code>binary_name</code>：<code>target/release/</code> 中的二进制文件名（必须与 Cargo.toml 中的 <code>[[bin]] name</code> 匹配）</li>
+<li><code>skill_md</code>：嵌入的 SKILL.md 内容</li>
+<li><code>manifest_json</code>：嵌入的 manifest.json 内容</li>
+</ul>
+<hr>
+<h2 id="构建与测试"><a class="header" href="#构建与测试">构建与测试</a></h2>
+<h3 id="8-构建"><a class="header" href="#8-构建">8. 构建</a></h3>
+<pre><code class="language-bash"># 只构建你的技能
+cargo build -p my-skill
+
+# 构建全部
+cargo build --workspace
+</code></pre>
+<h3 id="9-独立测试"><a class="header" href="#9-独立测试">9. 独立测试</a></h3>
+<pre><code class="language-bash"># 直接测试你的工具
+echo '{"param1": "hello", "param2": 5}' | ./target/debug/my_skill my_tool
+
+# 预期输出：
+# {"output":"Processed hello with param2=5","success":true}
+
+# 测试错误处理
+echo '{}' | ./target/debug/my_skill my_tool
+echo '{"param1": "test"}' | ./target/debug/my_skill unknown_tool
+</code></pre>
+<h3 id="10-网关集成测试"><a class="header" href="#10-网关集成测试">10. 网关集成测试</a></h3>
+<pre><code class="language-bash"># 构建 release 版本并安装
+cargo build --release --workspace
+
+# 启动网关（技能自动引导加载）
+octos gateway
+
+# 检查技能是否已加载
+ls ~/.octos/skills/my-skill/
+# main  manifest.json  SKILL.md
+
+# 让 Agent 使用你的技能
+</code></pre>
+<hr>
+<h2 id="示例"><a class="header" href="#示例">示例</a></h2>
+<h3 id="示例-1纯本地技能时钟"><a class="header" href="#示例-1纯本地技能时钟">示例 1：纯本地技能（时钟）</a></h3>
+<p>不需要网络，不需要环境变量。使用 <code>chrono</code> + <code>chrono-tz</code>。</p>
+<pre><code>crates/app-skills/time/
+├── Cargo.toml          # deps: chrono, chrono-tz, serde, serde_json
+├── manifest.json       # 1 tool: get_time, timeout_secs: 5
+├── SKILL.md            # Triggers: time, clock, 几点
+└── src/main.rs         # Reads system clock, formats with timezone
+</code></pre>
+<p><strong>关键模式：</strong> 未指定时区时默认使用本地时间。</p>
+<h3 id="示例-2网络技能天气"><a class="header" href="#示例-2网络技能天气">示例 2：网络技能（天气）</a></h3>
+<p>调用外部 API，需要网络。使用 <code>reqwest</code>（blocking）。</p>
+<pre><code>crates/app-skills/weather/
+├── Cargo.toml          # deps: reqwest (blocking, rustls-tls), serde, serde_json
+├── manifest.json       # 2 tools: get_weather, get_forecast, timeout_secs: 15
+├── SKILL.md            # Triggers: weather, forecast, 天气
+└── src/main.rs         # Geocode city → fetch weather from Open-Meteo
+</code></pre>
+<p><strong>关键模式：</strong></p>
+<ul>
+<li>构建带超时的 HTTP 客户端</li>
+<li>优雅处理 API 错误（返回 <code>success: false</code>）</li>
+<li>对用户输入进行 URL 编码</li>
+<li>一个二进制文件中包含多个工具（根据 <code>argv[1]</code> 匹配）</li>
+</ul>
+<h3 id="示例-3需要环境变量的技能发送邮件"><a class="header" href="#示例-3需要环境变量的技能发送邮件">示例 3：需要环境变量的技能（发送邮件）</a></h3>
+<p>需要从环境变量获取凭据。</p>
+<pre><code>crates/app-skills/send-email/
+├── Cargo.toml          # deps: lettre, serde, serde_json, reqwest
+├── manifest.json       # 1 tool: send_email
+├── SKILL.md            # requires_env: SMTP_HOST,SMTP_USERNAME,SMTP_PASSWORD
+└── src/main.rs         # Reads SMTP_* env vars, sends via SMTP
+</code></pre>
+<p><strong>关键模式：</strong> 尽早检查环境变量，用清晰的错误消息报错。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>fn get_smtp_config() -&gt; SmtpConfig {
+    let host = std::env::var("SMTP_HOST")
+        .unwrap_or_else(|_| fail("SMTP_HOST env var not set"));
+    // ...
+}
+<span class="boring">}</span></code></pre>
+<hr>
+<h2 id="清单扩展mcp-服务器钩子和提示片段"><a class="header" href="#清单扩展mcp-服务器钩子和提示片段">清单扩展：MCP 服务器、钩子和提示片段</a></h2>
+<p>技能可以在 <code>manifest.json</code> 中声明的不仅仅是工具。三个额外的扩展点允许技能提供 MCP 服务器、生命周期钩子和系统提示内容。这些统称为 <strong>extras</strong>。</p>
+<h3 id="mcp-服务器"><a class="header" href="#mcp-服务器">MCP 服务器</a></h3>
+<p>技能可以声明 MCP（Model Context Protocol）服务器，网关在技能加载时自动启动。这让技能可以通过 MCP 协议（而非或同时使用 stdin/stdout 二进制协议）暴露工具。</p>
+<p>在 <code>manifest.json</code> 中添加 <code>mcp_servers</code> 数组：</p>
+<pre><code class="language-json">{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "tools": [],
+  "mcp_servers": [
+    {
+      "command": "node",
+      "args": ["mcp-server/index.js"],
+      "env": ["API_KEY", "API_SECRET"]
+    }
+  ]
+}
+</code></pre>
+<p><strong>MCP 服务器字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>command</code></td><td>否*</td><td>启动 MCP 服务器进程的命令</td></tr>
+<tr><td><code>args</code></td><td>否</td><td>传递给命令的参数</td></tr>
+<tr><td><code>env</code></td><td>否</td><td>要转发的环境变量<strong>名称</strong>列表（非值）</td></tr>
+<tr><td><code>url</code></td><td>否*</td><td>HTTP 传输：远程 MCP 服务器端点的 URL</td></tr>
+<tr><td><code>headers</code></td><td>否</td><td>HTTP 传输：附加请求头（键值对象）</td></tr>
+</tbody>
+</table>
+</div>
+<p>* <code>command</code> 和 <code>url</code> 必须设置其中一个。本地（stdio）MCP 服务器使用 <code>command</code>，远程（HTTP）MCP 服务器使用 <code>url</code>。</p>
+<p><strong>路径解析：</strong> 如果 <code>command</code> 以 <code>./</code> 或 <code>../</code> 开头，则相对于技能目录解析。裸命令（如 <code>"node"</code>、<code>"python3"</code>）照常从 <code>PATH</code> 查找。</p>
+<p><strong>环境变量转发：</strong> <code>env</code> 数组包含环境变量的<em>名称</em>而非值。加载时，每个名称从进程环境中查找。只有实际设置的变量才会转发给 MCP 服务器进程。缺少的变量会被静默忽略。</p>
+<p><strong>示例：本地 stdio MCP 服务器</strong></p>
+<pre><code class="language-json">{
+  "mcp_servers": [
+    {
+      "command": "./bin/mcp-server",
+      "args": ["--port", "0"],
+      "env": ["DATABASE_URL"]
+    }
+  ]
+}
+</code></pre>
+<p><strong>示例：远程 HTTP MCP 服务器</strong></p>
+<pre><code class="language-json">{
+  "mcp_servers": [
+    {
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer ${API_KEY}"
+      }
+    }
+  ]
+}
+</code></pre>
+<hr>
+<h3 id="生命周期钩子"><a class="header" href="#生命周期钩子">生命周期钩子</a></h3>
+<p>技能可以声明生命周期钩子，在特定的 Agent 事件发生时运行 shell 命令。这适用于审计、策略执行或副作用。</p>
+<p>在 <code>manifest.json</code> 中添加 <code>hooks</code> 数组：</p>
+<pre><code class="language-json">{
+  "name": "my-audit-skill",
+  "version": "1.0.0",
+  "tools": [],
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/audit.sh"],
+      "timeout_ms": 5000,
+      "tool_filter": ["shell"]
+    }
+  ]
+}
+</code></pre>
+<p><strong>钩子字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>默认值</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>event</code></td><td>是</td><td>–</td><td>生命周期事件名称（见下表）</td></tr>
+<tr><td><code>command</code></td><td>是</td><td>–</td><td>作为 argv 数组的命令（不经过 shell 解释）</td></tr>
+<tr><td><code>timeout_ms</code></td><td>否</td><td>5000</td><td>最大执行时间（毫秒）</td></tr>
+<tr><td><code>tool_filter</code></td><td>否</td><td><code>[]</code>（所有工具）</td><td>仅对这些工具名称触发（仅限工具事件）</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>支持的事件：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>事件</th><th>可拒绝？</th><th>触发时机</th></tr>
+</thead>
+<tbody>
+<tr><td><code>before_tool_call</code></td><td>是</td><td>工具执行前。退出码 1 = 拒绝。</td></tr>
+<tr><td><code>after_tool_call</code></td><td>否</td><td>工具完成后（无论成功或失败）。</td></tr>
+<tr><td><code>before_llm_call</code></td><td>是</td><td>向 LLM 发送请求前。退出码 1 = 拒绝。</td></tr>
+<tr><td><code>after_llm_call</code></td><td>否</td><td>收到 LLM 响应后。</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>路径解析：</strong> <code>command</code> 数组的第一个元素（<code>command[0]</code>）遵循与 MCP 服务器相同的规则 – 以 <code>./</code> 或 <code>../</code> 开头的路径相对于技能目录解析。其他元素原样传递。</p>
+<p><strong>钩子载荷：</strong> 网关通过 stdin 向钩子进程发送 JSON 载荷。工具事件的载荷包含 <code>tool_name</code>、<code>arguments</code> 和会话上下文。LLM 事件的载荷包含 <code>model</code>、<code>message_count</code> 等。</p>
+<p><strong>拒绝行为：</strong> <code>before_*</code> 钩子可以通过退出码 1 拒绝操作。钩子的 stdout 内容作为拒绝原因。</p>
+<p><strong>示例：审计所有 shell 工具调用</strong></p>
+<pre><code class="language-json">{
+  "hooks": [
+    {
+      "event": "before_tool_call",
+      "command": ["./hooks/policy-check.sh"],
+      "timeout_ms": 3000,
+      "tool_filter": ["shell", "bash"]
+    },
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/audit-log.sh"],
+      "timeout_ms": 5000,
+      "tool_filter": ["shell", "bash"]
+    }
+  ]
+}
+</code></pre>
+<hr>
+<h3 id="提示片段"><a class="header" href="#提示片段">提示片段</a></h3>
+<p>技能可以通过声明提示片段文件向系统提示中注入内容。这适用于向 Agent 传授特定领域的知识、规则或行为，无需编写任何代码。</p>
+<p>在 <code>manifest.json</code> 中添加 <code>prompts</code> 对象：</p>
+<pre><code class="language-json">{
+  "name": "my-style-guide",
+  "version": "1.0.0",
+  "tools": [],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+</code></pre>
+<p><strong>提示字段：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>include</code></td><td>是</td><td>要包含的文件的 glob 模式数组</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>路径解析：</strong> glob 模式相对于技能目录解析。例如，<code>"prompts/*.md"</code> 匹配技能目录下 <code>prompts/</code> 子目录中的所有 <code>.md</code> 文件。</p>
+<p><strong>行为：</strong> 匹配的文件在加载时读取，其内容追加到系统提示中。文件按 glob 展开顺序处理。</p>
+<p><strong>示例：技能目录布局</strong></p>
+<pre><code>~/.octos/skills/my-style-guide/
+├── manifest.json
+├── SKILL.md
+└── prompts/
+    ├── coding-rules.md
+    └── review-checklist.md
+</code></pre>
+<p>对应的清单：</p>
+<pre><code class="language-json">{
+  "name": "my-style-guide",
+  "version": "1.0.0",
+  "tools": [],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+</code></pre>
+<p>当该技能激活时，<code>coding-rules.md</code> 和 <code>review-checklist.md</code> 都会被注入到系统提示中。</p>
+<hr>
+<h3 id="纯扩展技能"><a class="header" href="#纯扩展技能">纯扩展技能</a></h3>
+<p>技能不需要提供任何可执行工具。如果 <code>manifest.json</code> 的 <code>tools</code> 数组为空（或完全省略），但声明了 <code>mcp_servers</code>、<code>hooks</code> 或 <code>prompts</code>，网关会加载扩展而不寻找二进制文件。这适用于：</p>
+<ul>
+<li><strong>纯提示注入技能</strong> – 一组 <code>.md</code> 文件，向 Agent 传授某个领域的知识</li>
+<li><strong>配置技能</strong> – 对所有工具调用执行策略的钩子</li>
+<li><strong>远程 MCP 技能</strong> – 运行在其他地方、通过 <code>url</code> 声明的 MCP 服务器</li>
+</ul>
+<p><strong>示例：纯提示技能</strong></p>
+<pre><code class="language-json">{
+  "name": "company-policy",
+  "version": "1.0.0",
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+</code></pre>
+<p>没有 <code>tools</code>、没有二进制文件、没有 <code>mcp_servers</code>、没有 <code>hooks</code> – 只有提示内容。</p>
+<p><strong>示例：纯钩子技能</strong></p>
+<pre><code class="language-json">{
+  "name": "audit-logger",
+  "version": "1.0.0",
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["./hooks/log-to-siem.sh"],
+      "timeout_ms": 5000
+    }
+  ]
+}
+</code></pre>
+<p>没有工具 – 技能只提供审计钩子。</p>
+<p><strong>示例：组合扩展</strong></p>
+<p>一个技能可以在常规工具之外同时声明全部三种扩展：</p>
+<pre><code class="language-json">{
+  "name": "advanced-skill",
+  "version": "1.0.0",
+  "tools": [
+    { "name": "analyze", "description": "Run analysis", "input_schema": { "type": "object" } }
+  ],
+  "mcp_servers": [
+    { "command": "node", "args": ["mcp/server.js"], "env": ["API_KEY"] }
+  ],
+  "hooks": [
+    { "event": "after_tool_call", "command": ["./hooks/audit.sh"], "tool_filter": ["analyze"] }
+  ],
+  "prompts": {
+    "include": ["prompts/*.md"]
+  }
+}
+</code></pre>
+<hr>
+<h3 id="完整清单字段参考"><a class="header" href="#完整清单字段参考">完整清单字段参考</a></h3>
+<p><code>manifest.json</code> 顶层字段的完整集合，包含扩展：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>默认值</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>–</td><td>技能标识符</td></tr>
+<tr><td><code>version</code></td><td>是</td><td>–</td><td>语义化版本</td></tr>
+<tr><td><code>author</code></td><td>否</td><td>–</td><td>作者名称</td></tr>
+<tr><td><code>description</code></td><td>否</td><td>–</td><td>可读的描述</td></tr>
+<tr><td><code>timeout_secs</code></td><td>否</td><td>30</td><td>每次工具调用的最大执行时间（1-600）</td></tr>
+<tr><td><code>requires_network</code></td><td>否</td><td>false</td><td>信息性标志</td></tr>
+<tr><td><code>sha256</code></td><td>否</td><td>–</td><td>二进制完整性校验（十六进制哈希）</td></tr>
+<tr><td><code>tools</code></td><td>否</td><td><code>[]</code></td><td>工具定义数组</td></tr>
+<tr><td><code>mcp_servers</code></td><td>否</td><td><code>[]</code></td><td>MCP 服务器声明数组</td></tr>
+<tr><td><code>hooks</code></td><td>否</td><td><code>[]</code></td><td>生命周期钩子定义数组</td></tr>
+<tr><td><code>prompts</code></td><td>否</td><td>–</td><td>提示片段配置对象</td></tr>
+<tr><td><code>binaries</code></td><td>否</td><td><code>{}</code></td><td>按 <code>{os}-{arch}</code> 索引的预编译二进制文件</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="进阶主题"><a class="header" href="#进阶主题">进阶主题</a></h2>
+<h3 id="单个技能中的多个工具"><a class="header" href="#单个技能中的多个工具">单个技能中的多个工具</a></h3>
+<p>一个技能二进制文件可以实现多个工具。工具名称通过 <code>argv[1]</code> 传递：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>match tool_name {
+    "get_weather" =&gt; handle_get_weather(&amp;buf),
+    "get_forecast" =&gt; handle_get_forecast(&amp;buf),
+    _ =&gt; fail(&amp;format!("Unknown tool '{tool_name}'")),
+}
+<span class="boring">}</span></code></pre>
+<p>每个工具必须在 <code>manifest.json</code> 中声明：</p>
+<pre><code class="language-json">{
+  "tools": [
+    { "name": "get_weather", "description": "...", "input_schema": { ... } },
+    { "name": "get_forecast", "description": "...", "input_schema": { ... } }
+  ]
+}
+</code></pre>
+<h3 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h3>
+<p>技能继承网关的环境（减去被屏蔽的变量）。使用 API 密钥的方式：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let api_key = std::env::var("MY_API_KEY")
+    .unwrap_or_else(|_| fail("MY_API_KEY not set"));
+<span class="boring">}</span></code></pre>
+<p>在 SKILL.md frontmatter 中声明依赖，这样在环境变量缺失时技能会被标记为不可用：</p>
+<pre><code class="language-yaml">---
+requires_env: MY_API_KEY
+---
+</code></pre>
+<h3 id="超时配置"><a class="header" href="#超时配置">超时配置</a></h3>
+<p>在 <code>manifest.json</code> 中设置合理的超时：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>技能类型</th><th>推荐超时</th></tr>
+</thead>
+<tbody>
+<tr><td>本地计算</td><td>5 秒</td></tr>
+<tr><td>单次 API 调用</td><td>15 秒</td></tr>
+<tr><td>多步 API 调用</td><td>30-60 秒</td></tr>
+<tr><td>长时间研究</td><td>300-600 秒</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="安全"><a class="header" href="#安全">安全</a></h3>
+<p><strong>二进制完整性：</strong></p>
+<ul>
+<li><strong>拒绝符号链接：</strong> 插件二进制文件必须是常规文件。加载时会拒绝符号链接，以防范链接替换攻击。加载器使用 <code>symlink_metadata()</code>（而非 <code>metadata()</code>）来检测。</li>
+<li><strong>SHA-256 校验：</strong> 如果 <code>manifest.json</code> 中存在 <code>sha256</code>，加载器会计算二进制文件的哈希值，不匹配则拒绝。已校验的字节写入单独的文件供网关执行，消除 TOCTOU（检查时间/使用时间）漏洞。</li>
+<li><strong>大小限制：</strong> 插件可执行文件不得超过 100 MB。超大的二进制文件在读取前即被拒绝。</li>
+</ul>
+<p><strong>环境清理：</strong></p>
+<p>网关在启动技能进程前自动剥离以下环境变量：</p>
+<ul>
+<li><code>LD_PRELOAD</code>、<code>DYLD_INSERT_LIBRARIES</code>、<code>DYLD_LIBRARY_PATH</code></li>
+<li><code>NODE_OPTIONS</code>、<code>PYTHONPATH</code>、<code>PERL5LIB</code></li>
+<li><code>RUSTFLAGS</code>、<code>RUST_LOG</code></li>
+<li>以及 10 余个其他变量（见 <code>sandbox.rs</code> 中的 <code>BLOCKED_ENV_VARS</code>）</li>
+</ul>
+<p><strong>技能开发者的最佳实践：</strong></p>
+<ul>
+<li>验证所有输入（永远不要信任 <code>city</code>、<code>path</code> 等）</li>
+<li>为 HTTP 请求设置超时</li>
+<li>避免 shell 注入（不要将用户输入传递给 shell 命令）</li>
+<li>在发布构建中设置 <code>manifest.json</code> 中的 <code>sha256</code> 以启用完整性校验</li>
+</ul>
+<h3 id="平台技能-vs-应用技能"><a class="header" href="#平台技能-vs-应用技能">平台技能 vs 应用技能</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>应用技能</th><th>平台技能</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>位置</strong></td><td><code>crates/app-skills/</code></td><td><code>crates/platform-skills/</code></td></tr>
+<tr><td><strong>数组</strong></td><td><code>BUNDLED_APP_SKILLS</code></td><td><code>PLATFORM_SKILLS</code></td></tr>
+<tr><td><strong>引导</strong></td><td>每次网关启动</td><td>仅管理员机器人</td></tr>
+<tr><td><strong>作用域</strong></td><td>按网关</td><td>所有网关共享</td></tr>
+<tr><td><strong>使用场景</strong></td><td>始终可用、自包含</td><td>需要外部服务</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="无需完整重建即可更新技能"><a class="header" href="#无需完整重建即可更新技能">无需完整重建即可更新技能</a></h3>
+<p>技能可以独立重建和部署：</p>
+<pre><code class="language-bash"># 只构建该技能
+cargo build --release -p weather
+
+# 复制到远程服务器
+scp target/release/weather remote:~/.octos/skills/weather/main
+
+# 无需重启网关 — 下次工具调用时使用新二进制文件
+</code></pre>
+<p>注意：如果修改了 <code>SKILL.md</code> 或 <code>manifest.json</code>，则需要重新构建 <code>octos</code> 二进制文件（因为它们通过 <code>include_str!</code> 嵌入）。</p>
+<hr>
+<h2 id="安装与分发"><a class="header" href="#安装与分发">安装与分发</a></h2>
+<h3 id="技能类型"><a class="header" href="#技能类型">技能类型</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>类型</th><th>位置</th><th>安装方式</th><th>二进制文件</th><th>使用场景</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>内置</strong></td><td><code>crates/app-skills/</code></td><td>编译进 <code>octos</code> 二进制</td><td>嵌入式</td><td>随每个版本发布的核心技能</td></tr>
+<tr><td><strong>外部</strong></td><td>GitHub 仓库</td><td><code>octos skills install user/repo</code></td><td>下载或构建</td><td>社区/自定义技能</td></tr>
+<tr><td><strong>配置文件本地</strong></td><td><code>&lt;profile-data&gt;/skills/</code></td><td>按配置文件安装</td><td>自包含</td><td>租户隔离技能</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="按配置文件的技能管理"><a class="header" href="#按配置文件的技能管理">按配置文件的技能管理</a></h3>
+<p>技能按配置文件安装以确保租户隔离。每个配置文件有独立的技能目录：</p>
+<pre><code>~/.octos/profiles/alice/data/
+  skills/
+    mofa-comic/
+      main              ← 二进制文件（自包含，不在 ~/.cargo/bin）
+      SKILL.md
+      manifest.json
+      styles/*.toml     ← 打包的资源文件
+    mofa-slides/
+      main
+      SKILL.md
+      manifest.json
+      styles/*.toml
+</code></pre>
+<p><strong>重要：</strong> 技能二进制文件以 <code>main</code> 的形式保留在其技能目录中。它们<strong>不会</strong>被复制到 <code>~/.cargo/bin/</code> 或任何全局位置。插件加载器在 <code>&lt;skill-dir&gt;/main</code> 处找到它们。</p>
+<h3 id="安装卸载列表命令"><a class="header" href="#安装卸载列表命令">安装/卸载/列表命令</a></h3>
+<p>所有操作界面都支持按配置文件操作：</p>
+<pre><code class="language-bash"># CLI（--profile 标志放在子命令之前）
+octos skills --profile alice install mofa-org/mofa-skills/mofa-comic
+octos skills --profile alice list
+octos skills --profile alice remove mofa-comic
+
+# 聊天中（自动使用当前配置文件）
+/skills install mofa-org/mofa-skills/mofa-comic
+/skills list
+/skills remove mofa-comic
+
+# Admin API
+POST /api/admin/profiles/alice/skills     {"repo": "mofa-org/mofa-skills/mofa-comic"}
+GET  /api/admin/profiles/alice/skills
+DELETE /api/admin/profiles/alice/skills/mofa-comic
+
+# Agent 工具（自动使用当前配置文件）
+manage_skills(action="install", repo="mofa-org/mofa-skills/mofa-comic")
+manage_skills(action="list")
+manage_skills(action="remove", name="mofa-comic")
+manage_skills(action="search", query="comic")
+</code></pre>
+<h3 id="技能加载优先级"><a class="header" href="#技能加载优先级">技能加载优先级</a></h3>
+<p>网关从多个目录加载技能。名称冲突时先匹配者优先：</p>
+<ol>
+<li><code>&lt;profile-data&gt;/skills/</code> — 按配置文件（最高优先级）</li>
+<li><code>&lt;project-dir&gt;/skills/</code> — 项目本地</li>
+<li><code>&lt;project-dir&gt;/bundled-skills/</code> — 内置应用技能</li>
+<li><code>~/.octos/skills/</code> — 全局（最低优先级）</li>
+</ol>
+<h3 id="发布到注册表"><a class="header" href="#发布到注册表">发布到注册表</a></h3>
+<p>外部技能可通过 <a href="https://github.com/octos-org/octos-hub">octos-hub</a> 注册表被发现。</p>
+<ol>
+<li>将你的技能仓库推送到 GitHub</li>
+<li>通过 PR 向 <code>registry.json</code> 添加条目：</li>
+</ol>
+<pre><code class="language-json">{
+  "name": "my-skills",
+  "description": "What your skills do",
+  "repo": "your-user/your-repo",
+  "skills": ["skill-a", "skill-b"],
+  "requires": ["git", "cargo"],
+  "tags": ["keyword1", "keyword2"]
+}
+</code></pre>
+<ol start="3">
+<li>用户即可查找并安装你的技能：</li>
+</ol>
+<pre><code class="language-bash">octos skills search keyword1
+octos skills --profile alice install your-user/your-repo/skill-a
+</code></pre>
+<h3 id="预编译二进制分发"><a class="header" href="#预编译二进制分发">预编译二进制分发</a></h3>
+<p>为了加快安装速度（跳过编译），在 <code>manifest.json</code> 中添加 <code>binaries</code> 段：</p>
+<pre><code class="language-json">{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "binaries": {
+    "darwin-aarch64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-aarch64.tar.gz",
+      "sha256": "abc123..."
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-x86_64.tar.gz",
+      "sha256": "def456..."
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-linux-x86_64.tar.gz",
+      "sha256": "789ghi..."
+    }
+  },
+  "tools": [ ... ]
+}
+</code></pre>
+<p>安装器下载匹配的二进制文件，验证 SHA-256，然后解压到 <code>&lt;skill-dir&gt;/main</code>。如果没有可用的预编译二进制文件，则回退到 <code>cargo build --release</code>。</p>
+<h3 id="技能的环境变量"><a class="header" href="#技能的环境变量">技能的环境变量</a></h3>
+<p>网关自动向插件进程注入 API 密钥：</p>
+<ul>
+<li>主提供商的 API 密钥（例如 <code>DASHSCOPE_API_KEY</code>）</li>
+<li>备选提供商的密钥（例如 <code>GEMINI_API_KEY</code>、<code>OPENAI_API_KEY</code>）</li>
+<li>非标准端点的 Base URL</li>
+<li><code>OCTOS_DATA_DIR</code> 和 <code>OCTOS_WORK_DIR</code></li>
+</ul>
+<p>密钥在网关启动时从 macOS 钥匙串解析。技能二进制文件以环境变量的形式接收它们 – 无需手动 export。</p>
+<h3 id="打包资源样式配置"><a class="header" href="#打包资源样式配置">打包资源（样式、配置）</a></h3>
+<p>包含资源文件（样式、模板、配置）的技能应将它们打包在技能目录中：</p>
+<pre><code>my-skill/
+  main
+  SKILL.md
+  manifest.json
+  styles/
+    default.toml
+    manga.toml
+  templates/
+    report.html
+</code></pre>
+<p>二进制文件应相对于自身可执行文件的位置解析资源：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let exe = std::env::current_exe()?;
+let skill_dir = exe.parent().unwrap();
+let styles_dir = skill_dir.join("styles");
+<span class="boring">}</span></code></pre>
+<p><strong>不要</strong>在工作目录（cwd）中查找资源 – cwd 指向配置文件的数据目录，而非技能目录。</p>
+<hr>
+<h2 id="检查清单"><a class="header" href="#检查清单">检查清单</a></h2>
+<h3 id="工具技能二进制文件--工具"><a class="header" href="#工具技能二进制文件--工具">工具技能（二进制文件 + 工具）</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> 创建 <code>crates/app-skills/&lt;name&gt;/</code>，包含 Cargo.toml、manifest.json、SKILL.md、src/main.rs</li>
+<li><input disabled="" type="checkbox"> Cargo.toml 中的 <code>[[bin]] name</code> 与 bundled_app_skills.rs 中的 <code>binary_name</code> 匹配</li>
+<li><input disabled="" type="checkbox"> manifest.json 对所有工具输入有有效的 JSON Schema</li>
+<li><input disabled="" type="checkbox"> SKILL.md 有包含触发关键词的 frontmatter</li>
+<li><input disabled="" type="checkbox"> 二进制文件读取 <code>argv[1]</code> 获取工具名称，从 stdin 读取 JSON 输入</li>
+<li><input disabled="" type="checkbox"> 二进制文件向 stdout 输出 <code>{"output": "...", "success": true/false}</code></li>
+<li><input disabled="" type="checkbox"> 错误情况返回 <code>success: false</code> 并附带清晰的消息</li>
+<li><input disabled="" type="checkbox"> 添加到工作区 <code>Cargo.toml</code> 的 members</li>
+<li><input disabled="" type="checkbox"> 添加到 <code>bundled_app_skills.rs</code> 中的 <code>BUNDLED_APP_SKILLS</code></li>
+<li><input disabled="" type="checkbox"> <code>cargo build --workspace</code> 成功</li>
+<li><input disabled="" type="checkbox"> 独立测试：<code>echo '{"param": "value"}' | ./target/debug/my_skill my_tool</code></li>
+<li><input disabled="" type="checkbox"> 网关测试：技能出现在 <code>~/.octos/skills/</code> 中且 Agent 可以使用</li>
+</ul>
+<h3 id="扩展mcp-服务器钩子提示片段"><a class="header" href="#扩展mcp-服务器钩子提示片段">扩展（MCP 服务器、钩子、提示片段）</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> <code>mcp_servers</code>：设置了 <code>command</code> 或 <code>url</code>；<code>env</code> 仅列出变量名称而非值</li>
+<li><input disabled="" type="checkbox"> <code>mcp_servers</code>：相对命令路径（<code>./bin/server</code>）在技能目录中存在</li>
+<li><input disabled="" type="checkbox"> <code>hooks</code>：<code>event</code> 是 <code>before_tool_call</code>、<code>after_tool_call</code>、<code>before_llm_call</code>、<code>after_llm_call</code> 之一</li>
+<li><input disabled="" type="checkbox"> <code>hooks</code>：<code>command</code> 是 argv 数组（非 shell 字符串）；<code>command[0]</code> 的相对路径能正确解析</li>
+<li><input disabled="" type="checkbox"> <code>hooks</code>：当钩子只应用于特定工具时设置了 <code>tool_filter</code></li>
+<li><input disabled="" type="checkbox"> <code>prompts</code>：<code>include</code> 中的 glob 模式匹配技能目录中预期的 <code>.md</code> 文件</li>
+<li><input disabled="" type="checkbox"> 纯扩展技能：<code>tools</code> 数组为空或省略；不需要二进制文件</li>
+<li><input disabled="" type="checkbox"> 网关测试：扩展出现在加载器日志中（<code>loaded skill extras</code>）</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="cli-reference.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="architecture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="cli-reference.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="architecture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

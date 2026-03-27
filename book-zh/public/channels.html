@@ -1,0 +1,601 @@
+<!DOCTYPE HTML>
+<html lang="zh" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>网关与频道 - Octos 文档</title>
+
+
+        <!-- Custom HTML head -->
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/octos-80618944.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "searchindex-546dfab1.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-dd287637.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Octos 文档</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/octos-org/octos" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/octos-org/octos/edit/main/book-zh/src/src/channels.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="网关与频道"><a class="header" href="#网关与频道">网关与频道</a></h1>
+<p>Octos 以<strong>网关</strong>模式运行，将各消息平台桥接到你的 LLM 智能体。每个平台连接称为一个<strong>频道</strong>。你可以在同一个网关进程中同时运行多个频道——例如同时接入 Telegram 和 Slack。</p>
+<h2 id="频道概览"><a class="header" href="#频道概览">频道概览</a></h2>
+<p>频道在 <code>config.json</code> 的 <code>gateway.channels</code> 数组中配置。每个条目指定一个 <code>type</code>、可选的 <code>allowed_senders</code> 用于访问控制，以及平台特定的 <code>settings</code>。</p>
+<p>查看已编译和已配置的频道：</p>
+<pre><code class="language-bash">octos channels status
+</code></pre>
+<p>该命令会显示一张表格，列出每个频道的编译状态（feature flags）和配置摘要（环境变量的设置情况）。</p>
+<hr>
+<h2 id="telegram"><a class="header" href="#telegram">Telegram</a></h2>
+<p>需要从 <a href="https://t.me/BotFather">@BotFather</a> 获取 bot token。</p>
+<pre><code class="language-bash">export TELEGRAM_BOT_TOKEN="123456:ABC..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "telegram",
+  "allowed_senders": ["your_user_id"],
+  "settings": {
+    "token_env": "TELEGRAM_BOT_TOKEN"
+  }
+}
+</code></pre>
+<p>Telegram 支持 bot 命令、内联键盘、语音消息、图片和文件。</p>
+<hr>
+<h2 id="slack"><a class="header" href="#slack">Slack</a></h2>
+<p>需要一个 Socket Mode 应用，同时提供 bot token 和 app-level token。</p>
+<pre><code class="language-bash">export SLACK_BOT_TOKEN="xoxb-..."
+export SLACK_APP_TOKEN="xapp-..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "slack",
+  "settings": {
+    "bot_token_env": "SLACK_BOT_TOKEN",
+    "app_token_env": "SLACK_APP_TOKEN"
+  }
+}
+</code></pre>
+<hr>
+<h2 id="discord"><a class="header" href="#discord">Discord</a></h2>
+<p>需要从 <a href="https://discord.com/developers/applications">Discord Developer Portal</a> 获取 bot token。</p>
+<pre><code class="language-bash">export DISCORD_BOT_TOKEN="..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "discord",
+  "settings": {
+    "token_env": "DISCORD_BOT_TOKEN"
+  }
+}
+</code></pre>
+<hr>
+<h2 id="whatsapp"><a class="header" href="#whatsapp">WhatsApp</a></h2>
+<p>需要一个运行在 WebSocket URL 上的 Node.js 桥接（Baileys）。</p>
+<pre><code class="language-json">{
+  "type": "whatsapp",
+  "settings": {
+    "bridge_url": "ws://localhost:3001"
+  }
+}
+</code></pre>
+<hr>
+<h2 id="飞书中国版"><a class="header" href="#飞书中国版">飞书（中国版）</a></h2>
+<p>飞书默认使用 WebSocket 长连接模式（无需公网 URL）。</p>
+<pre><code class="language-bash">export FEISHU_APP_ID="cli_..."
+export FEISHU_APP_SECRET="..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "feishu",
+  "settings": {
+    "app_id_env": "FEISHU_APP_ID",
+    "app_secret_env": "FEISHU_APP_SECRET"
+  }
+}
+</code></pre>
+<p>构建时需启用 <code>feishu</code> feature flag：</p>
+<pre><code class="language-bash">cargo build --release -p octos-cli --features feishu
+</code></pre>
+<hr>
+<h2 id="lark国际版"><a class="header" href="#lark国际版">Lark（国际版）</a></h2>
+<p>Lark（国际版飞书）<strong>不支持</strong> WebSocket 模式，需改用 webhook 模式——由 Lark 通过 HTTP POST 将事件推送到你的服务器。</p>
+<pre><code>Lark Cloud --&gt; ngrok --&gt; localhost:9321/webhook/event --&gt; Gateway --&gt; LLM
+</code></pre>
+<h3 id="开发者控制台配置"><a class="header" href="#开发者控制台配置">开发者控制台配置</a></h3>
+<ol>
+<li>前往 <a href="https://open.larksuite.com/app">open.larksuite.com/app</a>，创建或选择一个应用</li>
+<li>在 Features 下添加 <strong>Bot</strong> 能力</li>
+<li>配置事件订阅：
+<ul>
+<li>Events &amp; Callbacks &gt; Event Configuration &gt; Edit subscription method</li>
+<li>选择 “Send events to developer server”</li>
+<li>将请求 URL 设为 <code>https://YOUR_NGROK_URL/webhook/event</code></li>
+</ul>
+</li>
+<li>添加事件：<code>im.message.receive_v1</code>（接收消息）</li>
+<li>启用权限：<code>im:message</code>、<code>im:message:send_as_bot</code>、<code>im:resource</code></li>
+<li>发布应用：App Release &gt; Version Management &gt; Create Version &gt; Apply for Online Release</li>
+</ol>
+<h3 id="配置"><a class="header" href="#配置">配置</a></h3>
+<pre><code class="language-bash">export LARK_APP_ID="cli_..."
+export LARK_APP_SECRET="..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "lark",
+  "allowed_senders": [],
+  "settings": {
+    "app_id_env": "LARK_APP_ID",
+    "app_secret_env": "LARK_APP_SECRET",
+    "region": "global",
+    "mode": "webhook",
+    "webhook_port": 9321
+  }
+}
+</code></pre>
+<h3 id="配置项参考"><a class="header" href="#配置项参考">配置项参考</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>配置项</th><th>说明</th><th>默认值</th></tr>
+</thead>
+<tbody>
+<tr><td><code>app_id_env</code></td><td>App ID 的环境变量名</td><td><code>FEISHU_APP_ID</code></td></tr>
+<tr><td><code>app_secret_env</code></td><td>App Secret 的环境变量名</td><td><code>FEISHU_APP_SECRET</code></td></tr>
+<tr><td><code>region</code></td><td><code>"cn"</code>（飞书）或 <code>"global"</code> / <code>"lark"</code>（Lark 国际版）</td><td><code>"cn"</code></td></tr>
+<tr><td><code>mode</code></td><td><code>"ws"</code>（WebSocket）或 <code>"webhook"</code>（HTTP）</td><td><code>"ws"</code></td></tr>
+<tr><td><code>webhook_port</code></td><td>webhook HTTP 服务端口</td><td><code>9321</code></td></tr>
+<tr><td><code>encrypt_key</code></td><td>Lark 控制台的 Encrypt Key（用于 AES-256-CBC）</td><td>无</td></tr>
+<tr><td><code>verification_token</code></td><td>Lark 控制台的 Verification Token</td><td>无</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="加密可选"><a class="header" href="#加密可选">加密（可选）</a></h3>
+<p>如果你在 Lark 控制台（Events &amp; Callbacks &gt; Encryption Strategy）配置了 Encrypt Key，需将其添加到配置中：</p>
+<pre><code class="language-json">{
+  "type": "lark",
+  "settings": {
+    "app_id_env": "LARK_APP_ID",
+    "app_secret_env": "LARK_APP_SECRET",
+    "region": "global",
+    "mode": "webhook",
+    "webhook_port": 9321,
+    "encrypt_key": "your-encrypt-key-here",
+    "verification_token": "your-verification-token"
+  }
+}
+</code></pre>
+<p>启用加密后，Lark 会发送加密的 POST 请求体。网关使用 SHA-256 密钥派生的 AES-256-CBC 进行解密，并通过 <code>X-Lark-Signature</code> 头验证签名。</p>
+<h3 id="支持的消息类型"><a class="header" href="#支持的消息类型">支持的消息类型</a></h3>
+<p><strong>入站消息：</strong> 文本、图片、文件（PDF、文档）、音频、视频、表情包</p>
+<p><strong>出站消息：</strong> Markdown（通过互动卡片）、图片上传、文件上传</p>
+<h3 id="运行"><a class="header" href="#运行">运行</a></h3>
+<pre><code class="language-bash"># 启动 ngrok 隧道
+ngrok http 9321
+
+# 启动网关
+LARK_APP_ID="cli_xxxxx" LARK_APP_SECRET="xxxxx" octos gateway --cwd /path/to/workdir
+</code></pre>
+<h3 id="常见问题排查"><a class="header" href="#常见问题排查">常见问题排查</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>问题</th><th>解决方案</th></tr>
+</thead>
+<tbody>
+<tr><td>WS 端点返回 404</td><td>Lark 国际版不支持 WebSocket，请使用 <code>"mode": "webhook"</code></td></tr>
+<tr><td>Challenge 验证失败</td><td>确认 ngrok 正在运行且 URL 与 Lark 控制台中的一致</td></tr>
+<tr><td>收不到事件</td><td>添加事件后需发布应用版本；检查控制台中的 Event Log</td></tr>
+<tr><td>机器人不回复</td><td>确认已授予 <code>im:message:send_as_bot</code> 权限</td></tr>
+<tr><td>Ngrok URL 变了</td><td>免费 ngrok URL 每次重启都会变化，需在 Lark 控制台更新请求 URL</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="邮件imapsmtp"><a class="header" href="#邮件imapsmtp">邮件（IMAP/SMTP）</a></h2>
+<p>通过 IMAP 轮询收件箱获取入站消息，通过 SMTP 发送回复。需启用 <code>email</code> feature flag。</p>
+<pre><code class="language-bash">export EMAIL_USERNAME="bot@example.com"
+export EMAIL_PASSWORD="app-specific-password"
+</code></pre>
+<pre><code class="language-json">{
+  "type": "email",
+  "allowed_senders": ["trusted@example.com"],
+  "settings": {
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "username_env": "EMAIL_USERNAME",
+    "password_env": "EMAIL_PASSWORD",
+    "from_address": "bot@example.com",
+    "poll_interval_secs": 30,
+    "max_body_chars": 10000
+  }
+}
+</code></pre>
+<hr>
+<h2 id="企业微信wecom"><a class="header" href="#企业微信wecom">企业微信（WeCom）</a></h2>
+<p>需要一个配置了消息回调 URL 的自建应用。需启用 <code>wecom</code> feature flag。</p>
+<pre><code class="language-bash">export WECOM_CORP_ID="ww..."
+export WECOM_AGENT_SECRET="..."
+</code></pre>
+<pre><code class="language-json">{
+  "type": "wecom",
+  "settings": {
+    "corp_id_env": "WECOM_CORP_ID",
+    "agent_secret_env": "WECOM_AGENT_SECRET",
+    "agent_id": "1000002",
+    "verification_token": "...",
+    "encoding_aes_key": "...",
+    "webhook_port": 9322
+  }
+}
+</code></pre>
+<hr>
+<h2 id="微信通过-workbuddy-桥接"><a class="header" href="#微信通过-workbuddy-桥接">微信（通过 WorkBuddy 桥接）</a></h2>
+<p>普通微信用户可以通过 WorkBuddy 桌面端桥接连接到你的智能体。WorkBuddy 负责微信传输层；Octos 通过其 WeCom Bot 频道处理 AI 逻辑。</p>
+<pre><code>微信（手机） --&gt; WorkBuddy（桌面端） --&gt; 企业微信群机器人（WSS） --&gt; octos wecom-bot 频道
+</code></pre>
+<h3 id="配置步骤"><a class="header" href="#配置步骤">配置步骤</a></h3>
+<ol>
+<li>
+<p>在<a href="https://work.weixin.qq.com/">企业微信管理后台</a>的“应用管理 &gt; 群机器人“中创建一个<strong>企业微信群机器人</strong>，记下 Bot ID 和 Secret。</p>
+</li>
+<li>
+<p>配置 <code>wecom-bot</code> 频道：</p>
+</li>
+</ol>
+<pre><code class="language-bash">export WECOM_BOT_SECRET="your_robot_secret_here"
+</code></pre>
+<pre><code class="language-json">{
+  "type": "wecom-bot",
+  "allowed_senders": [],
+  "settings": {
+    "bot_id": "YOUR_BOT_ID",
+    "secret_env": "WECOM_BOT_SECRET"
+  }
+}
+</code></pre>
+<ol start="3">
+<li>构建并启动：</li>
+</ol>
+<pre><code class="language-bash">cargo build --release -p octos-cli --features "wecom-bot"
+octos gateway
+</code></pre>
+<ol start="4">
+<li>安装 <strong>WorkBuddy</strong> 桌面客户端，通过扫码关联你的微信，并连接到同一个企业微信群机器人。</li>
+</ol>
+<h3 id="连接详情"><a class="header" href="#连接详情">连接详情</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>属性</th><th>值</th></tr>
+</thead>
+<tbody>
+<tr><td>协议</td><td>WebSocket (WSS)</td></tr>
+<tr><td>端点</td><td><code>wss://openws.work.weixin.qq.com</code></td></tr>
+<tr><td>心跳</td><td>每 30 秒 Ping/pong</td></tr>
+<tr><td>自动重连</td><td>支持，指数退避（5s–60s）</td></tr>
+<tr><td>最大消息长度</td><td>4096 字符</td></tr>
+<tr><td>消息格式</td><td>Markdown</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>wecom-bot</code> 频道使用出站 WebSocket 连接——无需公网 URL 或端口转发。适合部署在 NAT 或防火墙后的服务器。</p>
+<h3 id="限制"><a class="header" href="#限制">限制</a></h3>
+<ul>
+<li><strong>仅支持文本</strong> – 语音和图片消息以占位符形式传递</li>
+<li><strong>不支持消息编辑</strong> – 回复以新消息形式发送</li>
+<li><strong>单向触发</strong> – 微信到 Octos 自动触发；主动推送需使用定时任务</li>
+</ul>
+<hr>
+<h2 id="会话控制命令"><a class="header" href="#会话控制命令">会话控制命令</a></h2>
+<p>在任何网关频道中，以下命令用于管理对话会话：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>命令</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>/new</code></td><td>创建新会话（从当前对话的最近 10 条消息分叉）</td></tr>
+<tr><td><code>/new &lt;name&gt;</code></td><td>创建命名会话</td></tr>
+<tr><td><code>/s &lt;name&gt;</code></td><td>切换到指定名称的会话</td></tr>
+<tr><td><code>/s</code></td><td>切换到默认会话</td></tr>
+<tr><td><code>/sessions</code></td><td>列出当前聊天的所有会话</td></tr>
+<tr><td><code>/back</code></td><td>切换到上一个活跃会话</td></tr>
+<tr><td><code>/delete</code></td><td>删除当前会话</td></tr>
+</tbody>
+</table>
+</div>
+<p>每个聊天同一时间只有一个<strong>活跃</strong>会话。消息会路由到活跃会话。非活跃会话仍可执行后台任务（深度搜索、流水线等）。当非活跃会话完成工作时，你会收到通知——使用 <code>/s &lt;name&gt;</code> 查看结果。</p>
+<hr>
+<h2 id="语音转写"><a class="header" href="#语音转写">语音转写</a></h2>
+<p>来自频道的语音和音频消息在发送给智能体前会自动转写。系统优先尝试本地 ASR（通过 OminiX 引擎），本地不可用时降级到云端 Whisper。转写结果会以 <code>[transcription: ...]</code> 的形式前置。</p>
+<pre><code class="language-bash"># 本地 ASR（优先） -- 由 octos serve 自动设置
+export OMINIX_API_URL="http://localhost:8080"
+
+# 云端降级
+export GROQ_API_KEY="gsk_..."
+</code></pre>
+<p><code>config.json</code> 中的语音配置：</p>
+<pre><code class="language-json">{
+  "voice": {
+    "auto_asr": true,
+    "auto_tts": true,
+    "default_voice": "vivian",
+    "asr_language": null
+  }
+}
+</code></pre>
+<ul>
+<li><strong><code>auto_asr</code></strong> – 自动转写收到的语音/音频消息</li>
+<li><strong><code>auto_tts</code></strong> – 用户发送语音时自动合成语音回复</li>
+<li><strong><code>default_voice</code></strong> – 自动 TTS 的语音预设</li>
+<li><strong><code>asr_language</code></strong> – 强制指定转写语言（<code>null</code> = 自动检测）</li>
+</ul>
+<hr>
+<h2 id="访问控制"><a class="header" href="#访问控制">访问控制</a></h2>
+<p>使用 <code>allowed_senders</code> 限制谁可以与智能体交互。空列表表示允许所有人。</p>
+<pre><code class="language-json">{
+  "type": "telegram",
+  "allowed_senders": ["123456", "789012"]
+}
+</code></pre>
+<p>每种频道类型使用各自的发送者标识格式（Telegram 用户 ID、邮箱地址、企业微信用户 ID 等）。</p>
+<hr>
+<h2 id="定时任务"><a class="header" href="#定时任务">定时任务</a></h2>
+<p>智能体可以调度周期性任务，通过任意频道发送消息：</p>
+<pre><code class="language-bash">octos cron list                          # 列出活跃任务
+octos cron list --all                    # 包含已禁用的任务
+octos cron add --name "report" --message "Generate daily report" --cron "0 0 9 * * * *"
+octos cron add --name "check" --message "Check status" --every 3600
+octos cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00Z"
+octos cron remove &lt;job-id&gt;
+octos cron enable &lt;job-id&gt;               # 启用任务
+octos cron enable &lt;job-id&gt; --disable     # 禁用任务
+</code></pre>
+<p>任务支持可选的 <code>timezone</code> 字段，使用 IANA 时区名称（如 <code>"America/New_York"</code>、<code>"Asia/Shanghai"</code>）。未指定时使用 UTC。</p>
+<hr>
+<h2 id="消息合并"><a class="header" href="#消息合并">消息合并</a></h2>
+<p>长回复会自动拆分为符合频道限制的分段：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>频道</th><th>每条消息最大字符数</th></tr>
+</thead>
+<tbody>
+<tr><td>Telegram</td><td>4000</td></tr>
+<tr><td>Discord</td><td>1900</td></tr>
+<tr><td>Slack</td><td>3900</td></tr>
+</tbody>
+</table>
+</div>
+<p>拆分优先级：段落边界 &gt; 换行符 &gt; 句末 &gt; 空格 &gt; 硬截断。</p>
+<hr>
+<h2 id="配置热更新"><a class="header" href="#配置热更新">配置热更新</a></h2>
+<p>网关会自动检测配置文件变更：</p>
+<ul>
+<li><strong>热更新</strong>（无需重启）：系统提示词、AGENTS.md、SOUL.md、USER.md</li>
+<li><strong>需要重启</strong>：服务商、模型、API 密钥、频道设置</li>
+</ul>
+<p>变更通过 SHA-256 哈希检测，并附带防抖机制。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="providers.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="memory-skills.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="providers.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="memory-skills.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
