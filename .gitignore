@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 **/*.rs.bk
+/book/public/
 
 # IDE
 .idea/
@@ -36,7 +37,19 @@ scripts/deploy.sh
 !ORG-README.md
 !CLAUDE.md
 !CHANGELOG.md
-!docs/**/*.md
+# User-facing docs only (internal analysis/audits stay local)
+!docs/user-guide.md
+!docs/user-guide-zh.md
+!docs/app-skill-dev-guide.md
+!docs/app-skill-dev-guide-zh.md
+!docs/TESTING.md
+!docs/ARCHITECTURE.md
+!docs/SANDBOX.md
+!docs/SECURITY_ARCHITECTURE.md
+
+# mdBook documentation site
+!book/book.toml
+!book/src/**/*.md
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md

@@ -1,0 +1,15 @@
+[book]
+title = "Octos Documentation"
+authors = ["Yue Chen"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "public"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/octos-org/octos"
+edit-url-template = "https://github.com/octos-org/octos/edit/main/book/src/{path}"
+site-url = "/octos/"

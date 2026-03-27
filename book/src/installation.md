@@ -1,8 +1,51 @@
-# Local Deployment Guide
+# Installation & Deployment
 
-Deploy octos on your own machine (macOS, Linux, or Windows).
+## Prerequisites
 
-## Quick Start
+| Requirement | Version | Notes |
+|------------|---------|-------|
+| Rust | 1.85.0+ | Install via [rustup.rs](https://rustup.rs) |
+| macOS | 13+ | Apple Silicon or Intel |
+| Linux | glibc 2.31+ | Ubuntu 20.04+, Debian 11+, Fedora 34+ |
+| Windows | 10/11 | Native build or WSL2 |
+
+You also need an API key from at least one supported LLM provider.
+
+### Optional Dependencies
+
+| Dependency | Used For | Install |
+|-----------|----------|---------|
+| Node.js | WhatsApp bridge, PPTX creation skill | `brew install node` / `apt install nodejs` |
+| ffmpeg | Media/video skills | `brew install ffmpeg` / `apt install ffmpeg` |
+| Chrome/Chromium | Browser automation tool | `brew install --cask chromium` |
+| LibreOffice | Office document conversion | `brew install --cask libreoffice` |
+| Poppler | PDF rendering (`pdftoppm`) | `brew install poppler` / `apt install poppler-utils` |
+
+## Build from Source
+
+```bash
+git clone https://github.com/octos-org/octos
+cd octos
+
+# Basic (CLI, chat, run, gateway with CLI channel)
+cargo install --path crates/octos-cli
+
+# With messaging channels
+cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
+
+# With browser automation (requires Chrome/Chromium)
+cargo install --path crates/octos-cli --features browser
+
+# With web UI and REST API
+cargo install --path crates/octos-cli --features api
+
+# Verify
+octos --version
+```
+
+## Deploy Script
+
+For a streamlined installation, use the deploy script:
 
 ```bash
 # Minimal install (CLI + chat only)
@@ -14,25 +57,6 @@ Deploy octos on your own machine (macOS, Linux, or Windows).
 # Custom channels
 ./scripts/local-deploy.sh --channels telegram,discord,api
 ```
-
-## Prerequisites
-
-| Requirement | Version | Notes |
-|------------|---------|-------|
-| Rust | 1.85.0+ | Install via [rustup.rs](https://rustup.rs) |
-| macOS | 13+ | Apple Silicon or Intel |
-| Linux | glibc 2.31+ | Ubuntu 20.04+, Debian 11+, Fedora 34+ |
-| Windows | 10/11 | Native build or WSL2 |
-
-### Optional Dependencies
-
-| Dependency | Used For | Install |
-|-----------|----------|---------|
-| Node.js | WhatsApp bridge, pptxgenjs | `brew install node` / `apt install nodejs` |
-| ffmpeg | Media/video skills | `brew install ffmpeg` / `apt install ffmpeg` |
-| Chrome/Chromium | Browser tool | `brew install --cask chromium` |
-| LibreOffice | Office doc conversion | `brew install --cask libreoffice` |
-| Poppler | PDF rendering | `brew install poppler` / `apt install poppler-utils` |
 
 ## Platform-Specific Instructions
 
@@ -126,7 +150,7 @@ sudo dnf install -y gcc pkg-config openssl-devel
 
 ### Windows (Native)
 
-octos builds and runs natively on Windows. Shell commands are executed via `cmd /C`.
+Octos builds and runs natively on Windows. Shell commands are executed via `cmd /C`.
 
 ```powershell
 # 1. Install Rust (download rustup-init.exe from https://rustup.rs)
@@ -139,28 +163,18 @@ cargo install --path crates/octos-cli
 
 # 3. Set API key and run
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
-crew chat
-```
-
-**PowerShell CI script:**
-
-A local CI script is provided for Windows:
-
-```powershell
-.\scripts\ci.ps1           # Run fmt + clippy + tests
-.\scripts\ci.ps1 -Fix      # Auto-fix formatting
-.\scripts\ci.ps1 -Quick    # Skip clippy (just fmt + test)
+octos chat
 ```
 
 **Windows notes:**
 
 - Sandbox is disabled on Windows (no bubblewrap/sandbox-exec equivalent); shell commands run without isolation. Docker sandbox mode still works if Docker Desktop is installed.
-- API keys are stored via Windows Credential Manager (`keyring` crate).
+- API keys are stored via Windows Credential Manager.
 - Process management uses `taskkill` for cleanup.
 
 ### Windows (WSL2)
 
-Alternatively, you can use WSL2 for a Linux environment:
+Alternatively, use WSL2 for a Linux environment:
 
 ```powershell
 # 1. Install WSL2 (PowerShell as admin)
@@ -169,13 +183,15 @@ wsl --install -d Ubuntu
 # 2. Open Ubuntu terminal, then follow Linux (Ubuntu) steps above
 ```
 
-**Accessing the dashboard from Windows:**
+When running `octos serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080` (WSL2 auto-forwards ports).
 
-When running `crew serve` inside WSL2, the dashboard is accessible from your Windows browser at `http://localhost:8080/admin/` (WSL2 auto-forwards ports).
+## Docker
+
+```bash
+docker compose --profile gateway up -d
+```
 
 ## Deploy Script Reference
-
-On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
 
 ```
 ./scripts/local-deploy.sh [OPTIONS]
@@ -191,10 +207,12 @@ Options:
   --prefix DIR       Install prefix (default: ~/.cargo/bin)
 ```
 
+On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
+
 **What the script does:**
 
 1. Checks prerequisites (Rust, platform deps)
-2. Builds `octos` binary with selected features
+2. Builds the `octos` binary with selected features
 3. Builds app-skill binaries (unless `--no-skills`)
 4. Signs binaries on macOS (ad-hoc codesign)
 5. Runs `octos init` if `~/.octos` doesn't exist
@@ -208,9 +226,9 @@ Options:
 rm -rf ~/.octos
 ```
 
-## Post-Install Configuration
+## Post-Install Verification
 
-### API Keys
+### Set API Keys
 
 Set at least one LLM provider key:
 
@@ -223,28 +241,12 @@ export OPENAI_API_KEY=sk-...
 octos auth login --provider openai
 ```
 
-### Config File
-
-Edit `~/.octos/config.json` (or `.octos/config.json` in project directory):
-
-```json
-{
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514",
-  "gateway": {
-    "channels": [
-      { "type": "telegram", "settings": { "token_env": "TELEGRAM_BOT_TOKEN" } }
-    ]
-  }
-}
-```
-
-### Verify Installation
+### Verify
 
 ```bash
-octos --version          # Check binary
-octos status             # Check config + API keys
-octos chat --message "Hello"  # Quick test
+octos --version              # Check binary
+octos status                 # Check config + API keys
+octos chat --message "Hello" # Quick test
 ```
 
 ## Upgrading
@@ -269,9 +271,7 @@ systemctl --user restart octos-serve
 | `octos: command not found` | Add `~/.cargo/bin` to PATH: `export PATH="$HOME/.cargo/bin:$PATH"` |
 | Build fails on Linux | Install `build-essential pkg-config libssl-dev` |
 | macOS codesign warning | Run: `codesign -s - ~/.cargo/bin/octos` |
-| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080/admin/` |
+| Dashboard not accessible | Check port: `octos serve --port 8080`, open `http://localhost:8080` |
 | WSL2 port not forwarded | Restart WSL: `wsl --shutdown` then reopen terminal |
 | Service won't start | Check logs: `tail -f ~/.octos/serve.log` or `journalctl --user -u octos-serve` |
 | API key not found | Ensure env var is set in the service environment, not just your shell |
-| Windows: `crew` not found | Ensure `%USERPROFILE%\.cargo\bin` is in your PATH |
-| Windows: shell commands fail | Commands run via `cmd /C`; use Windows-compatible syntax |
