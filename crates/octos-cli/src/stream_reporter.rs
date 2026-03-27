@@ -33,6 +33,10 @@ pub enum StreamProgressEvent {
     /// Reset the streaming buffer (e.g. before an LLM retry so partial
     /// text from a failed attempt doesn't get concatenated with the retry).
     BufferReset,
+    /// Raw SSE JSON to forward directly to the web client.
+    /// Used for discrete progress events (thinking, cost_update) that
+    /// the web UI needs as separate SSE events, not baked into message text.
+    RawSse { json: String },
 }
 
 /// A `ProgressReporter` that forwards stream events through an unbounded channel.
@@ -58,16 +62,63 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
-            ProgressEvent::ToolStarted { name, .. } => StreamProgressEvent::ToolStarted { name },
-            ProgressEvent::ToolCompleted { name, success, .. } => {
-                StreamProgressEvent::ToolCompleted { name, success }
+            ProgressEvent::ToolStarted { ref name, .. } => {
+                // Also send raw SSE for web client status indicators
+                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                    json: serde_json::json!({"type": "tool_start", "tool": name}).to_string(),
+                });
+                StreamProgressEvent::ToolStarted { name: name.clone() }
             }
-            ProgressEvent::ToolProgress { name, message, .. } => {
-                StreamProgressEvent::ToolProgress { name, message }
+            ProgressEvent::ToolCompleted {
+                ref name, success, ..
+            } => {
+                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                    json: serde_json::json!({"type": "tool_end", "tool": name, "success": success})
+                        .to_string(),
+                });
+                StreamProgressEvent::ToolCompleted {
+                    name: name.clone(),
+                    success,
+                }
+            }
+            ProgressEvent::ToolProgress {
+                ref name,
+                ref message,
+                ..
+            } => {
+                let _ = self.tx.send(StreamProgressEvent::RawSse {
+                    json: serde_json::json!({"type": "tool_progress", "tool": name, "message": message})
+                        .to_string(),
+                });
+                StreamProgressEvent::ToolProgress {
+                    name: name.clone(),
+                    message: message.clone(),
+                }
             }
             ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
             ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
+            // Forward discrete progress events as raw SSE JSON for the web client.
+            ProgressEvent::Thinking { iteration } => StreamProgressEvent::RawSse {
+                json: serde_json::json!({"type": "thinking", "iteration": iteration}).to_string(),
+            },
+            ProgressEvent::Response { iteration, .. } => StreamProgressEvent::RawSse {
+                json: serde_json::json!({"type": "response", "iteration": iteration}).to_string(),
+            },
+            ProgressEvent::CostUpdate {
+                session_input_tokens,
+                session_output_tokens,
+                session_cost,
+                ..
+            } => StreamProgressEvent::RawSse {
+                json: serde_json::json!({
+                    "type": "cost_update",
+                    "input_tokens": session_input_tokens,
+                    "output_tokens": session_output_tokens,
+                    "session_cost": session_cost,
+                })
+                .to_string(),
+            },
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -254,12 +305,15 @@ pub async fn run_stream_forwarder(
                 if let Some(ref updater) = operation_updater {
                     updater(&format!("Running {name}"));
                 }
-                // Flush text before tool status
+                // Show tool status line in the streaming message
                 if !no_edit_support
-                    && !buffer.is_empty()
                     && is_session_active(&session_key, &active_sessions).await
                 {
-                    buffer.push_str(&format!("\n\n⚙ `{name}`..."));
+                    if buffer.is_empty() {
+                        buffer.push_str(&format!("⚙ `{name}`..."));
+                    } else {
+                        buffer.push_str(&format!("\n\n⚙ `{name}`..."));
+                    }
                     let visible = strip_think_from_buffer(&buffer);
                     if !visible.is_empty() {
                         flush_to_channel(
@@ -304,36 +358,39 @@ pub async fn run_stream_forwarder(
             }
             StreamProgressEvent::ToolProgress { name, message } => {
                 // Update the tool status line with the progress message
-                if !buffer.is_empty() {
-                    let pending = format!("⚙ `{name}`...");
-                    let progress = format!("⚙ `{name}`: {message}");
-                    if buffer.contains(&pending) {
-                        buffer = buffer.replace(&pending, &progress);
+                let pending = format!("⚙ `{name}`...");
+                let progress = format!("⚙ `{name}`: {message}");
+                if buffer.contains(&pending) {
+                    buffer = buffer.replace(&pending, &progress);
+                } else {
+                    // Replace previous progress line for this tool
+                    let prev_prefix = format!("⚙ `{name}`:");
+                    if let Some(pos) = buffer.rfind(&prev_prefix) {
+                        let end = buffer[pos..].find('\n').map_or(buffer.len(), |i| pos + i);
+                        buffer.replace_range(pos..end, &progress);
+                    } else if !buffer.is_empty() {
+                        // Tool progress arrived without a prior ToolStarted line
+                        buffer.push_str(&format!("\n\n{progress}"));
                     } else {
-                        // Replace previous progress line for this tool
-                        let prev_prefix = format!("⚙ `{name}`:");
-                        if let Some(pos) = buffer.rfind(&prev_prefix) {
-                            let end = buffer[pos..].find('\n').map_or(buffer.len(), |i| pos + i);
-                            buffer.replace_range(pos..end, &progress);
-                        }
+                        buffer.push_str(&progress);
                     }
-                    if last_edit.elapsed() >= EDIT_THROTTLE
-                        && is_session_active(&session_key, &active_sessions).await
-                    {
-                        let visible = strip_think_from_buffer(&buffer);
-                        if !visible.is_empty() {
-                            flush_to_channel(
-                                &channel,
-                                &chat_id,
-                                &visible,
-                                &mut message_id,
-                                &mut no_edit_support,
-                                sender_user_id.as_deref(),
-                            )
-                            .await;
-                        }
-                        last_edit = Instant::now();
+                }
+                if last_edit.elapsed() >= EDIT_THROTTLE
+                    && is_session_active(&session_key, &active_sessions).await
+                {
+                    let visible = strip_think_from_buffer(&buffer);
+                    if !visible.is_empty() {
+                        flush_to_channel(
+                            &channel,
+                            &chat_id,
+                            &visible,
+                            &mut message_id,
+                            &mut no_edit_support,
+                            sender_user_id.as_deref(),
+                        )
+                        .await;
                     }
+                    last_edit = Instant::now();
                 }
             }
             StreamProgressEvent::LlmStatus { message } => {
@@ -398,6 +455,11 @@ pub async fn run_stream_forwarder(
                 // Keep the message_id so the retry edits the same message
                 // instead of creating a new one.
                 buffer.clear();
+            }
+            StreamProgressEvent::RawSse { json } => {
+                // Forward raw SSE JSON directly to the channel.
+                // Only ApiChannel implements this; other channels ignore it.
+                let _ = channel.send_raw_sse(&chat_id, &json).await;
             }
         }
     }

@@ -90,7 +90,7 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
 
 /// Default max tokens per LLM call.
 pub fn default_max_tokens() -> u32 {
-    4_096
+    8_192
 }
 
 /// Estimate token count from text using character heuristic.

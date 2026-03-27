@@ -117,6 +117,7 @@ mod tests {
             status,
             content: format!("output from {node_id}"),
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         }
     }
 
@@ -191,3 +192,4 @@ mod tests {
         assert!(cp.get_outcome("n2").is_none());
     }
 }
+

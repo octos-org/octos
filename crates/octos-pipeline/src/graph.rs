@@ -162,6 +162,9 @@ pub struct NodeOutcome {
     pub content: String,
     /// Token usage for this node.
     pub token_usage: TokenUsage,
+    /// Files written by this node's agent.
+    #[serde(default)]
+    pub files_modified: Vec<std::path::PathBuf>,
 }
 
 /// Outcome status for a pipeline node.

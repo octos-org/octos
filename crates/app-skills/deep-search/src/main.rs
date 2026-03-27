@@ -449,11 +449,9 @@ async fn run_deep_search(
     let report_path = dir.join("_report.md");
     report.push_str(&format!(
         "\n---\n{} pages crawled across {} search rounds.\n\
-         Report saved to: {}\n\
-         ACTION REQUIRED: Use send_file to deliver {} to the user now.\n",
+         Report saved to: {}\n",
         saved_files.len(),
         search_queries.len(),
-        report_path.display(),
         report_path.display(),
     ));
 

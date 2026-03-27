@@ -1101,7 +1101,23 @@ impl GatewayRuntime {
         let (config_tx, config_rx) = tokio::sync::watch::channel(None);
         let _watcher_handle = ConfigWatcher::new(watch_paths, config.clone(), config_tx).spawn();
 
-        // Create channel manager and register channels
+        // Create channel manager and register channels.
+        // If --api-port is passed but no Api channel is configured (serve mode
+        // auto-allocation), inject a synthetic Api channel entry so the gateway
+        // starts an HTTP listener that the serve API can proxy to.
+        let mut channels_for_reg = gw_config.channels.clone();
+        if cmd.api_port.is_some()
+            && !channels_for_reg
+                .iter()
+                .any(|c| c.channel_type == "api")
+        {
+            channels_for_reg.push(crate::config::ChannelEntry {
+                channel_type: "api".into(),
+                allowed_senders: vec![],
+                settings: serde_json::json!({}),
+            });
+        }
+
         let mut channel_mgr = ChannelManager::new();
         {
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
@@ -1114,7 +1130,7 @@ impl GatewayRuntime {
                 #[cfg(feature = "matrix")]
                 matrix_channel: &mut matrix_channel,
             };
-            adapters::register_all(&mut channel_mgr, &gw_config.channels, &mut reg_ctx)?;
+            adapters::register_all(&mut channel_mgr, &channels_for_reg, &mut reg_ctx)?;
         }
 
         // Determine default channel and chat_id for cron delivery fallback
@@ -1181,11 +1197,12 @@ impl GatewayRuntime {
         );
         println!();
 
-        // Create status indicators for each channel (used for typing + dynamic status)
+        // Create status indicators for each channel (used for typing + dynamic status).
+        // Use channels_for_reg (not gw_config.channels) so the API channel is included.
         let status_words = PersonaService::read_status_words(&data_dir);
         let status_indicators: Arc<HashMap<String, Arc<StatusComposer>>> = {
             let mut map = HashMap::new();
-            for entry in &gw_config.channels {
+            for entry in &channels_for_reg {
                 if let Some(ch) = channel_mgr.get_channel(&entry.channel_type) {
                     map.insert(
                         entry.channel_type.clone(),

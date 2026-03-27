@@ -330,6 +330,7 @@ mod tests {
             status,
             content: content.into(),
             token_usage: TokenUsage::default(),
+            files_modified: vec![],
         }
     }
 
@@ -455,3 +456,4 @@ mod tests {
         ));
     }
 }
+

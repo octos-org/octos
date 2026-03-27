@@ -13,7 +13,10 @@ export default function AuthGuard({ children }: { children?: React.ReactNode }) 
   }
 
   if (!user) {
-    return <Navigate to="/login" replace />
+    // Redirect to the unified login page (octos-web SPA at /login).
+    // Pass redirect param so the user returns to /admin/ after login.
+    window.location.href = '/login?redirect=/admin/'
+    return null
   }
 
   return children ? <>{children}</> : <Outlet />

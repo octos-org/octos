@@ -744,6 +744,28 @@ pub async fn test_search(
     let query = "test";
 
     let result = match req.provider.as_str() {
+        "tavily" => {
+            let body = serde_json::json!({
+                "query": query,
+                "max_results": 1,
+                "include_answer": false,
+            });
+            let resp = client
+                .post("https://api.tavily.com/search")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                Ok("Tavily Search API connected successfully".to_string())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("Tavily API error ({status}): {body}"))
+            }
+        }
         "perplexity" => {
             let body = serde_json::json!({
                 "model": "sonar",

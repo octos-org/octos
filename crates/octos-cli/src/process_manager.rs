@@ -28,6 +28,9 @@ const BRIDGE_BASE_WS_PORT: u16 = 3101;
 /// Base port for auto-assigned Feishu/Twilio webhook servers.
 const WEBHOOK_BASE_PORT: u16 = 9321;
 
+/// Base port for auto-assigned API channel servers (serve mode).
+const API_BASE_PORT: u16 = 9401;
+
 /// Manages gateway and bridge child processes — one of each per user profile.
 pub struct ProcessManager {
     processes: Arc<RwLock<HashMap<String, GatewayProcess>>>,
@@ -211,8 +214,22 @@ impl ProcessManager {
             None => None,
         };
 
-        // Detect API channel port from profile config
-        let api_port = crate::profiles::api_channel_port(profile);
+        // Detect API channel port from profile config.
+        // In serve mode, auto-allocate an API port so the serve API can proxy
+        // chat/session requests to the child gateway.
+        let api_port = crate::profiles::api_channel_port(profile).or_else(|| {
+            if self.serve_port.is_some() {
+                let port = self.allocate_api_port(&procs);
+                tracing::info!(
+                    profile = %profile.id,
+                    port,
+                    "auto-allocated API port for serve mode"
+                );
+                Some(port)
+            } else {
+                None
+            }
+        });
 
         // Resolve data directory and ensure subdirs exist
         tracing::debug!(profile = %profile.id, "start: resolving data dir");
@@ -680,6 +697,17 @@ impl ProcessManager {
         let used: std::collections::HashSet<u16> =
             procs.values().filter_map(|p| p.webhook_port).collect();
         let mut port = WEBHOOK_BASE_PORT;
+        while used.contains(&port) || !port_available(port) {
+            port += 1;
+        }
+        port
+    }
+
+    /// Allocate the next available API channel port (for serve mode auto-injection).
+    fn allocate_api_port(&self, procs: &HashMap<String, GatewayProcess>) -> u16 {
+        let used: std::collections::HashSet<u16> =
+            procs.values().filter_map(|p| p.api_port).collect();
+        let mut port = API_BASE_PORT;
         while used.contains(&port) || !port_available(port) {
             port += 1;
         }

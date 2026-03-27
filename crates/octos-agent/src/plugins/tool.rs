@@ -291,9 +291,23 @@ impl Tool for PluginTool {
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(exit_status.success());
+            // Check if plugin reported a file path
+            let file_modified = parsed
+                .get("file_modified")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    // Detect "Report saved to: <path>" pattern in output
+                    output.lines().find_map(|line| {
+                        line.strip_prefix("Report saved to: ")
+                            .or_else(|| line.strip_prefix("Report saved to:"))
+                            .map(|p| std::path::PathBuf::from(p.trim()))
+                    })
+                });
             return Ok(ToolResult {
                 output,
                 success,
+                file_modified,
                 ..Default::default()
             });
         }

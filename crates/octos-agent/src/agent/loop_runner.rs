@@ -117,6 +117,8 @@ impl Agent {
             }
 
             iteration += 1;
+            self.reporter()
+                .report(ProgressEvent::Thinking { iteration });
 
             // LRU tool management: tick iteration counter and auto-evict idle tools
             self.tools.tick();
@@ -176,6 +178,10 @@ impl Agent {
                 }
                 Err(e) => return Err(e),
             };
+            self.reporter().report(ProgressEvent::Response {
+                content: response.content.clone().unwrap_or_default(),
+                iteration,
+            });
             {
                 let tool_names: Vec<&str> = response
                     .tool_calls
@@ -339,13 +345,21 @@ impl Agent {
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
 
-                debug!(
+                let tool_names: Vec<&str> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.name.as_str())
+                    .collect();
+                info!(
                     iteration,
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
                     stop_reason = ?response.stop_reason,
+                    tool_calls = response.tool_calls.len(),
+                    tool_names = %tool_names.join(","),
+                    response_content_len = response.content.as_deref().map(|s| s.len()).unwrap_or(0),
                     duration_ms = iter_start.elapsed().as_millis() as u64,
-                    "llm response"
+                    "task LLM response"
                 );
 
                 match response.stop_reason {

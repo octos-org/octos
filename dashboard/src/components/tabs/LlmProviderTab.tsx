@@ -75,6 +75,24 @@ export default function LlmProviderTab({ config, onChange }: Props) {
     onChange({ ...config, ...patch })
   }
 
+  /** Change primary provider — updates provider, model, and api_key_env together. */
+  const changePrimaryProvider = (provider: string | null) => {
+    const models = getModelIds(provider || '')
+    const newEnv = getApiKeyEnvName(provider)
+    updateConfig({ provider, model: models[0] || null, api_key_env: newEnv })
+  }
+
+  /** Change primary API key value. */
+  const changePrimaryKey = (value: string) => {
+    const newEnvVars = { ...config.env_vars }
+    if (value) {
+      newEnvVars[primaryEnv] = value
+    } else {
+      delete newEnvVars[primaryEnv]
+    }
+    updateConfig({ api_key_env: primaryEnv, env_vars: newEnvVars })
+  }
+
   const setFallbacks = (fbs: FallbackModel[]) => {
     updateConfig({ fallback_models: fbs })
   }
@@ -84,6 +102,13 @@ export default function LlmProviderTab({ config, onChange }: Props) {
     const models = getModelIds(provider)
     const env = getFallbackEnvName(provider, fallbacks.length, fallbacks, primaryEnv)
     setFallbacks([...fallbacks, { provider, model: models[0] || null, api_key_env: env }])
+  }
+
+  /** Change fallback provider — updates provider, model, and api_key_env together. */
+  const changeFallbackProvider = (idx: number, provider: string) => {
+    const models = getModelIds(provider)
+    const newEnv = getFallbackEnvName(provider, idx, fallbacks, primaryEnv)
+    updateFallback(idx, { provider, model: models[0] || null, api_key_env: newEnv })
   }
 
   const moveFallback = (idx: number, direction: -1 | 1) => {
@@ -174,11 +199,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
         <Field label="Provider">
           <select
             value={config.provider || ''}
-            onChange={(e) => {
-              const provider = e.target.value || null
-              const models = getModelIds(provider || '')
-              updateConfig({ provider, model: models[0] || null })
-            }}
+            onChange={(e) => changePrimaryProvider(e.target.value || null)}
             className="input"
           >
             {!config.provider && <option value="">Select a provider...</option>}
@@ -198,15 +219,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
           <input
             type="password"
             value={config.env_vars[primaryEnv] || ''}
-            onChange={(e) => {
-              const newEnvVars = { ...config.env_vars }
-              if (e.target.value) {
-                newEnvVars[primaryEnv] = e.target.value
-              } else {
-                delete newEnvVars[primaryEnv]
-              }
-              updateConfig({ api_key_env: primaryEnv, env_vars: newEnvVars })
-            }}
+            onChange={(e) => changePrimaryKey(e.target.value)}
             placeholder={`Paste your ${config.provider || 'anthropic'} API key`}
             className="input font-mono text-xs"
           />
@@ -280,12 +293,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
               <Field label="Provider">
                 <select
                   value={fb.provider}
-                  onChange={(e) => {
-                    const newProvider = e.target.value
-                    const models = getModelIds(newProvider)
-                    const newEnv = getFallbackEnvName(newProvider, idx, fallbacks, primaryEnv)
-                    updateFallback(idx, { provider: newProvider, model: models[0] || null, api_key_env: newEnv })
-                  }}
+                  onChange={(e) => changeFallbackProvider(idx, e.target.value)}
                   className="input"
                 >
                   {PROVIDERS.map((p) => (

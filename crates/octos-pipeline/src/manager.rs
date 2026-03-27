@@ -173,6 +173,7 @@ impl ManagerOutcome {
             },
             content: output,
             token_usage: Default::default(),
+            files_modified: vec![],
         }
     }
 }
@@ -300,3 +301,4 @@ mod tests {
         );
     }
 }
+
