@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 /book/public/
+/book-zh/public/
 
 # IDE
 .idea/
