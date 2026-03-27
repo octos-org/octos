@@ -1,73 +1,65 @@
-/* Octos Documentation Theme
-   Ocean blue-green + octopus coral-pink
-   Palette:
-     --ocean-deep:    #0B3D4E   (dark teal, sidebar bg)
-     --ocean-mid:     #1A6B7A   (medium teal, accents)
-     --ocean-light:   #E8F6F8   (light mint, page bg)
-     --ocean-surface: #F4FAFB   (near-white, cards)
-     --coral-pink:    #F27A8A   (octopus pink, primary accent)
-     --coral-warm:    #FF9BAA   (lighter pink, hover)
-     --coral-deep:    #D4566A   (dark pink, active)
-     --sea-foam:      #7DD4C0   (green accent, success)
-     --text-primary:  #1A2F38   (dark ocean text)
-     --text-secondary:#4A6B75   (muted text)
+/* Octos Documentation Theme — Finding Nemo Palette
+   Nemo Orange:     #E85B26 / #FF5F1F  (primary accent, active links)
+   Ocean Blue:      #00B4EF            (main brand, links, headings)
+   Yellow Accent:   #F9D53F            (highlights, search marks)
+   Dark Water:      #0739B9 / #0D3B7C  (sidebar bg, dark theme)
 */
 
-/* ============ Light Theme (default) ============ */
+/* ============ Light Theme (Octos Light) ============ */
 .light, html:not(.js) {
-  --bg: #F4FAFB;
-  --fg: #1A2F38;
-  --sidebar-bg: #0B3D4E;
-  --sidebar-fg: #D4EEF2;
-  --sidebar-active: #F27A8A;
-  --sidebar-non-existant: #4A8A98;
-  --sidebar-spacer: #1A6B7A;
-  --links: #1A6B7A;
-  --inline-code-color: #D4566A;
-  --theme-popup-bg: #E8F6F8;
-  --theme-popup-border: #B8DDE3;
-  --theme-hover: #DCF0F3;
-  --quote-bg: #E8F6F8;
-  --quote-border: #7DD4C0;
-  --table-border-color: #B8DDE3;
-  --table-header-bg: #0B3D4E;
-  --table-alternate-bg: #F4FAFB;
-  --searchbar-border-color: #B8DDE3;
+  --bg: #F5F9FC;
+  --fg: #1A2A3A;
+  --sidebar-bg: #0D3B7C;
+  --sidebar-fg: #B8D8F0;
+  --sidebar-active: #FF5F1F;
+  --sidebar-non-existant: #5A8AB5;
+  --sidebar-spacer: #0739B9;
+  --links: #00B4EF;
+  --inline-code-color: #E85B26;
+  --theme-popup-bg: #EAF4FB;
+  --theme-popup-border: #A8D4F0;
+  --theme-hover: #DEEEF8;
+  --quote-bg: #EAF4FB;
+  --quote-border: #00B4EF;
+  --table-border-color: #B0D4EC;
+  --table-header-bg: #0D3B7C;
+  --table-alternate-bg: #F5F9FC;
+  --searchbar-border-color: #A8D4F0;
   --searchbar-bg: #FFFFFF;
-  --searchbar-fg: #1A2F38;
-  --searchbar-shadow-color: rgba(26, 107, 122, 0.1);
-  --searchresults-border-color: #B8DDE3;
-  --searchresults-li-bg: #E8F6F8;
-  --search-mark-bg: #FFD4DB;
+  --searchbar-fg: #1A2A3A;
+  --searchbar-shadow-color: rgba(0, 180, 239, 0.1);
+  --searchresults-border-color: #A8D4F0;
+  --searchresults-li-bg: #EAF4FB;
+  --search-mark-bg: #F9D53F;
   --color-scheme: light;
 }
 
-/* ============ Dark Theme (Ayu-inspired ocean) — covers ALL dark themes ============ */
+/* ============ Dark Theme (Octos Dark) — covers ALL dark themes ============ */
 html.ayu, html.navy, html.coal, html.rust, .ayu, .navy, .coal, .rust {
-  --bg: #0A2530;
-  --fg: #D4EEF2;
-  --sidebar-bg: #071C25;
-  --sidebar-fg: #8CBDC8;
-  --sidebar-active: #F27A8A;
-  --sidebar-non-existant: #3A6A78;
-  --sidebar-spacer: #1A4A58;
-  --links: #7DD4C0;
-  --inline-code-color: #FF9BAA;
-  --theme-popup-bg: #0D2E3A;
-  --theme-popup-border: #1A4A58;
-  --theme-hover: #122F3D;
-  --quote-bg: #0D2E3A;
-  --quote-border: #7DD4C0;
-  --table-border-color: #1A4A58;
-  --table-header-bg: #071C25;
-  --table-alternate-bg: #0D2E3A;
-  --searchbar-border-color: #1A4A58;
-  --searchbar-bg: #0D2E3A;
-  --searchbar-fg: #D4EEF2;
+  --bg: #081E3F;
+  --fg: #D4E6F5;
+  --sidebar-bg: #061533;
+  --sidebar-fg: #7AAED4;
+  --sidebar-active: #FF5F1F;
+  --sidebar-non-existant: #3A6A98;
+  --sidebar-spacer: #0D3B7C;
+  --links: #00B4EF;
+  --inline-code-color: #FF8C56;
+  --theme-popup-bg: #0A2548;
+  --theme-popup-border: #0D3B7C;
+  --theme-hover: #0C2D55;
+  --quote-bg: #0A2548;
+  --quote-border: #00B4EF;
+  --table-border-color: #0D3B7C;
+  --table-header-bg: #061533;
+  --table-alternate-bg: #0A2548;
+  --searchbar-border-color: #0D3B7C;
+  --searchbar-bg: #0A2548;
+  --searchbar-fg: #D4E6F5;
   --searchbar-shadow-color: rgba(0, 0, 0, 0.3);
-  --searchresults-border-color: #1A4A58;
-  --searchresults-li-bg: #0D2E3A;
-  --search-mark-bg: #D4566A;
+  --searchresults-border-color: #0D3B7C;
+  --searchresults-li-bg: #0A2548;
+  --search-mark-bg: #F9D53F;
   --color-scheme: dark;
 }
 
@@ -115,7 +107,7 @@ code, pre code {
 
 /* Sidebar part titles (User Guide, Operations, Developer Guide) */
 .sidebar .chapter li.part-title {
-  color: var(--sidebar-active);
+  color: #F9D53F;
   font-weight: 700;
   font-size: 0.82em;
   text-transform: uppercase;
@@ -132,39 +124,42 @@ code, pre code {
 
 /* ============ Content ============ */
 .content h1 {
-  color: #0B3D4E;
-  border-bottom: 3px solid #F27A8A;
+  color: #0D3B7C;
+  border-bottom: 3px solid #E85B26;
   padding-bottom: 8px;
 }
 
 .content h2 {
-  color: #1A6B7A;
-  border-bottom: 1px solid #B8DDE3;
+  color: #0739B9;
+  border-bottom: 1px solid #B0D4EC;
   padding-bottom: 4px;
 }
 
 .content h3 {
-  color: #1A6B7A;
+  color: #00B4EF;
 }
 
 html.ayu .content h1,
 html.navy .content h1,
-html.coal .content h1 {
-  color: #D4EEF2;
-  border-bottom-color: #F27A8A;
+html.coal .content h1,
+html.rust .content h1 {
+  color: #D4E6F5;
+  border-bottom-color: #E85B26;
 }
 
 html.ayu .content h2,
 html.navy .content h2,
-html.coal .content h2 {
-  color: #7DD4C0;
-  border-bottom-color: #1A4A58;
+html.coal .content h2,
+html.rust .content h2 {
+  color: #00B4EF;
+  border-bottom-color: #0D3B7C;
 }
 
 html.ayu .content h3,
 html.navy .content h3,
-html.coal .content h3 {
-  color: #7DD4C0;
+html.coal .content h3,
+html.rust .content h3 {
+  color: #00B4EF;
 }
 
 /* Links */
@@ -176,8 +171,8 @@ html.coal .content h3 {
 }
 
 .content a:hover {
-  color: #F27A8A;
-  border-bottom-color: #F27A8A;
+  color: #E85B26;
+  border-bottom-color: #E85B26;
 }
 
 /* ============ Code blocks ============ */
@@ -188,8 +183,8 @@ html.coal .content h3 {
 }
 
 html.light .content pre, html:not(.js) .content pre {
-  background: #0B3D4E;
-  color: #D4EEF2;
+  background: #0D3B7C;
+  color: #D4E6F5;
 }
 
 .content code:not(pre code) {
@@ -199,8 +194,8 @@ html.light .content pre, html:not(.js) .content pre {
 }
 
 html.light .content code:not(pre code), html:not(.js) .content code:not(pre code) {
-  background: #E8F6F8;
-  color: #D4566A;
+  background: #EAF4FB;
+  color: #E85B26;
 }
 
 /* ============ Tables ============ */
@@ -221,7 +216,7 @@ html.light .content code:not(pre code), html:not(.js) .content code:not(pre code
 }
 
 html.light .content table th, html:not(.js) .content table th {
-  color: #F4FAFB;
+  color: #F5F9FC;
 }
 
 .content table td {
@@ -235,7 +230,7 @@ html.light .content table th, html:not(.js) .content table th {
 
 /* ============ Blockquotes ============ */
 .content blockquote {
-  border-left: 4px solid #F27A8A;
+  border-left: 4px solid #E85B26;
   background: var(--quote-bg);
   padding: 12px 16px;
   border-radius: 0 8px 8px 0;
@@ -249,7 +244,7 @@ html.light .content table th, html:not(.js) .content table th {
 }
 
 .nav-chapters:hover {
-  color: #F27A8A;
+  color: #E85B26;
 }
 
 /* ============ Scrollbar (webkit) ============ */
@@ -258,12 +253,12 @@ html.light .content table th, html:not(.js) .content table th {
 }
 
 .sidebar::-webkit-scrollbar-thumb {
-  background: #1A6B7A;
+  background: #0739B9;
   border-radius: 3px;
 }
 
 .sidebar::-webkit-scrollbar-thumb:hover {
-  background: #F27A8A;
+  background: #FF5F1F;
 }
 
 /* ============ Top menu bar ============ */
