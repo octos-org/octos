@@ -164,7 +164,8 @@ impl MemoryStore {
 
     /// Read the full content of a named entity. Returns `None` if not found.
     pub async fn read_entity(&self, name: &str) -> Result<Option<String>> {
-        let path = self.bank_dir().join(format!("{name}.md"));
+        let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
+        let path = self.bank_dir().join(format!("{safe_name}.md"));
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => Ok(Some(content)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -175,7 +176,8 @@ impl MemoryStore {
     /// Write (create or update) an entity page. Creates bank directory if needed.
     pub async fn write_entity(&self, name: &str, content: &str) -> Result<()> {
         self.ensure_bank_dir().await?;
-        let path = self.bank_dir().join(format!("{name}.md"));
+        let safe_name = name.replace(['/', '\\', '\0', '~', '.'], "_");
+        let path = self.bank_dir().join(format!("{safe_name}.md"));
         tokio::fs::write(&path, content)
             .await
             .wrap_err_with(|| format!("failed to write entity: {name}"))

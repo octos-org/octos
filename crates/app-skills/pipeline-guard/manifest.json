@@ -7,7 +7,7 @@
   "hooks": [
     {
       "event": "before_tool_call",
-      "command": ["main"],
+      "command": ["./main"],
       "timeout_ms": 10000,
       "tool_filter": ["run_pipeline"]
     }

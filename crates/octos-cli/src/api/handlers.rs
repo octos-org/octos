@@ -553,8 +553,11 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
         let home = std::env::var("HOME").unwrap_or_default();
-        let octos_dir = format!("{home}/.octos");
-        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with("/tmp");
+        let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
+        let tmp_dir = std::fs::canonicalize("/tmp")
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
         if !allowed {
             return (StatusCode::FORBIDDEN, "access denied").into_response();
         }
@@ -597,7 +600,8 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| filename.clone());
+        .unwrap_or_else(|| filename.clone())
+        .replace(['"', '\r', '\n', '\\'], "_");
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());

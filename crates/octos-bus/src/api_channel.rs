@@ -494,9 +494,13 @@ async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<Str
         Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
     };
 
-    // Must be under home dir or /tmp
+    // Must be under $HOME/.octos or /tmp (NOT the entire $HOME)
     let home = std::env::var("HOME").unwrap_or_default();
-    let allowed = canonical.starts_with(&home) || canonical.starts_with("/tmp");
+    let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
+    let tmp_dir = std::fs::canonicalize("/tmp")
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
     if !allowed {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     }

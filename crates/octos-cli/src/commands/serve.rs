@@ -128,16 +128,12 @@ impl ServeCommand {
                  Generating a random token for this session.",
                 self.host
             );
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            std::time::SystemTime::now().hash(&mut h);
-            std::process::id().hash(&mut h);
-            let token = format!(
-                "{:016x}{:016x}",
-                h.finish(),
-                h.finish().wrapping_mul(6364136223846793005)
-            );
+            // Generate cryptographically random token
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let a: u64 = rng.r#gen();
+            let b: u64 = rng.r#gen();
+            let token = format!("{a:016x}{b:016x}");
             println!(
                 "{}: {} (auto-generated, pass --auth-token to set your own)",
                 "Auth token".yellow(),

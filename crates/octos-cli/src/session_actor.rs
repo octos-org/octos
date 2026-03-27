@@ -2080,13 +2080,17 @@ impl SessionActor {
                 // without relying on the LLM to call send_file within its token budget.
                 for file in &conv_response.files_modified {
                     if file.extension().and_then(|e| e.to_str()) == Some("md") {
-                        let filename = file
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
+                        // Resolve relative paths to absolute so the file URL works
+                        let abs_file = if file.is_relative() {
+                            std::fs::canonicalize(file)
+                                .or_else(|_| std::fs::canonicalize(self.data_dir.join(file)))
+                                .unwrap_or_else(|_| file.clone())
+                        } else {
+                            file.clone()
+                        };
                         info!(
                             session = %self.session_key,
-                            file = %file.display(),
+                            file = %abs_file.display(),
                             channel = %self.channel,
                             chat_id = %self.chat_id,
                             "auto-delivering report file"
@@ -2096,7 +2100,7 @@ impl SessionActor {
                             chat_id: self.chat_id.clone(),
                             content: String::new(),
                             reply_to: None,
-                            media: vec![file.to_string_lossy().into_owned()],
+                            media: vec![abs_file.to_string_lossy().into_owned()],
                             metadata: serde_json::json!({}),
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {

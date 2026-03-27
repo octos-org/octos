@@ -324,6 +324,9 @@ fn pick_models(catalog: &ModelCatalog) -> Option<ModelPicks> {
             )
     });
 
+    // Use model key for DOT injection (the ProviderRouter resolves via
+    // last-resort suffix matching). Full provider/model keys with '/' can
+    // break the DOT parser's attribute handling.
     let strong_pool: Vec<String> = strong_sorted
         .iter()
         .map(|e| e.model_key().to_string())
