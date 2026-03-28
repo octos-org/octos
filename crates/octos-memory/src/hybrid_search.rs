@@ -6,8 +6,8 @@ use hnsw_rs::prelude::*;
 
 /// Hybrid search index combining BM25 keyword search with HNSW vector similarity.
 pub struct HybridIndex {
-    /// BM25 inverted index: term -> [(doc_idx, term_frequency)]
-    inverted: HashMap<String, Vec<(usize, f32)>>,
+    /// BM25 inverted index: term -> [(doc_idx, raw_term_count)]
+    inverted: HashMap<String, Vec<(usize, u32)>>,
     /// Document lengths (number of tokens per doc)
     doc_lengths: Vec<usize>,
     /// Running total of all document lengths (avoids O(n) recomputation)
@@ -16,8 +16,6 @@ pub struct HybridIndex {
     avg_dl: f64,
     /// Episode IDs in insertion order
     ids: Vec<String>,
-    /// Full text per document (for re-tokenization is unnecessary; stored for future use)
-    texts: Vec<String>,
     /// HNSW vector index (None when no embeddings stored)
     hnsw: Option<Hnsw<'static, f32, DistCosine>>,
     /// Which docs have embeddings (by index)
@@ -57,7 +55,6 @@ impl HybridIndex {
             total_len: 0,
             avg_dl: 0.0,
             ids: Vec::new(),
-            texts: Vec::new(),
             hnsw: None,
             has_embedding: Vec::new(),
             dimension,
@@ -75,9 +72,29 @@ impl HybridIndex {
 
     /// Insert a document with optional embedding.
     pub fn insert(&mut self, episode_id: &str, text: &str, embedding: Option<&[f32]>) {
+        // Dedup: skip if already indexed (#110)
+        if self.ids.contains(&episode_id.to_string()) {
+            return; // Already indexed
+        }
+
+        // HNSW capacity guard (#109)
+        if self.ids.len() >= HNSW_CAPACITY {
+            tracing::warn!(
+                "HNSW index at capacity ({HNSW_CAPACITY}), skipping insert for {episode_id}"
+            );
+            return;
+        }
+        if self.ids.len() >= HNSW_CAPACITY * 80 / 100 {
+            tracing::warn!(
+                "HNSW index at {}% capacity ({}/{})",
+                self.ids.len() * 100 / HNSW_CAPACITY,
+                self.ids.len(),
+                HNSW_CAPACITY
+            );
+        }
+
         let doc_idx = self.ids.len();
         self.ids.push(episode_id.to_string());
-        self.texts.push(text.to_string());
 
         // Tokenize and build inverted index
         let tokens = tokenize(text);
@@ -87,18 +104,17 @@ impl HybridIndex {
         self.total_len += tokens.len();
         self.avg_dl = self.total_len as f64 / self.doc_lengths.len() as f64;
 
-        // Count term frequencies
+        // Count term frequencies (store raw counts for BM25, #101)
         let mut tf_map: HashMap<&str, u32> = HashMap::new();
         for token in &tokens {
             *tf_map.entry(token.as_str()).or_default() += 1;
         }
 
         for (term, count) in tf_map {
-            let tf = count as f32 / tokens.len().max(1) as f32;
             self.inverted
                 .entry(term.to_string())
                 .or_default()
-                .push((doc_idx, tf));
+                .push((doc_idx, count));
         }
 
         // Insert embedding into HNSW if provided and dimension matches
@@ -224,9 +240,9 @@ impl HybridIndex {
                 let df = postings.len() as f64;
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
 
-                for &(doc_idx, tf) in postings {
+                for &(doc_idx, raw_tf) in postings {
                     let dl = self.doc_lengths[doc_idx] as f64;
-                    let tf_d = tf as f64;
+                    let tf_d = raw_tf as f64;
                     let numerator = tf_d * (BM25_K1 + 1.0);
                     let denominator = tf_d + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avg_dl);
                     *scores.entry(doc_idx).or_default() += idf * numerator / denominator;

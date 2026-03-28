@@ -14,7 +14,8 @@ pub fn is_abort_trigger(text: &str) -> bool {
 
 /// Return a localized cancel response matching the trigger language.
 pub fn abort_response(trigger: &str) -> &'static str {
-    let t = trigger.trim();
+    let t = trigger.trim().to_lowercase();
+    let t = t.as_str();
     match t {
         "停" | "停止" | "取消" | "停下" | "别说了" => "🛑 已取消。",
         "やめて" | "止めて" | "ストップ" => "🛑 キャンセルしました。",

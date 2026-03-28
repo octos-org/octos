@@ -142,6 +142,8 @@ struct CreateSubAccountInput {
     profile_id: String,
     name: String,
     #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
     channels: Vec<serde_json::Value>,
     #[serde(default)]
     system_prompt: Option<String>,
@@ -163,6 +165,7 @@ impl Tool for CreateSubAccountTool {
             "properties": {
                 "profile_id": { "type": "string", "description": "Parent profile ID" },
                 "name": { "type": "string", "description": "Name for the sub-account (e.g. 'work bot', 'support')" },
+                "email": { "type": "string", "description": "Email address for web client OTP login (optional)" },
                 "channels": {
                     "type": "array",
                     "description": "Channel configurations (e.g. [{\"Telegram\": {\"token_env\": \"WORK_TG_TOKEN\"}}])",
@@ -187,6 +190,10 @@ impl Tool for CreateSubAccountTool {
             "channels": input.channels,
             "env_vars": input.env_vars,
         });
+
+        if let Some(email) = &input.email {
+            body["email"] = serde_json::json!(email);
+        }
 
         if let Some(prompt) = &input.system_prompt {
             body["gateway"] = serde_json::json!({

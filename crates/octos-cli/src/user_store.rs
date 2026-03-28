@@ -178,10 +178,17 @@ pub fn email_to_user_id(email: &str) -> String {
             last_was_hyphen = false;
         }
     }
+    // Truncate to 63 chars to stay within slug limits
+    let mut result: String = result.chars().take(63).collect();
+    // Trim any trailing hyphen produced by truncation
+    while result.ends_with('-') {
+        result.pop();
+    }
     if result.is_empty() {
         "user".into()
-    } else if result.len() > 64 {
-        result[..64].trim_end_matches('-').to_string()
+    } else if !result.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        // Ensure the slug starts with an alphanumeric character
+        format!("u{result}")
     } else {
         result
     }

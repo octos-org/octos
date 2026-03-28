@@ -178,7 +178,10 @@ impl CollectingEventHandler {
     }
 
     pub fn events(&self) -> Vec<PipelineEvent> {
-        self.events.lock().unwrap().clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -190,7 +193,10 @@ impl Default for CollectingEventHandler {
 
 impl PipelineEventHandler for CollectingEventHandler {
     fn on_event(&self, event: &PipelineEvent) {
-        self.events.lock().unwrap().push(event.clone());
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event.clone());
     }
 }
 

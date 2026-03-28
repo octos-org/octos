@@ -44,7 +44,7 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
             );
         }
     }
-    *CATALOG.write().unwrap() = Some(map);
+    *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(map);
 }
 
 /// Look up a value from the runtime catalog by model ID.
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(max_output_tokens("MiniMax-M2.7"), 65_536);
         assert_eq!(context_window_tokens("deepseek-chat"), 128_000);
         // Clean up
-        *CATALOG.write().unwrap() = None;
+        *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]

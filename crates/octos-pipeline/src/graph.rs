@@ -1,6 +1,6 @@
 //! Core graph types for pipeline representation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use octos_core::TokenUsage;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,71 @@ pub struct PipelineGraph {
     /// Named subgraphs (clusters).
     #[serde(default)]
     pub subgraphs: Vec<Subgraph>,
+}
+
+impl PipelineGraph {
+    /// Detect cycles in the pipeline graph using DFS with three-color marking.
+    /// Returns `Ok(())` if the graph is acyclic, or `Err` with the cycle path.
+    pub fn detect_cycles(&self) -> Result<(), String> {
+        // Build adjacency list from edges
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &self.edges {
+            adj.entry(edge.source.as_str())
+                .or_default()
+                .push(edge.target.as_str());
+        }
+
+        // DFS coloring: White = unvisited, Gray = in current path, Black = fully explored
+        let mut white: HashSet<&str> = self.nodes.keys().map(|s| s.as_str()).collect();
+        let mut gray: HashSet<&str> = HashSet::new();
+        let mut black: HashSet<&str> = HashSet::new();
+        // Track the path for error reporting
+        let mut path: Vec<&str> = Vec::new();
+
+        fn dfs<'a>(
+            node: &'a str,
+            adj: &HashMap<&str, Vec<&'a str>>,
+            white: &mut HashSet<&'a str>,
+            gray: &mut HashSet<&'a str>,
+            black: &mut HashSet<&'a str>,
+            path: &mut Vec<&'a str>,
+        ) -> Result<(), String> {
+            white.remove(node);
+            gray.insert(node);
+            path.push(node);
+
+            if let Some(neighbors) = adj.get(node) {
+                for &next in neighbors {
+                    if black.contains(next) {
+                        continue;
+                    }
+                    if gray.contains(next) {
+                        // Found a cycle: build the cycle path from `next` to `next`
+                        let cycle_start = path.iter().position(|&n| n == next).unwrap_or(0);
+                        let mut cycle: Vec<&str> = path[cycle_start..].to_vec();
+                        cycle.push(next);
+                        return Err(format!("cycle detected: {}", cycle.join(" -> ")));
+                    }
+                    dfs(next, adj, white, gray, black, path)?;
+                }
+            }
+
+            path.pop();
+            gray.remove(node);
+            black.insert(node);
+            Ok(())
+        }
+
+        // Visit all nodes (handles disconnected components)
+        let all_nodes: Vec<&str> = self.nodes.keys().map(|s| s.as_str()).collect();
+        for node in all_nodes {
+            if white.contains(node) {
+                dfs(node, &adj, &mut white, &mut gray, &mut black, &mut path)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// A single node in the pipeline graph.

@@ -29,26 +29,23 @@ use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 
-use super::{build_profiled_session_key, resolve_dispatch_profile_id};
-use super::{adapters, account_handler, skills_handler};
+use super::build_system_prompt;
 use super::message_preprocessing;
 use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
-use super::build_system_prompt;
+use super::{account_handler, adapters, skills_handler};
+use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
-use crate::session_actor::{
-    ActorFactory, ActorRegistry, SnapshotToolRegistryFactory,
-};
+use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
-
 
 /// Holds all state needed by the gateway's main message loop.
 ///
@@ -538,8 +535,17 @@ impl GatewayRuntime {
         let mut plugin_env = build_plugin_env(&config, &provider_name);
         // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
         // resolve storage relative to the correct profile, not the gateway root.
-        plugin_env.push(("OCTOS_DATA_DIR".to_string(), data_dir.to_string_lossy().to_string()));
-        plugin_env.push(("OCTOS_VOICE_DIR".to_string(), data_dir.join("voice_profiles").to_string_lossy().to_string()));
+        plugin_env.push((
+            "OCTOS_DATA_DIR".to_string(),
+            data_dir.to_string_lossy().to_string(),
+        ));
+        plugin_env.push((
+            "OCTOS_VOICE_DIR".to_string(),
+            data_dir
+                .join("voice_profiles")
+                .to_string_lossy()
+                .to_string(),
+        ));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         #[cfg(feature = "matrix")]
@@ -758,10 +764,8 @@ impl GatewayRuntime {
 
             // Capture config for per-session SpawnTool and PipelineTool creation
             provider_policy_for_factory = tools.provider_policy().cloned();
-            worker_prompt_for_factory = Some(load_prompt(
-                "worker",
-                octos_agent::DEFAULT_WORKER_PROMPT,
-            ));
+            worker_prompt_for_factory =
+                Some(load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT));
             provider_router_for_factory = provider_router.clone();
 
             // Seed QoS scores on the router for fallback ranking
@@ -914,7 +918,7 @@ impl GatewayRuntime {
             .unwrap_or(octos_agent::DEFAULT_SESSION_TIMEOUT_SECS);
         let agent_config = AgentConfig {
             max_iterations,
-            save_episodes: false,
+            save_episodes: true,
             tool_timeout_secs: gw_config
                 .tool_timeout_secs
                 .unwrap_or(octos_agent::DEFAULT_TOOL_TIMEOUT_SECS),
@@ -975,7 +979,6 @@ impl GatewayRuntime {
             // Keep research (deep_search, deep_crawl) active — users
             // often call these directly. Defer rarely-used groups only.
             for group in &[
-                "group:memory",
                 "group:admin",
                 "group:sessions",
                 "group:web",
@@ -1106,11 +1109,7 @@ impl GatewayRuntime {
         // auto-allocation), inject a synthetic Api channel entry so the gateway
         // starts an HTTP listener that the serve API can proxy to.
         let mut channels_for_reg = gw_config.channels.clone();
-        if cmd.api_port.is_some()
-            && !channels_for_reg
-                .iter()
-                .any(|c| c.channel_type == "api")
-        {
+        if cmd.api_port.is_some() && !channels_for_reg.iter().any(|c| c.channel_type == "api") {
             channels_for_reg.push(crate::config::ChannelEntry {
                 channel_type: "api".into(),
                 allowed_senders: vec![],
@@ -1539,51 +1538,51 @@ impl GatewayRuntime {
                 self.status_indicators.get(&reply_channel).cloned()
             };
 
-            let (prompt_override, dispatch_sender_uid) =
-                if let Some(ref pid) = dispatch_profile_id {
-                    let prompt = if self.actor_registry.has_profile_factory(pid) {
-                        None
-                    } else if !profile_prompt_cache.contains_key(pid.as_str()) {
-                        let loaded = if let Some(ref store) = self.profile_store {
-                            match store.get(pid) {
-                                Ok(Some(p)) => Some(p.config.gateway.system_prompt),
-                                Ok(None) => {
-                                    warn!(profile_id = %pid, "target profile not found");
-                                    None
-                                }
-                                Err(e) => {
-                                    warn!(profile_id = %pid, error = %e, "failed to load profile");
-                                    None
-                                }
+            let (prompt_override, dispatch_sender_uid) = if let Some(ref pid) = dispatch_profile_id
+            {
+                let prompt = if self.actor_registry.has_profile_factory(pid) {
+                    None
+                } else if !profile_prompt_cache.contains_key(pid.as_str()) {
+                    let loaded = if let Some(ref store) = self.profile_store {
+                        match store.get(pid) {
+                            Ok(Some(p)) => Some(p.config.gateway.system_prompt),
+                            Ok(None) => {
+                                warn!(profile_id = %pid, "target profile not found");
+                                None
                             }
-                        } else {
-                            None
-                        };
-                        let prompt_val = loaded.flatten();
-                        if profile_prompt_cache.len() >= PROFILE_PROMPT_CACHE_CAP {
-                            profile_prompt_cache.clear();
+                            Err(e) => {
+                                warn!(profile_id = %pid, error = %e, "failed to load profile");
+                                None
+                            }
                         }
-                        profile_prompt_cache.insert(pid.clone(), prompt_val.clone());
-                        prompt_val
-                    } else {
-                        profile_prompt_cache.get(pid.as_str()).cloned().flatten()
-                    };
-
-                    #[cfg(feature = "matrix")]
-                    let sender_uid = if let Some(ref mc) = self.matrix_channel {
-                        let uid = mc.bot_router().reverse_route(pid).await;
-                        tracing::debug!(profile_id = %pid, sender_uid = ?uid, "resolved sender_user_id for profile");
-                        uid
                     } else {
                         None
                     };
-                    #[cfg(not(feature = "matrix"))]
-                    let sender_uid: Option<String> = None;
-
-                    (prompt, sender_uid)
+                    let prompt_val = loaded.flatten();
+                    if profile_prompt_cache.len() >= PROFILE_PROMPT_CACHE_CAP {
+                        profile_prompt_cache.clear();
+                    }
+                    profile_prompt_cache.insert(pid.clone(), prompt_val.clone());
+                    prompt_val
                 } else {
-                    (None, None)
+                    profile_prompt_cache.get(pid.as_str()).cloned().flatten()
                 };
+
+                #[cfg(feature = "matrix")]
+                let sender_uid = if let Some(ref mc) = self.matrix_channel {
+                    let uid = mc.bot_router().reverse_route(pid).await;
+                    tracing::debug!(profile_id = %pid, sender_uid = ?uid, "resolved sender_user_id for profile");
+                    uid
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "matrix"))]
+                let sender_uid: Option<String> = None;
+
+                (prompt, sender_uid)
+            } else {
+                (None, None)
+            };
 
             // Dispatch to per-session actor (creates one if needed)
             tracing::debug!(

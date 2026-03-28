@@ -159,7 +159,13 @@ impl RetryProvider {
     fn rate_limit_delay(error: &eyre::Report) -> Option<Duration> {
         let msg = error.to_string();
         // Only apply to rate-limit / TPM errors
-        if !msg.contains("429") && !msg.contains("rate limit") && !msg.contains("tokens per min") {
+        let msg_lower = msg.to_lowercase();
+        if !msg_lower.contains("429")
+            && !msg_lower.contains("rate limit")
+            && !msg_lower.contains("tokens per min")
+            && !msg_lower.contains("too many requests")
+            && !msg_lower.contains("resource_exhausted")
+        {
             return None;
         }
         // Try to parse "try again in Xs" or "try again in X.XXXs"

@@ -40,6 +40,7 @@ pub fn validate(graph: &PipelineGraph) -> Vec<LintDiagnostic> {
     rule_12_edge_sources_exist(graph, &mut diags);
     rule_13_parallel_converge(graph, &mut diags);
     rule_14_dynamic_parallel(graph, &mut diags);
+    rule_15_no_cycles(graph, &mut diags);
     diags
 }
 
@@ -312,6 +313,16 @@ fn rule_13_parallel_converge(graph: &PipelineGraph, diags: &mut Vec<LintDiagnost
                 message: format!("parallel node '{}' has no outgoing edges", node.id),
             });
         }
+    }
+}
+
+fn rule_15_no_cycles(graph: &PipelineGraph, diags: &mut Vec<LintDiagnostic>) {
+    if let Err(cycle_path) = graph.detect_cycles() {
+        diags.push(LintDiagnostic {
+            rule: 15,
+            severity: Severity::Error,
+            message: cycle_path,
+        });
     }
 }
 

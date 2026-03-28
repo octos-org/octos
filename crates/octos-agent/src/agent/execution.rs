@@ -224,16 +224,18 @@ impl Agent {
                     // Unwrap JoinHandle results -- panics in tool tasks become errors
                     results
                         .into_iter()
-                        .map(|r| {
+                        .zip(response.tool_calls.iter())
+                        .map(|(r, tc)| {
                             r.unwrap_or_else(|e| {
-                                // Task panicked -- return a placeholder error tuple
+                                // Task panicked -- return error with tool_call_id so
+                                // the LLM knows which tool failed.
                                 (
                                     Message {
                                         role: MessageRole::Tool,
-                                        content: format!("Tool task panicked: {e}"),
+                                        content: format!("Tool '{}' panicked: {e}", tc.name),
                                         media: vec![],
                                         tool_calls: None,
-                                        tool_call_id: None,
+                                        tool_call_id: Some(tc.id.clone()),
                                         reasoning_content: None,
                                         timestamp: chrono::Utc::now(),
                                     },

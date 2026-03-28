@@ -401,9 +401,15 @@ fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<St
 
     for msg in messages {
         match msg.role {
-            octos_core::MessageRole::System => {
-                system_instruction = Some(msg.content.clone());
-            }
+            octos_core::MessageRole::System => match &mut system_instruction {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&msg.content);
+                }
+                None => {
+                    system_instruction = Some(msg.content.clone());
+                }
+            },
             octos_core::MessageRole::User => {
                 let parts = build_user_parts(msg);
                 push_or_merge(&mut contents, "user", parts);

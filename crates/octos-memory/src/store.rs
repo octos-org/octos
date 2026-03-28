@@ -38,43 +38,44 @@ impl EpisodeStore {
 
         let db_path = data_dir.join("episodes.redb");
 
-        // redb is sync, so we spawn_blocking for the initial open
-        let db = tokio::task::spawn_blocking(move || {
-            Database::create(&db_path).wrap_err("failed to open redb database")
-        })
-        .await??;
+        // redb is sync, so we spawn_blocking for the initial open + table init + index rebuild
+        let (db, index) = tokio::task::spawn_blocking(move || {
+            let db = Database::create(&db_path).wrap_err("failed to open redb database")?;
 
-        // Initialize tables
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(EPISODES_TABLE)?;
-            let _ = write_txn.open_table(CWD_INDEX_TABLE)?;
-            let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
-        }
-        write_txn.commit()?;
+            // Initialize tables
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(EPISODES_TABLE)?;
+                let _ = write_txn.open_table(CWD_INDEX_TABLE)?;
+                let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
+            }
+            write_txn.commit()?;
 
-        // Rebuild in-memory hybrid index from stored data
-        let mut index = HybridIndex::new(DEFAULT_DIMENSION);
-        {
-            let read_txn = db.begin_read()?;
-            let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
-            let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+            // Rebuild in-memory hybrid index from stored data
+            let mut index = HybridIndex::new(DEFAULT_DIMENSION);
+            {
+                let read_txn = db.begin_read()?;
+                let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
+                let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
 
-            for entry in episodes_table.iter()? {
-                let (key, value) = entry?;
-                let ep_id = key.value().to_string();
-                if let Ok(episode) = serde_json::from_str::<Episode>(value.value()) {
-                    let embedding: Option<Vec<f32>> = embeddings_table
-                        .get(ep_id.as_str())
-                        .ok()
-                        .flatten()
-                        .and_then(|v| bincode::deserialize(v.value()).ok());
-                    index.insert(&ep_id, &episode.summary, embedding.as_deref());
+                for entry in episodes_table.iter()? {
+                    let (key, value) = entry?;
+                    let ep_id = key.value().to_string();
+                    if let Ok(episode) = serde_json::from_str::<Episode>(value.value()) {
+                        let embedding: Option<Vec<f32>> = embeddings_table
+                            .get(ep_id.as_str())
+                            .ok()
+                            .flatten()
+                            .and_then(|v| bincode::deserialize(v.value()).ok());
+                        index.insert(&ep_id, &episode.summary, embedding.as_deref());
+                    }
                 }
             }
-        }
 
-        debug!(path = %data_dir.display(), "opened episode store");
+            debug!(path = %data_dir.display(), "opened episode store");
+            Ok::<_, eyre::Report>((db, index))
+        })
+        .await??;
 
         Ok(Self {
             db: Arc::new(db),
@@ -103,7 +104,29 @@ impl EpisodeStore {
                 let mut index = write_txn.open_table(CWD_INDEX_TABLE)?;
                 let existing: Vec<String> = index
                     .get(cwd.as_str())?
-                    .map(|v| serde_json::from_str(v.value()).unwrap_or_default())
+                    .map(|v| match serde_json::from_str(v.value()) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            // Don't replace with empty Vec — try to salvage by
+                            // extracting any quoted strings that look like episode IDs.
+                            let raw = v.value();
+                            warn!("failed to parse cwd index JSON ({} bytes): {e}; attempting salvage", raw.len());
+                            let salvaged: Vec<String> = raw
+                                .split('"')
+                                .enumerate()
+                                .filter_map(|(i, s)| {
+                                    // Odd indices are inside quotes in valid JSON arrays
+                                    if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
+                                        Some(s.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            warn!("salvaged {} episode IDs from corrupted index", salvaged.len());
+                            salvaged
+                        }
+                    })
                     .unwrap_or_default();
 
                 let mut ids = existing;
@@ -146,8 +169,31 @@ impl EpisodeStore {
             // Get episode IDs for this cwd
             let episode_ids: Vec<String> = index_table
                 .get(cwd_str.as_str())?
-                .map(|v| serde_json::from_str(v.value()).unwrap_or_default())
+                .map(|v| match serde_json::from_str(v.value()) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        let raw = v.value();
+                        warn!("failed to parse episode index JSON ({} bytes): {e}; attempting salvage", raw.len());
+                        raw.split('"')
+                            .enumerate()
+                            .filter_map(|(i, s)| {
+                                if i % 2 == 1 && !s.is_empty() && !s.contains(['[', ']', ',']) {
+                                    Some(s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    }
+                })
                 .unwrap_or_default();
+
+            // Tokenize query consistently (#127): split on non-alphanumeric, filter short tokens
+            let terms: Vec<String> = query
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 2)
+                .map(|w| w.to_string())
+                .collect();
 
             // Load and filter episodes
             let mut results: Vec<(Episode, usize)> = Vec::new();
@@ -155,11 +201,17 @@ impl EpisodeStore {
             for id in episode_ids {
                 if let Some(json) = episodes_table.get(id.as_str())? {
                     if let Ok(episode) = serde_json::from_str::<Episode>(json.value()) {
-                        // Simple relevance: count query term matches in summary
-                        let summary_lower = episode.summary.to_lowercase();
-                        let relevance = query
-                            .split_whitespace()
-                            .filter(|term| summary_lower.contains(term))
+                        // Tokenize summary the same way for word-boundary matching (#130)
+                        let summary_tokens: Vec<String> = episode
+                            .summary
+                            .to_lowercase()
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|w| w.len() >= 2)
+                            .map(|w| w.to_string())
+                            .collect();
+                        let relevance = terms
+                            .iter()
+                            .filter(|term| summary_tokens.contains(term))
                             .count();
 
                         if relevance > 0 {
@@ -181,6 +233,9 @@ impl EpisodeStore {
     }
 
     /// Get the N most recent episodes for a directory.
+    ///
+    /// Retained for admin API use (e.g. dashboard episode browser).
+    #[allow(dead_code)]
     pub async fn recent_for_cwd(&self, cwd: &Path, n: usize) -> Result<Vec<Episode>> {
         let db = self.db.clone();
         let cwd_str = cwd.to_string_lossy().to_string();
@@ -193,7 +248,13 @@ impl EpisodeStore {
             // Get episode IDs for this cwd
             let episode_ids: Vec<String> = index_table
                 .get(cwd_str.as_str())?
-                .map(|v| serde_json::from_str(v.value()).unwrap_or_default())
+                .map(|v| match serde_json::from_str(v.value()) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        warn!("failed to parse episode index JSON: {e}");
+                        Vec::new()
+                    }
+                })
                 .unwrap_or_default();
 
             // Load episodes
@@ -216,6 +277,9 @@ impl EpisodeStore {
     }
 
     /// Get an episode by ID.
+    ///
+    /// Retained for admin API use (e.g. episode detail endpoint).
+    #[allow(dead_code)]
     pub async fn get(&self, id: &str) -> Result<Option<Episode>> {
         let db = self.db.clone();
         let id = id.to_string();

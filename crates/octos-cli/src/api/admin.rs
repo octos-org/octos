@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
 
+/// Basic email format validation.
+fn validate_email(email: &str) -> Result<(), String> {
+    if email.len() > 254 {
+        return Err("Email address too long (max 254 chars)".into());
+    }
+    let parts: Vec<&str> = email.splitn(2, '@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() || !parts[1].contains('.') {
+        return Err(format!("Invalid email format: {email}"));
+    }
+    Ok(())
+}
+
 // ── Request / Response types ──────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -37,6 +49,9 @@ pub struct UpdateProfileRequest {
     pub data_dir: Option<Option<String>>,
     #[serde(default)]
     pub config: Option<ProfileConfig>,
+    /// Set or update the email address for OTP login.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -110,9 +125,18 @@ pub async fn overview(
     }))
 }
 
+#[derive(Deserialize, Default)]
+pub struct PaginationParams {
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// GET /api/admin/profiles
 pub async fn list_profiles(
     State(state): State<Arc<AppState>>,
+    Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<Vec<ProfileResponse>>, (StatusCode, String)> {
     let store = state.profile_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -127,8 +151,16 @@ pub async fn list_profiles(
         .list()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut items = Vec::with_capacity(profiles.len());
-    for p in profiles {
+    let offset = pagination.offset.unwrap_or(0);
+    let limit = pagination.limit.unwrap_or(100);
+    let page = profiles
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    let mut items = Vec::with_capacity(page.len());
+    for p in page {
         let status = pm.status(&p.id).await;
         items.push(ProfileResponse {
             profile: mask_secrets(&p),
@@ -275,6 +307,43 @@ pub async fn update_profile(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
+    // Update or create User entry for OTP login
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                // Check if email is taken by a different user
+                if let Ok(Some(existing)) = user_store.get_by_email(&email) {
+                    if existing.id != id {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!("Email '{email}' is already registered to another account"),
+                        ));
+                    }
+                }
+                let user = match user_store.get(&id) {
+                    Ok(Some(mut u)) => {
+                        u.email = email;
+                        u.name = profile.name.clone();
+                        u
+                    }
+                    _ => crate::user_store::User {
+                        id: id.clone(),
+                        email,
+                        name: profile.name.clone(),
+                        role: crate::user_store::UserRole::User,
+                        created_at: Utc::now(),
+                        last_login_at: None,
+                    },
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
+    }
+
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     Ok(Json(ProfileResponse {
@@ -297,6 +366,11 @@ pub async fn delete_profile(
         "admin not configured".into(),
     ))?;
 
+    // Load the profile before deleting so we can clean up its data directory
+    let profile = store
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     // Stop the gateway if running
     let _ = pm.stop(&id).await;
 
@@ -304,6 +378,13 @@ pub async fn delete_profile(
     if let Ok(subs) = store.list_sub_accounts(&id) {
         for sub in &subs {
             let _ = pm.stop(&sub.id).await;
+            // Clean up sub-account data directory
+            let sub_data_dir = store.resolve_data_dir(sub);
+            if sub_data_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
+                    tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
+                }
+            }
             let _ = store.delete(&sub.id);
         }
     }
@@ -314,6 +395,16 @@ pub async fn delete_profile(
 
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
+    }
+
+    // Clean up data directory
+    if let Some(profile) = profile {
+        let data_dir = store.resolve_data_dir(&profile);
+        if data_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                tracing::warn!(profile = %id, dir = %data_dir.display(), error = %e, "failed to clean up data directory");
+            }
+        }
     }
 
     tracing::info!(profile = %id, "profile deleted");
@@ -351,6 +442,12 @@ pub async fn start_gateway(
             "Cannot start: LLM provider must be configured first".into(),
         ));
     }
+
+    // TODO(#147): Sub-account start has a validation gap compared to self-service start.
+    // The self-service handler (auth_handlers::start_my_gateway) does not resolve
+    // effective profile for inherited LLM config, while this admin handler does.
+    // Both paths should also validate that channel credentials are properly configured
+    // (e.g. required env vars exist) before starting the gateway process.
 
     if let Err(e) = pm.start(&profile).await {
         tracing::error!(profile = %id, error = %e, "admin gateway failed to start");
@@ -960,6 +1057,9 @@ pub async fn stop_all(
 #[derive(Deserialize)]
 pub struct CreateSubAccountRequest {
     pub name: String,
+    /// Optional email address for OTP login to the web client.
+    #[serde(default)]
+    pub email: Option<String>,
     #[serde(default)]
     pub channels: Vec<crate::profiles::ChannelCredentials>,
     #[serde(default)]
@@ -997,6 +1097,35 @@ pub async fn list_sub_accounts(
     Ok(Json(items))
 }
 
+/// Validate that channel credentials have the required fields populated.
+/// Returns an error message if any channel is missing required fields.
+fn validate_channel_credentials(
+    channels: &[crate::profiles::ChannelCredentials],
+) -> Result<(), String> {
+    use crate::profiles::ChannelCredentials;
+    for ch in channels {
+        match ch {
+            ChannelCredentials::Telegram { token_env, .. } => {
+                if token_env.is_empty() {
+                    return Err("Telegram channel: token_env must be non-empty".into());
+                }
+            }
+            ChannelCredentials::WeChat { token_env, .. } => {
+                if token_env.is_empty() {
+                    return Err("WeChat channel: token_env must be non-empty".into());
+                }
+            }
+            ChannelCredentials::Feishu { app_id_env, .. } => {
+                if app_id_env.is_empty() {
+                    return Err("Feishu channel: app_id_env must be non-empty".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// POST /api/admin/profiles/:id/accounts — Create a sub-account.
 pub async fn create_sub_account(
     State(state): State<Arc<AppState>>,
@@ -1011,6 +1140,11 @@ pub async fn create_sub_account(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
+
+    // Validate channel credentials if any are provided
+    if !req.channels.is_empty() {
+        validate_channel_credentials(&req.channels).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
 
     let mut sub = store
         .create_sub_account(
@@ -1028,6 +1162,34 @@ pub async fn create_sub_account(
         store
             .save(&sub)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    // Create a User entry so the sub-account can log in via OTP
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                // Check if email is already taken
+                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("Email '{email}' is already registered to another account"),
+                    ));
+                }
+                let user = crate::user_store::User {
+                    id: sub.id.clone(),
+                    email,
+                    name: sub.name.clone(),
+                    role: crate::user_store::UserRole::User,
+                    created_at: Utc::now(),
+                    last_login_at: None,
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
     }
 
     let status = pm.status(&sub.id).await;
@@ -2661,6 +2823,14 @@ pub async fn create_tenant(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
+    // Validate tenant name - only allow safe characters for shell interpolation
+    use std::sync::LazyLock;
+    static TENANT_NAME_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$").unwrap());
+    if !TENANT_NAME_RE.is_match(&req.name) {
+        return Err((StatusCode::BAD_REQUEST, "Tenant name must be 1-63 alphanumeric characters, hyphens, or underscores, starting with alphanumeric".to_string()));
+    }
+
     let store = state.tenant_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "tenant store not configured".into(),
@@ -3088,13 +3258,17 @@ pub async fn wechat_qr_poll(
         .timeout(std::time::Duration::from_secs(40))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let encoded_key: String = req.session_key.chars().map(|c| {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-            c.to_string()
-        } else {
-            format!("%{:02X}", c as u32)
-        }
-    }).collect();
+    let encoded_key: String = req
+        .session_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect();
     let url = format!(
         "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
         encoded_key
@@ -3110,28 +3284,48 @@ pub async fn wechat_qr_poll(
             }
             (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
         })?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid poll response: {e}")))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("invalid poll response: {e}"),
+        )
+    })?;
 
     let status = body["status"].as_str().unwrap_or("wait").to_string();
 
     if status == "confirmed" {
         let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
-        let bot_id = body["ilink_bot_id"].as_str().unwrap_or_default().to_string();
+        let bot_id = body["ilink_bot_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Save token to profile
         if !bot_token.is_empty() {
-            if let Some(pm) = state.process_manager.as_ref() {
-                let store = pm.profile_store();
-                std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+            if let Some(_pm) = state.process_manager.as_ref() {
+                // Write token with restrictive permissions from the start (no TOCTOU race)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open("/tmp/octos-wechat-token")
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+                }
             }
         }
 
+        // Don't expose bot_token to the client — it's already saved server-side
         return Ok(Json(WeChatQrPollResponse {
             status,
-            bot_token: Some(bot_token),
+            bot_token: None,
             bot_id: Some(bot_id),
         }));
     }
