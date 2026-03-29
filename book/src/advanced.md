@@ -156,12 +156,14 @@ Keep only the newest queued message, discard older ones.
 
 ### Interrupt
 
-Same as Steer, but also cancels the running agent.
+Keep only the newest queued message and cancel the running agent.
 
 - Agent processes A. User sends B, then C.
 - A is **cancelled**, B is discarded, C is processed immediately.
 - Fastest response to course-correction.
 - Use when responsiveness matters more than completing the current task.
+
+> **Note:** Currently, Interrupt and Steer share the same drain-and-discard behavior. There is no in-flight agent cancellation — the running agent completes before the newest message is processed. True mid-flight cancellation is planned.
 
 ### Speculative
 
@@ -190,9 +192,11 @@ Spawn concurrent overflow agents for each new message while the primary runs.
 
 The session actor can auto-escalate from Followup to Speculative when sustained latency degradation is detected:
 
-- `ResponsivenessObserver` tracks LLM response times.
-- If consecutive slow responses exceed 2x baseline, Speculative mode and hedge racing are auto-activated.
-- When the provider recovers, the mode reverts to normal.
+- `ResponsivenessObserver` learns a **median** baseline from the first 5 requests (robust to outliers), then tracks LLM response times in a 20-sample rolling window. The baseline **adapts** every 20 samples via 80/20 EMA blend with the current window median, so gradual drift is tracked.
+- If 3 consecutive responses exceed **3× baseline** latency, Speculative queue mode and Hedge racing are auto-activated simultaneously.
+- A user notification is sent: "Detected slow responses. Enabling hedge racing + speculative queue."
+- When the provider recovers (one normal-latency response), both revert to Followup and static routing.
+- Auto-escalation also triggers on API channel (web client), which always uses the speculative processing path.
 
 ### Queue Commands
 
@@ -406,11 +410,11 @@ sys.exit(0)
 
 Shell commands run inside a sandbox for isolation. Three backends are supported:
 
-| Backend | Platform | Notes |
-|---------|----------|-------|
-| bwrap | Linux | Bubblewrap namespace isolation |
-| macOS | macOS | sandbox-exec with SBPL profiles |
-| Docker | Any | Container isolation with resource limits |
+| Backend | Platform | Isolation | Network Control |
+|---------|----------|-----------|-----------------|
+| bwrap | Linux | RO bind `/usr,/lib,/bin,/sbin,/etc`; RW bind workdir; tmpfs `/tmp`; unshare-pid | `--unshare-net` if network denied |
+| macOS | macOS | sandbox-exec with SBPL profile: `process-exec/fork`, `file-read*`, writes to workdir + `/private/tmp` | `(allow network*)` or `(deny network*)` |
+| Docker | Any | `--rm --security-opt no-new-privileges --cap-drop ALL` | `--network none` if network denied |
 
 Configure in `config.json`:
 
@@ -433,7 +437,11 @@ Configure in `config.json`:
 
 - **Modes**: `auto` (detect best available), `bwrap`, `macos`, `docker`, `none`.
 - **Mount modes**: `rw` (read-write), `ro` (read-only), `none` (no workspace mount).
-- **Environment sanitization**: 18 dangerous environment variables (`LD_PRELOAD`, `NODE_OPTIONS`, etc.) are automatically cleared in all sandbox backends.
+- **Docker resource limits**: `--cpus`, `--memory`, `--pids-limit`.
+- **Docker bind mount safety**: `docker.sock`, `/proc`, `/sys`, `/dev`, and `/etc` are blocked as bind mount sources.
+- **Path validation**: Docker rejects `:`, `\0`, `\n`, `\r`; macOS rejects control chars, `(`, `)`, `\`, `"`.
+- **Environment sanitization**: 18 dangerous environment variables are automatically cleared in all sandbox backends, MCP server spawning, hooks, and the browser tool: `LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, DYLD_FALLBACK_LIBRARY_PATH, DYLD_VERSIONED_LIBRARY_PATH, NODE_OPTIONS, PYTHONSTARTUP, PYTHONPATH, PERL5OPT, RUBYOPT, RUBYLIB, JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR`.
+- **Process cleanup**: Shell tool sends SIGTERM, waits grace period, then SIGKILL to child processes on timeout.
 
 ---
 
@@ -550,7 +558,7 @@ The agent maintains long-term memory across sessions:
 
 Memory search combines BM25 (keyword) and vector (semantic) scoring:
 
-- **Ranking**: `alpha * vector_score + (1 - alpha) * bm25_score` (default alpha: 0.7)
+- **Ranking**: `vector_weight * vector_score + bm25_weight * bm25_score` (defaults: 0.7 / 0.3)
 - **Index**: HNSW with L2-normalized embeddings
 - **Fallback**: BM25-only when no embedding provider is configured
 

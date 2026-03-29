@@ -161,24 +161,60 @@ Configure a priority-ordered fallback chain. If the primary provider fails, the 
 
 - **401/403** (authentication errors) -- failover immediately, no retry on the same provider
 - **429** (rate limit) / **5xx** (server errors) -- retry with exponential backoff, then failover
+- **400** (content-format errors) -- failover if the error contains "must not be empty", "reasoning_content", "API key not valid", or "invalid_value"
+- **Timeouts** -- failover immediately, no retry (don't waste 120s × retries on an unresponsive provider)
 - **Circuit breaker** -- 3 consecutive failures marks a provider as degraded
 
 ## Adaptive Routing
 
-When multiple fallback models are configured, adaptive routing dynamically selects the best provider based on real-time performance metrics instead of following the static priority order.
+When multiple fallback models are configured, adaptive routing dynamically selects the best provider based on real-time performance metrics instead of following the static priority order. Three mutually exclusive modes are available:
 
 ```json
 {
   "adaptive_routing": {
-    "enabled": true,
+    "mode": "hedge",
+    "qos_ranking": true,
     "latency_threshold_ms": 30000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
-    "failure_threshold": 3
+    "failure_threshold": 3,
+    "weight_latency": 0.3,
+    "weight_error_rate": 0.3,
+    "weight_priority": 0.2,
+    "weight_cost": 0.2
   }
 }
 ```
+
+### Adaptive Modes
+
+| Mode | Description |
+|------|-------------|
+| `off` (default) | Static priority order. Failover only when a provider is circuit-broken (N consecutive failures). No scoring, no racing. |
+| `hedge` | Hedged racing: fire each request to 2 providers simultaneously, take the winner, cancel the loser. Both results accumulate QoS metrics. |
+| `lane` | Score-based lane changing: dynamically pick the best single provider based on a 4-factor scoring formula. Cheaper than hedge (no duplicate requests). |
+
+### QoS Ranking
+
+Setting `qos_ranking: true` enables quality-of-service ranking using a unified model catalog (`model_catalog.json`). The catalog provides baseline metrics (stability, latency, output quality) that blend with live traffic data via EMA:
+
+- **Cold start**: Baseline catalog values are used (10 synthetic samples seeded).
+- **Warm state**: Live metrics gradually replace baselines (weight ramps from 0 to 1 over 10 calls).
+- **Export**: Live catalog is exported to `model_catalog.json` for observability.
+
+### Scoring Formula
+
+Each provider is scored on 4 factors (lower score = better). All weights are configurable via `adaptive_routing`:
+
+| Factor | Weight key | Default | Description |
+|--------|-----------|---------|-------------|
+| **Stability** | `weight_error_rate` | 0.3 | Blended baseline + live error rate. EMA blend: weight ramps from 0→1 over 10 calls. |
+| **Quality** | `weight_latency` | 0.3 | 60% normalized ds_output quality + 40% normalized throughput (output tokens/sec EMA) |
+| **Priority** | `weight_priority` | 0.2 | Config-order preference (primary = 0). Normalize to [0, 1]. |
+| **Cost** | `weight_cost` | 0.2 | Normalized output cost per million tokens. Unknown cost → 0 (no penalty). |
+
+### Provider Metadata
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -188,4 +224,27 @@ When multiple fallback models are configured, adaptive routing dynamically selec
 | `probe_interval_secs` | 60 | Minimum seconds between probes to the same provider |
 | `failure_threshold` | 3 | Consecutive failures before the circuit breaker opens |
 
-When adaptive routing is enabled, it replaces the static priority chain with dynamic selection based on latency and error-rate metrics. A small percentage of requests are routed to non-primary providers as probes, allowing the system to detect recovery and rebalance traffic.
+### Hedge Mode Details
+
+When Hedge is active:
+1. The primary provider and the cheapest alternate are raced via `tokio::select!`.
+2. The winner's response is returned; the loser is cancelled.
+3. Both completed requests record metrics (cancelled requests do not).
+4. If the primary fails, the alternate is tried sequentially (it was cancelled by the race).
+
+### Auto-Escalation
+
+When sustained latency degradation is detected (3 consecutive responses exceeding 3× baseline), the session actor auto-activates Hedge mode + Speculative queue. The `ResponsivenessObserver` learns a **median** baseline from the first 5 requests (robust to outliers), then **adapts** every 20 samples via 80/20 EMA blend with the current window median. When the provider recovers (one normal-latency response), both revert to normal.
+
+### Provider Wrappers
+
+The routing stack is composed of layered wrappers:
+
+| Wrapper | Purpose |
+|---------|---------|
+| `AdaptiveRouter` | Top-level: metrics-driven scoring, Hedge/Lane modes, circuit breaker, probe requests |
+| `ProviderChain` | Ordered failover with per-provider circuit breaker (failure count ≥ threshold → degraded) |
+| `FallbackProvider` | Primary + QoS-ranked fallbacks with cooldown tracking via `ProviderRouter` |
+| `RetryProvider` | Exponential backoff on 429/5xx. Timeout → no retry (failover instead) |
+| `ProviderRouter` | Sub-agent multi-model routing. Prefix-based key resolution, cooldown, QoS-scored fallbacks |
+| `SwappableProvider` | Runtime model swap via `RwLock` (e.g. `switch_model` tool). Leaks ~50 bytes per swap |

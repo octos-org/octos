@@ -18,47 +18,96 @@ Bootstrap files are hot-reloaded -- edit them and the agent picks up changes wit
 
 ## Memory System
 
-Octos uses a 3-layer memory architecture:
+Octos uses a 3-layer memory architecture that combines automatic recording with agent-driven knowledge management:
 
-### Long-Term Memory
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     System Prompt (every turn)                    │
+│                                                                   │
+│  1. Episodic Memory  ─── top 6 relevant past task experiences    │
+│  2. Memory Context   ─── MEMORY.md + recent 7 days daily notes   │
+│  3. Entity Bank      ─── one-line abstracts of all known entities │
+│                                                                   │
+│  Tools: save_memory / recall_memory  (entity bank CRUD)           │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-Stored in `.octos/memory/MEMORY.md`. This is a persistent scratchpad where the agent (or you) can save important facts, preferences, and notes that should survive across all sessions. The agent can write to this file using its memory tools.
+### Layer 1: Episodic Memory (automatic)
 
-### Daily Notes
+Every completed task is automatically recorded as an **episode** in `episodes.redb`, a persistent embedded database. Each episode stores:
 
-Stored as `.octos/memory/YYYY-MM-DD.md`. A new file is auto-created each day. The agent logs notable events, decisions, and observations here. The last 7 days of daily notes are automatically included in the agent's context, giving it a rolling window of recent activity.
+- **Summary** — LLM-generated, truncated to 500 chars
+- **Outcome** — Success, Failure, Blocked, or Cancelled
+- **Files modified** — list of file paths touched during the task
+- **Key decisions** — notable choices made during execution
+- **Working directory** — scope for directory-scoped retrieval
 
-### Session History
+At the start of each new task, the agent queries the episode store for up to **6 relevant past experiences** using:
 
-Stored as JSONL files in `.octos/sessions/`. Each conversation session maintains its own history. When a session is resumed, the full history is loaded back into context.
+- **Hybrid search** (default when embedding is configured): combines BM25 keyword matching (30% weight) with HNSW vector similarity (70% weight)
+- **Keyword search** (fallback when no embedder): matches query terms against episode summaries, scoped to the same working directory
 
-### Memory Tools
+**Embedding configuration** (in `config.json`):
 
-The agent has built-in tools to manage its own memory:
+```json
+{
+  "embedding": {
+    "provider": "openai",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": null
+  }
+}
+```
 
-- **Save** -- write a key fact or note to long-term memory or the current daily note
-- **Recall** -- search memory for relevant information
+When configured, the agent embeds each episode summary in a fire-and-forget background task and stores the vector alongside the episode. At query time, the task instruction is embedded and used for vector search. When omitted, the system falls back to BM25-only keyword matching.
 
-You can also edit `.octos/memory/MEMORY.md` directly in any text editor.
+### Layer 2: Long-Term Memory & Daily Notes (file-based)
+
+**Long-term memory** (`.octos/memory/MEMORY.md`) holds persistent facts and notes that survive across all sessions. Edit this file manually or via the `write_file` tool — it is injected verbatim into the system prompt on every turn.
+
+**Daily notes** (`.octos/memory/YYYY-MM-DD.md`) provide a rolling window of recent activity. The last **7 days** of daily notes are automatically included in the agent's context. These files can be created manually or via the `write_file` tool.
+
+> **Note:** Daily notes are read by the system prompt builder but are not auto-populated. You can populate them manually or instruct the agent to write to them using `write_file`.
+
+### Layer 3: Entity Bank (tool-driven)
+
+The entity bank is a structured knowledge store at `.octos/memory/bank/entities/`. Each entity is a markdown file containing everything the agent knows about a specific topic.
+
+**How it works:**
+
+1. **Abstracts in prompt** — The first non-heading line of each entity becomes a one-line abstract. All abstracts are injected into the system prompt, giving the agent a compact index of everything it knows.
+2. **Full pages on demand** — The agent uses the `recall_memory` tool to load the full content of a specific entity when it needs more detail.
+3. **Agent-managed** — The agent decides when to create and update entities using the `save_memory` tool.
+
+**Memory tools:**
+
+- **`save_memory`** — Create or update an entity page. The agent is instructed to first `recall_memory` for existing content, then merge new information before saving (no data loss).
+- **`recall_memory`** — Load the full content of a named entity. If the entity doesn't exist, returns a list of all available entities.
+
+> **Auto-deferral:** When the total tool count exceeds 15, memory tools are moved to the `group:memory` deferred group. The agent must use `activate_tools` to enable them before saving or recalling.
 
 ## File Layout
 
 ```
 .octos/
-├── config.json          # Configuration (versioned, auto-migrated)
-├── cron.json            # Cron job store
-├── AGENTS.md            # Agent instructions
-├── SOUL.md              # Personality
-├── USER.md              # User info
-├── HEARTBEAT.md         # Background tasks
-├── sessions/            # Chat history (JSONL)
-├── memory/              # Memory files
-│   ├── MEMORY.md        # Long-term memory
-│   └── 2025-02-10.md    # Daily note (example)
-├── skills/              # Custom skills
-├── episodes.redb        # Episodic memory DB
+├── config.json              # Configuration (versioned, auto-migrated)
+├── cron.json                # Cron job store
+├── AGENTS.md                # Agent instructions
+├── SOUL.md                  # Personality
+├── USER.md                  # User info
+├── HEARTBEAT.md             # Background tasks
+├── sessions/                # Chat history (JSONL)
+├── memory/                  # Memory files
+│   ├── MEMORY.md            # Long-term memory (manual or write_file)
+│   ├── 2025-02-10.md        # Daily note (manual or write_file)
+│   └── bank/
+│       └── entities/        # Entity bank (managed by save/recall tools)
+│           ├── yuechen.md   # Entity: "who is the user"
+│           └── octos.md     # Entity: "what is this project"
+├── skills/                  # Custom skills
+├── episodes.redb            # Episodic memory DB (auto-populated)
 └── history/
-    └── chat_history     # Readline history
+    └── chat_history         # Readline history
 ```
 
 ---

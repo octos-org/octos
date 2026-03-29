@@ -156,12 +156,14 @@ Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具
 
 ### Interrupt
 
-与 Steer 相同，但还会取消正在运行的 Agent。
+只保留最新的排队消息并取消正在运行的 Agent。
 
 - Agent 正在处理 A。用户发送 B，然后 C。
 - A 被**取消**，B 被丢弃，C 立即开始处理。
 - 对方向修正的响应最快。
 - 当响应速度比完成当前任务更重要时使用。
+
+> **注意：** 当前 Interrupt 和 Steer 共享相同的排空并丢弃行为。不存在飞行中的 Agent 取消——正在运行的 Agent 会在处理最新消息之前完成。真正的飞行中取消功能正在计划中。
 
 ### Speculative
 
@@ -190,9 +192,11 @@ Octos 通过将工具分为**活跃**和**延迟**两组来管理庞大的工具
 
 当检测到持续的延迟恶化时，会话 actor 可以自动从 Followup 升级到 Speculative：
 
-- `ResponsivenessObserver` 跟踪 LLM 响应时间。
-- 如果连续的慢响应超过基线的 2 倍，自动激活 Speculative 模式和对冲竞速。
-- 当提供商恢复正常后，模式自动恢复。
+- `ResponsivenessObserver` 从前 5 次请求中学习**中位数**基线（对异常值更鲁棒），然后在 20 样本的滚动窗口中跟踪 LLM 响应时间。基线每 20 个样本通过 80/20 EMA 混合当前窗口中位数进行**自适应调整**，可跟踪渐进漂移。
+- 如果连续 3 次响应超过 **3×基线** 延迟，同时自动激活 Speculative 队列模式和对冲竞速（Hedge）。
+- 发送用户通知："检测到响应缓慢，已启用对冲竞速 + 投机队列。"
+- 当提供商恢复（一次正常延迟的响应）时，两者都恢复为 Followup 和静态路由。
+- API 通道（Web 客户端）也会触发自动升级，因为它始终使用投机处理路径。
 
 ### 队列命令
 
@@ -406,11 +410,11 @@ sys.exit(0)
 
 Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
-| 后端 | 平台 | 说明 |
-|---------|----------|-------|
-| bwrap | Linux | Bubblewrap 命名空间隔离 |
-| macOS | macOS | 使用 SBPL 配置的 sandbox-exec |
-| Docker | 任意平台 | 带资源限制的容器隔离 |
+| 后端 | 平台 | 隔离方式 | 网络控制 |
+|---------|----------|-------|---------|
+| bwrap | Linux | 只读绑定 `/usr,/lib,/bin,/sbin,/etc`；读写绑定工作目录；tmpfs `/tmp`；unshare-pid | 禁止网络时使用 `--unshare-net` |
+| macOS | macOS | 使用 SBPL 配置的 sandbox-exec：`process-exec/fork`、`file-read*`、工作目录 + `/private/tmp` 写入 | `(allow network*)` 或 `(deny network*)` |
+| Docker | 任意平台 | `--rm --security-opt no-new-privileges --cap-drop ALL` | 禁止网络时使用 `--network none` |
 
 在 `config.json` 中配置：
 
@@ -433,7 +437,11 @@ Shell 命令在沙箱中运行以实现隔离。支持三种后端：
 
 - **模式**：`auto`（自动检测最佳可用方案）、`bwrap`、`macos`、`docker`、`none`。
 - **挂载模式**：`rw`（读写）、`ro`（只读）、`none`（不挂载工作区）。
-- **环境变量清理**：所有沙箱后端都会自动清除 18 个危险环境变量（`LD_PRELOAD`、`NODE_OPTIONS` 等）。
+- **Docker 资源限制**：`--cpus`、`--memory`、`--pids-limit`。
+- **Docker 绑定挂载安全**：`docker.sock`、`/proc`、`/sys`、`/dev` 和 `/etc` 被阻止作为绑定挂载源。
+- **路径验证**：Docker 拒绝 `:`、`\0`、`\n`、`\r`；macOS 拒绝控制字符、`(`、`)`、`\`、`"`。
+- **环境变量清理**：18 个危险环境变量在所有沙箱后端、MCP 服务器启动、钩子和浏览器工具中自动清除：`LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, DYLD_FALLBACK_LIBRARY_PATH, DYLD_VERSIONED_LIBRARY_PATH, NODE_OPTIONS, PYTHONSTARTUP, PYTHONPATH, PERL5OPT, RUBYOPT, RUBYLIB, JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR`。
+- **进程清理**：Shell 工具在超时时发送 SIGTERM，等待宽限期后发送 SIGKILL 清理子进程。
 
 ---
 

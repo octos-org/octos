@@ -304,21 +304,56 @@ pub struct ProviderChain {
 }
 ```
 
-**行为**：按顺序尝试提供商，跳过已劣化的（失败次数 >= 阈值）。可重试错误时移至下一个。成功时重置失败计数。如果全部劣化，选择失败次数最少的。
+**行为**：按顺序尝试提供商，跳过已劣化的（失败次数 >= 阈值）。可转移错误时移至下一个。成功时重置失败计数。如果全部劣化，选择失败次数最少的。
 
-**可重试**：与 RetryProvider 相同的标准（429、5xx、连接/超时错误）。
+**可转移范围**（比可重试更广）：包括 401/403（不应重试同一提供商但应转移到其他提供商）和超时（不应浪费 120s × 重试次数在无响应的提供商上）。
 
 ### AdaptiveRouter（`adaptive.rs`）
 
-指标驱动的提供商选择。跟踪每个提供商的 EMA 延迟、P95 延迟、错误率。包含带探测请求的熔断器以恢复失败的提供商。
+指标驱动的提供商选择，支持三种互斥模式（Off/Hedge/Lane）。跟踪每个提供商的 EMA 延迟（可配置 `ema_alpha`，默认 0.3）、P95 延迟（64 样本循环缓冲区）、错误率、吞吐量（输出 tokens/sec EMA）和成本。四因子评分：稳定性、质量、优先级、成本（所有权重可配置）。包含熔断器、探测请求、模型目录播种（`model_catalog.json`）和 QoS 排名。评分使用 EMA 混合：冷启动时使用目录基线数据，实时指标逐渐替代（权重在 10 次调用中从 0 渐变到 1）。
+
+```rust
+pub struct AdaptiveSlot {
+    provider: Arc<dyn LlmProvider>,
+    metrics: ProviderMetrics,
+    priority: usize,
+    cost_per_m: f64,
+    model_type: Mutex<ModelType>,        // Strong | Fast
+    cost_in: AtomicU64,
+    ds_output: AtomicU64,                // 深度搜索输出质量
+    baseline_stability: AtomicU64,
+    baseline_tool_avg_ms: AtomicU64,
+    baseline_p95_ms: AtomicU64,
+    context_window: AtomicU64,
+    max_output: AtomicU64,
+}
+```
+
+**Hedge 模式**：通过 `tokio::select!` 竞速主服务商 + 最便宜的备选，取消输家。只有完成的请求记录指标（被取消的输家指标不记录）。如果主服务商失败，备选会顺序重试。
+
+**Lane 模式**：对所有服务商评分，选择最佳的一个。向过期服务商发送探测请求（概率可配置，默认 0.1；间隔默认 60s）。
+
+### FallbackProvider（`fallback.rs`）
+
+包装主服务商 + 按 QoS 排名的备选。失败时通过 `ProviderRouter` 记录冷却。按顺序尝试每个备选。
 
 ### SwappableProvider（`swappable.rs`）
 
-通过 `RwLock` 实现运行时模型切换。允许在不重启 Agent 的情况下更换底层提供商。
+通过 `RwLock` 实现运行时模型切换。每次切换泄漏约 50 字节（对于罕见的用户操作可接受）。`cached_model_id` 和 `cached_provider_name` 是泄漏的 `&'static str`，以满足 `&str` 返回类型的要求。
 
 ### ProviderRouter（`router.rs`）
 
-子 Agent 多模型路由。将不同的子 Agent 任务路由到不同的提供商/模型。
+子 Agent 多模型路由，支持前缀键解析。支持冷却（默认 60s）、按模型目录评分的 `compatible_fallbacks()`、从 `pricing.rs` 自动推导的费用信息和 LLM 可见的工具模式元数据。
+
+```rust
+pub struct ProviderRouter {
+    providers: RwLock<HashMap<String, Arc<dyn LlmProvider>>>,
+    active_key: RwLock<Option<String>>,
+    metadata: RwLock<HashMap<String, SubProviderMeta>>,
+    cooldowns: RwLock<HashMap<String, Instant>>,
+    qos_scores: RwLock<HashMap<String, f64>>,
+}
+```
 
 ### OminixClient（`ominix.rs`）
 
@@ -443,11 +478,11 @@ pub struct Episode {
 
 ```rust
 pub struct HybridIndex {
-    inverted: HashMap<String, Vec<(usize, f32)>>,  // term → [(doc_idx, tf)]
+    inverted: HashMap<String, Vec<(usize, u32)>>,  // term → [(doc_idx, raw_tf_count)]
     doc_lengths: Vec<usize>,
+    total_len: usize,                         // 运行总量，用于 O(1) avg_dl
     avg_dl: f64,
     ids: Vec<String>,
-    texts: Vec<String>,
     hnsw: Option<Hnsw<'static, f32, DistCosine>>,
     has_embedding: Vec<bool>,
     dimension: usize,                               // default: 1536
@@ -457,7 +492,8 @@ pub struct HybridIndex {
 **BM25 评分**（常量：K1=1.2, B=0.75）：
 - 分词：小写化，按非字母数字字符拆分，过滤长度 < 2 的 token
 - IDF：`ln((N - df + 0.5) / (df + 0.5) + 1.0)`
-- 评分：`IDF * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * dl/avg_dl))`
+- 评分：`IDF * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * dl/avg_dl))` — 使用**原始词频计数**（非归一化）
+- 去重检测：`ids.contains(episode_id)` 跳过已索引的文档（第 76-78 行）
 - 归一化到 [0, 1] 范围（epsilon `1e-10` 防止接近零的最大分数导致 NaN）
 
 **HNSW 向量索引**（通过 `hnsw_rs`）：
@@ -1305,23 +1341,24 @@ crates/
 ### 执行沙箱
 
 - 三种后端：bwrap（Linux）、sandbox-exec（macOS）、Docker — `SandboxMode::Auto` 检测
-- 18 个 BLOCKED_ENV_VARS 在所有沙箱后端、MCP 服务器启动和浏览器工具中共享
+- 18 个 BLOCKED_ENV_VARS 在所有沙箱后端、MCP 服务器启动、钩子和浏览器工具中共享：`LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, DYLD_FALLBACK_LIBRARY_PATH, DYLD_VERSIONED_LIBRARY_PATH, NODE_OPTIONS, PYTHONSTARTUP, PYTHONPATH, PERL5OPT, RUBYOPT, RUBYLIB, JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR`
 - 按后端的路径注入防护（Docker：`:`、`\0`、`\n`、`\r`；macOS：控制字符、`(`、`)`、`\`、`"`）
-- Docker：`--cap-drop ALL`、`--security-opt no-new-privileges`、`--network none`
+- Docker：`--cap-drop ALL`、`--security-opt no-new-privileges`、`--network none`，阻止绑定挂载源（`docker.sock`、`/proc`、`/sys`、`/dev`、`/etc`）
 
 ### 工具安全
 
-- ShellTool SafePolicy：拒绝 `rm -rf /`、`dd`、`mkfs`、fork 炸弹；询问 `sudo`、`git push --force`。匹配前空白归一化。超时钳制到 [1, 600] 秒。
-- 工具策略：allow/deny，deny 优先语义，支持分组，按提供商过滤
+- ShellTool SafePolicy：拒绝 `rm -rf /`、`dd`、`mkfs`、fork 炸弹、`chmod -R 777 /`；询问 `sudo`、`rm -rf`、`git push --force`、`git reset --hard`。匹配前空白归一化。超时钳制到 [1, 600] 秒。SIGTERM→宽限期→SIGKILL 子进程清理。
+- 工具策略：allow/deny，deny 优先语义，8 个命名分组（`group:fs`、`group:runtime`、`group:web`、`group:search`、`group:sessions` 等），通配符匹配，按提供商过滤（`tools.byProvider`）
 - 工具参数大小限制：每次调用 1MB（非分配的 `estimate_json_size`，含转义字符计算）
-- 路径遍历防护 + 通过 `O_NOFOLLOW`（Unix）的符号链接安全文件 I/O，消除 TOCTOU 竞态
-- SSRF 防护在共享的 `ssrf.rs` 模块中：阻止私有 IP（10/8、172.16/12、192.168/16、169.254/16、IPv6 ULA/链路本地、IPv4 映射/兼容）。被 web_fetch 和 browser 使用。
+- 符号链接安全文件 I/O：Unix 上通过 `O_NOFOLLOW` 实现原子级内核检查，消除 TOCTOU 竞态；Windows 上使用基于元数据的符号链接检查回退
+- SSRF 防护在共享的 `ssrf.rs` 模块中：DNS 解析失败时采用故障关闭策略（DNS 失败时阻止请求），私有 IP 阻止（10/8、172.16/12、192.168/16、169.254/16），IPv6 覆盖（ULA `fc00::/7`、链路本地 `fe80::/10`、站点本地 `fec0::/10`、IPv4 映射 `::ffff:0:0/96`、IPv4 兼容 `::/96`），回环地址阻止。被 web_fetch 和 browser 使用。
 - 浏览器：URL scheme 白名单（仅 http/https）、10 秒 JS 执行超时、僵尸进程清理、截图使用安全临时文件
 - MCP：输入 schema 验证（最大深度 10，最大大小 64KB）防止恶意工具定义
+- 提示注入防护（`prompt_guard.rs`）：5 种威胁类别（SystemOverride、RoleConfusion、ToolCallInjection、SecretExtraction、InstructionInjection），10 种检测模式。检测到的威胁被包裹在 `[injection-blocked:...]` 中进行清理。
 
 ### 数据安全
 
-- 工具输出清理：剥离 base64 数据 URI 和长十六进制字符串（`sanitize.rs`）
+- 工具输出清理（`sanitize.rs`）：剥离 base64 数据 URI、长十六进制字符串（64+ 字符），以及**凭据脱敏** — 7 个正则表达式覆盖 OpenAI（`sk-...`）、Anthropic（`sk-ant-...`）、AWS（`AKIA...`）、GitHub（`ghp_/gho_/ghs_/ghr_/github_pat_...`）、GitLab（`glpat-...`）、Bearer token 和通用 `password`/`api_key` 赋值
 - 通过 `truncate_utf8()` 在所有工具输出和邮件正文中实现 UTF-8 安全截断
 - 通过百分号编码文件名 + 截断时的哈希后缀防止会话文件冲突
 - 会话文件大小限制：最大 10MB 防止损坏文件导致 OOM

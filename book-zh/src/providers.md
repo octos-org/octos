@@ -161,17 +161,41 @@ octos chat --model qwen-max         # -> dashscope
 
 - **401/403**（认证错误）-- 立即转移，不在同一服务商上重试
 - **429**（限流）/ **5xx**（服务端错误）-- 指数退避重试，之后转移
+- **400**（内容格式错误）-- 当错误包含 `"must not be empty"`、`"reasoning_content"`、`"API key not valid"` 或 `"invalid_value"` 时转移（不同服务商的验证规则可能不同）
+- **超时** -- 立即转移（不在无响应的服务商上浪费 120s × 重试次数）
 - **熔断器** -- 连续 3 次失败将标记该服务商为降级状态
+
+**重试配置**（指数退避）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max_retries` | 3 | 每个服务商的重试次数 |
+| `initial_delay` | 1s | 首次重试延迟 |
+| `max_delay` | 60s | 最大重试延迟 |
+| `backoff_multiplier` | 2.0 | 指数倍增系数 |
+
+429 错误会从响应体中解析 `"try again in Xs"` 以实现更智能的退避（回退默认：30s）。
 
 ## 自适应路由
 
-当配置了多个降级模型时，自适应路由会根据实时性能指标动态选择最优服务商，而非按静态优先级顺序。
+当配置了多个降级模型时，自适应路由会以指标驱动的动态选择取代静态优先级链。
+
+### 路由模式
+
+三种互斥模式，通过 `adaptive_routing.mode` 设置：
+
+| 模式 | 说明 |
+|------|------|
+| `off`（默认） | 静态优先级顺序。仅在熔断器打开（3 次连续失败）时才转移。 |
+| `hedge` | **对冲竞速**：同时向 2 个服务商发送请求，取先到的结果，取消后到的。两者都累积 QoS 指标。 |
+| `lane` | **评分选道**：基于 4 因子评分公式动态选择最优服务商。比对冲更省（无重复请求）。 |
 
 ```json
 {
   "adaptive_routing": {
-    "enabled": true,
-    "latency_threshold_ms": 30000,
+    "mode": "hedge",
+    "qos_ranking": true,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -182,10 +206,51 @@ octos chat --model qwen-max         # -> dashscope
 
 | 配置项 | 默认值 | 说明 |
 |---------|---------|-------------|
-| `latency_threshold_ms` | 30000 | 平均延迟超过此值的服务商将被降权 |
-| `error_rate_threshold` | 0.3 | 错误率超过 30% 的服务商将被降低优先级 |
+| `mode` | `"off"` | `"off"`、`"hedge"` 或 `"lane"` |
+| `qos_ranking` | `false` | 启用 QoS 质量排名（使用模型目录评分） |
+| `latency_threshold_ms` | 10000 | 内部使用的软惩罚阈值 |
+| `error_rate_threshold` | 0.3 | 错误率超过此值的服务商将被降低优先级 |
 | `probe_probability` | 0.1 | 发送至非主服务商作为健康探测的请求比例 |
 | `probe_interval_secs` | 60 | 对同一服务商两次探测之间的最小间隔（秒） |
 | `failure_threshold` | 3 | 连续失败多少次后触发熔断 |
 
-启用自适应路由后，将以基于延迟和错误率的动态选择取代静态优先级链。少量请求会被路由到非主服务商作为探测，使系统能够检测恢复并重新平衡流量。
+### 评分公式（Lane 模式）
+
+每个服务商通过加权 4 因子公式评分，**越低越好**。所有权重可通过 `adaptive_routing` 配置：
+
+```
+score = w_stability × blended_error_rate
+      + w_quality  × (0.6 × norm_quality + 0.4 × norm_throughput)
+      + w_priority × norm_config_order
+      + w_cost      × norm_output_price
+```
+
+| 因子 | 权重键 | 默认 | 说明 |
+|------|--------|------|------|
+| 稳定性 | `weight_error_rate` | 0.3 | 混合基线 + 实时错误率。EMA 混合权重在 10 次调用中从 0 渐变到 1。 |
+| 质量 | `weight_latency` | 0.3 | 60% 归一化 ds_output 质量 + 40% 归一化吞吐量（输出 tokens/秒 EMA） |
+| 优先级 | `weight_priority` | 0.2 | 配置顺序偏好（0=主服务商，越高越靠后）。归一化到 [0, 1]。 |
+| 成本 | `weight_cost` | 0.2 | 归一化的每百万 token 输出价格。未知成本 → 0（无惩罚）。 |
+
+目录可以从 `model_catalog.json` 基准文件预填充，使路由器在启动时即具备参考评分而非冷启动启发。
+
+### 自动升级
+
+当检测到持续的延迟恶化时，会话 actor 会自动激活对冲模式 + 投机队列：
+
+- `ResponsivenessObserver` 从前 5 次请求学习**中位数**基线（对异常值鲁棒），然后通过 80/20 EMA 每隔 20 个样本**自适应调整**基线。
+- 如果连续 3 次 LLM 响应超过 **3×基线** 延迟，对冲竞速和投机队列同时启用。
+- 当服务商恢复（一次正常延迟响应）时，两者都恢复为 Followup 和静态路由。
+
+### 服务商包装栈
+
+路由系统由分层包装器组成：
+
+| 包装器 | 用途 |
+|--------|------|
+| `AdaptiveRouter` | 顶层：指标驱动评分、对冲/选道模式、熔断器、探测请求 |
+| `ProviderChain` | 有序故障转移，带每服务商熔断器（失败次数 >= 阈值 → 降级） |
+| `FallbackProvider` | 主服务商 + 按QoS排名的备选，通过 `ProviderRouter` 追踪冷却 |
+| `RetryProvider` | 429/5xx 指数退避。超时 → 不重试（改为转移） |
+| `ProviderRouter` | 子 Agent 多模型路由。前缀键解析、冷却、QoS评分备选 |
+| `SwappableProvider` | 通过 `RwLock` 实现运行时模型切换（如 `switch_model` 工具）。每次切换泄漏约 50 字节 |
