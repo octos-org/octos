@@ -189,9 +189,11 @@ fn fetch_tts_wav(
 }
 
 fn check_health(client: &reqwest::blocking::Client, base_url: &str) -> Result<(), String> {
+    // Generous timeout: ominix-api is single-threaded (MLX), so /health may block
+    // while a TTS/ASR synthesis is in progress.
     match client
         .get(format!("{base_url}/health"))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))
         .send()
     {
         Ok(resp) if resp.status().is_success() => Ok(()),
