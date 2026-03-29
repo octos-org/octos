@@ -582,7 +582,7 @@ async fn web_search(
 
     // Default: race top 2 available engines in parallel.
     // Gives redundancy + speed without the resource explosion of fire-all.
-    // Priority: tavily > perplexity > brave > google_cdp > duckduckgo
+    // Priority: tavily > perplexity > brave > bing_cdp > duckduckgo
     let mut available: Vec<&str> = Vec::new();
     if std::env::var("TAVILY_API_KEY")
         .ok()
@@ -602,7 +602,7 @@ async fn web_search(
     {
         available.push("brave");
     }
-    available.push("google_cdp"); // free, uses headless Chrome
+    available.push("bing_cdp"); // free, uses headless Chrome
     available.push("duckduckgo"); // always available (free)
 
     // Race top 2
@@ -689,7 +689,7 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
     {
         let q = query.to_string();
         handles.push(tokio::spawn(async move {
-            ("google_cdp", google_cdp_search(&q, count).await)
+            ("bing_cdp", bing_cdp_search(&q, count).await)
         }));
     }
     {
@@ -760,7 +760,7 @@ async fn try_engine(
             you_search(client, query, count, &key).await
         }
         "duckduckgo" => ddg_search(client, query, count).await,
-        "google_cdp" => google_cdp_search(query, count).await,
+        "bing_cdp" => bing_cdp_search(query, count).await,
         _ => return None,
     };
     if r.success && !r.output.contains("No results found") {
@@ -1023,13 +1023,14 @@ async fn brave_search(
 }
 
 // ---------------------------------------------------------------------------
-// Google CDP Search (headless Chrome via deep-crawl binary)
+// Bing CDP Search (headless Chrome via deep-crawl binary)
 // ---------------------------------------------------------------------------
 
-/// Search Google via headless Chrome. Calls the `deep_crawl` sibling binary
+/// Search Bing via headless Chrome. Calls the `deep_crawl` sibling binary
 /// to render the SERP, then extracts result links from the text output.
-/// No API key needed — just Chromium installed.
-async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
+/// No API key needed — just Chromium installed. Uses Bing instead of Google
+/// because Google CAPTCHAs automated requests from datacenter IPs.
+async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
     // Find deep_crawl binary: check sibling dir, cargo bin, and PATH
     let crawl_bin = {
         let candidates: Vec<std::path::PathBuf> = [
@@ -1062,7 +1063,7 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
                     }
                     _ => {
                         return SearchResult {
-                            output: "google_cdp: deep_crawl binary not found".into(),
+                            output: "bing_cdp:deep_crawl binary not found".into(),
                             success: false,
                         };
                     }
@@ -1071,14 +1072,16 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
         }
     };
 
-    let google_url = format!(
-        "https://www.google.com/search?q={}&num={}&hl=en",
+    // Use Bing instead of Google — Google CAPTCHAs automated requests from datacenter IPs.
+    // Bing is much more lenient with headless Chrome scraping.
+    let search_url = format!(
+        "https://www.bing.com/search?q={}&count={}",
         urlencoded(query),
         count.min(10)
     );
 
     let input = serde_json::json!({
-        "url": google_url,
+        "url": search_url,
         "max_depth": 0,
         "timeout_secs": 20
     });
@@ -1094,7 +1097,7 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
         Ok(c) => c,
         Err(e) => {
             return SearchResult {
-                output: format!("google_cdp: failed to spawn deep_crawl: {e}"),
+                output: format!("bing_cdp:failed to spawn deep_crawl: {e}"),
                 success: false,
             };
         }
@@ -1116,13 +1119,13 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return SearchResult {
-                output: format!("google_cdp: deep_crawl failed: {e}"),
+                output: format!("bing_cdp:deep_crawl failed: {e}"),
                 success: false,
             };
         }
         Err(_) => {
             return SearchResult {
-                output: "google_cdp: timeout after 30s".into(),
+                output: "bing_cdp:timeout after 30s".into(),
                 success: false,
             };
         }
@@ -1135,7 +1138,7 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
         Ok(v) => v,
         Err(_) => {
             return SearchResult {
-                output: format!("google_cdp: failed to parse output ({} bytes)", stdout.len()),
+                output: format!("bing_cdp:failed to parse output ({} bytes)", stdout.len()),
                 success: false,
             };
         }
@@ -1148,7 +1151,7 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
 
     if text.is_empty() {
         return SearchResult {
-            output: format!("google_cdp: empty response for: {query}"),
+            output: format!("bing_cdp:empty response for: {query}"),
             success: false,
         };
     }
@@ -1163,9 +1166,10 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
         }
         // Lines with URLs
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            if !trimmed.contains("google.com")
+            if !trimmed.contains("bing.com")
+                && !trimmed.contains("microsoft.com")
+                && !trimmed.contains("google.com")
                 && !trimmed.contains("gstatic.com")
-                && !trimmed.contains("googleapis.com")
             {
                 let title = if current_title.is_empty() {
                     trimmed.to_string()
@@ -1174,7 +1178,7 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
                 };
                 results.push(format!("- {}\n  {}", title, trimmed));
             }
-        } else if trimmed.len() > 10 && !trimmed.contains("Google") {
+        } else if trimmed.len() > 10 && !trimmed.contains("Google") && !trimmed.contains("Bing") {
             current_title = trimmed.to_string();
         }
     }
@@ -1182,13 +1186,13 @@ async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
     if results.is_empty() {
         // Fall back to returning the raw text which may have useful content
         return SearchResult {
-            output: format!("Google results for: {query}\n\n{}", &text[..text.len().min(3000)]),
+            output: format!("Bing results for: {query}\n\n{}", &text[..text.len().min(3000)]),
             success: !text.is_empty(),
         };
     }
 
     let output = format!(
-        "Google results for: {query}\n\n{}",
+        "Bing results for: {query}\n\n{}",
         results.iter().take(count as usize).cloned().collect::<Vec<_>>().join("\n\n")
     );
 
