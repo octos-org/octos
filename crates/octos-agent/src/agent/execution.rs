@@ -128,9 +128,34 @@ impl Agent {
                                 });
                             }
 
-                            // Auto-send files requested by the plugin (no LLM round-trip needed)
-                            for file_path in &tool_result.files_to_send {
-                                let path_str = file_path.to_string_lossy().to_string();
+                            // Auto-send files: explicit files_to_send OR detected file paths in output.
+                            // This acts as a universal post-tool hook — any plugin that produces
+                            // a deliverable file gets it sent to the user automatically.
+                            let mut files: Vec<String> = tool_result.files_to_send
+                                .iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+
+                            // Detect file paths in output for plugins that don't set files_to_send
+                            if files.is_empty() && tool_result.success {
+                                let sendable_extensions = [
+                                    ".mp3", ".wav", ".ogg", ".flac",  // audio
+                                    ".pptx", ".pdf", ".xlsx",         // documents
+                                    ".png", ".jpg", ".jpeg", ".svg",  // images
+                                ];
+                                for word in tool_result.output.split_whitespace() {
+                                    let lower = word.to_lowercase();
+                                    if sendable_extensions.iter().any(|ext| lower.ends_with(ext)) {
+                                        // Strip trailing punctuation
+                                        let cleaned = word.trim_end_matches(|c: char| c == '.' || c == ',' || c == ')' || c == ']');
+                                        if std::path::Path::new(cleaned).exists() {
+                                            files.push(cleaned.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            for path_str in &files {
                                 info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
                                 let send_args = serde_json::json!({"file_path": path_str});
                                 match tools.execute("send_file", &send_args).await {
