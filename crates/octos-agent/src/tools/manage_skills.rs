@@ -674,20 +674,32 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
     let dest = dir.join("main");
 
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-        // Extract the first file from the tar.gz archive
+        // Extract the first real file from the tar.gz archive.
+        // Skip macOS AppleDouble resource fork files (._* prefix) which
+        // appear before the actual binary in archives created on macOS.
         use std::io::Read;
         let gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
         for entry in archive.entries()? {
             let mut entry = entry?;
-            if entry.header().entry_type().is_file() {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
-                std::fs::write(&dest, &buf)?;
-                found = true;
-                break;
+            if !entry.header().entry_type().is_file() {
+                continue;
             }
+            // Skip AppleDouble resource fork files
+            let is_apple_double = entry
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("._")))
+                .unwrap_or(false);
+            if is_apple_double {
+                continue;
+            }
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            std::fs::write(&dest, &buf)?;
+            found = true;
+            break;
         }
         if !found {
             return Ok(false);
