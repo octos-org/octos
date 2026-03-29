@@ -1030,32 +1030,44 @@ async fn brave_search(
 /// to render the SERP, then extracts result links from the text output.
 /// No API key needed — just Chromium installed.
 async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
-    // Find deep_crawl binary (sibling to our executable)
-    let crawl_bin = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        Some(dir) => {
-            let candidate = dir.join("deep_crawl");
-            if candidate.exists() {
-                candidate
-            } else {
-                let alt = dir.join("deep-crawl");
-                if alt.exists() {
-                    alt
-                } else {
-                    return SearchResult {
-                        output: "google_cdp: deep_crawl binary not found".into(),
-                        success: false,
-                    };
+    // Find deep_crawl binary: check sibling dir, cargo bin, and PATH
+    let crawl_bin = {
+        let candidates: Vec<std::path::PathBuf> = [
+            // Sibling bundled-app-skill directory
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent()?.parent().map(|d| d.join("deep-crawl").join("main"))),
+            // Same directory as our binary
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("deep_crawl").to_path_buf())),
+            // ~/.cargo/bin
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cargo/bin/deep_crawl")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        match candidates.into_iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => {
+                // Try PATH via which
+                match std::process::Command::new("which")
+                    .arg("deep_crawl")
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim())
+                    }
+                    _ => {
+                        return SearchResult {
+                            output: "google_cdp: deep_crawl binary not found".into(),
+                            success: false,
+                        };
+                    }
                 }
             }
-        }
-        None => {
-            return SearchResult {
-                output: "google_cdp: cannot determine executable path".into(),
-                success: false,
-            };
         }
     };
 
