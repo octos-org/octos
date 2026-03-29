@@ -1083,7 +1083,8 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
     let input = serde_json::json!({
         "url": search_url,
         "max_depth": 0,
-        "timeout_secs": 20
+        "max_pages": 1,
+        "timeout_secs": 30
     });
 
     let result = tokio::process::Command::new(&crawl_bin)
@@ -1111,7 +1112,7 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
 
     // Wait with timeout
     let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
         child.wait_with_output(),
     )
     .await
@@ -1125,7 +1126,7 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
         }
         Err(_) => {
             return SearchResult {
-                output: "bing_cdp:timeout after 30s".into(),
+                output: "bing_cdp:timeout after 60s".into(),
                 success: false,
             };
         }
