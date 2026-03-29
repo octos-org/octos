@@ -41,28 +41,105 @@ UNINSTALL=false
 RUN_DOCTOR=false
 
 # ── Parse arguments ───────────────────────────────────────────────────
+needval() {
+    if [ $# -lt 2 ] || case "$2" in -*) true ;; *) false ;; esac; then
+        echo "ERROR: $1 requires a value"; exit 1
+    fi
+}
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tenant-name)   TENANT_NAME="$2"; shift 2 ;;
-        --frps-token)    FRPS_TOKEN="$2"; shift 2 ;;
-        --frps-token-file) FRPS_TOKEN_FILE="$2"; shift 2 ;;
-        --frps-server)   FRPS_SERVER="$2"; shift 2 ;;
-        --ssh-port)      SSH_PORT="$2"; shift 2 ;;
-        --auth-token)    AUTH_TOKEN="$2"; shift 2 ;;
-        --domain)        TUNNEL_DOMAIN="$2"; shift 2 ;;
-        --version)       VERSION="$2"; shift 2 ;;
-        --prefix)        PREFIX="$2"; shift 2 ;;
+        --tenant-name)   needval "$@"; TENANT_NAME="$2"; shift 2 ;;
+        --frps-token)    needval "$@"; FRPS_TOKEN="$2"; shift 2 ;;
+        --frps-token-file) needval "$@"; FRPS_TOKEN_FILE="$2"; shift 2 ;;
+        --frps-server)   needval "$@"; FRPS_SERVER="$2"; shift 2 ;;
+        --ssh-port)      needval "$@"; SSH_PORT="$2"; shift 2 ;;
+        --auth-token)    needval "$@"; AUTH_TOKEN="$2"; shift 2 ;;
+        --domain)        needval "$@"; TUNNEL_DOMAIN="$2"; shift 2 ;;
+        --version)       needval "$@"; VERSION="$2"; shift 2 ;;
+        --prefix)        needval "$@"; PREFIX="$2"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
         --doctor)        RUN_DOCTOR=true; shift ;;
         --help|-h)
-            sed -n '2,22s/^# //p' "$0"
+            cat << 'HELPEOF'
+install.sh — Install octos from pre-built binaries on a fresh machine.
+Self-contained: no repo clone, Rust, or Node.js needed.
+
+Usage:
+  curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+  curl -fsSL ... | bash -s -- --tenant-name alice --frps-token <token>
+
+Options:
+  --tenant-name NAME       Tenant subdomain (e.g. "alice")
+  --frps-token TOKEN       frps auth token
+  --frps-token-file FILE   Read frps auth token from FILE
+  --frps-server ADDR       frps server address (default: 163.192.33.32)
+  --ssh-port PORT          SSH tunnel remote port (default: 6001)
+  --auth-token TOKEN       Dashboard auth token (default: auto-generated)
+  --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
+  --version TAG            Release version to install (default: latest)
+  --prefix DIR             Install prefix (default: ~/.octos/bin)
+  --no-tunnel              Skip frpc tunnel setup
+  --uninstall              Remove octos and frpc services and binaries
+  --doctor                 Diagnose installation and service health
+HELPEOF
             exit 0
             ;;
         *)
             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# ── Validate arguments ──────────────────────────────────────────────
+# Values are embedded in TOML, XML plist, and systemd unit files.
+# Reject characters that would break any of those formats.
+normalize_path() {
+    local path="$1"
+    case "$path" in
+        "~")
+            printf '%s\n' "$HOME"
+            ;;
+        "~/"*)
+            printf '%s/%s\n' "$HOME" "${path#"~/"}"
+            ;;
+        /*)
+            printf '%s\n' "$path"
+            ;;
+        *)
+            printf '%s/%s\n' "$PWD" "$path"
+            ;;
+    esac
+}
+
+PREFIX="$(normalize_path "$PREFIX")"
+DATA_DIR="$(normalize_path "$DATA_DIR")"
+
+validate() {
+    local name="$1" value="$2" pattern="$3"
+    if ! printf '%s' "$value" | grep -qE "^${pattern}\$"; then
+        echo "ERROR: invalid $name: '$value'"
+        echo "       Must match: $pattern"
+        exit 1
+    fi
+}
+
+# Validate all non-empty user-controlled values that get embedded in config files.
+# Called after CLI parsing AND after every alternate input source (token files,
+# interactive prompts, existing config reads).
+validate_inputs() {
+    [ -n "$TENANT_NAME" ]  && validate "tenant-name" "$TENANT_NAME" '[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?'
+    [ -n "$AUTH_TOKEN" ]    && validate "auth-token"  "$AUTH_TOKEN"  '[a-zA-Z0-9._-]+'
+    [ -n "$FRPS_TOKEN" ]    && validate "frps-token"  "$FRPS_TOKEN"  '[a-zA-Z0-9._-]+'
+    [ -n "$TUNNEL_DOMAIN" ] && validate "domain"      "$TUNNEL_DOMAIN" '[a-zA-Z0-9.-]+'
+    [ -n "$FRPS_SERVER" ]   && validate "frps-server" "$FRPS_SERVER" '[a-zA-Z0-9.:-]+'
+    [ -n "$SSH_PORT" ]      && validate "ssh-port"    "$SSH_PORT"    '[0-9]+'
+    [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] && validate "version" "$VERSION" '[a-zA-Z0-9._-]+'
+    [ -n "$PREFIX" ]        && validate "prefix"      "$PREFIX"      '/[a-zA-Z0-9/._~-]*'
+    [ -n "$DATA_DIR" ]      && validate "data-dir"    "$DATA_DIR"    '/[a-zA-Z0-9/._~-]*'
+    return 0
+}
+
+validate_inputs
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -71,6 +148,347 @@ section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
 hint()    { echo "          -> $1"; }
+
+# ── Platform helpers ────────────────────────────────────────────────
+
+# Print the install command for a package on the current OS.
+# Usage: pkg_hint <package>
+pkg_hint() {
+    case "$OS" in
+        Darwin)
+            case "$1" in
+                git)       echo "xcode-select --install" ;;
+                node)      echo "brew install node" ;;
+                chromium)  echo "brew install --cask google-chrome" ;;
+                ffmpeg)    echo "brew install ffmpeg" ;;
+            esac
+            ;;
+        Linux)
+            case "$1" in
+                git)       echo "sudo apt-get install -y git (or your package manager)" ;;
+                node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
+                chromium)  echo "sudo apt-get install -y chromium-browser" ;;
+                ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
+                iproute2)  echo "sudo apt-get install -y iproute2" ;;
+            esac
+            ;;
+        *)
+            echo "(see your OS package manager)" ;;
+    esac
+}
+
+# Print a service management command.
+# Usage: svc_hint <start|stop|restart|status> <serve|frpc>
+svc_hint() {
+    local action="$1" service="$2"
+    case "$OS" in
+        Darwin)
+            local plist="/Library/LaunchDaemons/io.octos.${service}.plist"
+            case "$action" in
+                start)   echo "sudo launchctl load $plist" ;;
+                stop)    echo "sudo launchctl unload $plist" ;;
+                restart) echo "sudo launchctl unload $plist && sudo launchctl load $plist" ;;
+                status)  echo "sudo launchctl print system/io.octos.${service}" ;;
+            esac
+            ;;
+        Linux)
+            local unit="$service"
+            [ "$service" = "serve" ] && unit="octos-serve"
+            case "$action" in
+                start)   echo "sudo systemctl start $unit" ;;
+                stop)    echo "sudo systemctl stop $unit" ;;
+                restart) echo "sudo systemctl restart $unit" ;;
+                status)  echo "sudo systemctl status $unit" ;;
+            esac
+            ;;
+        *)
+            echo "# service management not supported on $OS" ;;
+    esac
+}
+
+# Write frpc.toml to /etc/frp/frpc.toml.
+# Uses globals: FRPS_SERVER, FRPS_TOKEN, TENANT_NAME, TUNNEL_DOMAIN, SSH_PORT
+write_frpc_config() {
+    local tmp
+    tmp=$(mktemp /tmp/frpc.toml.XXXXXX)
+    cat > "$tmp" << EOF
+serverAddr = "${FRPS_SERVER}"
+serverPort = 7000
+auth.method = "token"
+auth.token = "${FRPS_TOKEN}"
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "${TENANT_NAME}-web"
+type = "http"
+localPort = 8080
+customDomains = ["${TENANT_NAME}.${TUNNEL_DOMAIN}"]
+
+[[proxies]]
+name = "${TENANT_NAME}-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = ${SSH_PORT}
+EOF
+    sudo mkdir -p /etc/frp
+    sudo mv "$tmp" /etc/frp/frpc.toml
+    sudo chown root:root /etc/frp/frpc.toml 2>/dev/null || sudo chown root:wheel /etc/frp/frpc.toml
+    sudo chmod 600 /etc/frp/frpc.toml
+}
+
+# Download and install frpc binary to /usr/local/bin.
+# Uses globals: FRPC_VERSION, FRP_ARCH, OS
+install_frpc_binary() {
+    if [ -f /usr/local/bin/frpc ]; then
+        ok "frpc already installed ($(/usr/local/bin/frpc --version 2>/dev/null || echo 'unknown'))"
+        return 0
+    fi
+    echo "    Installing frpc v${FRPC_VERSION}..."
+    case "$FRP_ARCH" in
+        amd64|arm64) ;; # ok
+        *) err "Unsupported frpc architecture: $FRP_ARCH" ; return 1 ;;
+    esac
+    local frp_os frp_tarball frp_url frp_tmp
+    frp_os=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
+    frp_tarball="frp_${FRPC_VERSION}_${frp_os}_${FRP_ARCH}.tar.gz"
+    frp_url="https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/${frp_tarball}"
+    frp_tmp=$(mktemp -d /tmp/frpc-install.XXXXXX)
+    curl -fsSL -o "${frp_tmp}/${frp_tarball}" "$frp_url"
+    tar -xzf "${frp_tmp}/${frp_tarball}" -C "$frp_tmp"
+    sudo mkdir -p /usr/local/bin
+    sudo cp "${frp_tmp}/frp_${FRPC_VERSION}_${frp_os}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
+    sudo chmod 0755 /usr/local/bin/frpc
+    rm -rf "$frp_tmp"
+    ok "frpc installed"
+}
+
+# Write and load the frpc system service (plist on Darwin, systemd on Linux).
+# Idempotent: unloads existing service before reloading.
+write_frpc_service() {
+    case "$OS" in
+        Darwin)
+            local plist="/Library/LaunchDaemons/io.octos.frpc.plist"
+            local tmp
+            tmp=$(mktemp /tmp/io.octos.frpc.plist.XXXXXX)
+            cat > "$tmp" << 'PLIST_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frpc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/frpc</string>
+        <string>-c</string>
+        <string>/etc/frp/frpc.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/frpc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/frpc.log</string>
+</dict>
+</plist>
+PLIST_EOF
+            # Clean up legacy LaunchAgent
+            launchctl unload "$HOME/Library/LaunchAgents/io.octos.frpc.plist" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/io.octos.frpc.plist"
+            sudo launchctl unload "$plist" 2>/dev/null || true
+            sudo mv "$tmp" "$plist"
+            sudo chown root:wheel "$plist"
+            sudo chmod 644 "$plist"
+            sudo launchctl load "$plist"
+            ;;
+        Linux)
+            local unit="/etc/systemd/system/frpc.service"
+            local tmp
+            tmp=$(mktemp /tmp/frpc.service.XXXXXX)
+            cat > "$tmp" << 'UNIT_EOF'
+[Unit]
+Description=frpc tunnel client for octos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+            sudo mv "$tmp" "$unit"
+            sudo chown root:root "$unit"
+            sudo chmod 644 "$unit"
+            sudo systemctl daemon-reload
+            sudo systemctl enable frpc
+            sudo systemctl restart frpc
+            ;;
+        *)
+            warn "frpc service setup not supported on $OS"
+            return 1
+            ;;
+    esac
+}
+
+# Write and load the octos serve system service (plist on Darwin, systemd on Linux).
+# Uses globals: OCTOS_BIN, AUTH_TOKEN, DATA_DIR, PREFIX, HOME
+write_octos_service() {
+    case "$OS" in
+        Darwin)
+            # Clean up legacy LaunchAgents (old names that conflict with port 8080)
+            local legacy
+            for legacy in \
+                "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
+                "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.ominix-api.plist" \
+                "$HOME/Library/LaunchAgents/io.ominix.octos-serve.plist"; do
+                if [ -f "$legacy" ]; then
+                    launchctl unload "$legacy" 2>/dev/null || true
+                    rm -f "$legacy"
+                fi
+            done
+
+            local plist="/Library/LaunchDaemons/io.octos.serve.plist"
+            local tmp
+            tmp=$(mktemp /tmp/io.octos.serve.plist.XXXXXX)
+            cat > "$tmp" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$OCTOS_BIN</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>8080</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--auth-token</string>
+        <string>$AUTH_TOKEN</string>
+    </array>
+    <key>UserName</key>
+    <string>$(whoami)</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$DATA_DIR/serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>$DATA_DIR/serve.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$PREFIX:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>OCTOS_DATA_DIR</key>
+        <string>$DATA_DIR</string>
+        <key>OCTOS_AUTH_TOKEN</key>
+        <string>$AUTH_TOKEN</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+</dict>
+</plist>
+EOF
+            echo "    (sudo is needed to install and start the system service)"
+            sudo launchctl unload "$plist" 2>/dev/null || true
+            sudo mv "$tmp" "$plist"
+            sudo chown root:wheel "$plist"
+            sudo chmod 644 "$plist"
+            sudo launchctl load "$plist"
+            ok "octos serve started via launchd"
+            ;;
+
+        Linux)
+            local unit="/etc/systemd/system/octos-serve.service"
+            local tmp
+            tmp=$(mktemp /tmp/octos-serve.service.XXXXXX)
+            cat > "$tmp" << EOF
+[Unit]
+Description=octos serve (dashboard + gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$(whoami)
+ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN
+Restart=on-failure
+RestartSec=5
+Environment=HOME=$HOME
+Environment=OCTOS_DATA_DIR=$DATA_DIR
+Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
+Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=$HOME
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            echo "    (sudo is needed to install and start the system service)"
+            sudo mv "$tmp" "$unit"
+            sudo chown root:root "$unit"
+            sudo chmod 644 "$unit"
+            sudo systemctl daemon-reload
+            sudo systemctl enable octos-serve
+            sudo systemctl restart octos-serve
+            ok "octos serve started via systemd"
+            ;;
+
+        *)
+            warn "octos serve service setup not supported on $OS"
+            hint "Run manually: $OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN"
+            ;;
+    esac
+}
+
+# Stop and remove all octos system services (octos serve + frpc).
+uninstall_services() {
+    case "$OS" in
+        Darwin)
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.frpc.plist
+            # Clean up legacy LaunchAgents
+            launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/io.octos.serve.plist 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/io.ominix.crew-serve.plist 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/io.ominix.octos-serve.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/io.octos.*.plist
+            rm -f ~/Library/LaunchAgents/io.ominix.*.plist
+            ok "launchd services removed"
+            ;;
+        Linux)
+            sudo systemctl stop octos-serve.service 2>/dev/null || true
+            sudo systemctl disable octos-serve.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/octos-serve.service
+            sudo systemctl stop frpc.service 2>/dev/null || true
+            sudo systemctl disable frpc.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/frpc.service
+            sudo systemctl daemon-reload 2>/dev/null || true
+            ok "systemd services removed"
+            ;;
+        *)
+            warn "service removal not supported on $OS — remove services manually"
+            ;;
+    esac
+}
 
 # err() exits during install but not during doctor
 if [ "$RUN_DOCTOR" = true ]; then
@@ -140,16 +558,8 @@ if [ "$RUN_DOCTOR" = true ]; then
         echo "    CMD: $OCTOS_CMD"
     else
         err "octos serve is not running"
-        case "$OS" in
-            Darwin)
-                hint "Start: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist"
-                hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
-                ;;
-            Linux)
-                hint "Start: sudo systemctl start octos-serve"
-                hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
-                ;;
-        esac
+        hint "Start: $(svc_hint start serve)"
+        hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
     fi
 
     # ── Port 8080 ────────────────────────────────────────────────────
@@ -184,8 +594,9 @@ if [ "$RUN_DOCTOR" = true ]; then
         fi
     else
         warn "cannot check port 8080 (none of lsof, ss, or netstat found)"
-        if [ "$OS" = "Linux" ]; then
-            hint "Install one: sudo apt-get install -y iproute2   # provides ss"
+        _iproute_hint=$(pkg_hint iproute2)
+        if [ -n "$_iproute_hint" ]; then
+            hint "Install one: $_iproute_hint   # provides ss"
         fi
     fi
 
@@ -248,8 +659,8 @@ if [ "$RUN_DOCTOR" = true ]; then
                     ok "service appears loaded (process running)"
                 else
                     warn "plist exists but service does not appear to be running"
-                    hint "Check: sudo launchctl print system/io.octos.serve"
-                    hint "Load:  sudo launchctl load $PLIST"
+                    hint "Check: $(svc_hint status serve)"
+                    hint "Load:  $(svc_hint start serve)"
                 fi
             else
                 warn "no LaunchDaemon plist found"
@@ -283,13 +694,16 @@ if [ "$RUN_DOCTOR" = true ]; then
                     ok "service is active"
                 else
                     warn "service is not active"
-                    hint "Start: sudo systemctl start octos-serve"
-                    hint "Check: sudo systemctl status octos-serve"
+                    hint "Start: $(svc_hint start serve)"
+                    hint "Check: $(svc_hint status serve)"
                 fi
             else
                 warn "no systemd unit found"
                 hint "Re-run install.sh to set up the service"
             fi
+            ;;
+        *)
+            warn "service configuration check not supported on $OS"
             ;;
     esac
 
@@ -310,14 +724,7 @@ if [ "$RUN_DOCTOR" = true ]; then
     else
         if [ -f /usr/local/bin/frpc ]; then
             err "frpc installed but not running"
-            case "$OS" in
-                Darwin)
-                    hint "Start: sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist"
-                    ;;
-                Linux)
-                    hint "Start: sudo systemctl start frpc"
-                    ;;
-            esac
+            hint "Start: $(svc_hint start frpc)"
         fi
     fi
 
@@ -372,18 +779,7 @@ if [ "$RUN_DOCTOR" = true ]; then
             hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
         else
             hint "frpc is installed and configured but the process is not running"
-            case "$OS" in
-                Darwin)
-                    if [ -f /Library/LaunchDaemons/io.octos.frpc.plist ]; then
-                        hint "  Start: sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist"
-                    else
-                        hint "  No LaunchDaemon found. Re-run install.sh with tunnel options"
-                    fi
-                    ;;
-                Linux)
-                    hint "  Start: sudo systemctl start frpc"
-                    ;;
-            esac
+            hint "  Start: $(svc_hint start frpc)"
         fi
     elif [ "$ADMIN_OK" = false ]; then
         err "admin portal is not responding locally — fix octos serve first (see above)"
@@ -451,31 +847,7 @@ fi
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
-    echo "    (sudo is needed to remove system services)"
-    case "$OS" in
-        Darwin)
-            sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
-            sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
-            sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist 2>/dev/null || true
-            sudo rm -f /Library/LaunchDaemons/io.octos.frpc.plist
-            # Clean up legacy LaunchAgents
-            launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
-            launchctl unload ~/Library/LaunchAgents/io.octos.serve.plist 2>/dev/null || true
-            launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
-            rm -f ~/Library/LaunchAgents/io.octos.*.plist
-            ok "launchd services removed"
-            ;;
-        Linux)
-            sudo systemctl stop octos-serve.service 2>/dev/null || true
-            sudo systemctl disable octos-serve.service 2>/dev/null || true
-            sudo rm -f /etc/systemd/system/octos-serve.service
-            sudo systemctl stop frpc.service 2>/dev/null || true
-            sudo systemctl disable frpc.service 2>/dev/null || true
-            sudo rm -f /etc/systemd/system/frpc.service
-            sudo systemctl daemon-reload 2>/dev/null || true
-            ok "systemd services removed"
-            ;;
-    esac
+    uninstall_services
 
     rm -rf "$PREFIX"
     sudo rm -f /usr/local/bin/frpc
@@ -492,6 +864,7 @@ fi
 if [ -z "$FRPS_TOKEN" ] && [ -n "$FRPS_TOKEN_FILE" ]; then
     if [ -f "$FRPS_TOKEN_FILE" ]; then
         FRPS_TOKEN=$(cat "$FRPS_TOKEN_FILE")
+        validate_inputs
     else
         err "token file not found: $FRPS_TOKEN_FILE"
     fi
@@ -543,6 +916,8 @@ if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; };
         [ -z "$FRPS_TOKEN" ] && err "frps token is required"
     fi
 
+    validate_inputs
+
     # Detect architecture for frpc download
     case "$ARCH" in
         x86_64)        FRP_ARCH="amd64" ;;
@@ -558,118 +933,16 @@ if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; };
     echo "      SSH port:     ${SSH_PORT}"
 
     # Install frpc if missing
-    if [ ! -f /usr/local/bin/frpc ]; then
-        echo "    Installing frpc v${FRPC_VERSION}..."
-        FRP_OS=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
-        FRP_TARBALL="frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}.tar.gz"
-        FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/${FRP_TARBALL}"
-        FRP_TMP=$(mktemp -d /tmp/frpc-install.XXXXXX)
-        curl -fsSL -o "${FRP_TMP}/${FRP_TARBALL}" "$FRP_URL"
-        tar -xzf "${FRP_TMP}/${FRP_TARBALL}" -C "$FRP_TMP"
-        sudo mkdir -p /usr/local/bin
-        sudo cp "${FRP_TMP}/frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
-        sudo chmod 0755 /usr/local/bin/frpc
-        rm -rf "$FRP_TMP"
-        ok "frpc installed"
-    fi
+    install_frpc_binary
 
     # Write frpc config
-    FRPC_CONF_TMP=$(mktemp /tmp/frpc.toml.XXXXXX)
-    cat > "$FRPC_CONF_TMP" << EOF
-serverAddr = "${FRPS_SERVER}"
-serverPort = 7000
-auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
-log.to = "/var/log/frpc.log"
-log.level = "info"
-log.maxDays = 7
-
-[[proxies]]
-name = "${TENANT_NAME}-web"
-type = "http"
-localPort = 8080
-customDomains = ["${TENANT_NAME}.${TUNNEL_DOMAIN}"]
-
-[[proxies]]
-name = "${TENANT_NAME}-ssh"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 22
-remotePort = ${SSH_PORT}
-EOF
-    sudo mkdir -p /etc/frp
-    sudo mv "$FRPC_CONF_TMP" /etc/frp/frpc.toml
-    sudo chmod 644 /etc/frp/frpc.toml
+    write_frpc_config
     ok "frpc config updated"
 
     # Restart frpc service
-    case "$OS" in
-        Darwin)
-            FRPC_PLIST="/Library/LaunchDaemons/io.octos.frpc.plist"
-            if [ -f "$FRPC_PLIST" ]; then
-                sudo launchctl unload "$FRPC_PLIST" 2>/dev/null || true
-                sudo launchctl load "$FRPC_PLIST"
-            else
-                # Create the plist if it doesn't exist
-                FRPC_PLIST_TMP=$(mktemp /tmp/io.octos.frpc.plist.XXXXXX)
-                cat > "$FRPC_PLIST_TMP" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.octos.frpc</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/frpc</string>
-        <string>-c</string>
-        <string>/etc/frp/frpc.toml</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/frpc.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/frpc.log</string>
-</dict>
-</plist>
-EOF
-                sudo mv "$FRPC_PLIST_TMP" "$FRPC_PLIST"
-                sudo chown root:wheel "$FRPC_PLIST"
-                sudo chmod 644 "$FRPC_PLIST"
-                sudo launchctl load "$FRPC_PLIST"
-            fi
-            ok "frpc restarted via launchd"
-            ;;
-        Linux)
-            FRPC_UNIT="/etc/systemd/system/frpc.service"
-            if [ ! -f "$FRPC_UNIT" ]; then
-                # Create the unit file if it doesn't exist
-                FRPC_UNIT_TMP=$(mktemp /tmp/frpc.service.XXXXXX)
-                cat > "$FRPC_UNIT_TMP" << EOF
-[Unit]
-Description=frpc tunnel client for octos
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                sudo mv "$FRPC_UNIT_TMP" "$FRPC_UNIT"
-                sudo systemctl daemon-reload
-                sudo systemctl enable frpc
-            fi
-            sudo systemctl restart frpc
-            ok "frpc restarted via systemd"
-            ;;
-    esac
+    echo "    (sudo is needed to install the frpc system service)"
+    write_frpc_service
+    ok "frpc restarted"
 
     # Verify
     sleep 2
@@ -722,8 +995,8 @@ else
             echo "    Follow the dialog to complete installation, then re-run this script."
             exit 1
             ;;
-        Linux)
-            err "git not found. Install with: sudo apt-get install -y git (or your package manager)"
+        *)
+            err "git not found. Install with: $(pkg_hint git)"
             ;;
     esac
 fi
@@ -735,10 +1008,7 @@ else
     warn "Node.js not found"
     echo "    Enables: WhatsApp bridge, custom skills with package.json, pptxgenjs"
     echo "    Install:"
-    case "$OS" in
-        Darwin) echo "      brew install node" ;;
-        Linux)  echo "      curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
-    esac
+    echo "      $(pkg_hint node)"
 fi
 
 # Chromium / Chrome
@@ -763,10 +1033,7 @@ if [ "$CHROME_FOUND" = false ]; then
     warn "Chromium/Chrome not found"
     echo "    Enables: browser tool (web browsing, screenshots), deep-crawl skill"
     echo "    Install:"
-    case "$OS" in
-        Darwin) echo "      brew install --cask google-chrome" ;;
-        Linux)  echo "      sudo apt-get install -y chromium-browser" ;;
-    esac
+    echo "      $(pkg_hint chromium)"
 fi
 
 # ffmpeg
@@ -776,10 +1043,7 @@ else
     warn "ffmpeg not found"
     echo "    Enables: voice/audio skills, media transcoding"
     echo "    Install:"
-    case "$OS" in
-        Darwin) echo "      brew install ffmpeg" ;;
-        Linux)  echo "      sudo apt-get install -y ffmpeg" ;;
-    esac
+    echo "      $(pkg_hint ffmpeg)"
 fi
 
 # ── Resolve download source ──────────────────────────────────────────
@@ -863,21 +1127,46 @@ fi
 # ── Initialize octos workspace ────────────────────────────────────────
 section "Initializing octos"
 
-# Temporarily add PREFIX to PATH so octos init can run
+# Temporarily add PREFIX to PATH for subsequent commands
 export PATH="$PREFIX:$PATH"
+export OCTOS_HOME="$DATA_DIR"
 
 if [ ! -d "$DATA_DIR" ]; then
-    "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
-    ok "workspace initialized via octos init"
+    # octos init always writes to $cwd/.octos/, which won't match a custom
+    # DATA_DIR.  When DATA_DIR is the default ~/.octos we can let init create
+    # it; otherwise we set up the directory structure directly.
+    if [ "$DATA_DIR" = "$HOME/.octos" ]; then
+        "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
+        ok "workspace initialized via octos init"
+    else
+        mkdir -p "$DATA_DIR"
+        ok "created custom data directory: $DATA_DIR"
+    fi
 else
     ok "$DATA_DIR already exists (skipping init)"
 fi
 
-# Ensure required subdirectories exist (in case init didn't create them all)
+# Ensure required subdirectories, config, and bootstrap files exist.
+# These match what `octos init --defaults` creates (see init.rs).
 mkdir -p "$DATA_DIR"/{profiles,memory,sessions,skills,logs,research,history}
 if [ ! -f "$DATA_DIR/config.json" ]; then
-    echo '{}' > "$DATA_DIR/config.json"
+    cat > "$DATA_DIR/config.json" << 'INITEOF'
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "api_key_env": "ANTHROPIC_API_KEY"
+}
+INITEOF
 fi
+[ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'INITEOF'
+# Ignore task state and database files
+tasks/
+sessions/
+*.redb
+INITEOF
+[ ! -f "$DATA_DIR/AGENTS.md" ] && printf '# Agent Instructions\n\nCustomize agent behavior and guidelines here.\n' > "$DATA_DIR/AGENTS.md"
+[ ! -f "$DATA_DIR/SOUL.md" ]   && printf '# Personality\n\nDefine the agent'\''s personality and values.\n' > "$DATA_DIR/SOUL.md"
+[ ! -f "$DATA_DIR/USER.md" ]   && printf '# User Info\n\nAdd your information and preferences here.\n' > "$DATA_DIR/USER.md"
 ok "data directory: $DATA_DIR"
 
 # ── Generate auth token ──────────────────────────────────────────────
@@ -889,110 +1178,7 @@ fi
 section "Setting up octos serve"
 
 OCTOS_BIN="$PREFIX/octos"
-PLIST_LABEL="io.octos.serve"
-
-case "$OS" in
-    Darwin)
-        # Clean up legacy LaunchAgents (old names that conflict with port 8080)
-        for LEGACY in \
-            "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
-            "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
-            "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist" \
-            "$HOME/Library/LaunchAgents/io.ominix.ominix-api.plist" \
-            "$HOME/Library/LaunchAgents/io.ominix.octos-serve.plist"; do
-            if [ -f "$LEGACY" ]; then
-                launchctl unload "$LEGACY" 2>/dev/null || true
-                rm -f "$LEGACY"
-            fi
-        done
-
-        PLIST_FILE="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
-        PLIST_TMP=$(mktemp /tmp/io.octos.serve.plist.XXXXXX)
-        cat > "$PLIST_TMP" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$OCTOS_BIN</string>
-        <string>serve</string>
-        <string>--port</string>
-        <string>8080</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--auth-token</string>
-        <string>$AUTH_TOKEN</string>
-    </array>
-    <key>UserName</key>
-    <string>$(whoami)</string>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$DATA_DIR/serve.log</string>
-    <key>StandardErrorPath</key>
-    <string>$DATA_DIR/serve.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$PREFIX:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>$HOME</string>
-        <key>OCTOS_DATA_DIR</key>
-        <string>$DATA_DIR</string>
-        <key>OCTOS_AUTH_TOKEN</key>
-        <string>$AUTH_TOKEN</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$HOME</string>
-</dict>
-</plist>
-EOF
-        echo "    (sudo is needed to install and start the system service)"
-        sudo launchctl unload "$PLIST_FILE" 2>/dev/null || true
-        sudo mv "$PLIST_TMP" "$PLIST_FILE"
-        sudo chown root:wheel "$PLIST_FILE"
-        sudo chmod 644 "$PLIST_FILE"
-        sudo launchctl load "$PLIST_FILE"
-        ok "octos serve started via launchd"
-        ;;
-
-    Linux)
-        UNIT_FILE="/etc/systemd/system/octos-serve.service"
-        UNIT_TMP=$(mktemp /tmp/octos-serve.service.XXXXXX)
-        cat > "$UNIT_TMP" << EOF
-[Unit]
-Description=octos serve (dashboard + gateway)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$(whoami)
-ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN
-Restart=on-failure
-RestartSec=5
-Environment=HOME=$HOME
-Environment=OCTOS_DATA_DIR=$DATA_DIR
-Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
-Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=$HOME
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        echo "    (sudo is needed to install and start the system service)"
-        sudo mv "$UNIT_TMP" "$UNIT_FILE"
-        sudo systemctl daemon-reload
-        sudo systemctl enable octos-serve
-        sudo systemctl restart octos-serve
-        ok "octos serve started via systemd"
-        ;;
-esac
+write_octos_service
 
 # ── Verify octos serve ────────────────────────────────────────────────
 section "Verifying octos serve"
@@ -1060,6 +1246,8 @@ if [ "$SKIP_TUNNEL" = false ]; then
         fi
     fi
 
+    validate_inputs
+
     # ── Confirm before proceeding ─────────────────────────────────────
     echo ""
     echo "    Tunnel configuration:"
@@ -1078,10 +1266,7 @@ if [ "$SKIP_TUNNEL" = false ]; then
         echo "    frpc will be installed with placeholders. Update the config later:"
         echo "      sudo nano /etc/frp/frpc.toml"
         echo "    Then restart frpc:"
-        case "$OS" in
-            Darwin) echo "      sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist && sudo launchctl load /Library/LaunchDaemons/io.octos.frpc.plist" ;;
-            Linux)  echo "      sudo systemctl restart frpc" ;;
-        esac
+        echo "      $(svc_hint restart frpc)"
         echo ""
         echo "    Or re-run: bash install.sh --tenant-name <name> --frps-token <token>"
     fi
@@ -1091,128 +1276,16 @@ if [ "$SKIP_TUNNEL" = false ]; then
     read -r < /dev/tty
 
     # ── Install frpc ──────────────────────────────────────────────────
-    if [ ! -f /usr/local/bin/frpc ]; then
-        echo "    Installing frpc v${FRPC_VERSION}..."
-
-        case "$FRP_ARCH" in
-            amd64|arm64) ;; # ok
-            *) err "Unsupported frpc architecture: $FRP_ARCH" ;;
-        esac
-
-        FRP_OS=$(echo "$OS" | tr '[:upper:]' '[:lower:]')
-        FRP_TARBALL="frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}.tar.gz"
-        FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/${FRP_TARBALL}"
-        FRP_TMP=$(mktemp -d /tmp/frpc-install.XXXXXX)
-
-        curl -fsSL -o "${FRP_TMP}/${FRP_TARBALL}" "$FRP_URL"
-        tar -xzf "${FRP_TMP}/${FRP_TARBALL}" -C "$FRP_TMP"
-
-        echo "    (sudo is needed to install frpc to /usr/local/bin)"
-        sudo mkdir -p /usr/local/bin
-        sudo cp "${FRP_TMP}/frp_${FRPC_VERSION}_${FRP_OS}_${FRP_ARCH}/frpc" /usr/local/bin/frpc
-        sudo chmod 0755 /usr/local/bin/frpc
-        rm -rf "$FRP_TMP"
-        ok "frpc installed"
-    else
-        ok "frpc already installed ($(/usr/local/bin/frpc --version 2>/dev/null || echo 'unknown'))"
-    fi
+    install_frpc_binary
 
     # ── Write frpc config ─────────────────────────────────────────────
-    FRPC_CONF_TMP=$(mktemp /tmp/frpc.toml.XXXXXX)
-    cat > "$FRPC_CONF_TMP" << EOF
-serverAddr = "${FRPS_SERVER}"
-serverPort = 7000
-auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
-log.to = "/var/log/frpc.log"
-log.level = "info"
-log.maxDays = 7
-
-[[proxies]]
-name = "${TENANT_NAME}-web"
-type = "http"
-localPort = 8080
-customDomains = ["${TENANT_NAME}.${TUNNEL_DOMAIN}"]
-
-[[proxies]]
-name = "${TENANT_NAME}-ssh"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 22
-remotePort = ${SSH_PORT}
-EOF
-    echo "    (sudo is needed to write config to /etc/frp)"
-    sudo mkdir -p /etc/frp
-    sudo mv "$FRPC_CONF_TMP" /etc/frp/frpc.toml
-    sudo chmod 644 /etc/frp/frpc.toml
+    write_frpc_config
     ok "frpc config written to /etc/frp/frpc.toml"
 
     # ── Create frpc system service ────────────────────────────────────
     echo "    (sudo is needed to install the frpc system service)"
-    case "$OS" in
-        Darwin)
-            FRPC_PLIST="/Library/LaunchDaemons/io.octos.frpc.plist"
-            FRPC_PLIST_TMP=$(mktemp /tmp/io.octos.frpc.plist.XXXXXX)
-            cat > "$FRPC_PLIST_TMP" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.octos.frpc</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/frpc</string>
-        <string>-c</string>
-        <string>/etc/frp/frpc.toml</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/frpc.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/frpc.log</string>
-</dict>
-</plist>
-EOF
-            # Clean up legacy LaunchAgent
-            launchctl unload "$HOME/Library/LaunchAgents/io.octos.frpc.plist" 2>/dev/null || true
-            rm -f "$HOME/Library/LaunchAgents/io.octos.frpc.plist"
-
-            sudo launchctl unload "$FRPC_PLIST" 2>/dev/null || true
-            sudo mv "$FRPC_PLIST_TMP" "$FRPC_PLIST"
-            sudo chown root:wheel "$FRPC_PLIST"
-            sudo chmod 644 "$FRPC_PLIST"
-            sudo launchctl load "$FRPC_PLIST"
-            ok "frpc started via launchd"
-            ;;
-
-        Linux)
-            FRPC_UNIT="/etc/systemd/system/frpc.service"
-            FRPC_UNIT_TMP=$(mktemp /tmp/frpc.service.XXXXXX)
-            cat > "$FRPC_UNIT_TMP" << EOF
-[Unit]
-Description=frpc tunnel client for octos
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            sudo mv "$FRPC_UNIT_TMP" "$FRPC_UNIT"
-            sudo systemctl daemon-reload
-            sudo systemctl enable frpc
-            sudo systemctl restart frpc
-            ok "frpc started via systemd"
-            ;;
-    esac
+    write_frpc_service
+    ok "frpc service installed"
 
     # ── Verify tunnel ─────────────────────────────────────────────────
     section "Verifying tunnel"
@@ -1252,15 +1325,9 @@ if [ -n "$TENANT_NAME" ]; then
 fi
 echo ""
 echo "  Manage services:"
-if [ "$OS" = "Darwin" ]; then
-    echo "    Status:  sudo launchctl print system/io.octos.serve"
-    echo "    Stop:    sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist"
-    echo "    Start:   sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist"
-else
-    echo "    Status:  sudo systemctl status octos-serve"
-    echo "    Stop:    sudo systemctl stop octos-serve"
-    echo "    Start:   sudo systemctl start octos-serve"
-fi
+echo "    Status:  $(svc_hint status serve)"
+echo "    Stop:    $(svc_hint stop serve)"
+echo "    Start:   $(svc_hint start serve)"
 echo ""
 echo "  Troubleshoot: curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --doctor"
 echo ""
