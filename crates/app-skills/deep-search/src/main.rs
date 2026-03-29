@@ -582,7 +582,7 @@ async fn web_search(
 
     // Default: race top 2 available engines in parallel.
     // Gives redundancy + speed without the resource explosion of fire-all.
-    // Priority: tavily > perplexity > brave > duckduckgo
+    // Priority: tavily > perplexity > brave > google_cdp > duckduckgo
     let mut available: Vec<&str> = Vec::new();
     if std::env::var("TAVILY_API_KEY")
         .ok()
@@ -602,6 +602,7 @@ async fn web_search(
     {
         available.push("brave");
     }
+    available.push("google_cdp"); // free, uses headless Chrome
     available.push("duckduckgo"); // always available (free)
 
     // Race top 2
@@ -686,6 +687,12 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
         }));
     }
     {
+        let q = query.to_string();
+        handles.push(tokio::spawn(async move {
+            ("google_cdp", google_cdp_search(&q, count).await)
+        }));
+    }
+    {
         let c = client.clone();
         let q = query.to_string();
         handles.push(tokio::spawn(async move {
@@ -753,6 +760,7 @@ async fn try_engine(
             you_search(client, query, count, &key).await
         }
         "duckduckgo" => ddg_search(client, query, count).await,
+        "google_cdp" => google_cdp_search(query, count).await,
         _ => return None,
     };
     if r.success && !r.output.contains("No results found") {
@@ -1008,6 +1016,170 @@ async fn brave_search(
             r.description
         ));
     }
+    SearchResult {
+        output,
+        success: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Google CDP Search (headless Chrome via deep-crawl binary)
+// ---------------------------------------------------------------------------
+
+/// Search Google via headless Chrome. Calls the `deep_crawl` sibling binary
+/// to render the SERP, then extracts result links from the text output.
+/// No API key needed — just Chromium installed.
+async fn google_cdp_search(query: &str, count: u8) -> SearchResult {
+    // Find deep_crawl binary (sibling to our executable)
+    let crawl_bin = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        Some(dir) => {
+            let candidate = dir.join("deep_crawl");
+            if candidate.exists() {
+                candidate
+            } else {
+                let alt = dir.join("deep-crawl");
+                if alt.exists() {
+                    alt
+                } else {
+                    return SearchResult {
+                        output: "google_cdp: deep_crawl binary not found".into(),
+                        success: false,
+                    };
+                }
+            }
+        }
+        None => {
+            return SearchResult {
+                output: "google_cdp: cannot determine executable path".into(),
+                success: false,
+            };
+        }
+    };
+
+    let google_url = format!(
+        "https://www.google.com/search?q={}&num={}&hl=en",
+        urlencoded(query),
+        count.min(10)
+    );
+
+    let input = serde_json::json!({
+        "url": google_url,
+        "max_depth": 0,
+        "timeout_secs": 20
+    });
+
+    let result = tokio::process::Command::new(&crawl_bin)
+        .arg("deep_crawl")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let mut child = match result {
+        Ok(c) => c,
+        Err(e) => {
+            return SearchResult {
+                output: format!("google_cdp: failed to spawn deep_crawl: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    // Write input JSON to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(input.to_string().as_bytes()).await;
+    }
+
+    // Wait with timeout
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return SearchResult {
+                output: format!("google_cdp: deep_crawl failed: {e}"),
+                success: false,
+            };
+        }
+        Err(_) => {
+            return SearchResult {
+                output: "google_cdp: timeout after 30s".into(),
+                success: false,
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse deep_crawl JSON output
+    let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            return SearchResult {
+                output: format!("google_cdp: failed to parse output ({} bytes)", stdout.len()),
+                success: false,
+            };
+        }
+    };
+
+    let text = parsed
+        .get("output")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if text.is_empty() {
+        return SearchResult {
+            output: format!("google_cdp: empty response for: {query}"),
+            success: false,
+        };
+    }
+
+    // Extract URLs from the crawled text (Google SERP contains result URLs)
+    let mut results = Vec::new();
+    let mut current_title = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Lines with URLs
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            if !trimmed.contains("google.com")
+                && !trimmed.contains("gstatic.com")
+                && !trimmed.contains("googleapis.com")
+            {
+                let title = if current_title.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    std::mem::take(&mut current_title)
+                };
+                results.push(format!("- {}\n  {}", title, trimmed));
+            }
+        } else if trimmed.len() > 10 && !trimmed.contains("Google") {
+            current_title = trimmed.to_string();
+        }
+    }
+
+    if results.is_empty() {
+        // Fall back to returning the raw text which may have useful content
+        return SearchResult {
+            output: format!("Google results for: {query}\n\n{}", &text[..text.len().min(3000)]),
+            success: !text.is_empty(),
+        };
+    }
+
+    let output = format!(
+        "Google results for: {query}\n\n{}",
+        results.iter().take(count as usize).cloned().collect::<Vec<_>>().join("\n\n")
+    );
+
     SearchResult {
         output,
         success: true,
