@@ -9,10 +9,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use octos_llm::{ChatConfig, ToolSpec, LlmProvider};
-use octos_llm::openai::OpenAIProvider;
 use octos_llm::anthropic::AnthropicProvider;
 use octos_llm::gemini::GeminiProvider;
+use octos_llm::openai::OpenAIProvider;
+use octos_llm::{ChatConfig, LlmProvider, ToolSpec};
 use serde::Serialize;
 
 // ── Synthetic tool definitions ──────────────────────────────────
@@ -28,264 +28,384 @@ fn make_tool(name: &str, desc: &str, params: serde_json::Value) -> ToolSpec {
 /// Generate N synthetic tools with realistic schemas.
 fn generate_tools(count: usize) -> Vec<ToolSpec> {
     let templates = vec![
-        ("get_weather", "Get current weather for a city", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City name"},
-                "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-            },
-            "required": ["city"]
-        })),
-        ("web_search", "Search the web for information", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results"}
-            },
-            "required": ["query"]
-        })),
-        ("read_file", "Read contents of a file", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path"},
-                "offset": {"type": "integer"},
-                "limit": {"type": "integer"}
-            },
-            "required": ["path"]
-        })),
-        ("write_file", "Write content to a file", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path"},
-                "content": {"type": "string", "description": "Content to write"}
-            },
-            "required": ["path", "content"]
-        })),
-        ("send_email", "Send an email", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "to": {"type": "string"},
-                "subject": {"type": "string"},
-                "body": {"type": "string"}
-            },
-            "required": ["to", "subject", "body"]
-        })),
-        ("get_time", "Get current time in a timezone", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "timezone": {"type": "string", "description": "IANA timezone"}
-            },
-            "required": ["timezone"]
-        })),
-        ("list_dir", "List directory contents", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"}
-            },
-            "required": ["path"]
-        })),
-        ("run_shell", "Execute a shell command", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "timeout_secs": {"type": "integer"}
-            },
-            "required": ["command"]
-        })),
-        ("translate", "Translate text between languages", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "from": {"type": "string"},
-                "to": {"type": "string"}
-            },
-            "required": ["text", "to"]
-        })),
-        ("calculate", "Evaluate a math expression", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string"}
-            },
-            "required": ["expression"]
-        })),
-        ("create_image", "Generate an image from a text prompt", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "size": {"type": "string", "enum": ["256x256", "512x512", "1024x1024"]}
-            },
-            "required": ["prompt"]
-        })),
-        ("database_query", "Run a SQL query", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "database": {"type": "string"}
-            },
-            "required": ["query"]
-        })),
-        ("http_request", "Make an HTTP request", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
-                "body": {"type": "string"},
-                "headers": {"type": "object"}
-            },
-            "required": ["url"]
-        })),
-        ("compress_file", "Compress a file or directory", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "input_path": {"type": "string"},
-                "output_path": {"type": "string"},
-                "format": {"type": "string", "enum": ["zip", "tar.gz", "7z"]}
-            },
-            "required": ["input_path"]
-        })),
-        ("schedule_task", "Schedule a task for later execution", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string"},
-                "cron": {"type": "string", "description": "Cron expression"},
-                "enabled": {"type": "boolean"}
-            },
-            "required": ["task", "cron"]
-        })),
-        ("git_commit", "Create a git commit", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["message"]
-        })),
-        ("resize_image", "Resize an image", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "input_path": {"type": "string"},
-                "width": {"type": "integer"},
-                "height": {"type": "integer"},
-                "output_path": {"type": "string"}
-            },
-            "required": ["input_path", "width", "height"]
-        })),
-        ("text_to_speech", "Convert text to audio", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "voice": {"type": "string"},
-                "language": {"type": "string"}
-            },
-            "required": ["text"]
-        })),
-        ("pdf_extract", "Extract text from a PDF file", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "pages": {"type": "string", "description": "Page range, e.g. '1-5'"}
-            },
-            "required": ["path"]
-        })),
-        ("memory_store", "Store a key-value pair in memory", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "key": {"type": "string"},
-                "value": {"type": "string"},
-                "ttl_secs": {"type": "integer"}
-            },
-            "required": ["key", "value"]
-        })),
-        ("video_transcribe", "Transcribe audio from a video file", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "language": {"type": "string"}
-            },
-            "required": ["path"]
-        })),
-        ("deploy_service", "Deploy a service to the cloud", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "image": {"type": "string"},
-                "port": {"type": "integer"},
-                "env": {"type": "object"}
-            },
-            "required": ["name", "image"]
-        })),
-        ("monitor_url", "Set up monitoring for a URL", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "interval_secs": {"type": "integer"},
-                "alert_email": {"type": "string"}
-            },
-            "required": ["url"]
-        })),
-        ("encrypt_file", "Encrypt a file with a password", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "input_path": {"type": "string"},
-                "output_path": {"type": "string"},
-                "algorithm": {"type": "string", "enum": ["aes256", "chacha20"]}
-            },
-            "required": ["input_path"]
-        })),
-        ("analyze_csv", "Analyze a CSV file and return statistics", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "columns": {"type": "array", "items": {"type": "string"}},
-                "operations": {"type": "array", "items": {"type": "string", "enum": ["mean", "median", "sum", "count"]}}
-            },
-            "required": ["path"]
-        })),
-        ("browser_navigate", "Navigate a headless browser to a URL", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "wait_for": {"type": "string", "description": "CSS selector to wait for"},
-                "screenshot": {"type": "boolean"}
-            },
-            "required": ["url"]
-        })),
-        ("deep_search", "Deep multi-engine web search with synthesis", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "search_engine": {"type": "string", "enum": ["perplexity", "tavily", "brave", "duckduckgo", "all"]},
-                "num_angles": {"type": "integer"}
-            },
-            "required": ["query"]
-        })),
-        ("run_pipeline", "Execute a multi-step pipeline defined as DOT graph", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pipeline": {"type": "string", "description": "Inline DOT digraph"},
-                "input": {"type": "string"},
-                "timeout_secs": {"type": "integer"}
-            },
-            "required": ["pipeline", "input"]
-        })),
-        ("voice_clone", "Clone a voice from an audio sample", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "audio_path": {"type": "string"},
-                "voice_name": {"type": "string"},
-                "language": {"type": "string"}
-            },
-            "required": ["audio_path", "voice_name"]
-        })),
-        ("manage_account", "Manage user accounts", serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["create", "delete", "list", "update", "start", "stop"]},
-                "name": {"type": "string"},
-                "config": {"type": "object"}
-            },
-            "required": ["action"]
-        })),
+        (
+            "get_weather",
+            "Get current weather for a city",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"},
+                    "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["city"]
+            }),
+        ),
+        (
+            "web_search",
+            "Search the web for information",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "num_results": {"type": "integer", "description": "Number of results"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "read_file",
+            "Read contents of a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["path"]
+            }),
+        ),
+        (
+            "write_file",
+            "Write content to a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "content": {"type": "string", "description": "Content to write"}
+                },
+                "required": ["path", "content"]
+            }),
+        ),
+        (
+            "send_email",
+            "Send an email",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["to", "subject", "body"]
+            }),
+        ),
+        (
+            "get_time",
+            "Get current time in a timezone",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timezone": {"type": "string", "description": "IANA timezone"}
+                },
+                "required": ["timezone"]
+            }),
+        ),
+        (
+            "list_dir",
+            "List directory contents",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        ),
+        (
+            "run_shell",
+            "Execute a shell command",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_secs": {"type": "integer"}
+                },
+                "required": ["command"]
+            }),
+        ),
+        (
+            "translate",
+            "Translate text between languages",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "from": {"type": "string"},
+                    "to": {"type": "string"}
+                },
+                "required": ["text", "to"]
+            }),
+        ),
+        (
+            "calculate",
+            "Evaluate a math expression",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"}
+                },
+                "required": ["expression"]
+            }),
+        ),
+        (
+            "create_image",
+            "Generate an image from a text prompt",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "size": {"type": "string", "enum": ["256x256", "512x512", "1024x1024"]}
+                },
+                "required": ["prompt"]
+            }),
+        ),
+        (
+            "database_query",
+            "Run a SQL query",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "http_request",
+            "Make an HTTP request",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+                    "body": {"type": "string"},
+                    "headers": {"type": "object"}
+                },
+                "required": ["url"]
+            }),
+        ),
+        (
+            "compress_file",
+            "Compress a file or directory",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "format": {"type": "string", "enum": ["zip", "tar.gz", "7z"]}
+                },
+                "required": ["input_path"]
+            }),
+        ),
+        (
+            "schedule_task",
+            "Schedule a task for later execution",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "cron": {"type": "string", "description": "Cron expression"},
+                    "enabled": {"type": "boolean"}
+                },
+                "required": ["task", "cron"]
+            }),
+        ),
+        (
+            "git_commit",
+            "Create a git commit",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["message"]
+            }),
+        ),
+        (
+            "resize_image",
+            "Resize an image",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string"},
+                    "width": {"type": "integer"},
+                    "height": {"type": "integer"},
+                    "output_path": {"type": "string"}
+                },
+                "required": ["input_path", "width", "height"]
+            }),
+        ),
+        (
+            "text_to_speech",
+            "Convert text to audio",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "voice": {"type": "string"},
+                    "language": {"type": "string"}
+                },
+                "required": ["text"]
+            }),
+        ),
+        (
+            "pdf_extract",
+            "Extract text from a PDF file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "pages": {"type": "string", "description": "Page range, e.g. '1-5'"}
+                },
+                "required": ["path"]
+            }),
+        ),
+        (
+            "memory_store",
+            "Store a key-value pair in memory",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                    "ttl_secs": {"type": "integer"}
+                },
+                "required": ["key", "value"]
+            }),
+        ),
+        (
+            "video_transcribe",
+            "Transcribe audio from a video file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "language": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        ),
+        (
+            "deploy_service",
+            "Deploy a service to the cloud",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "image": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "env": {"type": "object"}
+                },
+                "required": ["name", "image"]
+            }),
+        ),
+        (
+            "monitor_url",
+            "Set up monitoring for a URL",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "interval_secs": {"type": "integer"},
+                    "alert_email": {"type": "string"}
+                },
+                "required": ["url"]
+            }),
+        ),
+        (
+            "encrypt_file",
+            "Encrypt a file with a password",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "algorithm": {"type": "string", "enum": ["aes256", "chacha20"]}
+                },
+                "required": ["input_path"]
+            }),
+        ),
+        (
+            "analyze_csv",
+            "Analyze a CSV file and return statistics",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                    "operations": {"type": "array", "items": {"type": "string", "enum": ["mean", "median", "sum", "count"]}}
+                },
+                "required": ["path"]
+            }),
+        ),
+        (
+            "browser_navigate",
+            "Navigate a headless browser to a URL",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "wait_for": {"type": "string", "description": "CSS selector to wait for"},
+                    "screenshot": {"type": "boolean"}
+                },
+                "required": ["url"]
+            }),
+        ),
+        (
+            "deep_search",
+            "Deep multi-engine web search with synthesis",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "search_engine": {"type": "string", "enum": ["perplexity", "tavily", "brave", "duckduckgo", "all"]},
+                    "num_angles": {"type": "integer"}
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "run_pipeline",
+            "Execute a multi-step pipeline defined as DOT graph",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pipeline": {"type": "string", "description": "Inline DOT digraph"},
+                    "input": {"type": "string"},
+                    "timeout_secs": {"type": "integer"}
+                },
+                "required": ["pipeline", "input"]
+            }),
+        ),
+        (
+            "voice_clone",
+            "Clone a voice from an audio sample",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "audio_path": {"type": "string"},
+                    "voice_name": {"type": "string"},
+                    "language": {"type": "string"}
+                },
+                "required": ["audio_path", "voice_name"]
+            }),
+        ),
+        (
+            "manage_account",
+            "Manage user accounts",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "delete", "list", "update", "start", "stop"]},
+                    "name": {"type": "string"},
+                    "config": {"type": "object"}
+                },
+                "required": ["action"]
+            }),
+        ),
     ];
 
     templates
@@ -326,8 +446,8 @@ fn create_providers() -> Vec<ProviderInfo> {
 
     // DeepSeek
     if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-        let p = OpenAIProvider::new(&key, "deepseek-chat")
-            .with_base_url("https://api.deepseek.com/v1");
+        let p =
+            OpenAIProvider::new(&key, "deepseek-chat").with_base_url("https://api.deepseek.com/v1");
         providers.push(ProviderInfo {
             name: "deepseek/deepseek-chat".into(),
             provider: Box::new(p),
@@ -336,8 +456,7 @@ fn create_providers() -> Vec<ProviderInfo> {
 
     // Moonshot / kimi-k2.5
     if let Ok(key) = std::env::var("KIMI_API_KEY") {
-        let p = OpenAIProvider::new(&key, "kimi-k2.5")
-            .with_base_url("https://api.moonshot.ai/v1");
+        let p = OpenAIProvider::new(&key, "kimi-k2.5").with_base_url("https://api.moonshot.ai/v1");
         providers.push(ProviderInfo {
             name: "moonshot/kimi-k2.5".into(),
             provider: Box::new(p),
@@ -346,8 +465,8 @@ fn create_providers() -> Vec<ProviderInfo> {
 
     // MiniMax (direct)
     if let Ok(key) = std::env::var("MINIMAX_API_KEY") {
-        let p = OpenAIProvider::new(&key, "MiniMax-M2.7")
-            .with_base_url("https://api.minimax.io/v1");
+        let p =
+            OpenAIProvider::new(&key, "MiniMax-M2.7").with_base_url("https://api.minimax.io/v1");
         providers.push(ProviderInfo {
             name: "minimax/MiniMax-M2.7".into(),
             provider: Box::new(p),
@@ -356,8 +475,8 @@ fn create_providers() -> Vec<ProviderInfo> {
 
     // Z.AI / GLM-5 (Anthropic-compatible API)
     if let Ok(key) = std::env::var("ZAI_API_KEY") {
-        let p = AnthropicProvider::new(&key, "glm-5")
-            .with_base_url("https://api.z.ai/api/anthropic");
+        let p =
+            AnthropicProvider::new(&key, "glm-5").with_base_url("https://api.z.ai/api/anthropic");
         providers.push(ProviderInfo {
             name: "zai/glm-5".into(),
             provider: Box::new(p),
@@ -483,7 +602,11 @@ async fn test_stability_at_tool_count(
                 let elapsed = start.elapsed().as_millis() as u64;
                 latencies.push(elapsed);
 
-                let has_content = resp.content.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+                let has_content = resp
+                    .content
+                    .as_ref()
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false);
                 let has_tools = !resp.tool_calls.is_empty();
 
                 if has_content || has_tools {
@@ -534,7 +657,10 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
         ("What's the weather in Paris?", "get_weather"),
         ("Search the web for latest AI news", "web_search"),
         ("Read the file /tmp/readme.md", "read_file"),
-        ("Send an email to bob@example.com about the meeting", "send_email"),
+        (
+            "Send an email to bob@example.com about the meeting",
+            "send_email",
+        ),
         ("What time is it in Tokyo?", "get_time"),
         ("List all files in /home/user/docs", "list_dir"),
         ("Translate 'hello world' to Chinese", "translate"),
@@ -594,9 +720,21 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
 
     // Argument accuracy: check key fields are populated
     let arg_tests = vec![
-        ("Get weather in London in celsius", "get_weather", vec!["city"]),
-        ("Search for 'rust programming' and get 5 results", "web_search", vec!["query"]),
-        ("Read file /etc/hosts from line 10 limit 20", "read_file", vec!["path"]),
+        (
+            "Get weather in London in celsius",
+            "get_weather",
+            vec!["city"],
+        ),
+        (
+            "Search for 'rust programming' and get 5 results",
+            "web_search",
+            vec!["query"],
+        ),
+        (
+            "Read file /etc/hosts from line 10 limit 20",
+            "read_file",
+            vec!["path"],
+        ),
     ];
 
     let mut correct_args = 0;
@@ -617,9 +755,7 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
                 {
                     let args = &tc.arguments;
                     // arguments is already serde_json::Value
-                    let all_present = required_fields
-                        .iter()
-                        .all(|f| args.get(f).is_some());
+                    let all_present = required_fields.iter().all(|f| args.get(f).is_some());
                     if all_present {
                         correct_args += 1;
                     }
@@ -744,7 +880,11 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
         }];
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
             if !resp.tool_calls.is_empty()
-                || resp.content.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
+                || resp
+                    .content
+                    .as_ref()
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false)
             {
                 rapid_successes += 1;
             }
@@ -772,7 +912,14 @@ async fn run_benchmark(stability_only: bool) {
     println!("\n{}", "=".repeat(70));
     println!("  TOOL USE CAPABILITY BENCHMARK");
     println!("  Providers: {}", providers.len());
-    println!("  Mode: {}", if stability_only { "Quick Rank (stability)" } else { "Full Suite" });
+    println!(
+        "  Mode: {}",
+        if stability_only {
+            "Quick Rank (stability)"
+        } else {
+            "Full Suite"
+        }
+    );
     println!("{}\n", "=".repeat(70));
 
     let tool_counts = vec![5, 10, 15, 20, 25, 30];
@@ -789,12 +936,8 @@ async fn run_benchmark(stability_only: bool) {
 
         for &count in &tool_counts {
             print!("  tools={count:>2}: ");
-            let result = test_stability_at_tool_count(
-                pi.provider.as_ref(),
-                count,
-                attempts_per_level,
-            )
-            .await;
+            let result =
+                test_stability_at_tool_count(pi.provider.as_ref(), count, attempts_per_level).await;
 
             let bar = "█".repeat((result.response_rate * 10.0) as usize);
             let empty_bar = "░".repeat(10 - (result.response_rate * 10.0) as usize);

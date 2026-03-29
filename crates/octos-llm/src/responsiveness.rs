@@ -26,6 +26,8 @@ pub struct ResponsivenessObserver {
     slow_trigger: u32,
     /// Whether auto-protection is currently active.
     active: bool,
+    /// Counter for baseline adaptation (adapts every window_size samples).
+    adapt_counter: usize,
 }
 
 impl ResponsivenessObserver {
@@ -39,6 +41,7 @@ impl ResponsivenessObserver {
             consecutive_slow: 0,
             slow_trigger: 3,
             active: false,
+            adapt_counter: 0,
         }
     }
 
@@ -49,10 +52,24 @@ impl ResponsivenessObserver {
             self.window.pop_front();
         }
 
-        // Learn baseline from first N samples
+        // Learn baseline from first N samples using median (robust to outliers)
         if self.baseline.is_none() && self.window.len() >= self.baseline_samples {
-            let sum: Duration = self.window.iter().sum();
-            self.baseline = Some(sum / self.window.len() as u32);
+            self.baseline = Some(Self::median(&self.window));
+        }
+
+        // Adapt baseline slowly over time (every 20 samples, blend with current median)
+        if self.baseline.is_some() && self.window.len() == self.window_size {
+            self.adapt_counter += 1;
+            if self.adapt_counter >= self.window_size {
+                self.adapt_counter = 0;
+                let current_median = Self::median(&self.window);
+                let old = self.baseline.unwrap();
+                // EMA: 80% old baseline + 20% current median
+                let new_baseline = Duration::from_nanos(
+                    (old.as_nanos() as f64 * 0.8 + current_median.as_nanos() as f64 * 0.2) as u64,
+                );
+                self.baseline = Some(new_baseline);
+            }
         }
 
         // Check if this request was slow relative to baseline
@@ -63,6 +80,13 @@ impl ResponsivenessObserver {
                 self.consecutive_slow = 0;
             }
         }
+    }
+
+    /// Compute median of a deque of durations.
+    fn median(window: &VecDeque<Duration>) -> Duration {
+        let mut sorted: Vec<Duration> = window.iter().copied().collect();
+        sorted.sort();
+        sorted[sorted.len() / 2]
     }
 
     /// Should auto-protection be activated?

@@ -1349,7 +1349,10 @@ fn is_boilerplate_element(el: &scraper::node::Element) -> bool {
     let class = el.attr("class").unwrap_or("");
     let id = el.attr("id").unwrap_or("");
     let role = el.attr("role").unwrap_or("");
-    if matches!(role, "navigation" | "banner" | "complementary" | "contentinfo") {
+    if matches!(
+        role,
+        "navigation" | "banner" | "complementary" | "contentinfo"
+    ) {
         return true;
     }
     let combined = format!("{class} {id}").to_lowercase();
@@ -1378,13 +1381,27 @@ fn is_boilerplate_element(el: &scraper::node::Element) -> bool {
 /// Remove common boilerplate noise lines from extracted text.
 fn clean_boilerplate(text: &str) -> String {
     let noise: &[&str] = &[
-        "accept all cookies", "accept cookies", "cookie policy", "cookie settings",
-        "we use cookies", "this website uses cookies", "privacy policy",
-        "terms of service", "terms and conditions", "sign up for our newsletter",
-        "subscribe to our newsletter", "follow us on", "share this article",
-        "share on facebook", "share on twitter", "advertisement",
-        "skip to content", "skip to main content", "back to top",
-        "loading...", "please enable javascript",
+        "accept all cookies",
+        "accept cookies",
+        "cookie policy",
+        "cookie settings",
+        "we use cookies",
+        "this website uses cookies",
+        "privacy policy",
+        "terms of service",
+        "terms and conditions",
+        "sign up for our newsletter",
+        "subscribe to our newsletter",
+        "follow us on",
+        "share this article",
+        "share on facebook",
+        "share on twitter",
+        "advertisement",
+        "skip to content",
+        "skip to main content",
+        "back to top",
+        "loading...",
+        "please enable javascript",
     ];
     let lines: Vec<&str> = text
         .lines()
@@ -1402,7 +1419,9 @@ fn clean_boilerplate(text: &str) -> String {
     for line in lines {
         if line.trim().is_empty() {
             blank_count += 1;
-            if blank_count <= 2 { result.push('\n'); }
+            if blank_count <= 2 {
+                result.push('\n');
+            }
         } else {
             blank_count = 0;
             result.push_str(line);

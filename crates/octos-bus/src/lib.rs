@@ -24,14 +24,14 @@ pub mod feishu_channel;
 pub mod matrix_channel;
 #[cfg(feature = "qq-bot")]
 pub mod qq_bot_channel;
-#[cfg(feature = "wechat")]
-pub mod wechat_channel;
 #[cfg(feature = "slack")]
 pub mod slack_channel;
 #[cfg(feature = "telegram")]
 pub mod telegram_channel;
 #[cfg(feature = "twilio")]
 pub mod twilio_channel;
+#[cfg(feature = "wechat")]
+pub mod wechat_channel;
 #[cfg(feature = "wecom-bot")]
 pub mod wecom_bot_channel;
 #[cfg(feature = "wecom")]
@@ -65,14 +65,14 @@ pub use feishu_channel::FeishuChannel;
 pub use matrix_channel::{BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel};
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;
-#[cfg(feature = "wechat")]
-pub use wechat_channel::WeChatChannel;
 #[cfg(feature = "slack")]
 pub use slack_channel::SlackChannel;
 #[cfg(feature = "telegram")]
 pub use telegram_channel::TelegramChannel;
 #[cfg(feature = "twilio")]
 pub use twilio_channel::TwilioChannel;
+#[cfg(feature = "wechat")]
+pub use wechat_channel::WeChatChannel;
 #[cfg(feature = "wecom-bot")]
 pub use wecom_bot_channel::WeComBotChannel;
 #[cfg(feature = "wecom")]

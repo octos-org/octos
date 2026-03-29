@@ -1702,4 +1702,3 @@ mod tests {
         assert!(tasks[0].task.contains("test query"));
     }
 }
-

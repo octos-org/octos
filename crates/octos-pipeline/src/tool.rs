@@ -258,14 +258,13 @@ impl Tool for RunPipelineTool {
         // Signal shutdown to all workers regardless of how we finished
         shutdown.store(true, std::sync::atomic::Ordering::Release);
 
-        let result = result
-            .map_err(|_| {
-                eyre::eyre!(
-                    "pipeline timed out after {}s (timeout_secs={})",
-                    timeout_secs,
-                    timeout_secs
-                )
-            })??;
+        let result = result.map_err(|_| {
+            eyre::eyre!(
+                "pipeline timed out after {}s (timeout_secs={})",
+                timeout_secs,
+                timeout_secs
+            )
+        })??;
 
         let summary = result
             .node_summaries
@@ -330,8 +329,16 @@ fn sanitize_dot(dot: &str) -> String {
     if result.starts_with("```") {
         // Strip ```dot or ```graphviz or ``` prefix/suffix
         let lines: Vec<&str> = result.lines().collect();
-        let start = if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) { 1 } else { 0 };
-        let end = if lines.last().map(|l| l.trim() == "```").unwrap_or(false) { lines.len() - 1 } else { lines.len() };
+        let start = if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) {
+            1
+        } else {
+            0
+        };
+        let end = if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
+            lines.len() - 1
+        } else {
+            lines.len()
+        };
         result = lines[start..end].join("\n");
     }
 

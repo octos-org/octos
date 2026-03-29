@@ -450,7 +450,9 @@ async fn handle_session_messages(
     let history = session.get_history(fetch_count);
     let use_alt = history.is_empty();
     let history = if use_alt {
-        sess.get_or_create(&alt_key).get_history(fetch_count).to_vec()
+        sess.get_or_create(&alt_key)
+            .get_history(fetch_count)
+            .to_vec()
     } else {
         history.to_vec()
     };
@@ -498,8 +500,8 @@ async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<Str
     let home = std::env::var("HOME").unwrap_or_default();
     let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
         .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
-    let tmp_dir = std::fs::canonicalize("/tmp")
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let tmp_dir =
+        std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
     if !allowed {
         return (StatusCode::FORBIDDEN, "access denied").into_response();

@@ -54,7 +54,8 @@ impl Agent {
 
             let call_result = async {
                 let stream = self.llm.chat_stream(messages, tools_spec, config).await?;
-                self.consume_stream_with_input_estimate(stream, iteration, input_estimate).await
+                self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
+                    .await
             }
             .await;
 

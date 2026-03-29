@@ -168,7 +168,8 @@ async fn shared_activate_tools_across_multiple_sessions() {
         assert!(
             result.output.contains("web_search"),
             "session {}: should activate web_search, got: {}",
-            session_num, result.output
+            session_num,
+            result.output
         );
 
         // Registry will be dropped at end of loop iteration

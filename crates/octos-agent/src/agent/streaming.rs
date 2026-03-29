@@ -43,7 +43,8 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate).await
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate)
+            .await
     }
 
     async fn consume_stream_inner(
