@@ -49,7 +49,7 @@ TTS and ASR run on separate threads — they do not block each other.
 Transcribe an audio file to text via Qwen3-ASR. Supports WAV, OGG, MP3, FLAC, M4A.
 
 ```json
-{"audio_path": "/tmp/voice.ogg", "language": "Chinese"}
+{"audio_path": "voice.ogg", "language": "Chinese"}
 ```
 
 **Parameters:**
