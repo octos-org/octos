@@ -91,7 +91,9 @@ impl PluginLoader {
                     Ok((tools, extras)) => {
                         let n = tools.len();
                         for tool in tools {
-                            result.tool_names.push(tool.name().to_string());
+                            let name = tool.name().to_string();
+                            result.tool_names.push(name.clone());
+                            registry.mark_as_plugin(&name);
                             registry.register(tool);
                         }
                         result.tool_count += n;

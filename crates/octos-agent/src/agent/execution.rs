@@ -128,16 +128,18 @@ impl Agent {
                                 });
                             }
 
-                            // Auto-send files: explicit files_to_send OR detected file paths in output.
-                            // This acts as a universal post-tool hook — any plugin that produces
-                            // a deliverable file gets it sent to the user automatically.
+                            // Auto-send files from plugin tools only.
+                            // Explicit files_to_send always honored. Path detection only
+                            // for plugin tools (not shell, write_file, etc.) to avoid
+                            // double-sending when the LLM also calls send_file.
+                            let is_plugin = tools.is_plugin(&tc_name);
                             let mut files: Vec<String> = tool_result.files_to_send
                                 .iter()
                                 .map(|p| p.to_string_lossy().to_string())
                                 .collect();
 
-                            // Detect file paths in output for plugins that don't set files_to_send
-                            if files.is_empty() && tool_result.success {
+                            // Detect file paths in plugin output only
+                            if files.is_empty() && tool_result.success && is_plugin {
                                 let sendable_extensions = [
                                     ".mp3", ".wav", ".ogg", ".flac",  // audio
                                     ".pptx", ".pdf", ".xlsx",         // documents
@@ -146,7 +148,6 @@ impl Agent {
                                 for word in tool_result.output.split_whitespace() {
                                     let lower = word.to_lowercase();
                                     if sendable_extensions.iter().any(|ext| lower.ends_with(ext)) {
-                                        // Strip trailing punctuation
                                         let cleaned = word.trim_end_matches(|c: char| c == '.' || c == ',' || c == ')' || c == ']');
                                         if std::path::Path::new(cleaned).exists() {
                                             files.push(cleaned.to_string());
