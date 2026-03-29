@@ -128,6 +128,24 @@ impl Agent {
                                 });
                             }
 
+                            // Auto-send files requested by the plugin (no LLM round-trip needed)
+                            for file_path in &tool_result.files_to_send {
+                                let path_str = file_path.to_string_lossy().to_string();
+                                info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
+                                let send_args = serde_json::json!({"file_path": path_str});
+                                match tools.execute("send_file", &send_args).await {
+                                    Ok(r) if r.success => {
+                                        info!(tool = %tc_name, file = %path_str, "file auto-sent");
+                                    }
+                                    Ok(r) => {
+                                        warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
+                                    }
+                                    Err(e) => {
+                                        warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                    }
+                                }
+                            }
+
                             let output_preview =
                                 octos_core::truncated_utf8(&tool_result.output, 200, "...");
 

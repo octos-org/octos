@@ -45,6 +45,11 @@ pub struct ToolResult {
     pub success: bool,
     /// File modified by this tool (if any).
     pub file_modified: Option<PathBuf>,
+    /// Files to automatically send to the user via the chat channel.
+    /// Plugins set this via `"files_to_send": ["/path/to/file.mp3"]` in JSON output.
+    /// The agent loop sends these files after the tool completes, without requiring
+    /// an extra LLM call to invoke send_file.
+    pub files_to_send: Vec<PathBuf>,
     /// Tokens used by this tool (for subagent tools).
     pub tokens_used: Option<TokenUsage>,
 }
