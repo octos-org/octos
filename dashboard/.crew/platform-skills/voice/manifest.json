@@ -1,14 +1,14 @@
 {
   "name": "voice",
-  "version": "1.0.0",
-  "author": "hagency",
-  "description": "OminiX voice skill: ASR, TTS, and model management via local Qwen3 models on Apple Silicon",
-  "timeout_secs": 300,
+  "version": "1.1.0",
+  "author": "octos",
+  "description": "OminiX voice skill: ASR, preset-voice TTS with emotion/speed control, and model management via local Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
+  "timeout_secs": 600,
   "requires_network": true,
   "tools": [
     {
       "name": "voice_transcribe",
-      "description": "Transcribe an audio file to text using OminiX ASR (Qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
+      "description": "Transcribe an audio file to text using Qwen3-ASR (POST /v1/audio/asr/qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -26,7 +26,7 @@
     },
     {
       "name": "voice_synthesize",
-      "description": "Synthesize speech from text using OminiX TTS (Qwen3). Produces a WAV audio file. Use this when the user asks for a voice reply or text-to-speech. After generating, use send_file to deliver the audio to the user.",
+      "description": "Synthesize speech from text. Uses Qwen3-TTS when ominix-api is running (high quality, emotion/style control, speed adjustment). Falls back to macOS built-in Say command when ominix-api is unavailable. Produces a WAV/MP3 audio file. After generating, use send_file to deliver the audio to the user. NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (fm_tts).",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -36,7 +36,7 @@
           },
           "output_path": {
             "type": "string",
-            "description": "Path to save the WAV file. Default: /tmp/crew_tts_<timestamp>.wav"
+            "description": "Path to save the audio file. Default: auto-generated in OCTOS_WORK_DIR"
           },
           "language": {
             "type": "string",
@@ -44,67 +44,18 @@
           },
           "speaker": {
             "type": "string",
-            "description": "Voice name: a preset ('vivian', 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee') OR a saved voice profile name. Use voice_list_profiles to see saved profiles."
+            "description": "Preset voice name: 'vivian' (default), 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee'"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Style/emotion instruction to control how the voice speaks. Chinese prompts (best with vivian, serena, dylan, uncle_fu): excited='用兴奋激动的语气说话，充满热情和活力', sad='用悲伤失望的语气说话，声音低沉，语速缓慢', cheerful='用开朗愉快的语气说话，声音明亮上扬，节奏轻快', shout='用大声喊叫的方式说话，声音高亢有力，语速快', sarcastic='用讽刺嘲讽的语气说话，语调阴阳怪气，拖长尾音', soft='用温柔轻柔的语气说话', panic='用惊慌恐惧的语气说话，声音颤抖，语速急促'. English prompts (best with ryan, aiden): excited='Speak with excitement and enthusiasm, full of energy', sad='Speak in a sad, disappointed tone, voice low and slow', cheerful='Speak cheerfully with a bright, upbeat voice', soft='Speak gently and softly'. Custom free-form prompts also supported."
+          },
+          "speed": {
+            "type": "number",
+            "description": "Speed factor: >1.0 = faster, <1.0 = slower. Range 0.5-2.0. Default: 1.0"
           }
         },
         "required": ["text"]
-      }
-    },
-    {
-      "name": "voice_clone",
-      "description": "Clone a voice from a reference audio sample (3-10 seconds) and synthesize new speech in that voice. Uses ECAPA-TDNN x-vector speaker embedding extraction. Requires the Base TTS model (not CustomVoice). After generating, use send_file to deliver the audio. IMPORTANT: When the user sends a voice sample for cloning, always ask what name they want for this voice profile, then set save_as to save it for future use.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "reference_audio": {
-            "type": "string",
-            "description": "Absolute path to reference audio file (3-10 seconds, WAV/OGG/MP3/FLAC/M4A). The voice in this clip will be cloned."
-          },
-          "text": {
-            "type": "string",
-            "description": "The text to synthesize in the cloned voice"
-          },
-          "output_path": {
-            "type": "string",
-            "description": "Path to save the WAV file. Default: /tmp/crew_clone_<timestamp>.wav"
-          },
-          "language": {
-            "type": "string",
-            "description": "Speech language: 'chinese' (default), 'english', 'japanese', 'korean'"
-          },
-          "save_as": {
-            "type": "string",
-            "description": "Save this voice as a named profile for future use. The name can then be used as speaker in voice_synthesize."
-          }
-        },
-        "required": ["reference_audio", "text"]
-      }
-    },
-    {
-      "name": "voice_save_profile",
-      "description": "Save an audio sample as a named voice profile for future TTS cloning. The saved profile can then be used as the speaker parameter in voice_synthesize. Profiles are private to this user/profile.",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Name for this voice profile (e.g. 'alice', 'my_voice', 'boss'). Lowercase alphanumeric + underscore/hyphen."
-          },
-          "audio_path": {
-            "type": "string",
-            "description": "Absolute path to the reference audio file (3-10 seconds)"
-          }
-        },
-        "required": ["name", "audio_path"]
-      }
-    },
-    {
-      "name": "voice_list_profiles",
-      "description": "List all saved voice profiles for this user. Shows profile names that can be used as the speaker parameter in voice_synthesize.",
-      "input_schema": {
-        "type": "object",
-        "properties": {},
-        "required": []
       }
     },
     {
