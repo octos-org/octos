@@ -128,33 +128,13 @@ impl Agent {
                                 });
                             }
 
-                            // Auto-send files from plugin tools only.
-                            // Explicit files_to_send always honored. Path detection only
-                            // for plugin tools (not shell, write_file, etc.) to avoid
-                            // double-sending when the LLM also calls send_file.
-                            let is_plugin = tools.is_plugin(&tc_name);
-                            let mut files: Vec<String> = tool_result.files_to_send
+                            // Auto-send files explicitly declared by the plugin via files_to_send.
+                            // No heuristic path detection — plugins must opt-in by including
+                            // "files_to_send": ["/path/to/file"] in their JSON output.
+                            let files: Vec<String> = tool_result.files_to_send
                                 .iter()
                                 .map(|p| p.to_string_lossy().to_string())
                                 .collect();
-
-                            // Detect file paths in plugin output only
-                            if files.is_empty() && tool_result.success && is_plugin {
-                                let sendable_extensions = [
-                                    ".mp3", ".wav", ".ogg", ".flac",  // audio
-                                    ".pptx", ".pdf", ".xlsx",         // documents
-                                    ".png", ".jpg", ".jpeg", ".svg",  // images
-                                ];
-                                for word in tool_result.output.split_whitespace() {
-                                    let lower = word.to_lowercase();
-                                    if sendable_extensions.iter().any(|ext| lower.ends_with(ext)) {
-                                        let cleaned = word.trim_end_matches(|c: char| c == '.' || c == ',' || c == ')' || c == ']');
-                                        if std::path::Path::new(cleaned).exists() {
-                                            files.push(cleaned.to_string());
-                                        }
-                                    }
-                                }
-                            }
 
                             for path_str in &files {
                                 info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
