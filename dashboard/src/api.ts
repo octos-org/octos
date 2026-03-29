@@ -233,7 +233,13 @@ export const myApi = {
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
 
   testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
-    authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-provider', {
+    authedRequest<{ ok: boolean; message?: string; error?: string; models?: string[] }>('/my/test-provider', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  fetchProviderModels: (data: { provider: string; model?: string; api_key?: string; api_key_env?: string; base_url?: string; profile_id?: string }) =>
+    authedRequest<string[]>('/my/provider-models', {
       method: 'POST',
       body: JSON.stringify(data),
     }),

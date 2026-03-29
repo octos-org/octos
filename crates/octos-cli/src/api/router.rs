@@ -99,6 +99,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
+        .route("/api/my/provider-models", post(admin::provider_models))
         .route("/api/my/test-search", post(admin::test_search))
         .route("/api/my/model-limits", get(admin::model_limits))
         .route(

@@ -169,10 +169,7 @@ impl SwitchModelTool {
                 .map(|m| format!(" (default: {m})"))
                 .unwrap_or_default();
 
-            lines.push(format!(
-                "  - {}{} [{}]",
-                entry.name, default, key_status
-            ));
+            lines.push(format!("  - {}{} [{}]", entry.name, default, key_status));
         }
 
         Ok(ToolResult {

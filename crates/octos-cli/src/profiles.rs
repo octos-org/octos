@@ -790,6 +790,7 @@ pub(crate) fn config_from_profile(
                 feishu_from_address: e.feishu_from_address.clone(),
                 feishu_region: e.feishu_region.clone(),
             }),
+        auth_token: None,
         adaptive_routing: None,
         voice: None,
         #[cfg(feature = "api")]

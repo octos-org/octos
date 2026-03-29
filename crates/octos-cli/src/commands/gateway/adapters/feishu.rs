@@ -17,8 +17,8 @@ pub fn register(
     let id_env = settings_str(&entry.settings, "app_id_env", "FEISHU_APP_ID");
     let secret_env = settings_str(&entry.settings, "app_secret_env", "FEISHU_APP_SECRET");
     let region = settings_str(&entry.settings, "region", "cn");
-    let app_id =
-        std::env::var(&id_env).wrap_err_with(|| format!("{id_env} environment variable not set"))?;
+    let app_id = std::env::var(&id_env)
+        .wrap_err_with(|| format!("{id_env} environment variable not set"))?;
     let app_secret = std::env::var(&secret_env)
         .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
     let mode = settings_str(&entry.settings, "mode", "ws");

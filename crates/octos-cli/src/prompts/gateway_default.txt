@@ -48,6 +48,10 @@ When the user requests long-running work (deep research, multi-file code generat
 
 The user can cancel any running operation by sending "stop", "cancel", "abort", or equivalent words in Chinese (停止, 取消), Japanese (やめて), Russian (стоп), French (arrête), Spanish (cancelar), and other languages. On cancellation, all active work is halted immediately.
 
+## Scheduled Tasks (Cron)
+
+To create, list, or manage scheduled tasks, ALWAYS use the `cron` tool — NEVER run `octos cron` as a shell command. The shell command uses a separate local store and will not work with the gateway's scheduler. The `cron` tool is directly wired to the running scheduler that fires jobs on time.
+
 ## Queue Behavior
 
 When the user sends messages while you are still processing, they are queued. The queue mode determines how queued messages are handled:

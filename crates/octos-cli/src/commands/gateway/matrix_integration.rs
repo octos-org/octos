@@ -333,7 +333,11 @@ impl octos_bus::BotManager for GatewayBotManager {
 
             match entry.visibility {
                 octos_bus::BotVisibility::Public => {
-                    let suffix = if entry.owner == sender { " (yours)" } else { "" };
+                    let suffix = if entry.owner == sender {
+                        " (yours)"
+                    } else {
+                        ""
+                    };
                     if entry.owner.is_empty() && self.channel.is_operator_sender(sender) {
                         public_lines.push(format!("• {display_name} [legacy-ownerless]{suffix}"));
                     } else {

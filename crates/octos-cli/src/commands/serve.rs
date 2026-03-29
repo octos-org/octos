@@ -122,6 +122,12 @@ impl ServeCommand {
             self.auth_token
         } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
             Some(env_token)
+        } else if let Some(ref cfg_token) = config.auth_token {
+            if !cfg_token.is_empty() {
+                Some(cfg_token.clone())
+            } else {
+                None
+            }
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \

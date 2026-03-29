@@ -230,6 +230,7 @@ pub async fn me(
                     }
                 };
                 Some(ProfileResponse {
+                    email: None,
                     profile: mask_secrets(&p),
                     status,
                 })
@@ -281,6 +282,7 @@ pub async fn me(
                 }
             };
             Some(ProfileResponse {
+                email: None,
                 profile: mask_secrets(&p),
                 status,
             })
@@ -320,6 +322,7 @@ pub async fn my_profile(
     };
 
     Ok(Json(ProfileResponse {
+        email: None,
         profile: mask_secrets(&profile),
         status,
     }))
@@ -376,6 +379,7 @@ pub async fn update_my_profile(
     };
 
     Ok(Json(ProfileResponse {
+        email: None,
         profile: mask_secrets(&profile),
         status,
     }))
@@ -614,6 +618,7 @@ pub async fn my_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(crate::api::admin::ProfileResponse {
+            email: None,
             profile: crate::profiles::mask_secrets(&s),
             status,
         });

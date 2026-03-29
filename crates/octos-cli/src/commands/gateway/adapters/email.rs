@@ -26,10 +26,8 @@ pub fn register(
         .unwrap_or(465) as u16;
     let user_env = settings_str(&entry.settings, "username_env", "EMAIL_USERNAME");
     let pass_env = settings_str(&entry.settings, "password_env", "EMAIL_PASSWORD");
-    let username =
-        std::env::var(&user_env).wrap_err_with(|| format!("{user_env} not set"))?;
-    let password =
-        std::env::var(&pass_env).wrap_err_with(|| format!("{pass_env} not set"))?;
+    let username = std::env::var(&user_env).wrap_err_with(|| format!("{user_env} not set"))?;
+    let password = std::env::var(&pass_env).wrap_err_with(|| format!("{pass_env} not set"))?;
     let from_address = settings_str(&entry.settings, "from_address", &username);
     let poll_interval = entry
         .settings

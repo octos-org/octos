@@ -719,9 +719,11 @@ impl ProcessManager {
     /// Check if a profile has a WhatsApp channel that needs a managed bridge.
     /// A managed bridge is needed when bridge_url is empty or "auto".
     fn needs_wechat_bridge(&self, profile: &UserProfile) -> bool {
-        profile.config.channels.iter().any(|ch| {
-            matches!(ch, ChannelCredentials::WeChat { .. })
-        })
+        profile
+            .config
+            .channels
+            .iter()
+            .any(|ch| matches!(ch, ChannelCredentials::WeChat { .. }))
     }
 
     fn needs_managed_bridge(&self, profile: &UserProfile) -> bool {
@@ -912,15 +914,25 @@ impl ProcessManager {
         drop(bridges2);
 
         // Resolve token from profile env_vars
-        let token_env = profile.config.channels.iter().find_map(|ch| {
-            if let ChannelCredentials::WeChat { token_env, .. } = ch {
-                Some(token_env.clone())
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| "WECHAT_BOT_TOKEN".into());
+        let token_env = profile
+            .config
+            .channels
+            .iter()
+            .find_map(|ch| {
+                if let ChannelCredentials::WeChat { token_env, .. } = ch {
+                    Some(token_env.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "WECHAT_BOT_TOKEN".into());
 
-        let token = profile.config.env_vars.get(&token_env).cloned().unwrap_or_default();
+        let token = profile
+            .config
+            .env_vars
+            .get(&token_env)
+            .cloned()
+            .unwrap_or_default();
 
         // Find the wechat-bridge binary
         let exe_dir = std::env::current_exe()
@@ -932,7 +944,10 @@ impl ProcessManager {
             exe_dir.join("wechat-bridge")
         } else {
             // Check in bundled app-skills
-            let bundled = self.profile_store.octos_home_dir().join("bundled-app-skills/wechat-bridge/main");
+            let bundled = self
+                .profile_store
+                .octos_home_dir()
+                .join("bundled-app-skills/wechat-bridge/main");
             if bundled.exists() {
                 bundled
             } else {
@@ -957,7 +972,8 @@ impl ProcessManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| eyre::eyre!("failed to spawn wechat-bridge: {e}"))?;
 
         let pid = child.id().unwrap_or(0);
@@ -987,17 +1003,15 @@ impl ProcessManager {
                                     *qr_clone.lock().await = Some(url.to_string());
                                 }
                             }
-                            Some("status") => {
-                                match evt["status"].as_str() {
-                                    Some("connected" | "polling") => {
-                                        *status_clone.lock().await = BridgeStatus::Connected;
-                                    }
-                                    Some("session_timeout") => {
-                                        *status_clone.lock().await = BridgeStatus::Disconnected;
-                                    }
-                                    _ => {}
+                            Some("status") => match evt["status"].as_str() {
+                                Some("connected" | "polling") => {
+                                    *status_clone.lock().await = BridgeStatus::Connected;
                                 }
-                            }
+                                Some("session_timeout") => {
+                                    *status_clone.lock().await = BridgeStatus::Disconnected;
+                                }
+                                _ => {}
+                            },
                             _ => {}
                         }
                     }
@@ -1032,18 +1046,21 @@ impl ProcessManager {
             bridges_ref.write().await.remove(&key2);
         });
 
-        self.bridges.write().await.insert(key, BridgeProcess {
-            pid,
-            ws_port,
-            http_port: ws_port + 1,
-            started_at: chrono::Utc::now(),
-            qr_code,
-            status,
-            phone_number: Arc::new(tokio::sync::Mutex::new(None)),
-            lid: Arc::new(tokio::sync::Mutex::new(None)),
-            log_tx,
-            stop_tx,
-        });
+        self.bridges.write().await.insert(
+            key,
+            BridgeProcess {
+                pid,
+                ws_port,
+                http_port: ws_port + 1,
+                started_at: chrono::Utc::now(),
+                qr_code,
+                status,
+                phone_number: Arc::new(tokio::sync::Mutex::new(None)),
+                lid: Arc::new(tokio::sync::Mutex::new(None)),
+                log_tx,
+                stop_tx,
+            },
+        );
 
         // Wait a moment for the bridge to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1086,7 +1103,9 @@ impl ProcessManager {
     fn allocate_wechat_port(&self, bridges: &HashMap<String, BridgeProcess>) -> u16 {
         let used: std::collections::HashSet<u16> = bridges.values().map(|b| b.ws_port).collect();
         let mut port = 3201u16;
-        while used.contains(&port) || !port_available(port) { port += 1; }
+        while used.contains(&port) || !port_available(port) {
+            port += 1;
+        }
         port
     }
     fn allocate_bridge_ports(&self, bridges: &HashMap<String, BridgeProcess>) -> (u16, u16) {

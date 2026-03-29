@@ -28,12 +28,12 @@ pub(crate) use prompt::build_system_prompt;
 // Types used by tests via `use super::*`
 #[cfg(test)]
 use {
-    std::sync::Arc,
-    std::sync::atomic::{AtomicBool, AtomicUsize},
+    crate::session_actor::SnapshotToolRegistryFactory,
     octos_agent::{AgentConfig, ToolRegistry},
     octos_bus::{ActiveSessionStore, ChannelManager, CronService, SessionManager},
     profile_factory::ProfileActorFactoryBuilder,
-    crate::session_actor::SnapshotToolRegistryFactory,
+    std::sync::Arc,
+    std::sync::atomic::{AtomicBool, AtomicUsize},
 };
 
 /// Run as a persistent gateway daemon.
@@ -145,7 +145,6 @@ pub(crate) fn build_profiled_session_key(
     let effective_profile_id = profile_id.unwrap_or(MAIN_PROFILE_ID);
     SessionKey::with_profile_topic(effective_profile_id, channel, chat_id, topic)
 }
-
 
 impl Executable for GatewayCommand {
     fn execute(self) -> Result<()> {

@@ -59,6 +59,25 @@ pub struct ProfileResponse {
     #[serde(flatten)]
     pub profile: UserProfile,
     pub status: crate::process_manager::ProcessStatus,
+    /// Login email address (from UserStore).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
+impl ProfileResponse {
+    pub fn from(profile: UserProfile, status: crate::process_manager::ProcessStatus) -> Self {
+        Self {
+            profile,
+            status,
+            email: None,
+        }
+    }
+    pub fn with_email_lookup(mut self, user_store: Option<&crate::user_store::UserStore>) -> Self {
+        self.email = user_store
+            .and_then(|us| us.get(&self.profile.id).ok().flatten())
+            .map(|u| u.email);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -111,6 +130,7 @@ pub async fn overview(
             running += 1;
         }
         items.push(ProfileResponse {
+            email: None,
             profile: mask_secrets(&p),
             status,
         });
@@ -163,6 +183,7 @@ pub async fn list_profiles(
     for p in page {
         let status = pm.status(&p.id).await;
         items.push(ProfileResponse {
+            email: None,
             profile: mask_secrets(&p),
             status,
         });
@@ -190,10 +211,14 @@ pub async fn get_profile(
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
 
     let status = pm.status(&id).await;
-    Ok(Json(ProfileResponse {
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    Ok(Json(
+        ProfileResponse {
+            email: None,
+            profile: mask_secrets(&profile),
+            status,
+        }
+        .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 /// POST /api/admin/profiles
@@ -244,6 +269,7 @@ pub async fn create_profile(
     Ok((
         StatusCode::CREATED,
         Json(ProfileResponse {
+            email: None,
             profile: mask_secrets(&profile),
             status,
         }),
@@ -347,6 +373,7 @@ pub async fn update_profile(
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     Ok(Json(ProfileResponse {
+        email: None,
         profile: mask_secrets(&profile),
         status,
     }))
@@ -724,6 +751,72 @@ pub async fn test_provider(
     }
 }
 
+/// POST /api/my/provider-models — fetch available models from a provider's API.
+pub async fn provider_models(
+    State(state): State<Arc<AppState>>,
+    identity: Option<axum::Extension<super::router::AuthIdentity>>,
+    Json(req): Json<TestProviderRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let api_key = if let Some(ref key) = req.api_key {
+        if !key.is_empty() && !key.contains("***") {
+            key.clone()
+        } else {
+            resolve_saved_key(&state, &identity, &req)?
+        }
+    } else {
+        resolve_saved_key(&state, &identity, &req)?
+    };
+    if api_key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No API key".into()));
+    }
+    let models = fetch_provider_models(&req.provider, &api_key, req.base_url.as_deref())
+        .await
+        .unwrap_or_default();
+    Ok(Json(models))
+}
+
+/// Fetch available models from a provider's /v1/models endpoint.
+async fn fetch_provider_models(
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Option<Vec<String>> {
+    let base = base_url
+        .map(|u| u.trim_end_matches('/').to_string())
+        .or_else(|| {
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.default_base_url.map(|u| u.to_string()))
+        })?;
+    let base_trimmed = base.trim_end_matches("/v1").trim_end_matches("/v1/");
+    let url = if provider == "anthropic" {
+        format!("{base}/v1/models")
+    } else {
+        format!("{base_trimmed}/v1/models")
+    };
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(10));
+    if provider == "anthropic" {
+        req = req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        req = req.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("data").and_then(|d| d.as_array()).map(|arr| {
+        let mut ids: Vec<String> = arr
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        ids.sort();
+        ids
+    })
+}
+
 /// Recursively merge `patch` into `target` (RFC 7396 JSON Merge Patch).
 /// Only keys present in `patch` are overwritten; absent keys are preserved.
 fn json_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -763,13 +856,17 @@ fn resolve_saved_key(
         "profile store not configured".into(),
     ))?;
 
-    let profile_id = match identity {
-        Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
-        Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            super::auth_handlers::ADMIN_PROFILE_ID.into()
-        }
-        None => {
-            return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
+    let profile_id = if let Some(ref pid) = req.profile_id {
+        pid.clone()
+    } else {
+        match identity {
+            Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
+            Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
+                super::auth_handlers::ADMIN_PROFILE_ID.into()
+            }
+            None => {
+                return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
+            }
         }
     };
 
@@ -788,17 +885,17 @@ fn resolve_saved_key(
 
 #[derive(Deserialize)]
 pub struct TestProviderRequest {
-    /// Native provider name: "anthropic", "openai", "gemini", "openrouter"
     pub provider: String,
+    #[serde(default)]
     pub model: String,
-    /// Raw API key (for new/unsaved keys).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Env var name to resolve from saved profile (for already-saved keys).
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -960,7 +1057,7 @@ fn resolve_saved_search_key(
         "profile store not configured".into(),
     ))?;
 
-    let profile_id = match identity {
+    let profile_id: String = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
             super::auth_handlers::ADMIN_PROFILE_ID.into()
@@ -1090,6 +1187,7 @@ pub async fn list_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(ProfileResponse {
+            email: None,
             profile: mask_secrets(&s),
             status,
         });
@@ -1196,6 +1294,7 @@ pub async fn create_sub_account(
     Ok((
         StatusCode::CREATED,
         Json(ProfileResponse {
+            email: None,
             profile: mask_secrets(&sub),
             status,
         }),

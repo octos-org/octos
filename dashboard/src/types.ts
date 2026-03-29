@@ -98,6 +98,7 @@ export interface ProfileResponse {
   created_at: string
   updated_at: string
   status: ProcessStatus
+  email?: string | null
 }
 
 export interface OverviewResponse {

@@ -15,7 +15,7 @@ export default function HomePage() {
   const {
     profileId, parentId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
-    profileName, setProfileName, enabled, setEnabled,
+    profileName, setProfileName, profileEmail, setProfileEmail, enabled, setEnabled,
     save, saving, deleteProfile,
   } = useProfile()
   const navigate = useNavigate()
@@ -215,6 +215,17 @@ export default function HomePage() {
               onChange={(e) => setProfileName(e.target.value)}
               className="input max-w-md"
             />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1.5">Login Email</label>
+            <input
+              value={profileEmail}
+              onChange={(e) => setProfileEmail(e.target.value)}
+              placeholder="user@example.com (for web client OTP login)"
+              type="email"
+              className="input max-w-md"
+            />
+            <p className="text-xs text-gray-500 mt-1">Set an email address to enable OTP login to the web client for this profile.</p>
           </div>
           <div>
             <label className="flex items-center gap-2 cursor-pointer">
