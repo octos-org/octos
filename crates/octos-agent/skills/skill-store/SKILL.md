@@ -32,6 +32,14 @@ Use `force=true` to overwrite an existing skill. Use `branch` for a specific ver
 manage_skills(action="list")
 ```
 
+## Update a Skill
+
+```
+manage_skills(action="update", name="mofa-fm")
+```
+
+Reads the original source repo from `.source` and reinstalls with the latest version.
+
 ## Remove a Skill
 
 ```
