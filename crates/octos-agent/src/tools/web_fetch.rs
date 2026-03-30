@@ -197,7 +197,7 @@ impl Tool for WebFetchTool {
 async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String> {
     let mut current_url = initial_url.to_string();
 
-    for hop in 0..=MAX_REDIRECTS {
+    for _ in 0..MAX_REDIRECTS {
         // Validate the URL and resolve DNS (fail-closed on DNS error).
         let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
 
@@ -223,24 +223,20 @@ async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String>
             .await
             .map_err(|e| format!("Failed to fetch URL: {e}"))?;
 
-        if response.status().is_redirection() {
-            if hop == MAX_REDIRECTS {
-                return Err(format!("Too many redirects (max {MAX_REDIRECTS})"));
-            }
-            let location = response
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| "Redirect with no Location header".to_string())?;
-            // Resolve relative redirects against the current URL.
-            current_url = parsed
-                .join(location)
-                .map_err(|_| format!("Invalid redirect URL: {location}"))?
-                .to_string();
-            continue;
+        if !response.status().is_redirection() {
+            return Ok(response);
         }
 
-        return Ok(response);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| "Redirect with no Location header".to_string())?;
+        // Resolve relative redirects against the current URL.
+        current_url = parsed
+            .join(location)
+            .map_err(|_| format!("Invalid redirect URL: {location}"))?
+            .to_string();
     }
 
     Err(format!("Too many redirects (max {MAX_REDIRECTS})"))
