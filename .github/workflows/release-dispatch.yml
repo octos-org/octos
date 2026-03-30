@@ -75,4 +75,5 @@ jobs:
           files: |
             octos-bundle-aarch64-apple-darwin.tar.gz
             scripts/install.sh
+            scripts/octos-doctor.sh
           body_path: RELEASE_NOTES.md
