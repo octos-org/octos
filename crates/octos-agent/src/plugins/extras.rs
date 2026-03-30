@@ -17,6 +17,8 @@ pub struct SkillExtras {
     pub mcp_servers: Vec<McpServerConfig>,
     pub hooks: Vec<HookConfig>,
     pub prompt_fragments: Vec<String>,
+    /// Tool names that should only be available in spawn subagents (deferred in main session).
+    pub spawn_only_tools: Vec<String>,
 }
 
 /// Resolve manifest extras against the skill directory.

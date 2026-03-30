@@ -37,6 +37,11 @@ pub struct SpawnTool {
     worker_prompt: Option<String>,
     /// Direct delivery channel to session actor (bypasses InboundMessage relay).
     background_result_sender: Option<BackgroundResultSender>,
+    /// Plugin directories to load into subagent registries.
+    /// Subagents can use plugin tools (fm_tts, etc.) when listed in allowed_tools.
+    plugin_dirs: Vec<PathBuf>,
+    /// Extra environment variables for plugin processes.
+    plugin_extra_env: Vec<(String, String)>,
 }
 
 impl SpawnTool {
@@ -57,6 +62,8 @@ impl SpawnTool {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
         }
     }
 
@@ -80,6 +87,8 @@ impl SpawnTool {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
         }
     }
 
@@ -106,6 +115,13 @@ impl SpawnTool {
     /// Set a default worker prompt for sub-agents (overrides compiled-in worker.txt).
     pub fn with_worker_prompt(mut self, prompt: String) -> Self {
         self.worker_prompt = Some(prompt);
+        self
+    }
+
+    /// Set plugin directories and env vars so subagents can use plugin tools.
+    pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>, extra_env: Vec<(String, String)>) -> Self {
+        self.plugin_dirs = dirs;
+        self.plugin_extra_env = extra_env;
         self
     }
 
@@ -317,6 +333,14 @@ impl Tool for SpawnTool {
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
             let mut tools = ToolRegistry::with_builtins(&self.working_dir);
+            // Load plugin tools so subagents can use fm_tts, etc.
+            if !self.plugin_dirs.is_empty() {
+                let _ = crate::plugins::PluginLoader::load_into(
+                    &mut tools,
+                    &self.plugin_dirs,
+                    &self.plugin_extra_env,
+                );
+            }
             let policy = ToolPolicy {
                 allow: allowed_tools,
                 deny: vec!["spawn".into()],
@@ -375,9 +399,19 @@ impl Tool for SpawnTool {
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let task_label = label.clone();
+            let plugin_dirs = self.plugin_dirs.clone();
+            let plugin_extra_env = self.plugin_extra_env.clone();
 
             tokio::spawn(async move {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
+                // Load plugin tools so subagents can use fm_tts, etc.
+                if !plugin_dirs.is_empty() {
+                    let _ = crate::plugins::PluginLoader::load_into(
+                        &mut tools,
+                        &plugin_dirs,
+                        &plugin_extra_env,
+                    );
+                }
                 let policy = ToolPolicy {
                     allow: allowed_tools,
                     deny: vec!["spawn".into()],
