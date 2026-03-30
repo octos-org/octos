@@ -1220,9 +1220,19 @@ if [ "$SKIP_TUNNEL" = false ]; then
         printf "    > "
         read -r TENANT_NAME < /dev/tty
         if [ -z "$TENANT_NAME" ]; then
-            TENANT_NAME="$(hostname -s | tr '[:upper:]' '[:lower:]')"
-            TENANT_PLACEHOLDER=true
-            warn "Using placeholder tenant: $TENANT_NAME"
+            raw_hostname="$(hostname -s)"
+            # Derive a slug from the hostname: lowercase, allow [a-z0-9-] only.
+            TENANT_NAME="$(printf '%s' "$raw_hostname" \
+                | tr '[:upper:]' '[:lower:]' \
+                | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//; s/--*/-/g')"
+            if [ -z "$TENANT_NAME" ]; then
+                warn "Could not derive a valid tenant from hostname '$raw_hostname'. Please enter a tenant name."
+                printf "    > "
+                read -r TENANT_NAME < /dev/tty
+            else
+                TENANT_PLACEHOLDER=true
+                warn "Using placeholder tenant: $TENANT_NAME"
+            fi
         fi
     fi
 
