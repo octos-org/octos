@@ -180,6 +180,8 @@ pub struct ToolRegistry {
     plugin_tools: HashSet<String>,
     /// Tools that are permanently deferred (spawn_only) — cannot be activated by activate_tools.
     spawn_only: HashSet<String>,
+    /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
+    spawn_only_messages: HashMap<String, String>,
 }
 
 impl Default for ToolRegistry {
@@ -200,6 +202,7 @@ impl ToolRegistry {
             lifecycle: std::sync::Mutex::new(ToolLifecycle::default()),
             plugin_tools: HashSet::new(),
             spawn_only: HashSet::new(),
+            spawn_only_messages: HashMap::new(),
         }
     }
 
@@ -208,15 +211,25 @@ impl ToolRegistry {
         self.plugin_tools.insert(name.to_string());
     }
 
-    /// Mark a tool as spawn_only. The tool stays visible to the LLM but when called,
-    /// the execution loop auto-redirects it to a background spawn subagent.
-    pub fn mark_spawn_only(&mut self, name: &str) {
+    /// Mark a tool as spawn_only with an optional custom message.
+    pub fn mark_spawn_only(&mut self, name: &str, message: Option<String>) {
         self.spawn_only.insert(name.to_string());
+        if let Some(msg) = message {
+            self.spawn_only_messages.insert(name.to_string(), msg);
+        }
     }
 
     /// Check if a tool is marked spawn_only.
     pub fn is_spawn_only(&self, name: &str) -> bool {
         self.spawn_only.contains(name)
+    }
+
+    /// Get the custom message for a spawn_only tool, or a default.
+    pub fn spawn_only_message(&self, name: &str) -> String {
+        self.spawn_only_messages
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string())
     }
 
     /// Check if a tool came from a plugin binary.
@@ -365,6 +378,7 @@ impl ToolRegistry {
             lifecycle: std::sync::Mutex::new(lifecycle),
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
+            spawn_only_messages: self.spawn_only_messages.clone(),
         }
     }
 

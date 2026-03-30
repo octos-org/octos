@@ -105,10 +105,14 @@ pub struct PluginToolDef {
     /// JSON Schema for input parameters.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
-    /// If true, this tool is only available in spawn subagents, not the main session.
-    /// The main session should use `spawn(allowed_tools=["tool_name"])` to invoke it.
+    /// If true, the tool runs in a background task automatically when called.
+    /// The execution loop returns immediately with `spawn_only_message`.
     #[serde(default)]
     pub spawn_only: bool,
+    /// Message returned to the LLM when a spawn_only tool is auto-backgrounded.
+    /// Default: "SUCCESS: Task is now running in background..."
+    #[serde(default)]
+    pub spawn_only_message: Option<String>,
 }
 
 /// Binary download info for a specific platform.

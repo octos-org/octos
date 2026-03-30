@@ -101,7 +101,8 @@ impl PluginLoader {
                         // but still registered (available in spawn subagent registries).
                         if !spawn_only.is_empty() {
                             for name in &spawn_only {
-                                registry.mark_spawn_only(name);
+                                let msg = extras.spawn_only_messages.get(name).cloned();
+                                registry.mark_spawn_only(name, msg);
                             }
                             // Don't defer — tool stays visible to LLM.
                             // The execution loop auto-redirects calls to background spawn.
@@ -277,12 +278,18 @@ impl PluginLoader {
             .map(Duration::from_secs)
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
-        // Collect spawn_only tool names before consuming manifest.tools
+        // Collect spawn_only tool names and messages before consuming manifest.tools
         let spawn_only_names: Vec<String> = manifest
             .tools
             .iter()
             .filter(|t| t.spawn_only)
             .map(|t| t.name.clone())
+            .collect();
+        let spawn_only_msgs: std::collections::HashMap<String, String> = manifest
+            .tools
+            .iter()
+            .filter(|t| t.spawn_only && t.spawn_only_message.is_some())
+            .map(|t| (t.name.clone(), t.spawn_only_message.clone().unwrap()))
             .collect();
 
         let tools: Vec<PluginTool> = manifest
@@ -303,6 +310,7 @@ impl PluginLoader {
         // Return extras with spawn_only info
         let mut extras = extras;
         extras.spawn_only_tools = spawn_only_names;
+        extras.spawn_only_messages = spawn_only_msgs;
 
         Ok((tools, extras))
     }
