@@ -173,18 +173,33 @@ impl PluginLoader {
             return Ok((vec![], extras));
         }
 
-        // Find executable: try plugin name, then "main"
+        // Find executable: try manifest name, dir name, "main", then any executable in dir
         let dir_name = plugin_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("main");
-        let executable = [dir_name, "main"]
+        let executable = [&manifest.name as &str, dir_name, "main"]
             .iter()
             .map(|name| plugin_dir.join(name))
             .find(|p| p.exists() && is_executable(p))
+            .or_else(|| {
+                // Fallback: find any executable file in the plugin dir
+                std::fs::read_dir(plugin_dir).ok()?.flatten().find_map(|e| {
+                    let p = e.path();
+                    if p.is_file() && is_executable(&p) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        // Skip hidden files and known non-executables
+                        if !name.starts_with('.') && !name.ends_with(".json") && !name.ends_with(".md") && !name.ends_with(".toml") && !name.ends_with(".tar.gz") {
+                            return Some(p);
+                        }
+                    }
+                    None
+                })
+            })
             .ok_or_else(|| {
                 eyre::eyre!(
-                    "no executable found in plugin '{}' (tried '{}', 'main')",
+                    "no executable found in plugin '{}' (tried '{}', '{}', 'main', and directory scan)",
+                    manifest.name,
                     manifest.name,
                     dir_name
                 )
