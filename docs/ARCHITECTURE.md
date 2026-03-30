@@ -2,13 +2,12 @@
 
 ## Overview
 
-octos is a 15-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is an 18-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 **Workspace members**:
-- **6 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli
-- **1 pipeline crate**: octos-pipeline
-- **7 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather
-- **1 platform-skill crate**: asr
+- **8 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin
+- **9 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather, wechat-bridge, pipeline-guard
+- **1 platform-skill crate**: voice
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -246,11 +245,12 @@ pub struct CreateParams {
 | Ollama | — | localhost:11434/v1 | llama3.2 | (none) |
 | vLLM | — | (user-provided) | (user-provided) | VLLM_API_KEY |
 
-### Anthropic-Compatible Provider
+### Anthropic-Compatible Providers
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
 | Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| R9S | r9s.ai | api.r9s.ai/v1 | claude-sonnet-4-6 | R9S_API_KEY |
 
 ### ModelHints (OpenAI provider)
 
@@ -572,7 +572,7 @@ pub struct ToolResult {
 
 **ToolRegistry**: `HashMap<String, Arc<dyn Tool>>` with `provider_policy: Option<ToolPolicy>` for soft filtering.
 
-### Built-in Tools (14)
+### Built-in Tools
 
 | Tool | Parameters | Key Behavior |
 |---|---|---|
@@ -590,8 +590,18 @@ pub struct ToolResult {
 | **spawn** | task, label?, mode="background", allowed_tools, context? | Subagent with inherited provider policy. sync=inline, background=async. **Gateway-only** |
 | **cron** | action, message, schedule params | Schedule add/list/remove/enable/disable. **Gateway-only** |
 | **browser** | action, url?, selector?, text?, expression? | Headless Chrome via CDP (always compiled). Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
+| **send_file** | path, caption? | Delivers files to chat channels via OutboundMessage. Path validated against `data_dir`. **Gateway-only** |
+| **git** | subcommand, args | Git operations within workspace |
+| **diff_edit** | path, diff | Unified diff with fuzzy matching (+-3 lines), reverse hunk application |
+| **save_memory** | key, content | Persist memory entries |
+| **recall_memory** | query | Retrieve relevant memories via hybrid search |
+| **deep_search** | query | Multi-step research with web search + synthesis |
+| **site_crawl** | url, depth? | Crawl website pages for content extraction |
+| **take_photo** | — | Camera capture (platform-skill integration) |
+| **code_structure** | path? | Extract code structure (AST-based) |
+| **manage_skills** | action, name? | List/install/remove skills programmatically |
 
-**Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, and cron are registered only in gateway mode (`gateway.rs`).
+**Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 
 ### Tool Policies
 
@@ -735,11 +745,7 @@ pub struct SkillsLoader {
 #### Built-in Skills (3, compile-time `include_str!()`)
 
 ```rust
-pub struct BuiltinSkill {
-    pub name: &'static str,
-    pub content: &'static str,  // full SKILL.md including frontmatter
-}
-pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
+pub const BUILTIN_SKILLS: &[(&str, &str)] = &[...];  // (name, content) pairs
 ```
 
 | Skill | Purpose |
@@ -747,8 +753,6 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[...];
 | cron | Task scheduling instructions |
 | skill-store | Skill store browsing and installation |
 | skill-creator | Create new skills |
-| tmux | Terminal multiplexer control |
-| weather | Weather information retrieval |
 
 #### CLI Management (`octos skills`)
 
@@ -784,15 +788,23 @@ Plugins extend the agent with external tools via standalone executables. Each pl
 
 ```rust
 pub struct PluginManifest {
-    pub name: String,
+    pub id: String,                       // kebab-case, alias "name" for legacy
     pub version: String,
-    pub tools: Vec<PluginToolDef>,    // default: empty vec
+    pub plugin_type: Option<PluginType>,  // Tool | Skill | Channel | Hook (inferred if absent)
+    pub binary: Option<String>,           // executable filename, default: "main"
+    pub timeout_secs: Option<u64>,        // tool call timeout
+    pub tools: Vec<PluginToolDef>,        // default: empty vec
+    pub hooks: Vec<String>,              // hook event names (hook-type)
+    pub requires: Option<Requirements>,  // bins, env, os gating
+    pub config_schema: Option<Value>,    // plugin-specific config
+    pub install: Vec<InstallSpec>,       // install steps (brew, apt, cargo, url)
 }
 
 pub struct PluginToolDef {
     pub name: String,                 // must be unique across all plugins
     pub description: String,
     pub input_schema: serde_json::Value,  // default: {"type": "object"}
+    pub spawn_only: bool,             // auto-redirect to background execution
 }
 ```
 
@@ -823,12 +835,14 @@ pub struct PluginLoader;  // stateless, all methods are associated functions
 **`load_into(registry, dirs)`**:
 1. Scan each directory for subdirectories
 2. For each subdirectory, look for `manifest.json`
-3. Parse manifest, find executable (try directory name first, then `main`)
-4. Validate executable permissions (Unix: `mode & 0o111 != 0`; non-Unix: existence check)
-5. Wrap each tool definition as a `PluginTool` implementing the `Tool` trait
-6. Register into `ToolRegistry`
-7. Log warning: `"loaded unverified plugin (no signature check)"`
-8. Return total tool count. Failed plugins are skipped with warning, not fatal.
+3. Parse manifest, find executable (try manifest name, dir name, `main`, or any executable in dir)
+4. Validate executable permissions (Unix: `mode & 0o111 != 0`; non-Unix: existence check). Symlinks rejected via `symlink_metadata()`
+5. If `sha256` in manifest: hash-verify executable, write verified copy to `.{name}_verified` with `0o500` perms (TOCTOU-safe)
+6. Wrap each tool definition as a `PluginTool` implementing the `Tool` trait
+7. Register into `ToolRegistry`; mark `spawn_only` tools via `registry.mark_spawn_only()`
+8. Collect `SkillExtras` (MCP servers, hooks, prompt fragments, spawn_only tool names)
+9. Auto-inject `SKILL.md` as system prompt fragment when skill has spawn_only tools
+10. Return total tool count. Failed plugins are skipped with warning, not fatal.
 
 #### PluginTool — Execution Protocol
 
@@ -855,6 +869,14 @@ pub struct PluginTool {
 - Spawn failure → eyre error with plugin name and executable path
 - Timeout → eyre error with plugin name, tool name, and duration
 - JSON parse failure → graceful fallback to raw output
+
+#### spawn_only Tools
+
+Plugin tools marked `spawn_only: true` in `manifest.json` are auto-intercepted during execution. Instead of running inline, the tool call is wrapped in `tokio::spawn` and returns immediately with "Background task started". No LLM cooperation needed — works transparently with any model.
+
+**Mechanism** (`execution.rs`): When a tool call targets a `spawn_only` tool, the execution loop wraps it in a background tokio task. The tool runs directly (not via a subagent LLM), and any `files_to_send` in the result are auto-dispatched via the session's outbound channel.
+
+**Visibility**: spawn_only tools remain visible in tool specs (the LLM can see and call them). They are protected from LRU eviction via `base_tools`.
 
 ### Progress Reporting
 
@@ -1144,6 +1166,20 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 ### Session Compaction (Gateway)
 
 Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summarizes older messages via LLM to <500 words. Rewrites JSONL session file.
+
+---
+
+## octos-plugin — Plugin SDK
+
+Standalone crate for plugin manifest parsing, discovery, and gating. Used by `octos-agent/src/plugins/` for loading plugins at runtime.
+
+**PluginType** enum: `Tool`, `Skill`, `Channel`, `Hook`. Inferred from manifest if not explicit (`tools` non-empty → Tool, else Skill).
+
+**Requirements** gating: checks binary existence on PATH (`bins`), environment variables (`env`), and OS constraints (`os`). All must pass for plugin to load.
+
+**InstallSpec**: Declarative install steps with `kind` (brew, apt, cargo, url), platform-specific formulas/packages, and provided binary names.
+
+**Discovery** (`discovery.rs`): Scans plugin directories with precedence (local `.octos/plugins/` before global `~/.octos/plugins/`).
 
 ---
 

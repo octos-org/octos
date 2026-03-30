@@ -227,7 +227,7 @@ All backends remove these from the child process environment before execution.
 `octos-agent/src/plugins/loader.rs` handles plugin loading with integrity verification:
 
 1. **Manifest parsing**: `manifest.json` must exist and contain valid JSON with tool definitions.
-2. **Executable discovery**: Tries directory name, then `main`. Must be executable (`mode & 0o111 != 0` on Unix).
+2. **Executable discovery**: Tries manifest name, directory name, `main`, or any executable in directory. Must be executable (`mode & 0o111 != 0` on Unix). Symlinks rejected via `symlink_metadata()`.
 3. **Size limit**: 100 MB maximum executable size (checked before reading into memory).
 4. **SHA-256 verification**: If `sha256` is present in manifest, the executable bytes are hashed and compared. Mismatch = reject.
 5. **TOCTOU-safe execution**: After verification, the exact bytes read are written to a `.{name}_verified` sibling file with `0o500` permissions (read+execute, no write). `PluginTool` executes this verified copy, not the original. This prevents swapping the binary after hash verification.
