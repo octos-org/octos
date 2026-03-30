@@ -352,16 +352,17 @@ impl Tool for SpawnTool {
                 tools.set_provider_policy(pp.clone());
             }
             let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
-            // Base prompt: use configured worker prompt if available.
+            // Base prompt: configured worker prompt, or compiled-in default.
             // Additional instructions are appended, never replacing the base.
-            let base_prompt = self.worker_prompt.clone().unwrap_or_default();
+            let base_prompt = self
+                .worker_prompt
+                .clone()
+                .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
             let full_prompt = match &input.additional_instructions {
-                Some(extra) => format!("{base_prompt}\n\n{extra}"),
-                None => base_prompt,
+                Some(extra) if !extra.is_empty() => format!("{base_prompt}\n\n{extra}"),
+                _ => base_prompt,
             };
-            if !full_prompt.is_empty() {
-                worker = worker.with_system_prompt(full_prompt);
-            }
+            worker = worker.with_system_prompt(full_prompt);
 
             let subtask = Task::new(
                 TaskKind::Code {
@@ -428,14 +429,13 @@ impl Tool for SpawnTool {
                     tools.set_provider_policy(pp);
                 }
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
-                let base_prompt = default_worker_prompt.unwrap_or_default();
+                let base_prompt = default_worker_prompt
+                    .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
-                    Some(extra) => format!("{base_prompt}\n\n{extra}"),
-                    None => base_prompt,
+                    Some(extra) if !extra.is_empty() => format!("{base_prompt}\n\n{extra}"),
+                    _ => base_prompt,
                 };
-                if !full_prompt.is_empty() {
-                    worker = worker.with_system_prompt(full_prompt);
-                }
+                worker = worker.with_system_prompt(full_prompt);
 
                 let subtask = Task::new(
                     TaskKind::Code {
