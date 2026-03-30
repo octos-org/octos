@@ -523,43 +523,50 @@
                     <span data-lang="en">Auth Token (save this!)</span><span data-lang="zh">认证令牌（请妥善保存！）</span>
                 </p>
                 <p class="token" id="resultToken"></p>
+                <p style="margin-top: 12px; margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
+                    <span data-lang="en">SSH Port</span><span data-lang="zh">SSH 端口</span>
+                </p>
+                <p class="token" id="resultSshPort"></p>
                 <p style="margin-top: 16px; font-size: 13px; color: var(--text-dim);">
-                    <span data-lang="en">Run this on your Mac Mini to set up:</span>
-                    <span data-lang="zh">在你的 Mac Mini 上运行以下命令完成配置：</span>
+                    <span data-lang="en">Run this on your Mac Mini to install octos + tunnel:</span>
+                    <span data-lang="zh">在你的 Mac Mini 上运行以下命令安装 octos + 隧道：</span>
                 </p>
                 <div style="background: var(--bg); border-radius: 8px; padding: 12px; margin-top: 8px; overflow-x: auto;">
                     <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
                 </div>
+                <p style="margin-top: 12px; font-size: 12px; color: var(--text-dim);">
+                    <span data-lang="en">Note: You'll need the frps token from your admin to complete tunnel setup.</span>
+                    <span data-lang="zh">注意：你需要管理员提供的 frps 令牌来完成隧道配置。</span>
+                </p>
             </div>
         </div>
         <!-- Installation code block -->
         <div class="code-block">
-            <pre><span class="comment" data-lang="en"># After registration, you'll get a setup command. Run it on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，你会获得一条安装命令。在你的 Mac Mini 上运行：</span>
+            <pre><span class="comment" data-lang="en"># After registration, run the install command on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，在你的 Mac Mini 上运行安装命令：</span>
 
-<span class="cmd">curl -fsSL</span> https://octos-cloud.org/api/admin/tenants/alice/setup-script <span class="cmd">| bash</span>
+<span class="cmd">curl -fsSL</span> https://github.com/octos-org/octos/releases/latest/download/install.sh <span class="cmd">| bash -s --</span> \
+  <span class="flag">--tenant-name</span> alice <span class="flag">--ssh-port</span> 6001 <span class="flag">--frps-token</span> &lt;token&gt;
 
-<span class="output">  ==> Setting up octos tunnel for alice.octos-cloud.org
-  ==> Installing frpc...         frpc installed
-  ==> Writing frpc config...     /etc/frp/frpc.toml
-  ==> Starting services...       launchd service loaded (io.octos.frpc)
-  ==> Done!</span>
-
-<span class="comment" data-lang="en"># Or use the full bootstrap script (installs octos + frpc + dashboard):</span><span class="comment" data-lang="zh"># 或使用完整安装脚本（安装 octos + frpc + 管理面板）：</span>
-
-<span class="cmd">./scripts/frp/bootstrap-tenant.sh</span> alice cloud@10.0.1.50 <span class="flag">--password</span> ****
-
-<span class="output">  ==> Building octos (release, all features)...
-  ==> Uploading binaries...      10 binaries uploaded
-  ==> Installing frpc...         frpc v0.61.1
-  ==> Writing frpc config...     tunnel configured
-  ==> Starting services...       launchd services started
-  ==> Verifying...
-      octos serve: RUNNING on port 8080
-      frpc:        RUNNING
-      tunnel:      CONNECTED</span>
+<span class="output">  ==> Detecting platform
+      OK: Darwin arm64 (aarch64-apple-darwin)
+  ==> Checking runtime dependencies
+      OK: git 2.50.1
+      OK: Node.js v25.5.0
+  ==> Installing octos
+      OK: binaries installed to ~/.octos/bin
+  ==> Setting up octos serve
+      OK: octos serve started via launchd
+  ==> Tunnel setup
+      OK: frpc installed
+      OK: frpc config written to /etc/frp/frpc.toml
+      OK: frpc started via launchd
+  ==> Installation complete!</span>
 
 <span class="comment" data-lang="en"># Your dashboard is live!</span><span class="comment" data-lang="zh"># 你的面板已上线！</span>
-<span class="cmd">open</span> https://alice.octos-cloud.org</pre>
+<span class="cmd">open</span> https://alice.octos-cloud.org
+
+<span class="comment" data-lang="en"># Troubleshoot anytime:</span><span class="comment" data-lang="zh"># 随时诊断问题：</span>
+<span class="cmd">curl</span> -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | <span class="cmd">bash</span> -s -- <span class="flag">--doctor</span></pre>
         </div>
     </div>
 </section>
@@ -773,8 +780,13 @@ async function handleRegister(e) {
         result.style.display = 'block';
         document.getElementById('resultUrl').textContent = 'https://' + tenant.subdomain + '.octos-cloud.org';
         document.getElementById('resultToken').textContent = tenant.auth_token;
+        document.getElementById('resultSshPort').textContent = tenant.ssh_port;
         document.getElementById('resultCmd').textContent =
-            'curl -fsSL https://octos-cloud.org/api/admin/tenants/' + tenant.id + '/setup-script | bash';
+            'curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \\\n' +
+            '  --tenant-name ' + tenant.subdomain + ' \\\n' +
+            '  --auth-token ' + tenant.auth_token + ' \\\n' +
+            '  --ssh-port ' + tenant.ssh_port + ' \\\n' +
+            '  --frps-token <YOUR_FRPS_TOKEN>';
 
     } catch (e) {
         const isZh = document.body.getAttribute('data-active-lang') === 'zh';
