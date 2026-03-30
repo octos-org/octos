@@ -983,11 +983,7 @@ esac
 # Pre-built binaries are only available for these combinations.
 # Fail early instead of downloading a 404.
 case "$TRIPLE" in
-    aarch64-apple-darwin|x86_64-unknown-linux-gnu) ;; # published in release workflow
-    aarch64-unknown-linux-gnu)
-        err "Linux ARM64 (aarch64) does not have pre-built binaries yet."
-        hint "Build from source: cargo install --path crates/octos-cli"
-        ;;
+    aarch64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;; # published in release workflow
     x86_64-apple-darwin)
         err "macOS x86_64 does not have pre-built binaries yet."
         hint "Build from source: cargo install --path crates/octos-cli"
