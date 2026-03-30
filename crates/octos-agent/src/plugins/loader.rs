@@ -100,6 +100,9 @@ impl PluginLoader {
                         // Defer spawn_only tools so they're hidden from main session specs
                         // but still registered (available in spawn subagent registries).
                         if !spawn_only.is_empty() {
+                            for name in &spawn_only {
+                                registry.mark_spawn_only(name);
+                            }
                             registry.defer(spawn_only.iter().cloned());
                             tracing::info!(
                                 tools = %spawn_only.join(", "),

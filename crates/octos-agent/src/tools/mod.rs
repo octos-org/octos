@@ -178,6 +178,8 @@ pub struct ToolRegistry {
     lifecycle: std::sync::Mutex<ToolLifecycle>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
+    /// Tools that are permanently deferred (spawn_only) — cannot be activated by activate_tools.
+    spawn_only: HashSet<String>,
 }
 
 impl Default for ToolRegistry {
@@ -197,12 +199,18 @@ impl ToolRegistry {
             deferred: std::sync::Mutex::new(HashSet::new()),
             lifecycle: std::sync::Mutex::new(ToolLifecycle::default()),
             plugin_tools: HashSet::new(),
+            spawn_only: HashSet::new(),
         }
     }
 
     /// Mark a tool name as coming from a plugin binary.
     pub fn mark_as_plugin(&mut self, name: &str) {
         self.plugin_tools.insert(name.to_string());
+    }
+
+    /// Mark a tool as spawn_only (permanently deferred, not activatable).
+    pub fn mark_spawn_only(&mut self, name: &str) {
+        self.spawn_only.insert(name.to_string());
     }
 
     /// Check if a tool came from a plugin binary.
@@ -350,6 +358,7 @@ impl ToolRegistry {
             deferred: std::sync::Mutex::new(deferred),
             lifecycle: std::sync::Mutex::new(lifecycle),
             plugin_tools: self.plugin_tools.clone(),
+            spawn_only: self.spawn_only.clone(),
         }
     }
 
@@ -389,11 +398,12 @@ impl ToolRegistry {
 
         if let Some(info) = policy::tool_group_info(group_or_name) {
             for &tool in info.tools {
-                if deferred.remove(tool) {
+                // Never activate spawn_only tools — they must be used via spawn subagent
+                if !self.spawn_only.contains(tool) && deferred.remove(tool) {
                     activated.push(tool.to_string());
                 }
             }
-        } else if deferred.remove(group_or_name) {
+        } else if !self.spawn_only.contains(group_or_name) && deferred.remove(group_or_name) {
             activated.push(group_or_name.to_string());
         }
 
