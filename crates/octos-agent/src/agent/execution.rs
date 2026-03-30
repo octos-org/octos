@@ -102,51 +102,71 @@ impl Agent {
                         }
                     }
 
-                    // Auto-redirect spawn_only tools to background spawn.
-                    // The LLM calls fm_tts directly, but we intercept and run it
-                    // in a spawn subagent so the session stays responsive.
+                    // Auto-background spawn_only tools: run the tool in a background
+                    // tokio task and return immediately. The tool's files_to_send
+                    // auto-delivers the result to the user. No subagent LLM needed.
                     if tools.is_spawn_only(&tc_name) {
                         tracing::info!(
                             tool = %tc_name,
-                            "auto-redirecting spawn_only tool to background spawn"
+                            "running spawn_only tool in background"
                         );
-                        let spawn_args = serde_json::json!({
-                            "task": format!("Call {} with these arguments and deliver the result: {}", tc_name, effective_args),
-                            "allowed_tools": [&tc_name, "send_file"],
-                            "mode": "background",
-                            "label": format!("{tc_name} (background)")
+                        let bg_tools = tools.clone();
+                        let bg_name = tc_name.clone();
+                        let bg_args = effective_args.clone();
+                        tokio::spawn(async move {
+                            match bg_tools.execute(&bg_name, &bg_args).await {
+                                Ok(r) => {
+                                    tracing::info!(
+                                        tool = %bg_name,
+                                        success = r.success,
+                                        "spawn_only background tool completed"
+                                    );
+                                    // Auto-send files from the background task
+                                    for file_path in &r.files_to_send {
+                                        let path_str = file_path.to_string_lossy().to_string();
+                                        tracing::info!(tool = %bg_name, file = %path_str, "background auto-sending file");
+                                        let send_args = serde_json::json!({"file_path": path_str});
+                                        match bg_tools.execute("send_file", &send_args).await {
+                                            Ok(sr) if sr.success => {
+                                                tracing::info!(tool = %bg_name, file = %path_str, "background file sent");
+                                            }
+                                            Ok(sr) => {
+                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %sr.output, "background file send failed");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %e, "background file send failed");
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tool = %bg_name,
+                                        error = %e,
+                                        "spawn_only background tool failed"
+                                    );
+                                }
+                            }
                         });
-                        let ctx = ToolContext {
-                            tool_id: tc_id.clone(),
-                            reporter: reporter.clone(),
-                        };
-                        let result = TOOL_CTX
-                            .scope(ctx, tools.execute("spawn", &spawn_args))
-                            .await;
-                        let duration = tool_start.elapsed();
-                        let (content, tool_success) = match result {
-                            Ok(r) => (r.output, r.success),
-                            Err(e) => (format!("Background task failed: {e}"), false),
-                        };
                         reporter.report(ProgressEvent::ToolCompleted {
                             name: tc_name.clone(),
                             tool_id: tc_id.clone(),
-                            success: tool_success,
-                            output_preview: octos_core::truncated_utf8(&content, 200, "..."),
-                            duration,
+                            success: true,
+                            output_preview: "Running in background — audio will be sent when ready.".into(),
+                            duration: tool_start.elapsed(),
                         });
                         return (
                             Message {
                                 role: MessageRole::Tool,
-                                content,
+                                content: "Task running in background. The audio will be automatically sent to the user when ready.".into(),
                                 media: vec![],
                                 tool_calls: None,
                                 tool_call_id: Some(tc_id),
                                 reasoning_content: None,
                                 timestamp: chrono::Utc::now(),
                             },
-                            None,  // file_modified
-                            None,  // tokens_used
+                            None,
+                            None,
                         );
                     }
 
