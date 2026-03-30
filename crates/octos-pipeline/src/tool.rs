@@ -285,6 +285,7 @@ impl Tool for RunPipelineTool {
         // Find the report file from this pipeline run's actual files_modified.
         // The session actor auto-delivers .md files via file_modified on ToolResult,
         // so no LLM instruction needed.
+        // Ensure absolute path so session actor can find and deliver the file.
         let report_file = result
             .files_modified
             .iter()
@@ -292,10 +293,23 @@ impl Tool for RunPipelineTool {
                 let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 name.ends_with(".md") && !name.starts_with("_search")
             })
-            .cloned();
+            .map(|f| {
+                if f.is_absolute() {
+                    f.clone()
+                } else {
+                    std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
+                }
+            });
         if let Some(ref path) = report_file {
             tracing::info!(file = %path.display(), "pipeline produced report file");
         }
+
+        // Also set files_to_send so the execution loop auto-delivers
+        let files_to_send = report_file
+            .iter()
+            .filter(|p| p.exists())
+            .cloned()
+            .collect();
 
         Ok(ToolResult {
             output: format!(
@@ -305,6 +319,7 @@ impl Tool for RunPipelineTool {
             success: result.success,
             tokens_used: Some(result.token_usage),
             file_modified: report_file,
+            files_to_send,
             ..Default::default()
         })
     }

@@ -2098,6 +2098,15 @@ impl SessionActor {
                 // Auto-deliver report files produced by the agent (e.g. from run_pipeline).
                 // This ensures the file reaches the user's channel (Telegram, web, etc.)
                 // without relying on the LLM to call send_file within its token budget.
+                if conv_response.files_modified.is_empty() {
+                    tracing::debug!(session = %self.session_key, "no files_modified in conv_response");
+                } else {
+                    tracing::info!(
+                        session = %self.session_key,
+                        files = ?conv_response.files_modified.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                        "conv_response has files_modified"
+                    );
+                }
                 for file in &conv_response.files_modified {
                     if file.extension().and_then(|e| e.to_str()) == Some("md") {
                         // Resolve relative paths to absolute so the file URL works
