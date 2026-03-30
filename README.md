@@ -29,6 +29,29 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
 - **Sandbox isolation**: bwrap + sandbox-exec + Docker. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
+## Install on a Fresh Mac
+
+For standalone Mac Mini or other macOS systems — no Rust, Xcode, or development tools required. One command on a fresh machine:
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+```
+
+This installs the `octos` binary to `~/.octos/bin`, initializes the workspace, and sets up `octos serve` as a system service via launchd.
+
+With tunnel options (remote access via frpc):
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
+  --tenant-name alice --frps-token <token>
+```
+
+Diagnose an existing installation:
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/octos-doctor.sh | bash
+```
+
 ## Quick Start
 
 ```bash
