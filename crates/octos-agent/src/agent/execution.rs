@@ -158,7 +158,7 @@ impl Agent {
                         return (
                             Message {
                                 role: MessageRole::Tool,
-                                content: "Task running in background. The audio will be automatically sent to the user when ready.".into(),
+                                content: "SUCCESS: Audio generation started in background. The file will be delivered to the user automatically when ready. Do NOT call fm_tts again — the task is already running.".into(),
                                 media: vec![],
                                 tool_calls: None,
                                 tool_call_id: Some(tc_id),
