@@ -15,10 +15,26 @@ set -euo pipefail
 PREFIX="${OCTOS_PREFIX:-$HOME/.octos/bin}"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 
+needval() {
+    # Ensure that option "$1" has a non-empty value in "$2".
+    if [ "$#" -lt 2 ] || [ -z "${2-}" ]; then
+        echo "Option $1 requires an argument" >&2
+        exit 1
+    fi
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --prefix)   PREFIX="$2"; shift 2 ;;
-        --data-dir) DATA_DIR="$2"; shift 2 ;;
+        --prefix)
+            needval "$1" "${2-}"
+            PREFIX="$2"
+            shift 2
+            ;;
+        --data-dir)
+            needval "$1" "${2-}"
+            DATA_DIR="$2"
+            shift 2
+            ;;
         --help|-h)
             cat << 'HELPEOF'
 octos-doctor.sh — Diagnose octos installation and service health.
