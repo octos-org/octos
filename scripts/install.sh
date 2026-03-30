@@ -1137,7 +1137,7 @@ if [ ! -d "$DATA_DIR" ]; then
     # DATA_DIR.  When DATA_DIR is the default ~/.octos we can let init create
     # it; otherwise we set up the directory structure directly.
     if [ "$DATA_DIR" = "$HOME/.octos" ]; then
-        "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
+        "$PREFIX/octos" init --cwd "$HOME" --defaults 2>/dev/null || "$PREFIX/octos" init --cwd "$HOME" 2>/dev/null || true
         ok "workspace initialized via octos init"
     else
         mkdir -p "$DATA_DIR"
