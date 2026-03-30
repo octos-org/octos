@@ -35,18 +35,68 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-aarch64-apple-darwin
+          path: octos-bundle-aarch64-apple-darwin.tar.gz
+
+  build-linux-x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set build metadata
+        run: |
+          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build octos CLI
+        run: cargo build --release -p octos-cli --features "api,telegram,discord,feishu,twilio,wecom,wecom-bot"
+
+      - name: Build app-skill binaries
+        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p clock -p weather
+
+      - name: Bundle release tarball
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager clock weather; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-x86_64-unknown-linux-gnu
+          path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+
+  release:
+    needs: [build-macos-arm, build-linux-x86]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Install git-cliff
         run: cargo install git-cliff --locked
 
       - name: Generate release notes
-        run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          git-cliff --latest --strip header -o RELEASE_NOTES.md
+        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            octos-bundle-aarch64-apple-darwin.tar.gz
+            artifacts/octos-bundle-aarch64-apple-darwin/octos-bundle-aarch64-apple-darwin.tar.gz
+            artifacts/octos-bundle-x86_64-unknown-linux-gnu/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
             scripts/install.sh
             scripts/octos-doctor.sh
           body_path: RELEASE_NOTES.md
