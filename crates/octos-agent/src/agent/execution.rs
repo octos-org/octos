@@ -102,6 +102,54 @@ impl Agent {
                         }
                     }
 
+                    // Auto-redirect spawn_only tools to background spawn.
+                    // The LLM calls fm_tts directly, but we intercept and run it
+                    // in a spawn subagent so the session stays responsive.
+                    if tools.is_spawn_only(&tc_name) {
+                        tracing::info!(
+                            tool = %tc_name,
+                            "auto-redirecting spawn_only tool to background spawn"
+                        );
+                        let spawn_args = serde_json::json!({
+                            "task": format!("Call {} with these arguments and deliver the result: {}", tc_name, effective_args),
+                            "allowed_tools": [&tc_name, "send_file"],
+                            "mode": "background",
+                            "label": format!("{tc_name} (background)")
+                        });
+                        let ctx = ToolContext {
+                            tool_id: tc_id.clone(),
+                            reporter: reporter.clone(),
+                        };
+                        let result = TOOL_CTX
+                            .scope(ctx, tools.execute("spawn", &spawn_args))
+                            .await;
+                        let duration = tool_start.elapsed();
+                        let (content, tool_success) = match result {
+                            Ok(r) => (r.output, r.success),
+                            Err(e) => (format!("Background task failed: {e}"), false),
+                        };
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: tool_success,
+                            output_preview: octos_core::truncated_utf8(&content, 200, "..."),
+                            duration,
+                        });
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            None,  // file_modified
+                            None,  // tokens_used
+                        );
+                    }
+
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),

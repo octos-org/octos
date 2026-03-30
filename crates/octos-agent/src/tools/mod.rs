@@ -208,9 +208,15 @@ impl ToolRegistry {
         self.plugin_tools.insert(name.to_string());
     }
 
-    /// Mark a tool as spawn_only (permanently deferred, not activatable).
+    /// Mark a tool as spawn_only. The tool stays visible to the LLM but when called,
+    /// the execution loop auto-redirects it to a background spawn subagent.
     pub fn mark_spawn_only(&mut self, name: &str) {
         self.spawn_only.insert(name.to_string());
+    }
+
+    /// Check if a tool is marked spawn_only.
+    pub fn is_spawn_only(&self, name: &str) -> bool {
+        self.spawn_only.contains(name)
     }
 
     /// Check if a tool came from a plugin binary.

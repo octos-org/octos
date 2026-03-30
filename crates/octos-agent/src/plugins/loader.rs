@@ -103,10 +103,11 @@ impl PluginLoader {
                             for name in &spawn_only {
                                 registry.mark_spawn_only(name);
                             }
-                            registry.defer(spawn_only.iter().cloned());
+                            // Don't defer — tool stays visible to LLM.
+                            // The execution loop auto-redirects calls to background spawn.
                             tracing::info!(
                                 tools = %spawn_only.join(", "),
-                                "deferred spawn-only tools"
+                                "registered spawn-only tools (auto-redirect to background)"
                             );
                         }
                         result.tool_count += n;
