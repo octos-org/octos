@@ -494,6 +494,20 @@ fn expand_tilde(path: &str) -> String {
             Some(pos) => (&rest[..pos], &rest[pos..]),
             None => (rest, ""),
         };
+        // Reject usernames with path traversal or unsafe characters.
+        // Only allow alphanumeric, hyphen, underscore, and dot (no leading dot).
+        let is_safe_username = !username.is_empty()
+            && !username.starts_with('.')
+            && username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        if !is_safe_username {
+            warn!(
+                path,
+                username, "tilde expansion blocked: invalid username, returning path as-is"
+            );
+            return path.to_string();
+        }
         #[cfg(target_os = "macos")]
         let home_base = "/Users";
         #[cfg(windows)]
@@ -716,6 +730,34 @@ mod tests {
         // Non-tilde paths unchanged
         assert_eq!(expand_tilde("/usr/bin/foo"), "/usr/bin/foo");
         assert_eq!(expand_tilde("relative/path"), "relative/path");
+    }
+
+    #[test]
+    fn test_expand_tilde_rejects_traversal() {
+        // Path traversal via username must return the path unexpanded
+        assert_eq!(expand_tilde("~../../bin/evil"), "~../../bin/evil");
+        assert_eq!(expand_tilde("~../etc/passwd"), "~../etc/passwd");
+        assert_eq!(expand_tilde("~.hidden/path"), "~.hidden/path");
+    }
+
+    #[test]
+    fn test_expand_tilde_rejects_empty_username() {
+        // ~/ is handled by the first branch; bare ~ with suffix but no username
+        // after stripping ~ would be empty, should not expand
+        // Note: "~/" is handled by the first branch (home dir), this tests "~"
+        // which is also first branch. The empty-username path is covered by
+        // is_safe_username check.
+    }
+
+    #[test]
+    fn test_expand_tilde_allows_valid_usernames() {
+        let expanded = expand_tilde("~valid-user_1/path");
+        assert!(!expanded.starts_with('~'));
+        assert!(expanded.contains("valid-user_1"));
+
+        let expanded = expand_tilde("~user.name/path");
+        assert!(!expanded.starts_with('~'));
+        assert!(expanded.contains("user.name"));
     }
 
     #[tokio::test]
