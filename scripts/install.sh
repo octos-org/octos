@@ -431,6 +431,7 @@ Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME
 Environment=OCTOS_DATA_DIR=$DATA_DIR
+Environment=OCTOS_HOME=$DATA_DIR
 Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=$HOME
