@@ -1,7 +1,22 @@
-//! Prompt injection detection and sanitization.
+//! Prompt injection detection and sanitization (defense-in-depth).
 //!
 //! Scans text (tool output, user messages) for prompt injection patterns
 //! and optionally defangs them before they enter the conversation history.
+//!
+//! **Not a security boundary.** This module detects naive plaintext injection
+//! attempts (e.g., "ignore previous instructions") via regex pattern matching.
+//! It is bypassed by: base64 encoding, URL encoding, HTML entities, Unicode
+//! homoglyphs, zero-width characters, and RTL override characters. These are
+//! documented as known limitations in the test suite.
+//!
+//! Architectural controls are the real mitigations:
+//! - **Sandbox isolation** prevents tool-level damage regardless of prompt state.
+//! - **Tool policy** (allow/deny lists) restricts which tools the agent can invoke.
+//! - **Human-in-the-loop** (hook `before_tool_call` with exit code 1) blocks
+//!   high-impact actions pending user approval.
+//!
+//! This module provides logging and best-effort sanitization as an additional
+//! layer, not as a substitute for the above.
 
 use std::ops::Range;
 use std::sync::LazyLock;
