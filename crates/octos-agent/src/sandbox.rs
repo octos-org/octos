@@ -39,8 +39,8 @@ pub const BLOCKED_ENV_VARS: &[&str] = &[
 /// Sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    /// Whether sandboxing is enabled.
-    #[serde(default)]
+    /// Whether sandboxing is enabled (default: true).
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
 
     /// Sandbox mode (auto-detect by default).
@@ -87,7 +87,7 @@ const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             mode: SandboxMode::Auto,
             allow_network: false,
             docker: DockerConfig::default(),
@@ -156,6 +156,10 @@ impl Default for DockerConfig {
             extra_binds: Vec::new(),
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_docker_image() -> String {
@@ -534,6 +538,11 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                 })
             } else {
+                tracing::warn!(
+                    "no sandbox backend found (bwrap, sandbox-exec, or docker). \
+                     Shell commands will run WITHOUT isolation. \
+                     Install a sandbox backend or set sandbox.enabled = false to silence this warning."
+                );
                 Box::new(NoSandbox)
             }
         }
@@ -574,7 +583,10 @@ mod tests {
 
     #[test]
     fn test_create_sandbox_disabled() {
-        let config = SandboxConfig::default();
+        let config = SandboxConfig {
+            enabled: false,
+            ..SandboxConfig::default()
+        };
         let sb = create_sandbox(&config);
         // Should be NoSandbox — just verify it doesn't panic
         let _cmd = sb.wrap_command("ls", Path::new("/tmp"));
@@ -953,7 +965,7 @@ mod tests {
     #[test]
     fn test_sandbox_config_default() {
         let config = SandboxConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled, "sandbox should be enabled by default");
         assert_eq!(config.mode, SandboxMode::Auto);
         assert!(!config.allow_network);
     }
@@ -972,10 +984,18 @@ mod tests {
     fn test_sandbox_config_serde_defaults() {
         // Empty JSON object should produce sensible defaults
         let config: SandboxConfig = serde_json::from_str("{}").unwrap();
-        assert!(!config.enabled);
+        assert!(config.enabled, "sandbox should be enabled by default when field is missing");
         assert_eq!(config.mode, SandboxMode::Auto);
         assert!(!config.allow_network);
         assert_eq!(config.docker.image, "ubuntu:24.04");
+    }
+
+    #[test]
+    fn test_sandbox_config_explicit_disable() {
+        // Users can explicitly disable sandboxing
+        let config: SandboxConfig =
+            serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!config.enabled);
     }
 
     // --- create_sandbox with SandboxMode::None ---
