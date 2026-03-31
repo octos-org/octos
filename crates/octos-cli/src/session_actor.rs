@@ -3016,6 +3016,7 @@ mod tests {
                         tool_calls: vec![],
                         stop_reason: StopReason::EndTurn,
                         usage: TokenUsage::default(),
+                        provider_index: None,
                     });
                 }
                 responses.remove(0)
@@ -3048,6 +3049,7 @@ mod tests {
                 output_tokens: 10,
                 ..Default::default()
             },
+            provider_index: None,
         }
     }
 

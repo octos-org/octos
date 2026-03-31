@@ -97,6 +97,7 @@ mod tests {
                 output_tokens,
                 ..Default::default()
             },
+            provider_index: None,
         }
     }
 

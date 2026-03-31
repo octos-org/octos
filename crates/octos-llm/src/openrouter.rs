@@ -173,6 +173,7 @@ impl LlmProvider for OpenRouterProvider {
                 output_tokens: api_response.usage.completion_tokens,
                 ..Default::default()
             },
+            provider_index: None,
         })
     }
 

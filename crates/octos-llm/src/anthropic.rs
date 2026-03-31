@@ -186,6 +186,7 @@ impl LlmProvider for AnthropicProvider {
                 output_tokens: api_response.usage.output_tokens,
                 ..Default::default()
             },
+            provider_index: None,
         })
     }
 

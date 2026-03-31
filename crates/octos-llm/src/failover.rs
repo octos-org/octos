@@ -37,6 +37,9 @@ pub struct ProviderChain {
     slots: Vec<ProviderSlot>,
     /// Number of consecutive failures before a provider is considered degraded.
     failure_threshold: u32,
+    /// Index of the last provider that returned a successful response.
+    /// Used by `report_late_failure` to penalize the correct provider.
+    last_success_index: AtomicU32,
     /// Wall-clock timeout for the entire chain (retry + failover included).
     max_request_duration: Option<Duration>,
 }
@@ -60,6 +63,7 @@ impl ProviderChain {
         Self {
             slots,
             failure_threshold: 3,
+            last_success_index: AtomicU32::new(0),
             max_request_duration: Some(DEFAULT_MAX_REQUEST_DURATION),
         }
     }
@@ -95,6 +99,7 @@ impl ProviderChain {
     }
 
     fn record_success(&self, index: usize) {
+        self.last_success_index.store(index as u32, Ordering::Relaxed);
         let prev = self.slots[index].failures.swap(0, Ordering::Relaxed);
         if prev > 0 {
             info!(
@@ -124,8 +129,9 @@ impl ProviderChain {
             }
 
             match slot.provider.chat(messages, tools, config).await {
-                Ok(response) => {
+                Ok(mut response) => {
                     self.record_success(idx);
+                    response.provider_index = Some(idx);
                     return Ok(response);
                 }
                 Err(e) => {
@@ -238,7 +244,7 @@ impl LlmProvider for ProviderChain {
     }
 
     fn report_late_failure(&self) {
-        let idx = self.pick_start();
+        let idx = self.last_success_index.load(Ordering::Relaxed) as usize;
         self.record_failure(idx);
     }
 }
@@ -291,6 +297,7 @@ mod tests {
                 tool_calls: vec![],
                 stop_reason: crate::types::StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                provider_index: None,
             })
         }
 
