@@ -95,6 +95,9 @@ pub struct ExecutorConfig {
     /// Shared shutdown signal — set to true to cancel all pipeline workers.
     /// Propagated to each worker agent's shutdown flag.
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum number of parallel workers for fan-out stages (default 8).
+    /// Prevents unbounded resource consumption under high parallelism.
+    pub max_parallel_workers: usize,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -755,9 +758,12 @@ impl PipelineExecutor {
 
                 let fan_start = Instant::now();
 
-                // Prepare and execute all targets concurrently
+                // Prepare and execute all targets concurrently, capped by semaphore
                 let total_targets = targets.len();
                 let par_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                    self.config.max_parallel_workers,
+                ));
                 let mut futures = Vec::new();
                 for target_id in &targets {
                     let target_node = graph
@@ -800,7 +806,9 @@ impl PipelineExecutor {
                     let par_done = par_completed.clone();
                     let par_node_label = node.label.as_deref().unwrap_or(&node.id).to_string();
 
+                    let sem = semaphore.clone();
                     futures.push(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
                         let start = Instant::now();
                         let result = execute_with_retries_static(
                             &handler,
@@ -1577,6 +1585,7 @@ mod tests {
             plugin_dirs: vec![],
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
         }
     }
 
