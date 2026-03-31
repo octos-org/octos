@@ -49,7 +49,7 @@ pub async fn maybe_compact_with_config(
     llm: &dyn LlmProvider,
     config: &CompactionConfig,
 ) -> Result<bool> {
-    let session = session_mgr.get_or_create(key);
+    let session = session_mgr.get_or_create(key).await;
     let total = session.messages.len();
 
     if total < config.threshold {
@@ -143,7 +143,7 @@ pub async fn maybe_compact_with_config(
 
     // Build the compacted message list before mutating in-memory state,
     // so a failed rewrite doesn't leave the session truncated.
-    let session = session_mgr.get_or_create(key);
+    let session = session_mgr.get_or_create(key).await;
     let recent: Vec<Message> = session.messages[to_summarize..].to_vec();
 
     let summary_msg = Message {
@@ -163,7 +163,7 @@ pub async fn maybe_compact_with_config(
     // Replace in-memory state only — the LLM sees the compacted context.
     // Do NOT rewrite the disk file — it stays append-only so the full
     // conversation history is preserved for the UI and future reference.
-    let session = session_mgr.get_or_create(key);
+    let session = session_mgr.get_or_create(key).await;
     let _original_count = session.messages.len();
     session.messages = compacted;
     session.updated_at = Utc::now();
