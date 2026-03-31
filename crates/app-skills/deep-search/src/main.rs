@@ -582,8 +582,14 @@ async fn web_search(
 
     // Default: race top 2 available engines in parallel.
     // Gives redundancy + speed without the resource explosion of fire-all.
-    // Priority: tavily > perplexity > brave > bing_cdp > duckduckgo
+    // Priority: serper > tavily > perplexity > brave > bing_cdp > duckduckgo
     let mut available: Vec<&str> = Vec::new();
+    if std::env::var("SERPER_API_KEY")
+        .ok()
+        .is_some_and(|k| !k.is_empty())
+    {
+        available.push("serper");
+    }
     if std::env::var("TAVILY_API_KEY")
         .ok()
         .is_some_and(|k| !k.is_empty())
@@ -661,6 +667,15 @@ async fn web_search(
 async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) -> SearchResult {
     let mut handles = Vec::new();
 
+    if let Ok(k) = std::env::var("SERPER_API_KEY") {
+        if !k.is_empty() {
+            let c = client.clone();
+            let q = query.to_string();
+            handles.push(tokio::spawn(async move {
+                ("serper", serper_search(&c, &q, count, &k).await)
+            }));
+        }
+    }
     if let Ok(k) = std::env::var("TAVILY_API_KEY") {
         if !k.is_empty() {
             let c = client.clone();
@@ -743,6 +758,10 @@ async fn try_engine(
     engine: &str,
 ) -> Option<SearchResult> {
     let r = match engine {
+        "serper" => {
+            let key = std::env::var("SERPER_API_KEY").ok()?;
+            serper_search(client, query, count, &key).await
+        }
         "tavily" => {
             let key = std::env::var("TAVILY_API_KEY").ok()?;
             tavily_search(client, query, count, &key).await
@@ -768,6 +787,88 @@ async fn try_engine(
     } else {
         None
     }
+}
+
+/// Serper.dev Google Search API.
+async fn serper_search(
+    client: &reqwest::Client,
+    query: &str,
+    count: u8,
+    api_key: &str,
+) -> SearchResult {
+    let response = match client
+        .post("https://google.serper.dev/search")
+        .header("X-API-KEY", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({"q": query, "num": count.min(10)}))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return SearchResult {
+                output: format!("Serper error: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return SearchResult {
+            output: format!("Serper HTTP {status}: {}", {
+                let mut end = text.len().min(200);
+                while !text.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                &text[..end]
+            }),
+            success: false,
+        };
+    }
+
+    let data: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return SearchResult {
+                output: format!("Serper parse error: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    let mut output = String::new();
+
+    if let Some(kg) = data.get("knowledgeGraph") {
+        if let Some(title) = kg["title"].as_str() {
+            output.push_str(&format!("**{}**", title));
+            if let Some(desc) = kg["description"].as_str() {
+                output.push_str(&format!(": {}", desc));
+            }
+            output.push_str("\n\n");
+        }
+    }
+
+    if let Some(results) = data["organic"].as_array() {
+        for (i, r) in results.iter().enumerate() {
+            let title = r["title"].as_str().unwrap_or("Untitled");
+            let link = r["link"].as_str().unwrap_or("");
+            let snippet = r["snippet"].as_str().unwrap_or("");
+            output.push_str(&format!(
+                "{}. [{}]({})\n{}\n\n",
+                i + 1,
+                title,
+                link,
+                snippet
+            ));
+        }
+    }
+
+    let success = !output.is_empty();
+    SearchResult { output, success }
 }
 
 /// Tavily AI-optimized search.
