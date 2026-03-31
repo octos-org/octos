@@ -3140,6 +3140,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -3226,6 +3227,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());
