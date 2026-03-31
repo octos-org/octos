@@ -327,19 +327,45 @@ impl Tool for PluginTool {
                 })
                 .unwrap_or_default();
 
-            // Auto-deliver output file when plugin didn't report it
+            // Auto-deliver output file when plugin didn't report it.
+            // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
-                effective_args.get("out").and_then(|v| v.as_str()).and_then(|p| {
+                // Try from `out` arg
+                let out_file = effective_args.get("out").and_then(|v| v.as_str()).and_then(|p| {
                     let path = std::path::PathBuf::from(p);
-                    let abs = if path.is_relative() {
-                        self.work_dir.as_ref().map(|d| d.join(&path)).unwrap_or(path)
-                    } else { path };
-                    if abs.exists() {
-                        tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
-                        files_to_send.push(abs.clone());
-                        Some(abs)
-                    } else { None }
-                })
+                    if path.is_absolute() && path.exists() {
+                        return Some(path);
+                    }
+                    // Try work_dir, then cwd
+                    let candidates: Vec<std::path::PathBuf> = [
+                        self.work_dir.as_ref().map(|d| d.join(&path)),
+                        std::env::current_dir().ok().map(|d| d.join(&path)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    candidates.into_iter().find(|c| c.exists())
+                });
+                // Also try parsing file path from output text (e.g. "Generated PPTX: path.pptx")
+                let from_output = if out_file.is_none() {
+                    output.lines().find_map(|line| {
+                        line.strip_prefix("Generated PPTX: ")
+                            .or_else(|| line.strip_prefix("Generated: "))
+                            .map(|p| std::path::PathBuf::from(p.trim()))
+                            .and_then(|path| {
+                                if path.exists() { return Some(path.clone()); }
+                                let in_work = self.work_dir.as_ref().map(|d| d.join(&path));
+                                let in_cwd = std::env::current_dir().ok().map(|d| d.join(&path));
+                                in_work.filter(|p| p.exists()).or_else(|| in_cwd.filter(|p| p.exists()))
+                            })
+                    })
+                } else { None };
+                let found = out_file.or(from_output);
+                if let Some(ref abs) = found {
+                    tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
+                    files_to_send.push(abs.clone());
+                }
+                found
             } else { file_modified };
 
             return Ok(ToolResult {
