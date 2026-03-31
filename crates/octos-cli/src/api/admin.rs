@@ -2433,7 +2433,7 @@ pub async fn read_session(
     let sm = octos_bus::SessionManager::open(&data_dir)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let key = octos_core::SessionKey(query.key.clone());
-    let session = sm.load(&key).ok_or((
+    let session = sm.load(&key).await.ok_or((
         StatusCode::NOT_FOUND,
         format!("session '{}' not found", query.key),
     ))?;

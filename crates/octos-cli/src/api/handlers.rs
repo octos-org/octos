@@ -142,7 +142,7 @@ async fn chat_sync(
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key);
+        let session = sess.get_or_create(&session_key).await;
         session.get_history(50).to_vec()
     };
 
@@ -196,7 +196,7 @@ async fn chat_streaming(
     // Load history before spawning
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key);
+        let session = sess.get_or_create(&session_key).await;
         session.get_history(50).to_vec()
     };
 
@@ -388,7 +388,7 @@ pub async fn session_messages(
         };
         let key = SessionKey::new("api", &id);
         let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&key);
+        let session = sess.get_or_create(&key).await;
         let messages: Vec<MessageInfo> = session
             .get_history(fetch_count)
             .iter()

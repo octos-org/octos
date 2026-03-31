@@ -193,7 +193,7 @@ impl GatewayDispatcher {
             let new_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             let preview = {
                 let mut mgr = self.session_mgr.lock().await;
-                let session = mgr.get_or_create(&new_key);
+                let session = mgr.get_or_create(&new_key).await;
                 let history = session.get_history(2);
                 if history.is_empty() {
                     String::new()

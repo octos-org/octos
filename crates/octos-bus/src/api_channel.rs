@@ -446,11 +446,12 @@ async fn handle_session_messages(
 
     let mut sess = state.sessions.lock().await;
     // Try primary key first, fall back to _main: prefixed key
-    let session = sess.get_or_create(&key);
+    let session = sess.get_or_create(&key).await;
     let history = session.get_history(fetch_count);
     let use_alt = history.is_empty();
     let history = if use_alt {
         sess.get_or_create(&alt_key)
+            .await
             .get_history(fetch_count)
             .to_vec()
     } else {
