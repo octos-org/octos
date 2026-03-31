@@ -401,11 +401,11 @@ Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.oc
 
 **Mitigation**: Session files have a 10 MB limit. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
 
-### 4.7 Sandbox Disabled by Default
+### 4.7 Sandbox Enabled by Default
 
-**Issue**: `SandboxConfig::default()` has `enabled: false`. Shell commands run without isolation unless explicitly configured.
+`SandboxConfig::default()` has `enabled: true` with `SandboxMode::Auto`. Auto-detection selects the best available backend (bwrap on Linux, sandbox-exec on macOS, Docker as fallback). If no backend is found, a prominent warning is logged and commands run unsandboxed.
 
-**Mitigation**: Enable sandboxing in production profile configs. Auto-detection (`SandboxMode::Auto`) selects the best available backend.
+Users can explicitly opt out with `"sandbox": {"enabled": false}` in config.
 
 ---
 
@@ -413,9 +413,9 @@ Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.oc
 
 Inspired by LAMP shared hosting's 25-year-old multi-tenant isolation model, which octos is essentially re-solving for AI agents. LAMP's key insight: **the kernel should enforce isolation, not application code**. Application-level checks (`resolve_path()`, tool policy) are defense-in-depth, not the primary boundary.
 
-### 5.1 Enable sandbox by default (short-term)
+### 5.1 ~~Enable sandbox by default~~ (DONE)
 
-Change `SandboxConfig::default()` to `enabled: true`. Auto-detection (`SandboxMode::Auto`) selects the best available backend. Every production profile should have kernel-enforced tool isolation with zero configuration.
+Completed. `SandboxConfig::default()` now has `enabled: true`. A warning is logged when no sandbox backend is found. See §3.7.
 
 ### 5.2 Per-profile UID isolation (medium-term, highest impact)
 
