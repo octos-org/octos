@@ -901,17 +901,16 @@ impl ProcessManager {
     /// Stop a managed bridge for a profile.
     /// Start a WeChat bridge subprocess. Returns the WS port.
     async fn start_wechat_bridge(&self, profile: &UserProfile) -> Result<u16> {
-        let bridges = self.bridges.read().await;
+        // Hold the write lock for the entire operation to prevent concurrent
+        // calls from allocating the same port (TOCTOU race).
+        let mut bridges = self.bridges.write().await;
         let key = format!("{}-wechat", profile.id);
         if bridges.contains_key(&key) {
             // Already running — return existing port
             return Ok(bridges[&key].ws_port);
         }
-        drop(bridges);
 
-        let bridges2 = self.bridges.read().await;
-        let ws_port = self.allocate_wechat_port(&bridges2);
-        drop(bridges2);
+        let ws_port = self.allocate_wechat_port(&bridges);
 
         // Resolve token from profile env_vars
         let token_env = profile
@@ -1030,24 +1029,9 @@ impl ProcessManager {
             });
         }
 
-        // Monitor process lifecycle
-        let key2 = key.clone();
-        let bridges_ref = self.bridges.clone();
-        let mut stop_rx2 = stop_rx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = child.wait() => {
-                    tracing::warn!("WeChat bridge exited");
-                }
-                _ = stop_rx2.changed() => {
-                    let _ = child.kill().await;
-                }
-            }
-            bridges_ref.write().await.remove(&key2);
-        });
-
-        self.bridges.write().await.insert(
-            key,
+        // Insert into map before releasing write lock to prevent races.
+        bridges.insert(
+            key.clone(),
             BridgeProcess {
                 pid,
                 ws_port,
@@ -1061,6 +1045,23 @@ impl ProcessManager {
                 stop_tx,
             },
         );
+        drop(bridges);
+
+        // Monitor process lifecycle
+        let key2 = key;
+        let bridges_ref = self.bridges.clone();
+        let mut stop_rx2 = stop_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = child.wait() => {
+                    tracing::warn!("WeChat bridge exited");
+                }
+                _ = stop_rx2.changed() => {
+                    let _ = child.kill().await;
+                }
+            }
+            bridges_ref.write().await.remove(&key2);
+        });
 
         // Wait a moment for the bridge to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
