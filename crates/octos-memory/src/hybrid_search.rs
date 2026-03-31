@@ -63,6 +63,11 @@ impl HybridIndex {
         }
     }
 
+    /// Returns true if no documents have been indexed.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
     /// Set custom hybrid scoring weights. Weights should sum to 1.0.
     pub fn with_weights(mut self, vector_weight: f32, bm25_weight: f32) -> Self {
         self.vector_weight = vector_weight;
