@@ -109,6 +109,12 @@ pub struct Config {
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
 
+    /// Enable the admin shell endpoint (POST /api/admin/shell).
+    /// Default: false. Only enable for development/debugging.
+    /// A leaked admin token with this enabled grants full server access.
+    #[serde(default)]
+    pub allow_admin_shell: bool,
+
     /// Dashboard user authentication configuration (email OTP).
     /// When set, enables multi-user login via email verification codes.
     #[cfg(feature = "api")]
@@ -1064,11 +1070,9 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.tool_policy_by_provider.len(), 2);
         assert!(config.tool_policy_by_provider.contains_key("gemini"));
-        assert!(
-            config
-                .tool_policy_by_provider
-                .contains_key("claude-sonnet-4-20250514")
-        );
+        assert!(config
+            .tool_policy_by_provider
+            .contains_key("claude-sonnet-4-20250514"));
     }
 
     #[test]
