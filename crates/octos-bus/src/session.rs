@@ -658,7 +658,9 @@ impl SessionManager {
                 updated_at: chrono::Utc::now(),
             };
             if let Ok(json) = serde_json::to_string(&meta) {
-                let _ = std::fs::write(&path, format!("{json}\n"));
+                if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
+                    warn!(path = %path.display(), error = %e, "failed to write session metadata");
+                }
             }
         }
     }

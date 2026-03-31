@@ -471,19 +471,16 @@ impl ProcessManager {
                     if let Some(weak) = pm_weak.clone() {
                         let pid2 = profile_id.clone();
                         let ps2 = profile_store_for_restart.clone();
-                        let handle = tokio::runtime::Handle::current();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            handle.block_on(async {
-                                if let Some(pm) = weak.upgrade() {
-                                    if let Ok(Some(profile)) = ps2.get(&pid2) {
-                                        tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
-                                        if let Err(e) = pm.start(&profile).await {
-                                            tracing::error!(profile = %pid2, error = %e, "auto-restart failed");
-                                        }
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if let Some(pm) = weak.upgrade() {
+                                if let Ok(Some(profile)) = ps2.get(&pid2) {
+                                    tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
+                                    if let Err(e) = pm.start(&profile).await {
+                                        tracing::error!(profile = %pid2, error = %e, "auto-restart failed");
                                     }
                                 }
-                            });
+                            }
                         });
                     }
                 }

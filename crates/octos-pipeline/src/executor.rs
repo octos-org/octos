@@ -301,6 +301,7 @@ fn extract_json_array(text: &str) -> Option<&str> {
 fn process_worker_results(
     results: Vec<(String, PipelineNode, Duration, Result<NodeOutcome>)>,
     bridge: Option<&PipelineStatusBridge>,
+    working_dir: &std::path::Path,
 ) -> (
     String,
     bool,
@@ -379,7 +380,7 @@ fn process_worker_results(
     // Resolve file references: if workers saved results to disk and output
     // directory paths, read the _search_results.md files and inline their
     // content. This ensures the converge node gets actual data, not just paths.
-    let merged_content = resolve_search_result_files(&merged_content);
+    let merged_content = resolve_search_result_files(&merged_content, working_dir);
 
     (merged_content, any_error, summaries, total_tokens, outcomes)
 }
@@ -388,7 +389,7 @@ fn process_worker_results(
 /// the `_search_results.md` file contents. Workers may output paths like
 /// "Results saved to: ./research/topic-slug/" — we find those directories
 /// and read their summary files so downstream nodes get actual content.
-fn resolve_search_result_files(content: &str) -> String {
+fn resolve_search_result_files(content: &str, working_dir: &std::path::Path) -> String {
     use std::path::Path;
 
     let mut result = content.to_string();
@@ -452,8 +453,8 @@ fn resolve_search_result_files(content: &str) -> String {
 
     // Also scan the working directory for recent research directories
     if appended.is_empty() {
-        // Fallback: if no paths found in content, look for research dirs in cwd
-        if let Ok(entries) = std::fs::read_dir("research") {
+        // Fallback: if no paths found in content, look for research dirs in working_dir
+        if let Ok(entries) = std::fs::read_dir(working_dir.join("research")) {
             let mut dirs: Vec<_> = entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir())
@@ -829,7 +830,7 @@ impl PipelineExecutor {
                 let results = futures::future::join_all(futures).await;
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(results, self.config.status_bridge.as_ref());
+                    process_worker_results(results, self.config.status_bridge.as_ref(), &self.config.working_dir);
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;
@@ -1126,7 +1127,7 @@ impl PipelineExecutor {
                 let results = futures::future::join_all(futures).await;
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(results, self.config.status_bridge.as_ref());
+                    process_worker_results(results, self.config.status_bridge.as_ref(), &self.config.working_dir);
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;
