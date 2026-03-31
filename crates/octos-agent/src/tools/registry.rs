@@ -71,6 +71,8 @@ pub struct ToolRegistry {
     spawn_only: HashSet<String>,
     /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
     spawn_only_messages: HashMap<String, String>,
+    /// Callback to notify session actor when background (spawn_only) tasks complete or fail.
+    background_result_sender: Option<super::spawn::BackgroundResultSender>,
 }
 
 impl Default for ToolRegistry {
@@ -92,6 +94,7 @@ impl ToolRegistry {
             plugin_tools: HashSet::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
+            background_result_sender: None,
         }
     }
 
@@ -119,6 +122,16 @@ impl ToolRegistry {
             .get(name)
             .cloned()
             .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string())
+    }
+
+    /// Set background result sender for spawn_only task lifecycle notifications.
+    pub fn set_background_result_sender(&mut self, sender: super::spawn::BackgroundResultSender) {
+        self.background_result_sender = Some(sender);
+    }
+
+    /// Get background result sender (cloned Arc).
+    pub fn background_result_sender(&self) -> Option<super::spawn::BackgroundResultSender> {
+        self.background_result_sender.clone()
     }
 
     /// Check if a tool came from a plugin binary.
@@ -268,6 +281,7 @@ impl ToolRegistry {
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
+            background_result_sender: self.background_result_sender.clone(),
         }
     }
 

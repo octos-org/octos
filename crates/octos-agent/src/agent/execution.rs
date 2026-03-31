@@ -113,12 +113,24 @@ impl Agent {
                         let bg_tools = tools.clone();
                         let bg_name = tc_name.clone();
                         let bg_args = effective_args.clone();
+                        let bg_sender = tools.background_result_sender();
                         tokio::spawn(async move {
-                            match bg_tools.execute(&bg_name, &bg_args).await {
-                                Ok(r) => {
+                            let mut result = bg_tools.execute(&bg_name, &bg_args).await;
+
+                            // Retry once on transient failure (e.g. ominix-api restart)
+                            if let Ok(ref r) = result {
+                                if !r.success && (r.output.contains("error sending request") || r.output.contains("connection refused")) {
+                                    tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    result = bg_tools.execute(&bg_name, &bg_args).await;
+                                }
+                            }
+
+                            match result {
+                                Ok(r) if r.success => {
                                     tracing::info!(
                                         tool = %bg_name,
-                                        success = r.success,
+                                        success = true,
                                         "spawn_only background tool completed"
                                     );
                                     // Auto-send files from the background task
@@ -138,13 +150,31 @@ impl Agent {
                                             }
                                         }
                                     }
+                                    // Notify session of success (if wired)
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✓ {} completed — file delivered", bg_name)).await;
+                                    }
+                                }
+                                Ok(r) => {
+                                    tracing::warn!(
+                                        tool = %bg_name,
+                                        error = %r.output,
+                                        "spawn_only background tool failed"
+                                    );
+                                    // Notify session of failure
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✗ {} failed: {}", bg_name, r.output)).await;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
                                         tool = %bg_name,
                                         error = %e,
-                                        "spawn_only background tool failed"
+                                        "spawn_only background tool error"
                                     );
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✗ {} error: {}", bg_name, e)).await;
+                                    }
                                 }
                             }
                         });
