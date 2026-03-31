@@ -19,10 +19,8 @@ use serenity::builder::{CreateAttachment, CreateEmbed, CreateMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
-
 use crate::channel::Channel;
+use crate::dedup::MessageDedup;
 use crate::media::download_media;
 
 pub struct DiscordChannel {
@@ -31,7 +29,7 @@ pub struct DiscordChannel {
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
     media_dir: PathBuf,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: Arc<MessageDedup>,
 }
 
 impl DiscordChannel {
@@ -48,22 +46,8 @@ impl DiscordChannel {
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             media_dir,
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: Arc::new(MessageDedup::new()),
         }
-    }
-
-    /// Check if a message ID has been seen; add if not.
-    #[cfg(test)]
-    fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(msg_id) {
-            return true;
-        }
-        if seen.len() >= MAX_SEEN_IDS {
-            seen.clear();
-        }
-        seen.insert(msg_id.to_string());
-        false
     }
 
     /// Parse an emoji string into a serenity ReactionType.
@@ -94,7 +78,7 @@ struct Handler {
     allowed_senders: HashSet<String>,
     media_dir: PathBuf,
     download_http: HttpClient,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: Arc<MessageDedup>,
 }
 
 #[async_trait]
@@ -105,17 +89,10 @@ impl EventHandler for Handler {
         }
 
         // Dedup: skip messages already seen (e.g. on reconnect)
-        {
-            let msg_id_str = msg.id.to_string();
-            let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.contains(&msg_id_str) {
-                debug!(msg_id = %msg_id_str, "Discord: dedup filtered message");
-                return;
-            }
-            if seen.len() >= MAX_SEEN_IDS {
-                seen.clear();
-            }
-            seen.insert(msg_id_str);
+        let msg_id_str = msg.id.to_string();
+        if self.dedup.is_duplicate(&msg_id_str) {
+            debug!(msg_id = %msg_id_str, "Discord: dedup filtered message");
+            return;
         }
 
         let sender_id = msg.author.id.to_string();
@@ -197,7 +174,7 @@ impl Channel for DiscordChannel {
             allowed_senders: self.allowed_senders.clone(),
             media_dir: self.media_dir.clone(),
             download_http: HttpClient::new(),
-            seen_ids: Arc::clone(&self.seen_ids),
+            dedup: Arc::clone(&self.dedup),
         };
 
         let mut client = Client::builder(&self.token, intents)
@@ -379,7 +356,7 @@ mod tests {
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             media_dir: PathBuf::from("/tmp/test-media"),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: Arc::new(MessageDedup::new()),
         }
     }
 
@@ -417,19 +394,9 @@ mod tests {
     #[test]
     fn test_dedup() {
         let ch = make_channel(vec![]);
-        assert!(!ch.dedup_check("msg1"));
-        assert!(ch.dedup_check("msg1")); // duplicate
-        assert!(!ch.dedup_check("msg2"));
-    }
-
-    #[test]
-    fn test_dedup_overflow_clears() {
-        let ch = make_channel(vec![]);
-        for i in 0..MAX_SEEN_IDS {
-            ch.dedup_check(&format!("msg_{i}"));
-        }
-        assert!(!ch.dedup_check("new_msg"));
-        assert!(!ch.dedup_check("msg_0"));
+        assert!(!ch.dedup.is_duplicate("msg1"));
+        assert!(ch.dedup.is_duplicate("msg1")); // duplicate
+        assert!(!ch.dedup.is_duplicate("msg2"));
     }
 
     #[test]

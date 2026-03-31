@@ -27,6 +27,7 @@ extern crate rustls;
 extern crate rustls_native_certs;
 
 use crate::channel::Channel;
+use crate::dedup::MessageDedup;
 
 /// QQ Bot token endpoint.
 const TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
@@ -38,8 +39,6 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 const RECONNECT_BASE_DELAY_MS: u64 = 5000;
 /// Max reconnect delay in milliseconds.
 const RECONNECT_MAX_DELAY_MS: u64 = 60000;
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
 /// Max message length for QQ Bot text messages.
 const MAX_MSG_LENGTH: usize = 4000;
 /// Safety margin before token expiry (seconds).
@@ -77,7 +76,7 @@ pub struct QQBotChannel {
     client_secret: String,
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: MessageDedup,
     http_client: Client,
     access_token: Arc<Mutex<Option<TokenState>>>,
     session_state: Arc<Mutex<Option<SessionState>>>,
@@ -99,7 +98,7 @@ impl QQBotChannel {
             client_secret: client_secret.to_string(),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             c2c_chats: Arc::new(std::sync::Mutex::new(HashSet::new())),
             http_client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -113,19 +112,6 @@ impl QQBotChannel {
 
     fn check_allowed(&self, sender_id: &str) -> bool {
         self.allowed_senders.is_empty() || self.allowed_senders.contains(sender_id)
-    }
-
-    /// Check if a message ID has been seen; add if not.
-    fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(msg_id) {
-            return true;
-        }
-        if seen.len() >= MAX_SEEN_IDS {
-            seen.clear();
-        }
-        seen.insert(msg_id.to_string());
-        false
     }
 
     /// Fetch or refresh the access token.
@@ -321,7 +307,7 @@ impl QQBotChannel {
             return None;
         }
 
-        if !msg_id.is_empty() && self.dedup_check(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!(msg_id, "QQBot: dedup filtered message");
             return None;
         }
@@ -369,7 +355,7 @@ impl QQBotChannel {
             return None;
         }
 
-        if !msg_id.is_empty() && self.dedup_check(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!(msg_id, "QQBot: dedup filtered C2C message");
             return None;
         }
@@ -773,7 +759,7 @@ mod tests {
             client_secret: "test_secret".into(),
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             c2c_chats: Arc::new(std::sync::Mutex::new(HashSet::new())),
             http_client: Client::new(),
             access_token: Arc::new(Mutex::new(None)),
@@ -810,19 +796,9 @@ mod tests {
     #[test]
     fn should_detect_duplicate_messages() {
         let bot = make_bot(vec![]);
-        assert!(!bot.dedup_check("msg1"));
-        assert!(bot.dedup_check("msg1"));
-        assert!(!bot.dedup_check("msg2"));
-    }
-
-    #[test]
-    fn should_clear_dedup_on_overflow() {
-        let bot = make_bot(vec![]);
-        for i in 0..MAX_SEEN_IDS {
-            bot.dedup_check(&format!("msg_{i}"));
-        }
-        assert!(!bot.dedup_check("new_msg"));
-        assert!(!bot.dedup_check("msg_0"));
+        assert!(!bot.dedup.is_duplicate("msg1"));
+        assert!(bot.dedup.is_duplicate("msg1"));
+        assert!(!bot.dedup.is_duplicate("msg2"));
     }
 
     #[test]
