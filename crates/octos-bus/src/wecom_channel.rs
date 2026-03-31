@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::channel::Channel;
+use crate::dedup::MessageDedup;
 use crate::media::{download_media, is_image};
 use crate::wecom_crypto::{
     decode_aes_key, decrypt_wecom_message, verify_wecom_signature, xml_extract,
@@ -25,8 +26,6 @@ use crate::wecom_crypto::{
 
 /// Token refresh interval (slightly under 2 hours).
 const TOKEN_TTL_SECS: u64 = 7000;
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
 /// WeCom API base URL.
 const WECOM_API: &str = "https://qyapi.weixin.qq.com/cgi-bin";
 
@@ -45,7 +44,7 @@ pub struct WeComChannel {
     http: Client,
     media_dir: PathBuf,
     token_cache: Arc<tokio::sync::Mutex<Option<(String, Instant)>>>,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: MessageDedup,
     webhook_port: u16,
 }
 
@@ -75,7 +74,7 @@ impl WeComChannel {
             http: Client::new(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             webhook_port: 9322,
         }
     }
@@ -212,26 +211,13 @@ impl WeComChannel {
         Ok(())
     }
 
-    /// Check if a message ID has been seen; add if not.
-    fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(msg_id) {
-            return true;
-        }
-        if seen.len() >= MAX_SEEN_IDS {
-            seen.clear();
-        }
-        seen.insert(msg_id.to_string());
-        false
-    }
-
     /// Parse a decrypted WeCom XML message into an InboundMessage.
     async fn parse_message(&self, xml: &str) -> Option<InboundMessage> {
         let msg_type = xml_extract(xml, "MsgType")?;
         let from_user = xml_extract(xml, "FromUserName")?;
         let msg_id = xml_extract(xml, "MsgId").unwrap_or_default();
 
-        if !msg_id.is_empty() && self.dedup_check(&msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(&msg_id) {
             debug!(msg_id, "WeCom: dedup filtered message");
             return None;
         }
@@ -584,7 +570,7 @@ mod tests {
             http: Client::new(),
             media_dir: PathBuf::from("/tmp/test-wecom-media"),
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             webhook_port: 9322,
         }
     }
@@ -592,19 +578,9 @@ mod tests {
     #[test]
     fn test_dedup() {
         let ch = make_channel(vec![]);
-        assert!(!ch.dedup_check("msg1"));
-        assert!(ch.dedup_check("msg1")); // duplicate
-        assert!(!ch.dedup_check("msg2"));
-    }
-
-    #[test]
-    fn test_dedup_overflow_clears() {
-        let ch = make_channel(vec![]);
-        for i in 0..MAX_SEEN_IDS {
-            ch.dedup_check(&format!("msg_{i}"));
-        }
-        assert!(!ch.dedup_check("new_msg"));
-        assert!(!ch.dedup_check("msg_0"));
+        assert!(!ch.dedup.is_duplicate("msg1"));
+        assert!(ch.dedup.is_duplicate("msg1")); // duplicate
+        assert!(!ch.dedup.is_duplicate("msg2"));
     }
 
     #[test]

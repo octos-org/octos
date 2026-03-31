@@ -5,7 +5,7 @@
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -277,6 +277,22 @@ pub enum ModelType {
     Fast,
 }
 
+impl ModelType {
+    fn to_u8(self) -> u8 {
+        match self {
+            ModelType::Strong => 0,
+            ModelType::Fast => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ModelType::Strong,
+            _ => ModelType::Fast,
+        }
+    }
+}
+
 impl std::fmt::Display for ModelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -373,7 +389,8 @@ struct AdaptiveSlot {
     /// Published output price in USD per million tokens (0.0 = unknown/free).
     cost_per_m: f64,
     /// Model capability type (Strong/Fast). Set from catalog seed.
-    model_type: Mutex<ModelType>,
+    /// Encoded as AtomicU8 for lock-free reads in the routing hot path.
+    model_type: AtomicU8,
     /// Input cost in USD per million tokens. Set from catalog seed.
     cost_in: AtomicU64,
     /// Deep search output quality (token count). Set from catalog seed.
@@ -456,7 +473,9 @@ pub struct AdaptiveRouter {
     /// Last provider index selected (for detecting switches).
     last_selected: AtomicU32,
     /// Optional callback for status updates (failover, provider switching).
-    status_callback: Mutex<Option<StatusCallback>>,
+    /// RwLock allows concurrent reads in the hot path (emit_status) while
+    /// writes (set_status_callback) are rare setup-time operations.
+    status_callback: RwLock<Option<StatusCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -483,7 +502,7 @@ impl AdaptiveRouter {
                 metrics: ProviderMetrics::new(),
                 priority: i,
                 cost_per_m: costs.get(i).copied().unwrap_or(0.0),
-                model_type: Mutex::new(ModelType::Fast), // default, overridden by catalog seed
+                model_type: AtomicU8::new(ModelType::Fast.to_u8()), // default, overridden by catalog seed
                 cost_in: AtomicU64::new(0),
                 ds_output: AtomicU64::new(0),
                 baseline_stability: AtomicU64::new(0),
@@ -505,7 +524,7 @@ impl AdaptiveRouter {
             mode: AtomicU8::new(AdaptiveMode::Off as u8),
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
-            status_callback: Mutex::new(None),
+            status_callback: RwLock::new(None),
         }
     }
 
@@ -531,12 +550,12 @@ impl AdaptiveRouter {
     /// Set a callback for status updates (failover notifications).
     /// Called from `chat_stream()` failover so the UI can inform the user.
     pub fn set_status_callback(&self, cb: Option<StatusCallback>) {
-        *self.status_callback.lock().unwrap() = cb;
+        *self.status_callback.write().unwrap() = cb;
     }
 
     /// Emit a status message through the callback (if set).
     fn emit_status(&self, message: String) {
-        if let Some(cb) = self.status_callback.lock().unwrap().as_ref() {
+        if let Some(cb) = self.status_callback.read().unwrap().as_ref() {
             cb(message);
         }
     }
@@ -622,7 +641,7 @@ impl AdaptiveRouter {
                 slot.provider.model_id()
             );
             if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
-                *slot.model_type.lock().unwrap() = entry.model_type;
+                slot.model_type.store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
                     .store(entry.cost_in.to_bits(), Ordering::Relaxed);
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
@@ -691,7 +710,7 @@ impl AdaptiveRouter {
 
                 ModelCatalogEntry {
                     provider: format!("{}/{}", s.provider.provider_name(), s.provider.model_id()),
-                    model_type: *s.model_type.lock().unwrap(),
+                    model_type: ModelType::from_u8(s.model_type.load(Ordering::Relaxed)),
                     stability,
                     tool_avg_ms,
                     p95_ms,
@@ -1379,6 +1398,7 @@ mod tests {
                 tool_calls: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                provider_index: None,
             })
         }
 

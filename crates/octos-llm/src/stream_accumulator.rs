@@ -97,6 +97,7 @@ impl StreamAccumulator {
             tool_calls,
             stop_reason,
             usage: self.usage,
+            provider_index: None,
         }
     }
 }

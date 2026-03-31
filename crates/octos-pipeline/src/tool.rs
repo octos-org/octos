@@ -243,6 +243,7 @@ impl Tool for RunPipelineTool {
             plugin_dirs: self.plugin_dirs.clone(),
             status_bridge,
             shutdown: shutdown.clone(),
+            max_parallel_workers: 8,
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].

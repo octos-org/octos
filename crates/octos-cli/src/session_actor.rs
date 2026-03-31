@@ -3016,6 +3016,7 @@ mod tests {
                         tool_calls: vec![],
                         stop_reason: StopReason::EndTurn,
                         usage: TokenUsage::default(),
+                        provider_index: None,
                     });
                 }
                 responses.remove(0)
@@ -3048,6 +3049,7 @@ mod tests {
                 output_tokens: 10,
                 ..Default::default()
             },
+            provider_index: None,
         }
     }
 
@@ -3140,6 +3142,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -3226,6 +3229,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());

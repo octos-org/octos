@@ -59,6 +59,7 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         plugin_dirs: vec![],
         status_bridge: None,
         shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        max_parallel_workers: 8,
     }
 }
 

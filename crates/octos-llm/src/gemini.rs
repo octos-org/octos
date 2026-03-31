@@ -200,6 +200,7 @@ impl LlmProvider for GeminiProvider {
                 cache_read_tokens: usage.cached_content_token_count,
                 ..Default::default()
             },
+            provider_index: None,
         })
     }
 

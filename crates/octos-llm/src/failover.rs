@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -29,10 +30,18 @@ struct ProviderSlot {
 /// Tries providers in order, skipping degraded ones (failure count >= threshold).
 /// On retriable error, moves to the next provider. On success, resets the
 /// provider's failure count.
+/// Default wall-clock timeout for an entire `chat()` call across all providers.
+const DEFAULT_MAX_REQUEST_DURATION: Duration = Duration::from_secs(120);
+
 pub struct ProviderChain {
     slots: Vec<ProviderSlot>,
     /// Number of consecutive failures before a provider is considered degraded.
     failure_threshold: u32,
+    /// Index of the last provider that returned a successful response.
+    /// Used by `report_late_failure` to penalize the correct provider.
+    last_success_index: AtomicU32,
+    /// Wall-clock timeout for the entire chain (retry + failover included).
+    max_request_duration: Option<Duration>,
 }
 
 impl ProviderChain {
@@ -54,12 +63,20 @@ impl ProviderChain {
         Self {
             slots,
             failure_threshold: 3,
+            last_success_index: AtomicU32::new(0),
+            max_request_duration: Some(DEFAULT_MAX_REQUEST_DURATION),
         }
     }
 
     /// Set the failure threshold for circuit breaking.
     pub fn with_failure_threshold(mut self, threshold: u32) -> Self {
         self.failure_threshold = threshold;
+        self
+    }
+
+    /// Set the wall-clock timeout for the entire chain. `None` disables the cap.
+    pub fn with_max_request_duration(mut self, duration: Option<Duration>) -> Self {
+        self.max_request_duration = duration;
         self
     }
 
@@ -82,6 +99,7 @@ impl ProviderChain {
     }
 
     fn record_success(&self, index: usize) {
+        self.last_success_index.store(index as u32, Ordering::Relaxed);
         let prev = self.slots[index].failures.swap(0, Ordering::Relaxed);
         if prev > 0 {
             info!(
@@ -90,6 +108,51 @@ impl ProviderChain {
                 "provider recovered, resetting circuit breaker"
             );
         }
+    }
+
+    async fn chat_inner(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let start = self.pick_start();
+        let mut last_error = None;
+
+        for offset in 0..self.slots.len() {
+            let idx = (start + offset) % self.slots.len();
+            let slot = &self.slots[idx];
+
+            // Skip degraded providers (unless it's our last resort)
+            if offset > 0 && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold {
+                continue;
+            }
+
+            match slot.provider.chat(messages, tools, config).await {
+                Ok(mut response) => {
+                    self.record_success(idx);
+                    response.provider_index = Some(idx);
+                    return Ok(response);
+                }
+                Err(e) => {
+                    let retryable = RetryProvider::should_failover(&e);
+                    self.record_failure(idx);
+
+                    if retryable && offset + 1 < self.slots.len() {
+                        warn!(
+                            provider = slot.provider.provider_name(),
+                            error = %e,
+                            "failing over to next provider"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
     }
 
     fn record_failure(&self, index: usize) {
@@ -113,42 +176,18 @@ impl LlmProvider for ProviderChain {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let start = self.pick_start();
-        let mut last_error = None;
-
-        for offset in 0..self.slots.len() {
-            let idx = (start + offset) % self.slots.len();
-            let slot = &self.slots[idx];
-
-            // Skip degraded providers (unless it's our last resort)
-            if offset > 0 && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold {
-                continue;
-            }
-
-            match slot.provider.chat(messages, tools, config).await {
-                Ok(response) => {
-                    self.record_success(idx);
-                    return Ok(response);
-                }
-                Err(e) => {
-                    let retryable = RetryProvider::should_failover(&e);
-                    self.record_failure(idx);
-
-                    if retryable && offset + 1 < self.slots.len() {
-                        warn!(
-                            provider = slot.provider.provider_name(),
-                            error = %e,
-                            "failing over to next provider"
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
+        let fut = self.chat_inner(messages, tools, config);
+        match self.max_request_duration {
+            Some(dur) => tokio::time::timeout(dur, fut)
+                .await
+                .map_err(|_| {
+                    eyre::eyre!(
+                        "ProviderChain timed out after {:.0}s (all retries + failovers)",
+                        dur.as_secs_f64()
+                    )
+                })?,
+            None => fut.await,
         }
-
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
     }
 
     async fn chat_stream(
@@ -205,7 +244,7 @@ impl LlmProvider for ProviderChain {
     }
 
     fn report_late_failure(&self) {
-        let idx = self.pick_start();
+        let idx = self.last_success_index.load(Ordering::Relaxed) as usize;
         self.record_failure(idx);
     }
 }
@@ -258,6 +297,7 @@ mod tests {
                 tool_calls: vec![],
                 stop_reason: crate::types::StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                provider_index: None,
             })
         }
 
