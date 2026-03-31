@@ -33,7 +33,17 @@ impl CommandPolicy for AllowAllPolicy {
     }
 }
 
-/// Policy that denies potentially dangerous commands.
+/// Policy that denies a small set of obviously dangerous commands.
+///
+/// **Not a security boundary.** `SafePolicy` catches common accidents (e.g.,
+/// `rm -rf /`, fork bombs) via simple pattern matching on whitespace-normalized
+/// command strings. It is trivially bypassable — shell metacharacters, variable
+/// expansion (`rm${IFS}-rf${IFS}/`), encoding tricks, and any command not on the
+/// short deny list all pass through unblocked.
+///
+/// Real isolation must come from the sandbox layer ([`super::sandbox`]). Treat
+/// `SafePolicy` as defense-in-depth for obvious mistakes, not as a guarantee
+/// that dangerous commands cannot execute.
 pub struct SafePolicy {
     /// Patterns that should be denied.
     deny_patterns: Vec<String>,
