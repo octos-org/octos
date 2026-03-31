@@ -26,6 +26,7 @@ extern crate rustls;
 extern crate rustls_native_certs;
 
 use crate::channel::Channel;
+use crate::dedup::MessageDedup;
 
 /// Default WeCom WebSocket endpoint.
 const WS_URL: &str = "wss://openws.work.weixin.qq.com";
@@ -39,8 +40,6 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 const RECONNECT_BASE_DELAY_MS: u64 = 5000;
 /// Max reconnect delay in milliseconds.
 const RECONNECT_MAX_DELAY_MS: u64 = 60000;
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
 /// Max message length for WeCom markdown.
 const MAX_MSG_LENGTH: usize = 4096;
 /// Maximum req_id entries to track for stream replies.
@@ -63,7 +62,7 @@ pub struct WeComBotChannel {
     secret: String,
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: MessageDedup,
     /// Shared write-half of the WebSocket, set once connected.
     ws_sink: Arc<Mutex<Option<WsSink>>>,
     /// Maps `chat_id` → `req_id` from the most recent inbound message.
@@ -83,7 +82,7 @@ impl WeComBotChannel {
             secret: secret.to_string(),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             ws_sink: Arc::new(Mutex::new(None)),
             req_id_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -91,19 +90,6 @@ impl WeComBotChannel {
 
     fn check_allowed(&self, sender_id: &str) -> bool {
         self.allowed_senders.is_empty() || self.allowed_senders.contains(sender_id)
-    }
-
-    /// Check if a message ID has been seen; add if not.
-    fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(msg_id) {
-            return true;
-        }
-        if seen.len() >= MAX_SEEN_IDS {
-            seen.clear();
-        }
-        seen.insert(msg_id.to_string());
-        false
     }
 
     /// Store a `req_id` for a chat so streaming replies can reference it.
@@ -142,7 +128,7 @@ impl WeComBotChannel {
             self.store_req_id(chat_id, req_id);
         }
 
-        if !msg_id.is_empty() && self.dedup_check(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!(msg_id, "WeComBot: dedup filtered message");
             return None;
         }
@@ -711,7 +697,7 @@ mod tests {
             secret: "test_secret".into(),
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             ws_sink: Arc::new(Mutex::new(None)),
             req_id_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -745,19 +731,9 @@ mod tests {
     #[test]
     fn should_detect_duplicate_messages() {
         let bot = make_bot(vec![]);
-        assert!(!bot.dedup_check("msg1"));
-        assert!(bot.dedup_check("msg1"));
-        assert!(!bot.dedup_check("msg2"));
-    }
-
-    #[test]
-    fn should_clear_dedup_on_overflow() {
-        let bot = make_bot(vec![]);
-        for i in 0..MAX_SEEN_IDS {
-            bot.dedup_check(&format!("msg_{i}"));
-        }
-        assert!(!bot.dedup_check("new_msg"));
-        assert!(!bot.dedup_check("msg_0"));
+        assert!(!bot.dedup.is_duplicate("msg1"));
+        assert!(bot.dedup.is_duplicate("msg1"));
+        assert!(!bot.dedup.is_duplicate("msg2"));
     }
 
     #[test]

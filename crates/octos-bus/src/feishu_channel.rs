@@ -22,12 +22,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
 use crate::channel::Channel;
+use crate::dedup::MessageDedup;
 use crate::media::{download_media, is_image};
 
 /// Token refresh interval (slightly under 2 hours).
 const TOKEN_TTL_SECS: u64 = 7000;
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
 
 fn base_url_for_region(region: &str) -> String {
     match region {
@@ -150,7 +149,7 @@ pub struct FeishuChannel {
     http: Client,
     media_dir: PathBuf,
     token_cache: Arc<tokio::sync::Mutex<Option<(String, Instant)>>>,
-    seen_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    dedup: MessageDedup,
     /// "ws" for WebSocket long connection, "webhook" for HTTP webhook mode.
     mode: String,
     /// Port for webhook HTTP server (only used in webhook mode).
@@ -179,7 +178,7 @@ impl FeishuChannel {
             http: Client::new(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             mode: "ws".to_string(),
             webhook_port: 9321,
             encrypt_key: None,
@@ -450,19 +449,6 @@ impl FeishuChannel {
         Ok(message_id)
     }
 
-    /// Check if a message ID has been seen; add if not. Trims when over capacity.
-    fn dedup_check(&self, msg_id: &str) -> bool {
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(msg_id) {
-            return true;
-        }
-        if seen.len() >= MAX_SEEN_IDS {
-            seen.clear();
-        }
-        seen.insert(msg_id.to_string());
-        false
-    }
-
     /// Determine receive_id_type from chat_id prefix.
     fn receive_id_type(chat_id: &str) -> &'static str {
         if chat_id.starts_with("oc_") {
@@ -493,7 +479,7 @@ impl FeishuChannel {
             .get("message_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if message_id.is_empty() || self.dedup_check(message_id) {
+        if message_id.is_empty() || self.dedup.is_duplicate(message_id) {
             debug!(message_id, "Feishu: dedup filtered message");
             return None;
         }
@@ -1096,7 +1082,7 @@ mod tests {
             http: Client::new(),
             media_dir: PathBuf::from("/tmp/test-feishu-media"),
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            seen_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dedup: MessageDedup::new(),
             mode: "ws".into(),
             webhook_port: 9321,
             encrypt_key: None,
@@ -1151,19 +1137,9 @@ mod tests {
     #[test]
     fn test_dedup() {
         let ch = make_channel(vec![]);
-        assert!(!ch.dedup_check("msg1"));
-        assert!(ch.dedup_check("msg1")); // duplicate
-        assert!(!ch.dedup_check("msg2"));
-    }
-
-    #[test]
-    fn test_dedup_overflow_clears() {
-        let ch = make_channel(vec![]);
-        for i in 0..MAX_SEEN_IDS {
-            ch.dedup_check(&format!("msg_{i}"));
-        }
-        assert!(!ch.dedup_check("new_msg"));
-        assert!(!ch.dedup_check("msg_0"));
+        assert!(!ch.dedup.is_duplicate("msg1"));
+        assert!(ch.dedup.is_duplicate("msg1")); // duplicate
+        assert!(!ch.dedup.is_duplicate("msg2"));
     }
 
     #[test]
