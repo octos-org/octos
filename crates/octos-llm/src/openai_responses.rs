@@ -456,6 +456,7 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
             reasoning_tokens,
             ..Default::default()
         },
+        provider_index: None,
     }
 }
 

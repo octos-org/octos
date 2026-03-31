@@ -1379,6 +1379,7 @@ mod tests {
                 tool_calls: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                provider_index: None,
             })
         }
 

@@ -566,6 +566,7 @@ mod tests {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                provider_index: None,
             })
         }
 
