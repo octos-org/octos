@@ -179,9 +179,21 @@ impl Tool for PluginTool {
             "plugin process spawned"
         );
 
+        // Inject defaults for known plugins
+        let mut effective_args = args.clone();
+        if self.tool_def.name == "mofa_slides" {
+            if let Some(obj) = effective_args.as_object_mut() {
+                if !obj.contains_key("out") || obj["out"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
+                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    obj.insert("out".into(), serde_json::Value::String(format!("slides_{ts}.pptx")));
+                    tracing::info!("injected default 'out' for mofa_slides");
+                }
+            }
+        }
+
         // Write args to stdin
         if let Some(mut stdin) = child.stdin.take() {
-            let data = serde_json::to_vec(args)?;
+            let data = serde_json::to_vec(&effective_args)?;
             stdin.write_all(&data).await?;
             // Drop stdin to signal EOF
         }
@@ -305,7 +317,7 @@ impl Tool for PluginTool {
                     })
                 });
             // Parse files_to_send: plugin can request auto-delivery to chat
-            let files_to_send = parsed
+            let mut files_to_send: Vec<std::path::PathBuf> = parsed
                 .get("files_to_send")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -314,6 +326,22 @@ impl Tool for PluginTool {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // Auto-deliver output file when plugin didn't report it
+            let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
+                effective_args.get("out").and_then(|v| v.as_str()).and_then(|p| {
+                    let path = std::path::PathBuf::from(p);
+                    let abs = if path.is_relative() {
+                        self.work_dir.as_ref().map(|d| d.join(&path)).unwrap_or(path)
+                    } else { path };
+                    if abs.exists() {
+                        tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
+                        files_to_send.push(abs.clone());
+                        Some(abs)
+                    } else { None }
+                })
+            } else { file_modified };
+
             return Ok(ToolResult {
                 output,
                 success,
