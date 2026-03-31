@@ -496,6 +496,8 @@ fn expand_tilde(path: &str) -> String {
         };
         // Reject usernames with path traversal or unsafe characters.
         // Only allow alphanumeric, hyphen, underscore, and dot (no leading dot).
+        // This allowlist implicitly blocks path separators (/ \), null bytes,
+        // and other injection characters on all platforms.
         let is_safe_username = !username.is_empty()
             && !username.starts_with('.')
             && username
@@ -741,12 +743,12 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_tilde_rejects_empty_username() {
-        // ~/ is handled by the first branch; bare ~ with suffix but no username
-        // after stripping ~ would be empty, should not expand
-        // Note: "~/" is handled by the first branch (home dir), this tests "~"
-        // which is also first branch. The empty-username path is covered by
-        // is_safe_username check.
+    fn test_expand_tilde_rejects_unsafe_chars() {
+        // Null bytes and backslashes in username are blocked by the allowlist
+        assert_eq!(expand_tilde("~user\0evil"), "~user\0evil");
+        assert_eq!(expand_tilde("~user\\evil"), "~user\\evil");
+        assert_eq!(expand_tilde("~user:evil"), "~user:evil");
+        assert_eq!(expand_tilde("~ spaces"), "~ spaces");
     }
 
     #[test]
