@@ -164,12 +164,49 @@ pkg_hint() {
             esac
             ;;
         Linux)
-            case "$1" in
-                git)       echo "sudo apt-get install -y git (or your package manager)" ;;
-                node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
-                chromium)  echo "sudo apt-get install -y chromium-browser" ;;
-                ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
-                iproute2)  echo "sudo apt-get install -y iproute2" ;;
+            # Detect package manager
+            local pm=""
+            if command -v apt-get &>/dev/null; then pm="apt"
+            elif command -v pacman &>/dev/null; then pm="pacman"
+            elif command -v dnf &>/dev/null; then pm="dnf"
+            elif command -v yum &>/dev/null; then pm="yum"
+            elif command -v apk &>/dev/null; then pm="apk"
+            fi
+            case "$pm" in
+                apt)
+                    case "$1" in
+                        git)       echo "sudo apt-get install -y git" ;;
+                        node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
+                        chromium)  echo "sudo apt-get install -y chromium-browser" ;;
+                        ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
+                        iproute2)  echo "sudo apt-get install -y iproute2" ;;
+                    esac ;;
+                pacman)
+                    case "$1" in
+                        git)       echo "sudo pacman -S --noconfirm git" ;;
+                        node)      echo "sudo pacman -S --noconfirm nodejs npm" ;;
+                        chromium)  echo "sudo pacman -S --noconfirm chromium" ;;
+                        ffmpeg)    echo "sudo pacman -S --noconfirm ffmpeg" ;;
+                        iproute2)  echo "sudo pacman -S --noconfirm iproute2" ;;
+                    esac ;;
+                dnf|yum)
+                    case "$1" in
+                        git)       echo "sudo $pm install -y git" ;;
+                        node)      echo "sudo $pm install -y nodejs npm" ;;
+                        chromium)  echo "sudo $pm install -y chromium" ;;
+                        ffmpeg)    echo "sudo $pm install -y ffmpeg" ;;
+                        iproute2)  echo "sudo $pm install -y iproute" ;;
+                    esac ;;
+                apk)
+                    case "$1" in
+                        git)       echo "sudo apk add git" ;;
+                        node)      echo "sudo apk add nodejs npm" ;;
+                        chromium)  echo "sudo apk add chromium" ;;
+                        ffmpeg)    echo "sudo apk add ffmpeg" ;;
+                        iproute2)  echo "sudo apk add iproute2" ;;
+                    esac ;;
+                *)
+                    echo "install '$1' using your package manager" ;;
             esac
             ;;
         *)

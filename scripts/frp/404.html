@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Octos Cloud</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0f;
+            color: #e4e4ef;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            text-align: center;
+            max-width: 480px;
+            padding: 40px 24px;
+        }
+        .logo { font-size: 64px; margin-bottom: 24px; }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #e4e4ef;
+        }
+        p {
+            color: #8888a0;
+            font-size: 16px;
+            line-height: 1.6;
+            margin-bottom: 32px;
+        }
+        a {
+            display: inline-block;
+            background: #6366f1;
+            color: #fff;
+            text-decoration: none;
+            padding: 12px 32px;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        a:hover { background: #818cf8; }
+        .subdomain {
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #6366f1;
+            background: rgba(99,102,241,0.1);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+    </style>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            var host = window.location.hostname;
+            var sub = host.split('.')[0];
+            var el = document.getElementById('subdomain');
+            if (el && sub) el.textContent = sub;
+        });
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">&#x1F419;</div>
+        <h1>This subdomain is not active</h1>
+        <p>
+            <span class="subdomain" id="subdomain"></span> is not claimed or the node is currently offline.
+        </p>
+        <a href="https://octos-cloud.org">Go to Octos Cloud</a>
+    </div>
+</body>
+</html>

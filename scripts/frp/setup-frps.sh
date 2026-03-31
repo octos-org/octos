@@ -75,6 +75,7 @@ sudo tee "$CONFIG_FILE" > /dev/null << EOF
 bindPort = ${FRPS_BIND_PORT}
 vhostHTTPPort = ${FRPS_VHOST_HTTP_PORT}
 vhostHTTPSPort = ${FRPS_VHOST_HTTPS_PORT}
+custom_404_page = "${CONFIG_DIR}/404.html"
 
 auth.method = "token"
 auth.token = "${FRPS_TOKEN}"
@@ -93,6 +94,27 @@ log.to = "/var/log/frps.log"
 log.level = "info"
 log.maxDays = 7
 EOF
+
+# Install custom 404 page
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/404.html" ]; then
+    sudo cp "$SCRIPT_DIR/404.html" "${CONFIG_DIR}/404.html"
+    echo "    Installed custom 404 page"
+else
+    # Inline fallback if script is run standalone without the repo
+    sudo tee "${CONFIG_DIR}/404.html" > /dev/null << 'HTMLEOF'
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Octos Cloud</title>
+<style>*{margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0a0a0f;color:#e4e4ef;min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center}
+h1{font-size:24px;margin:24px 0 12px}p{color:#8888a0;font-size:16px;margin-bottom:32px}
+a{background:#6366f1;color:#fff;text-decoration:none;padding:12px 32px;border-radius:8px;font-size:15px}</style></head>
+<body><div><div style="font-size:64px">&#x1F419;</div><h1>This subdomain is not active</h1>
+<p>This subdomain is not claimed or the node is currently offline.</p>
+<a href="https://octos-cloud.org">Go to Octos Cloud</a></div></body></html>
+HTMLEOF
+    echo "    Created inline 404 page"
+fi
 
 echo "    Wrote config to ${CONFIG_FILE}"
 
