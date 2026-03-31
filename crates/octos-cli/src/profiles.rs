@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use eyre::{Result, WrapErr, bail};
+use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
@@ -793,6 +793,7 @@ pub(crate) fn config_from_profile(
         auth_token: None,
         adaptive_routing: None,
         voice: None,
+        allow_admin_shell: false,
         #[cfg(feature = "api")]
         dashboard_auth: None,
         #[cfg(feature = "api")]
@@ -1482,11 +1483,9 @@ mod tests {
         assert!(empty.is_empty());
 
         // Duplicate should fail
-        assert!(
-            store
-                .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
-                .is_err()
-        );
+        assert!(store
+            .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
+            .is_err());
     }
 
     #[test]

@@ -264,8 +264,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/system/update", post(admin::system_update))
         // Model limits (from model_limits.json)
         .route("/api/admin/model-limits", get(admin::model_limits))
-        // Remote shell (for debugging/development via coding agents)
-        .route("/api/admin/shell", post(admin::admin_shell))
         // Tunnel tenant management
         .route("/api/admin/tenants", get(admin::list_tenants))
         .route("/api/admin/tenants", post(admin::create_tenant))
@@ -275,6 +273,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/tenants/{id}/setup-script",
             get(admin::tenant_setup_script),
         );
+
+    // Conditionally enable admin shell endpoint (disabled by default).
+    let admin_api = if state.allow_admin_shell {
+        tracing::warn!(
+            "admin shell endpoint enabled (POST /api/admin/shell). \
+             Disable with allow_admin_shell = false in config for production."
+        );
+        admin_api.route("/api/admin/shell", post(admin::admin_shell))
+    } else {
+        admin_api
+    };
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

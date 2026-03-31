@@ -261,6 +261,7 @@ impl ServeCommand {
             tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
             frps_server: std::env::var("FRPS_SERVER").ok(),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
+            allow_admin_shell: config.allow_admin_shell,
         });
 
         // Auto-start enabled profiles

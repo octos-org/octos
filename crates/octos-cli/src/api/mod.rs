@@ -65,4 +65,6 @@ pub struct AppState {
     pub frps_server: Option<String>,
     /// frps control port.
     pub frps_port: Option<u16>,
+    /// Whether the admin shell endpoint is enabled (default: false).
+    pub allow_admin_shell: bool,
 }
