@@ -151,7 +151,44 @@ impl EpisodeStore {
     }
 
     /// Find episodes relevant to a query in the given directory.
+    ///
+    /// Delegates to `find_relevant_hybrid` (BM25-only, no embedding) and
+    /// post-filters by CWD. Falls back to a direct DB scan if the hybrid
+    /// index is empty.
     pub async fn find_relevant(
+        &self,
+        cwd: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Episode>> {
+        // Check if hybrid index has documents
+        let index_populated = self
+            .index
+            .read()
+            .map(|idx| !idx.is_empty())
+            .unwrap_or(false);
+
+        if index_populated {
+            // Over-fetch to account for CWD filtering, then filter
+            let candidates = self.find_relevant_hybrid(query, None, limit * 4).await?;
+            let filtered: Vec<Episode> = candidates
+                .into_iter()
+                .filter(|ep| ep.working_dir == cwd)
+                .take(limit)
+                .collect();
+
+            if !filtered.is_empty() {
+                return Ok(filtered);
+            }
+            // Fall through to DB scan if hybrid returned no CWD matches
+        }
+
+        // Fallback: direct DB scan (for empty index or no CWD matches)
+        self.find_relevant_db_scan(cwd, query, limit).await
+    }
+
+    /// Direct DB scan fallback for CWD-scoped relevance search.
+    async fn find_relevant_db_scan(
         &self,
         cwd: &Path,
         query: &str,

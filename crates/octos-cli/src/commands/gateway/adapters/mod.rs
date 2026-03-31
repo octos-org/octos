@@ -5,10 +5,9 @@
 //! the concrete channel with the [`ChannelManager`].
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use colored::Colorize;
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::Mutex;
 
@@ -121,11 +120,7 @@ pub fn register_all(
             #[cfg(feature = "wechat")]
             "wechat" => wechat::register(channel_mgr, entry, ctx.shutdown, ctx.wechat_bridge_url)?,
             other => {
-                println!(
-                    "{}: channel '{}' not supported, skipping",
-                    "Warning".yellow(),
-                    other
-                );
+                tracing::warn!(channel = other, "channel not supported, skipping");
             }
         }
     }

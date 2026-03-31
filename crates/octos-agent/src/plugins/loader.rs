@@ -12,7 +12,7 @@ use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
-use super::extras::{SkillExtras, resolve_extras};
+use super::extras::{resolve_extras, SkillExtras};
 use super::manifest::PluginManifest;
 use super::tool::PluginTool;
 
@@ -289,7 +289,12 @@ impl PluginLoader {
             .tools
             .iter()
             .filter(|t| t.spawn_only && t.spawn_only_message.is_some())
-            .map(|t| (t.name.clone(), t.spawn_only_message.clone().unwrap()))
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.spawn_only_message.clone().unwrap_or_default(),
+                )
+            })
             .collect();
 
         let tools: Vec<PluginTool> = manifest

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -29,6 +30,9 @@ struct ProviderSlot {
 /// Tries providers in order, skipping degraded ones (failure count >= threshold).
 /// On retriable error, moves to the next provider. On success, resets the
 /// provider's failure count.
+/// Default wall-clock timeout for an entire `chat()` call across all providers.
+const DEFAULT_MAX_REQUEST_DURATION: Duration = Duration::from_secs(120);
+
 pub struct ProviderChain {
     slots: Vec<ProviderSlot>,
     /// Number of consecutive failures before a provider is considered degraded.
@@ -36,6 +40,8 @@ pub struct ProviderChain {
     /// Index of the last provider that returned a successful response.
     /// Used by `report_late_failure` to penalize the correct provider.
     last_success_index: AtomicU32,
+    /// Wall-clock timeout for the entire chain (retry + failover included).
+    max_request_duration: Option<Duration>,
 }
 
 impl ProviderChain {
@@ -58,12 +64,19 @@ impl ProviderChain {
             slots,
             failure_threshold: 3,
             last_success_index: AtomicU32::new(0),
+            max_request_duration: Some(DEFAULT_MAX_REQUEST_DURATION),
         }
     }
 
     /// Set the failure threshold for circuit breaking.
     pub fn with_failure_threshold(mut self, threshold: u32) -> Self {
         self.failure_threshold = threshold;
+        self
+    }
+
+    /// Set the wall-clock timeout for the entire chain. `None` disables the cap.
+    pub fn with_max_request_duration(mut self, duration: Option<Duration>) -> Self {
+        self.max_request_duration = duration;
         self
     }
 
@@ -97,22 +110,7 @@ impl ProviderChain {
         }
     }
 
-    fn record_failure(&self, index: usize) {
-        let count = self.slots[index].failures.fetch_add(1, Ordering::Relaxed) + 1;
-        let name = self.slots[index].provider.provider_name();
-        if count == self.failure_threshold {
-            warn!(
-                provider = name,
-                failures = count,
-                "provider degraded (circuit breaker open)"
-            );
-        }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for ProviderChain {
-    async fn chat(
+    async fn chat_inner(
         &self,
         messages: &[Message],
         tools: &[ToolSpec],
@@ -155,6 +153,41 @@ impl LlmProvider for ProviderChain {
         }
 
         Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
+    }
+
+    fn record_failure(&self, index: usize) {
+        let count = self.slots[index].failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let name = self.slots[index].provider.provider_name();
+        if count == self.failure_threshold {
+            warn!(
+                provider = name,
+                failures = count,
+                "provider degraded (circuit breaker open)"
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ProviderChain {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let fut = self.chat_inner(messages, tools, config);
+        match self.max_request_duration {
+            Some(dur) => tokio::time::timeout(dur, fut)
+                .await
+                .map_err(|_| {
+                    eyre::eyre!(
+                        "ProviderChain timed out after {:.0}s (all retries + failovers)",
+                        dur.as_secs_f64()
+                    )
+                })?,
+            None => fut.await,
+        }
     }
 
     async fn chat_stream(

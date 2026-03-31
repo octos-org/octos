@@ -31,14 +31,23 @@ pub enum AuthIdentity {
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Restrict CORS to known origins — localhost dev servers and *.ominix.io.
+    // Restrict CORS to an explicit allowlist of known origins.
+    // Do NOT use suffix matching (e.g. ends_with(".ominix.io")) — a hijacked
+    // subdomain would pass the check and enable cross-origin requests.
+    const ALLOWED_ORIGINS: &[&str] = &[
+        "https://app.ominix.io",
+        "https://admin.ominix.io",
+        "https://api.ominix.io",
+        "https://app.crew.ominix.io",
+        "https://admin.crew.ominix.io",
+        "https://api.crew.ominix.io",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ];
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
             let o = origin.to_str().unwrap_or("");
-            o.ends_with(".crew.ominix.io")
-                || o.ends_with(".ominix.io")
-                || o == "http://localhost:3000"
-                || o == "http://localhost:5173"
+            ALLOWED_ORIGINS.contains(&o)
         }))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
@@ -438,7 +447,15 @@ async fn user_auth_middleware(
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
     // The reverse proxy (Caddy) sets this header to identify the profile,
     // so requests through the proxy are implicitly authenticated.
-    if !profile_id.is_empty() {
+    // SECURITY: Only accept this header from loopback addresses to prevent
+    // profile impersonation via misconfigured reverse proxy or SSRF.
+    let is_loopback = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+
+    if !profile_id.is_empty() && is_loopback {
         // Validate that the profile actually exists to prevent spoofing.
         if let Some(ref store) = state.profile_store {
             if store.get(&profile_id).ok().flatten().is_none() {
@@ -461,6 +478,13 @@ async fn user_auth_middleware(
             });
             return Ok(next.run(req).await);
         }
+    }
+
+    if !profile_id.is_empty() && !is_loopback {
+        tracing::warn!(
+            profile_id = %profile_id,
+            "X-Profile-Id header rejected: request not from loopback address"
+        );
     }
 
     tracing::warn!(

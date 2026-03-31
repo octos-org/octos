@@ -243,15 +243,17 @@ impl SessionManager {
     /// Get or create a session. Loads from disk on first access.
     pub fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
-        if !self.cache.contains(&key_str) {
-            let session = self
-                .load_from_disk(key)
-                .unwrap_or_else(|| Session::new(key.clone()));
-            self.cache.put(key_str.clone(), session);
-        }
-        self.cache
-            .get_mut(&key_str)
-            .expect("session must exist: inserted above")
+        let disk_session = if self.cache.contains(&key_str) {
+            None
+        } else {
+            Some(
+                self.load_from_disk(key)
+                    .unwrap_or_else(|| Session::new(key.clone())),
+            )
+        };
+        self.cache.get_or_insert_mut(key_str, || {
+            disk_session.unwrap_or_else(|| Session::new(key.clone()))
+        })
     }
 
     /// Add a message to a session and persist it.
@@ -656,7 +658,9 @@ impl SessionManager {
                 updated_at: chrono::Utc::now(),
             };
             if let Ok(json) = serde_json::to_string(&meta) {
-                let _ = std::fs::write(&path, format!("{json}\n"));
+                if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
+                    warn!(path = %path.display(), error = %e, "failed to write session metadata");
+                }
             }
         }
     }
