@@ -77,16 +77,15 @@ impl HybridIndex {
             return; // Already indexed
         }
 
-        // HNSW capacity guard (#109)
-        if self.ids.len() >= HNSW_CAPACITY {
+        // HNSW capacity warnings
+        let at_capacity = self.ids.len() >= HNSW_CAPACITY;
+        if at_capacity {
             tracing::warn!(
-                "HNSW index at capacity ({HNSW_CAPACITY}), skipping insert for {episode_id}"
+                "HNSW index at capacity ({HNSW_CAPACITY}), indexing {episode_id} in BM25 only — consider rebuilding with a larger capacity"
             );
-            return;
-        }
-        if self.ids.len() >= HNSW_CAPACITY * 80 / 100 {
+        } else if self.ids.len() >= HNSW_CAPACITY * 80 / 100 {
             tracing::warn!(
-                "HNSW index at {}% capacity ({}/{})",
+                "HNSW index at {}% capacity ({}/{}) — consider rebuilding with a larger capacity",
                 self.ids.len() * 100 / HNSW_CAPACITY,
                 self.ids.len(),
                 HNSW_CAPACITY
@@ -117,11 +116,13 @@ impl HybridIndex {
                 .push((doc_idx, count));
         }
 
-        // Insert embedding into HNSW if provided and dimension matches
+        // Insert embedding into HNSW if provided, dimension matches, and not at capacity
         let valid_emb = embedding.filter(|e| e.len() == self.dimension);
         let normalized = valid_emb.and_then(l2_normalize);
-        self.has_embedding.push(normalized.is_some());
-        if let Some(normalized) = normalized {
+        let can_insert_hnsw = normalized.is_some() && !at_capacity;
+        self.has_embedding.push(can_insert_hnsw);
+        if can_insert_hnsw {
+            let normalized = normalized.unwrap();
             let hnsw = self.hnsw.get_or_insert_with(|| {
                 Hnsw::new(
                     HNSW_MAX_NB_CONNECTION,
