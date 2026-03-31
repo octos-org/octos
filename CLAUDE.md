@@ -17,21 +17,28 @@ cargo install --path crates/octos-cli  # Install CLI locally
 
 ## Architecture
 
-octos is a Rust-native AI coding agent framework. 6-crate workspace, layered:
+octos is a Rust-native, API-first Agentic OS — multi-tenant AI agent platform. 8-crate workspace + bundled skills, layered:
 
 ```
 octos-cli  (CLI: clap commands, config loading, config watcher)
     |
-octos-agent  (Agent loop, tool system, sandbox, MCP, compaction)
+octos-agent  (Agent loop, tool system, sandbox, MCP, compaction, plugins)
     |          \
 octos-memory   octos-llm  (hybrid search + memory store | LLM providers)
     \           /
     octos-core  (Task, Message, Error types, truncate_utf8 - no internal deps)
 ```
 
-octos-bus (Message bus, channels, sessions, coalescing, cron, heartbeat) sits alongside octos-agent.
+Alongside octos-agent:
+- **octos-bus**: Message bus, 14 channels (Telegram/Discord/Slack/WhatsApp/Email/WeChat/...), sessions, coalescing, cron, heartbeat
+- **octos-pipeline**: DOT-graph pipeline engine — per-node model selection, parallel fan-out, checkpoints, human gates
+- **octos-plugin**: Plugin SDK — manifest parsing, discovery, gating (binary/env/OS checks)
 
-Commands: chat, init, status, gateway, clean, completions, cron, channels, auth (login/logout/status), skills (list/install/remove).
+Bundled skills in `crates/app-skills/` (weather, time, news, deep-search, etc.) and `crates/platform-skills/` (voice).
+
+Commands: chat, init, status, gateway, serve, clean, completions, cron, channels, auth (login/logout/status), skills (list/install/remove).
+
+Three runtime modes: `octos chat` (interactive CLI), `octos gateway` (multi-channel), `octos serve` (web dashboard + 91 REST endpoints).
 
 Auth module (`octos-cli/src/auth/`): OAuth PKCE + device code for OpenAI, paste-token for others. Stored in `~/.octos/auth.json`. `config.rs` checks auth store before env vars.
 
@@ -63,7 +70,21 @@ Token-aware message compaction: estimates tokens, strips tool arguments, summari
 
 ### LLM Providers (`octos-llm/src/`)
 
-`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. 8 OpenAI-compatible via `with_base_url()`. `RetryProvider` wraps any provider with exponential backoff on 429/5xx.
+`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. 8 OpenAI-compatible via `with_base_url()`. 3-layer failover: `RetryProvider` (exponential backoff on 429/5xx) → `ProviderChain` → `AdaptiveRouter` (hedge racing, lane scoring, circuit breakers).
+
+### Plugin System (`octos-agent/src/plugins/`, `octos-plugin/`)
+
+Skills are self-contained binaries with `manifest.json` declarations. Binary protocol: `./skill_binary <tool_name>` with JSON on stdin, JSON `{success, output, files_to_send}` on stdout. Discovery scans directories with precedence rules. Gating checks binary existence, env, and OS requirements.
+
+**spawn_only tools**: Manifest field `spawn_only: true` marks tools for background execution. Auto-intercepted in the execution loop — wrapped in `tokio::spawn`, returns immediately. No LLM cooperation needed. SKILL.md auto-injected as system prompt for skills with spawn_only tools.
+
+### Pipeline Engine (`octos-pipeline/`)
+
+DOT-graph based multi-step agent workflows. Per-node model selection via `ModelStylesheet`. Parallel fan-out spawns N concurrent workers at runtime. Includes artifact store, checkpoints, condition evaluation, human gates. `PipelineResult` tracks output, token usage, per-node summaries, modified files.
+
+### LRU Tool Deferral
+
+15 active tools for fast LLM reasoning, 34+ available on demand. Idle tools auto-evict. `spawn_only` tools cannot be evicted.
 
 ### Memory (`octos-memory/src/`)
 
@@ -120,4 +141,6 @@ All code changes follow the RED -> GREEN -> REFACTOR cycle. See `.claude/rules/t
 - Shared SSRF protection (`tools/ssrf.rs`): blocks private IPs, IPv6 ULA/link-local, IPv4-mapped/compatible addresses
 - Symlink-safe file I/O via `O_NOFOLLOW` on Unix (eliminates TOCTOU races); symlink-check fallback on Windows
 - Cross-platform: shell via `cmd /C` on Windows, `sh -c` on Unix; process kill via `taskkill` on Windows, `kill` signals on Unix; `where` on Windows, `which` on Unix for binary discovery
-- API server (`crew serve`) binds to 127.0.0.1 by default (`--host` to override)
+- Plugin skills use binary protocol: `./binary <tool_name>` with JSON stdin/stdout
+- `deny(unsafe_code)` workspace-wide lint
+- API server (`octos serve`) binds to 127.0.0.1 by default (`--host` to override)

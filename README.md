@@ -4,7 +4,7 @@
 
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
-31MB static binary. 91 REST endpoints. 14 LLM providers. 14 messaging channels. Multi-tenant. Zero dependencies.
+31MB static binary. 91 REST endpoints. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero dependencies.
 
 ## What is Octos?
 
@@ -22,7 +22,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
 - **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime.
 - **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, Lane scoring, circuit breakers.
-- **LRU tool deferral**: 15 active tools for fast LLM reasoning, 34+ on demand. Idle tools auto-evict.
+- **LRU tool deferral**: 15 active tools for fast LLM reasoning, 34+ on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
 - **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp.
 - **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction).
@@ -100,7 +100,7 @@ octos serve (control plane + dashboard)
        │
        ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, ...)
        │   └── AdaptiveRouter → ProviderChain → RetryProvider
-       ├── Tool Registry (13 built-in + 12 agent + 8 app-skills)
+       ├── Tool Registry (25 built-in + plugins + 9 app-skills)
        │   └── LRU Deferral (15 active, activate on demand)
        ├── Pipeline Engine (DOT graphs, per-node model, parallel fan-out)
        ├── Session Store (JSONL, LRU cache, LLM compaction)

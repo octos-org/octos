@@ -25,6 +25,8 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
     - [Account Manager](#125-account-manager)
     - [Clock](#126-clock)
     - [Weather](#127-weather)
+    - [WeChat Bridge](#128-wechat-bridge)
+    - [Pipeline Guard](#129-pipeline-guard)
 13. [Platform Skills (ASR/TTS)](#13-platform-skills-asrtts)
 14. [Custom Skill Installation](#14-custom-skill-installation)
 15. [Configuration Reference](#15-configuration-reference)
@@ -1385,6 +1387,19 @@ Bot: [uses get_forecast with city="New York, US", days=5]
      - Sunday: Clear skies, 10°C/18°C
      Looks like Saturday might have some light rain, but Sunday should be clear!
 ```
+
+### 12.8 WeChat Bridge
+
+**Binary:** `wechat-bridge`
+
+WebSocket bridge for WeChat personal accounts. Connects to the WeChat client via WebSocket and forwards messages to the gateway.
+
+### 12.9 Pipeline Guard
+
+**Type:** Hook (not a tool)
+**Event:** `before_tool_call` (filter: `run_pipeline`)
+
+Validates DOT graphs and injects optimal model assignments before `run_pipeline` executes. Runs as a before-hook with 10s timeout — can deny malformed pipeline submissions.
 
 ---
 
