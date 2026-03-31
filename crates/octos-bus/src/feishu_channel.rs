@@ -757,11 +757,11 @@ impl FeishuChannel {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Feishu webhook: invalid JSON body: {e}");
-                    return axum::http::Response::builder()
-                        .status(400)
-                        .header("Content-Type", "application/json")
-                        .body(serde_json::json!({"error": "invalid json"}).to_string())
-                        .unwrap();
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "invalid json"})),
+                    )
+                        .into_response();
                 }
             };
 
@@ -784,11 +784,11 @@ impl FeishuChannel {
                     let computed = verify_signature(timestamp, nonce, ek, &body);
                     if computed != expected_sig {
                         warn!("Feishu webhook: signature mismatch");
-                        return axum::http::Response::builder()
-                            .status(403)
-                            .header("Content-Type", "application/json")
-                            .body(serde_json::json!({"error": "signature mismatch"}).to_string())
-                            .unwrap();
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(serde_json::json!({"error": "signature mismatch"})),
+                        )
+                            .into_response();
                     }
                 }
             }
@@ -803,32 +803,31 @@ impl FeishuChannel {
                             Ok(v) => v,
                             Err(e) => {
                                 warn!("Feishu webhook: failed to parse decrypted event: {e}");
-                                return axum::http::Response::builder()
-                                    .status(400)
-                                    .header("Content-Type", "application/json")
-                                    .body(
-                                        serde_json::json!({"error": "decrypt parse error"})
-                                            .to_string(),
-                                    )
-                                    .unwrap();
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    axum::Json(
+                                        serde_json::json!({"error": "decrypt parse error"}),
+                                    ),
+                                )
+                                    .into_response();
                             }
                         },
                         Err(e) => {
                             warn!("Feishu webhook: decryption failed: {e}");
-                            return axum::http::Response::builder()
-                                .status(400)
-                                .header("Content-Type", "application/json")
-                                .body(serde_json::json!({"error": "decryption failed"}).to_string())
-                                .unwrap();
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"error": "decryption failed"})),
+                            )
+                                .into_response();
                         }
                     }
                 } else {
                     warn!("Feishu webhook: received encrypted event but no encrypt_key configured");
-                    return axum::http::Response::builder()
-                        .status(400)
-                        .header("Content-Type", "application/json")
-                        .body(serde_json::json!({"error": "no encrypt key configured"}).to_string())
-                        .unwrap();
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "no encrypt key configured"})),
+                    )
+                        .into_response();
                 }
             } else {
                 body_json
@@ -841,11 +840,7 @@ impl FeishuChannel {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 info!("Feishu webhook: url_verification challenge received");
-                return axum::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "application/json")
-                    .body(serde_json::json!({"challenge": challenge}).to_string())
-                    .unwrap();
+                return axum::Json(serde_json::json!({"challenge": challenge})).into_response();
             }
 
             // Verification token check (for non-encrypted plaintext events)
@@ -856,21 +851,18 @@ impl FeishuChannel {
                     .unwrap_or("");
                 if !event_token.is_empty() && event_token != vt {
                     warn!("Feishu webhook: verification token mismatch");
-                    return axum::http::Response::builder()
-                        .status(403)
-                        .header("Content-Type", "application/json")
-                        .body(serde_json::json!({"error": "token mismatch"}).to_string())
-                        .unwrap();
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({"error": "token mismatch"})),
+                    )
+                        .into_response();
                 }
             }
 
             // Forward event to the channel for processing
             let _ = state.inbound_tx.send(event_json).await;
 
-            axum::http::Response::builder()
-                .status(200)
-                .body("ok".to_string())
-                .unwrap()
+            "ok".into_response()
         }
 
         // Internal channel for passing parsed events

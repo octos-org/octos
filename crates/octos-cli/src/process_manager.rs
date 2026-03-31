@@ -741,8 +741,7 @@ impl ProcessManager {
     /// Internal: start a bridge process. Returns the WS port.
     async fn start_bridge_inner(&self, profile: &UserProfile) -> Result<u16> {
         let mut bridges = self.bridges.write().await;
-        if bridges.contains_key(&profile.id) {
-            let existing = bridges.get(&profile.id).unwrap();
+        if let Some(existing) = bridges.get(&profile.id) {
             return Ok(existing.ws_port);
         }
 
