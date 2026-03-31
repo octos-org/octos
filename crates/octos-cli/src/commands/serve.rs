@@ -506,7 +506,10 @@ impl ServeCommand {
         println!();
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app)
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
                 println!();

@@ -447,7 +447,15 @@ async fn user_auth_middleware(
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
     // The reverse proxy (Caddy) sets this header to identify the profile,
     // so requests through the proxy are implicitly authenticated.
-    if !profile_id.is_empty() {
+    // SECURITY: Only accept this header from loopback addresses to prevent
+    // profile impersonation via misconfigured reverse proxy or SSRF.
+    let is_loopback = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+
+    if !profile_id.is_empty() && is_loopback {
         // Validate that the profile actually exists to prevent spoofing.
         if let Some(ref store) = state.profile_store {
             if store.get(&profile_id).ok().flatten().is_none() {
@@ -470,6 +478,13 @@ async fn user_auth_middleware(
             });
             return Ok(next.run(req).await);
         }
+    }
+
+    if !profile_id.is_empty() && !is_loopback {
+        tracing::warn!(
+            profile_id = %profile_id,
+            "X-Profile-Id header rejected: request not from loopback address"
+        );
     }
 
     tracing::warn!(
