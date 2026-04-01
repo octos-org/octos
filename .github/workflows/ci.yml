@@ -43,6 +43,12 @@ jobs:
             exit 1
           fi
 
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.33.1
+
   check:
     runs-on: ubuntu-latest
     steps:
