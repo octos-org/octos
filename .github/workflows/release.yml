@@ -170,5 +170,6 @@ jobs:
             artifacts/octos-bundle-aarch64-unknown-linux-gnu/octos-bundle-aarch64-unknown-linux-gnu.tar.gz
             artifacts/octos-bundle-x86_64-pc-windows-msvc/octos-bundle-x86_64-pc-windows-msvc.zip
             scripts/install.sh
+            scripts/install.ps1
             scripts/octos-doctor.sh
           body_path: RELEASE_NOTES.md

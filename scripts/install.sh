@@ -1032,21 +1032,14 @@ ok "$OS $ARCH ($TRIPLE)"
 # ── Check / install runtime dependencies ─────────────────────────────
 section "Checking runtime dependencies"
 
-# git — required for skill installation
+# git — needed for skill installation
 if command -v git &>/dev/null; then
     ok "git $(git --version | awk '{print $3}')"
 else
-    case "$OS" in
-        Darwin)
-            echo "    Installing Xcode Command Line Tools (provides git)..."
-            xcode-select --install 2>/dev/null || true
-            echo "    Follow the dialog to complete installation, then re-run this script."
-            exit 1
-            ;;
-        *)
-            err "git not found. Install with: $(pkg_hint git)"
-            ;;
-    esac
+    warn "git not found"
+    echo "    Enables: skill installation (octos skills install)"
+    echo "    Install:"
+    echo "      $(pkg_hint git)"
 fi
 
 # Node.js / npm

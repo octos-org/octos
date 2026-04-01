@@ -39,7 +39,13 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 Supported platforms: **macOS ARM64** (Apple Silicon), **Linux x86_64**, and **Linux ARM64**. Installs to `~/.octos/bin`, initializes the workspace, and sets up `octos serve` as a system service (launchd on macOS, systemd on Linux).
 
-With tunnel options (remote access via frpc):
+On **Windows** (PowerShell):
+
+```powershell
+irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
+```
+
+With tunnel options (remote access via frpc, macOS/Linux only):
 
 ```bash
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
@@ -49,7 +55,11 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 Diagnose an existing installation:
 
 ```bash
+# macOS / Linux
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/octos-doctor.sh | bash
+
+# Windows
+.\install.ps1 -Doctor
 ```
 
 ## Quick Start
