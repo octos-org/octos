@@ -6,14 +6,16 @@ on:
 permissions:
   contents: write
 
+env:
+  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard"
+
 jobs:
   build-macos-arm:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Set build metadata
@@ -21,32 +23,178 @@ jobs:
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      - name: Build octos CLI
-        run: cargo build --release -p octos-cli --features telegram,whatsapp,feishu,twilio,api
+      - name: Build
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
 
-      - name: Build app-skill binaries
-        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather
-
-      - name: Bundle release tarball
+      - name: Bundle
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather; do
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm
+          path: octos-bundle-aarch64-apple-darwin.tar.gz
+
+  build-linux-x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set build metadata
+        run: |
+          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86
+          path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+
+  build-linux-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64-release
+
+      - name: Set build metadata
+        run: |
+          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm
+          path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+
+      - name: Set build metadata
+        shell: bash
+        run: |
+          echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        shell: bash
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/${b}.exe" dist/ 2>/dev/null || true
+          done
+          cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: octos-bundle-x86_64-pc-windows-msvc.zip
+
+  build-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows, build-docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install git-cliff
         run: cargo install git-cliff --locked
 
       - name: Generate release notes
-        run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          git-cliff --latest --strip header -o RELEASE_NOTES.md
+        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            octos-bundle-aarch64-apple-darwin.tar.gz
+            artifacts/macos-arm/octos-bundle-aarch64-apple-darwin.tar.gz
+            artifacts/linux-x86/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+            artifacts/linux-arm/octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+            artifacts/windows/octos-bundle-x86_64-pc-windows-msvc.zip
             scripts/install.sh
             scripts/octos-doctor.sh
           body_path: RELEASE_NOTES.md
