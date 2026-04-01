@@ -1,6 +1,6 @@
 # Security Architecture
 
-octos multi-tenant AI agent gateway security reference. Last updated: 2026-03-15.
+octos multi-tenant AI agent gateway security reference. Last updated: 2026-03-30.
 
 ---
 
@@ -25,15 +25,37 @@ octos runs multiple AI agent profiles on a single host, each with access to shel
 
 ---
 
-## 2. Architecture Layers
+## 2. Security Boundary Classification
 
-### 2.1 Session Isolation
+Not all defensive layers provide equal guarantees. This table classifies each layer as a **hard boundary** (kernel/crypto-enforced, not bypassable by application bugs) or a **soft boundary** (defense-in-depth, best-effort, bypassable by a determined attacker).
+
+| Layer | Type | Enforcement | Bypass Resistance |
+|-------|------|-------------|-------------------|
+| **Sandbox** (bwrap, sandbox-exec, Docker) | Hard | Kernel namespaces / SBPL / container | Requires kernel exploit |
+| **SSRF filter** (`ssrf.rs`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
+| **`O_NOFOLLOW` file I/O** | Hard | Kernel (atomic open flag) | No known bypass |
+| **`BLOCKED_ENV_VARS`** | Hard | Process environment (set before exec) | Requires parent process compromise |
+| **Tool Policy** (allow/deny lists) | Hard | Application (deny-wins, checked at dispatch) | Requires code bug in policy enforcement |
+| **Auth middleware** (token, constant-time compare) | Hard | Application + crypto | Requires token leak or code bug |
+| **Docker `--cap-drop ALL`, `--no-new-privileges`** | Hard | Kernel capabilities | Requires kernel exploit |
+| **Plugin SHA-256 verification** | Hard | Crypto (verified copy executed) | Requires SHA-256 collision |
+| **`SafePolicy`** (command deny list) | **Soft** | Regex on normalized string | **Trivially bypassed** — shell metacharacters, variable expansion, encoding tricks, any command not on the short list. See `policy.rs` doc comment. |
+| **Prompt guard** (`prompt_guard.rs`) | **Soft** | Regex on plaintext | **Trivially bypassed** — base64, URL encoding, HTML entities, Unicode homoglyphs, zero-width chars, RTL overrides. See module doc comment. |
+| **`resolve_path()`** (path containment) | Soft | Application (normalize + prefix check) | Requires code bug, but not kernel-enforced. Defense-in-depth behind sandbox. |
+
+**Key takeaway:** Do not rely on `SafePolicy` or `prompt_guard` to stop a determined attacker. They catch accidental or naive attempts. The sandbox, tool policy, and SSRF filter are the real security boundaries.
+
+---
+
+## 3. Architecture Layers
+
+### 3.1 Session Isolation
 
 Session isolation operates at three levels: **profile** (OS process), **user** (per-actor `SessionHandle` + directory), and **session** (JSONL file).
 
 #### Profile-level isolation (OS process boundary)
 
-Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.octos/profiles/{id}/`). Profiles share no in-process state — cross-profile access requires filesystem traversal (mitigated by sandboxing, §2.3).
+Each profile runs as a separate gateway child process with its own `data_dir` (typically `~/.octos/profiles/{id}/`). Profiles share no in-process state — cross-profile access requires filesystem traversal (mitigated by sandboxing, §3.3).
 
 #### User-level isolation (per-actor SessionHandle)
 
@@ -70,7 +92,7 @@ Each session is an independent JSONL file with the following protections:
 
 When queue mode is `speculative`, overflow tasks run as spawned tokio tasks within the same `SessionActor`, sharing the actor's `Arc<Mutex<SessionHandle>>`. The per-actor mutex serializes writes, preventing concurrent corruption. Overflow tasks do NOT create new actors or access other users' data.
 
-**Limitation**: User isolation is directory-based and actor-scoped, not kernel-enforced. A compromised shell tool in one session can read another user's directory within the same profile unless sandboxing is enabled (§2.3). For kernel-enforced user isolation, see §4 recommendation #6 (per-profile UID isolation).
+**Limitation**: User isolation is directory-based and actor-scoped, not kernel-enforced. A compromised shell tool in one session can read another user's directory within the same profile unless sandboxing is enabled (§3.3). For kernel-enforced user isolation, see §5 recommendation #6 (per-profile UID isolation).
 
 #### Per-user workspace isolation (tool file access)
 
@@ -105,7 +127,7 @@ Each user gets a dedicated workspace directory for tool execution:
 
 3. **Process visibility** — user A's shell can observe user B's processes via `ps`. macOS `sandbox-exec` does not support PID namespace isolation (unlike Linux bubblewrap `--unshare-pid`). Requires containers for process-level isolation.
 
-### 2.2 File I/O Safety
+### 3.2 File I/O Safety
 
 `resolve_path()` in `octos-agent/src/tools/mod.rs`:
 
@@ -119,7 +141,7 @@ Symlink protection uses two layers:
 
 On non-Unix platforms, a fallback `symlink_metadata()` check is used (TOCTOU window exists but is narrow).
 
-### 2.3 Sandbox Backends
+### 3.3 Sandbox Backends
 
 Three sandbox backends in `octos-agent/src/sandbox.rs`, selectable via `SandboxConfig`:
 
@@ -133,7 +155,7 @@ Three sandbox backends in `octos-agent/src/sandbox.rs`, selectable via `SandboxC
 **macOS sandbox-exec**:
 - SBPL profile: `(deny default)` base policy.
 - `(allow file-write*)` scoped to `(subpath "{cwd}")`, `/private/tmp`, `/private/var/folders`. With per-user workspace isolation, `{cwd}` is the user's own workspace directory (`{data_dir}/users/{base_key}/workspace/`), so write access is kernel-restricted to that user's files.
-- `(allow file-read*)` globally (read-only access to system). See §2.1 limitation #1 for discussion.
+- `(allow file-read*)` globally (read-only access to system). See §3.1 limitation #1 for discussion.
 - Path injection prevention: rejects paths containing control chars (`< 0x20`, `0x7F`), parentheses, backslash, and double-quote -- all SBPL metacharacters. Fails closed (error, not unsandboxed execution).
 
 **Docker**:
@@ -181,7 +203,7 @@ Key observations:
 
 **Recommendation**: Use `"mode": "auto"` (default) which selects macOS sandbox-exec on macOS and Docker on Linux. Only force `"mode": "docker"` when you need full OS-level isolation (different filesystem namespace, PID isolation, CPU/memory limits).
 
-**Mitigation for Docker overhead** (planned): Adopt persistent container model — one container per session with `docker exec` for subsequent commands, auto-pruned after idle timeout. This amortizes startup cost (~130ms first command, ~5ms subsequent) and preserves filesystem state across commands within a session. See §4.6 for details.
+**Mitigation for Docker overhead** (planned): Adopt persistent container model — one container per session with `docker exec` for subsequent commands, auto-pruned after idle timeout. This amortizes startup cost (~130ms first command, ~5ms subsequent) and preserves filesystem state across commands within a session. See §5.6 for details.
 
 **BLOCKED_ENV_VARS** (18 variables, shared across all backends + MCP + hooks + browser):
 ```
@@ -194,7 +216,7 @@ JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR
 
 All backends remove these from the child process environment before execution.
 
-### 2.4 Tool Policy
+### 3.4 Tool Policy
 
 `ToolPolicy` in `octos-agent/src/tools/policy.rs` provides allow/deny lists with **deny-wins** semantics:
 
@@ -205,11 +227,11 @@ All backends remove these from the child process environment before execution.
 - **Tag-based filtering**: `require_tags` restricts tool visibility by semantic tags (e.g., `code`, `web`, `gateway`). Tools with no tags are universal (pass any filter).
 - **Provider-specific policies**: `set_provider_policy()` filters both `specs()` and `execute()` -- an LLM cannot call a tool it cannot see.
 
-**ShellTool SafePolicy**: Denies dangerous commands (`rm -rf /`, `dd`, `mkfs`, fork bombs). Whitespace-normalized before matching. Timeout clamped to `[1, 600]` seconds.
+**ShellTool SafePolicy** (soft boundary — see §2): Denies a small set of obviously dangerous commands (`rm -rf /`, `dd`, `mkfs`, fork bombs). Whitespace-normalized before matching. Timeout clamped to `[1, 600]` seconds. This is **not a security boundary** — it catches accidental mistakes but is trivially bypassed by shell metacharacters and encoding tricks. Sandbox isolation (§3.3) is the real protection layer.
 
 **Tool argument size limit**: 1 MB (`estimate_json_size` -- non-allocating recursive walk of `serde_json::Value`, prevents OOM on deeply nested payloads).
 
-### 2.5 SSRF Protection
+### 3.5 SSRF Protection
 
 `octos-agent/src/tools/ssrf.rs` provides shared SSRF validation for `web_fetch`, `browser`, and MCP HTTP transports.
 
@@ -222,12 +244,12 @@ All backends remove these from the child process environment before execution.
 - IPv6: loopback (::1), unspecified (::), multicast (ff00::/8), ULA (fc00::/7), link-local (fe80::/10), site-local (fec0::/10).
 - IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x) addresses are unwrapped and checked against IPv4 rules.
 
-### 2.6 Plugin Integrity
+### 3.6 Plugin Integrity
 
 `octos-agent/src/plugins/loader.rs` handles plugin loading with integrity verification:
 
 1. **Manifest parsing**: `manifest.json` must exist and contain valid JSON with tool definitions.
-2. **Executable discovery**: Tries directory name, then `main`. Must be executable (`mode & 0o111 != 0` on Unix).
+2. **Executable discovery**: Tries manifest name, directory name, `main`, or any executable in directory. Must be executable (`mode & 0o111 != 0` on Unix). Symlinks rejected via `symlink_metadata()`.
 3. **Size limit**: 100 MB maximum executable size (checked before reading into memory).
 4. **SHA-256 verification**: If `sha256` is present in manifest, the executable bytes are hashed and compared. Mismatch = reject.
 5. **TOCTOU-safe execution**: After verification, the exact bytes read are written to a `.{name}_verified` sibling file with `0o500` permissions (read+execute, no write). `PluginTool` executes this verified copy, not the original. This prevents swapping the binary after hash verification.
@@ -236,7 +258,7 @@ All backends remove these from the child process environment before execution.
 
 **Warning**: Plugins without `sha256` in manifest are loaded with a warning log. This is intentional for development but should be audited in production.
 
-### 2.7 MCP Security
+### 3.7 MCP Security
 
 `octos-agent/src/mcp.rs` secures MCP server integration:
 
@@ -262,7 +284,7 @@ All backends remove these from the child process environment before execution.
 - HTTP: 30-second timeout per request.
 - MCP tool execution: 30-second timeout per tool call.
 
-### 2.8 Auth Middleware
+### 3.8 Auth Middleware
 
 `octos-cli/src/api/router.rs` implements two-tier authentication:
 
@@ -280,7 +302,7 @@ All backends remove these from the child process environment before execution.
 
 **Unauthenticated routes**: Auth endpoints (`/api/auth/*`), webhook proxy (`/webhook/*`), static files.
 
-### 2.9 Hook Security
+### 3.9 Hook Security
 
 `octos-agent/src/hooks.rs` runs lifecycle hooks with multiple safety measures:
 
@@ -298,7 +320,7 @@ All backends remove these from the child process environment before execution.
 
 **Payload**: JSON on stdin with event type, tool name, arguments, session context. Tool arguments are included in before_tool_call payloads (allows audit hooks to inspect commands before execution).
 
-### 2.10 Per-Profile CWD Isolation
+### 3.10 Per-Profile CWD Isolation
 
 When `octos serve` spawns a gateway subprocess for each profile, the child process now receives `--cwd {data_dir}` (e.g., `~/.octos/profiles/{id}/data/`) instead of inheriting the parent's home directory. This narrows the default working directory from the entire user home to the profile's own data directory, strengthening several existing defenses.
 
@@ -341,61 +363,61 @@ Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.oc
 
 ---
 
-## 3. Known Limitations & Mitigations
+## 4. Known Limitations & Mitigations
 
-### 3.1 Global Environment Variables
+### 4.1 Global Environment Variables
 
 **Issue**: All gateway child processes inherit the parent process environment. API keys set as env vars (e.g., `KIMI_API_KEY`) are visible to all profiles.
 
 **Mitigation**: Use per-profile `env_vars` map in profile configuration. The gateway process sets only the profile's configured env vars. Avoid exporting shared API keys in the shell environment.
 
-### 3.2 MCP Inherits Parent Env
+### 4.2 MCP Inherits Parent Env
 
 **Issue**: MCP stdio servers inherit the full parent process environment minus `BLOCKED_ENV_VARS`. This may expose API keys or other secrets to MCP server processes.
 
 **Mitigation**: MCP `env` config allows explicit env var injection. For sensitive deployments, run MCP servers with minimal env using the `env` field rather than relying on inheritance.
 
-### 3.3 No Pre-LLM Secret Redaction
+### 4.3 No Pre-LLM Secret Redaction
 
 **Issue**: Tool output (e.g., `shell` reading `.env` files, `read_file` on config files) is passed directly to the LLM. There is no filter to redact secrets before they enter the LLM context window.
 
 **Mitigation**: Use tool policies to restrict `read_file` access. Consider adding a `before_llm_call` hook that inspects message content for secret patterns (regex-based).
 
-### 3.4 Unauthenticated Webhooks
+### 4.4 Unauthenticated Webhooks
 
 **Issue**: `/webhook/feishu/{profile_id}` and `/webhook/twilio/{profile_id}` are unauthenticated by design -- external platforms (Feishu, Twilio) cannot authenticate with Bearer tokens.
 
 **Mitigation**: Rely on platform-specific signature validation within each handler. The profile_id in the URL path provides routing but not access control.
 
-### 3.5 Admin API Without Auth in Dev Mode
+### 4.5 Admin API Without Auth in Dev Mode
 
 **Issue**: When no `auth_token` is configured and no `AuthManager` is present, all API routes (including admin) are accessible without authentication.
 
 **Mitigation**: Always set an auth token in production. The router explicitly checks `has_auth` and only applies middleware when configured.
 
-### 3.6 read_file Loads Full Content
+### 4.6 read_file Loads Full Content
 
 **Issue**: `read_no_follow` reads the entire file into memory before any slicing or offset is applied. A large file (e.g., multi-GB log) can cause OOM.
 
 **Mitigation**: Session files have a 10 MB limit. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
 
-### 3.7 Sandbox Disabled by Default
+### 4.7 Sandbox Enabled by Default
 
-**Issue**: `SandboxConfig::default()` has `enabled: false`. Shell commands run without isolation unless explicitly configured.
+`SandboxConfig::default()` has `enabled: true` with `SandboxMode::Auto`. Auto-detection selects the best available backend (bwrap on Linux, sandbox-exec on macOS, Docker as fallback). If no backend is found, a prominent warning is logged and commands run unsandboxed.
 
-**Mitigation**: Enable sandboxing in production profile configs. Auto-detection (`SandboxMode::Auto`) selects the best available backend.
+Users can explicitly opt out with `"sandbox": {"enabled": false}` in config.
 
 ---
 
-## 4. Hardening Recommendations
+## 5. Hardening Recommendations
 
 Inspired by LAMP shared hosting's 25-year-old multi-tenant isolation model, which octos is essentially re-solving for AI agents. LAMP's key insight: **the kernel should enforce isolation, not application code**. Application-level checks (`resolve_path()`, tool policy) are defense-in-depth, not the primary boundary.
 
-### 4.1 Enable sandbox by default (short-term)
+### 5.1 ~~Enable sandbox by default~~ (DONE)
 
-Change `SandboxConfig::default()` to `enabled: true`. Auto-detection (`SandboxMode::Auto`) selects the best available backend. Every production profile should have kernel-enforced tool isolation with zero configuration.
+Completed. `SandboxConfig::default()` now has `enabled: true`. A warning is logged when no sandbox backend is found. See §3.7.
 
-### 4.2 Per-profile UID isolation (medium-term, highest impact)
+### 5.2 Per-profile UID isolation (medium-term, highest impact)
 
 **LAMP equivalent**: Each PHP-FPM pool runs as a separate Unix user (`webA`, `webB`). The kernel enforces everything — file permissions, process visibility, signal delivery.
 
@@ -449,7 +471,7 @@ sudo -u octos_profile_abc octos gateway \
 - `crates/octos-cli/src/profiles.rs` — Add `isolation` config section
 - `crates/octos-cli/src/commands/gateway/mod.rs` — Read isolation config
 
-### 4.3 Read isolation (medium-term)
+### 5.3 Read isolation (medium-term)
 
 **LAMP equivalent**: `open_basedir = /home/webA/:/tmp/` — PHP interpreter refuses to open files outside these paths.
 
@@ -497,13 +519,13 @@ ruleset.restrict_self()?;
 - `crates/octos-agent/src/sandbox.rs` — Add `read_paths: Vec<PathBuf>` to `SandboxConfig`, update SBPL generation and bwrap bind mounts
 - New: Landlock backend in `sandbox.rs` (Linux 5.13+ detection via `prctl(PR_GET_NO_NEW_PRIVS)`)
 
-### 4.4 Disk quotas (medium-term)
+### 5.4 Disk quotas (medium-term)
 
 **LAMP equivalent**: `setquota -u webA 5G 5.5G 0 0 /home` — kernel-enforced storage limit per tenant.
 
 **Current gap**: No disk quota. A malicious shell command (`dd if=/dev/zero of=big bs=1G count=100`) can fill the disk, affecting all profiles.
 
-**With per-profile UID** (§4.2): Use standard Unix quotas.
+**With per-profile UID** (§5.2): Use standard Unix quotas.
 ```bash
 # Enable quotas on the filesystem (one-time)
 sudo quotaon -u /home
@@ -538,7 +560,7 @@ Application-level quota is bypassable (shell commands write directly), so per-pr
 }
 ```
 
-### 4.5 Dangerous bind mount blocking (short-term)
+### 5.5 Dangerous bind mount blocking (short-term)
 
 **Learned from OpenClaw**: Block dangerous Docker bind mount sources that could lead to container escape or host compromise.
 
@@ -572,7 +594,7 @@ fn validate_bind_mount(source: &str) -> Result<()> {
 **Files to modify**:
 - `crates/octos-agent/src/sandbox.rs` — Add validation in `DockerSandbox::wrap_command()`
 
-### 4.6 Persistent Docker containers (medium-term)
+### 5.6 Persistent Docker containers (medium-term)
 
 **Current**: One container per shell command (`docker run --rm`). 200-500ms startup overhead per command, filesystem state lost between commands.
 
@@ -607,7 +629,7 @@ async fn prune_idle_containers(max_idle: Duration, max_age: Duration) { ... }
 - `crates/octos-agent/src/sandbox.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
 - `crates/octos-cli/src/session_actor.rs` — Tie container lifecycle to `SessionActor` lifetime
 
-### 4.7 Profile containers with network isolation (long-term)
+### 5.7 Profile containers with network isolation (long-term)
 
 Currently each profile runs as a native OS process on the host. The next evolution is running each profile inside its own Docker container, giving full kernel isolation (filesystem, PID, network, resource limits) between profiles.
 
@@ -735,7 +757,7 @@ impl AllowlistProxy {
 - New: `crates/octos-cli/src/proxy.rs` — Domain-allowlist HTTPS CONNECT proxy (~200 LOC)
 - `crates/octos-cli/src/commands/serve.rs` — Start proxy alongside control plane
 
-### 4.8 Additional hardening
+### 5.8 Additional hardening
 
 **Webhook signature validation** (short-term, all profiles):
 - Implement Twilio request signature verification (`X-Twilio-Signature`)
@@ -764,7 +786,7 @@ impl AllowlistProxy {
 **Landlock/seccomp** (long-term):
 - On Linux 5.13+, apply Landlock LSM for file access restriction (per-user read/write paths)
 - Seccomp-bpf for syscall filtering (block ptrace, mount, setuid)
-- See §4.3 for Landlock implementation details
+- See §5.3 for Landlock implementation details
 
 **Encrypted session storage** (long-term):
 - Encrypt session JSONL files at rest with per-profile keys
@@ -775,7 +797,7 @@ impl AllowlistProxy {
 
 ---
 
-## 5. LAMP Stack Comparison
+## 6. LAMP Stack Comparison
 
 octos is solving the same multi-tenant isolation problem that PHP shared hosting solved 25+ years ago. This comparison identifies gaps and guides the hardening roadmap.
 
@@ -800,15 +822,15 @@ Apache/nginx (root)                    octos serve (control plane)
 
 | LAMP Feature | Enforcement | octos Equivalent | Enforcement | Gap | Planned Fix |
 |-------------|-------------|-------------------|-------------|-----|-------------|
-| Per-tenant Unix UID | Kernel (DAC) | Per-profile OS process | Process boundary only | **No UID isolation** | §4.2 per-profile UID |
-| `chroot` / bind mount | Kernel | Per-user workspace | Application + SBPL writes | **Reads not restricted** | §4.3 read isolation (Landlock/SBPL) |
-| `open_basedir` | PHP runtime | `resolve_path()` | Application code | Bug = bypass | §4.3 + Landlock |
+| Per-tenant Unix UID | Kernel (DAC) | Per-profile OS process | Process boundary only | **No UID isolation** | §5.2 per-profile UID |
+| `chroot` / bind mount | Kernel | Per-user workspace | Application + SBPL writes | **Reads not restricted** | §5.3 read isolation (Landlock/SBPL) |
+| `open_basedir` | PHP runtime | `resolve_path()` | Application code | Bug = bypass | §5.3 + Landlock |
 | `disable_functions` | PHP runtime | `ToolPolicy` deny list | Application code | Bug = bypass | Defense in depth |
-| Disk quota (`setquota`) | Kernel | None | — | **No quota** | §4.4 with per-profile UID |
-| `/proc` hiding (`hidepid=2`) | Kernel | None (macOS N/A) | — | **Processes visible** | §4.7 profile containers |
+| Disk quota (`setquota`) | Kernel | None | — | **No quota** | §5.4 with per-profile UID |
+| `/proc` hiding (`hidepid=2`) | Kernel | None (macOS N/A) | — | **Processes visible** | §5.7 profile containers |
 | MySQL per-user grants | MySQL ACL | Per-profile redb file | Filesystem | Adequate | — |
-| Network ACL (iptables) | Kernel | SSRF check in app | Application code | **No per-profile network** | §4.7 proxy allowlist |
-| Bandwidth metering | Kernel/iptables | None | — | **No metering** | §4.7 proxy can meter |
+| Network ACL (iptables) | Kernel | SSRF check in app | Application code | **No per-profile network** | §5.7 proxy allowlist |
+| Bandwidth metering | Kernel/iptables | None | — | **No metering** | §5.7 proxy can meter |
 
 ### What octos already does better than LAMP
 

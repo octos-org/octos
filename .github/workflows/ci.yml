@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard"
 
 jobs:
   dashboard:
@@ -63,6 +65,181 @@ jobs:
 
       - name: activate_tools regression tests
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+  check-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64
+
+      - name: Build (workspace + all features)
+        run: |
+          cargo build --workspace
+          cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Test
+        run: cargo test --workspace
+
+  check-riscv:
+    runs-on: ubuntu-24.04-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: riscv64
+
+      - name: Build (workspace + all features)
+        run: |
+          cargo build --workspace
+          cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Test
+        run: cargo test --workspace
+
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+
+      - name: Build (workspace + all features)
+        run: |
+          cargo build --workspace
+          cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ── Release artifact builds (main only) ──────────────────────────
+  build-macos-arm:
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-aarch64-apple-darwin
+          path: octos-bundle-aarch64-apple-darwin.tar.gz
+          retention-days: 7
+
+  build-linux-x86:
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-x86_64-unknown-linux-gnu
+          path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+          retention-days: 7
+
+  build-linux-arm:
+    if: github.event_name == 'push'
+    needs: check-arm
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64-release
+
+      - name: Build release
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/$b" dist/ 2>/dev/null || true
+          done
+          cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-aarch64-unknown-linux-gnu
+          path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+          retention-days: 7
+
+  build-windows:
+    if: github.event_name == 'push'
+    needs: check-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+
+      - name: Build release
+        run: |
+          cargo build --release -p octos-cli --features ${{ env.FEATURES }}
+          cargo build --release ${{ env.SKILL_CRATES }}
+
+      - name: Bundle
+        shell: bash
+        run: |
+          mkdir dist
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
+            cp "target/release/${b}.exe" dist/ 2>/dev/null || true
+          done
+          cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octos-bundle-x86_64-pc-windows-msvc
+          path: octos-bundle-x86_64-pc-windows-msvc.zip
+          retention-days: 7
 
   e2e-tool-regression:
     runs-on: macos-14

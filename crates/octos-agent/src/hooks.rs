@@ -104,6 +104,77 @@ pub struct HookPayload {
     pub latency_ms: Option<u64>,
 }
 
+/// Maximum byte length for arguments/result fields in hook payloads.
+const MAX_PAYLOAD_FIELD_BYTES: usize = 1024;
+
+/// Tool names whose arguments and results may contain secrets (file contents,
+/// shell output, passwords). Their payloads are replaced with a redaction
+/// notice instead of being truncated.
+const SENSITIVE_TOOLS: &[&str] = &["shell", "write_file", "read_file"];
+
+/// Truncate a string to at most `max_bytes`, cutting at a UTF-8 boundary.
+/// Appends "... (truncated)" when truncation occurs.
+fn truncate_string(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &s[..end])
+}
+
+/// Truncate a JSON value to at most `max_bytes` when serialized.
+/// Objects/arrays are serialized then truncated as a string; scalars are
+/// returned as-is if they fit.
+fn truncate_json_value(v: &serde_json::Value, max_bytes: usize) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(truncate_string(s, max_bytes))
+        }
+        other => {
+            let serialized = serde_json::to_string(other).unwrap_or_default();
+            if serialized.len() <= max_bytes {
+                other.clone()
+            } else {
+                serde_json::Value::String(truncate_string(&serialized, max_bytes))
+            }
+        }
+    }
+}
+
+/// Sanitize arguments and result fields for hook payloads.
+/// For sensitive tools, replaces content with a redaction notice.
+/// For other tools, truncates to `MAX_PAYLOAD_FIELD_BYTES`.
+fn sanitize_payload(
+    tool_name: Option<&str>,
+    arguments: Option<serde_json::Value>,
+    result: Option<String>,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let is_sensitive = tool_name
+        .map(|n| SENSITIVE_TOOLS.contains(&n))
+        .unwrap_or(false);
+
+    let sanitized_args = arguments.map(|args| {
+        if is_sensitive {
+            serde_json::json!({"redacted": true, "reason": "sensitive tool"})
+        } else {
+            truncate_json_value(&args, MAX_PAYLOAD_FIELD_BYTES)
+        }
+    });
+
+    let sanitized_result = result.map(|r| {
+        if is_sensitive {
+            "[redacted: sensitive tool output]".to_string()
+        } else {
+            truncate_string(&r, MAX_PAYLOAD_FIELD_BYTES)
+        }
+    });
+
+    (sanitized_args, sanitized_result)
+}
+
 impl HookPayload {
     /// Payload for a before-LLM-call hook.
     pub fn before_llm(
@@ -161,16 +232,20 @@ impl HookPayload {
     }
 
     /// Payload for a before-tool-call hook.
+    ///
+    /// Arguments are sanitized: sensitive tools are redacted, others truncated
+    /// to 1 KB to prevent secrets from leaking to hook processes.
     pub fn before_tool(
         name: &str,
         arguments: serde_json::Value,
         tool_id: &str,
         ctx: Option<&HookContext>,
     ) -> Self {
+        let (sanitized_args, _) = sanitize_payload(Some(name), Some(arguments), None);
         let mut p = Self {
             event: HookEvent::BeforeToolCall,
             tool_name: Some(name.to_string()),
-            arguments: Some(arguments),
+            arguments: sanitized_args,
             tool_id: Some(tool_id.to_string()),
             ..Self::empty(HookEvent::BeforeToolCall)
         };
@@ -179,6 +254,9 @@ impl HookPayload {
     }
 
     /// Payload for an after-tool-call hook.
+    ///
+    /// Result is sanitized: sensitive tools are redacted, others truncated
+    /// to 1 KB to prevent secrets from leaking to hook processes.
     pub fn after_tool(
         name: &str,
         tool_id: &str,
@@ -187,11 +265,12 @@ impl HookPayload {
         duration_ms: u64,
         ctx: Option<&HookContext>,
     ) -> Self {
+        let (_, sanitized_result) = sanitize_payload(Some(name), None, Some(result));
         let mut p = Self {
             event: HookEvent::AfterToolCall,
             tool_name: Some(name.to_string()),
             tool_id: Some(tool_id.to_string()),
-            result: Some(result),
+            result: sanitized_result,
             success: Some(success),
             duration_ms: Some(duration_ms),
             ..Self::empty(HookEvent::AfterToolCall)
@@ -494,6 +573,22 @@ fn expand_tilde(path: &str) -> String {
             Some(pos) => (&rest[..pos], &rest[pos..]),
             None => (rest, ""),
         };
+        // Reject usernames with path traversal or unsafe characters.
+        // Only allow alphanumeric, hyphen, underscore, and dot (no leading dot).
+        // This allowlist implicitly blocks path separators (/ \), null bytes,
+        // and other injection characters on all platforms.
+        let is_safe_username = !username.is_empty()
+            && !username.starts_with('.')
+            && username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        if !is_safe_username {
+            warn!(
+                path,
+                username, "tilde expansion blocked: invalid username, returning path as-is"
+            );
+            return path.to_string();
+        }
         #[cfg(target_os = "macos")]
         let home_base = "/Users";
         #[cfg(windows)]
@@ -718,6 +813,34 @@ mod tests {
         assert_eq!(expand_tilde("relative/path"), "relative/path");
     }
 
+    #[test]
+    fn test_expand_tilde_rejects_traversal() {
+        // Path traversal via username must return the path unexpanded
+        assert_eq!(expand_tilde("~../../bin/evil"), "~../../bin/evil");
+        assert_eq!(expand_tilde("~../etc/passwd"), "~../etc/passwd");
+        assert_eq!(expand_tilde("~.hidden/path"), "~.hidden/path");
+    }
+
+    #[test]
+    fn test_expand_tilde_rejects_unsafe_chars() {
+        // Null bytes and backslashes in username are blocked by the allowlist
+        assert_eq!(expand_tilde("~user\0evil"), "~user\0evil");
+        assert_eq!(expand_tilde("~user\\evil"), "~user\\evil");
+        assert_eq!(expand_tilde("~user:evil"), "~user:evil");
+        assert_eq!(expand_tilde("~ spaces"), "~ spaces");
+    }
+
+    #[test]
+    fn test_expand_tilde_allows_valid_usernames() {
+        let expanded = expand_tilde("~valid-user_1/path");
+        assert!(!expanded.starts_with('~'));
+        assert!(expanded.contains("valid-user_1"));
+
+        let expanded = expand_tilde("~user.name/path");
+        assert!(!expanded.starts_with('~'));
+        assert!(expanded.contains("user.name"));
+    }
+
     #[tokio::test]
     async fn test_executor_no_hooks() {
         let executor = HookExecutor::new(vec![]);
@@ -849,5 +972,79 @@ mod tests {
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
         assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_truncate_string_short() {
+        assert_eq!(truncate_string("hello", 1024), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_long() {
+        let long = "x".repeat(2000);
+        let result = truncate_string(&long, 1024);
+        assert!(result.len() < 1100); // 1024 + "... (truncated)"
+        assert!(result.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_truncate_string_utf8_boundary() {
+        // Multi-byte char: each is 3 bytes
+        let s = "\u{4e16}\u{754c}"; // 6 bytes total
+        let result = truncate_string(s, 4);
+        // Should cut at char boundary (3), not at 4
+        assert!(result.contains("... (truncated)"));
+    }
+
+    #[test]
+    fn test_sensitive_tool_before_redacted() {
+        let payload = HookPayload::before_tool(
+            "shell",
+            serde_json::json!({"command": "cat /etc/passwd"}),
+            "tc1",
+            None,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"redacted\":true"));
+        assert!(!json.contains("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_sensitive_tool_after_redacted() {
+        let payload = HookPayload::after_tool(
+            "read_file",
+            "tc1",
+            "SECRET_KEY=hunter2\nDB_PASS=abc".into(),
+            true,
+            10,
+            None,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("redacted"));
+        assert!(!json.contains("hunter2"));
+    }
+
+    #[test]
+    fn test_nonsensitive_tool_truncated_not_redacted() {
+        let big_args = serde_json::json!({"data": "x".repeat(2000)});
+        let payload = HookPayload::before_tool("glob", big_args, "tc1", None);
+        let json = serde_json::to_string(&payload).unwrap();
+        // Should be truncated, not redacted
+        assert!(json.contains("truncated"));
+        assert!(!json.contains("\"redacted\""));
+    }
+
+    #[test]
+    fn test_nonsensitive_tool_small_payload_unchanged() {
+        let payload = HookPayload::before_tool(
+            "glob",
+            serde_json::json!({"pattern": "*.rs"}),
+            "tc1",
+            None,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("*.rs"));
+        assert!(!json.contains("truncated"));
+        assert!(!json.contains("redacted"));
     }
 }

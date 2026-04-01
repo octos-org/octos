@@ -579,6 +579,22 @@ impl ActorFactory {
 
         tools.register(spawn_tool);
 
+        // Wire background result sender for spawn_only tool lifecycle notifications
+        let bg_tx2 = tx.clone();
+        tools.set_background_result_sender(Arc::new(
+            move |task_label: String, content: String| {
+                let tx = bg_tx2.clone();
+                Box::pin(async move {
+                    tx.send(ActorMessage::BackgroundResult {
+                        task_label,
+                        content,
+                    })
+                    .await
+                    .is_ok()
+                })
+            },
+        ));
+
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
                 cron_service.clone(),
@@ -926,28 +942,39 @@ impl SessionActor {
                             }
                         }
                         Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            // Don't notify — the rewrite LLM turn below will
-                            // produce a clean message for the user.
-                            self.inject_background_result(&task_label, &content, false).await;
-                            // Trigger an LLM turn to rewrite the raw report into
-                            // a clean, user-facing format instead of dumping raw output.
-                            let rewrite_msg = octos_core::InboundMessage {
-                                channel: self.channel.clone(),
-                                sender_id: "system".to_string(),
-                                chat_id: self.chat_id.clone(),
-                                content: format!(
-                                    "[REWRITE] The background task \"{task_label}\" has completed. \
-                                     Rewrite the raw report above into a clean, well-structured, \
-                                     readable message for the user. Keep all key findings, data, \
-                                     and citations. Use proper Markdown formatting. \
-                                     Match the language of the original research request."
-                                ),
-                                timestamp: chrono::Utc::now(),
-                                media: vec![],
-                                metadata: serde_json::json!({}),
-                                message_id: None,
-                            };
-                            self.process_inbound(rewrite_msg, vec![]).await;
+                            // Lightweight notification for spawn_only tool completions
+                            // (e.g. fm_tts success/failure) — send directly, no LLM turn.
+                            if content.starts_with('✓') || content.starts_with('✗') {
+                                tracing::info!(task = %task_label, "spawn_only notification: {}", content);
+                                let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: content.clone(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                            } else {
+                                // Full background result (from spawn subagent) — inject + rewrite
+                                self.inject_background_result(&task_label, &content, false).await;
+                                let rewrite_msg = octos_core::InboundMessage {
+                                    channel: self.channel.clone(),
+                                    sender_id: "system".to_string(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: format!(
+                                        "[REWRITE] The background task \"{task_label}\" has completed. \
+                                         Rewrite the raw report above into a clean, well-structured, \
+                                         readable message for the user. Keep all key findings, data, \
+                                         and citations. Use proper Markdown formatting. \
+                                         Match the language of the original research request."
+                                    ),
+                                    timestamp: chrono::Utc::now(),
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                    message_id: None,
+                                };
+                                self.process_inbound(rewrite_msg, vec![]).await;
+                            }
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -1917,7 +1944,18 @@ impl SessionActor {
                             overflow_served = true;
                         }
                         Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            self.inject_background_result(&task_label, &content, true).await;
+                            if content.starts_with('✓') || content.starts_with('✗') {
+                                let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                    channel: self.channel.clone(),
+                                    chat_id: self.chat_id.clone(),
+                                    content: content.clone(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: serde_json::json!({}),
+                                }).await;
+                            } else {
+                                self.inject_background_result(&task_label, &content, true).await;
+                            }
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -3016,6 +3054,7 @@ mod tests {
                         tool_calls: vec![],
                         stop_reason: StopReason::EndTurn,
                         usage: TokenUsage::default(),
+                        provider_index: None,
                     });
                 }
                 responses.remove(0)
@@ -3048,6 +3087,7 @@ mod tests {
                 output_tokens: 10,
                 ..Default::default()
             },
+            provider_index: None,
         }
     }
 
@@ -3140,6 +3180,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -3226,6 +3267,7 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
         };
 
         let handle = tokio::spawn(actor.run());

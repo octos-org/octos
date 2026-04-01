@@ -134,6 +134,7 @@ fn end_turn(text: &str, input: u32, output: u32) -> ChatResponse {
             output_tokens: output,
             ..Default::default()
         },
+        provider_index: None,
     }
 }
 
@@ -148,6 +149,7 @@ fn tool_use(calls: Vec<ToolCall>, input: u32, output: u32) -> ChatResponse {
             output_tokens: output,
             ..Default::default()
         },
+        provider_index: None,
     }
 }
 
@@ -994,7 +996,7 @@ async fn test_custom_system_prompt_reaches_subagent() {
                     "task": "Review server.py for SQL injection vulnerabilities",
                     "mode": "sync",
                     "model": "reviewer",
-                    "system_prompt": "You are a security-focused code reviewer. Flag OWASP Top 10 issues. Be thorough and precise."
+                    "additional_instructions": "Focus on OWASP Top 10 security issues. Be thorough and precise."
                 }),
 
                 metadata: None,
@@ -1097,7 +1099,7 @@ async fn test_default_system_prompt_without_override() {
 
 /// Verifies that input_schema includes the system_prompt field.
 #[test]
-fn test_spawn_input_schema_includes_system_prompt() {
+fn test_spawn_input_schema_includes_additional_instructions() {
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
     let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::new("parent", vec![]));
     let (store, _tmp) = stub_store();
@@ -1105,10 +1107,15 @@ fn test_spawn_input_schema_includes_system_prompt() {
     let spawn = SpawnTool::new(llm, Arc::new(store), work_dir.path().into(), tx);
 
     let schema = spawn.input_schema();
-    let sp_prop = &schema["properties"]["system_prompt"];
-    assert_eq!(sp_prop["type"].as_str().unwrap(), "string");
-    let desc = sp_prop["description"].as_str().unwrap();
-    assert!(desc.contains("Custom system prompt"));
+    let ai_prop = &schema["properties"]["additional_instructions"];
+    assert_eq!(ai_prop["type"].as_str().unwrap(), "string");
+    let desc = ai_prop["description"].as_str().unwrap();
+    assert!(desc.contains("appended"));
+    // system_prompt should no longer appear in schema
+    assert!(
+        schema["properties"]["system_prompt"].is_null(),
+        "system_prompt should not be in the LLM-facing schema"
+    );
 }
 
 /// Helper: create a minimal EpisodeStore for schema tests (doesn't need to persist).

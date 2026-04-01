@@ -193,7 +193,7 @@ impl GatewayDispatcher {
             let new_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             let preview = {
                 let mut mgr = self.session_mgr.lock().await;
-                let session = mgr.get_or_create(&new_key);
+                let session = mgr.get_or_create(&new_key).await;
                 let history = session.get_history(2);
                 if history.is_empty() {
                     String::new()
@@ -322,10 +322,14 @@ impl GatewayDispatcher {
         reply_chat_id: &str,
         base_key_str: &str,
     ) -> Option<DispatchResult> {
-        if !cmd.starts_with("/delete ") {
+        if !cmd.starts_with("/delete ") && !cmd.starts_with("/d ") {
             return None;
         }
-        let name = cmd.strip_prefix("/delete").unwrap_or("").trim();
+        let name = cmd
+            .strip_prefix("/delete")
+            .or_else(|| cmd.strip_prefix("/d"))
+            .unwrap_or("")
+            .trim();
         if name.is_empty() {
             let _ = self
                 .out_tx
@@ -759,6 +763,21 @@ mod tests {
 
         let result = disp
             .handle_delete_command("/delete old", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: old");
+    }
+
+    #[tokio::test]
+    async fn should_delete_named_session_with_short_alias() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let inbound = make_test_inbound("telegram", "123", "/d old");
+
+        let result = disp
+            .handle_delete_command("/d old", &inbound, "telegram", "123", "telegram:123")
             .await;
 
         assert!(matches!(result, Some(DispatchResult::Handled)));

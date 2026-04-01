@@ -964,6 +964,7 @@ impl GatewayRuntime {
             "grep",
             "message",
             "send_file",
+            "spawn",
             "activate_tools",
         ]);
         // Pin all plugin/skill tools as base so they are never auto-evicted.

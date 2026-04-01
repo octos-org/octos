@@ -102,6 +102,104 @@ impl Agent {
                         }
                     }
 
+                    // Auto-background spawn_only tools: run the tool in a background
+                    // tokio task and return immediately. The tool's files_to_send
+                    // auto-delivers the result to the user. No subagent LLM needed.
+                    if tools.is_spawn_only(&tc_name) {
+                        tracing::info!(
+                            tool = %tc_name,
+                            "running spawn_only tool in background"
+                        );
+                        let bg_tools = tools.clone();
+                        let bg_name = tc_name.clone();
+                        let bg_args = effective_args.clone();
+                        let bg_sender = tools.background_result_sender();
+                        tokio::spawn(async move {
+                            let mut result = bg_tools.execute(&bg_name, &bg_args).await;
+
+                            // Retry once on transient failure (e.g. ominix-api restart)
+                            if let Ok(ref r) = result {
+                                if !r.success && (r.output.contains("error sending request") || r.output.contains("connection refused")) {
+                                    tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    result = bg_tools.execute(&bg_name, &bg_args).await;
+                                }
+                            }
+
+                            match result {
+                                Ok(r) if r.success => {
+                                    tracing::info!(
+                                        tool = %bg_name,
+                                        success = true,
+                                        "spawn_only background tool completed"
+                                    );
+                                    // Auto-send files from the background task
+                                    for file_path in &r.files_to_send {
+                                        let path_str = file_path.to_string_lossy().to_string();
+                                        tracing::info!(tool = %bg_name, file = %path_str, "background auto-sending file");
+                                        let send_args = serde_json::json!({"file_path": path_str});
+                                        match bg_tools.execute("send_file", &send_args).await {
+                                            Ok(sr) if sr.success => {
+                                                tracing::info!(tool = %bg_name, file = %path_str, "background file sent");
+                                            }
+                                            Ok(sr) => {
+                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %sr.output, "background file send failed");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %e, "background file send failed");
+                                            }
+                                        }
+                                    }
+                                    // Notify session of success (if wired)
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✓ {} completed — file delivered", bg_name)).await;
+                                    }
+                                }
+                                Ok(r) => {
+                                    tracing::warn!(
+                                        tool = %bg_name,
+                                        error = %r.output,
+                                        "spawn_only background tool failed"
+                                    );
+                                    // Notify session of failure
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✗ {} failed: {}", bg_name, r.output)).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tool = %bg_name,
+                                        error = %e,
+                                        "spawn_only background tool error"
+                                    );
+                                    if let Some(ref sender) = bg_sender {
+                                        let _ = sender(bg_name.clone(), format!("✗ {} error: {}", bg_name, e)).await;
+                                    }
+                                }
+                            }
+                        });
+                        reporter.report(ProgressEvent::ToolCompleted {
+                            name: tc_name.clone(),
+                            tool_id: tc_id.clone(),
+                            success: true,
+                            output_preview: "Running in background — audio will be sent when ready.".into(),
+                            duration: tool_start.elapsed(),
+                        });
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: tools.spawn_only_message(&tc_name),
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            None,
+                            None,
+                        );
+                    }
+
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),

@@ -471,10 +471,11 @@ impl ProcessManager {
                     if let Some(weak) = pm_weak.clone() {
                         let pid2 = profile_id.clone();
                         let ps2 = profile_store_for_restart.clone();
-                        let handle = tokio::runtime::Handle::current();
+                        // Use spawn_local-safe pattern: sleep then restart on current runtime
+                        let rt = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(2));
-                            handle.block_on(async {
+                            rt.block_on(async move {
                                 if let Some(pm) = weak.upgrade() {
                                     if let Ok(Some(profile)) = ps2.get(&pid2) {
                                         tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
@@ -741,8 +742,7 @@ impl ProcessManager {
     /// Internal: start a bridge process. Returns the WS port.
     async fn start_bridge_inner(&self, profile: &UserProfile) -> Result<u16> {
         let mut bridges = self.bridges.write().await;
-        if bridges.contains_key(&profile.id) {
-            let existing = bridges.get(&profile.id).unwrap();
+        if let Some(existing) = bridges.get(&profile.id) {
             return Ok(existing.ws_port);
         }
 
@@ -901,17 +901,16 @@ impl ProcessManager {
     /// Stop a managed bridge for a profile.
     /// Start a WeChat bridge subprocess. Returns the WS port.
     async fn start_wechat_bridge(&self, profile: &UserProfile) -> Result<u16> {
-        let bridges = self.bridges.read().await;
+        // Hold the write lock for the entire operation to prevent concurrent
+        // calls from allocating the same port (TOCTOU race).
+        let mut bridges = self.bridges.write().await;
         let key = format!("{}-wechat", profile.id);
         if bridges.contains_key(&key) {
             // Already running — return existing port
             return Ok(bridges[&key].ws_port);
         }
-        drop(bridges);
 
-        let bridges2 = self.bridges.read().await;
-        let ws_port = self.allocate_wechat_port(&bridges2);
-        drop(bridges2);
+        let ws_port = self.allocate_wechat_port(&bridges);
 
         // Resolve token from profile env_vars
         let token_env = profile
@@ -1030,24 +1029,9 @@ impl ProcessManager {
             });
         }
 
-        // Monitor process lifecycle
-        let key2 = key.clone();
-        let bridges_ref = self.bridges.clone();
-        let mut stop_rx2 = stop_rx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = child.wait() => {
-                    tracing::warn!("WeChat bridge exited");
-                }
-                _ = stop_rx2.changed() => {
-                    let _ = child.kill().await;
-                }
-            }
-            bridges_ref.write().await.remove(&key2);
-        });
-
-        self.bridges.write().await.insert(
-            key,
+        // Insert into map before releasing write lock to prevent races.
+        bridges.insert(
+            key.clone(),
             BridgeProcess {
                 pid,
                 ws_port,
@@ -1061,6 +1045,23 @@ impl ProcessManager {
                 stop_tx,
             },
         );
+        drop(bridges);
+
+        // Monitor process lifecycle
+        let key2 = key;
+        let bridges_ref = self.bridges.clone();
+        let mut stop_rx2 = stop_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = child.wait() => {
+                    tracing::warn!("WeChat bridge exited");
+                }
+                _ = stop_rx2.changed() => {
+                    let _ = child.kill().await;
+                }
+            }
+            bridges_ref.write().await.remove(&key2);
+        });
 
         // Wait a moment for the bridge to start
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1152,4 +1153,485 @@ fn find_node() -> Result<PathBuf> {
         }
     }
     bail!("node not found — install Node.js to use managed WhatsApp bridges")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::{ProfileConfig, ProfileStore, UserProfile};
+    use chrono::Utc;
+    use std::sync::Arc;
+
+    /// Create a temporary ProfileStore backed by a real temp directory.
+    fn temp_profile_store() -> (tempfile::TempDir, Arc<ProfileStore>) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let store = ProfileStore::open(dir.path()).expect("failed to open profile store");
+        (dir, Arc::new(store))
+    }
+
+    /// Build a minimal UserProfile for testing.
+    fn test_profile(id: &str, channels: Vec<ChannelCredentials>) -> UserProfile {
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                channels,
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_pm() -> (tempfile::TempDir, ProcessManager) {
+        let (dir, store) = temp_profile_store();
+        (dir, ProcessManager::new(store))
+    }
+
+    // ── port_available ────────────────────────────────────────────────
+
+    #[test]
+    fn should_report_bound_port_as_unavailable() {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_available(port));
+    }
+
+    #[test]
+    fn should_report_free_port_as_available() {
+        // Bind then drop to get a port that was recently free.
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("failed to bind ephemeral port");
+            listener.local_addr().unwrap().port()
+        };
+        // Port should be free now (barring TIME_WAIT race, very unlikely on localhost).
+        assert!(port_available(port));
+    }
+
+    // ── allocate_webhook_port ─────────────────────────────────────────
+
+    #[test]
+    fn should_allocate_webhook_port_from_base_when_no_existing() {
+        let (_dir, pm) = make_pm();
+        let procs = HashMap::new();
+        let port = pm.allocate_webhook_port(&procs);
+        assert_eq!(port, WEBHOOK_BASE_PORT);
+    }
+
+    #[test]
+    fn should_skip_used_webhook_ports() {
+        let (_dir, pm) = make_pm();
+        let mut procs = HashMap::new();
+        // Simulate a process using the base webhook port.
+        let (log_tx, _) = broadcast::channel(1);
+        let (stop_tx, _) = watch::channel(false);
+        procs.insert(
+            "existing".to_string(),
+            GatewayProcess {
+                pid: 1,
+                started_at: Utc::now(),
+                log_tx,
+                stop_tx,
+                webhook_port: Some(WEBHOOK_BASE_PORT),
+                api_port: None,
+                log_history: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let port = pm.allocate_webhook_port(&procs);
+        assert!(port > WEBHOOK_BASE_PORT);
+        // Should not collide with the existing port.
+        assert_ne!(port, WEBHOOK_BASE_PORT);
+    }
+
+    // ── allocate_api_port ─────────────────────────────────────────────
+
+    #[test]
+    fn should_allocate_api_port_from_base_when_no_existing() {
+        let (_dir, pm) = make_pm();
+        let procs = HashMap::new();
+        let port = pm.allocate_api_port(&procs);
+        assert_eq!(port, API_BASE_PORT);
+    }
+
+    #[test]
+    fn should_skip_used_api_ports() {
+        let (_dir, pm) = make_pm();
+        let mut procs = HashMap::new();
+        let (log_tx, _) = broadcast::channel(1);
+        let (stop_tx, _) = watch::channel(false);
+        procs.insert(
+            "existing".to_string(),
+            GatewayProcess {
+                pid: 1,
+                started_at: Utc::now(),
+                log_tx,
+                stop_tx,
+                webhook_port: None,
+                api_port: Some(API_BASE_PORT),
+                log_history: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let port = pm.allocate_api_port(&procs);
+        assert!(port > API_BASE_PORT);
+    }
+
+    #[test]
+    fn should_allocate_sequential_api_ports_for_multiple_profiles() {
+        let (_dir, pm) = make_pm();
+        let mut procs = HashMap::new();
+
+        // Simulate two existing processes with sequential ports.
+        for (i, id) in ["p1", "p2"].iter().enumerate() {
+            let (log_tx, _) = broadcast::channel(1);
+            let (stop_tx, _) = watch::channel(false);
+            procs.insert(
+                id.to_string(),
+                GatewayProcess {
+                    pid: i as u32 + 1,
+                    started_at: Utc::now(),
+                    log_tx,
+                    stop_tx,
+                    webhook_port: None,
+                    api_port: Some(API_BASE_PORT + i as u16),
+                    log_history: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        }
+        let port = pm.allocate_api_port(&procs);
+        // Should be at least API_BASE_PORT + 2 (skipping 0 and 1).
+        assert!(port >= API_BASE_PORT + 2);
+    }
+
+    // ── allocate_bridge_ports ─────────────────────────────────────────
+
+    #[test]
+    fn should_allocate_bridge_ports_as_consecutive_pair() {
+        let (_dir, pm) = make_pm();
+        let bridges = HashMap::new();
+        let (ws, http) = pm.allocate_bridge_ports(&bridges);
+        assert_eq!(ws, BRIDGE_BASE_WS_PORT);
+        assert_eq!(http, BRIDGE_BASE_WS_PORT + 1);
+    }
+
+    #[test]
+    fn should_skip_used_bridge_ports() {
+        let (_dir, pm) = make_pm();
+        let mut bridges = HashMap::new();
+        let (log_tx, _) = broadcast::channel(1);
+        let (stop_tx, _) = watch::channel(false);
+        bridges.insert(
+            "existing".to_string(),
+            BridgeProcess {
+                pid: 1,
+                ws_port: BRIDGE_BASE_WS_PORT,
+                http_port: BRIDGE_BASE_WS_PORT + 1,
+                started_at: Utc::now(),
+                qr_code: Arc::new(Mutex::new(None)),
+                status: Arc::new(Mutex::new(BridgeStatus::Waiting)),
+                phone_number: Arc::new(Mutex::new(None)),
+                lid: Arc::new(Mutex::new(None)),
+                log_tx,
+                stop_tx,
+            },
+        );
+        let (ws, http) = pm.allocate_bridge_ports(&bridges);
+        // Must skip past the pair used by "existing" (3101, 3102).
+        assert!(ws > BRIDGE_BASE_WS_PORT);
+        assert_eq!(http, ws + 1);
+    }
+
+    // ── allocate_wechat_port ──────────────────────────────────────────
+
+    #[test]
+    fn should_allocate_wechat_port_from_base() {
+        let (_dir, pm) = make_pm();
+        let bridges = HashMap::new();
+        let port = pm.allocate_wechat_port(&bridges);
+        assert_eq!(port, 3201);
+    }
+
+    // ── needs_managed_bridge ──────────────────────────────────────────
+
+    #[test]
+    fn should_need_bridge_when_whatsapp_url_empty_and_bridge_js_set() {
+        let (dir, store) = temp_profile_store();
+        let bridge_path = dir.path().join("bridge.js");
+        std::fs::write(&bridge_path, "// stub").unwrap();
+        let pm = ProcessManager::new(store).with_bridge_js(bridge_path);
+
+        let profile = test_profile(
+            "wa-auto",
+            vec![ChannelCredentials::WhatsApp {
+                bridge_url: String::new(),
+            }],
+        );
+        assert!(pm.needs_managed_bridge(&profile));
+    }
+
+    #[test]
+    fn should_need_bridge_when_whatsapp_url_is_auto() {
+        let (dir, store) = temp_profile_store();
+        let bridge_path = dir.path().join("bridge.js");
+        std::fs::write(&bridge_path, "// stub").unwrap();
+        let pm = ProcessManager::new(store).with_bridge_js(bridge_path);
+
+        let profile = test_profile(
+            "wa-auto2",
+            vec![ChannelCredentials::WhatsApp {
+                bridge_url: "auto".to_string(),
+            }],
+        );
+        assert!(pm.needs_managed_bridge(&profile));
+    }
+
+    #[test]
+    fn should_not_need_bridge_when_explicit_url() {
+        let (dir, store) = temp_profile_store();
+        let bridge_path = dir.path().join("bridge.js");
+        std::fs::write(&bridge_path, "// stub").unwrap();
+        let pm = ProcessManager::new(store).with_bridge_js(bridge_path);
+
+        let profile = test_profile(
+            "wa-explicit",
+            vec![ChannelCredentials::WhatsApp {
+                bridge_url: "ws://remote:3101".to_string(),
+            }],
+        );
+        assert!(!pm.needs_managed_bridge(&profile));
+    }
+
+    #[test]
+    fn should_not_need_bridge_when_no_bridge_js() {
+        let (_dir, pm) = make_pm();
+        let profile = test_profile(
+            "wa-no-js",
+            vec![ChannelCredentials::WhatsApp {
+                bridge_url: String::new(),
+            }],
+        );
+        assert!(!pm.needs_managed_bridge(&profile));
+    }
+
+    #[test]
+    fn should_not_need_bridge_for_non_whatsapp_profile() {
+        let (dir, store) = temp_profile_store();
+        let bridge_path = dir.path().join("bridge.js");
+        std::fs::write(&bridge_path, "// stub").unwrap();
+        let pm = ProcessManager::new(store).with_bridge_js(bridge_path);
+
+        let profile = test_profile(
+            "tg",
+            vec![ChannelCredentials::Telegram {
+                token_env: "BOT_TOKEN".to_string(),
+                allowed_senders: String::new(),
+            }],
+        );
+        assert!(!pm.needs_managed_bridge(&profile));
+    }
+
+    // ── needs_wechat_bridge ───────────────────────────────────────────
+
+    #[test]
+    fn should_detect_wechat_channel() {
+        let (_dir, pm) = make_pm();
+        let profile = test_profile(
+            "wc",
+            vec![ChannelCredentials::WeChat {
+                token_env: "TOKEN".to_string(),
+                base_url: "http://localhost".to_string(),
+            }],
+        );
+        assert!(pm.needs_wechat_bridge(&profile));
+    }
+
+    #[test]
+    fn should_not_detect_wechat_for_telegram() {
+        let (_dir, pm) = make_pm();
+        let profile = test_profile(
+            "tg",
+            vec![ChannelCredentials::Telegram {
+                token_env: "BOT_TOKEN".to_string(),
+                allowed_senders: String::new(),
+            }],
+        );
+        assert!(!pm.needs_wechat_bridge(&profile));
+    }
+
+    // ── with_serve_config ─────────────────────────────────────────────
+
+    #[test]
+    fn should_set_serve_port_and_admin_token() {
+        let (_dir, store) = temp_profile_store();
+        let pm = ProcessManager::new(store).with_serve_config(8080, Some("secret".to_string()));
+        assert_eq!(pm.serve_port, Some(8080));
+        assert_eq!(pm.admin_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn should_set_serve_config_without_token() {
+        let (_dir, store) = temp_profile_store();
+        let pm = ProcessManager::new(store).with_serve_config(9090, None);
+        assert_eq!(pm.serve_port, Some(9090));
+        assert!(pm.admin_token.is_none());
+    }
+
+    // ── with_bridge_js ────────────────────────────────────────────────
+
+    #[test]
+    fn should_set_bridge_js_path_when_file_exists() {
+        let (dir, store) = temp_profile_store();
+        let bridge_path = dir.path().join("bridge.js");
+        std::fs::write(&bridge_path, "// stub").unwrap();
+        let pm = ProcessManager::new(store).with_bridge_js(bridge_path.clone());
+        assert_eq!(pm.bridge_js_path, Some(bridge_path));
+    }
+
+    #[test]
+    fn should_ignore_bridge_js_when_file_missing() {
+        let (_dir, store) = temp_profile_store();
+        let pm = ProcessManager::new(store).with_bridge_js(PathBuf::from("/nonexistent/bridge.js"));
+        assert!(pm.bridge_js_path.is_none());
+    }
+
+    // ── ProcessStatus / BridgeStatus ──────────────────────────────────
+
+    #[test]
+    fn should_serialize_process_status_not_running() {
+        let status = ProcessStatus {
+            running: false,
+            pid: None,
+            started_at: None,
+            uptime_secs: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["running"], false);
+        assert!(json["pid"].is_null());
+    }
+
+    #[test]
+    fn should_serialize_bridge_status_variants() {
+        assert_eq!(
+            serde_json::to_value(BridgeStatus::Waiting)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "waiting"
+        );
+        assert_eq!(
+            serde_json::to_value(BridgeStatus::Connected)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "connected"
+        );
+        assert_eq!(
+            serde_json::to_value(BridgeStatus::Disconnected)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "disconnected"
+        );
+        assert_eq!(
+            serde_json::to_value(BridgeStatus::LoggedOut)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "logged_out"
+        );
+    }
+
+    // ── Async tests (status, stop, log_history on empty PM) ──────────
+
+    #[tokio::test]
+    async fn should_return_not_running_for_unknown_profile() {
+        let (_dir, pm) = make_pm();
+        let status = pm.status("nonexistent").await;
+        assert!(!status.running);
+        assert!(status.pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_stopping_nonexistent_profile() {
+        let (_dir, pm) = make_pm();
+        let stopped = pm.stop("nonexistent").await.unwrap();
+        assert!(!stopped);
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_log_history_for_unknown_profile() {
+        let (_dir, pm) = make_pm();
+        let history = pm.log_history("nonexistent").await;
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_unknown_webhook_port() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.webhook_port("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_unknown_api_port() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.api_port("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_first_api_port_when_empty() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.first_api_port().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_empty_statuses_when_no_processes() {
+        let (_dir, pm) = make_pm();
+        let statuses = pm.all_statuses().await;
+        assert!(statuses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_stop_all_return_zero_when_empty() {
+        let (_dir, pm) = make_pm();
+        let count = pm.stop_all().await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_unknown_bridge_qr() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.bridge_qr("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_subscribe_logs_unknown() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.subscribe_logs("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_read_metrics_unknown() {
+        let (_dir, pm) = make_pm();
+        assert!(pm.read_metrics("nonexistent").await.is_none());
+    }
+
+    // ── No port collision across allocation types ─────────────────────
+
+    #[test]
+    fn should_have_distinct_base_ports() {
+        // Verify that the base port constants are all different.
+        let ports = [BRIDGE_BASE_WS_PORT, WEBHOOK_BASE_PORT, API_BASE_PORT];
+        for i in 0..ports.len() {
+            for j in (i + 1)..ports.len() {
+                assert_ne!(ports[i], ports[j], "base port collision at index {i} and {j}");
+            }
+        }
+        // Bridge ports are in the 3000s, webhook/api in the 9000s.
+        assert!(BRIDGE_BASE_WS_PORT < WEBHOOK_BASE_PORT);
+        assert!(WEBHOOK_BASE_PORT < API_BASE_PORT);
+    }
 }

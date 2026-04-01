@@ -241,6 +241,7 @@ impl Agent {
                 tool_calls,
                 stop_reason,
                 usage,
+                provider_index: None,
             },
             streamed,
         ))

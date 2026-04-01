@@ -17,6 +17,10 @@ pub struct ChatResponse {
     pub stop_reason: StopReason,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// Index of the provider slot that produced this response (set by `ProviderChain`).
+    /// Used by `report_late_failure` to penalize the correct provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_index: Option<usize>,
 }
 
 /// Why the model stopped generating.

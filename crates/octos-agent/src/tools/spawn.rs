@@ -191,9 +191,10 @@ struct Input {
     /// Override context window size (tokens) for the sub-agent.
     #[serde(default)]
     context_window: Option<u32>,
-    /// Custom system prompt for the sub-agent (replaces default worker prompt).
-    #[serde(default)]
-    system_prompt: Option<String>,
+    /// Additional instructions appended to the subagent's system prompt.
+    /// These are added after the parent's worker prompt, never replacing it.
+    #[serde(default, alias = "system_prompt")]
+    additional_instructions: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -293,9 +294,9 @@ impl Tool for SpawnTool {
                     "type": "integer",
                     "description": "Override the context window size (tokens) for the subagent."
                 },
-                "system_prompt": {
+                "additional_instructions": {
                     "type": "string",
-                    "description": "Custom system prompt that defines the subagent's role and behavior. Replaces the default worker prompt. Use this to specialize the subagent (e.g. 'You are a security-focused code reviewer. Flag OWASP Top 10 issues.')."
+                    "description": "Extra instructions appended to the subagent's system prompt. Use to specialize behavior (e.g. 'Focus on OWASP Top 10 security issues.'). Cannot override or replace the base system prompt."
                 }
             },
             "required": ["task"]
@@ -351,11 +352,17 @@ impl Tool for SpawnTool {
                 tools.set_provider_policy(pp.clone());
             }
             let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
-            if let Some(ref sp) = input.system_prompt {
-                worker = worker.with_system_prompt(sp.clone());
-            } else if let Some(ref wp) = self.worker_prompt {
-                worker = worker.with_system_prompt(wp.clone());
-            }
+            // Base prompt: configured worker prompt, or compiled-in default.
+            // Additional instructions are appended, never replacing the base.
+            let base_prompt = self
+                .worker_prompt
+                .clone()
+                .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
+            let full_prompt = match &input.additional_instructions {
+                Some(extra) if !extra.is_empty() => format!("{base_prompt}\n\n{extra}"),
+                _ => base_prompt,
+            };
+            worker = worker.with_system_prompt(full_prompt);
 
             let subtask = Task::new(
                 TaskKind::Code {
@@ -395,7 +402,7 @@ impl Tool for SpawnTool {
             let inbound_tx = self.inbound_tx.clone();
             let wid = worker_id.clone();
             let provider_policy = self.provider_policy.clone();
-            let custom_system_prompt = input.system_prompt;
+            let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let task_label = label.clone();
@@ -422,11 +429,13 @@ impl Tool for SpawnTool {
                     tools.set_provider_policy(pp);
                 }
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
-                if let Some(sp) = custom_system_prompt {
-                    worker = worker.with_system_prompt(sp);
-                } else if let Some(wp) = default_worker_prompt {
-                    worker = worker.with_system_prompt(wp);
-                }
+                let base_prompt = default_worker_prompt
+                    .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
+                let full_prompt = match additional_instructions {
+                    Some(extra) if !extra.is_empty() => format!("{base_prompt}\n\n{extra}"),
+                    _ => base_prompt,
+                };
+                worker = worker.with_system_prompt(full_prompt);
 
                 let subtask = Task::new(
                     TaskKind::Code {
@@ -524,6 +533,8 @@ mod tests {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -557,6 +568,7 @@ mod tests {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                provider_index: None,
             })
         }
 

@@ -47,15 +47,15 @@ jobs:
         run: cargo release ${{ inputs.bump }} --execute --no-confirm
 
       - name: Build octos CLI
-        run: cargo build --release -p octos-cli --features telegram,whatsapp,feishu,twilio,api
+        run: cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
 
       - name: Build app-skill binaries
-        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice-skill -p clock -p weather
+        run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard
 
       - name: Bundle release tarball
         run: |
           mkdir dist
-          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice-skill clock weather; do
+          for b in octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard; do
             cp "target/release/$b" dist/ 2>/dev/null || true
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *

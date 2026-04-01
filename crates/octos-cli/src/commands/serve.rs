@@ -261,6 +261,7 @@ impl ServeCommand {
             tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
             frps_server: std::env::var("FRPS_SERVER").ok(),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
+            allow_admin_shell: config.allow_admin_shell,
         });
 
         // Auto-start enabled profiles
@@ -505,7 +506,10 @@ impl ServeCommand {
         println!();
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app)
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
                 println!();

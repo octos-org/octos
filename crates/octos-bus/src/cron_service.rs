@@ -266,7 +266,7 @@ impl CronService {
             store.jobs.retain(|j| !to_delete.contains(&j.id));
         }
 
-        if let Err(e) = self.save_store() {
+        if let Err(e) = self.save_store_async().await {
             tracing::warn!("failed to save cron store: {e}");
         }
         self.arm_timer();
@@ -303,6 +303,27 @@ impl CronService {
         let tmp_path = self.store_path.with_extension("tmp");
         std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
         std::fs::rename(&tmp_path, &self.store_path).wrap_err("failed to rename cron store")?;
+        Ok(())
+    }
+
+    /// Async version of save_store that uses spawn_blocking to avoid blocking
+    /// the tokio runtime thread.
+    async fn save_store_async(&self) -> Result<()> {
+        let json = {
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::to_string_pretty(&*store).wrap_err("failed to serialize cron store")?
+        };
+        let tmp_path = self.store_path.with_extension("tmp");
+        let store_path = self.store_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&tmp_path, &json).wrap_err("failed to write cron store temp")?;
+            std::fs::rename(&tmp_path, &store_path).wrap_err("failed to rename cron store")?;
+            Ok::<_, eyre::Report>(())
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+
         Ok(())
     }
 }

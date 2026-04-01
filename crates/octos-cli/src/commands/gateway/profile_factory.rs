@@ -496,6 +496,7 @@ impl ProfileActorFactoryBuilder {
                 "grep",
                 "message",
                 "send_file",
+                "spawn",
                 "activate_tools",
             ]);
             let visible = tools.specs().len();

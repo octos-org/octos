@@ -102,8 +102,8 @@ The manifest declares what tools the skill provides. The LLM reads this to decid
 | `description` | No | — | Human-readable description |
 | `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
 | `requires_network` | No | false | Informational flag |
-| `sha256` | No | — | Binary integrity check (hex hash) |
-| `tools` | No | `[]` | Array of tool definitions |
+| `sha256` | No | — | Binary integrity check (hex hash). TOCTOU-safe: verified copy written to `.{name}_verified` |
+| `tools` | No | `[]` | Array of tool definitions (each may include `spawn_only: true` for background execution) |
 | `mcp_servers` | No | `[]` | MCP server declarations |
 | `hooks` | No | `[]` | Lifecycle hook definitions |
 | `prompts` | No | — | Prompt fragment config |

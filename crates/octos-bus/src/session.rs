@@ -236,27 +236,30 @@ impl SessionManager {
     }
 
     /// Load a session from disk (read-only). Returns None if not found.
-    pub fn load(&self, key: &SessionKey) -> Option<Session> {
-        self.load_from_disk(key)
+    pub async fn load(&self, key: &SessionKey) -> Option<Session> {
+        self.load_from_disk(key).await
     }
 
     /// Get or create a session. Loads from disk on first access.
-    pub fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
+    pub async fn get_or_create(&mut self, key: &SessionKey) -> &mut Session {
         let key_str = key.0.clone();
-        if !self.cache.contains(&key_str) {
-            let session = self
-                .load_from_disk(key)
-                .unwrap_or_else(|| Session::new(key.clone()));
-            self.cache.put(key_str.clone(), session);
-        }
-        self.cache
-            .get_mut(&key_str)
-            .expect("session must exist: inserted above")
+        let disk_session = if self.cache.contains(&key_str) {
+            None
+        } else {
+            Some(
+                self.load_from_disk(key)
+                    .await
+                    .unwrap_or_else(|| Session::new(key.clone())),
+            )
+        };
+        self.cache.get_or_insert_mut(key_str, || {
+            disk_session.unwrap_or_else(|| Session::new(key.clone()))
+        })
     }
 
     /// Add a message to a session and persist it.
     pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
-        let session = self.get_or_create(key);
+        let session = self.get_or_create(key).await;
         session.messages.push(message.clone());
         session.updated_at = Utc::now();
         self.append_to_disk(key, &message).await?;
@@ -332,7 +335,8 @@ impl SessionManager {
     /// Load a session from its JSONL file.
     ///
     /// Checks the legacy flat layout first, then the per-user directory layout.
-    fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
+    /// Uses spawn_blocking to avoid blocking the async runtime.
+    async fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
         let path = self.session_path(key);
 
         // If not found in flat layout, try per-user layout
@@ -359,54 +363,60 @@ impl SessionManager {
             }
         };
 
-        // Guard against oversized files to prevent OOM
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_SESSION_FILE_SIZE {
+        let key_clone = key.clone();
+        tokio::task::spawn_blocking(move || {
+            // Guard against oversized files to prevent OOM
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > MAX_SESSION_FILE_SIZE {
+                    warn!(
+                        key = %key_clone,
+                        size = meta.len(),
+                        limit = MAX_SESSION_FILE_SIZE,
+                        "session file too large, skipping"
+                    );
+                    return None;
+                }
+            }
+
+            let content = std::fs::read_to_string(&path).ok()?;
+            let mut lines = content.lines();
+
+            // First line is metadata
+            let meta_line = lines.next()?;
+            let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
+
+            // Reject files from a newer schema we don't understand
+            if meta.schema_version > CURRENT_SESSION_SCHEMA {
                 warn!(
-                    key = %key,
-                    size = meta.len(),
-                    limit = MAX_SESSION_FILE_SIZE,
-                    "session file too large, skipping"
+                    key = %key_clone,
+                    file_version = meta.schema_version,
+                    current_version = CURRENT_SESSION_SCHEMA,
+                    "session file has newer schema version, skipping"
                 );
                 return None;
             }
-        }
 
-        let content = std::fs::read_to_string(&path).ok()?;
-        let mut lines = content.lines();
+            // Remaining lines are messages
+            let messages: Vec<Message> = lines
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
 
-        // First line is metadata
-        let meta_line = lines.next()?;
-        let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
+            debug!(key = %key_clone, messages = messages.len(), "Loaded session from disk");
 
-        // Reject files from a newer schema we don't understand
-        if meta.schema_version > CURRENT_SESSION_SCHEMA {
-            warn!(
-                key = %key,
-                file_version = meta.schema_version,
-                current_version = CURRENT_SESSION_SCHEMA,
-                "session file has newer schema version, skipping"
-            );
-            return None;
-        }
-
-        // Remaining lines are messages
-        let messages: Vec<Message> = lines
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-
-        debug!(key = %key, messages = messages.len(), "Loaded session from disk");
-
-        Some(Session {
-            key: key.clone(),
-            parent_key: meta.parent_key.map(SessionKey),
-            topic: meta.topic,
-            summary: meta.summary,
-            messages,
-            created_at: meta.created_at,
-            updated_at: meta.updated_at,
+            Some(Session {
+                key: key_clone,
+                parent_key: meta.parent_key.map(SessionKey),
+                topic: meta.topic,
+                summary: meta.summary,
+                messages,
+                created_at: meta.created_at,
+                updated_at: meta.updated_at,
+            })
         })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Append a message to the JSONL file. Creates the file with metadata if new.
@@ -525,7 +535,7 @@ impl SessionManager {
         new_chat_id: &str,
         copy_messages: usize,
     ) -> Result<SessionKey> {
-        let parent = self.get_or_create(parent_key);
+        let parent = self.get_or_create(parent_key).await;
         let messages: Vec<Message> = parent.get_history(copy_messages).to_vec();
         // Derive channel from parent key (format: "channel:chat_id")
         let channel = parent_key.0.split(':').next().unwrap_or("cli");
@@ -656,7 +666,9 @@ impl SessionManager {
                 updated_at: chrono::Utc::now(),
             };
             if let Ok(json) = serde_json::to_string(&meta) {
-                let _ = std::fs::write(&path, format!("{json}\n"));
+                if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
+                    warn!(path = %path.display(), error = %e, "failed to write session metadata");
+                }
             }
         }
     }
@@ -996,7 +1008,7 @@ impl SessionManager {
 
     /// Update the summary field for a session (rewrites metadata line).
     pub async fn update_summary(&mut self, key: &SessionKey, summary: String) -> Result<()> {
-        let session = self.get_or_create(key);
+        let session = self.get_or_create(key).await;
         session.summary = Some(summary);
         self.rewrite(key).await
     }
@@ -1305,7 +1317,7 @@ mod tests {
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
         let key = SessionKey::new("cli", "default");
 
-        let session = mgr.get_or_create(&key);
+        let session = mgr.get_or_create(&key).await;
         assert_eq!(session.messages.len(), 0);
 
         mgr.add_message(&key, make_message(MessageRole::User, "hello"))
@@ -1315,7 +1327,7 @@ mod tests {
             .await
             .unwrap();
 
-        let session = mgr.get_or_create(&key);
+        let session = mgr.get_or_create(&key).await;
         assert_eq!(session.messages.len(), 2);
     }
 
@@ -1338,7 +1350,7 @@ mod tests {
         // New manager should load from disk
         {
             let mut mgr = SessionManager::open(tmp.path()).unwrap();
-            let session = mgr.get_or_create(&key);
+            let session = mgr.get_or_create(&key).await;
             assert_eq!(session.messages.len(), 2);
             assert_eq!(session.messages[0].content, "saved");
             assert_eq!(session.messages[1].content, "reply");
@@ -1354,12 +1366,12 @@ mod tests {
         mgr.add_message(&key, make_message(MessageRole::User, "temp"))
             .await
             .unwrap();
-        assert_eq!(mgr.get_or_create(&key).messages.len(), 1);
+        assert_eq!(mgr.get_or_create(&key).await.messages.len(), 1);
 
         mgr.clear(&key).await.unwrap();
 
         // After clear, should be empty
-        let session = mgr.get_or_create(&key);
+        let session = mgr.get_or_create(&key).await;
         assert_eq!(session.messages.len(), 0);
     }
 
@@ -1378,10 +1390,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(mgr.get_or_create(&k1).messages.len(), 1);
-        assert_eq!(mgr.get_or_create(&k2).messages.len(), 1);
-        assert_eq!(mgr.get_or_create(&k1).messages[0].content, "from chat1");
-        assert_eq!(mgr.get_or_create(&k2).messages[0].content, "from chat2");
+        assert_eq!(mgr.get_or_create(&k1).await.messages.len(), 1);
+        assert_eq!(mgr.get_or_create(&k2).await.messages.len(), 1);
+        assert_eq!(mgr.get_or_create(&k1).await.messages[0].content, "from chat1");
+        assert_eq!(mgr.get_or_create(&k2).await.messages[0].content, "from chat2");
     }
 
     #[tokio::test]
@@ -1398,7 +1410,7 @@ mod tests {
         }
 
         // Mutate in-memory: keep only last 2
-        let session = mgr.get_or_create(&key);
+        let session = mgr.get_or_create(&key).await;
         session.messages.drain(0..3);
         assert_eq!(session.messages.len(), 2);
 
@@ -1407,7 +1419,7 @@ mod tests {
 
         // Load fresh from disk — should have only 2 messages
         let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let session2 = mgr2.get_or_create(&key);
+        let session2 = mgr2.get_or_create(&key).await;
         assert_eq!(session2.messages.len(), 2);
         assert_eq!(session2.messages[0].content, "msg3");
         assert_eq!(session2.messages[1].content, "msg4");
@@ -1428,7 +1440,7 @@ mod tests {
         let child_key = mgr.fork(&parent, "chat1_fork", 3).await.unwrap();
         assert_eq!(child_key, SessionKey::new("telegram", "chat1_fork"));
 
-        let child = mgr.get_or_create(&child_key);
+        let child = mgr.get_or_create(&child_key).await;
         assert_eq!(child.parent_key, Some(parent.clone()));
         assert_eq!(child.messages.len(), 3);
         assert_eq!(child.messages[0].content, "msg2");
@@ -1484,7 +1496,7 @@ mod tests {
         assert_eq!(mgr.cache_len(), 2);
 
         // But accessing k0 should reload it from disk
-        let session = mgr.get_or_create(&k0);
+        let session = mgr.get_or_create(&k0).await;
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "hello from oldest");
     }
@@ -1548,7 +1560,7 @@ mod tests {
         let mut fresh = SessionManager::open(tmp.path()).unwrap();
         for i in 0..10 {
             let key = SessionKey::new("test", &format!("session-{i}"));
-            let session = fresh.get_or_create(&key);
+            let session = fresh.get_or_create(&key).await;
             assert_eq!(
                 session.messages.len(),
                 2,
@@ -1574,7 +1586,7 @@ mod tests {
         // Reload from disk
         let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
         let child_key = SessionKey::new("cli", "branch");
-        let child = mgr2.get_or_create(&child_key);
+        let child = mgr2.get_or_create(&child_key).await;
         assert_eq!(child.parent_key, Some(parent));
         assert_eq!(child.messages.len(), 1);
         assert_eq!(child.messages[0].content, "hello");
@@ -1600,7 +1612,7 @@ mod tests {
         std::fs::write(&path, junk).unwrap();
 
         // load_from_disk should return None for oversized file
-        assert!(mgr.load_from_disk(&key).is_none());
+        assert!(mgr.load_from_disk(&key).await.is_none());
     }
 
     #[test]
@@ -1720,7 +1732,7 @@ mod tests {
 
         // Reload and verify topic
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
-        let session = mgr.get_or_create(&key);
+        let session = mgr.get_or_create(&key).await;
         assert_eq!(session.topic.as_deref(), Some("research"));
     }
 
@@ -1739,7 +1751,7 @@ mod tests {
 
         // Reload and verify summary
         let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
-        let session = mgr2.get_or_create(&key);
+        let session = mgr2.get_or_create(&key).await;
         assert_eq!(session.summary.as_deref(), Some("A test session"));
     }
 
@@ -1821,8 +1833,8 @@ mod tests {
         assert!(size < MAX_SESSION_FILE_SIZE + 1000);
     }
 
-    #[test]
-    fn test_load_rejects_future_schema_version() {
+    #[tokio::test]
+    async fn test_load_rejects_future_schema_version() {
         let tmp = TempDir::new().unwrap();
         let mgr = SessionManager::open(tmp.path()).unwrap();
         let key = SessionKey::new("cli", "future");
@@ -1839,7 +1851,7 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         // Should refuse to load
-        assert!(mgr.load_from_disk(&key).is_none());
+        assert!(mgr.load_from_disk(&key).await.is_none());
     }
 
     #[tokio::test]

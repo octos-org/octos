@@ -12,7 +12,7 @@ use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
-use super::extras::{SkillExtras, resolve_extras};
+use super::extras::{resolve_extras, SkillExtras};
 use super::manifest::PluginManifest;
 use super::tool::PluginTool;
 
@@ -100,10 +100,15 @@ impl PluginLoader {
                         // Defer spawn_only tools so they're hidden from main session specs
                         // but still registered (available in spawn subagent registries).
                         if !spawn_only.is_empty() {
-                            registry.defer(spawn_only.iter().cloned());
+                            for name in &spawn_only {
+                                let msg = extras.spawn_only_messages.get(name).cloned();
+                                registry.mark_spawn_only(name, msg);
+                            }
+                            // Don't defer — tool stays visible to LLM.
+                            // The execution loop auto-redirects calls to background spawn.
                             tracing::info!(
                                 tools = %spawn_only.join(", "),
-                                "deferred spawn-only tools"
+                                "registered spawn-only tools (auto-redirect to background)"
                             );
                         }
                         result.tool_count += n;
@@ -173,18 +178,33 @@ impl PluginLoader {
             return Ok((vec![], extras));
         }
 
-        // Find executable: try plugin name, then "main"
+        // Find executable: try manifest name, dir name, "main", then any executable in dir
         let dir_name = plugin_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("main");
-        let executable = [dir_name, "main"]
+        let executable = [&manifest.name as &str, dir_name, "main"]
             .iter()
             .map(|name| plugin_dir.join(name))
             .find(|p| p.exists() && is_executable(p))
+            .or_else(|| {
+                // Fallback: find any executable file in the plugin dir
+                std::fs::read_dir(plugin_dir).ok()?.flatten().find_map(|e| {
+                    let p = e.path();
+                    if p.is_file() && is_executable(&p) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        // Skip hidden files and known non-executables
+                        if !name.starts_with('.') && !name.ends_with(".json") && !name.ends_with(".md") && !name.ends_with(".toml") && !name.ends_with(".tar.gz") {
+                            return Some(p);
+                        }
+                    }
+                    None
+                })
+            })
             .ok_or_else(|| {
                 eyre::eyre!(
-                    "no executable found in plugin '{}' (tried '{}', 'main')",
+                    "no executable found in plugin '{}' (tried '{}', '{}', 'main', and directory scan)",
+                    manifest.name,
                     manifest.name,
                     dir_name
                 )
@@ -258,12 +278,23 @@ impl PluginLoader {
             .map(Duration::from_secs)
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
-        // Collect spawn_only tool names before consuming manifest.tools
+        // Collect spawn_only tool names and messages before consuming manifest.tools
         let spawn_only_names: Vec<String> = manifest
             .tools
             .iter()
             .filter(|t| t.spawn_only)
             .map(|t| t.name.clone())
+            .collect();
+        let spawn_only_msgs: std::collections::HashMap<String, String> = manifest
+            .tools
+            .iter()
+            .filter(|t| t.spawn_only && t.spawn_only_message.is_some())
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.spawn_only_message.clone().unwrap_or_default(),
+                )
+            })
             .collect();
 
         let tools: Vec<PluginTool> = manifest
@@ -284,6 +315,7 @@ impl PluginLoader {
         // Return extras with spawn_only info
         let mut extras = extras;
         extras.spawn_only_tools = spawn_only_names;
+        extras.spawn_only_messages = spawn_only_msgs;
 
         Ok((tools, extras))
     }

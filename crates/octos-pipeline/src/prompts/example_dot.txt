@@ -1,8 +1,8 @@
 Example:
 digraph research {{
   plan_and_search [handler="dynamic_parallel", converge="analyze", prompt="<WRITE: planner prompt tailored to the specific research question>", worker_prompt="<WRITE: researcher role + {{task}} placeholder, tailored to the domain>", tools="deep_search", max_tasks="8", timeout_secs="600"]
-  analyze [prompt="<WRITE: analyst role prompt. You receive all search findings as input. Cross-reference, identify gaps, and if needed use deep_crawl to fetch specific important URLs for deeper investigation.>", tools="read_file,deep_crawl", timeout_secs="300"]
-  synthesize [prompt="<WRITE: report writer role + output format tailored to the research type. IMPORTANT: Save the COMPLETE report via write_file, then return a concise executive summary (key findings + conclusions, ~1000 words) as your final text response.>", tools="write_file", goal_gate="true", timeout_secs="900"]
+  analyze [prompt="<WRITE: analyst role prompt. You receive all search findings as input. Cross-reference sources, resolve contradictions, identify gaps, and if needed use deep_crawl to fetch specific important URLs for deeper investigation. Your output MUST follow these sections: 1) Key Findings — numbered, sourced facts; 2) Contradictions & Conflicts — conflicting claims with sources for each side; 3) Gaps & Open Questions — what the sources fail to cover; 4) Sourced Claims — reference list mapping each claim to its URL or document. Keep language precise and factual — the synthesize stage depends on this structure.>", tools="read_file,deep_crawl", timeout_secs="300"]
+  synthesize [prompt="<WRITE: report writer role + output format tailored to the research type. CRITICAL: Write the ENTIRE report in ONE SINGLE write_file call — do NOT split across multiple calls. Then return a concise executive summary (key findings + conclusions, ~1000 words) as your final text response.>", tools="write_file", goal_gate="true", timeout_secs="900"]
   plan_and_search -> analyze
   analyze -> synthesize
 }}

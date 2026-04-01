@@ -1,6 +1,6 @@
 # Introduction
 
-> 🌐 **[中文文档](../zh/)**
+> 🌐 **[中文文档](/octos/zh/)**
 
 ## What is Octos?
 
