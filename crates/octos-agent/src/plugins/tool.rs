@@ -242,49 +242,59 @@ impl Tool for PluginTool {
             buf
         });
 
-        // Wait for process exit with timeout
-        let exit_status = match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
-                stderr_task.abort();
-                stdout_task.abort();
-                return Err(eyre::eyre!(
-                    "plugin '{}' tool '{}' execution failed: {e}",
-                    self.plugin_name,
-                    self.tool_def.name
-                ));
-            }
-            Err(_) => {
-                // Timeout — kill the child process and abort reader tasks
-                stderr_task.abort();
-                stdout_task.abort();
-                #[cfg(unix)]
-                if child_pid > 0 {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &format!("-{child_pid}")])
-                        .status();
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &child_pid.to_string()])
-                        .status();
-                }
-                #[cfg(windows)]
-                if child_pid > 0 {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/F", "/T", "/PID", &child_pid.to_string()])
-                        .status();
-                }
-                return Err(eyre::eyre!(
-                    "plugin '{}' tool '{}' timed out after {}s",
-                    self.plugin_name,
-                    self.tool_def.name,
-                    self.timeout.as_secs()
-                ));
-            }
+        // Wait for stdout/stderr to close (signals process exit) with timeout.
+        // We join the reader tasks instead of child.wait() because child.wait()
+        // can deadlock when pipe handles are held by spawned tasks.
+        let all_done = async {
+            let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
+            (
+                stdout_res.unwrap_or_default(),
+                stderr_res.unwrap_or_default(),
+            )
         };
 
-        // Collect stdout and stderr from reader tasks
-        let stdout_bytes = stdout_task.await.unwrap_or_default();
-        let stderr_text = stderr_task.await.unwrap_or_default();
+        let (exit_status, stdout_bytes, stderr_text) =
+            match tokio::time::timeout(self.timeout, async {
+                let (stdout_bytes, stderr_text) = all_done.await;
+                let status = child.wait().await;
+                (status, stdout_bytes, stderr_text)
+            })
+            .await
+            {
+                Ok((Ok(status), stdout_bytes, stderr_text)) => (status, stdout_bytes, stderr_text),
+                Ok((Err(e), _, _)) => {
+                    return Err(eyre::eyre!(
+                        "plugin '{}' tool '{}' execution failed: {e}",
+                        self.plugin_name,
+                        self.tool_def.name
+                    ));
+                }
+                Err(_) => {
+                    // Timeout — kill the child process
+                    let _ = child.kill().await;
+                    #[cfg(unix)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &format!("-{child_pid}")])
+                            .status();
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .status();
+                    }
+                    #[cfg(windows)]
+                    if child_pid > 0 {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &child_pid.to_string()])
+                            .status();
+                    }
+                    return Err(eyre::eyre!(
+                        "plugin '{}' tool '{}' timed out after {}s",
+                        self.plugin_name,
+                        self.tool_def.name,
+                        self.timeout.as_secs()
+                    ));
+                }
+            };
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
         tracing::info!(

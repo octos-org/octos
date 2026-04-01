@@ -67,10 +67,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<ApiMessage> = messages
-            .iter()
-            .map(|m| build_api_message(m))
-            .collect();
+        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
@@ -174,10 +171,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let api_messages: Vec<ApiMessage> = messages
-            .iter()
-            .map(|m| build_api_message(m))
-            .collect();
+        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
