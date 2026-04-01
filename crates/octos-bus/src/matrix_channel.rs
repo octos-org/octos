@@ -36,6 +36,7 @@ const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
 const MEMBERSHIP_INVITE: &str = "invite";
 const REL_TYPE_REPLACE: &str = "m.replace";
+const LIVE_MARKER: &str = "org.matrix.msc4357.live";
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
@@ -1572,8 +1573,13 @@ impl Channel for MatrixChannel {
             }
         }
 
+        let live = msg
+            .metadata
+            .get("streaming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let event_id = self
-            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id)
+            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id, live)
             .await?;
 
         // Remember which sender sent this event so edit_message can use the same identity.
@@ -1592,61 +1598,18 @@ impl Channel for MatrixChannel {
     }
 
     async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
-        // Use the same sender identity that sent the original message.
-        let sender = self
-            .event_senders
-            .read()
+        self.send_replace_event(chat_id, message_id, new_content, true)
             .await
-            .iter()
-            .rev()
-            .find(|(event_id, _)| event_id == message_id)
-            .map(|(_, sender)| sender.clone())
-            .unwrap_or_else(|| self.bot_user_id.clone());
+    }
 
-        let txn_id = uuid::Uuid::now_v7().to_string();
-        let url = self.make_api_url(&format!(
-            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
-            percent_encode_path(chat_id),
-            percent_encode_path(&txn_id),
-            percent_encode_path(&sender),
-        ));
-
-        let formatted_body = markdown_to_matrix_html(new_content);
-        let body = json!({
-            "msgtype": MSGTYPE_TEXT,
-            "body": format!("* {new_content}"),
-            "format": HTML_FORMAT,
-            "formatted_body": formatted_body,
-            "m.new_content": {
-                "msgtype": MSGTYPE_TEXT,
-                "body": new_content,
-                "format": HTML_FORMAT,
-                "formatted_body": formatted_body,
-            },
-            "m.relates_to": {
-                "rel_type": REL_TYPE_REPLACE,
-                "event_id": message_id,
-            }
-        });
-
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&self.as_token)
-            .json(&body)
-            .send()
+    async fn finish_stream(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+    ) -> Result<()> {
+        self.send_replace_event(chat_id, message_id, final_content, false)
             .await
-            .wrap_err("failed to send edit event to Matrix")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let resp_body = resp.text().await.unwrap_or_default();
-            return Err(eyre::eyre!(
-                "Matrix edit_message failed: status={status} body={resp_body}"
-            ));
-        }
-
-        Ok(())
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<()> {
@@ -1654,36 +1617,15 @@ impl Channel for MatrixChannel {
     }
 
     async fn send_typing_as(&self, chat_id: &str, sender_user_id: Option<&str>) -> Result<()> {
-        let sender = sender_user_id.unwrap_or(&self.bot_user_id);
-        let url = self.make_api_url(&format!(
-            "/_matrix/client/v3/rooms/{}/typing/{}?user_id={}",
-            percent_encode_path(chat_id),
-            percent_encode_path(sender),
-            percent_encode_path(sender),
-        ));
+        self.set_typing(chat_id, sender_user_id, true).await
+    }
 
-        let body = json!({
-            "typing": true,
-            "timeout": 30000,
-        });
+    async fn stop_typing(&self, chat_id: &str) -> Result<()> {
+        self.stop_typing_as(chat_id, None).await
+    }
 
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&self.as_token)
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("failed to send typing indicator to Matrix")?;
-
-        if !resp.status().is_success() {
-            debug!(
-                status = resp.status().as_u16(),
-                "typing indicator request returned non-success"
-            );
-        }
-
-        Ok(())
+    async fn stop_typing_as(&self, chat_id: &str, sender_user_id: Option<&str>) -> Result<()> {
+        self.set_typing(chat_id, sender_user_id, false).await
     }
 
     async fn stop(&self) -> Result<()> {
@@ -1709,6 +1651,50 @@ impl Channel for MatrixChannel {
 }
 
 impl MatrixChannel {
+    async fn set_typing(
+        &self,
+        chat_id: &str,
+        sender_user_id: Option<&str>,
+        typing: bool,
+    ) -> Result<()> {
+        let sender = sender_user_id.unwrap_or(&self.bot_user_id);
+        let url = self.make_api_url(&format!(
+            "/_matrix/client/v3/rooms/{}/typing/{}?user_id={}",
+            percent_encode_path(chat_id),
+            percent_encode_path(sender),
+            percent_encode_path(sender),
+        ));
+
+        let body = if typing {
+            json!({
+                "typing": true,
+                "timeout": 30000,
+            })
+        } else {
+            json!({
+                "typing": false,
+            })
+        };
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send typing indicator to Matrix")?;
+
+        if !resp.status().is_success() {
+            debug!(
+                status = resp.status().as_u16(),
+                typing, "typing indicator request returned non-success"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Send a message to a Matrix room and return the event_id.
     ///
     /// If `sender_user_id` is `Some`, the request uses that user for identity
@@ -1718,6 +1704,7 @@ impl MatrixChannel {
         room_id: &str,
         content: &str,
         sender_user_id: Option<&str>,
+        live: bool,
     ) -> Result<String> {
         let txn_id = uuid::Uuid::now_v7().to_string();
         let effective_sender_user_id = sender_user_id.unwrap_or(&self.bot_user_id);
@@ -1731,12 +1718,15 @@ impl MatrixChannel {
         let url = self.make_api_url(&path);
 
         let formatted_body = markdown_to_matrix_html(content);
-        let body = json!({
+        let mut body = json!({
             "msgtype": MSGTYPE_TEXT,
             "body": content,
             "format": HTML_FORMAT,
             "formatted_body": formatted_body,
         });
+        if live {
+            body[LIVE_MARKER] = json!({});
+        }
 
         let resp = self
             .http
@@ -1774,6 +1764,75 @@ impl MatrixChannel {
             .to_string();
 
         Ok(event_id)
+    }
+
+    /// Send `m.replace`. When `live`, includes MSC4357 marker for streaming.
+    async fn send_replace_event(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        live: bool,
+    ) -> Result<()> {
+        let sender = self
+            .event_senders
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|(event_id, _)| event_id == message_id)
+            .map(|(_, sender)| sender.clone())
+            .unwrap_or_else(|| self.bot_user_id.clone());
+
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let url = self.make_api_url(&format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
+            percent_encode_path(chat_id),
+            percent_encode_path(&txn_id),
+            percent_encode_path(&sender),
+        ));
+
+        let formatted_body = markdown_to_matrix_html(new_content);
+        let mut body = json!({
+            "msgtype": MSGTYPE_TEXT,
+            "body": format!("* {new_content}"),
+            "format": HTML_FORMAT,
+            "formatted_body": formatted_body,
+            "m.new_content": {
+                "msgtype": MSGTYPE_TEXT,
+                "body": new_content,
+                "format": HTML_FORMAT,
+                "formatted_body": formatted_body,
+            },
+            "m.relates_to": {
+                "rel_type": REL_TYPE_REPLACE,
+                "event_id": message_id,
+            }
+        });
+
+        if live {
+            body[LIVE_MARKER] = json!({});
+            body["m.new_content"][LIVE_MARKER] = json!({});
+        }
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send edit event to Matrix")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(eyre::eyre!(
+                "Matrix replace event failed: status={status} body={resp_body}"
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -2858,6 +2917,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_matrix_send_no_live() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "regular".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({}),
+        };
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert!(req.body.get(LIVE_MARKER).is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_matrix_edit_message() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
@@ -2886,6 +2978,54 @@ mod tests {
         assert_eq!(edit_req.body["m.relates_to"]["event_id"], "$event1");
         assert!(edit_req.body["formatted_body"].is_string());
 
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_live_lifecycle() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // Initial streaming message
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "first".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({"streaming": true}),
+        };
+        let eid = ch.send_with_id(&msg).await.unwrap().unwrap();
+        // Intermediate edit
+        ch.edit_message("!room:localhost", &eid, "partial")
+            .await
+            .unwrap();
+        // Final
+        ch.finish_stream("!room:localhost", &eid, "done")
+            .await
+            .unwrap();
+
+        wait_for_request_count(&requests, 3).await;
+        let reqs = requests.lock().await;
+        let sends: Vec<_> = reqs.iter().filter(|r| r.path.contains("/send/")).collect();
+        assert_eq!(sends.len(), 3);
+        // Initial and edit carry live marker
+        assert_eq!(sends[0].body[LIVE_MARKER], json!({}));
+        assert_eq!(sends[1].body[LIVE_MARKER], json!({}));
+        assert_eq!(sends[1].body["m.new_content"][LIVE_MARKER], json!({}));
+        // Finish omits it
+        assert!(sends[2].body.get(LIVE_MARKER).is_none());
+        assert!(sends[2].body["m.new_content"].get(LIVE_MARKER).is_none());
+        assert_eq!(sends[2].body["m.new_content"]["body"], "done");
         handle.abort();
     }
 
@@ -2919,7 +3059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_matrix_send_typing_with_sender_user_id() {
+    async fn test_matrix_send_typing_as() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
             &homeserver,
@@ -2943,6 +3083,46 @@ mod tests {
             .find(|r| r.path.contains("/typing/"))
             .expect("should have a typing request");
         assert_eq!(typing_req.method, Method::PUT);
+        assert!(
+            typing_req.path.contains("%40octos_weather%3Alocalhost"),
+            "typing path should use sender identity, got: {}",
+            typing_req.path
+        );
+        let query = typing_req.query.as_deref().unwrap_or("");
+        assert!(
+            query.contains("user_id=%40octos_weather%3Alocalhost"),
+            "typing query should use sender identity, got: {query}"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_matrix_stop_typing_as() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        ch.stop_typing_as("!room:localhost", Some("@octos_weather:localhost"))
+            .await
+            .unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let typing_req = reqs
+            .iter()
+            .find(|r| r.path.contains("/typing/"))
+            .expect("should have a typing request");
+        assert_eq!(typing_req.method, Method::PUT);
+        assert_eq!(typing_req.body["typing"], false);
         assert!(
             typing_req.path.contains("%40octos_weather%3Alocalhost"),
             "typing path should use sender identity, got: {}",
