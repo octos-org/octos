@@ -74,6 +74,10 @@ pub trait LlmProvider: Send + Sync {
     /// The adaptive router uses this to update failure metrics so subsequent calls
     /// may failover to a different provider.
     fn report_late_failure(&self) {}
+
+    /// Report streaming throughput metrics after a stream is fully consumed.
+    /// Used by the adaptive router to update throughput scoring.
+    fn report_stream_metrics(&self, _output_tokens: u32, _stream_duration_us: u64) {}
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.
