@@ -110,7 +110,11 @@ pub enum SkillsSubcommand {
     /// Install skills from GitHub (e.g. user/repo or user/repo/skill-name).
     Install {
         /// GitHub path: user/repo (all skills) or user/repo/skill-name (single skill).
-        repo: String,
+        /// Omit when using --all.
+        repo: Option<String>,
+        /// Install all packages from the registry.
+        #[arg(long)]
+        all: bool,
         /// Overwrite existing skills.
         #[arg(long)]
         force: bool,
@@ -166,9 +170,20 @@ impl Executable for SkillsCommand {
             SkillsSubcommand::List => cmd_list(&skills_dir),
             SkillsSubcommand::Install {
                 repo,
+                all,
                 force,
                 branch,
-            } => cmd_install(&skills_dir, &repo, force, &branch),
+            } => {
+                if all {
+                    cmd_install_all(&skills_dir, force, &branch)
+                } else if let Some(repo) = repo {
+                    cmd_install(&skills_dir, &repo, force, &branch)
+                } else {
+                    eyre::bail!(
+                        "Provide a repo path (e.g. user/repo) or use --all to install everything from the registry"
+                    )
+                }
+            }
             SkillsSubcommand::Remove { name } => cmd_remove(&skills_dir, &name),
             SkillsSubcommand::Search { query, registry } => {
                 cmd_search(query.as_deref(), registry.as_deref())
@@ -457,19 +472,21 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
 }
 
 fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
-    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
-
-    let entries: Vec<RegistryEntry> = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .wrap_err("failed to create HTTP client")?
-        .get(url)
-        .send()
-        .wrap_err_with(|| format!("failed to fetch registry from {url}"))?
-        .error_for_status()
-        .wrap_err("registry request failed")?
-        .json()
-        .wrap_err("failed to parse registry JSON")?;
+    let entries: Vec<RegistryEntry> = if let Some(url) = registry_url {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .wrap_err("failed to create HTTP client")?
+            .get(url)
+            .send()
+            .wrap_err_with(|| format!("failed to fetch registry from {url}"))?
+            .error_for_status()
+            .wrap_err("registry request failed")?
+            .json()
+            .wrap_err("failed to parse registry JSON")?
+    } else {
+        fetch_registry()?
+    };
 
     // Filter by query if provided (match against name, description, tags, skills).
     let query_lower = query.map(|q| q.to_lowercase());
@@ -624,6 +641,95 @@ fn cmd_install(skills_dir: &Path, repo: &str, force: bool, branch: &str) -> Resu
     {
         println!("{} No skills found in repository", "WARN".yellow());
     }
+    Ok(())
+}
+
+fn fetch_registry() -> Result<Vec<RegistryEntry>> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .wrap_err("failed to create HTTP client")?
+        .get(DEFAULT_REGISTRY_URL)
+        .send()
+        .wrap_err_with(|| format!("failed to fetch registry from {DEFAULT_REGISTRY_URL}"))?
+        .error_for_status()
+        .wrap_err("registry request failed")?
+        .json()
+        .wrap_err("failed to parse registry JSON")
+}
+
+fn cmd_install_all(skills_dir: &Path, force: bool, branch: &str) -> Result<()> {
+    println!(
+        "{} Fetching skill registry...",
+        "INFO".cyan()
+    );
+    let entries = fetch_registry()?;
+
+    if entries.is_empty() {
+        println!("{} Registry is empty — nothing to install", "WARN".yellow());
+        return Ok(());
+    }
+
+    println!(
+        "{} Found {} package(s) in registry\n",
+        "OK".green(),
+        entries.len()
+    );
+
+    let mut total_installed: Vec<String> = Vec::new();
+    let mut total_skipped: Vec<String> = Vec::new();
+    let mut total_failed: Vec<(String, String)> = Vec::new();
+
+    for entry in &entries {
+        println!("  {} {}...", "Installing".dimmed(), entry.repo.cyan());
+        match install_skill(skills_dir, &entry.repo, force, branch) {
+            Ok(result) => {
+                total_installed.extend(result.installed);
+                total_installed.extend(result.deps_installed);
+                total_skipped.extend(result.skipped);
+            }
+            Err(e) => {
+                println!("    {} {}: {}", "FAIL".red(), entry.name, e);
+                total_failed.push((entry.name.clone(), e.to_string()));
+            }
+        }
+    }
+
+    // Summary
+    println!();
+    println!("{}", "Summary".cyan().bold());
+    println!("{}", "=".repeat(40));
+    if !total_installed.is_empty() {
+        println!(
+            "  {} Installed {} skill(s): {}",
+            "OK".green(),
+            total_installed.len(),
+            total_installed.join(", ").cyan()
+        );
+    }
+    if !total_skipped.is_empty() {
+        println!(
+            "  {} Skipped {} existing: {}",
+            "SKIP".yellow(),
+            total_skipped.len(),
+            total_skipped.join(", ")
+        );
+    }
+    if !total_failed.is_empty() {
+        println!(
+            "  {} Failed {} package(s):",
+            "FAIL".red(),
+            total_failed.len()
+        );
+        for (name, err) in &total_failed {
+            println!("    - {}: {}", name, err);
+        }
+    }
+    if total_installed.is_empty() && total_skipped.is_empty() && total_failed.is_empty() {
+        println!("  No skills found in any registry package");
+    }
+    println!();
+
     Ok(())
 }
 
