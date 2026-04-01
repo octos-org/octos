@@ -300,7 +300,7 @@ struct ApiImageUrl {
     url: String,
 }
 
-fn build_api_message(msg: &Message) -> ApiMessage {
+fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
     let role = msg.role.as_str();
     let content = build_api_content(msg);
     let tool_calls = msg.tool_calls.as_ref().map(|tcs| {
