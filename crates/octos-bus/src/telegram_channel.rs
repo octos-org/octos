@@ -17,7 +17,7 @@ use teloxide::types::{
     ParseMode, ReplyParameters, UpdateKind,
 };
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::channel::Channel;
 use crate::markdown_html::markdown_to_telegram_html;
@@ -187,7 +187,9 @@ impl TelegramChannel {
             BotCommand::new("new", "Start new session or create named session"),
             BotCommand::new("s", "Switch to a named session"),
             BotCommand::new("sessions", "List and switch sessions"),
+            BotCommand::new("b", "Switch to previous session (short for /back)"),
             BotCommand::new("back", "Switch to previous session"),
+            BotCommand::new("d", "Delete a named session (short for /delete)"),
             BotCommand::new("delete", "Delete a named session"),
             BotCommand::new(
                 "adaptive",
@@ -556,8 +558,14 @@ impl Channel for TelegramChannel {
                             req = req.reply_parameters(ReplyParameters::new(mid));
                         }
                     }
-                    req.await
-                        .wrap_err_with(|| format!("failed to send voice: {path}"))?;
+                    match req.await {
+                        Ok(_) => info!(path, "Telegram send_voice succeeded"),
+                        Err(e) => {
+                            error!(path, error = %e, "Telegram send_voice failed");
+                            return Err(eyre::eyre!(e)
+                                .wrap_err(format!("failed to send voice: {path}")));
+                        }
+                    }
                 } else if lower.ends_with(".mp3")
                     || lower.ends_with(".wav")
                     || lower.ends_with(".m4a")
@@ -572,8 +580,14 @@ impl Channel for TelegramChannel {
                             req = req.reply_parameters(ReplyParameters::new(mid));
                         }
                     }
-                    req.await
-                        .wrap_err_with(|| format!("failed to send audio: {path}"))?;
+                    match req.await {
+                        Ok(_) => info!(path, "Telegram send_audio succeeded"),
+                        Err(e) => {
+                            error!(path, error = %e, "Telegram send_audio failed");
+                            return Err(eyre::eyre!(e)
+                                .wrap_err(format!("failed to send audio: {path}")));
+                        }
+                    }
                 } else {
                     // Send as document (generic file)
                     let mut req = self.bot.send_document(ChatId(chat_id), file);
@@ -585,8 +599,14 @@ impl Channel for TelegramChannel {
                             req = req.reply_parameters(ReplyParameters::new(mid));
                         }
                     }
-                    req.await
-                        .wrap_err_with(|| format!("failed to send document: {path}"))?;
+                    match req.await {
+                        Ok(_) => info!(path, "Telegram send_document succeeded"),
+                        Err(e) => {
+                            error!(path, error = %e, "Telegram send_document failed");
+                            return Err(eyre::eyre!(e)
+                                .wrap_err(format!("failed to send document: {path}")));
+                        }
+                    }
                 }
             }
         } else {
