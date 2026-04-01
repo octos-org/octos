@@ -791,9 +791,7 @@ impl FeishuChannel {
                                 warn!("Feishu webhook: failed to parse decrypted event: {e}");
                                 return (
                                     axum::http::StatusCode::BAD_REQUEST,
-                                    axum::Json(
-                                        serde_json::json!({"error": "decrypt parse error"}),
-                                    ),
+                                    axum::Json(serde_json::json!({"error": "decrypt parse error"})),
                                 )
                                     .into_response();
                             }

@@ -133,9 +133,7 @@ fn try_extract_event_bytes(buffer: &mut Vec<u8>) -> Option<SseEvent> {
 
 /// Find the position of a byte subsequence in a buffer.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Try to extract one complete SSE event from a string buffer.

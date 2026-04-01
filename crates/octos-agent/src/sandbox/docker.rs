@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use super::{DockerConfig, MountMode, Sandbox, BLOCKED_ENV_VARS};
+use super::{BLOCKED_ENV_VARS, DockerConfig, MountMode, Sandbox};
 
 /// Bind mount sources that could lead to container escape or host compromise.
 const BLOCKED_DOCKER_BIND_SOURCES: &[&str] = &[
@@ -170,7 +170,7 @@ mod tests {
         assert!(args.contains(&"1.5".to_string())); // --cpus
         assert!(args.contains(&"256m".to_string())); // --memory
         assert!(args.contains(&"100".to_string())); // --pids-limit
-                                                    // Network allowed -- no --network none
+        // Network allowed -- no --network none
         assert!(!args.iter().any(|a| a == "none"));
     }
 

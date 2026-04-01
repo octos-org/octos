@@ -5,8 +5,8 @@
 //! the concrete channel with the [`ChannelManager`].
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::Mutex;

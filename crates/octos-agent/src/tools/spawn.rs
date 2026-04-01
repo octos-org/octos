@@ -119,7 +119,11 @@ impl SpawnTool {
     }
 
     /// Set plugin directories and env vars so subagents can use plugin tools.
-    pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>, extra_env: Vec<(String, String)>) -> Self {
+    pub fn with_plugin_dirs(
+        mut self,
+        dirs: Vec<PathBuf>,
+        extra_env: Vec<(String, String)>,
+    ) -> Self {
         self.plugin_dirs = dirs;
         self.plugin_extra_env = extra_env;
         self

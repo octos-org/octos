@@ -830,7 +830,11 @@ impl PipelineExecutor {
                 let results = futures::future::join_all(futures).await;
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(results, self.config.status_bridge.as_ref(), &self.config.working_dir);
+                    process_worker_results(
+                        results,
+                        self.config.status_bridge.as_ref(),
+                        &self.config.working_dir,
+                    );
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;
@@ -1127,7 +1131,11 @@ impl PipelineExecutor {
                 let results = futures::future::join_all(futures).await;
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
-                    process_worker_results(results, self.config.status_bridge.as_ref(), &self.config.working_dir);
+                    process_worker_results(
+                        results,
+                        self.config.status_bridge.as_ref(),
+                        &self.config.working_dir,
+                    );
 
                 total_tokens.input_tokens += worker_tokens.input_tokens;
                 total_tokens.output_tokens += worker_tokens.output_tokens;

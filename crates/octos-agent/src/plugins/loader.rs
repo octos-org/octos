@@ -12,7 +12,7 @@ use crate::mcp::McpServerConfig;
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
-use super::extras::{resolve_extras, SkillExtras};
+use super::extras::{SkillExtras, resolve_extras};
 use super::manifest::PluginManifest;
 use super::tool::PluginTool;
 

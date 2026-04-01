@@ -641,7 +641,8 @@ impl AdaptiveRouter {
                 slot.provider.model_id()
             );
             if let Some(entry) = entries.iter().find(|e| e.provider == slot_key) {
-                slot.model_type.store(entry.model_type.to_u8(), Ordering::Relaxed);
+                slot.model_type
+                    .store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
                     .store(entry.cost_in.to_bits(), Ordering::Relaxed);
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);

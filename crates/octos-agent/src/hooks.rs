@@ -130,9 +130,7 @@ fn truncate_string(s: &str, max_bytes: usize) -> String {
 /// returned as-is if they fit.
 fn truncate_json_value(v: &serde_json::Value, max_bytes: usize) -> serde_json::Value {
     match v {
-        serde_json::Value::String(s) => {
-            serde_json::Value::String(truncate_string(s, max_bytes))
-        }
+        serde_json::Value::String(s) => serde_json::Value::String(truncate_string(s, max_bytes)),
         other => {
             let serialized = serde_json::to_string(other).unwrap_or_default();
             if serialized.len() <= max_bytes {
@@ -1036,12 +1034,8 @@ mod tests {
 
     #[test]
     fn test_nonsensitive_tool_small_payload_unchanged() {
-        let payload = HookPayload::before_tool(
-            "glob",
-            serde_json::json!({"pattern": "*.rs"}),
-            "tc1",
-            None,
-        );
+        let payload =
+            HookPayload::before_tool("glob", serde_json::json!({"pattern": "*.rs"}), "tc1", None);
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("*.rs"));
         assert!(!json.contains("truncated"));

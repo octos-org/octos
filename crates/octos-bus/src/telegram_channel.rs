@@ -562,8 +562,9 @@ impl Channel for TelegramChannel {
                         Ok(_) => info!(path, "Telegram send_voice succeeded"),
                         Err(e) => {
                             error!(path, error = %e, "Telegram send_voice failed");
-                            return Err(eyre::eyre!(e)
-                                .wrap_err(format!("failed to send voice: {path}")));
+                            return Err(
+                                eyre::eyre!(e).wrap_err(format!("failed to send voice: {path}"))
+                            );
                         }
                     }
                 } else if lower.ends_with(".mp3")
@@ -584,8 +585,9 @@ impl Channel for TelegramChannel {
                         Ok(_) => info!(path, "Telegram send_audio succeeded"),
                         Err(e) => {
                             error!(path, error = %e, "Telegram send_audio failed");
-                            return Err(eyre::eyre!(e)
-                                .wrap_err(format!("failed to send audio: {path}")));
+                            return Err(
+                                eyre::eyre!(e).wrap_err(format!("failed to send audio: {path}"))
+                            );
                         }
                     }
                 } else {
@@ -603,8 +605,9 @@ impl Channel for TelegramChannel {
                         Ok(_) => info!(path, "Telegram send_document succeeded"),
                         Err(e) => {
                             error!(path, error = %e, "Telegram send_document failed");
-                            return Err(eyre::eyre!(e)
-                                .wrap_err(format!("failed to send document: {path}")));
+                            return Err(
+                                eyre::eyre!(e).wrap_err(format!("failed to send document: {path}"))
+                            );
                         }
                     }
                 }
