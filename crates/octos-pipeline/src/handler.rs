@@ -257,15 +257,47 @@ impl Handler for CodergenHandler {
         };
 
         // If the node has write_file tool, instruct the agent to save the full report
-        // to a file and return a concise executive summary as text. The file will be
-        // delivered to the user directly; the summary avoids polluting context.
+        // to a file in ONE call and return a concise executive summary as text.
+        // Without explicit "single call" instruction, some models (e.g. kimi-k2.5)
+        // chunk output into ~4K token pieces across many iterations, causing timeouts.
         if node.tools.iter().any(|t| t == "write_file") {
             system_prompt.push_str(
                 "\n\nIMPORTANT: You MUST do two things:\n\
-                 1. Save your COMPLETE report using the write_file tool (choose a descriptive filename).\n\
+                 1. Save your COMPLETE report in ONE SINGLE write_file call (choose a descriptive \
+                 filename). Do NOT split the report across multiple write_file calls — put the \
+                 ENTIRE content in one call, even if it is very long.\n\
                  2. After saving, return a concise executive summary (key findings, conclusions, \
                  recommendations) as your final text response — around 1000 words. \
                  The full report file will be delivered to the user separately.",
+            );
+        }
+
+        // Analyze-node guidance: when the node has deep_crawl or read_file but
+        // NOT write_file, it is an analysis/convergence node that receives
+        // merged search results.  Inject structure so the output is easy for
+        // the downstream synthesize node to consume.
+        let has_analysis_tool = node
+            .tools
+            .iter()
+            .any(|t| t == "deep_crawl" || t == "read_file");
+        let has_write = node.tools.iter().any(|t| t == "write_file");
+        if has_analysis_tool && !has_write {
+            system_prompt.push_str(
+                "\n\nOUTPUT STRUCTURE — you MUST organise your analysis using these sections:\n\
+                 ## Key Findings\n\
+                 Numbered list of the most important facts, data points, and conclusions \
+                 drawn from the input sources. Each finding must cite its source.\n\n\
+                 ## Contradictions & Conflicts\n\
+                 List any claims that contradict each other across sources. For each, \
+                 state the conflicting positions and which source supports each side.\n\n\
+                 ## Gaps & Open Questions\n\
+                 Identify topics or questions that the sources do NOT adequately address. \
+                 If you used deep_crawl to fill a gap, note what you found.\n\n\
+                 ## Sourced Claims\n\
+                 A reference-style list mapping each major claim to its originating URL \
+                 or document. Format: `[claim summary] — source: <URL or filename>`\n\n\
+                 Keep your language precise and factual. Do NOT pad with filler. \
+                 The next stage will use this structured output to write the final report.",
             );
         }
 

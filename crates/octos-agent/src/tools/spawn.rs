@@ -533,6 +533,8 @@ mod tests {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
