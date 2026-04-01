@@ -526,19 +526,35 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
     };
 
     if images.is_empty() {
-        // If media was stripped due to model not supporting vision, note it in text
-        let media_note = if hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p)) {
-            let filenames: Vec<_> = msg
-                .media
-                .iter()
-                .map(|p| {
-                    std::path::Path::new(p)
+        // Build a note for any media the LLM won't see inline:
+        // - Non-image files (CSV, PDF, etc.) → include full path so agent can read_file
+        // - Images stripped because model lacks vision → include filename
+        let non_image_files: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p))
+            .collect();
+        let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p));
+
+        let media_note = if !non_image_files.is_empty() || stripped_images {
+            let mut parts = Vec::new();
+            for path in &non_image_files {
+                // Include full path so the agent can use read_file to access it
+                parts.push(format!("{path}"));
+            }
+            if stripped_images {
+                for p in msg.media.iter().filter(|p| vision::is_image(p)) {
+                    let name = std::path::Path::new(p)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.clone())
-                })
-                .collect();
-            Some(format!("[attached media: {}]", filenames.join(", ")))
+                        .unwrap_or_else(|| p.clone());
+                    parts.push(name);
+                }
+            }
+            Some(format!(
+                "[attached files: {}. Use read_file to access them.]",
+                parts.join(", ")
+            ))
         } else {
             None
         };
