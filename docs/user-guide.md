@@ -30,6 +30,7 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 13. [Platform Skills (ASR/TTS)](#13-platform-skills-asrtts)
 14. [Custom Skill Installation](#14-custom-skill-installation)
 15. [Configuration Reference](#15-configuration-reference)
+16. [Matrix Appservice (Palpo)](#16-matrix-appservice-palpo)
 
 ---
 
@@ -38,7 +39,7 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 Octos is a Rust-native AI agent platform that runs in two modes:
 
 - **`octos serve`** — Control plane with admin dashboard. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels.
-- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom).
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom, Matrix).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
@@ -2001,6 +2002,264 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 └── history/
     └── chat_history            # Readline history (CLI)
 ```
+
+---
+
+## 16. Matrix Appservice (Palpo)
+
+Octos can run as a [Matrix Application Service](https://spec.matrix.org/latest/application-service-api/) (appservice) behind a Matrix homeserver. This section describes how to deploy Octos alongside [Palpo](https://github.com/palpo-im/palpo) using Docker Compose so that users can talk to the bot from any Matrix client.
+
+### 16.1 How It Works
+
+```
+Matrix Client (Element, etc.)
+       │
+       ▼
+  Palpo (homeserver :8008)
+       │  pushes events via Appservice API
+       ▼
+  Octos (appservice listener :8009)
+       │  sends responses back via Palpo's client-server API
+       ▼
+  Palpo ──► Matrix Client
+```
+
+Palpo loads a **registration YAML** at startup that tells it which user namespaces belong to Octos and where to forward events. Octos listens on a dedicated port (default `8009`) for those events and replies through Palpo's client-server API.
+
+### 16.2 Directory Layout
+
+```
+palpo_with_octos/
+├── compose.yml                        # Docker Compose file
+├── palpo.toml                         # Palpo homeserver config
+├── appservices/
+│   └── octos-registration.yaml        # Appservice registration
+├── config/
+│   ├── botfather.json                 # Octos profile (Matrix channel)
+│   └── octos.json                     # Octos global config
+├── data/
+│   ├── pgsql/                         # PostgreSQL data
+│   ├── octos/                         # Octos runtime data
+│   └── media/                         # Palpo media store
+└── static/
+    └── index.html                     # Palpo home page
+```
+
+### 16.3 Step-by-Step Setup
+
+#### 1. Generate Tokens
+
+The appservice registration and the Octos profile must share two tokens. Generate them once:
+
+```bash
+# Generate as_token and hs_token (any random hex string works)
+openssl rand -hex 32   # → as_token
+openssl rand -hex 32   # → hs_token
+```
+
+Keep them handy — you will paste them into two files below.
+
+#### 2. Create the Appservice Registration
+
+Create `appservices/octos-registration.yaml`:
+
+```yaml
+# Matrix Appservice Registration — octos
+id: octos-matrix-appservice
+
+# URL where Palpo pushes events to octos (Docker service name, NOT localhost)
+url: "http://octos:8009"
+
+# Tokens — must match config/botfather.json
+as_token: "<your-as-token>"
+hs_token: "<your-hs-token>"
+
+sender_localpart: octosbot
+rate_limited: false
+
+namespaces:
+  users:
+    - exclusive: true
+      regex: "@octosbot_.*:your\\.server\\.name"
+    - exclusive: true
+      regex: "@octosbot:your\\.server\\.name"
+  aliases: []
+  rooms: []
+```
+
+Key fields:
+
+| Field | Description |
+|-------|-------------|
+| `url` | Where Palpo sends events. Use the Docker service name (e.g. `http://octos:8009`), not `localhost`. |
+| `as_token` | Token that Octos uses when calling Palpo's API. |
+| `hs_token` | Token that Palpo uses when pushing events to Octos. |
+| `sender_localpart` | The bot's Matrix local username (becomes `@octosbot:your.server.name`). |
+| `namespaces.users` | Regex patterns for user IDs the appservice manages. Include both the bot itself and any bridged-user prefix. |
+
+#### 3. Configure Palpo
+
+In `palpo.toml`, point to the directory containing the registration file:
+
+```toml
+server_name = "your.server.name"
+listen_addr = "0.0.0.0:8008"
+
+allow_registration = true
+allow_federation = true
+
+# Palpo auto-loads all .yaml files from this directory on startup
+appservice_registration_dir = "/var/palpo/appservices"
+
+[db]
+url = "postgres://palpo:<db-password>@palpo_postgres:5432/palpo"
+pool_size = 10
+
+[well_known]
+server = "your.server.name"
+client = "https://your.server.name"
+```
+
+#### 4. Create the Octos Profile
+
+Create `config/botfather.json` with a Matrix channel that uses the same tokens:
+
+```json
+{
+  "id": "botfather",
+  "name": "BotFather",
+  "enabled": true,
+  "config": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "channels": [
+      {
+        "type": "matrix",
+        "homeserver": "http://palpo:8008",
+        "as_token": "<your-as-token>",
+        "hs_token": "<your-hs-token>",
+        "server_name": "your.server.name",
+        "sender_localpart": "octosbot",
+        "user_prefix": "octosbot_",
+        "port": 8009,
+        "allowed_senders": ["@alice:your.server.name"]
+      }
+    ],
+    "gateway": {
+      "max_history": 50,
+      "queue_mode": "followup"
+    }
+  }
+}
+```
+
+Matrix channel fields:
+
+| Field | Description |
+|-------|-------------|
+| `type` | Must be `"matrix"`. |
+| `homeserver` | Palpo's internal URL (Docker service name). |
+| `as_token` / `hs_token` | Must match the registration YAML. |
+| `server_name` | The Matrix domain (must match `palpo.toml`). |
+| `sender_localpart` | Bot username (must match the registration). |
+| `user_prefix` | Prefix for bridged user IDs managed by this appservice. |
+| `port` | Port Octos listens on for appservice events from Palpo. |
+| `allowed_senders` | Matrix user IDs that may talk to the bot. Empty array = allow all. |
+
+#### 5. Docker Compose
+
+```yaml
+services:
+  palpo_postgres:
+    image: postgres:17
+    restart: always
+    volumes:
+      - ./data/pgsql:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: <db-password>
+      POSTGRES_USER: palpo
+      POSTGRES_DB: palpo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U palpo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  palpo:
+    image: ghcr.io/palpo-im/palpo:latest
+    restart: unless-stopped
+    ports:
+      - 8128:8008     # Client-server API
+      - 8348:8448     # Federation API
+    environment:
+      PALPO_CONFIG: "/var/palpo/palpo.toml"
+    volumes:
+      - ./palpo.toml:/var/palpo/palpo.toml:ro
+      - ./appservices:/var/palpo/appservices:ro
+      - ./data/media:/var/palpo/media
+      - ./static:/var/palpo/static:ro
+    depends_on:
+      palpo_postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  octos:
+    build:
+      context: /path/to/octos       # Path to Octos source repo
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - 8009:8009     # Appservice listener (receives events from Palpo)
+      - 8010:8080     # Octos dashboard / admin API
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      RUST_LOG: octos=debug,info
+    volumes:
+      - ./data/octos:/root/.octos
+      - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
+      - ./config/octos.json:/config/octos.json:ro
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080", "--config", "/config/octos.json"]
+    depends_on:
+      - palpo
+    networks:
+      - internal
+
+networks:
+  internal:
+    attachable: true
+```
+
+#### 6. Start Everything
+
+```bash
+docker compose up -d
+```
+
+Palpo reads `appservices/octos-registration.yaml` on startup. When a Matrix user sends a message in a room where the bot is invited, Palpo pushes the event to `http://octos:8009`, Octos processes it through the agent loop, and replies via Palpo's client-server API.
+
+### 16.4 Token Matching Checklist
+
+The most common misconfiguration is a token mismatch. All three of these must agree:
+
+| Value | `octos-registration.yaml` | `botfather.json` |
+|-------|--------------------------|-------------------|
+| `as_token` | `as_token: "abc..."` | `"as_token": "abc..."` |
+| `hs_token` | `hs_token: "def..."` | `"hs_token": "def..."` |
+| `sender_localpart` | `sender_localpart: octosbot` | `"sender_localpart": "octosbot"` |
+| server name | `regex: "@octosbot:your\\.server\\.name"` | `"server_name": "your.server.name"` |
+
+### 16.5 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Bot does not respond | Token mismatch between registration and profile | Verify the [token checklist](#164-token-matching-checklist) |
+| `Connection refused` in Palpo logs | Octos not running or wrong `url` in registration | Ensure Octos is up; use Docker service name (`http://octos:8009`), not `localhost` |
+| `User ID not in namespace` | `sender_localpart` doesn't match registration `namespaces.users` regex | Update the regex to include the bot's full user ID |
+| Messages from unauthorized users ignored | `allowed_senders` filtering | Add the user's Matrix ID to the array, or set it to `[]` to allow everyone |
 
 ---
 
