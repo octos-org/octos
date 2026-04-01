@@ -124,7 +124,7 @@ fn fetch_tts_wav(
             .headers()
             .get("transfer-encoding")
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |v| v.contains("chunked"));
+            .is_some_and(|v| v.contains("chunked"));
 
     // Read response with progress — for streaming PCM, report per-chunk progress
     eprintln!("Receiving TTS audio data...");
