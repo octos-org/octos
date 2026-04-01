@@ -88,7 +88,7 @@ octos serve
 - [CLI Reference](https://octos-org.github.io/octos/cli-reference.html)
 - [Skill Development](https://octos-org.github.io/octos/skill-development.html)
 
-**中文:** [中文 README](README-zh.md) | [用户指南](https://octos-org.github.io/octos/) (doc site)
+**中文:** [中文 README](README-zh.md) | [用户指南](https://octos-org.github.io/octos/zh/) (doc site)
 
 ## Architecture
 

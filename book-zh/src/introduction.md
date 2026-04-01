@@ -1,6 +1,6 @@
 # 简介
 
-> 🌐 **[English Documentation](../../)**
+> 🌐 **[English Documentation](/octos/)**
 
 ## Octos 是什么？
 

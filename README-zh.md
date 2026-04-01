@@ -36,7 +36,7 @@ octos chat
 
 ## 文档
 
-📖 **[完整文档](https://octos-org.github.io/octos/)** — 安装、配置、频道、提供者、记忆、技能、高级功能等。
+📖 **[完整文档](https://octos-org.github.io/octos/zh/)** — 安装、配置、频道、提供者、记忆、技能、高级功能等。
 
 **English:** [English README](README.md) | [Documentation](https://octos-org.github.io/octos/)
 
