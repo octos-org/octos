@@ -369,6 +369,7 @@ impl GatewayDispatcher {
     /// Returns `Some(Handled)` if the callback was a session switch (`s:topic`).
     /// Returns `None` if the callback data doesn't match, so the caller
     /// should fall through to normal message processing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_session_callback(
         &self,
         callback_data: &str,

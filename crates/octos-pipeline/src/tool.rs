@@ -317,7 +317,6 @@ impl Tool for RunPipelineTool {
             tokens_used: Some(result.token_usage),
             file_modified: report_file,
             files_to_send,
-            ..Default::default()
         })
     }
 }

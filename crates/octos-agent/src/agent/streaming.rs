@@ -29,14 +29,6 @@ impl Agent {
         }
     }
 
-    pub(super) async fn consume_stream(
-        &self,
-        mut stream: ChatStream,
-        iteration: u32,
-    ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, 0).await
-    }
-
     pub(super) async fn consume_stream_with_input_estimate(
         &self,
         stream: ChatStream,

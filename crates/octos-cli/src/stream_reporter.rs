@@ -192,7 +192,7 @@ async fn is_session_active(
 /// `active_sessions` + `session_key` — used to check if this session is currently
 /// active before sending/editing channel messages. When inactive, all direct
 /// channel operations are skipped to prevent cross-session message leaks.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_stream_forwarder(
     mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
     channel: Arc<dyn Channel>,
