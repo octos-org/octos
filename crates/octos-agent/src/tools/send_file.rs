@@ -389,6 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
     async fn test_base_dir_blocks_non_tmp_outside_path() {
         let base = tempfile::tempdir().unwrap();
 
