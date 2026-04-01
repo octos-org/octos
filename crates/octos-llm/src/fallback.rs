@@ -169,5 +169,7 @@ impl LlmProvider for FallbackProvider {
     }
 
     fn report_stream_metrics(&self, output_tokens: u32, stream_duration_us: u64) {
-        self.primary.report_stream_metrics(output_tokens, stream_duration_us);
+        self.primary
+            .report_stream_metrics(output_tokens, stream_duration_us);
     }
+}

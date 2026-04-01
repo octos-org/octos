@@ -69,10 +69,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/messages",
             get(handlers::session_messages),
         )
-        .route(
-            "/api/sessions/{id}/status",
-            get(handlers::session_status),
-        )
+        .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 

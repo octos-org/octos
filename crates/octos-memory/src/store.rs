@@ -316,9 +316,12 @@ impl EpisodeStore {
                     if let Ok(episode) = serde_json::from_str::<Episode>(old_json.value()) {
                         let cwd = episode.working_dir.to_string_lossy().to_string();
                         let mut cwd_index = write_txn.open_table(CWD_INDEX_TABLE)?;
-                        if let Some(ids_json) = cwd_index.get(cwd.as_str())? {
-                            let mut ids: Vec<String> =
-                                serde_json::from_str(ids_json.value()).unwrap_or_default();
+                        // Read and drop the immutable borrow before mutating
+                        let existing: Option<Vec<String>> =
+                            cwd_index.get(cwd.as_str())?.map(|ids_json| {
+                                serde_json::from_str(ids_json.value()).unwrap_or_default()
+                            });
+                        if let Some(mut ids) = existing {
                             ids.retain(|id| id != &ep_id);
                             if ids.is_empty() {
                                 cwd_index.remove(cwd.as_str())?;
