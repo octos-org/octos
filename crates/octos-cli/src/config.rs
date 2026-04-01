@@ -42,6 +42,11 @@ pub struct Config {
     #[serde(default)]
     pub api_type: Option<String>,
 
+    /// Admin auth token (for dashboard login). Also settable via --auth-token CLI arg
+    /// or OCTOS_AUTH_TOKEN env var.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+
     /// Gateway configuration (optional).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,

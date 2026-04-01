@@ -454,8 +454,14 @@ impl ProfileStore {
         let path = self.profile_path(&profile.id);
         let content =
             serde_json::to_string_pretty(profile).wrap_err("failed to serialize profile")?;
-        std::fs::write(&path, &content)
-            .wrap_err_with(|| format!("failed to write profile: {}", path.display()))?;
+
+        // Atomic write: write to temp file, then rename to avoid partial writes
+        // if the process is interrupted or concurrent saves race.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &content)
+            .wrap_err_with(|| format!("failed to write temp profile: {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .wrap_err_with(|| format!("failed to rename profile: {}", path.display()))?;
 
         // Restrict file permissions to owner-only (mode 0600)
         #[cfg(unix)]
@@ -527,6 +533,11 @@ impl ProfileStore {
     }
 
     /// List sub-accounts for a given parent profile.
+    ///
+    /// NOTE(#148): This performs an O(N) scan over all profiles and filters by parent_id.
+    /// For small deployments (<100 profiles) this is fine. If profile counts grow large,
+    /// consider adding a secondary index (e.g. a parent_id -> Vec<sub_id> mapping) or
+    /// storing sub-accounts in a subdirectory per parent.
     pub fn list_sub_accounts(&self, parent_id: &str) -> Result<Vec<UserProfile>> {
         let all = self.list()?;
         Ok(all
@@ -779,6 +790,7 @@ pub(crate) fn config_from_profile(
                 feishu_from_address: e.feishu_from_address.clone(),
                 feishu_region: e.feishu_region.clone(),
             }),
+        auth_token: None,
         adaptive_routing: None,
         voice: None,
         #[cfg(feature = "api")]

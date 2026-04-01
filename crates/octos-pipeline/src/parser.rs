@@ -302,13 +302,33 @@ impl<'a> DotParser<'a> {
         Ok(attrs)
     }
 
-    /// Parse a value: quoted string or bare identifier/number.
+    /// Parse a value: quoted string or bare value (allows `/` and `:` for
+    /// model names like `provider/model` that may appear unquoted).
     fn parse_value(&mut self) -> Result<String> {
         if self.peek() == Some('"') {
             self.parse_quoted_string()
         } else {
-            self.parse_identifier()
+            self.parse_bare_value()
         }
+    }
+
+    /// Parse a bare (unquoted) attribute value.
+    ///
+    /// Allows `/` and `:` in addition to the identifier charset so that
+    /// model names like `openai/gpt-4o` work without quoting.
+    fn parse_bare_value(&mut self) -> Result<String> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == start {
+            eyre::bail!("expected value at position {}", self.pos);
+        }
+        Ok(self.input[start..self.pos].to_string())
     }
 
     /// Parse a quoted string with escape handling.

@@ -1,87 +1,65 @@
-# Octos App Skill Development Guide
+# Skill Development
 
-[English](app-skill-dev-guide.md) | [中文](app-skill-dev-guide-zh.md)
-
-This guide covers everything you need to build, register, and deploy a new app skill for octos.
+This guide covers the full lifecycle of an Octos skill — from development to publication to end-user installation — similar to building an app, submitting it to an app store, and distributing it to users.
 
 ---
 
-## Architecture Overview
+## The Skill Ecosystem
 
-An app skill is a **standalone executable binary** that communicates with the octos gateway via a simple **stdin/stdout JSON protocol**. The gateway spawns the skill binary as a child process for each tool call, passes JSON arguments on stdin, and reads JSON results from stdout.
+```
+ Developer                    Octos Hub                     User
+ ─────────                    ─────────                     ────
+ 1. Develop skill        ──▶  3. Publish to registry   ──▶  5. Search & discover
+ 2. Test locally              4. Pre-built binaries         6. Install
+                                                            7. Update
+```
+
+| Concept | App Store Analogy | Octos Equivalent |
+|---------|-------------------|------------------|
+| **App** | iOS/Android app | Skill (binary + manifest + docs) |
+| **SDK** | Xcode / Android Studio | Rust + `manifest.json` + `SKILL.md` |
+| **App Store** | Apple App Store | [octos-hub](https://github.com/octos-org/octos-hub) registry |
+| **Distribution** | App Store binary delivery | Pre-built binaries in GitHub Releases |
+| **Install** | Tap "Get" | `octos skills install user/repo` |
+| **Sideload** | Ad-hoc / TestFlight | Copy to `~/.octos/skills/` directly |
+
+---
+
+## Part 1: Develop
+
+### Architecture
+
+A skill is a **standalone executable** that communicates via **stdin/stdout JSON**. The gateway spawns it as a child process for each tool call. Skills can be written in **any language** — Rust, Python, Node.js, shell, etc.
 
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
-                         ↓
-              Gateway spawns: ~/.octos/skills/weather/main get_weather
-                         ↓
-              Stdin:  {"city": "Paris"}
-              Stdout: {"output": "Paris, France\nClear sky\n...", "success": true}
-                         ↓
-              LLM sees result → generates natural language response
+                        ↓
+             Gateway spawns: ~/.octos/skills/weather/main get_weather
+                        ↓
+             Stdin:  {"city": "Paris"}
+             Stdout: {"output": "25°C, sunny", "success": true}
+                        ↓
+             LLM sees result → generates response
 ```
 
----
+### Skill Anatomy
 
-## Skill Directory Structure
-
-Each skill lives in its own crate under `crates/app-skills/`:
+Every skill is a directory with three files:
 
 ```
-crates/app-skills/my-skill/
-├── Cargo.toml          # Crate config, binary name
-├── manifest.json       # Tool definitions (JSON Schema)
-├── SKILL.md            # Documentation + frontmatter metadata
-└── src/
-    └── main.rs         # Binary entry point
+my-skill/
+├── manifest.json       # Tool definitions (JSON Schema) — the "API contract"
+├── SKILL.md            # Documentation + metadata — the "app description"
+├── main                # Executable binary — the "app binary"
+└── (optional extras)
+    ├── styles/         # Bundled assets
+    ├── prompts/*.md    # System prompt fragments
+    └── hooks/          # Lifecycle hook scripts
 ```
 
-After bootstrapping, the skill is installed at:
+### Step 1: Create manifest.json
 
-```
-~/.octos/skills/my-skill/
-├── main                # Executable binary (copied from target/)
-├── manifest.json       # Tool definitions
-└── SKILL.md            # Documentation
-```
-
----
-
-## Step-by-Step: Create a New Skill
-
-### 1. Create the Crate
-
-```bash
-mkdir -p crates/app-skills/my-skill/src
-```
-
-### 2. Cargo.toml
-
-```toml
-[package]
-name = "my-skill"
-version = "1.0.0"
-edition = "2021"
-description = "Short description of what this skill does"
-authors = ["your-name"]
-
-[[bin]]
-name = "my_skill"          # Binary name (used in bundled_app_skills.rs)
-path = "src/main.rs"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Add other deps as needed:
-# reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
-# chrono = "0.4"
-```
-
-**Important:** The `[[bin]] name` must match the `binary_name` in `bundled_app_skills.rs`.
-
-### 3. manifest.json
-
-Defines the tools the LLM can call. Uses JSON Schema for input validation.
+The manifest declares what tools the skill provides. The LLM reads this to decide when and how to call your skill.
 
 ```json
 {
@@ -125,24 +103,20 @@ Defines the tools the LLM can call. Uses JSON Schema for input validation.
 | `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
 | `requires_network` | No | false | Informational flag |
 | `sha256` | No | — | Binary integrity check (hex hash) |
-| `tools` | Yes | — | Array of tool definitions |
+| `tools` | No | `[]` | Array of tool definitions |
+| `mcp_servers` | No | `[]` | MCP server declarations |
+| `hooks` | No | `[]` | Lifecycle hook definitions |
+| `prompts` | No | — | Prompt fragment config |
+| `binaries` | No | `{}` | Pre-built binaries by `{os}-{arch}` |
 
-**Tool definition fields:**
+### Step 2: Create SKILL.md
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Tool name (snake_case, globally unique) |
-| `description` | Yes | Description shown to LLM — be specific about when to use |
-| `input_schema` | Yes | JSON Schema for input parameters |
-
-### 4. SKILL.md
-
-Documentation with YAML frontmatter. The LLM reads this to understand when and how to use the skill.
+Documentation with YAML frontmatter. The LLM reads this to understand context and trigger conditions.
 
 ```markdown
 ---
 name: my-skill
-description: Short description. Triggers: keyword1, keyword2, 关键词, trigger phrase.
+description: Short description. Triggers: keyword1, keyword2, trigger phrase.
 version: 1.0.0
 author: your-name
 always: false
@@ -158,10 +132,6 @@ Detailed description of what this skill does and when to use it.
 
 Explain what this tool does with examples.
 
-\```json
-{"param1": "example value", "param2": 5}
-\```
-
 **Parameters:**
 - `param1` (required): What it means
 - `param2` (optional): What it controls. Default: 10
@@ -172,20 +142,26 @@ Explain what this tool does with examples.
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `name` | Yes | — | Skill identifier |
-| `description` | Yes | — | One-line description. Include trigger keywords after "Triggers:" |
+| `description` | Yes | — | One-line description with trigger keywords |
 | `version` | Yes | — | Semantic version |
 | `author` | No | — | Author name |
-| `always` | No | `false` | If `true`, skill docs are always included in system prompt |
-| `requires_bins` | No | — | Comma-separated binaries that must exist (checked via `which`) |
+| `always` | No | `false` | If `true`, always included in system prompt |
+| `requires_bins` | No | — | Comma-separated binaries that must exist |
 | `requires_env` | No | — | Comma-separated env vars that must be set |
 
-**Trigger keywords** help the agent decide when to activate the skill. Include terms in multiple languages if your users are multilingual.
+### Step 3: Implement the Binary
 
-### 5. src/main.rs
+The binary implements the stdin/stdout JSON protocol.
 
-The binary implements the stdin/stdout protocol.
+**Protocol:**
 
-**Minimal template:**
+1. **argv[1]** = tool name (e.g., `get_weather`)
+2. **stdin** = JSON object matching the tool's `input_schema`
+3. **stdout** = JSON with `output` (string) and `success` (bool)
+4. **exit code** = 0 for success, non-zero for failure
+5. **stderr** = ignored (use for debug logging)
+
+**Rust template:**
 
 ```rust
 use std::io::Read;
@@ -212,7 +188,7 @@ fn main() {
 
     match tool_name {
         "my_tool" => handle_my_tool(&buf),
-        _ => fail(&format!("Unknown tool '{tool_name}'. Expected: my_tool")),
+        _ => fail(&format!("Unknown tool '{tool_name}'")),
     }
 }
 
@@ -227,208 +203,508 @@ fn handle_my_tool(input_json: &str) {
         Err(e) => fail(&format!("Invalid input: {e}")),
     };
 
-    // ... your logic here ...
-
     let result = format!("Processed {} with param2={}", input.param1, input.param2);
     println!("{}", json!({"output": result, "success": true}));
 }
 ```
 
-**Protocol rules:**
+**Python template:**
 
-1. **argv[1]** = tool name (e.g., `get_weather`, `get_forecast`)
-2. **stdin** = JSON object matching the tool's `input_schema`
-3. **stdout** = JSON object with:
-   - `output` (string): Human-readable result text
-   - `success` (bool): `true` for success, `false` for failure
-4. **exit code**: 0 for success, non-zero for failure
-5. **stderr**: Ignored by the gateway (use for debug logging)
+```python
+#!/usr/bin/env python3
+import sys, json
 
----
+def main():
+    tool_name = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    input_data = json.loads(sys.stdin.read())
 
-## Register the Skill
+    if tool_name == "my_tool":
+        result = f"Processed {input_data['param1']}"
+        print(json.dumps({"output": result, "success": True}))
+    else:
+        print(json.dumps({"output": f"Unknown tool: {tool_name}", "success": False}))
+        sys.exit(1)
 
-### 6. Add to Workspace
+if __name__ == "__main__":
+    main()
+```
 
-In the root `Cargo.toml`, add to `members`:
+**Shell template:**
+
+```bash
+#!/bin/sh
+TOOL="$1"
+INPUT=$(cat)
+
+if [ "$TOOL" = "my_tool" ]; then
+    PARAM1=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['param1'])")
+    printf '{"output": "Processed %s", "success": true}\n' "$PARAM1"
+else
+    printf '{"output": "Unknown tool: %s", "success": false}\n' "$TOOL"
+    exit 1
+fi
+```
+
+### Step 4: For Bundled Skills (Rust Crate)
+
+If contributing a skill to the core Octos distribution:
+
+```bash
+mkdir -p crates/app-skills/my-skill/src
+```
+
+**Cargo.toml:**
 
 ```toml
-[workspace]
+[package]
+name = "my-skill"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "my_skill"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+Add to workspace `Cargo.toml`:
+
+```toml
 members = [
-    # ... existing members ...
+    # ...
     "crates/app-skills/my-skill",
 ]
 ```
 
-### 7. Register in bundled_app_skills.rs
-
-In `crates/octos-agent/src/bundled_app_skills.rs`, add to `BUNDLED_APP_SKILLS`:
+Register in `crates/octos-agent/src/bundled_app_skills.rs`:
 
 ```rust
 pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
-    // ... existing skills ...
+    // ...
     (
-        "my-skill",                                          // dir_name (skill directory name)
-        "my_skill",                                          // binary_name (must match [[bin]] name)
-        include_str!("../../app-skills/my-skill/SKILL.md"),  // embedded docs
-        include_str!("../../app-skills/my-skill/manifest.json"), // embedded manifest
+        "my-skill",                                          // dir_name
+        "my_skill",                                          // binary_name
+        include_str!("../../app-skills/my-skill/SKILL.md"),
+        include_str!("../../app-skills/my-skill/manifest.json"),
     ),
 ];
 ```
 
-**Tuple format:** `(dir_name, binary_name, skill_md, manifest_json)`
-
-- `dir_name`: Name of the directory under `~/.octos/skills/`
-- `binary_name`: Name of the binary in `target/release/` (must match `[[bin]] name` in Cargo.toml)
-- `skill_md`: Embedded SKILL.md content
-- `manifest_json`: Embedded manifest.json content
-
 ---
 
-## Build & Test
+## Part 2: Test
 
-### 8. Build
+### Standalone Testing
+
+Test your skill binary directly without the gateway:
 
 ```bash
-# Build just your skill
+# Build (Rust)
 cargo build -p my-skill
 
-# Build everything
-cargo build --workspace
-```
-
-### 9. Test Standalone
-
-```bash
-# Test your tool directly
+# Test a tool call
 echo '{"param1": "hello", "param2": 5}' | ./target/debug/my_skill my_tool
-
-# Expected output:
-# {"output":"Processed hello with param2=5","success":true}
+# Expected: {"output":"Processed hello with param2=5","success":true}
 
 # Test error handling
 echo '{}' | ./target/debug/my_skill my_tool
 echo '{"param1": "test"}' | ./target/debug/my_skill unknown_tool
 ```
 
-### 10. Test with Gateway
+For non-Rust skills, make the binary executable and test the same way:
 
 ```bash
-# Build release + install
+chmod +x my-skill/main
+echo '{"param1": "hello"}' | ./my-skill/main my_tool
+```
+
+### Gateway Integration Testing
+
+```bash
+# Build everything
 cargo build --release --workspace
 
-# Start gateway (skills are bootstrapped automatically)
+# Start the gateway
 octos gateway
 
-# Check skill was loaded
+# Verify skill loaded
 ls ~/.octos/skills/my-skill/
 # main  manifest.json  SKILL.md
 
-# Ask the agent to use your skill
+# Ask the agent to use your skill in conversation
 ```
+
+### Recommended Timeout Values
+
+| Skill Type | Timeout |
+|------------|---------|
+| Local computation | 5s |
+| Single API call | 15s |
+| Multi-step API calls | 30-60s |
+| Long-running research | 300-600s |
 
 ---
 
-## Examples
+## Part 3: Publish
 
-### Example 1: Local-Only Skill (Clock)
+Publishing makes your skill discoverable to all Octos users — like submitting an app to the App Store.
 
-No network, no env vars. Uses `chrono` + `chrono-tz`.
+### Push to GitHub
 
-```
-crates/app-skills/time/
-├── Cargo.toml          # deps: chrono, chrono-tz, serde, serde_json
-├── manifest.json       # 1 tool: get_time, timeout_secs: 5
-├── SKILL.md            # Triggers: time, clock, 几点
-└── src/main.rs         # Reads system clock, formats with timezone
-```
+Organize your repository. A repo can contain a single skill or multiple skills:
 
-**Key pattern:** Default to local time when no timezone given.
-
-### Example 2: Network Skill (Weather)
-
-Calls external API, needs network. Uses `reqwest` (blocking).
+**Single-skill repo:**
 
 ```
-crates/app-skills/weather/
-├── Cargo.toml          # deps: reqwest (blocking, rustls-tls), serde, serde_json
-├── manifest.json       # 2 tools: get_weather, get_forecast, timeout_secs: 15
-├── SKILL.md            # Triggers: weather, forecast, 天气
-└── src/main.rs         # Geocode city → fetch weather from Open-Meteo
+my-skill/                    ← repo root
+├── manifest.json
+├── SKILL.md
+├── Cargo.toml               (or package.json, requirements.txt, etc.)
+└── src/main.rs
 ```
 
-**Key patterns:**
-- Build HTTP client with timeouts
-- Handle API errors gracefully (return `success: false`)
-- URL-encode user input
-- Multiple tools in one binary (match on `argv[1]`)
-
-### Example 3: Env-Var Skill (Send Email)
-
-Requires credentials from environment variables.
+**Multi-skill repo:**
 
 ```
-crates/app-skills/send-email/
-├── Cargo.toml          # deps: lettre, serde, serde_json, reqwest
-├── manifest.json       # 1 tool: send_email
-├── SKILL.md            # requires_env: SMTP_HOST,SMTP_USERNAME,SMTP_PASSWORD
-└── src/main.rs         # Reads SMTP_* env vars, sends via SMTP
+my-skills/                   ← repo root
+├── skill-a/
+│   ├── manifest.json
+│   ├── SKILL.md
+│   └── src/main.rs
+├── skill-b/
+│   ├── manifest.json
+│   ├── SKILL.md
+│   └── main.py
+└── shared/                  ← shared dependencies (auto-detected)
+    └── utils.py
 ```
 
-**Key pattern:** Check env vars early, fail with clear error message.
+### Submit to the Registry
 
-```rust
-fn get_smtp_config() -> SmtpConfig {
-    let host = std::env::var("SMTP_HOST")
-        .unwrap_or_else(|_| fail("SMTP_HOST env var not set"));
-    // ...
+The [octos-hub](https://github.com/octos-org/octos-hub) registry is the central catalog for discoverable skills. Submit a PR to add your entry to `registry.json`:
+
+```json
+{
+  "name": "my-skills",
+  "description": "What your skills do",
+  "repo": "your-user/your-repo",
+  "version": "1.0.0",
+  "author": "your-name",
+  "license": "MIT",
+  "skills": ["skill-a", "skill-b"],
+  "requires": ["git", "cargo"],
+  "provides_tools": true,
+  "tags": ["keyword1", "keyword2"]
 }
 ```
 
+**Registry entry fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Package name (can differ from repo name) |
+| `description` | Yes | Searchable description |
+| `repo` | Yes | GitHub `user/repo` or full URL |
+| `version` | No | Latest version |
+| `author` | No | Author name |
+| `license` | No | License identifier (MIT, Apache-2.0, etc.) |
+| `skills` | No | Individual skill names in the package |
+| `requires` | No | External dependencies (e.g., `["git", "cargo"]`) |
+| `provides_tools` | No | Whether skills have `manifest.json` with tools |
+| `tags` | No | Searchable tags |
+| `binaries` | No | Pre-built binaries (see Distribution below) |
+
+Once the PR is merged, users can discover your skill:
+
+```bash
+octos skills search keyword1
+```
+
 ---
 
-## Manifest Extensions: MCP Servers, Hooks, and Prompt Fragments
+## Part 4: Distribute
 
-Skills can declare more than just tools in `manifest.json`. Three additional extension points let a skill provide MCP servers, lifecycle hooks, and system prompt content. These are collectively called **extras**.
+Pre-built binaries let users install instantly without compiling — like downloading an app binary from the store.
 
-### MCP Servers
+### Add Binaries to manifest.json
 
-A skill can declare MCP (Model Context Protocol) servers that the gateway auto-starts when the skill loads. This lets a skill expose tools via the MCP protocol instead of (or in addition to) the stdin/stdout binary protocol.
-
-Add an `mcp_servers` array to `manifest.json`:
+In your skill's `manifest.json`, add a `binaries` section keyed by `{os}-{arch}`:
 
 ```json
 {
   "name": "my-skill",
   "version": "1.0.0",
-  "tools": [],
-  "mcp_servers": [
-    {
-      "command": "node",
-      "args": ["mcp-server/index.js"],
-      "env": ["API_KEY", "API_SECRET"]
+  "binaries": {
+    "darwin-aarch64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/my-skill-darwin-aarch64.tar.gz",
+      "sha256": "abc123..."
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/my-skill-darwin-x86_64.tar.gz",
+      "sha256": "def456..."
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/you/repo/releases/download/v1.0.0/my-skill-linux-x86_64.tar.gz",
+      "sha256": "789ghi..."
     }
+  },
+  "tools": [ ... ]
+}
+```
+
+### Automate with GitHub Actions
+
+Set up CI to build and publish binaries on each release tag:
+
+```yaml
+name: Release Skill
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/my_skill dist/main
+          cd dist && tar czf my-skill-${{ matrix.platform }}.tar.gz main
+          shasum -a 256 my-skill-${{ matrix.platform }}.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/my-skill-*.tar.gz
+```
+
+### Install Resolution Order
+
+When a user runs `octos skills install`, the installer tries these sources in order:
+
+1. **manifest.json `binaries`** — skill author's own CI/CD builds
+2. **Registry `binaries`** — registry-audited pre-built binaries
+3. **`cargo build --release`** — fallback: compile from source (if `Cargo.toml` exists)
+4. **`npm install`** — fallback: install Node.js dependencies (if `package.json` exists)
+
+Pre-built binaries are verified with SHA-256 before installation.
+
+---
+
+## Part 5: Install
+
+### For Users: Search and Install
+
+```bash
+# Search the registry
+octos skills search weather
+octos skills search "deep research"
+
+# Install from GitHub (all skills in repo)
+octos skills install user/repo
+
+# Install a specific skill from a multi-skill repo
+octos skills install user/repo/skill-name
+
+# Install with a specific branch
+octos skills install user/repo --branch dev
+
+# Force reinstall
+octos skills install user/repo --force
+```
+
+### Per-Profile Installation
+
+Skills are isolated per profile (like per-user app installs):
+
+```bash
+# Install to a specific profile
+octos skills --profile alice install user/repo/my-skill
+
+# List skills for a profile
+octos skills --profile alice list
+
+# Remove from a profile
+octos skills --profile alice remove my-skill
+```
+
+### In-Chat Installation
+
+Users can manage skills from within a conversation:
+
+```
+/skills install user/repo/my-skill
+/skills list
+/skills remove my-skill
+/skills search comic
+```
+
+### Admin API
+
+Programmatic skill management via REST:
+
+```bash
+# Install
+POST /api/admin/profiles/alice/skills     {"repo": "user/repo/my-skill"}
+
+# List
+GET  /api/admin/profiles/alice/skills
+
+# Remove
+DELETE /api/admin/profiles/alice/skills/my-skill
+```
+
+### Sideloading (Manual Install)
+
+Copy a skill directory directly — like sideloading an app:
+
+```bash
+# Copy to global skills directory
+cp -r my-skill/ ~/.octos/skills/my-skill/
+chmod +x ~/.octos/skills/my-skill/main
+
+# Or to a profile-specific directory
+cp -r my-skill/ ~/.octos/profiles/alice/data/skills/my-skill/
+```
+
+### Installed Skill Layout
+
+```
+~/.octos/skills/my-skill/
+├── main                # Executable binary
+├── manifest.json       # Tool definitions
+├── SKILL.md            # Documentation
+├── .source             # Install tracking (repo, branch, date)
+└── styles/             # Bundled assets (if any)
+```
+
+The `.source` file tracks where the skill was installed from:
+
+```json
+{
+  "repo": "user/repo",
+  "subdir": "my-skill",
+  "branch": "main",
+  "installed_at": "2026-03-28T..."
+}
+```
+
+### Skill Loading Priority
+
+When multiple directories contain a skill with the same name, first match wins:
+
+| Priority | Location | Source |
+|----------|----------|--------|
+| 1 (highest) | `<profile-data>/skills/` | Per-profile install |
+| 2 | `<project-dir>/skills/` | Project-local |
+| 3 | `<project-dir>/bundled-skills/` | Bundled app-skills |
+| 4 (lowest) | `~/.octos/skills/` | Global install |
+
+---
+
+## Part 6: Update
+
+```bash
+# Update a skill from its source repo
+octos skills update my-skill
+
+# Update from a specific branch
+octos skills update my-skill --branch main
+
+# View skill details (version, source, tools)
+octos skills info my-skill
+```
+
+The updater reads the `.source` file to know where to pull from, then re-runs the install flow (clone → discover → build/download → copy).
+
+### Hot-Reload
+
+Skill binaries can be updated without restarting the gateway:
+
+```bash
+# Build just the skill
+cargo build --release -p my-skill
+
+# Replace the binary
+cp target/release/my_skill ~/.octos/skills/my-skill/main
+
+# Next tool call automatically uses the new binary
+```
+
+> **Note:** If you change `SKILL.md` or `manifest.json` for a *bundled* skill, you must rebuild the `octos` binary too (they're embedded via `include_str!`). External skills reload immediately.
+
+---
+
+## Advanced Topics
+
+### Multiple Tools in One Skill
+
+A single binary can serve multiple tools. Route on `argv[1]`:
+
+```rust
+match tool_name {
+    "get_weather" => handle_get_weather(&buf),
+    "get_forecast" => handle_get_forecast(&buf),
+    _ => fail(&format!("Unknown tool '{tool_name}'")),
+}
+```
+
+Declare all tools in `manifest.json`:
+
+```json
+{
+  "tools": [
+    { "name": "get_weather", "description": "...", "input_schema": { ... } },
+    { "name": "get_forecast", "description": "...", "input_schema": { ... } }
   ]
 }
 ```
 
-**MCP server fields:**
+### Environment Variables
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `command` | No* | Command to spawn the MCP server process |
-| `args` | No | Arguments passed to the command |
-| `env` | No | List of environment variable **names** (not values) to forward |
-| `url` | No* | HTTP transport: URL of a remote MCP server endpoint |
-| `headers` | No | HTTP transport: additional headers (key-value object) |
+Skills inherit the gateway's environment (minus blocked security-sensitive vars). Declare requirements in SKILL.md:
 
-\* Exactly one of `command` or `url` should be set. Use `command` for local (stdio) MCP servers and `url` for remote (HTTP) MCP servers.
+```yaml
+---
+requires_env: MY_API_KEY,MY_SECRET
+---
+```
 
-**Path resolution:** If `command` starts with `./` or `../`, it is resolved relative to the skill directory. Bare commands (e.g. `"node"`, `"python3"`) are looked up on `PATH` as usual.
+The gateway auto-injects provider API keys (e.g., `DASHSCOPE_API_KEY`, `OPENAI_API_KEY`) plus `OCTOS_DATA_DIR` and `OCTOS_WORK_DIR`.
 
-**Environment forwarding:** The `env` array contains environment variable *names*, not values. At load time, each name is looked up in the process environment. Only variables that are actually set are forwarded to the MCP server process. Variables that are missing are silently omitted.
+### Bundled Assets
 
-**Example: local stdio MCP server**
+Skills with asset files should resolve paths relative to the executable:
+
+```rust
+let exe = std::env::current_exe()?;
+let skill_dir = exe.parent().unwrap();
+let styles_dir = skill_dir.join("styles");
+```
+
+> Do **not** use the current working directory — it points to the profile's data dir, not the skill dir.
+
+### MCP Servers
+
+A skill can declare MCP servers the gateway auto-starts:
 
 ```json
 {
@@ -442,70 +718,24 @@ Add an `mcp_servers` array to `manifest.json`:
 }
 ```
 
-**Example: remote HTTP MCP server**
+Or remote MCP servers:
 
 ```json
 {
   "mcp_servers": [
     {
       "url": "https://mcp.example.com/v1",
-      "headers": {
-        "Authorization": "Bearer ${API_KEY}"
-      }
+      "headers": { "Authorization": "Bearer ${API_KEY}" }
     }
   ]
 }
 ```
 
----
+Path resolution: `./` and `../` are relative to the skill directory. `env` lists variable *names* (not values) to forward.
 
 ### Lifecycle Hooks
 
-A skill can declare lifecycle hooks that run shell commands when specific agent events occur. This is useful for auditing, policy enforcement, or side effects.
-
-Add a `hooks` array to `manifest.json`:
-
-```json
-{
-  "name": "my-audit-skill",
-  "version": "1.0.0",
-  "tools": [],
-  "hooks": [
-    {
-      "event": "after_tool_call",
-      "command": ["./hooks/audit.sh"],
-      "timeout_ms": 5000,
-      "tool_filter": ["shell"]
-    }
-  ]
-}
-```
-
-**Hook fields:**
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `event` | Yes | -- | Lifecycle event name (see table below) |
-| `command` | Yes | -- | Command as an argv array (no shell interpretation) |
-| `timeout_ms` | No | 5000 | Maximum execution time in milliseconds |
-| `tool_filter` | No | `[]` (all tools) | Only trigger for these tool names (tool events only) |
-
-**Supported events:**
-
-| Event | Can Deny? | When it fires |
-|-------|-----------|---------------|
-| `before_tool_call` | Yes | Before a tool is executed. Exit code 1 = deny. |
-| `after_tool_call` | No | After a tool finishes (success or failure). |
-| `before_llm_call` | Yes | Before sending a request to the LLM. Exit code 1 = deny. |
-| `after_llm_call` | No | After the LLM response is received. |
-
-**Path resolution:** The first element of the `command` array (`command[0]`) follows the same rules as MCP servers -- paths starting with `./` or `../` are resolved against the skill directory. Other elements are passed as-is.
-
-**Hook payload:** The gateway sends a JSON payload on stdin to the hook process. For tool events, the payload includes `tool_name`, `arguments`, and session context. For LLM events, it includes `model`, `message_count`, etc.
-
-**Deny behavior:** `before_*` hooks can deny the operation by exiting with code 1. The hook's stdout is included as the denial reason.
-
-**Example: audit all shell tool calls**
+Skills can run commands on agent events:
 
 ```json
 {
@@ -519,79 +749,22 @@ Add a `hooks` array to `manifest.json`:
     {
       "event": "after_tool_call",
       "command": ["./hooks/audit-log.sh"],
-      "timeout_ms": 5000,
-      "tool_filter": ["shell", "bash"]
+      "timeout_ms": 5000
     }
   ]
 }
 ```
 
----
+| Event | Can Deny? | When |
+|-------|-----------|------|
+| `before_tool_call` | Yes (exit 1) | Before tool execution |
+| `after_tool_call` | No | After tool completes |
+| `before_llm_call` | Yes (exit 1) | Before LLM request |
+| `after_llm_call` | No | After LLM response |
 
 ### Prompt Fragments
 
-A skill can inject content into the system prompt by declaring prompt fragment files. This is useful for teaching the agent domain-specific knowledge, rules, or behavior without writing any code.
-
-Add a `prompts` object to `manifest.json`:
-
-```json
-{
-  "name": "my-style-guide",
-  "version": "1.0.0",
-  "tools": [],
-  "prompts": {
-    "include": ["prompts/*.md"]
-  }
-}
-```
-
-**Prompt fields:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `include` | Yes | Array of glob patterns for files to include |
-
-**Path resolution:** Glob patterns are resolved relative to the skill directory. For example, `"prompts/*.md"` matches all `.md` files in the `prompts/` subdirectory of the skill.
-
-**Behavior:** Matched files are read at load time and their content is appended to the system prompt. Files are processed in glob expansion order.
-
-**Example: skill directory layout**
-
-```
-~/.octos/skills/my-style-guide/
-├── manifest.json
-├── SKILL.md
-└── prompts/
-    ├── coding-rules.md
-    └── review-checklist.md
-```
-
-With manifest:
-
-```json
-{
-  "name": "my-style-guide",
-  "version": "1.0.0",
-  "tools": [],
-  "prompts": {
-    "include": ["prompts/*.md"]
-  }
-}
-```
-
-Both `coding-rules.md` and `review-checklist.md` are injected into the system prompt whenever this skill is active.
-
----
-
-### Extras-Only Skills
-
-A skill does not need to provide any tool executables. If `manifest.json` has an empty `tools` array (or omits it entirely) but declares `mcp_servers`, `hooks`, or `prompts`, the gateway loads the extras without looking for a binary. This is useful for:
-
-- **Pure prompt injection skills** -- a collection of `.md` files that teach the agent a domain
-- **Configuration skills** -- hooks that enforce policies across all tool calls
-- **Remote MCP skills** -- MCP servers that run elsewhere, declared via `url`
-
-**Example: prompt-only skill**
+Inject content into the system prompt without writing code:
 
 ```json
 {
@@ -603,360 +776,102 @@ A skill does not need to provide any tool executables. If `manifest.json` has an
 }
 ```
 
-No `tools`, no binary, no `mcp_servers`, no `hooks` -- just prompt content.
+### Extras-Only Skills
 
-**Example: hooks-only skill**
+Skills don't need to provide tools. Valid combinations:
 
-```json
-{
-  "name": "audit-logger",
-  "version": "1.0.0",
-  "hooks": [
-    {
-      "event": "after_tool_call",
-      "command": ["./hooks/log-to-siem.sh"],
-      "timeout_ms": 5000
-    }
-  ]
-}
-```
-
-No tools -- the skill only provides an audit hook.
-
-**Example: combined extras**
-
-A single skill can declare all three extras alongside regular tools:
-
-```json
-{
-  "name": "advanced-skill",
-  "version": "1.0.0",
-  "tools": [
-    { "name": "analyze", "description": "Run analysis", "input_schema": { "type": "object" } }
-  ],
-  "mcp_servers": [
-    { "command": "node", "args": ["mcp/server.js"], "env": ["API_KEY"] }
-  ],
-  "hooks": [
-    { "event": "after_tool_call", "command": ["./hooks/audit.sh"], "tool_filter": ["analyze"] }
-  ],
-  "prompts": {
-    "include": ["prompts/*.md"]
-  }
-}
-```
-
----
-
-### Updated Manifest Field Reference
-
-The complete set of top-level `manifest.json` fields, including extensions:
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `name` | Yes | -- | Skill identifier |
-| `version` | Yes | -- | Semantic version |
-| `author` | No | -- | Author name |
-| `description` | No | -- | Human-readable description |
-| `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
-| `requires_network` | No | false | Informational flag |
-| `sha256` | No | -- | Binary integrity check (hex hash) |
-| `tools` | No | `[]` | Array of tool definitions |
-| `mcp_servers` | No | `[]` | Array of MCP server declarations |
-| `hooks` | No | `[]` | Array of lifecycle hook definitions |
-| `prompts` | No | -- | Prompt fragment configuration object |
-| `binaries` | No | `{}` | Pre-built binaries keyed by `{os}-{arch}` |
-
----
-
-## Advanced Topics
-
-### Multiple Tools in One Skill
-
-A single skill binary can implement multiple tools. The tool name is passed as `argv[1]`:
-
-```rust
-match tool_name {
-    "get_weather" => handle_get_weather(&buf),
-    "get_forecast" => handle_get_forecast(&buf),
-    _ => fail(&format!("Unknown tool '{tool_name}'")),
-}
-```
-
-Each tool must be declared in `manifest.json`:
-
-```json
-{
-  "tools": [
-    { "name": "get_weather", "description": "...", "input_schema": { ... } },
-    { "name": "get_forecast", "description": "...", "input_schema": { ... } }
-  ]
-}
-```
-
-### Environment Variables
-
-Skills inherit the gateway's environment (minus blocked vars). To use API keys:
-
-```rust
-let api_key = std::env::var("MY_API_KEY")
-    .unwrap_or_else(|_| fail("MY_API_KEY not set"));
-```
-
-Declare requirements in SKILL.md frontmatter so the skill is marked unavailable when env vars are missing:
-
-```yaml
----
-requires_env: MY_API_KEY
----
-```
-
-### Timeout Configuration
-
-Set appropriate timeouts in `manifest.json`:
-
-| Skill Type | Recommended Timeout |
-|------------|-------------------|
-| Local computation | 5s |
-| Single API call | 15s |
-| Multi-step API calls | 30-60s |
-| Long-running research | 300-600s |
+- **Prompt-only:** Teach the agent domain knowledge (no binary needed)
+- **Hooks-only:** Enforce policies across all tool calls
+- **MCP-only:** Expose tools via remote MCP servers
+- **Combined:** Tools + MCP + hooks + prompts in one skill
 
 ### Security
 
 **Binary integrity:**
+- Symlinks rejected (defense against link-swap attacks)
+- SHA-256 verification when `sha256` is set in manifest
+- Size limit: 100 MB max per binary
 
-- **Symlinks rejected:** Plugin binaries must be regular files. Symlinks are rejected at load time as a defense against link-swap attacks. The loader uses `symlink_metadata()` (not `metadata()`) to detect this.
-- **SHA-256 verification:** If `sha256` is present in `manifest.json`, the loader computes the hash of the binary and rejects it if the hash does not match. The verified bytes are written to a separate file that the gateway actually executes, closing the TOCTOU (time-of-check to time-of-use) gap.
-- **Size limit:** Plugin executables must be under 100 MB. Larger binaries are rejected before being read.
-
-**Environment sanitization:**
-
-The gateway automatically strips these env vars before spawning skill processes:
-
+**Environment sanitization** — these vars are stripped before spawning skills:
 - `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`
 - `NODE_OPTIONS`, `PYTHONPATH`, `PERL5LIB`
-- `RUSTFLAGS`, `RUST_LOG`
-- And 10+ others (see `BLOCKED_ENV_VARS` in `sandbox.rs`)
+- `RUSTFLAGS`, `RUST_LOG`, and 10+ others
 
-**Best practices for skill authors:**
-
-- Validate all input (never trust `city`, `path`, etc.)
+**Best practices:**
+- Validate all input (never trust user-provided paths, names, etc.)
 - Use timeouts on HTTP requests
-- Avoid shell injection (don't pass user input to shell commands)
-- Set `sha256` in `manifest.json` for release builds to enable integrity verification
+- Avoid shell injection
+- Set `sha256` in manifest for release builds
 
 ### Platform Skills vs App Skills
 
 | | App Skills | Platform Skills |
 |---|---|---|
-| **Location** | `crates/app-skills/` | `crates/platform-skills/` |
-| **Array** | `BUNDLED_APP_SKILLS` | `PLATFORM_SKILLS` |
-| **Bootstrap** | Every gateway startup | Admin bot only |
-| **Scope** | Per-gateway | Shared across all gateways |
-| **Use when** | Always available, self-contained | Requires external service |
-
-### Updating Skills Without Full Rebuild
-
-Skills can be rebuilt and deployed independently:
-
-```bash
-# Build just the skill
-cargo build --release -p weather
-
-# Copy to remote server
-scp target/release/weather remote:~/.octos/skills/weather/main
-
-# No gateway restart needed — next tool call uses the new binary
-```
-
-Note: If you change `SKILL.md` or `manifest.json`, you must rebuild the `octos` binary too (they're embedded via `include_str!`).
+| Location | `crates/app-skills/` | `crates/platform-skills/` |
+| Bootstrap | Every gateway startup | Admin bot only |
+| Scope | Per-gateway | Shared across gateways |
+| Use when | Self-contained, always available | Requires external service |
 
 ---
 
-## Installation & Distribution
+## Examples
 
-### Skill Types
-
-| Type | Location | Install Method | Binary | Use Case |
-|------|----------|---------------|--------|----------|
-| **Bundled** | `crates/app-skills/` | Compiled into `octos` binary | Embedded | Core skills shipped with every release |
-| **External** | GitHub repo | `octos skills install user/repo` | Downloaded or built | Community/custom skills |
-| **Profile-local** | `<profile-data>/skills/` | Per-profile install | Self-contained | Tenant-isolated skills |
-
-### Per-Profile Skill Management
-
-Skills are installed per-profile to ensure tenant isolation. Each profile has its own skills directory:
+### Example 1: Clock (Local, No Network)
 
 ```
-~/.octos/profiles/alice/data/
-  skills/
-    mofa-comic/
-      main              ← binary (self-contained, NOT in ~/.cargo/bin)
-      SKILL.md
-      manifest.json
-      styles/*.toml     ← bundled assets
-    mofa-slides/
-      main
-      SKILL.md
-      manifest.json
-      styles/*.toml
+crates/app-skills/time/
+├── Cargo.toml          # chrono, chrono-tz, serde, serde_json
+├── manifest.json       # 1 tool: get_time, timeout_secs: 5
+├── SKILL.md            # Triggers: time, clock
+└── src/main.rs         # System clock + timezone formatting
 ```
 
-**Important:** Skill binaries stay in their skill directory as `main`. They are NOT copied to `~/.cargo/bin/` or any global location. The plugin loader finds them at `<skill-dir>/main`.
-
-### Install/Remove/List Commands
-
-All surfaces support per-profile operation:
-
-```bash
-# CLI (--profile flag goes BEFORE subcommand)
-octos skills --profile alice install mofa-org/mofa-skills/mofa-comic
-octos skills --profile alice list
-octos skills --profile alice remove mofa-comic
-
-# In-chat (automatically uses current profile)
-/skills install mofa-org/mofa-skills/mofa-comic
-/skills list
-/skills remove mofa-comic
-
-# Admin API
-POST /api/admin/profiles/alice/skills     {"repo": "mofa-org/mofa-skills/mofa-comic"}
-GET  /api/admin/profiles/alice/skills
-DELETE /api/admin/profiles/alice/skills/mofa-comic
-
-# Agent tool (automatically uses current profile)
-manage_skills(action="install", repo="mofa-org/mofa-skills/mofa-comic")
-manage_skills(action="list")
-manage_skills(action="remove", name="mofa-comic")
-manage_skills(action="search", query="comic")
-```
-
-### Skill Loading Priority
-
-The gateway loads skills from multiple directories. First match wins on name conflict:
-
-1. `<profile-data>/skills/` — per-profile (highest priority)
-2. `<project-dir>/skills/` — project-local
-3. `<project-dir>/bundled-skills/` — bundled app-skills
-4. `~/.octos/skills/` — global (lowest priority)
-
-### Publishing to the Registry
-
-External skills are discoverable via the [octos-hub](https://github.com/octos-org/octos-hub) registry.
-
-1. Push your skill repo to GitHub
-2. Add an entry to `registry.json` via PR:
-
-```json
-{
-  "name": "my-skills",
-  "description": "What your skills do",
-  "repo": "your-user/your-repo",
-  "skills": ["skill-a", "skill-b"],
-  "requires": ["git", "cargo"],
-  "tags": ["keyword1", "keyword2"]
-}
-```
-
-3. Users can then find and install your skills:
-
-```bash
-octos skills search keyword1
-octos skills --profile alice install your-user/your-repo/skill-a
-```
-
-### Pre-built Binary Distribution
-
-For faster installs (skip compilation), add a `binaries` section to `manifest.json`:
-
-```json
-{
-  "name": "my-skill",
-  "version": "1.0.0",
-  "binaries": {
-    "darwin-aarch64": {
-      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-aarch64.tar.gz",
-      "sha256": "abc123..."
-    },
-    "darwin-x86_64": {
-      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-darwin-x86_64.tar.gz",
-      "sha256": "def456..."
-    },
-    "linux-x86_64": {
-      "url": "https://github.com/you/repo/releases/download/v1.0.0/skill-linux-x86_64.tar.gz",
-      "sha256": "789ghi..."
-    }
-  },
-  "tools": [ ... ]
-}
-```
-
-The installer downloads the matching binary, verifies SHA-256, and extracts to `<skill-dir>/main`. Falls back to `cargo build --release` if no binary is available.
-
-### Environment Variables for Skills
-
-The gateway automatically injects API keys into plugin processes:
-
-- Primary provider's API key (e.g., `DASHSCOPE_API_KEY`)
-- Fallback provider keys (e.g., `GEMINI_API_KEY`, `OPENAI_API_KEY`)
-- Base URLs for non-standard endpoints
-- `OCTOS_DATA_DIR` and `OCTOS_WORK_DIR`
-
-Keys are resolved from the macOS Keychain at gateway startup. Skill binaries receive them as environment variables — no manual export needed.
-
-### Bundled Assets (Styles, Config)
-
-Skills that include asset files (styles, templates, config) should bundle them in the skill directory:
+### Example 2: Weather (Network API)
 
 ```
-my-skill/
-  main
-  SKILL.md
-  manifest.json
-  styles/
-    default.toml
-    manga.toml
-  templates/
-    report.html
+crates/app-skills/weather/
+├── Cargo.toml          # reqwest (blocking, rustls-tls), serde, serde_json
+├── manifest.json       # 2 tools: get_weather, get_forecast, timeout_secs: 15
+├── SKILL.md            # Triggers: weather, forecast
+└── src/main.rs         # Geocode city → Open-Meteo API
 ```
 
-The binary should resolve assets relative to its own executable location:
+### Example 3: Email (Environment Credentials)
 
-```rust
-let exe = std::env::current_exe()?;
-let skill_dir = exe.parent().unwrap();
-let styles_dir = skill_dir.join("styles");
 ```
-
-**Do NOT** look for assets in the working directory (cwd) — it points to the profile's data dir, not the skill dir.
+crates/app-skills/send-email/
+├── Cargo.toml          # lettre, serde, serde_json
+├── manifest.json       # 1 tool: send_email
+├── SKILL.md            # requires_env: SMTP_HOST,SMTP_USERNAME,SMTP_PASSWORD
+└── src/main.rs         # SMTP with credential validation
+```
 
 ---
 
-## Checklist
+## Checklists
 
-### For tool skills (binary + tools)
+### Tool Skill (binary + tools)
 
-- [ ] Create `crates/app-skills/<name>/` with Cargo.toml, manifest.json, SKILL.md, src/main.rs
-- [ ] `[[bin]] name` in Cargo.toml matches `binary_name` in bundled_app_skills.rs
-- [ ] manifest.json has valid JSON Schema for all tool inputs
-- [ ] SKILL.md has frontmatter with trigger keywords
-- [ ] Binary reads `argv[1]` for tool name, stdin for JSON input
+- [ ] Directory has `manifest.json`, `SKILL.md`, and executable (`main` or binary)
+- [ ] `manifest.json` has valid JSON Schema for all tool inputs
+- [ ] `SKILL.md` has frontmatter with trigger keywords
+- [ ] Binary reads `argv[1]` for tool name, stdin for JSON
 - [ ] Binary writes `{"output": "...", "success": true/false}` to stdout
-- [ ] Error cases return `success: false` with clear message
-- [ ] Add to workspace `Cargo.toml` members
-- [ ] Add to `BUNDLED_APP_SKILLS` in `bundled_app_skills.rs`
-- [ ] `cargo build --workspace` succeeds
-- [ ] Standalone test: `echo '{"param": "value"}' | ./target/debug/my_skill my_tool`
-- [ ] Gateway test: skill appears in `~/.octos/skills/` and agent can use it
+- [ ] Error cases return `success: false` with clear messages
+- [ ] Standalone test passes: `echo '{"param": "val"}' | ./main my_tool`
+- [ ] Gateway test passes: skill loads and agent can invoke it
 
-### For extras (MCP servers, hooks, prompt fragments)
+### Extras Skill (MCP / hooks / prompts)
 
-- [ ] `mcp_servers`: `command` or `url` is set; `env` lists only variable names, not values
-- [ ] `mcp_servers`: relative command paths (`./bin/server`) exist in the skill directory
-- [ ] `hooks`: `event` is one of `before_tool_call`, `after_tool_call`, `before_llm_call`, `after_llm_call`
-- [ ] `hooks`: `command` is an argv array (not a shell string); `command[0]` relative paths resolve correctly
-- [ ] `hooks`: `tool_filter` is set when the hook should only apply to specific tools
-- [ ] `prompts`: glob patterns in `include` match the intended `.md` files in the skill directory
-- [ ] Extras-only skills: `tools` array is empty or omitted; no binary needed
-- [ ] Gateway test: extras appear in loader logs (`loaded skill extras`)
+- [ ] `mcp_servers`: `command` or `url` set; `env` lists names only
+- [ ] `hooks`: valid event name; `command` is argv array; relative paths resolve
+- [ ] `prompts`: glob patterns match intended `.md` files
+- [ ] Extras-only: `tools` is empty or omitted, no binary needed
+
+### Publishing
+
+- [ ] Repo pushed to GitHub with `manifest.json` and `SKILL.md` at expected paths
+- [ ] Registry PR submitted to [octos-hub](https://github.com/octos-org/octos-hub)
+- [ ] (Optional) Pre-built binaries for `darwin-aarch64`, `linux-x86_64`
+- [ ] (Optional) SHA-256 hashes in `manifest.json` `binaries` section
+- [ ] (Optional) GitHub Actions workflow for automated binary builds on release tags

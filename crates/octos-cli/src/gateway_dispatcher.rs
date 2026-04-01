@@ -64,12 +64,7 @@ impl GatewayDispatcher {
 
     /// Build a profiled session key for the given channel/chat/topic.
     fn profiled_key(&self, channel: &str, chat_id: &str, topic: &str) -> SessionKey {
-        build_profiled_session_key(
-            self.dispatch_profile_id.as_deref(),
-            channel,
-            chat_id,
-            topic,
-        )
+        build_profiled_session_key(self.dispatch_profile_id.as_deref(), channel, chat_id, topic)
     }
 
     /// Flush pending (buffered) messages for a session key, delivering them
@@ -132,7 +127,10 @@ impl GatewayDispatcher {
                 .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
 
             // Ensure the session file exists on disk so /sessions can list it.
-            self.session_mgr.lock().await.touch_user_session(base_key_str, name);
+            self.session_mgr
+                .lock()
+                .await
+                .touch_user_session(base_key_str, name);
 
             let _ = self
                 .out_tx
@@ -295,8 +293,7 @@ impl GatewayDispatcher {
                     ))
                     .await;
 
-                let target_key =
-                    self.profiled_key(&inbound.channel, &inbound.chat_id, &topic);
+                let target_key = self.profiled_key(&inbound.channel, &inbound.chat_id, &topic);
                 self.flush_pending(&target_key.to_string()).await;
             }
             Ok(None) => {
@@ -409,11 +406,7 @@ impl GatewayDispatcher {
             }
         }
 
-        let label = if topic.is_empty() {
-            "(default)"
-        } else {
-            topic
-        };
+        let label = if topic.is_empty() { "(default)" } else { topic };
         info!(session = %label, "session switched via inline keyboard");
 
         let target_key = self.profiled_key(&inbound.channel, &inbound.chat_id, topic);
@@ -500,12 +493,8 @@ mod tests {
     ) -> (GatewayDispatcher, PendingMessages, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
 
-        let session_mgr = Arc::new(Mutex::new(
-            SessionManager::open(tmp.path()).unwrap(),
-        ));
-        let active_sessions = Arc::new(RwLock::new(
-            ActiveSessionStore::open(tmp.path()).unwrap(),
-        ));
+        let session_mgr = Arc::new(Mutex::new(SessionManager::open(tmp.path()).unwrap()));
+        let active_sessions = Arc::new(RwLock::new(ActiveSessionStore::open(tmp.path()).unwrap()));
         let pending: PendingMessages = Arc::new(Mutex::new(HashMap::new()));
         let dispatcher =
             GatewayDispatcher::new(session_mgr, active_sessions, pending.clone(), out_tx);
@@ -549,7 +538,13 @@ mod tests {
         let session_key = SessionKey::new("telegram", "123");
 
         let result = disp
-            .handle_new_command("/new research", &session_key, "telegram", "123", "telegram:123")
+            .handle_new_command(
+                "/new research",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
             .await;
 
         assert!(matches!(result, Some(DispatchResult::Handled)));

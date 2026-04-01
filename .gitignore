@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 /book/public/
+/book-zh/public/
 
 # IDE
 .idea/
@@ -47,9 +48,15 @@ scripts/deploy.sh
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 
-# mdBook documentation site
+# mdBook documentation site (EN + ZH)
 !book/book.toml
 !book/src/**/*.md
+!book/theme/*.css
+!book/theme/*.hbs
+!book-zh/book.toml
+!book-zh/src/**/*.md
+!book-zh/theme/*.css
+!book-zh/theme/*.hbs
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md

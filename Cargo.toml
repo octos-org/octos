@@ -15,7 +15,6 @@ members = [
     "crates/app-skills/time",
     "crates/app-skills/weather",
     "crates/app-skills/wechat-bridge",
-    "crates/app-skills/voice",
     "crates/app-skills/pipeline-guard",
     "crates/platform-skills/voice",
     "crates/octos-pipeline",
@@ -61,6 +60,8 @@ base64 = "0.22"
 
 # Crypto
 sha2 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 rand = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 subtle = "2"

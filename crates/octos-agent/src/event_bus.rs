@@ -117,11 +117,14 @@ impl CollectingSubscriber {
     }
 
     pub fn events(&self) -> Vec<ProgressEvent> {
-        self.events.lock().unwrap().clone()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn count(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -133,7 +136,10 @@ impl Default for CollectingSubscriber {
 
 impl EventSubscriber for CollectingSubscriber {
     fn on_event(&self, event: &ProgressEvent) {
-        self.events.lock().unwrap().push(event.clone());
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event.clone());
     }
 }
 

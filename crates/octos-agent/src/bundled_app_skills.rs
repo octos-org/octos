@@ -48,12 +48,8 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/weather/SKILL.md"),
         include_str!("../../app-skills/weather/manifest.json"),
     ),
-    (
-        "voice-skill",
-        "voice-skill",
-        include_str!("../../app-skills/voice/SKILL.md"),
-        include_str!("../../app-skills/voice/manifest.json"),
-    ),
+    // voice-skill removed — voice TTS/ASR is handled by platform-skill "voice".
+    // Voice cloning is handled by mofa-fm.
     (
         "pipeline-guard",
         "pipeline-guard",

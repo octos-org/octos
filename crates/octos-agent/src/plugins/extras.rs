@@ -17,6 +17,8 @@ pub struct SkillExtras {
     pub mcp_servers: Vec<McpServerConfig>,
     pub hooks: Vec<HookConfig>,
     pub prompt_fragments: Vec<String>,
+    /// Tool names that should only be available in spawn subagents (deferred in main session).
+    pub spawn_only_tools: Vec<String>,
 }
 
 /// Resolve manifest extras against the skill directory.
@@ -41,6 +43,17 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
                     skill = %manifest.name,
                     "unknown hook event, skipping"
                 );
+            }
+        }
+    }
+
+    // Auto-inject SKILL.md when skill has spawn_only tools so the LLM
+    // knows how to access deferred tools via spawn.
+    if manifest.tools.iter().any(|t| t.spawn_only) {
+        let skill_md = skill_dir.join("SKILL.md");
+        if skill_md.exists() {
+            if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                extras.prompt_fragments.push(content);
             }
         }
     }

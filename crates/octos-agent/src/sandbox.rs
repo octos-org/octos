@@ -1242,9 +1242,7 @@ mod tests {
         );
         // Should contain workspace read (using canonical path)
         assert!(
-            profile.contains(&format!(
-                r#"(allow file-read* (subpath "{real_cwd}"))"#
-            )),
+            profile.contains(&format!(r#"(allow file-read* (subpath "{real_cwd}"))"#)),
             "should allow reading workspace at canonical path, profile:\n{profile}"
         );
         // Should contain custom path
@@ -1434,8 +1432,8 @@ mod tests {
             read_allow_paths: vec!["/nonexistent/path".to_string()],
         };
         // Use the canonical path so SBPL matches correctly
-        let real_secret = std::fs::canonicalize(&secret_file)
-            .unwrap_or_else(|_| secret_file.clone());
+        let real_secret =
+            std::fs::canonicalize(&secret_file).unwrap_or_else(|_| secret_file.clone());
         let cmd_str = format!("cat {} 2>&1; echo exit=$?", real_secret.display());
         let mut cmd = sb.wrap_command(&cmd_str, cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");

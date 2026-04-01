@@ -43,10 +43,7 @@ const MAX_MESSAGE_LEN: usize = 1_048_576;
 
 /// Resolve API port for a specific profile, or fall back to first available.
 /// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
-async fn resolve_api_port(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Option<(String, u16)> {
+async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
     let pm = state.process_manager.as_ref()?;
 
     // Check X-Profile-Id header first (set by reverse proxy from subdomain)
@@ -333,11 +330,8 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
         if proxy_resp.status().is_success() {
-            if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await
-            {
-                if let Ok(gateway_sessions) =
-                    serde_json::from_slice::<Vec<SessionInfo>>(&body)
-                {
+            if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await {
+                if let Ok(gateway_sessions) = serde_json::from_slice::<Vec<SessionInfo>>(&body) {
                     // Merge, dedup by id (standalone wins)
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
@@ -414,10 +408,7 @@ pub async fn session_messages(
 
     // Proxy to gateway (old sessions live there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!(
-            "/sessions/{id}/messages?limit={}&offset={}",
-            limit, offset
-        );
+        let path = format!("/sessions/{id}/messages?limit={}&offset={}", limit, offset);
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -553,8 +544,11 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
         let home = std::env::var("HOME").unwrap_or_default();
-        let octos_dir = format!("{home}/.octos");
-        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with("/tmp");
+        let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
+        let tmp_dir =
+            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
         if !allowed {
             return (StatusCode::FORBIDDEN, "access denied").into_response();
         }
@@ -597,13 +591,16 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| filename.clone());
+        .unwrap_or_else(|| filename.clone())
+        .replace(['"', '\r', '\n', '\\'], "_");
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", content_type.parse().unwrap());
     headers.insert(
         "content-disposition",
-        format!("inline; filename=\"{display_name}\"").parse().unwrap(),
+        format!("inline; filename=\"{display_name}\"")
+            .parse()
+            .unwrap(),
     );
 
     (StatusCode::OK, headers, data).into_response()

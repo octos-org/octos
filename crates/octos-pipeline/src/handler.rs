@@ -28,7 +28,10 @@ impl ProgressReporter for PipelineNodeReporter {
     fn report(&self, event: ProgressEvent) {
         let msg = match &event {
             ProgressEvent::Thinking { iteration } => {
-                format!("{} [{}]: thinking (iteration {})", self.node_id, self.model, iteration)
+                format!(
+                    "{} [{}]: thinking (iteration {})",
+                    self.node_id, self.model, iteration
+                )
             }
             ProgressEvent::ToolStarted { name, .. } => {
                 format!("{} [{}]: running {}", self.node_id, self.model, name)
@@ -40,10 +43,19 @@ impl ProgressReporter for PipelineNodeReporter {
                 ..
             } => {
                 let status = if *success { "done" } else { "failed" };
-                format!("{}: {} {} ({:.0}s)", self.node_id, name, status, duration.as_secs_f64())
+                format!(
+                    "{}: {} {} ({:.0}s)",
+                    self.node_id,
+                    name,
+                    status,
+                    duration.as_secs_f64()
+                )
             }
             ProgressEvent::StreamDone { iteration } => {
-                format!("{} [{}]: response received (iteration {})", self.node_id, self.model, iteration)
+                format!(
+                    "{} [{}]: response received (iteration {})",
+                    self.node_id, self.model, iteration
+                )
             }
             _ => return,
         };
@@ -224,7 +236,12 @@ impl Handler for CodergenHandler {
         } else {
             octos_agent::ToolPolicy {
                 allow: allowed,
-                deny: vec!["spawn".into(), "run_pipeline".into(), "send_file".into(), "message".into()],
+                deny: vec![
+                    "spawn".into(),
+                    "run_pipeline".into(),
+                    "send_file".into(),
+                    "message".into(),
+                ],
                 ..Default::default()
             }
         };
@@ -475,4 +492,3 @@ impl Handler for NoopHandler {
         })
     }
 }
-

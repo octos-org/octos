@@ -10,7 +10,7 @@ use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
 use octos_core::AgentId;
 use octos_llm::{LlmProvider, RetryProvider};
-use octos_memory::EpisodeStore;
+use octos_memory::{EpisodeStore, MemoryStore};
 
 use super::Executable;
 use super::chat::create_provider;
@@ -122,22 +122,24 @@ impl ServeCommand {
             self.auth_token
         } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
             Some(env_token)
+        } else if let Some(ref cfg_token) = config.auth_token {
+            if !cfg_token.is_empty() {
+                Some(cfg_token.clone())
+            } else {
+                None
+            }
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \
                  Generating a random token for this session.",
                 self.host
             );
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            std::time::SystemTime::now().hash(&mut h);
-            std::process::id().hash(&mut h);
-            let token = format!(
-                "{:016x}{:016x}",
-                h.finish(),
-                h.finish().wrapping_mul(6364136223846793005)
-            );
+            // Generate cryptographically random token
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let a: u64 = rng.r#gen();
+            let b: u64 = rng.r#gen();
+            let token = format!("{a:016x}{b:016x}");
             println!(
                 "{}: {} (auto-generated, pass --auth-token to set your own)",
                 "Auth token".yellow(),
@@ -301,6 +303,9 @@ impl ServeCommand {
                     }
                 }
 
+                // NOTE(#149): The 5-second poll interval is hardcoded. This could be made
+                // configurable (e.g. via a CLI flag or config field) for deployments that
+                // need faster detection or want to reduce filesystem polling overhead.
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
@@ -559,6 +564,12 @@ impl ServeCommand {
                 .wrap_err("failed to open episode store")?,
         );
 
+        let memory_store = Arc::new(
+            MemoryStore::open(data_dir)
+                .await
+                .wrap_err("failed to open memory store")?,
+        );
+
         let sandbox = octos_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, sandbox);
 
@@ -569,6 +580,22 @@ impl ServeCommand {
                 .wrap_err("failed to open tool config store")?,
         );
         tools.inject_tool_config(tool_config);
+
+        // Memory bank tools
+        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+        tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
+
+        // Cron service — jobs persist to cron.json but fire through the API channel.
+        // The inbound_tx is a dummy sender; actual cron firing requires gateway mode.
+        // This still enables cron CRUD (create/list/delete) for later execution.
+        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+        let cron_service = Arc::new(octos_bus::CronService::new(
+            data_dir.join("cron.json"),
+            cron_tx,
+        ));
+        cron_service.start();
+        let cron_tool = crate::cron_tool::CronTool::with_context(cron_service.clone(), "api", "");
+        tools.register(cron_tool);
 
         // MCP tools
         if !config.mcp_servers.is_empty() {
@@ -612,7 +639,7 @@ impl ServeCommand {
         let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
             .with_config(AgentConfig {
                 max_iterations: 20,
-                save_episodes: false,
+                save_episodes: true,
                 chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
                 ..Default::default()
             })

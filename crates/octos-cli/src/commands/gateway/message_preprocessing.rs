@@ -171,10 +171,7 @@ pub fn merge_queued_by_session(messages: Vec<InboundMessage>) -> Vec<InboundMess
 }
 
 /// Transcribe audio by spawning the voice platform skill binary.
-async fn transcribe_via_skill(
-    voice_binary: &Path,
-    input_json: &str,
-) -> eyre::Result<String> {
+async fn transcribe_via_skill(voice_binary: &Path, input_json: &str) -> eyre::Result<String> {
     use tokio::io::AsyncWriteExt;
 
     let mut child = tokio::process::Command::new(voice_binary)

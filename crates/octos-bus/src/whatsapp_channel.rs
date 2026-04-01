@@ -95,6 +95,8 @@ impl Channel for WhatsAppChannel {
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!(url = %self.bridge_url, "Starting WhatsApp channel");
 
+        let mut backoff_secs = 5u64;
+
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -104,11 +106,13 @@ impl Channel for WhatsAppChannel {
                 Ok(conn) => conn,
                 Err(e) => {
                     error!("Failed to connect to WhatsApp bridge: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(300); // Max 5 minutes
                     continue;
                 }
             };
 
+            backoff_secs = 5; // Reset on successful connection
             info!("WhatsApp bridge connected");
             let (ws_tx, mut ws_rx) = ws_stream.split();
 
@@ -280,8 +284,9 @@ impl Channel for WhatsAppChannel {
                 break;
             }
 
-            warn!("WhatsApp bridge disconnected, reconnecting in 5s...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            warn!("WhatsApp bridge disconnected, reconnecting in {backoff_secs}s...");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(300); // Max 5 minutes
         }
 
         info!("WhatsApp channel stopped");

@@ -345,12 +345,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_base_dir_blocks_outside_path() {
-        // Use a nested tempdir so the "outside" file is NOT under /tmp/ directly.
-        // /tmp/ is always allowed, so we need a base inside a subdirectory
-        // and an outside file in a sibling subdirectory.
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path().join("allowed");
-        let outside_dir = root.path().join("forbidden");
+        // Use a path under home dir (not /tmp/) to ensure the test is
+        // platform-independent (tempdir may be under /tmp/ on Linux).
+        let root = std::env::temp_dir().join("octos-test-send-file");
+        let base = root.join("allowed");
+        let outside_dir = root.join("forbidden");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::create_dir_all(&outside_dir).unwrap();
 
@@ -367,8 +366,26 @@ mod tests {
             .await
             .unwrap();
 
-        // File is under /tmp/ (allowed), so it should succeed
-        assert!(result.success);
+        // On macOS, temp_dir is /var/folders/... (not under /tmp/), so blocked.
+        // On Linux, temp_dir is /tmp/, so the file IS under /tmp/ and allowed.
+        // Test the correct platform behavior:
+        let canonical_tmp =
+            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let canonical_file = std::fs::canonicalize(&outside_file).unwrap();
+        if canonical_file.starts_with(&canonical_tmp) {
+            // Linux: file is under /tmp/ → allowed
+            assert!(result.success, "file under /tmp/ should be allowed");
+        } else {
+            // macOS: file is NOT under /tmp/ → blocked
+            assert!(
+                !result.success,
+                "file outside base_dir and /tmp/ should be blocked"
+            );
+            assert!(result.output.contains("outside the allowed directory"));
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -378,10 +395,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
-        // /etc/hostname exists on most systems and is outside both base_dir and /tmp/
+        // /etc/hosts exists on all Unix systems and is outside both base_dir and /tmp/
+        let test_path = if std::path::Path::new("/etc/hosts").exists() {
+            "/etc/hosts"
+        } else {
+            "/etc/resolv.conf"
+        };
+
         let result = tool
             .execute(&serde_json::json!({
-                "file_path": "/etc/hostname"
+                "file_path": test_path
             }))
             .await
             .unwrap();

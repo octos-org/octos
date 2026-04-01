@@ -15,7 +15,7 @@ export default function HomePage() {
   const {
     profileId, parentId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
-    profileName, setProfileName, enabled, setEnabled,
+    profileName, setProfileName, profileEmail, setProfileEmail, enabled, setEnabled,
     save, saving, deleteProfile,
   } = useProfile()
   const navigate = useNavigate()
@@ -26,6 +26,10 @@ export default function HomePage() {
   // Sub-accounts state
   const [subAccounts, setSubAccounts] = useState<ProfileResponse[]>([])
   const [subsLoading, setSubsLoading] = useState(false)
+  const [showCreateSub, setShowCreateSub] = useState(false)
+  const [newSubName, setNewSubName] = useState('')
+  const [newSubEmail, setNewSubEmail] = useState('')
+  const [createSubLoading, setCreateSubLoading] = useState(false)
 
   const loadSubAccounts = useCallback(async () => {
     if (parentId || !profileId) return
@@ -45,6 +49,26 @@ export default function HomePage() {
   useEffect(() => {
     loadSubAccounts()
   }, [loadSubAccounts])
+
+  const handleCreateSubAccount = async () => {
+    if (!profileId || !newSubName.trim()) return
+    setCreateSubLoading(true)
+    try {
+      await api.createSubAccount(profileId, {
+        name: newSubName.trim(),
+        email: newSubEmail.trim() || undefined,
+      })
+      toast('Sub-account created', 'success')
+      setNewSubName('')
+      setNewSubEmail('')
+      setShowCreateSub(false)
+      loadSubAccounts()
+    } catch (e: any) {
+      toast(e.message || 'Failed to create sub-account', 'error')
+    } finally {
+      setCreateSubLoading(false)
+    }
+  }
 
   const handleStart = async () => {
     setActionLoading(true)
@@ -193,6 +217,17 @@ export default function HomePage() {
             />
           </div>
           <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1.5">Login Email</label>
+            <input
+              value={profileEmail}
+              onChange={(e) => setProfileEmail(e.target.value)}
+              placeholder="user@example.com (for web client OTP login)"
+              type="email"
+              className="input max-w-md"
+            />
+            <p className="text-xs text-gray-500 mt-1">Set an email address to enable OTP login to the web client for this profile.</p>
+          </div>
+          <div>
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
@@ -246,7 +281,46 @@ export default function HomePage() {
                 <span className="ml-2 text-gray-500 font-normal">({subAccounts.length})</span>
               )}
             </h3>
+            {isAdmin && (
+              <button
+                onClick={() => setShowCreateSub(!showCreateSub)}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition"
+              >
+                {showCreateSub ? 'Cancel' : '+ Add'}
+              </button>
+            )}
           </div>
+
+          {showCreateSub && (
+            <div className="mb-4 p-3 rounded-lg bg-white/[0.03] border border-gray-700/50 space-y-3">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Name</label>
+                <input
+                  value={newSubName}
+                  onChange={e => setNewSubName(e.target.value)}
+                  placeholder="e.g. work-bot"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Email (for web client login)</label>
+                <input
+                  value={newSubEmail}
+                  onChange={e => setNewSubEmail(e.target.value)}
+                  placeholder="user@example.com"
+                  type="email"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+              </div>
+              <button
+                onClick={handleCreateSubAccount}
+                disabled={createSubLoading || !newSubName.trim()}
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent/80 transition disabled:opacity-50"
+              >
+                {createSubLoading ? 'Creating...' : 'Create Sub-Account'}
+              </button>
+            </div>
+          )}
 
           {subsLoading ? (
             <div className="flex items-center justify-center py-8">

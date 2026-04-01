@@ -23,7 +23,7 @@ impl ManageSkillsTool {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Input {
     action: String,
     #[serde(default)]
@@ -45,7 +45,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage agent skills: list installed, install from GitHub (user/repo or user/repo/skill-name), remove by name, or search the skill registry."
+        "Manage agent skills: list installed, install from GitHub (user/repo or user/repo/skill-name), update installed skills, remove by name, or search the skill registry. Install checks versions — if already installed and up to date, it reports the version. Use update to force-reinstall from the source repo."
     }
 
     fn tags(&self) -> &[&str] {
@@ -58,7 +58,7 @@ impl Tool for ManageSkillsTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "install", "remove", "search"],
+                    "enum": ["list", "install", "update", "remove", "search"],
                     "description": "Action to perform"
                 },
                 "repo": {
@@ -98,8 +98,38 @@ impl Tool for ManageSkillsTool {
             "install" => do_install(&skills_dir, &input),
             "remove" => do_remove(&skills_dir, &input),
             "search" => do_search(&input),
+            "update" => {
+                // Update = install with force
+                let mut force_input = input.clone();
+                force_input.force = true;
+                if force_input.repo.is_none() {
+                    if let Some(ref name) = force_input.name {
+                        // Read .source to get the original repo
+                        let source_file = skills_dir.join(name).join(".source");
+                        if let Ok(src) = std::fs::read_to_string(&source_file) {
+                            if let Ok(info) = serde_json::from_str::<serde_json::Value>(&src) {
+                                let repo = info.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+                                let subdir = info.get("subdir").and_then(|v| v.as_str());
+                                force_input.repo = Some(if let Some(sub) = subdir {
+                                    format!("{repo}/{sub}")
+                                } else {
+                                    repo.to_string()
+                                });
+                            }
+                        }
+                    }
+                }
+                if force_input.repo.is_none() {
+                    return Ok(ToolResult {
+                        output: "repo or name required for update. Use name of an installed skill (reads .source for repo).".into(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                do_install(&skills_dir, &force_input)
+            }
             other => Ok(ToolResult {
-                output: format!("Unknown action: {other}. Use list, install, remove, or search."),
+                output: format!("Unknown action: {other}. Use list, install, update, remove, or search."),
                 success: false,
                 ..Default::default()
             }),
@@ -252,7 +282,20 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
             .to_string();
         let dest = skills_dir.join(&name);
         if dest.exists() && !input.force {
-            skipped.push(name);
+            // Version check: compare local vs remote
+            let local_ver = skill_version(&dest);
+            let remote_ver = skill_version(&src);
+            if let (Some(lv), Some(rv)) = (&local_ver, &remote_ver) {
+                if version_newer(rv, lv) {
+                    skipped.push(format!(
+                        "{name} (update available: {lv} → {rv}, use force=true to update)"
+                    ));
+                } else {
+                    skipped.push(format!("{name} (up to date: {lv})"));
+                }
+            } else {
+                skipped.push(name);
+            }
         } else {
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
@@ -265,7 +308,20 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
         if clone_dir.join("SKILL.md").exists() {
             let dest = skills_dir.join(segments[1]);
             if dest.exists() && !input.force {
-                skipped.push(segments[1].to_string());
+                let local_ver = skill_version(&dest);
+                let remote_ver = skill_version(&clone_dir);
+                if let (Some(lv), Some(rv)) = (&local_ver, &remote_ver) {
+                    if version_newer(rv, lv) {
+                        skipped.push(format!(
+                            "{} (update available: {lv} → {rv}, use force=true to update)",
+                            segments[1]
+                        ));
+                    } else {
+                        skipped.push(format!("{} (up to date: {lv})", segments[1]));
+                    }
+                } else {
+                    skipped.push(segments[1].to_string());
+                }
             } else {
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
@@ -285,7 +341,19 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
                 }
                 let dest = skills_dir.join(&name);
                 if dest.exists() && !input.force {
-                    skipped.push(name);
+                    let local_ver = skill_version(&dest);
+                    let remote_ver = skill_version(&entry.path());
+                    if let (Some(lv), Some(rv)) = (&local_ver, &remote_ver) {
+                        if version_newer(rv, lv) {
+                            skipped.push(format!(
+                                "{name} (update available: {lv} → {rv}, use force=true to update)"
+                            ));
+                        } else {
+                            skipped.push(format!("{name} (up to date: {lv})"));
+                        }
+                    } else {
+                        skipped.push(name);
+                    }
                     continue;
                 }
                 if dest.exists() {
@@ -465,6 +533,29 @@ fn do_search(input: &Input) -> Result<ToolResult> {
         success: true,
         ..Default::default()
     })
+}
+
+/// Read the version from a skill directory's SKILL.md frontmatter.
+fn skill_version(skill_dir: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).ok()?;
+    extract_fm_value(&content, "version")
+}
+
+/// Simple semver comparison: is `a` newer than `b`?
+fn version_newer(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u32> {
+        s.split('.').filter_map(|p| p.parse().ok()).collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false // equal
 }
 
 fn extract_fm_value(content: &str, key: &str) -> Option<String> {
@@ -674,20 +765,32 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
     let dest = dir.join("main");
 
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-        // Extract the first file from the tar.gz archive
+        // Extract the first real file from the tar.gz archive.
+        // Skip macOS AppleDouble resource fork files (._* prefix) which
+        // appear before the actual binary in archives created on macOS.
         use std::io::Read;
         let gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
         for entry in archive.entries()? {
             let mut entry = entry?;
-            if entry.header().entry_type().is_file() {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
-                std::fs::write(&dest, &buf)?;
-                found = true;
-                break;
+            if !entry.header().entry_type().is_file() {
+                continue;
             }
+            // Skip AppleDouble resource fork files
+            let is_apple_double = entry
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("._")))
+                .unwrap_or(false);
+            if is_apple_double {
+                continue;
+            }
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            std::fs::write(&dest, &buf)?;
+            found = true;
+            break;
         }
         if !found {
             return Ok(false);

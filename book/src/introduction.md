@@ -1,5 +1,7 @@
 # Introduction
 
+> 🌐 **[中文文档](../zh/)**
+
 ## What is Octos?
 
 Octos is an open-source AI agent platform that turns any LLM into a multi-channel, multi-user intelligent assistant. You deploy a single Rust binary, connect your LLM API keys and messaging channels (Telegram, Discord, Slack, WhatsApp, Email, WeChat, and more), and Octos handles everything else -- conversation routing, tool execution, memory, provider failover, and multi-tenant isolation.

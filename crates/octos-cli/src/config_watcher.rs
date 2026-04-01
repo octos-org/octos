@@ -52,6 +52,8 @@ impl ConfigWatcher {
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut watcher = self;
+            // NOTE(#149): The 5-second poll interval is hardcoded. This could be made
+            // configurable for deployments that need faster or slower change detection.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;

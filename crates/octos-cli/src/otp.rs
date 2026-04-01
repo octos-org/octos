@@ -182,7 +182,8 @@ impl AuthManager {
             }
         } else {
             // Dev mode: log to console — email will NOT be delivered
-            tracing::warn!(email = %email_lower, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
+            tracing::debug!(email = %email_lower, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
+            tracing::warn!(email = %email_lower, "OTP generated (code redacted, enable debug logging to see) — configure dashboard_auth.smtp to send emails");
         }
 
         Ok(true)
@@ -398,8 +399,8 @@ impl AuthManager {
     }
 
     #[cfg(not(feature = "api"))]
-    async fn send_otp_email(&self, _smtp: &SmtpConfig, email: &str, code: &str) -> Result<()> {
-        tracing::info!(email = %email, code = %code, "OTP code (lettre not available)");
+    async fn send_otp_email(&self, _smtp: &SmtpConfig, email: &str, _code: &str) -> Result<()> {
+        tracing::info!(email = %email, "OTP sent (code redacted, lettre not available)");
         Ok(())
     }
 }

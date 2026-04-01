@@ -32,7 +32,7 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
             }
         }
     }
-    *PRICING_CATALOG.write().unwrap() = Some(map);
+    *PRICING_CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(map);
 }
 
 fn catalog_pricing(model_id: &str) -> Option<ModelPricing> {

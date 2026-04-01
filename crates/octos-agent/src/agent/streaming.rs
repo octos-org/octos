@@ -43,7 +43,8 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate).await
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate)
+            .await
     }
 
     async fn consume_stream_inner(
@@ -173,9 +174,20 @@ impl Agent {
             .filter(|(_, name, _, _)| !name.is_empty())
             .map(|(id, name, args, metadata)| {
                 let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
-                    tracing::warn!(tool = %name, error = %e, raw = %args, "malformed tool call JSON");
-                    // Return a String value so the tool's deserialize step fails
-                    // and the error propagates back to the LLM for correction.
+                    // For write_file with truncated content, recover what we can.
+                    // The raw string looks like: {"path":"./report.md","content":"# Report...
+                    // Extract path and content even from broken JSON.
+                    if name == "write_file" {
+                        if let Some(recovered) = recover_write_file_args(&args) {
+                            tracing::info!(
+                                tool = %name,
+                                "recovered truncated write_file content ({} chars)",
+                                recovered.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0)
+                            );
+                            return recovered;
+                        }
+                    }
+                    tracing::warn!(tool = %name, error = %e, "malformed tool call JSON");
                     serde_json::Value::String(format!(
                         "MALFORMED_JSON: {e}. Raw input: {}",
                         octos_core::truncated_utf8(&args, 200, "...")
@@ -267,4 +279,83 @@ impl Agent {
             timestamp: chrono::Utc::now(),
         }
     }
+}
+
+/// Recover write_file arguments from a truncated JSON string.
+///
+/// When the LLM's streaming output is cut off, the JSON for write_file looks like:
+/// `{"path":"./report.md","content":"# Report...<truncated>`
+///
+/// We extract `path` and `content` fields even from broken JSON, allowing the
+/// file to be written with the content we received (truncated but better than lost).
+fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
+    // Try to find "path" field
+    let path = extract_json_string_field(raw, "path")
+        .or_else(|| extract_json_string_field(raw, "file_path"))?;
+
+    // Try to find "content" field — it may be truncated
+    let content = extract_json_string_field(raw, "content")
+        .unwrap_or_default();
+
+    if path.is_empty() {
+        return None;
+    }
+
+    // Add a truncation notice if the JSON was clearly cut off
+    let content = if !raw.ends_with('}') && !content.is_empty() {
+        format!("{content}\n\n---\n*[Note: This report was truncated due to output length limits. The content above is partial.]*")
+    } else {
+        content
+    };
+
+    Some(serde_json::json!({
+        "path": path,
+        "content": content,
+    }))
+}
+
+/// Extract a string value for a given key from potentially malformed JSON.
+/// Handles JSON escaping within the string value.
+fn extract_json_string_field(raw: &str, key: &str) -> Option<String> {
+    // Look for "key": " or "key":"
+    let patterns = [
+        format!("\"{key}\": \""),
+        format!("\"{key}\":\""),
+    ];
+
+    for pattern in &patterns {
+        if let Some(start) = raw.find(pattern.as_str()) {
+            let value_start = start + pattern.len();
+            let bytes = raw.as_bytes();
+            let mut end = value_start;
+            let mut escaped = false;
+
+            // Walk through the string, handling JSON escapes
+            while end < bytes.len() {
+                if escaped {
+                    escaped = false;
+                    end += 1;
+                    continue;
+                }
+                match bytes[end] {
+                    b'\\' => {
+                        escaped = true;
+                        end += 1;
+                    }
+                    b'"' => break,
+                    _ => end += 1,
+                }
+            }
+
+            let raw_value = &raw[value_start..end];
+            // Unescape JSON string escapes
+            let unescaped = raw_value
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\");
+            return Some(unescaped);
+        }
+    }
+    None
 }

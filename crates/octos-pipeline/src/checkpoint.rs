@@ -192,4 +192,3 @@ mod tests {
         assert!(cp.get_outcome("n2").is_none());
     }
 }
-

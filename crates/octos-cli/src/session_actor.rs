@@ -579,10 +579,17 @@ impl ActorFactory {
 
         tools.register(spawn_tool);
 
-        if let Some(ref cron_service) = self.cron_service {
-            let cron_tool = CronTool::with_context(cron_service.clone(), channel, chat_id);
-            tools.register(cron_tool);
-        }
+        let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
+            let cron_tool = Arc::new(CronTool::with_context(
+                cron_service.clone(),
+                channel,
+                chat_id,
+            ));
+            tools.register_arc(cron_tool.clone());
+            Some(cron_tool)
+        } else {
+            None
+        };
 
         if let Some(ref pf) = self.pipeline_factory {
             let pt = pf.create();
@@ -680,6 +687,7 @@ impl ActorFactory {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: self.active_sessions.clone(),
             user_workspace: user_workspace.clone(),
+            cron_tool: cron_tool_ref,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -840,6 +848,8 @@ struct SessionActor {
     /// Per-user workspace directory — the agent's sandboxed working directory.
     /// Media files uploaded by the user are copied here so read_file can access them.
     user_workspace: std::path::PathBuf,
+    /// Per-session cron tool reference — updated with channel/chat_id on each message.
+    cron_tool: Option<Arc<CronTool>>,
 }
 
 impl SessionActor {
@@ -864,6 +874,14 @@ impl SessionActor {
                 msg = self.inbox.recv() => {
                     match msg {
                         Some(ActorMessage::Inbound { message, image_media }) => {
+                            // Update cron tool context with current channel/chat_id
+                            // so new cron jobs inherit the correct delivery target.
+                            if let Some(ref cron) = self.cron_tool {
+                                if !self.channel.is_empty() && !self.chat_id.is_empty() {
+                                    cron.set_context(&self.channel, &self.chat_id);
+                                }
+                            }
+
                             // Check for abort trigger before processing
                             if octos_core::is_abort_trigger(&message.content) {
                                 debug!(session = %self.session_key, "abort trigger detected");
@@ -1469,7 +1487,8 @@ impl SessionActor {
                             task_label,
                             content,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true).await;
+                            self.inject_background_result(&task_label, &content, true)
+                                .await;
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1509,7 +1528,8 @@ impl SessionActor {
                             task_label,
                             content,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true).await;
+                            self.inject_background_result(&task_label, &content, true)
+                                .await;
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -2078,15 +2098,28 @@ impl SessionActor {
                 // Auto-deliver report files produced by the agent (e.g. from run_pipeline).
                 // This ensures the file reaches the user's channel (Telegram, web, etc.)
                 // without relying on the LLM to call send_file within its token budget.
+                if conv_response.files_modified.is_empty() {
+                    tracing::debug!(session = %self.session_key, "no files_modified in conv_response");
+                } else {
+                    tracing::info!(
+                        session = %self.session_key,
+                        files = ?conv_response.files_modified.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                        "conv_response has files_modified"
+                    );
+                }
                 for file in &conv_response.files_modified {
                     if file.extension().and_then(|e| e.to_str()) == Some("md") {
-                        let filename = file
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
+                        // Resolve relative paths to absolute so the file URL works
+                        let abs_file = if file.is_relative() {
+                            std::fs::canonicalize(file)
+                                .or_else(|_| std::fs::canonicalize(self.data_dir.join(file)))
+                                .unwrap_or_else(|_| file.clone())
+                        } else {
+                            file.clone()
+                        };
                         info!(
                             session = %self.session_key,
-                            file = %file.display(),
+                            file = %abs_file.display(),
                             channel = %self.channel,
                             chat_id = %self.chat_id,
                             "auto-delivering report file"
@@ -2096,7 +2129,7 @@ impl SessionActor {
                             chat_id: self.chat_id.clone(),
                             content: String::new(),
                             reply_to: None,
-                            media: vec![file.to_string_lossy().into_owned()],
+                            media: vec![abs_file.to_string_lossy().into_owned()],
                             metadata: serde_json::json!({}),
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {
@@ -2127,9 +2160,8 @@ impl SessionActor {
 
                     // Prepend thinking content when show_thinking is enabled
                     let display_content = if self.user_status_config.show_thinking {
-                        let prefix = format_thinking_prefix(
-                            conv_response.reasoning_content.as_deref(),
-                        );
+                        let prefix =
+                            format_thinking_prefix(conv_response.reasoning_content.as_deref());
                         format!("{prefix}{display_content}")
                     } else {
                         display_content
@@ -2146,10 +2178,22 @@ impl SessionActor {
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
                         if let Some(model) = completion_meta.get("model").and_then(|v| v.as_str()) {
-                            let tok_in = completion_meta.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let tok_out = completion_meta.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let secs = completion_meta.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0);
-                            format!("{display_content}\n\n{}", format_annotation(model, tok_in, tok_out, secs))
+                            let tok_in = completion_meta
+                                .get("tokens_in")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let tok_out = completion_meta
+                                .get("tokens_out")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let secs = completion_meta
+                                .get("duration_s")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            format!(
+                                "{display_content}\n\n{}",
+                                format_annotation(model, tok_in, tok_out, secs)
+                            )
                         } else {
                             display_content
                         }
@@ -2428,9 +2472,8 @@ impl SessionActor {
                     let reply = strip_think_tags(&conv_response.content);
                     // Prepend thinking content when show_thinking is enabled
                     let reply = if user_status_config.show_thinking {
-                        let prefix = format_thinking_prefix(
-                            conv_response.reasoning_content.as_deref(),
-                        );
+                        let prefix =
+                            format_thinking_prefix(conv_response.reasoning_content.as_deref());
                         format!("{prefix}{reply}")
                     } else {
                         reply
@@ -2751,9 +2794,8 @@ impl SessionActor {
 
                     // Prepend thinking content when show_thinking is enabled
                     let display_content = if self.user_status_config.show_thinking {
-                        let prefix = format_thinking_prefix(
-                            conv_response.reasoning_content.as_deref(),
-                        );
+                        let prefix =
+                            format_thinking_prefix(conv_response.reasoning_content.as_deref());
                         format!("{prefix}{display_content}")
                     } else {
                         display_content
@@ -2762,7 +2804,10 @@ impl SessionActor {
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
                         if let Some((ref model, tok_in, tok_out, secs)) = annotation_data {
-                            format!("{display_content}\n\n{}", format_annotation(model, tok_in as u64, tok_out as u64, secs))
+                            format!(
+                                "{display_content}\n\n{}",
+                                format_annotation(model, tok_in as u64, tok_out as u64, secs)
+                            )
                         } else {
                             display_content
                         }
@@ -2889,7 +2934,8 @@ fn fmt_tokens(n: u64) -> String {
 
 /// Format annotation line: model · tokens in/out · duration
 fn format_annotation(model: &str, tok_in: u64, tok_out: u64, secs: u64) -> String {
-    format!("_{model} · {in_} in · {out_} out · {secs}s_",
+    format!(
+        "_{model} · {in_} in · {out_} out · {secs}s_",
         in_ = fmt_tokens(tok_in),
         out_ = fmt_tokens(tok_out),
     )

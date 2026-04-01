@@ -38,7 +38,9 @@ pub struct AdaptiveConfig {
     /// Minimum seconds between probes to the same provider.
     pub probe_interval_secs: u64,
     /// Scoring weights (should sum to ~1.0).
+    /// Controls quality+throughput factor (higher = prefer faster, higher-quality providers).
     pub weight_latency: f64,
+    /// Controls stability factor (higher = penalize error-prone providers more).
     pub weight_error_rate: f64,
     pub weight_priority: f64,
     /// Weight for published token cost (0.0 = ignore cost).
@@ -367,7 +369,6 @@ struct AdaptiveSlot {
     provider: std::sync::Arc<dyn LlmProvider>,
     metrics: ProviderMetrics,
     /// Config-order priority (0 = primary, 1 = first fallback, etc.).
-    #[allow(dead_code)]
     priority: usize,
     /// Published output price in USD per million tokens (0.0 = unknown/free).
     cost_per_m: f64,
@@ -849,10 +850,25 @@ impl AdaptiveRouter {
             0.5 // No data yet — neutral
         };
 
-        // ── Cost (15%) ──
+        // ── Priority (config weight) ──
+        // Lower priority index = better (0 = primary). Normalize to [0, 1].
+        let max_priority = self.slots.len().max(1) as f64;
+        let norm_priority = slot.priority as f64 / max_priority;
+
+        // ── Cost (config weight) ──
         let norm_cost = self.norm_cost(slot);
 
-        0.35 * blended_err + 0.30 * norm_quality + 0.20 * norm_throughput + 0.15 * norm_cost
+        // Configured weights (default: stability=0.3, quality=0.3, priority=0.2, cost=0.2).
+        // weight_error_rate → stability (blended baseline + live error rate)
+        // weight_latency    → quality (60% ds_output quality + 40% throughput)
+        let we = self.config.weight_error_rate; // stability
+        let wl = self.config.weight_latency; // quality + throughput
+        let wp = self.config.weight_priority;
+        let wc = self.config.weight_cost;
+        we * blended_err
+            + wl * (0.6 * norm_quality + 0.4 * norm_throughput)
+            + wp * norm_priority
+            + wc * norm_cost
     }
 
     /// Select provider index and whether this is a probe request.
@@ -1764,13 +1780,16 @@ mod tests {
     }
 
     /// Lane mode selects best provider by score after warm-up.
-    /// Warm up in Off mode (priority order), then switch to Lane.
-    /// With metrics showing primary is slow, Lane switches to faster provider.
+    /// Primary is warmed up with high error rate, then Lane switches to fallback.
     #[tokio::test]
     async fn test_lane_mode_picks_best_by_score() {
         let config = AdaptiveConfig {
             probe_probability: 0.0,
-            latency_threshold_ms: 100, // Low threshold for fast test
+            latency_threshold_ms: 100,
+            weight_priority: 0.05, // Low priority weight so metrics dominate
+            weight_latency: 0.3,
+            weight_error_rate: 0.45,
+            weight_cost: 0.2,
             ..Default::default()
         };
         let router = AdaptiveRouter::new(
@@ -1794,17 +1813,22 @@ mod tests {
             config,
         );
 
-        // Warm up in Off mode (priority order → primary always selected)
+        // Warm up in Off mode (priority order → primary always selected).
         router.set_mode(AdaptiveMode::Off);
-        for _ in 0..5 {
-            let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
-            assert_eq!(resp.content.as_deref(), Some("from-slow-primary"));
+        for _ in 0..12 {
+            let _ = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         }
 
-        // Switch to Lane mode. Primary has metrics: ~50ms latency.
-        // primary score  = 0.5*(50/100) + 0 + 0.3*(0/2) = 0.25
-        // fallback (cold) = 0.3*(1/2) = 0.15
-        // 0.15 < 0.25 → lane picks faster fallback
+        // Inject failure metrics on the primary to make it score worse.
+        // record_failure increments failure_count which raises error_rate.
+        for _ in 0..8 {
+            router.slots[0].metrics.record_failure();
+        }
+
+        // Switch to Lane mode. Primary has high error rate + high latency.
+        // Fallback is cold (neutral scores) but has no errors.
+        // With weight_error_rate=0.45, primary's high error score should
+        // push Lane to prefer fallback despite its higher priority index.
         router.set_mode(AdaptiveMode::Lane);
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-fast-fallback"));

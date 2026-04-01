@@ -23,7 +23,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const WECHAT_API_BASE: &str = "https://ilinkai.weixin.qq.com";
@@ -86,10 +86,20 @@ impl BridgeState {
         ]
     }
 
-    async fn send_to_wechat(&self, to: &str, text: &str, context_token: &str) -> Result<(), String> {
+    async fn send_to_wechat(
+        &self,
+        to: &str,
+        text: &str,
+        context_token: &str,
+    ) -> Result<(), String> {
         let token = self.token.read().await.clone();
-        let client_id = format!("octos-{:016x}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
+        let client_id = format!(
+            "octos-{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        );
 
         let body = json!({
             "msg": {
@@ -104,12 +114,16 @@ impl BridgeState {
             "base_info": {"channel_version": "1.0.0"}
         });
 
-        let mut req = self.http.post(format!("{}/ilink/bot/sendmessage", self.base_url))
+        let mut req = self
+            .http
+            .post(format!("{}/ilink/bot/sendmessage", self.base_url))
             .timeout(std::time::Duration::from_secs(15));
         for (k, v) in self.headers(&token) {
             req = req.header(k, v);
         }
-        req.json(&body).send().await
+        req.json(&body)
+            .send()
+            .await
             .map_err(|e| format!("send failed: {e}"))?;
         Ok(())
     }
@@ -121,14 +135,21 @@ async fn qr_login(base_url: &str) -> Result<String, String> {
 
     loop {
         // Get QR code
-        let resp = client.get(format!("{base_url}/ilink/bot/get_bot_qrcode?bot_type=3"))
-            .send().await
+        let resp = client
+            .get(format!("{base_url}/ilink/bot/get_bot_qrcode?bot_type=3"))
+            .send()
+            .await
             .map_err(|e| format!("QR fetch failed: {e}"))?;
-        let body: serde_json::Value = resp.json().await
+        let body: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("QR parse failed: {e}"))?;
 
         let qrcode = body["qrcode"].as_str().unwrap_or_default().to_string();
-        let qr_url = body["qrcode_img_content"].as_str().unwrap_or_default().to_string();
+        let qr_url = body["qrcode_img_content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         emit(&json!({"type": "qr", "qr_url": qr_url}));
         eprintln!("[wechat-bridge] QR code: {qr_url}");
@@ -136,19 +157,25 @@ async fn qr_login(base_url: &str) -> Result<String, String> {
         // Poll status
         let poll_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(40))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         loop {
             let url = format!("{base_url}/ilink/bot/get_qrcode_status?qrcode={qrcode}");
-            let resp = match poll_client.get(&url)
+            let resp = match poll_client
+                .get(&url)
                 .header("iLink-App-ClientVersion", "1")
-                .send().await {
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) if e.is_timeout() => continue,
                 Err(e) => return Err(format!("QR poll failed: {e}")),
             };
 
-            let body: serde_json::Value = resp.json().await
+            let body: serde_json::Value = resp
+                .json()
+                .await
                 .map_err(|e| format!("QR poll parse: {e}"))?;
             let status = body["status"].as_str().unwrap_or("wait");
 
@@ -192,7 +219,9 @@ async fn poll_loop(state: Arc<BridgeState>) {
             "base_info": {"channel_version": "1.0.0"}
         });
 
-        let mut req = state.http.post(format!("{}/ilink/bot/getupdates", state.base_url))
+        let mut req = state
+            .http
+            .post(format!("{}/ilink/bot/getupdates", state.base_url))
             .timeout(std::time::Duration::from_secs(LONG_POLL_TIMEOUT_SECS));
         for (k, v) in state.headers(&token) {
             req = req.header(k, v);
@@ -234,7 +263,9 @@ async fn poll_loop(state: Arc<BridgeState>) {
                 if let Some(msgs) = data["msgs"].as_array() {
                     for msg in msgs {
                         let msg_type = msg["message_type"].as_u64().unwrap_or(0);
-                        if msg_type != 1 { continue; } // only user messages
+                        if msg_type != 1 {
+                            continue;
+                        } // only user messages
 
                         let sender = msg["from_user_id"].as_str().unwrap_or_default();
                         let ctx = msg["context_token"].as_str().unwrap_or_default();
@@ -242,7 +273,10 @@ async fn poll_loop(state: Arc<BridgeState>) {
 
                         // Store context_token
                         if !ctx.is_empty() {
-                            state.context_tokens.write().await
+                            state
+                                .context_tokens
+                                .write()
+                                .await
                                 .insert(sender.to_string(), ctx.to_string());
                         }
 
@@ -258,7 +292,9 @@ async fn poll_loop(state: Arc<BridgeState>) {
                             }
                         }
 
-                        if text.trim().is_empty() { continue; }
+                        if text.trim().is_empty() {
+                            continue;
+                        }
 
                         eprintln!("[wechat-bridge] recv from={sender} text={text}");
 
@@ -275,7 +311,9 @@ async fn poll_loop(state: Arc<BridgeState>) {
                 }
             }
             Err(e) => {
-                if e.is_timeout() { continue; }
+                if e.is_timeout() {
+                    continue;
+                }
                 eprintln!("[wechat-bridge] poll error: {e}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
@@ -362,8 +400,13 @@ async fn main() {
 
     // Start WebSocket server
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    let listener = TcpListener::bind(&addr).await.expect("failed to bind WS port");
-    eprintln!("[wechat-bridge] WebSocket server on ws://localhost:{}", args.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind WS port");
+    eprintln!(
+        "[wechat-bridge] WebSocket server on ws://localhost:{}",
+        args.port
+    );
 
     // Start long-poll loop
     let poll_state = state.clone();

@@ -1,6 +1,8 @@
 //! Authentication and user self-service API handlers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -15,6 +17,11 @@ use crate::profiles::mask_secrets;
 use crate::user_store::{User, UserRole};
 
 use super::router::AuthIdentity;
+
+/// In-memory rate limiter for OTP send requests: email -> (count, window_start).
+/// Allows at most 3 requests per 5-minute window per email address.
+static OTP_RATE_LIMIT: LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ── Request / Response types ──────────────────────────────────────────
 
@@ -71,6 +78,26 @@ pub async fn send_code(
         .auth_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Rate-limit OTP sends: max 3 per email per 5-minute window.
+    {
+        let mut limits = OTP_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = limits
+            .entry(req.email.to_lowercase())
+            .or_insert((0, std::time::Instant::now()));
+        if entry.1.elapsed() > std::time::Duration::from_secs(300) {
+            *entry = (0, std::time::Instant::now()); // reset after 5 min
+        }
+        if entry.0 >= 3 {
+            tracing::warn!(email = %req.email, "OTP rate limit exceeded");
+            // Return generic success to avoid leaking rate-limit state
+            return Ok(Json(SendCodeResponse {
+                ok: true,
+                message: Some("Verification code sent to your email".into()),
+            }));
+        }
+        entry.0 += 1;
+    }
 
     tracing::info!(email = %req.email, "login OTP requested");
     match auth_mgr.send_otp(&req.email).await {
@@ -203,6 +230,7 @@ pub async fn me(
                     }
                 };
                 Some(ProfileResponse {
+                    email: None,
                     profile: mask_secrets(&p),
                     status,
                 })
@@ -254,6 +282,7 @@ pub async fn me(
                 }
             };
             Some(ProfileResponse {
+                email: None,
                 profile: mask_secrets(&p),
                 status,
             })
@@ -293,6 +322,7 @@ pub async fn my_profile(
     };
 
     Ok(Json(ProfileResponse {
+        email: None,
         profile: mask_secrets(&profile),
         status,
     }))
@@ -349,6 +379,7 @@ pub async fn update_my_profile(
     };
 
     Ok(Json(ProfileResponse {
+        email: None,
         profile: mask_secrets(&profile),
         status,
     }))
@@ -587,6 +618,7 @@ pub async fn my_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(crate::api::admin::ProfileResponse {
+            email: None,
             profile: crate::profiles::mask_secrets(&s),
             status,
         });
@@ -956,7 +988,6 @@ mod tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // WeChat QR Login (user-scoped)
 // ---------------------------------------------------------------------------
@@ -968,7 +999,10 @@ pub async fn my_wechat_qr_start(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Check if ProcessManager has a bridge with QR info
     if let Some(pm) = state.process_manager.as_ref() {
-        let ps = state.profile_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
+        let ps = state
+            .profile_store
+            .as_ref()
+            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
         let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps)
             .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
         let key = format!("{}-wechat", profile_id);
@@ -1014,7 +1048,10 @@ pub async fn my_wechat_qr_poll(
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let ps = state.profile_store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no profile store".into()))?;
     let profile_id = super::auth_handlers::resolve_my_profile_id(&identity, ps)
         .map_err(|_| (StatusCode::FORBIDDEN, "cannot resolve profile".into()))?;
 
@@ -1024,52 +1061,89 @@ pub async fn my_wechat_qr_poll(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let encoded: String = session_key.chars().map(|c| {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-            c.to_string()
-        } else {
-            format!("%{:02X}", c as u32)
-        }
-    }).collect();
+    let encoded: String = session_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect();
 
-    let url = format!("https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}", encoded);
-    let resp = client.get(&url).header("iLink-App-ClientVersion", "1").send().await
+    let url = format!(
+        "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
+        encoded
+    );
+    let resp = client
+        .get(&url)
+        .header("iLink-App-ClientVersion", "1")
+        .send()
+        .await
         .map_err(|e| {
-            if e.is_timeout() { return (StatusCode::OK, "timeout".into()); }
+            if e.is_timeout() {
+                return (StatusCode::OK, "timeout".into());
+            }
             (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
         })?;
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("parse error: {e}")))?;
 
     let status = body["status"].as_str().unwrap_or("wait");
 
     if status == "confirmed" {
         let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
-        let bot_id = body["ilink_bot_id"].as_str().unwrap_or_default().to_string();
+        let bot_id = body["ilink_bot_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         if !bot_token.is_empty() {
             if let Ok(Some(mut profile)) = ps.get(&profile_id) {
-                let has_wechat = profile.config.channels.iter().any(|c| {
-                    matches!(c, crate::profiles::ChannelCredentials::WeChat { .. })
-                });
+                let has_wechat = profile
+                    .config
+                    .channels
+                    .iter()
+                    .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
                 if !has_wechat {
-                    profile.config.channels.push(
-                        crate::profiles::ChannelCredentials::WeChat {
+                    profile
+                        .config
+                        .channels
+                        .push(crate::profiles::ChannelCredentials::WeChat {
                             token_env: "WECHAT_BOT_TOKEN".into(),
                             base_url: "https://ilinkai.weixin.qq.com".into(),
-                        },
-                    );
+                        });
                 }
-                profile.config.env_vars.insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
+                profile
+                    .config
+                    .env_vars
+                    .insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
                 let _ = ps.save(&profile);
-                // Set env var so the running wechat channel picks it up on next -14
-                std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+                // Set env var so the running wechat channel picks it up on next reconnect
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open("/tmp/octos-wechat-token")
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
+                }
             }
         }
 
+        // Don't expose bot_token to client — already saved server-side
         return Ok(Json(serde_json::json!({
             "status": status,
-            "bot_token": bot_token,
             "bot_id": bot_id
         })));
     }

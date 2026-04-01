@@ -582,7 +582,7 @@ async fn web_search(
 
     // Default: race top 2 available engines in parallel.
     // Gives redundancy + speed without the resource explosion of fire-all.
-    // Priority: tavily > perplexity > brave > duckduckgo
+    // Priority: tavily > perplexity > brave > bing_cdp > duckduckgo
     let mut available: Vec<&str> = Vec::new();
     if std::env::var("TAVILY_API_KEY")
         .ok()
@@ -602,6 +602,7 @@ async fn web_search(
     {
         available.push("brave");
     }
+    available.push("bing_cdp"); // free, uses headless Chrome
     available.push("duckduckgo"); // always available (free)
 
     // Race top 2
@@ -686,6 +687,12 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
         }));
     }
     {
+        let q = query.to_string();
+        handles.push(tokio::spawn(async move {
+            ("bing_cdp", bing_cdp_search(&q, count).await)
+        }));
+    }
+    {
         let c = client.clone();
         let q = query.to_string();
         handles.push(tokio::spawn(async move {
@@ -753,6 +760,7 @@ async fn try_engine(
             you_search(client, query, count, &key).await
         }
         "duckduckgo" => ddg_search(client, query, count).await,
+        "bing_cdp" => bing_cdp_search(query, count).await,
         _ => return None,
     };
     if r.success && !r.output.contains("No results found") {
@@ -1008,6 +1016,187 @@ async fn brave_search(
             r.description
         ));
     }
+    SearchResult {
+        output,
+        success: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bing CDP Search (headless Chrome via deep-crawl binary)
+// ---------------------------------------------------------------------------
+
+/// Search Bing via headless Chrome. Calls the `deep_crawl` sibling binary
+/// to render the SERP, then extracts result links from the text output.
+/// No API key needed — just Chromium installed. Uses Bing instead of Google
+/// because Google CAPTCHAs automated requests from datacenter IPs.
+async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
+    // Find deep_crawl binary: check sibling dir, cargo bin, and PATH
+    let crawl_bin = {
+        let candidates: Vec<std::path::PathBuf> = [
+            // Sibling bundled-app-skill directory
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent()?.parent().map(|d| d.join("deep-crawl").join("main"))),
+            // Same directory as our binary
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("deep_crawl").to_path_buf())),
+            // ~/.cargo/bin
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cargo/bin/deep_crawl")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        match candidates.into_iter().find(|p| p.exists()) {
+            Some(p) => p,
+            None => {
+                // Try PATH via which
+                match std::process::Command::new("which")
+                    .arg("deep_crawl")
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim())
+                    }
+                    _ => {
+                        return SearchResult {
+                            output: "bing_cdp:deep_crawl binary not found".into(),
+                            success: false,
+                        };
+                    }
+                }
+            }
+        }
+    };
+
+    // Use Bing instead of Google — Google CAPTCHAs automated requests from datacenter IPs.
+    // Bing is much more lenient with headless Chrome scraping.
+    let search_url = format!(
+        "https://www.bing.com/search?q={}&count={}",
+        urlencoded(query),
+        count.min(10)
+    );
+
+    let input = serde_json::json!({
+        "url": search_url,
+        "max_depth": 0,
+        "max_pages": 1,
+        "timeout_secs": 30
+    });
+
+    let result = tokio::process::Command::new(&crawl_bin)
+        .arg("deep_crawl")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let mut child = match result {
+        Ok(c) => c,
+        Err(e) => {
+            return SearchResult {
+                output: format!("bing_cdp:failed to spawn deep_crawl: {e}"),
+                success: false,
+            };
+        }
+    };
+
+    // Write input JSON to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(input.to_string().as_bytes()).await;
+    }
+
+    // Wait with timeout
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return SearchResult {
+                output: format!("bing_cdp:deep_crawl failed: {e}"),
+                success: false,
+            };
+        }
+        Err(_) => {
+            return SearchResult {
+                output: "bing_cdp:timeout after 60s".into(),
+                success: false,
+            };
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse deep_crawl JSON output
+    let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            return SearchResult {
+                output: format!("bing_cdp:failed to parse output ({} bytes)", stdout.len()),
+                success: false,
+            };
+        }
+    };
+
+    let text = parsed
+        .get("output")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if text.is_empty() {
+        return SearchResult {
+            output: format!("bing_cdp:empty response for: {query}"),
+            success: false,
+        };
+    }
+
+    // Extract URLs from the crawled text (Google SERP contains result URLs)
+    let mut results = Vec::new();
+    let mut current_title = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Lines with URLs
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            if !trimmed.contains("bing.com")
+                && !trimmed.contains("microsoft.com")
+                && !trimmed.contains("google.com")
+                && !trimmed.contains("gstatic.com")
+            {
+                let title = if current_title.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    std::mem::take(&mut current_title)
+                };
+                results.push(format!("- {}\n  {}", title, trimmed));
+            }
+        } else if trimmed.len() > 10 && !trimmed.contains("Google") && !trimmed.contains("Bing") {
+            current_title = trimmed.to_string();
+        }
+    }
+
+    if results.is_empty() {
+        // Fall back to returning the raw text which may have useful content
+        return SearchResult {
+            output: format!("Bing results for: {query}\n\n{}", &text[..text.len().min(3000)]),
+            success: !text.is_empty(),
+        };
+    }
+
+    let output = format!(
+        "Bing results for: {query}\n\n{}",
+        results.iter().take(count as usize).cloned().collect::<Vec<_>>().join("\n\n")
+    );
+
     SearchResult {
         output,
         success: true,
@@ -1349,7 +1538,10 @@ fn is_boilerplate_element(el: &scraper::node::Element) -> bool {
     let class = el.attr("class").unwrap_or("");
     let id = el.attr("id").unwrap_or("");
     let role = el.attr("role").unwrap_or("");
-    if matches!(role, "navigation" | "banner" | "complementary" | "contentinfo") {
+    if matches!(
+        role,
+        "navigation" | "banner" | "complementary" | "contentinfo"
+    ) {
         return true;
     }
     let combined = format!("{class} {id}").to_lowercase();
@@ -1378,13 +1570,27 @@ fn is_boilerplate_element(el: &scraper::node::Element) -> bool {
 /// Remove common boilerplate noise lines from extracted text.
 fn clean_boilerplate(text: &str) -> String {
     let noise: &[&str] = &[
-        "accept all cookies", "accept cookies", "cookie policy", "cookie settings",
-        "we use cookies", "this website uses cookies", "privacy policy",
-        "terms of service", "terms and conditions", "sign up for our newsletter",
-        "subscribe to our newsletter", "follow us on", "share this article",
-        "share on facebook", "share on twitter", "advertisement",
-        "skip to content", "skip to main content", "back to top",
-        "loading...", "please enable javascript",
+        "accept all cookies",
+        "accept cookies",
+        "cookie policy",
+        "cookie settings",
+        "we use cookies",
+        "this website uses cookies",
+        "privacy policy",
+        "terms of service",
+        "terms and conditions",
+        "sign up for our newsletter",
+        "subscribe to our newsletter",
+        "follow us on",
+        "share this article",
+        "share on facebook",
+        "share on twitter",
+        "advertisement",
+        "skip to content",
+        "skip to main content",
+        "back to top",
+        "loading...",
+        "please enable javascript",
     ];
     let lines: Vec<&str> = text
         .lines()
@@ -1402,7 +1608,9 @@ fn clean_boilerplate(text: &str) -> String {
     for line in lines {
         if line.trim().is_empty() {
             blank_count += 1;
-            if blank_count <= 2 { result.push('\n'); }
+            if blank_count <= 2 {
+                result.push('\n');
+            }
         } else {
             blank_count = 0;
             result.push_str(line);

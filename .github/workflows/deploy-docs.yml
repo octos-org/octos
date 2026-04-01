@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'book/**'
+      - 'book-zh/**'
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
 
@@ -28,8 +29,16 @@ jobs:
         with:
           mdbook-version: 'latest'
 
-      - name: Build documentation
+      - name: Build English documentation
         run: cd book && mdbook build
+
+      - name: Build Chinese documentation
+        run: cd book-zh && mdbook build
+
+      - name: Merge EN + ZH into single site
+        run: |
+          mkdir -p book/public/zh
+          cp -r book-zh/public/* book/public/zh/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

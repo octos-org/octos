@@ -105,6 +105,10 @@ pub struct PluginToolDef {
     /// JSON Schema for input parameters.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
+    /// If true, this tool is only available in spawn subagents, not the main session.
+    /// The main session should use `spawn(allowed_tools=["tool_name"])` to invoke it.
+    #[serde(default)]
+    pub spawn_only: bool,
 }
 
 /// Binary download info for a specific platform.

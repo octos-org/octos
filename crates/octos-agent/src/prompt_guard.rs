@@ -262,8 +262,18 @@ pub fn sanitize_injection(text: &str) -> String {
         if threat.span.end <= output.len() {
             output.replace_range(threat.span.clone(), &defanged);
         } else {
-            // Span shifted due to earlier replacement; fall back to string replace.
-            output = output.replacen(matched, &defanged, 1);
+            // Span shifted due to earlier replacement; search for the matched
+            // text starting near the original position rather than using
+            // replacen(_, _, 1) which always searches from the beginning and
+            // could replace the wrong occurrence.
+            let search_start = threat.span.start.min(output.len());
+            if let Some(rel) = output[search_start..].find(matched) {
+                let abs_start = search_start + rel;
+                output.replace_range(abs_start..abs_start + matched.len(), &defanged);
+            } else if let Some(abs_start) = output.find(matched) {
+                // Last resort: search from the beginning.
+                output.replace_range(abs_start..abs_start + matched.len(), &defanged);
+            }
         }
     }
 

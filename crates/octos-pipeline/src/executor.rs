@@ -1356,12 +1356,18 @@ impl PipelineExecutor {
                         elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
                         "pipeline complete (no outgoing edges)"
                     );
+                    let mut all_files: Vec<std::path::PathBuf> = outcome.files_modified.clone();
+                    for o in completed.values() {
+                        all_files.extend(o.files_modified.iter().cloned());
+                    }
+                    all_files.sort();
+                    all_files.dedup();
                     return Ok(PipelineResult {
                         output: outcome.content,
                         success: outcome.status == OutcomeStatus::Pass,
                         token_usage: total_tokens,
                         node_summaries: summaries,
-                        files_modified: vec![],
+                        files_modified: all_files,
                     });
                 }
             }
@@ -1696,4 +1702,3 @@ mod tests {
         assert!(tasks[0].task.contains("test query"));
     }
 }
-

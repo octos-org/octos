@@ -128,6 +128,30 @@ impl Agent {
                                 });
                             }
 
+                            // Auto-send files explicitly declared by the plugin via files_to_send.
+                            // No heuristic path detection — plugins must opt-in by including
+                            // "files_to_send": ["/path/to/file"] in their JSON output.
+                            let files: Vec<String> = tool_result.files_to_send
+                                .iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+
+                            for path_str in &files {
+                                info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
+                                let send_args = serde_json::json!({"file_path": path_str});
+                                match tools.execute("send_file", &send_args).await {
+                                    Ok(r) if r.success => {
+                                        info!(tool = %tc_name, file = %path_str, "file auto-sent");
+                                    }
+                                    Ok(r) => {
+                                        warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
+                                    }
+                                    Err(e) => {
+                                        warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                    }
+                                }
+                            }
+
                             let output_preview =
                                 octos_core::truncated_utf8(&tool_result.output, 200, "...");
 
@@ -224,16 +248,18 @@ impl Agent {
                     // Unwrap JoinHandle results -- panics in tool tasks become errors
                     results
                         .into_iter()
-                        .map(|r| {
+                        .zip(response.tool_calls.iter())
+                        .map(|(r, tc)| {
                             r.unwrap_or_else(|e| {
-                                // Task panicked -- return a placeholder error tuple
+                                // Task panicked -- return error with tool_call_id so
+                                // the LLM knows which tool failed.
                                 (
                                     Message {
                                         role: MessageRole::Tool,
-                                        content: format!("Tool task panicked: {e}"),
+                                        content: format!("Tool '{}' panicked: {e}", tc.name),
                                         media: vec![],
                                         tool_calls: None,
-                                        tool_call_id: None,
+                                        tool_call_id: Some(tc.id.clone()),
                                         reasoning_content: None,
                                         timestamp: chrono::Utc::now(),
                                     },

@@ -304,10 +304,21 @@ impl Tool for PluginTool {
                             .map(|p| std::path::PathBuf::from(p.trim()))
                     })
                 });
+            // Parse files_to_send: plugin can request auto-delivery to chat
+            let files_to_send = parsed
+                .get("files_to_send")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
             return Ok(ToolResult {
                 output,
                 success,
                 file_modified,
+                files_to_send,
                 ..Default::default()
             });
         }

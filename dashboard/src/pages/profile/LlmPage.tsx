@@ -3,7 +3,7 @@ import LlmProviderTab from '../../components/tabs/LlmProviderTab'
 import SaveFooter from '../../components/SaveFooter'
 
 export default function LlmPage() {
-  const { config, setConfig, save, saving, loading } = useProfile()
+  const { profileId, config, setConfig, save, saving, loading } = useProfile()
 
   if (loading) {
     return (
@@ -18,7 +18,7 @@ export default function LlmPage() {
       <h1 className="text-2xl font-bold text-white mb-6">LLM Providers</h1>
       <div className="bg-surface rounded-xl border border-gray-700/50 overflow-hidden">
         <div className="p-5">
-          <LlmProviderTab config={config} onChange={setConfig} />
+          <LlmProviderTab config={config} onChange={setConfig} profileId={profileId} />
         </div>
         <SaveFooter onSave={save} saving={saving} />
       </div>

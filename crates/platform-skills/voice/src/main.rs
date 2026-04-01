@@ -1,10 +1,13 @@
-//! Voice platform skill binary (ASR/TTS/model management) via ominix-api.
+//! Voice platform skill binary (ASR, preset-voice TTS, model management) via ominix-api.
 //!
 //! Protocol: `./main <tool_name>` with JSON on stdin, JSON on stdout.
 //! Auto-discovers ominix-api via OMINIX_API_URL, ~/.ominix/api_url, or default http://localhost:9090.
+//!
+//! NOTE: Voice cloning and custom voice profiles are handled by mofa-fm.
+//! This skill only supports preset voices for TTS.
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -28,29 +31,12 @@ struct SynthesizeInput {
     language: Option<String>,
     #[serde(default)]
     speaker: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct VoiceCloneInput {
-    /// Path to reference audio (3-10s WAV/OGG/MP3/FLAC/M4A)
-    reference_audio: String,
-    /// Text to synthesize in the cloned voice
-    text: String,
+    /// Style/emotion prompt (e.g. "用兴奋激动的语气说话，充满热情和活力")
     #[serde(default)]
-    output_path: Option<String>,
+    prompt: Option<String>,
+    /// Speed factor: >1.0 = faster, <1.0 = slower (0.5-2.0)
     #[serde(default)]
-    language: Option<String>,
-    /// If set, save the reference audio as a named voice profile for future use
-    #[serde(default)]
-    save_as: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SaveProfileInput {
-    /// Name for this voice profile (e.g. "alice", "boss")
-    name: String,
-    /// Path to the reference audio file to save
-    audio_path: String,
+    speed: Option<f32>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -72,7 +58,6 @@ fn api_base_url() -> String {
     }
     "http://localhost:9090".to_string()
 }
-
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
@@ -174,7 +159,11 @@ fn fetch_tts_wav(
         }
         if segments > 0 {
             let duration = buf.len() as f64 / 48000.0;
-            eprintln!("Audio stream complete: {:.1}s ({} bytes)", duration, buf.len());
+            eprintln!(
+                "Audio stream complete: {:.1}s ({} bytes)",
+                duration,
+                buf.len()
+            );
         }
     } else {
         use std::io::Read;
@@ -199,75 +188,12 @@ fn fetch_tts_wav(
     Ok(pcm_to_wav(&bytes, 24000))
 }
 
-/// Send a voice clone request as multipart form with raw WAV bytes.
-fn fetch_clone_wav(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    audio_bytes: Vec<u8>,
-    input: &str,
-    language: &str,
-) -> Result<Vec<u8>, String> {
-    use reqwest::blocking::multipart::{Form, Part};
-    let form = Form::new()
-        .text("input", input.to_string())
-        .text("language", language.to_string())
-        .part(
-            "reference_audio",
-            Part::bytes(audio_bytes)
-                .file_name("ref.wav")
-                .mime_str("audio/wav")
-                .unwrap(),
-        );
-
-    let resp = client
-        .post(url)
-        .multipart(form)
-        .send()
-        .map_err(|e| format!("Clone request failed: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let resp_text = resp.text().unwrap_or_default();
-        return Err(format!(
-            "Clone error (HTTP {status}): {}",
-            truncate(&resp_text, 200)
-        ));
-    }
-
-    eprintln!("Receiving clone audio data...");
-    let mut buf = Vec::new();
-    {
-        use std::io::Read;
-        let mut reader = resp;
-        let mut chunk_buf = [0u8; 32768];
-        let mut last_report = 0usize;
-        loop {
-            match reader.read(&mut chunk_buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk_buf[..n]);
-                    if buf.len() - last_report >= 48000 {
-                        let duration = buf.len() as f64 / 48000.0;
-                        eprintln!("Received {:.1}s of audio ({} bytes)...", duration, buf.len());
-                        last_report = buf.len();
-                    }
-                }
-                Err(e) => return Err(format!("Failed to read clone response: {e}")),
-            }
-        }
-    }
-    eprintln!("Received {} bytes total", buf.len());
-
-    if buf.is_empty() {
-        return Err("Clone returned empty response".to_string());
-    }
-    Ok(buf)
-}
-
 fn check_health(client: &reqwest::blocking::Client, base_url: &str) -> Result<(), String> {
+    // Generous timeout: ominix-api is single-threaded (MLX), so /health may block
+    // while a TTS/ASR synthesis is in progress.
     match client
         .get(format!("{base_url}/health"))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))
         .send()
     {
         Ok(resp) if resp.status().is_success() => Ok(()),
@@ -308,50 +234,6 @@ fn timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Per-user voice profiles directory: `$OCTOS_WORK_DIR/voice_profiles/`.
-/// Falls back to `$OCTOS_DATA_DIR/voice_profiles/` for backwards compat.
-/// Each saved profile is a raw audio file named `{name}.wav`.
-fn voice_profiles_dir() -> Option<PathBuf> {
-    // Prefer OCTOS_WORK_DIR (per-user workspace inside the agent sandbox)
-    // so the agent can see voice_profiles/ via glob/list_dir.
-    if let Ok(d) = std::env::var("OCTOS_WORK_DIR") {
-        return Some(Path::new(&d).join("voice_profiles"));
-    }
-    // Fallback to OCTOS_DATA_DIR (profile-level, outside sandbox)
-    std::env::var("OCTOS_DATA_DIR")
-        .ok()
-        .map(|d| Path::new(&d).join("voice_profiles"))
-}
-
-/// Resolve a speaker name: if a saved voice profile exists, return its path.
-/// Otherwise return None (caller should treat it as a preset name).
-fn resolve_voice_profile(speaker: &str) -> Option<PathBuf> {
-    let dir = voice_profiles_dir()?;
-    // Try exact name, then with .wav extension
-    for ext in &["", ".wav", ".ogg", ".mp3", ".m4a", ".flac"] {
-        let path = dir.join(format!("{speaker}{ext}"));
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Sanitize a profile name: lowercase, alphanumeric + underscore + hyphen only.
-fn sanitize_profile_name(name: &str) -> String {
-    name.trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 // ── voice_transcribe ─────────────────────────────────────────────────
@@ -443,35 +325,51 @@ fn handle_transcribe(input_json: &str) {
     succeed(&output);
 }
 
-// ── voice_synthesize ─────────────────────────────────────────────────
+// ── macOS Say fallback ──────────────────────────────────────────────
 
-fn synthesize_segment(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    text: &str,
-    voice: &str,
-    language: &str,
-    output_path: &Path,
-) -> Result<(usize, f64), String> {
-    let body = json!({
-        "input": text,
-        "voice": voice,
-        "language": language,
-        "response_format": "pcm"
-    });
+/// Synthesize using macOS built-in `say` command.
+/// `say` auto-detects language from text and picks the appropriate voice.
+/// Outputs AIFF, then converts to WAV via macOS built-in `afconvert`.
+fn synthesize_with_say(text: &str, speed: Option<f32>, output_path: &str) -> Result<(), String> {
+    let aiff_path = format!("{output_path}.aiff");
 
-    // Use streaming PCM mode so ominix-api streams per-sentence chunks
-    // instead of blocking until all text is synthesized.
-    let url = format!("{base_url}/v1/audio/tts/qwen3");
-    let wav_bytes = fetch_tts_wav(client, &url, &body)?;
+    let mut cmd = std::process::Command::new("say");
+    cmd.arg("-o").arg(&aiff_path);
+    // Map speed factor (0.5-2.0) to words-per-minute (~175 WPM is normal)
+    if let Some(s) = speed {
+        let wpm = (175.0 * s).clamp(80.0, 400.0) as u32;
+        cmd.arg("-r").arg(wpm.to_string());
+    }
+    cmd.arg(text);
 
-    std::fs::write(output_path, &wav_bytes)
-        .map_err(|e| format!("Failed to write {}: {e}", output_path.display()))?;
+    let status = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("`say` command failed: {e}"))?;
 
-    // 24kHz 16-bit mono = 48000 bytes/sec
-    let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
-    Ok((wav_bytes.len(), duration_secs))
+    if !status.success() {
+        return Err(format!("`say` exited with status {status}"));
+    }
+
+    // Convert AIFF to WAV using macOS built-in afconvert
+    let af_status = std::process::Command::new("afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16@24000", &aiff_path, output_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Clean up temp AIFF
+    let _ = std::fs::remove_file(&aiff_path);
+
+    match af_status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("afconvert failed with status {s}")),
+        Err(e) => Err(format!("afconvert failed: {e}")),
+    }
 }
+
+// ── voice_synthesize ─────────────────────────────────────────────────
 
 fn handle_synthesize(input_json: &str) {
     let input: SynthesizeInput = match serde_json::from_str(input_json) {
@@ -481,13 +379,6 @@ fn handle_synthesize(input_json: &str) {
 
     if input.text.trim().is_empty() {
         fail("'text' must not be empty");
-    }
-
-    let base_url = api_base_url();
-    let client = http_client();
-    eprintln!("Checking ominix-api health...");
-    if let Err(e) = check_health(&client, &base_url) {
-        fail(&e);
     }
 
     // Always save to OCTOS_WORK_DIR (inside profile data_dir) so send_file
@@ -521,62 +412,68 @@ fn handle_synthesize(input_json: &str) {
     let language = input.language.unwrap_or_else(|| "chinese".to_string());
     let speaker = input.speaker.unwrap_or_else(|| "vivian".to_string());
 
-    // Check if speaker is a saved voice profile — if so, use clone mode
-    if let Some(profile_path) = resolve_voice_profile(&speaker) {
-        eprintln!("Using voice profile '{speaker}' (clone mode)...");
-        let ref_bytes = match std::fs::read(&profile_path) {
-            Ok(b) => b,
-            Err(e) => fail(&format!("Failed to read voice profile '{}': {e}", speaker)),
-        };
+    // Try ominix-api first; fall back to macOS `say` if unavailable
+    let base_url = api_base_url();
+    let client = http_client();
+    let ominix_available = check_health(&client, &base_url).is_ok();
 
-        // Clone via model-specific endpoint (multipart with raw WAV).
-        // No ?format=wav → streaming PCM mode for per-sentence chunks.
-        let clone_url = format!("{base_url}/v1/audio/tts/clone");
-        eprintln!("Sending TTS clone request ({} chars of text)...", input.text.len());
-        let raw_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
-            Ok(b) => b,
-            Err(e) => fail(&format!("TTS (clone) failed: {e}")),
-        };
-        eprintln!("Received {} bytes of audio", raw_bytes.len());
-
-        // Wrap raw PCM in WAV header if needed (streaming mode returns PCM, not WAV)
-        let wav_bytes = if raw_bytes.len() >= 4 && &raw_bytes[..4] == b"RIFF" {
-            raw_bytes
-        } else {
-            pcm_to_wav(&raw_bytes, 24000)
-        };
-
-        if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
-            fail(&format!("Failed to write {output_path}: {e}"));
+    if ominix_available {
+        // Preset speaker — build JSON body with optional prompt/speed
+        let mut body = json!({
+            "input": input.text,
+            "voice": speaker,
+            "language": language,
+            "response_format": "pcm"
+        });
+        if let Some(ref prompt) = input.prompt {
+            body["prompt"] = json!(prompt);
         }
-        let pcm_len = wav_bytes.len().saturating_sub(44);
-        let duration_secs = pcm_len as f64 / 48000.0;
-        eprintln!("Converting to MP3...");
-        let final_path = try_convert_to_mp3(&output_path);
-        succeed(&format!(
-            "Generated audio (voice profile '{speaker}'): {final_path} ({duration_secs:.1}s, {} bytes). Use send_file to deliver it to the user.",
-            wav_bytes.len()
-        ));
+        if let Some(speed) = input.speed {
+            body["speed"] = json!(speed);
+        }
+
+        eprintln!("Synthesizing with preset voice '{speaker}'...");
+        let url = format!("{base_url}/v1/audio/tts/qwen3");
+        match fetch_tts_wav(&client, &url, &body) {
+            Ok(wav_bytes) => {
+                if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
+                    fail(&format!("Failed to write {output_path}: {e}"));
+                }
+                let duration_secs = wav_bytes.len().saturating_sub(44) as f64 / 48000.0;
+                eprintln!("Converting to MP3...");
+                let final_path = try_convert_to_mp3(&output_path);
+                succeed(&format!(
+                    "Generated audio: {final_path} ({duration_secs:.1}s, {} bytes). Use send_file to deliver it to the user.",
+                    wav_bytes.len()
+                ));
+            }
+            Err(e) => {
+                eprintln!("Qwen3-TTS failed ({e}), falling back to macOS Say...");
+                // Fall through to macOS Say below
+            }
+        }
+    } else {
+        eprintln!("ominix-api not available, using macOS Say...");
     }
 
-    // Preset speaker mode
-    eprintln!("Synthesizing with preset voice '{speaker}'...");
-    match synthesize_segment(
-        &client,
-        &base_url,
-        &input.text,
-        &speaker,
-        &language,
-        Path::new(&output_path),
-    ) {
-        Ok((size, duration_secs)) => {
+    // Fallback: macOS built-in `say` command
+    match synthesize_with_say(&input.text, input.speed, &output_path) {
+        Ok(()) => {
+            let size = std::fs::metadata(&output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let duration_secs = size.saturating_sub(44) as f64 / 48000.0;
             eprintln!("Converting to MP3...");
             let final_path = try_convert_to_mp3(&output_path);
             succeed(&format!(
-                "Generated audio: {final_path} ({duration_secs:.1}s, {size} bytes). Use send_file to deliver it to the user."
+                "Generated audio (macOS Say): {final_path} ({duration_secs:.1}s, {size} bytes). \
+                 Note: using built-in macOS voice — install ominix-api for higher-quality Qwen3-TTS. \
+                 Use send_file to deliver it to the user."
             ));
         }
-        Err(e) => fail(&e),
+        Err(e) => fail(&format!(
+            "TTS failed: ominix-api not available, macOS Say also failed: {e}"
+        )),
     }
 }
 
@@ -606,209 +503,6 @@ fn try_convert_to_mp3(wav_path: &str) -> String {
         }
         _ => wav_path.to_string(),
     }
-}
-
-// ── voice_clone ──────────────────────────────────────────────────────
-
-fn handle_voice_clone(input_json: &str) {
-    let input: VoiceCloneInput = match serde_json::from_str(input_json) {
-        Ok(v) => v,
-        Err(e) => fail(&format!("Invalid input: {e}")),
-    };
-
-    if input.text.trim().is_empty() {
-        fail("'text' must not be empty");
-    }
-
-    let ref_path = Path::new(&input.reference_audio);
-    if !ref_path.exists() {
-        fail(&format!(
-            "Reference audio not found: {}",
-            input.reference_audio
-        ));
-    }
-    if !ref_path.is_file() {
-        fail(&format!("Not a file: {}", input.reference_audio));
-    }
-
-    let meta = match std::fs::metadata(ref_path) {
-        Ok(m) => m,
-        Err(e) => fail(&format!("Cannot read reference audio: {e}")),
-    };
-    if meta.len() == 0 {
-        fail("Reference audio is empty (0 bytes)");
-    }
-    if meta.len() > 10_000_000 {
-        fail("Reference audio too large (>10MB). Use a 3-10 second clip.");
-    }
-
-    let base_url = api_base_url();
-    let client = http_client();
-    if let Err(e) = check_health(&client, &base_url) {
-        fail(&e);
-    }
-
-    let output_path = input
-        .output_path
-        .unwrap_or_else(|| format!("/tmp/octos_clone_{}.wav", timestamp()));
-
-    if let Some(parent) = Path::new(&output_path).parent() {
-        if !parent.exists() {
-            fail(&format!(
-                "Output directory does not exist: {}",
-                parent.display()
-            ));
-        }
-    }
-
-    let language = input.language.unwrap_or_else(|| "chinese".to_string());
-
-    // Read reference audio (raw bytes, sent as multipart to ominix-api)
-    let ref_bytes = match std::fs::read(&input.reference_audio) {
-        Ok(b) => b,
-        Err(e) => fail(&format!("Failed to read reference audio '{}': {e}", input.reference_audio)),
-    };
-
-    // Clone via model-specific endpoint (multipart with raw WAV).
-    // No ?format=wav → streaming PCM mode for per-sentence chunks.
-    eprintln!("Sending voice clone request ({} chars)...", input.text.len());
-    let clone_url = format!("{base_url}/v1/audio/tts/clone");
-    let raw_bytes = match fetch_clone_wav(&client, &clone_url, ref_bytes, &input.text, &language) {
-        Ok(b) => b,
-        Err(e) => fail(&format!("Voice clone failed: {e}")),
-    };
-
-    // Wrap raw PCM in WAV header if needed (streaming mode returns PCM)
-    let wav_bytes = if raw_bytes.len() >= 4 && &raw_bytes[..4] == b"RIFF" {
-        raw_bytes
-    } else {
-        pcm_to_wav(&raw_bytes, 24000)
-    };
-
-    if let Err(e) = std::fs::write(Path::new(&output_path), &wav_bytes) {
-        fail(&format!("Failed to write {output_path}: {e}"));
-    }
-
-    // 24kHz 16-bit mono = 48000 bytes/sec
-    let pcm_len = wav_bytes.len().saturating_sub(44);
-    let duration_secs = pcm_len as f64 / 48000.0;
-
-    // Optionally save the reference audio as a named voice profile
-    let save_msg = if let Some(name) = &input.save_as {
-        match save_voice_profile(name, ref_path) {
-            Ok(saved_name) => format!(" Voice profile '{saved_name}' saved — use speaker=\"{saved_name}\" in voice_synthesize for future TTS."),
-            Err(e) => format!(" Warning: failed to save voice profile: {e}"),
-        }
-    } else {
-        String::new()
-    };
-
-    succeed(&format!(
-        "Voice clone generated: {output_path} ({duration_secs:.1}s, {} bytes). \
-         Use send_file to deliver it to the user.{save_msg}",
-        wav_bytes.len()
-    ));
-}
-
-// ── voice_save_profile ──────────────────────────────────────────────
-
-/// Save an audio file as a named voice profile.
-fn save_voice_profile(name: &str, audio_path: &Path) -> Result<String, String> {
-    let dir = voice_profiles_dir()
-        .ok_or_else(|| "OCTOS_DATA_DIR not set — cannot save voice profiles".to_string())?;
-
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create voice_profiles dir: {e}"))?;
-
-    let sanitized = sanitize_profile_name(name);
-    if sanitized.is_empty() {
-        return Err("Profile name is empty after sanitization".to_string());
-    }
-
-    // Preserve original extension
-    let ext = audio_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("wav");
-    let dest = dir.join(format!("{sanitized}.{ext}"));
-
-    std::fs::copy(audio_path, &dest)
-        .map_err(|e| format!("Failed to copy audio to {}: {e}", dest.display()))?;
-
-    Ok(sanitized)
-}
-
-fn handle_save_profile(input_json: &str) {
-    let input: SaveProfileInput = match serde_json::from_str(input_json) {
-        Ok(v) => v,
-        Err(e) => fail(&format!("Invalid input: {e}")),
-    };
-
-    let audio_path = Path::new(&input.audio_path);
-    if !audio_path.is_file() {
-        fail(&format!("Audio file not found: {}", input.audio_path));
-    }
-
-    let meta = match std::fs::metadata(audio_path) {
-        Ok(m) => m,
-        Err(e) => fail(&format!("Cannot read audio file: {e}")),
-    };
-    if meta.len() == 0 {
-        fail("Audio file is empty (0 bytes)");
-    }
-    if meta.len() > 10_000_000 {
-        fail("Audio file too large (>10MB). Use a 3-10 second clip.");
-    }
-
-    match save_voice_profile(&input.name, audio_path) {
-        Ok(saved_name) => succeed(&format!(
-            "Voice profile '{saved_name}' saved. Use speaker=\"{saved_name}\" in voice_synthesize to generate speech in this voice."
-        )),
-        Err(e) => fail(&e),
-    }
-}
-
-// ── voice_list_profiles ─────────────────────────────────────────────
-
-fn handle_list_profiles(_input_json: &str) {
-    let dir = match voice_profiles_dir() {
-        Some(d) => d,
-        None => fail("OCTOS_DATA_DIR not set — no voice profiles directory"),
-    };
-
-    if !dir.exists() {
-        succeed("No saved voice profiles yet. Use voice_save_profile or voice_clone with save_as to create one.");
-    }
-
-    let mut profiles = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => fail(&format!("Failed to read voice_profiles dir: {e}")),
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("?");
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        profiles.push(format!("- **{name}** ({ext}, {size} bytes)"));
-    }
-
-    if profiles.is_empty() {
-        succeed("No saved voice profiles yet. Use voice_save_profile or voice_clone with save_as to create one.");
-    }
-
-    let list = profiles.join("\n");
-    succeed(&format!(
-        "## Saved Voice Profiles\n\n{list}\n\nUse speaker=\"<name>\" in voice_synthesize to use a saved profile."
-    ));
 }
 
 // ── list_models ──────────────────────────────────────────────────────
@@ -1014,15 +708,12 @@ fn main() {
     match tool_name {
         "voice_transcribe" => handle_transcribe(&buf),
         "voice_synthesize" => handle_synthesize(&buf),
-        "voice_clone" => handle_voice_clone(&buf),
-        "voice_save_profile" => handle_save_profile(&buf),
-        "voice_list_profiles" => handle_list_profiles(&buf),
         "list_models" => handle_list_models(&buf),
         "download_model" => handle_download_model(&buf),
         "load_model" => handle_load_model(&buf),
         "unload_model" => handle_unload_model(&buf),
         _ => fail(&format!(
-            "Unknown tool '{tool_name}'. Expected: voice_transcribe, voice_synthesize, voice_clone, voice_save_profile, voice_list_profiles, list_models, download_model, load_model, unload_model"
+            "Unknown tool '{tool_name}'. Expected: voice_transcribe, voice_synthesize, list_models, download_model, load_model, unload_model"
         )),
     }
 }

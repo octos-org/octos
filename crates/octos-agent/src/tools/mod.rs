@@ -45,6 +45,11 @@ pub struct ToolResult {
     pub success: bool,
     /// File modified by this tool (if any).
     pub file_modified: Option<PathBuf>,
+    /// Files to automatically send to the user via the chat channel.
+    /// Plugins set this via `"files_to_send": ["/path/to/file.mp3"]` in JSON output.
+    /// The agent loop sends these files after the tool completes, without requiring
+    /// an extra LLM call to invoke send_file.
+    pub files_to_send: Vec<PathBuf>,
     /// Tokens used by this tool (for subagent tools).
     pub tokens_used: Option<TokenUsage>,
 }
@@ -171,6 +176,8 @@ pub struct ToolRegistry {
     deferred: std::sync::Mutex<HashSet<String>>,
     /// LRU lifecycle manager for auto-eviction of idle tools.
     lifecycle: std::sync::Mutex<ToolLifecycle>,
+    /// Tool names that came from plugin binaries (for auto-send hook filtering).
+    plugin_tools: HashSet<String>,
 }
 
 impl Default for ToolRegistry {
@@ -189,7 +196,18 @@ impl ToolRegistry {
             cached_specs: std::sync::Mutex::new(None),
             deferred: std::sync::Mutex::new(HashSet::new()),
             lifecycle: std::sync::Mutex::new(ToolLifecycle::default()),
+            plugin_tools: HashSet::new(),
         }
+    }
+
+    /// Mark a tool name as coming from a plugin binary.
+    pub fn mark_as_plugin(&mut self, name: &str) {
+        self.plugin_tools.insert(name.to_string());
+    }
+
+    /// Check if a tool came from a plugin binary.
+    pub fn is_plugin(&self, name: &str) -> bool {
+        self.plugin_tools.contains(name)
     }
 
     /// Register a tool.
@@ -331,6 +349,7 @@ impl ToolRegistry {
             cached_specs: std::sync::Mutex::new(None),
             deferred: std::sync::Mutex::new(deferred),
             lifecycle: std::sync::Mutex::new(lifecycle),
+            plugin_tools: self.plugin_tools.clone(),
         }
     }
 

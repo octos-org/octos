@@ -33,12 +33,12 @@ mod slack;
 mod telegram;
 #[cfg(feature = "twilio")]
 mod twilio;
+#[cfg(feature = "wechat")]
+mod wechat;
 #[cfg(feature = "wecom")]
 mod wecom;
 #[cfg(feature = "wecom-bot")]
 mod wecom_bot;
-#[cfg(feature = "wechat")]
-mod wechat;
 #[cfg(feature = "whatsapp")]
 mod whatsapp;
 
@@ -93,9 +93,7 @@ pub fn register_all(
             #[cfg(feature = "email")]
             "email" => email::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "feishu")]
-            "feishu" | "lark" => {
-                feishu::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?
-            }
+            "feishu" | "lark" => feishu::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "twilio")]
             "twilio" => twilio::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "wecom")]
@@ -121,12 +119,7 @@ pub fn register_all(
             #[cfg(feature = "qq-bot")]
             "qq-bot" => qq_bot::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "wechat")]
-            "wechat" => wechat::register(
-                channel_mgr,
-                entry,
-                ctx.shutdown,
-                ctx.wechat_bridge_url,
-            )?,
+            "wechat" => wechat::register(channel_mgr, entry, ctx.shutdown, ctx.wechat_bridge_url)?,
             other => {
                 println!(
                     "{}: channel '{}' not supported, skipping",

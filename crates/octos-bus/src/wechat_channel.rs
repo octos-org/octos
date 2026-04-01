@@ -4,15 +4,15 @@
 //! This channel just translates between the bridge's WS protocol and octos InboundMessage/OutboundMessage.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use eyre::{bail, Result};
+use eyre::{Result, bail};
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
@@ -33,11 +33,7 @@ pub struct WeChatChannel {
 }
 
 impl WeChatChannel {
-    pub fn new(
-        bridge_url: &str,
-        allowed_senders: Vec<String>,
-        shutdown: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(bridge_url: &str, allowed_senders: Vec<String>, shutdown: Arc<AtomicBool>) -> Self {
         Self {
             bridge_url: bridge_url.to_string(),
             allowed_senders: allowed_senders.into_iter().collect(),
@@ -167,7 +163,9 @@ impl Channel for WeChatChannel {
         }
 
         let mut ws = self.ws_tx.lock().await;
-        let tx = ws.as_mut().ok_or_else(|| eyre::eyre!("WeChat: not connected to bridge"))?;
+        let tx = ws
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("WeChat: not connected to bridge"))?;
 
         let payload = json!({
             "type": "send",

@@ -31,11 +31,15 @@ pub enum AuthIdentity {
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Allow any origin — auth is handled via tokens, not CORS.
-    // This is required when the dashboard is accessed via IP or custom domain
-    // rather than localhost.
+    // Restrict CORS to known origins — localhost dev servers and *.ominix.io.
     let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+            let o = origin.to_str().unwrap_or("");
+            o.ends_with(".crew.ominix.io")
+                || o.ends_with(".ominix.io")
+                || o == "http://localhost:3000"
+                || o == "http://localhost:5173"
+        }))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
 
@@ -95,6 +99,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
+        .route("/api/my/provider-models", post(admin::provider_models))
         .route("/api/my/test-search", post(admin::test_search))
         .route("/api/my/model-limits", get(admin::model_limits))
         .route(
@@ -396,6 +401,10 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
 }
 
 /// Auth middleware for user-level access (user session or admin token).
+///
+/// Also accepts `X-Profile-Id` header as authentication for the chat API
+/// routes when accessed through a reverse proxy (e.g. Caddy with per-profile
+/// subdomains). The proxy sets this header to identify the profile.
 async fn user_auth_middleware(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     mut req: axum::http::Request<axum::body::Body>,
@@ -404,23 +413,55 @@ async fn user_auth_middleware(
     let token = extract_token(&req);
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let profile_id = req
+        .headers()
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
-    match resolve_identity(&state, &token).await {
-        Some(identity) => {
-            req.extensions_mut().insert(identity);
-            Ok(next.run(req).await)
+    // 1. Try token-based auth (admin token or OTP session)
+    if let Some(identity) = resolve_identity(&state, &token).await {
+        req.extensions_mut().insert(identity);
+        return Ok(next.run(req).await);
+    }
+
+    // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
+    // The reverse proxy (Caddy) sets this header to identify the profile,
+    // so requests through the proxy are implicitly authenticated.
+    if !profile_id.is_empty() {
+        // Validate that the profile actually exists to prevent spoofing.
+        if let Some(ref store) = state.profile_store {
+            if store.get(&profile_id).ok().flatten().is_none() {
+                tracing::warn!(profile_id = %profile_id, "X-Profile-Id references non-existent profile");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
-        None => {
-            tracing::warn!(
-                method = %method,
-                uri = %uri,
-                token_len = token.len(),
-                token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
-                "user auth rejected"
-            );
-            Err(StatusCode::UNAUTHORIZED)
+
+        let uri_str = uri.path();
+        // Only allow proxy auth for chat-related endpoints, not admin
+        if uri_str.starts_with("/api/chat")
+            || uri_str.starts_with("/api/upload")
+            || uri_str.starts_with("/api/sessions")
+            || uri_str.starts_with("/api/files")
+            || uri_str.starts_with("/api/status")
+        {
+            req.extensions_mut().insert(AuthIdentity::User {
+                id: profile_id,
+                role: UserRole::User,
+            });
+            return Ok(next.run(req).await);
         }
     }
+
+    tracing::warn!(
+        method = %method,
+        uri = %uri,
+        token_len = token.len(),
+        token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
+        "user auth rejected"
+    );
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// Auth middleware for admin-level access (admin token only, or admin role user).

@@ -306,19 +306,54 @@ pub struct ProviderChain {
 
 **Behavior**: Tries providers in order, skipping degraded ones (failures >= threshold). On retriable error, moves to the next. On success, resets failure count. If all degraded, picks the one with fewest failures.
 
-**Retryable**: Same criteria as RetryProvider (429, 5xx, connect/timeout errors).
+**Failoverable**: Broader than retryable — includes 401/403, timeouts, and content-format 400 errors (e.g. `"must not be empty"`, `"reasoning_content"`, `"API key not valid"`, `"invalid_value"`). These should not retry on the *same* provider but *should* failover to a different one.
 
 ### AdaptiveRouter (`adaptive.rs`)
 
-Metrics-driven provider selection. Tracks per-provider EMA latency, p95 latency, error rates. Includes circuit breaker with probe requests to recover failed providers.
+Metrics-driven provider selection with three mutually exclusive modes (Off, Hedge, Lane). Tracks per-provider EMA latency (configurable `ema_alpha`, default 0.3), p95 latency (64-sample circular buffer), error rates, throughput (output tokens/sec EMA), and cost. Four-factor scoring: stability, quality, priority, cost (all weights configurable). Includes circuit breaker, probe requests, model catalog seeding from `model_catalog.json`, and QoS ranking. Scoring uses EMA blending: baseline catalog data at cold start, live metrics gradually replace it (weight ramps from 0 to 1 over 10 calls).
+
+```rust
+pub struct AdaptiveSlot {
+    provider: Arc<dyn LlmProvider>,
+    metrics: ProviderMetrics,
+    priority: usize,
+    cost_per_m: f64,
+    model_type: Mutex<ModelType>,        // Strong | Fast
+    cost_in: AtomicU64,
+    ds_output: AtomicU64,                // deep search output quality
+    baseline_stability: AtomicU64,
+    baseline_tool_avg_ms: AtomicU64,
+    baseline_p95_ms: AtomicU64,
+    context_window: AtomicU64,
+    max_output: AtomicU64,
+}
+```
+
+**Hedge mode**: Races primary + cheapest alternate via `tokio::select!`, cancels loser. Only completed requests record metrics (cancelled loser metrics are discarded). If primary fails, alternate is tried sequentially.
+
+**Lane mode**: Scores all providers, picks single best. Probe requests sent to stale providers (configurable probability, default 0.1; interval, default 60s).
+
+### FallbackProvider (`fallback.rs`)
+
+Wraps primary + QoS-ranked fallbacks. On failure, records cooldown via `ProviderRouter`. Tries each fallback in order.
 
 ### SwappableProvider (`swappable.rs`)
 
-Runtime model switching via `RwLock`. Allows changing the underlying provider without restarting the agent.
+Runtime model switching via `RwLock`. Leaks ~50 bytes per swap (acceptable for rare user-initiated changes). `cached_model_id` and `cached_provider_name` are leaked `&'static str` to satisfy the `&str` return type.
 
 ### ProviderRouter (`router.rs`)
 
-Sub-agent multi-model routing. Routes different sub-agent tasks to different providers/models.
+Sub-agent multi-model routing with prefix-based key resolution. Supports cooldown (60s default), QoS-scored `compatible_fallbacks()` (sorted by model catalog score), cost info auto-derived from `pricing.rs`, and metadata for LLM-visible tool schemas.
+
+```rust
+pub struct ProviderRouter {
+    providers: RwLock<HashMap<String, Arc<dyn LlmProvider>>>,
+    active_key: RwLock<Option<String>>,
+    metadata: RwLock<HashMap<String, SubProviderMeta>>,
+    cooldowns: RwLock<HashMap<String, Instant>>,
+    qos_scores: RwLock<HashMap<String, f64>>,
+}
+```
 
 ### OminixClient (`ominix.rs`)
 
@@ -443,11 +478,11 @@ File-based persistent memory at `{data_dir}/memory/`:
 
 ```rust
 pub struct HybridIndex {
-    inverted: HashMap<String, Vec<(usize, f32)>>,  // term → [(doc_idx, tf)]
+    inverted: HashMap<String, Vec<(usize, u32)>>,  // term → [(doc_idx, raw_tf_count)]
     doc_lengths: Vec<usize>,
+    total_len: usize,                         // running total for O(1) avg_dl
     avg_dl: f64,
     ids: Vec<String>,
-    texts: Vec<String>,
     hnsw: Option<Hnsw<'static, f32, DistCosine>>,
     has_embedding: Vec<bool>,
     dimension: usize,                               // default: 1536
@@ -457,7 +492,8 @@ pub struct HybridIndex {
 **BM25 scoring** (constants: K1=1.2, B=0.75):
 - Tokenization: lowercase, split on non-alphanumeric, filter tokens < 2 chars
 - IDF: `ln((N - df + 0.5) / (df + 0.5) + 1.0)`
-- Score: `IDF * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * dl/avg_dl))`
+- Score: `IDF * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * dl/avg_dl))` — uses **raw term counts** (not normalized)
+- Duplicate detection: `ids.contains(episode_id)` skips already-indexed documents (line 76-78)
 - Normalized to [0, 1] range (epsilon `1e-10` prevents NaN from near-zero max scores)
 
 **HNSW vector index** (via `hnsw_rs`):
@@ -1302,21 +1338,22 @@ crates/
 
 ### Execution Sandbox
 - Three backends: bwrap (Linux), sandbox-exec (macOS), Docker — `SandboxMode::Auto` detection
-- 18 BLOCKED_ENV_VARS shared across all sandbox backends, MCP server spawning, and browser tool
+- 18 BLOCKED_ENV_VARS shared across all sandbox backends, MCP server spawning, hooks, and browser tool: `LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, DYLD_FALLBACK_LIBRARY_PATH, DYLD_VERSIONED_LIBRARY_PATH, NODE_OPTIONS, PYTHONSTARTUP, PYTHONPATH, PERL5OPT, RUBYOPT, RUBYLIB, JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR`
 - Path injection prevention per backend (Docker: `:`, `\0`, `\n`, `\r`; macOS: control chars, `(`, `)`, `\`, `"`)
-- Docker: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network none`
+- Docker: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network none`, blocked bind mount sources (`docker.sock`, `/proc`, `/sys`, `/dev`, `/etc`)
 
 ### Tool Safety
-- ShellTool SafePolicy: deny `rm -rf /`, `dd`, `mkfs`, fork bombs; ask for `sudo`, `git push --force`. Whitespace-normalized before matching. Timeout clamped to [1, 600]s.
-- Tool policies: allow/deny with deny-wins semantics, group support, provider-specific filtering
+- ShellTool SafePolicy: deny `rm -rf /`, `dd`, `mkfs`, fork bombs, `chmod -R 777 /`; ask for `sudo`, `rm -rf`, `git push --force`, `git reset --hard`. Whitespace-normalized before matching. Timeout clamped to [1, 600]s. SIGTERM→grace period→SIGKILL cleanup for child processes.
+- Tool policies: allow/deny with deny-wins semantics, 8 named groups (`group:fs`, `group:runtime`, `group:web`, `group:search`, `group:sessions`, etc.), wildcard matching, provider-specific filtering via `tools.byProvider`
 - Tool argument size limit: 1MB per invocation (non-allocating `estimate_json_size` with escape char accounting)
-- Path traversal prevention + symlink-safe file I/O via `O_NOFOLLOW` (Unix) eliminating TOCTOU races
-- SSRF protection in shared `ssrf.rs` module: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local, IPv4-mapped/compatible). Used by web_fetch and browser.
+- Symlink-safe file I/O via `O_NOFOLLOW` on Unix (atomic kernel-level check, eliminates TOCTOU races); metadata-based symlink check fallback on Windows
+- SSRF protection in shared `ssrf.rs` module: DNS resolution with fail-closed behavior (blocks on DNS failure), private IP blocking (10/8, 172.16/12, 192.168/16, 169.254/16), IPv6 coverage (ULA `fc00::/7`, link-local `fe80::/10`, site-local `fec0::/10`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`), loopback blocking. Used by web_fetch and browser.
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
+- Prompt injection guard (`prompt_guard.rs`): 5 threat categories (SystemOverride, RoleConfusion, ToolCallInjection, SecretExtraction, InstructionInjection), 10 detection patterns. Sanitizes threats by wrapping in `[injection-blocked:...]`.
 
 ### Data Safety
-- Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
+- Tool output sanitization (`sanitize.rs`): strips base64 data URIs, long hex strings (64+ chars), and **credential redaction** with 7 regex patterns covering OpenAI (`sk-...`), Anthropic (`sk-ant-...`), AWS (`AKIA...`), GitHub (`ghp_/gho_/ghs_/ghr_/github_pat_...`), GitLab (`glpat-...`), Bearer tokens, and generic `password`/`api_key` assignments
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
 - Session file size limit: 10MB max prevents OOM on corrupted files

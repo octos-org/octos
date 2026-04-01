@@ -90,9 +90,21 @@ impl PluginLoader {
                 match Self::load_plugin_with_work_dir(&path, extra_env, work_dir) {
                     Ok((tools, extras)) => {
                         let n = tools.len();
+                        let spawn_only = extras.spawn_only_tools.clone();
                         for tool in tools {
-                            result.tool_names.push(tool.name().to_string());
+                            let name = tool.name().to_string();
+                            result.tool_names.push(name.clone());
+                            registry.mark_as_plugin(&name);
                             registry.register(tool);
+                        }
+                        // Defer spawn_only tools so they're hidden from main session specs
+                        // but still registered (available in spawn subagent registries).
+                        if !spawn_only.is_empty() {
+                            registry.defer(spawn_only.iter().cloned());
+                            tracing::info!(
+                                tools = %spawn_only.join(", "),
+                                "deferred spawn-only tools"
+                            );
                         }
                         result.tool_count += n;
                         result.merge_extras(extras);
@@ -246,7 +258,15 @@ impl PluginLoader {
             .map(Duration::from_secs)
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
-        let tools = manifest
+        // Collect spawn_only tool names before consuming manifest.tools
+        let spawn_only_names: Vec<String> = manifest
+            .tools
+            .iter()
+            .filter(|t| t.spawn_only)
+            .map(|t| t.name.clone())
+            .collect();
+
+        let tools: Vec<PluginTool> = manifest
             .tools
             .into_iter()
             .map(|def| {
@@ -260,6 +280,10 @@ impl PluginLoader {
                 tool
             })
             .collect();
+
+        // Return extras with spawn_only info
+        let mut extras = extras;
+        extras.spawn_only_tools = spawn_only_names;
 
         Ok((tools, extras))
     }

@@ -31,6 +31,8 @@ interface ProfileContextValue {
   restartGateway: () => Promise<void>
   profileName: string
   setProfileName: (name: string) => void
+  profileEmail: string
+  setProfileEmail: (email: string) => void
   enabled: boolean
   setEnabled: (enabled: boolean) => void
   logStreamUrl: string
@@ -55,6 +57,7 @@ export function ProfileProvider({ children }: Props) {
   const [config, setConfig] = useState<ProfileConfig>(defaultConfig)
   const [status, setStatus] = useState<ProcessStatus | null>(null)
   const [profileName, setProfileName] = useState('')
+  const [profileEmail, setProfileEmail] = useState('')
   const [enabled, setEnabled] = useState(true)
   const [parentId, setParentId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -92,6 +95,7 @@ export function ProfileProvider({ children }: Props) {
       setConfig(profile.config)
       setStatus(profile.status)
       setProfileName(profile.name)
+      setProfileEmail(profile.email || '')
       setEnabled(profile.enabled)
       setParentId(profile.parent_id || null)
     } catch (e: any) {
@@ -110,6 +114,7 @@ export function ProfileProvider({ children }: Props) {
       setSaving(true)
       const profile = await adapter.updateProfile({
         name: profileName,
+        email: profileEmail || undefined,
         enabled,
         config,
       })
@@ -181,6 +186,8 @@ export function ProfileProvider({ children }: Props) {
     restartGateway,
     profileName,
     setProfileName,
+    profileEmail,
+    setProfileEmail,
     enabled,
     setEnabled,
     logStreamUrl,

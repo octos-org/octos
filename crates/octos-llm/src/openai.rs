@@ -186,12 +186,13 @@ impl OpenAIProvider {
                 // to be present (even empty) on ALL assistant messages when thinking
                 // is enabled. When omitted, the API returns 400 "reasoning_content
                 // is missing in assistant tool call message".
+                // Only synthesize a stub for models that actually need it (detected
+                // via fixed_temperature + model name containing "k2.5").
+                let needs_reasoning_stub =
+                    self.hints.fixed_temperature && self.model.to_lowercase().contains("k2.5");
                 let reasoning = match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
-                    // Kimi-k2.5 requires non-empty reasoning_content on ALL
-                    // assistant messages when thinking is enabled — empty string
-                    // is rejected as "missing".
-                    _ if role == "assistant" => Some("."),
+                    _ if role == "assistant" && needs_reasoning_stub => Some("."),
                     _ => None,
                 };
 

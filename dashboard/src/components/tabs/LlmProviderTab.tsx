@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import type { ProfileConfig, FallbackModel } from '../../types'
 import { PROVIDERS } from '../../types'
 import { myApi } from '../../api'
@@ -19,8 +19,19 @@ function getApiKeyEnvName(provider: string | null | undefined): string {
   return entry?.env || `${(provider || 'ANTHROPIC').toUpperCase()}_API_KEY`
 }
 
-function getModelIds(provider: string): string[] {
-  return (PROVIDER_MODELS[provider]?.models || []).map((m) => m.id)
+function getModelIds(provider: string, fetched?: Record<string, string[]>): string[] {
+  const staticIds = (PROVIDER_MODELS[provider]?.models || []).map((m) => m.id)
+  const dynamicIds = fetched?.[provider] || []
+  // Merge: static first, then any dynamic models not already in static
+  const seen = new Set(staticIds)
+  const merged = [...staticIds]
+  for (const id of dynamicIds) {
+    if (!seen.has(id)) {
+      merged.push(id)
+      seen.add(id)
+    }
+  }
+  return merged
 }
 
 function getModelPricing(provider: string, modelId: string): ModelEntry | null {
@@ -54,6 +65,7 @@ function getFallbackEnvName(provider: string, index: number, allFallbacks: Fallb
 interface Props {
   config: ProfileConfig
   onChange: (config: ProfileConfig) => void
+  profileId?: string
 }
 
 type TestState = 'idle' | 'testing' | 'success' | 'error'
@@ -64,12 +76,45 @@ interface TestResult {
   pricing: ModelEntry | null
 }
 
-export default function LlmProviderTab({ config, onChange }: Props) {
+export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const primaryEnv = getApiKeyEnvName(config.provider)
   const fallbacks = config.fallback_models || []
 
   // Test results keyed by index (-1 = primary)
   const [testResults, setTestResults] = useState<Record<number, TestResult>>({})
+  // Dynamic models fetched from provider APIs (keyed by provider name)
+  const [fetchedModels, setFetchedModels] = useState<Record<string, string[]>>({})
+
+  // Auto-fetch model lists from all configured providers on mount
+  const fetchModelsForProvider = useCallback(async (provider: string, apiKeyEnv?: string | null) => {
+    if (!provider || fetchedModels[provider]) return
+    try {
+      const models = await myApi.fetchProviderModels({
+        provider,
+        model: '',
+        api_key_env: apiKeyEnv || getApiKeyEnvName(provider),
+        profile_id: profileId,
+      })
+      if (models.length > 0) {
+        setFetchedModels((s) => ({ ...s, [provider]: models }))
+      }
+    } catch {
+      // silently ignore — provider may not support /v1/models
+    }
+  }, [fetchedModels])
+
+  useEffect(() => {
+    // Fetch for primary provider
+    if (config.provider) {
+      fetchModelsForProvider(config.provider, config.api_key_env)
+    }
+    // Fetch for each fallback provider
+    for (const fb of fallbacks) {
+      if (fb.provider) {
+        fetchModelsForProvider(fb.provider, fb.api_key_env)
+      }
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateConfig = (patch: Partial<ProfileConfig>) => {
     onChange({ ...config, ...patch })
@@ -77,7 +122,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
 
   /** Change primary provider — updates provider, model, and api_key_env together. */
   const changePrimaryProvider = (provider: string | null) => {
-    const models = getModelIds(provider || '')
+    const models = getModelIds(provider || '', fetchedModels)
     const newEnv = getApiKeyEnvName(provider)
     updateConfig({ provider, model: models[0] || null, api_key_env: newEnv })
   }
@@ -99,14 +144,16 @@ export default function LlmProviderTab({ config, onChange }: Props) {
 
   const addFallback = () => {
     const provider = 'deepseek'
-    const models = getModelIds(provider)
-    const env = getFallbackEnvName(provider, fallbacks.length, fallbacks, primaryEnv)
-    setFallbacks([...fallbacks, { provider, model: models[0] || null, api_key_env: env }])
+    const models = getModelIds(provider, fetchedModels)
+    const env = getFallbackEnvName(provider, 0, fallbacks, primaryEnv)
+    setFallbacks([{ provider, model: models[0] || null, api_key_env: env }, ...fallbacks])
+    // Scroll to the new fallback after render
+    setTimeout(() => document.getElementById('fallback-0')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100)
   }
 
   /** Change fallback provider — updates provider, model, and api_key_env together. */
   const changeFallbackProvider = (idx: number, provider: string) => {
-    const models = getModelIds(provider)
+    const models = getModelIds(provider, fetchedModels)
     const newEnv = getFallbackEnvName(provider, idx, fallbacks, primaryEnv)
     updateFallback(idx, { provider, model: models[0] || null, api_key_env: newEnv })
   }
@@ -178,6 +225,10 @@ export default function LlmProviderTab({ config, onChange }: Props) {
       const pricing = getModelPricing(provider, model)
       if (res.ok) {
         setTestResults((s) => ({ ...s, [key]: { state: 'success', error: '', pricing } }))
+        // Store dynamically fetched models from the provider
+        if (res.models && res.models.length > 0) {
+          setFetchedModels((s) => ({ ...s, [provider]: res.models! }))
+        }
       } else {
         setTestResults((s) => ({ ...s, [key]: { state: 'error', error: res.error || 'Unknown error', pricing: null } }))
       }
@@ -213,6 +264,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
           provider={config.provider || ''}
           model={config.model || ''}
           onModelChange={(model) => updateConfig({ model })}
+          fetchedModels={fetchedModels}
         />
 
         <Field label="API Key" hint={primaryEnv ? `Stored as ${primaryEnv}` : undefined}>
@@ -256,6 +308,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
           return (
             <div
               key={idx}
+              id={`fallback-${idx}`}
               className="bg-surface-dark/30 rounded-lg p-4 border border-gray-700/50 space-y-3"
             >
               <div className="flex items-center justify-between">
@@ -306,6 +359,7 @@ export default function LlmProviderTab({ config, onChange }: Props) {
                 provider={fb.provider}
                 model={fb.model || ''}
                 onModelChange={(model) => updateFallback(idx, { model })}
+                fetchedModels={fetchedModels}
               />
 
               <Field label="API Key" hint={sharesPrimaryKey ? `Shared with primary (${fbEnv})` : `Stored as ${fbEnv}`}>
@@ -338,12 +392,15 @@ export default function LlmProviderTab({ config, onChange }: Props) {
 
 // ── Sub-components ──────────────────────────────────────────────────
 
-function ModelSelect({ provider, model, onModelChange }: { provider: string; model: string; onModelChange: (m: string) => void }) {
+function ModelSelect({ provider, model, onModelChange, fetchedModels }: { provider: string; model: string; onModelChange: (m: string) => void; fetchedModels?: Record<string, string[]> }) {
   const entry = PROVIDER_MODELS[provider || '']
-  const models = entry?.models || []
-  const modelIds = models.map((m) => m.id)
-  const isCustom = model !== '' && !modelIds.includes(model)
-  const pricing = models.find((m) => m.id === model)
+  const staticModels = entry?.models || []
+  const staticIds = staticModels.map((m) => m.id)
+  // Merge static + dynamically fetched models
+  const dynamicIds = (fetchedModels?.[provider] || []).filter((id) => !staticIds.includes(id))
+  const allIds = [...staticIds, ...dynamicIds]
+  const isCustom = model !== '' && !allIds.includes(model)
+  const pricing = staticModels.find((m) => m.id === model)
 
   return (
     <Field label="Model">
@@ -360,14 +417,18 @@ function ModelSelect({ provider, model, onModelChange }: { provider: string; mod
           className="input"
         >
           {!model && <option value="">Select a model...</option>}
-          {models.map((m) => (
+          {staticModels.map((m) => (
             <option key={m.id} value={m.id}>
               {m.id} — {m.input === 0 && m.output === 0 ? 'Free' : `$${m.input}/$${m.output} per 1M tokens`}
             </option>
           ))}
+          {dynamicIds.length > 0 && <option disabled>── fetched from API ──</option>}
+          {dynamicIds.map((id) => (
+            <option key={id} value={id}>{id}</option>
+          ))}
           <option value="__custom__">{isCustom ? `Custom: ${model}` : 'Custom model...'}</option>
         </select>
-        {(isCustom || (!model && models.length === 0)) && (
+        {(isCustom || (!model && allIds.length === 0)) && (
           <input
             value={model}
             onChange={(e) => onModelChange(e.target.value)}

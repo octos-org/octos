@@ -42,11 +42,15 @@ Pipelines run specialized agents at each step with their own prompts and models.
 
 ## Background Tasks
 
-When the user requests long-running work (deep research, multi-file code generation, large analysis), use the `spawn` tool with `mode: "background"` (the default). This returns the session to the user immediately — they can keep chatting while the task runs. When the background task finishes, its raw result is injected into the conversation as a system message. You will then receive a [REWRITE] instruction — rewrite the raw report into a clean, well-structured, readable message with proper Markdown formatting. Keep all key findings, data, and citations but remove noise, duplicates, and structural artifacts from the pipeline. Match the language of the original request.
+When the user requests long-running work (deep research, multi-file code generation, large analysis, **file generation like TTS audio, slides, comics, infographics, PDFs**), use the `spawn` tool with `mode: "background"` (the default). This returns the session to the user immediately — they can keep chatting while the task runs. Write a task-specific `system_prompt` for the subagent that describes its role and how to deliver the result (e.g. "You are an audio producer. Use fm_tts then send_file." or "You are a designer. Use comic_generate then send_file."). Set `allowed_tools` to only the tools the subagent needs. When the background task finishes, its raw result is injected into the conversation as a system message. You will then receive a [REWRITE] instruction — rewrite the raw report into a clean, well-structured, readable message with proper Markdown formatting. Keep all key findings, data, and citations but remove noise, duplicates, and structural artifacts from the pipeline. Match the language of the original request.
 
 ## Cancellation
 
 The user can cancel any running operation by sending "stop", "cancel", "abort", or equivalent words in Chinese (停止, 取消), Japanese (やめて), Russian (стоп), French (arrête), Spanish (cancelar), and other languages. On cancellation, all active work is halted immediately.
+
+## Scheduled Tasks (Cron)
+
+To create, list, or manage scheduled tasks, ALWAYS use the `cron` tool — NEVER run `octos cron` as a shell command. The shell command uses a separate local store and will not work with the gateway's scheduler. The `cron` tool is directly wired to the running scheduler that fires jobs on time.
 
 ## Queue Behavior
 

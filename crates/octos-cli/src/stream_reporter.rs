@@ -306,9 +306,7 @@ pub async fn run_stream_forwarder(
                     updater(&format!("Running {name}"));
                 }
                 // Show tool status line in the streaming message
-                if !no_edit_support
-                    && is_session_active(&session_key, &active_sessions).await
-                {
+                if !no_edit_support && is_session_active(&session_key, &active_sessions).await {
                     if buffer.is_empty() {
                         buffer.push_str(&format!("⚙ `{name}`..."));
                     } else {

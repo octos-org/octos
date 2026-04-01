@@ -339,8 +339,17 @@ impl ProfileActorFactoryBuilder {
             // Load plugins
             let plugin_work_dir = profile_data_dir.join("skill-output");
             let mut plugin_env = build_plugin_env(&profile_config, &provider_name);
-            plugin_env.push(("OCTOS_DATA_DIR".to_string(), profile_data_dir.to_string_lossy().to_string()));
-            plugin_env.push(("OCTOS_VOICE_DIR".to_string(), profile_data_dir.join("voice_profiles").to_string_lossy().to_string()));
+            plugin_env.push((
+                "OCTOS_DATA_DIR".to_string(),
+                profile_data_dir.to_string_lossy().to_string(),
+            ));
+            plugin_env.push((
+                "OCTOS_VOICE_DIR".to_string(),
+                profile_data_dir
+                    .join("voice_profiles")
+                    .to_string_lossy()
+                    .to_string(),
+            ));
             let mut plugin_dirs =
                 crate::config::Config::plugin_dirs_from_project(&self.project_dir);
             let profile_skills = profile_data_dir.join("skills");
