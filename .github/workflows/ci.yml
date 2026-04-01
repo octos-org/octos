@@ -81,6 +81,23 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  check-riscv:
+    runs-on: ubuntu-24.04-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: riscv64
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
   check-windows:
     runs-on: windows-latest
     steps:
