@@ -33,6 +33,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
+    deferred_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sessions: Arc<Mutex<SessionManager>>,
 }
 
@@ -58,6 +59,10 @@ pub struct ApiChannel {
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Track last sent content per chat_id for delta computation.
     last_content: Arc<Mutex<HashMap<String, String>>>,
+    /// Buffered file events for sessions without an active SSE connection.
+    /// Background tasks (spawn_only) may complete after the SSE stream closes;
+    /// their file events are stored here and flushed on the next /chat request.
+    deferred_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sessions: Arc<Mutex<SessionManager>>,
 }
 
@@ -74,6 +79,7 @@ impl ApiChannel {
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
+            deferred_files: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         }
     }
@@ -90,6 +96,7 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
+            deferred_files: self.deferred_files.clone(),
             sessions: self.sessions.clone(),
         };
 
@@ -139,27 +146,21 @@ impl Channel for ApiChannel {
                 self.last_content.lock().await.remove(&msg.chat_id);
             } else if !msg.media.is_empty() {
                 // File message — send file paths so web client can download
+                let mut all_sent = true;
                 for file_path in &msg.media {
-                    let filename = std::path::Path::new(file_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    info!(
-                        chat_id = %msg.chat_id,
-                        file = %file_path,
-                        filename = %filename,
-                        "sending file SSE event"
-                    );
-                    let event = serde_json::json!({
-                        "type": "file",
-                        "path": file_path,
-                        "filename": filename,
-                        "caption": msg.content,
-                    });
-                    let send_ok = tx.send(event.to_string()).is_ok();
-                    if !send_ok {
-                        info!(chat_id = %msg.chat_id, "file SSE send failed — client disconnected");
+                    let event = self.make_file_event(file_path, &msg.content);
+                    let send_ok = tx.send(event.clone()).is_ok();
+                    if send_ok {
+                        info!(chat_id = %msg.chat_id, file = %file_path, "sent file SSE event");
+                    } else {
+                        info!(chat_id = %msg.chat_id, file = %file_path, "file SSE send failed — deferring");
+                        all_sent = false;
                     }
+                }
+                if !all_sent {
+                    // SSE closed mid-send — defer remaining files
+                    drop(pending);
+                    self.defer_file_events(msg).await;
                 }
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
@@ -171,6 +172,12 @@ impl Channel for ApiChannel {
                     pending.remove(&msg.chat_id);
                 }
             }
+        } else if !msg.media.is_empty() {
+            // No active SSE connection — defer file events for next /chat request.
+            // This happens when spawn_only background tasks complete after the
+            // original SSE stream has closed.
+            drop(pending);
+            self.defer_file_events(msg).await;
         }
         Ok(())
     }
@@ -245,6 +252,37 @@ impl Channel for ApiChannel {
     }
 }
 
+impl ApiChannel {
+    /// Build a JSON string for a file SSE event.
+    fn make_file_event(&self, file_path: &str, caption: &str) -> String {
+        let filename = std::path::Path::new(file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        serde_json::json!({
+            "type": "file",
+            "path": file_path,
+            "filename": filename,
+            "caption": caption,
+        })
+        .to_string()
+    }
+
+    /// Buffer file events for delivery on the next SSE connection.
+    async fn defer_file_events(&self, msg: &OutboundMessage) {
+        let mut deferred = self.deferred_files.lock().await;
+        let buf = deferred.entry(msg.chat_id.clone()).or_default();
+        for file_path in &msg.media {
+            info!(
+                chat_id = %msg.chat_id,
+                file = %file_path,
+                "deferred file event (no active SSE)"
+            );
+            buf.push(self.make_file_event(file_path, &msg.content));
+        }
+    }
+}
+
 /// POST /chat handler — accepts a message, returns an SSE stream of events.
 async fn handle_chat(
     State(state): State<ApiState>,
@@ -287,6 +325,18 @@ async fn handle_chat(
             None
         } else {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
+            // Flush any deferred file events from background tasks that
+            // completed while no SSE connection was active.
+            let deferred = state
+                .deferred_files
+                .lock()
+                .await
+                .remove(&session_id)
+                .unwrap_or_default();
+            for event_json in deferred {
+                info!(session = %session_id, "flushing deferred file event");
+                let _ = tx.send(event_json);
+            }
             pending.insert(session_id.clone(), tx);
             Some(rx)
         }
