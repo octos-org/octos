@@ -269,72 +269,6 @@ impl EpisodeStore {
         .await?
     }
 
-    /// Get the N most recent episodes for a directory.
-    ///
-    /// Retained for admin API use (e.g. dashboard episode browser).
-    #[allow(dead_code)]
-    pub async fn recent_for_cwd(&self, cwd: &Path, n: usize) -> Result<Vec<Episode>> {
-        let db = self.db.clone();
-        let cwd_str = cwd.to_string_lossy().to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read()?;
-            let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
-            let index_table = read_txn.open_table(CWD_INDEX_TABLE)?;
-
-            // Get episode IDs for this cwd
-            let episode_ids: Vec<String> = index_table
-                .get(cwd_str.as_str())?
-                .map(|v| match serde_json::from_str(v.value()) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        warn!("failed to parse episode index JSON: {e}");
-                        Vec::new()
-                    }
-                })
-                .unwrap_or_default();
-
-            // Load episodes
-            let mut episodes: Vec<Episode> = Vec::new();
-
-            for id in episode_ids {
-                if let Some(json) = episodes_table.get(id.as_str())? {
-                    if let Ok(episode) = serde_json::from_str::<Episode>(json.value()) {
-                        episodes.push(episode);
-                    }
-                }
-            }
-
-            // Sort by created_at descending
-            episodes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-            Ok(episodes.into_iter().take(n).collect())
-        })
-        .await?
-    }
-
-    /// Get an episode by ID.
-    ///
-    /// Retained for admin API use (e.g. episode detail endpoint).
-    #[allow(dead_code)]
-    pub async fn get(&self, id: &str) -> Result<Option<Episode>> {
-        let db = self.db.clone();
-        let id = id.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(EPISODES_TABLE)?;
-
-            if let Some(json) = table.get(id.as_str())? {
-                let episode: Episode = serde_json::from_str(json.value())?;
-                Ok(Some(episode))
-            } else {
-                Ok(None)
-            }
-        })
-        .await?
-    }
-
     /// Store an embedding for an episode.
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         let db = self.db.clone();
@@ -361,6 +295,76 @@ impl EpisodeStore {
         }
 
         Ok(())
+    }
+
+    /// Delete an episode by its ID. Removes from all DB tables and the in-memory index.
+    ///
+    /// Returns `true` if the episode existed and was deleted.
+    pub async fn delete_by_id(&self, episode_id: &str) -> Result<bool> {
+        let db = self.db.clone();
+        let ep_id = episode_id.to_string();
+
+        let found = tokio::task::spawn_blocking(move || {
+            let write_txn = db.begin_write()?;
+            let existed = {
+                // Remove from episodes table
+                let mut episodes = write_txn.open_table(EPISODES_TABLE)?;
+                let old = episodes.remove(ep_id.as_str())?;
+
+                if let Some(old_json) = &old {
+                    // Parse to get the cwd so we can update the cwd index
+                    if let Ok(episode) = serde_json::from_str::<Episode>(old_json.value()) {
+                        let cwd = episode.working_dir.to_string_lossy().to_string();
+                        let mut cwd_index = write_txn.open_table(CWD_INDEX_TABLE)?;
+                        if let Some(ids_json) = cwd_index.get(cwd.as_str())? {
+                            let mut ids: Vec<String> =
+                                serde_json::from_str(ids_json.value()).unwrap_or_default();
+                            ids.retain(|id| id != &ep_id);
+                            if ids.is_empty() {
+                                cwd_index.remove(cwd.as_str())?;
+                            } else {
+                                let new_json = serde_json::to_string(&ids)?;
+                                cwd_index.insert(cwd.as_str(), new_json.as_str())?;
+                            }
+                        }
+                    }
+                }
+
+                // Remove embedding
+                let mut embeddings = write_txn.open_table(EMBEDDINGS_TABLE)?;
+                embeddings.remove(ep_id.as_str())?;
+
+                old.is_some()
+            };
+            write_txn.commit()?;
+            Ok::<_, eyre::Report>(existed)
+        })
+        .await??;
+
+        // Remove from in-memory hybrid index
+        if found {
+            match self.index.write() {
+                Ok(mut idx) => {
+                    idx.remove(episode_id);
+                }
+                Err(e) => warn!("index write lock poisoned, skipping removal: {e}"),
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Delete multiple episodes by their IDs.
+    ///
+    /// Returns the number of episodes that were actually deleted.
+    pub async fn delete_many(&self, episode_ids: &[String]) -> Result<usize> {
+        let mut deleted = 0;
+        for id in episode_ids {
+            if self.delete_by_id(id).await? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Hybrid search across all episodes (not cwd-scoped).
@@ -431,66 +435,28 @@ mod tests {
     async fn test_open_creates_db() {
         let dir = tempfile::tempdir().unwrap();
         let store = EpisodeStore::open(dir.path()).await.unwrap();
-        // Verify we can get a nonexistent episode
-        let result = store.get("nonexistent").await.unwrap();
-        assert!(result.is_none());
+        // Verify empty store returns no results
+        let results = store
+            .find_relevant(Path::new("/nonexistent"), "anything", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]
-    async fn test_store_and_get() {
+    async fn test_store_and_find() {
         let dir = tempfile::tempdir().unwrap();
         let store = EpisodeStore::open(dir.path()).await.unwrap();
 
         let ep = make_episode("Fixed parser bug", "/tmp/project");
-        let ep_id = ep.id.clone();
-
         store.store(ep).await.unwrap();
 
-        let retrieved = store.get(&ep_id).await.unwrap();
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.id, ep_id);
-        assert_eq!(retrieved.summary, "Fixed parser bug");
-    }
-
-    #[tokio::test]
-    async fn test_recent_for_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = EpisodeStore::open(dir.path()).await.unwrap();
-
-        let ep1 = make_episode("first task", "/project");
-        let ep2 = make_episode("second task", "/project");
-        let ep3 = make_episode("other dir task", "/other");
-
-        store.store(ep1).await.unwrap();
-        store.store(ep2).await.unwrap();
-        store.store(ep3).await.unwrap();
-
-        let recent = store
-            .recent_for_cwd(Path::new("/project"), 10)
+        let results = store
+            .find_relevant(Path::new("/tmp/project"), "parser", 10)
             .await
             .unwrap();
-        assert_eq!(recent.len(), 2);
-
-        let other = store.recent_for_cwd(Path::new("/other"), 10).await.unwrap();
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].summary, "other dir task");
-    }
-
-    #[tokio::test]
-    async fn test_recent_for_cwd_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = EpisodeStore::open(dir.path()).await.unwrap();
-
-        for i in 0..5 {
-            store
-                .store(make_episode(&format!("task {i}"), "/proj"))
-                .await
-                .unwrap();
-        }
-
-        let recent = store.recent_for_cwd(Path::new("/proj"), 3).await.unwrap();
-        assert_eq!(recent.len(), 3);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary, "Fixed parser bug");
     }
 
     #[tokio::test]
@@ -561,19 +527,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reopen_persists_data() {
+    async fn should_delete_episode_when_id_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let ep = make_episode("Delete me", "/proj");
+        let ep_id = ep.id.clone();
+        store.store(ep).await.unwrap();
+
+        // Verify it exists
+        let results = store
+            .find_relevant(Path::new("/proj"), "delete", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Delete it
+        let deleted = store.delete_by_id(&ep_id).await.unwrap();
+        assert!(deleted);
+
+        // Verify it's gone
+        let results = store
+            .find_relevant(Path::new("/proj"), "delete", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_deleting_nonexistent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let deleted = store.delete_by_id("nonexistent-id").await.unwrap();
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn should_delete_many_episodes_when_bulk_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let ep1 = make_episode("First episode", "/proj");
+        let ep2 = make_episode("Second episode", "/proj");
+        let ep3 = make_episode("Third episode", "/proj");
+        let id1 = ep1.id.clone();
+        let id2 = ep2.id.clone();
+        let id3 = ep3.id.clone();
+        store.store(ep1).await.unwrap();
+        store.store(ep2).await.unwrap();
+        store.store(ep3).await.unwrap();
+
+        // Delete two of three
+        let count = store
+            .delete_many(&[id1, id2, "nonexistent".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Only ep3 should remain
+        let results = store
+            .find_relevant(Path::new("/proj"), "episode", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id3);
+    }
+
+    #[tokio::test]
+    async fn should_not_find_deleted_episode_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let ep_id;
         {
             let store = EpisodeStore::open(dir.path()).await.unwrap();
-            let ep = make_episode("persistent data", "/proj");
+            let ep = make_episode("Ephemeral data", "/proj");
             ep_id = ep.id.clone();
             store.store(ep).await.unwrap();
+            store.delete_by_id(&ep_id).await.unwrap();
         }
-        // Reopen
+        // Reopen and verify deletion persisted
         let store = EpisodeStore::open(dir.path()).await.unwrap();
-        let retrieved = store.get(&ep_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().summary, "persistent data");
+        let results = store
+            .find_relevant(Path::new("/proj"), "ephemeral", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reopen_persists_data() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = EpisodeStore::open(dir.path()).await.unwrap();
+            let ep = make_episode("persistent data", "/proj");
+            store.store(ep).await.unwrap();
+        }
+        // Reopen and verify data persists via find_relevant
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+        let results = store
+            .find_relevant(Path::new("/proj"), "persistent", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary, "persistent data");
     }
 }
