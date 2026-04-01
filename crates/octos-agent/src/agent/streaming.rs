@@ -295,8 +295,7 @@ fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
         .or_else(|| extract_json_string_field(raw, "file_path"))?;
 
     // Try to find "content" field — it may be truncated
-    let content = extract_json_string_field(raw, "content")
-        .unwrap_or_default();
+    let content = extract_json_string_field(raw, "content").unwrap_or_default();
 
     if path.is_empty() {
         return None;
@@ -304,7 +303,9 @@ fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
 
     // Add a truncation notice if the JSON was clearly cut off
     let content = if !raw.ends_with('}') && !content.is_empty() {
-        format!("{content}\n\n---\n*[Note: This report was truncated due to output length limits. The content above is partial.]*")
+        format!(
+            "{content}\n\n---\n*[Note: This report was truncated due to output length limits. The content above is partial.]*"
+        )
     } else {
         content
     };
@@ -319,10 +320,7 @@ fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
 /// Handles JSON escaping within the string value.
 fn extract_json_string_field(raw: &str, key: &str) -> Option<String> {
     // Look for "key": " or "key":"
-    let patterns = [
-        format!("\"{key}\": \""),
-        format!("\"{key}\":\""),
-    ];
+    let patterns = [format!("\"{key}\": \""), format!("\"{key}\":\"")];
 
     for pattern in &patterns {
         if let Some(start) = raw.find(pattern.as_str()) {

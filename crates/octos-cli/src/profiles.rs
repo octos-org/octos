@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use eyre::{bail, Result, WrapErr};
+use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
@@ -1483,9 +1483,11 @@ mod tests {
         assert!(empty.is_empty());
 
         // Duplicate should fail
-        assert!(store
-            .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
-            .is_err());
+        assert!(
+            store
+                .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
+                .is_err()
+        );
     }
 
     #[test]

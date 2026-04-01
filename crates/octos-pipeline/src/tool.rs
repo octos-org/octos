@@ -306,11 +306,7 @@ impl Tool for RunPipelineTool {
         }
 
         // Also set files_to_send so the execution loop auto-delivers
-        let files_to_send = report_file
-            .iter()
-            .filter(|p| p.exists())
-            .cloned()
-            .collect();
+        let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
 
         Ok(ToolResult {
             output: format!(

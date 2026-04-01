@@ -581,19 +581,17 @@ impl ActorFactory {
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
-        tools.set_background_result_sender(Arc::new(
-            move |task_label: String, content: String| {
-                let tx = bg_tx2.clone();
-                Box::pin(async move {
-                    tx.send(ActorMessage::BackgroundResult {
-                        task_label,
-                        content,
-                    })
-                    .await
-                    .is_ok()
+        tools.set_background_result_sender(Arc::new(move |task_label: String, content: String| {
+            let tx = bg_tx2.clone();
+            Box::pin(async move {
+                tx.send(ActorMessage::BackgroundResult {
+                    task_label,
+                    content,
                 })
-            },
-        ));
+                .await
+                .is_ok()
+            })
+        }));
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(

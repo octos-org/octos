@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use reqwest::redirect::Policy;
 use reqwest::Client;
+use reqwest::redirect::Policy;
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
@@ -215,7 +215,9 @@ async fn ssrf_safe_fetch(initial_url: &str) -> Result<reqwest::Response, String>
         for addr in &check.resolved_addrs {
             builder = builder.resolve(&host, *addr);
         }
-        let client = builder.build().map_err(|e| format!("HTTP client error: {e}"))?;
+        let client = builder
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
 
         let response = client
             .get(&current_url)

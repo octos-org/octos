@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use super::{Sandbox, BLOCKED_ENV_VARS};
+use super::{BLOCKED_ENV_VARS, Sandbox};
 
 /// Linux sandbox using bubblewrap (bwrap).
 pub struct BwrapSandbox {

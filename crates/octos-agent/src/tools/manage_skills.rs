@@ -543,9 +543,7 @@ fn skill_version(skill_dir: &std::path::Path) -> Option<String> {
 
 /// Simple semver comparison: is `a` newer than `b`?
 fn version_newer(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Vec<u32> {
-        s.split('.').filter_map(|p| p.parse().ok()).collect()
-    };
+    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
     let va = parse(a);
     let vb = parse(b);
     for i in 0..va.len().max(vb.len()) {

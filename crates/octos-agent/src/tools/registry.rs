@@ -7,14 +7,14 @@ use std::sync::Arc;
 use eyre::Result;
 use octos_llm::ToolSpec;
 
+#[cfg(feature = "ast")]
+use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
     BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
     ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
-#[cfg(feature = "ast")]
-use super::CodeStructureTool;
 use crate::sandbox::{NoSandbox, Sandbox};
 
 /// Estimate the serialized JSON size without allocating.

@@ -510,12 +510,12 @@ impl ServeCommand {
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                println!();
-                println!("{}", "Shutting down server...".yellow());
-            })
-            .await?;
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            println!();
+            println!("{}", "Shutting down server...".yellow());
+        })
+        .await?;
 
         // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");

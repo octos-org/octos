@@ -1392,8 +1392,14 @@ mod tests {
 
         assert_eq!(mgr.get_or_create(&k1).await.messages.len(), 1);
         assert_eq!(mgr.get_or_create(&k2).await.messages.len(), 1);
-        assert_eq!(mgr.get_or_create(&k1).await.messages[0].content, "from chat1");
-        assert_eq!(mgr.get_or_create(&k2).await.messages[0].content, "from chat2");
+        assert_eq!(
+            mgr.get_or_create(&k1).await.messages[0].content,
+            "from chat1"
+        );
+        assert_eq!(
+            mgr.get_or_create(&k2).await.messages[0].content,
+            "from chat2"
+        );
     }
 
     #[tokio::test]

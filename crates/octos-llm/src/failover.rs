@@ -99,7 +99,8 @@ impl ProviderChain {
     }
 
     fn record_success(&self, index: usize) {
-        self.last_success_index.store(index as u32, Ordering::Relaxed);
+        self.last_success_index
+            .store(index as u32, Ordering::Relaxed);
         let prev = self.slots[index].failures.swap(0, Ordering::Relaxed);
         if prev > 0 {
             info!(
@@ -178,14 +179,12 @@ impl LlmProvider for ProviderChain {
     ) -> Result<ChatResponse> {
         let fut = self.chat_inner(messages, tools, config);
         match self.max_request_duration {
-            Some(dur) => tokio::time::timeout(dur, fut)
-                .await
-                .map_err(|_| {
-                    eyre::eyre!(
-                        "ProviderChain timed out after {:.0}s (all retries + failovers)",
-                        dur.as_secs_f64()
-                    )
-                })?,
+            Some(dur) => tokio::time::timeout(dur, fut).await.map_err(|_| {
+                eyre::eyre!(
+                    "ProviderChain timed out after {:.0}s (all retries + failovers)",
+                    dur.as_secs_f64()
+                )
+            })?,
             None => fut.await,
         }
     }
