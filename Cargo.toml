@@ -19,6 +19,7 @@ members = [
     "crates/platform-skills/voice",
     "crates/octos-pipeline",
     "crates/octos-plugin",
+    "crates/octos-sandbox",
 ]
 
 [workspace.package]
@@ -151,7 +152,7 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 mailparse = "0.16"
 
 # Web API (optional)
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8"
 metrics = "0.24"

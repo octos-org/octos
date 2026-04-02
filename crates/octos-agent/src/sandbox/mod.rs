@@ -6,10 +6,14 @@
 mod bwrap;
 mod docker;
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 pub use bwrap::BwrapSandbox;
 pub use docker::DockerSandbox;
 pub use macos::MacosSandbox;
+#[cfg(windows)]
+pub use windows::AppContainerSandbox;
 
 use std::path::Path;
 
@@ -172,7 +176,7 @@ pub enum MountMode {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
-    /// Auto-detect: bwrap on Linux, sandbox-exec on macOS, none elsewhere.
+    /// Auto-detect: bwrap on Linux, sandbox-exec on macOS, AppContainer on Windows.
     #[default]
     Auto,
     /// Linux bubblewrap.
@@ -181,6 +185,9 @@ pub enum SandboxMode {
     Macos,
     /// Docker container isolation.
     Docker,
+    /// Windows AppContainer isolation.
+    #[serde(rename = "appcontainer")]
+    AppContainer,
     /// No sandboxing (pass-through).
     None,
 }
@@ -231,6 +238,21 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             config: config.docker.clone(),
             allow_network: config.allow_network,
         }),
+        SandboxMode::AppContainer => {
+            #[cfg(windows)]
+            {
+                Box::new(AppContainerSandbox {
+                    allow_network: config.allow_network,
+                    read_allow_paths: config.read_allow_paths.clone(),
+                    profile_name: None,
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                tracing::warn!("AppContainer is only available on Windows, falling back to NoSandbox");
+                Box::new(NoSandbox)
+            }
+        }
         SandboxMode::Auto => {
             if cfg!(target_os = "linux") && which_exists("bwrap") {
                 Box::new(BwrapSandbox {
@@ -241,6 +263,19 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                 })
+            } else if cfg!(target_os = "windows") {
+                #[cfg(windows)]
+                {
+                    Box::new(AppContainerSandbox {
+                        allow_network: config.allow_network,
+                        read_allow_paths: config.read_allow_paths.clone(),
+                        profile_name: None,
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    Box::new(NoSandbox)
+                }
             } else if which_exists("docker") {
                 Box::new(DockerSandbox {
                     config: config.docker.clone(),
@@ -248,7 +283,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 })
             } else {
                 tracing::warn!(
-                    "no sandbox backend found (bwrap, sandbox-exec, or docker). \
+                    "no sandbox backend found (bwrap, sandbox-exec, docker, or AppContainer). \
                      Shell commands will run WITHOUT isolation. \
                      Install a sandbox backend or set sandbox.enabled = false to silence this warning."
                 );
