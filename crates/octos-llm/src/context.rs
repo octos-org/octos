@@ -28,7 +28,7 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
     for (key, ctx, max_out) in entries {
         // Store by full key ("dashscope/qwen3.5-plus") and by model name alone ("qwen3.5-plus")
         map.insert(
-            key.clone(),
+            key.to_lowercase(),
             CatalogModel {
                 context_window: *ctx,
                 max_output: *max_out,
@@ -36,7 +36,7 @@ pub fn seed_from_catalog(entries: &[(String, u64, u64)]) {
         );
         if let Some(model) = key.split('/').next_back() {
             map.insert(
-                model.to_string(),
+                model.to_lowercase(),
                 CatalogModel {
                     context_window: *ctx,
                     max_output: *max_out,
