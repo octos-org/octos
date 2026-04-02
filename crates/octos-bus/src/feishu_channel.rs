@@ -818,6 +818,66 @@ impl FeishuChannel {
         Ok(message_id)
     }
 
+    /// Reply to a specific message via Feishu's reply API.
+    async fn reply_message(
+        &self,
+        parent_message_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<()> {
+        self.reply_message_returning_id(parent_message_id, msg_type, content)
+            .await?;
+        Ok(())
+    }
+
+    /// Reply to a message and return the new message_id.
+    async fn reply_message_returning_id(
+        &self,
+        parent_message_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
+        let token = self.get_token().await?;
+
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content,
+        });
+
+        let resp: serde_json::Value = self
+            .http
+            .post(format!(
+                "{}/im/v1/messages/{parent_message_id}/reply",
+                self.base_url
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to reply Feishu message")?
+            .json()
+            .await?;
+
+        let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let err_msg = resp
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            warn!("Feishu reply error: {err_msg}");
+            return Ok(None);
+        }
+
+        let message_id = resp
+            .get("data")
+            .and_then(|d| d.get("message_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(message_id)
+    }
+
     /// Determine receive_id_type from chat_id prefix.
     fn receive_id_type(chat_id: &str) -> &'static str {
         if chat_id.starts_with("oc_") {
@@ -1013,7 +1073,7 @@ impl FeishuChannel {
                     "message_type": msg_type,
                 }
             }),
-            message_id: None,
+            message_id: Some(message_id.to_string()),
         })
     }
 
@@ -1418,6 +1478,8 @@ impl Channel for FeishuChannel {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        let reply_to = msg.reply_to.as_deref();
+
         // Send text content as interactive card with markdown
         if !msg.content.is_empty() {
             let card = serde_json::json!({
@@ -1428,11 +1490,17 @@ impl Channel for FeishuChannel {
                     }
                 ]
             });
-            self.send_message(&msg.chat_id, "interactive", &card.to_string())
-                .await?;
+            let card_str = card.to_string();
+            if let Some(parent_id) = reply_to {
+                self.reply_message(parent_id, "interactive", &card_str)
+                    .await?;
+            } else {
+                self.send_message(&msg.chat_id, "interactive", &card_str)
+                    .await?;
+            }
         }
 
-        // Send media files
+        // Send media files (always as top-level messages — reply only the first text)
         for path in &msg.media {
             if is_image(path) {
                 match self.upload_image(path).await {
@@ -1483,8 +1551,14 @@ impl Channel for FeishuChannel {
                 }
             ]
         });
-        self.send_message_returning_id(&msg.chat_id, "interactive", &card.to_string())
-            .await
+        let card_str = card.to_string();
+        if let Some(parent_id) = msg.reply_to.as_deref() {
+            self.reply_message_returning_id(parent_id, "interactive", &card_str)
+                .await
+        } else {
+            self.send_message_returning_id(&msg.chat_id, "interactive", &card_str)
+                .await
+        }
     }
 
     async fn edit_message(
@@ -1693,6 +1767,32 @@ mod tests {
         // Deterministic
         let sig2 = verify_signature("ts123", "nonce456", "mykey", r#"{"test":"body"}"#);
         assert_eq!(sig, sig2);
+    }
+
+    #[tokio::test]
+    async fn should_preserve_message_id_from_inbound_event() {
+        let ch = make_channel(vec![]);
+        let envelope = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_user1" }
+                },
+                "message": {
+                    "message_id": "om_abc123",
+                    "chat_id": "oc_chat1",
+                    "message_type": "text",
+                    "content": r#"{"text":"hello"}"#
+                }
+            }
+        });
+
+        let inbound = ch.parse_event(&envelope).await.expect("should parse");
+        assert_eq!(
+            inbound.message_id,
+            Some("om_abc123".to_string()),
+            "Feishu must preserve platform message_id for reply threading"
+        );
     }
 
     #[test]

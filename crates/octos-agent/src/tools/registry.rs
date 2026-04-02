@@ -76,6 +76,8 @@ pub struct ToolRegistry {
     background_result_sender: Option<super::spawn::BackgroundResultSender>,
     /// Number of spawn_only background tasks currently in flight.
     active_bg_tasks: Arc<AtomicU32>,
+    /// Set to true when any spawn_only tool is actually invoked in this agent run.
+    spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for ToolRegistry {
@@ -99,6 +101,7 @@ impl ToolRegistry {
             spawn_only_messages: HashMap::new(),
             background_result_sender: None,
             active_bg_tasks: Arc::new(AtomicU32::new(0)),
+            spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -161,6 +164,21 @@ impl ToolRegistry {
     /// Return the set of spawn_only tool names.
     pub fn spawn_only_tools(&self) -> &HashSet<String> {
         &self.spawn_only
+    }
+
+    /// Mark that a spawn_only tool was invoked in this agent run.
+    pub fn mark_spawn_only_invoked(&self) {
+        self.spawn_only_invoked.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if any spawn_only tool was invoked in this agent run.
+    pub fn spawn_only_was_invoked(&self) -> bool {
+        self.spawn_only_invoked.load(Ordering::SeqCst)
+    }
+
+    /// Reset the spawn_only_invoked flag (call at start of each agent run).
+    pub fn reset_spawn_only_invoked(&self) {
+        self.spawn_only_invoked.store(false, Ordering::SeqCst);
     }
 
     /// Check if a tool came from a plugin binary.
@@ -312,6 +330,7 @@ impl ToolRegistry {
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: self.background_result_sender.clone(),
             active_bg_tasks: self.active_bg_tasks.clone(),
+            spawn_only_invoked: self.spawn_only_invoked.clone(),
         }
     }
 

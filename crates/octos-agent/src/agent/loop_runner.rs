@@ -60,6 +60,9 @@ impl Agent {
         media: Vec<String>,
         tracker: Option<&TokenTracker>,
     ) -> Result<ConversationResponse> {
+        // Reset per-run flags
+        self.tools.reset_spawn_only_invoked();
+
         let mut messages = vec![Message {
             role: MessageRole::System,
             content: self

@@ -86,8 +86,8 @@ fn run_passthrough(args: &Args) -> eyre::Result<u8> {
 fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
     use eyre::WrapErr;
     use rappct::acl::{self, AccessMask, ResourcePath};
-    use rappct::launch::{JobLimits, LaunchOptions, StdioConfig};
-    use rappct::{AppContainerProfile, SecurityCapabilitiesBuilder, launch_in_container};
+    use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
+    use rappct::{AppContainerProfile, SecurityCapabilitiesBuilder};
 
     // 1. Create or reuse the AppContainer profile
     let profile = AppContainerProfile::ensure(
@@ -129,14 +129,15 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
 
     // 5. Build command line
     let cmdline = args.command.join(" ");
+    let exe: PathBuf = args
+        .command
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows\\System32\\cmd.exe"));
 
-    // 6. Launch
+    // 6. Launch with IO (needed for wait())
     let opts = LaunchOptions {
-        exe: args
-            .command
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "cmd.exe".into()),
+        exe,
         cmdline: Some(cmdline),
         cwd: Some(args.cwd.clone()),
         stdio: StdioConfig::Inherit,
@@ -148,11 +149,11 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
         ..Default::default()
     };
 
-    let mut child =
-        launch_in_container(&caps, &opts).wrap_err("failed to launch sandboxed process")?;
+    let child =
+        launch_in_container_with_io(&caps, &opts).wrap_err("failed to launch sandboxed process")?;
 
-    // 7. Wait for completion
-    let exit_code = child.wait().wrap_err("failed to wait for sandboxed process")?;
+    // 7. Wait for completion (no timeout — let the caller handle that)
+    let exit_code = child.wait(None).wrap_err("failed to wait for sandboxed process")?;
 
     Ok(exit_code as u8)
 }

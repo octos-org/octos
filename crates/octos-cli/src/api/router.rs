@@ -62,6 +62,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
+        .route("/api/ws", get(handlers::ws_handler))
         .route(
             "/api/upload",
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
@@ -472,6 +473,7 @@ async fn user_auth_middleware(
         let uri_str = uri.path();
         // Only allow proxy auth for chat-related endpoints, not admin
         if uri_str.starts_with("/api/chat")
+            || uri_str.starts_with("/api/ws")
             || uri_str.starts_with("/api/upload")
             || uri_str.starts_with("/api/sessions")
             || uri_str.starts_with("/api/files")

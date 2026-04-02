@@ -85,6 +85,10 @@ struct Input {
     channel: Option<String>,
     #[serde(default)]
     chat_id: Option<String>,
+    /// Tool call ID from the originating LLM request. Threaded through to SSE
+    /// file events so the web client can link delivered files to their source message.
+    #[serde(default)]
+    tool_call_id: Option<String>,
 }
 
 #[async_trait]
@@ -224,13 +228,21 @@ impl Tool for SendFileTool {
             });
         }
 
+        let mut metadata = serde_json::Map::new();
+        if let Some(ref tc_id) = input.tool_call_id {
+            metadata.insert(
+                "tool_call_id".to_string(),
+                serde_json::Value::String(tc_id.clone()),
+            );
+        }
+
         let msg = OutboundMessage {
             channel: channel.clone(),
             chat_id: chat_id.clone(),
             content: input.caption.unwrap_or_default(),
             reply_to: None,
             media: vec![path.to_string_lossy().into_owned()],
-            metadata: serde_json::json!({}),
+            metadata: serde_json::Value::Object(metadata),
         };
 
         self.out_tx
@@ -508,5 +520,49 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn should_include_tool_call_id_in_metadata_when_provided() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "audio data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "tool_call_id": "call_abc123"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_abc123"),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_omit_tool_call_id_from_metadata_when_absent() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({"file_path": path}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert!(msg.metadata.get("tool_call_id").is_none());
     }
 }

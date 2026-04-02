@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::stream::StreamExt;
 use octos_agent::Agent;
 use octos_core::{AgentId, Message, SessionKey};
 use serde::{Deserialize, Serialize};
@@ -701,6 +703,317 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket endpoint
+// ---------------------------------------------------------------------------
+
+/// Client → Server message protocol over WebSocket.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsClientMsg {
+    /// Send a chat message (equivalent to POST /api/chat).
+    Send {
+        content: String,
+        #[serde(default)]
+        media: Vec<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
+    /// Abort the current streaming response.
+    Abort,
+}
+
+/// GET /api/ws?session={session_id}&token={token} — WebSocket endpoint.
+///
+/// Provides bidirectional real-time communication as an alternative to the
+/// SSE-based streaming flow. Server→Client events use the same JSON format
+/// as SSE events. Client→Server commands: `send` and `abort`.
+pub async fn ws_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Extract session_id from query params.
+    // (Auth is already handled by the user_auth_middleware layer.)
+    ws.on_upgrade(move |socket| ws_connection(socket, state, headers))
+}
+
+/// Handle an established WebSocket connection.
+async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
+    let (ws_tx, mut ws_rx) = socket.split();
+    let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
+
+    // Track the abort handle for the current streaming task so clients can
+    // cancel in-flight requests.
+    let abort_handle: Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        let text = match msg {
+            WsMessage::Text(t) => t,
+            WsMessage::Close(_) => break,
+            // Respond to pings with pongs (axum handles this automatically in
+            // most cases, but be explicit).
+            WsMessage::Ping(_) => continue,
+            _ => continue,
+        };
+
+        let client_msg: WsClientMsg = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = serde_json::json!({"type": "error", "message": format!("invalid message: {e}")});
+                let _ = send_ws(&ws_tx, &err.to_string()).await;
+                continue;
+            }
+        };
+
+        match client_msg {
+            WsClientMsg::Send {
+                content,
+                media,
+                session,
+            } => {
+                if content.len() > MAX_MESSAGE_LEN {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
+                    });
+                    let _ = send_ws(&ws_tx, &err.to_string()).await;
+                    continue;
+                }
+
+                let session_id = session.unwrap_or_else(|| "default".into());
+
+                // If a gateway is running, proxy through it (same as chat handler).
+                if let Some((_profile_id, port)) =
+                    resolve_api_port(&state, &headers).await
+                {
+                    let ws_tx2 = ws_tx.clone();
+                    let _abort_ref = abort_handle.clone();
+                    let http_client = state.http_client.clone();
+                    let handle = tokio::spawn(async move {
+                        ws_proxy_to_gateway(
+                            ws_tx2,
+                            &http_client,
+                            port,
+                            &content,
+                            Some(&session_id),
+                            &media,
+                        )
+                        .await;
+                    });
+                    *abort_handle.lock().await = Some(handle.abort_handle());
+                } else if let Ok((agent, sessions)) = validate_chat_request(&state, &ChatRequest {
+                    message: content.clone(),
+                    session_id: Some(session_id.clone()),
+                    stream: true,
+                    media: media.clone(),
+                }) {
+                    // Standalone agent mode — run the agent directly.
+                    let ws_tx2 = ws_tx.clone();
+                    let _abort_ref = abort_handle.clone();
+                    let handle = tokio::spawn(async move {
+                        ws_standalone_agent(
+                            ws_tx2,
+                            agent,
+                            sessions,
+                            &session_id,
+                            &content,
+                            media,
+                        )
+                        .await;
+                    });
+                    *abort_handle.lock().await = Some(handle.abort_handle());
+                } else {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "No LLM provider configured",
+                    });
+                    let _ = send_ws(&ws_tx, &err.to_string()).await;
+                }
+            }
+            WsClientMsg::Abort => {
+                if let Some(handle) = abort_handle.lock().await.take() {
+                    handle.abort();
+                    let msg = serde_json::json!({"type": "error", "message": "aborted"});
+                    let _ = send_ws(&ws_tx, &msg.to_string()).await;
+                }
+            }
+        }
+    }
+}
+
+/// Proxy a WebSocket chat request to the gateway's internal API channel and
+/// stream SSE events back as WebSocket text frames.
+async fn ws_proxy_to_gateway(
+    ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
+    http_client: &reqwest::Client,
+    port: u16,
+    message: &str,
+    session_id: Option<&str>,
+    media: &[String],
+) {
+    use futures::StreamExt;
+
+    let url = format!("http://127.0.0.1:{port}/chat");
+    let body = serde_json::json!({
+        "message": message,
+        "session_id": session_id,
+        "media": media,
+    });
+
+    let resp = match http_client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let err = serde_json::json!({"type": "error", "message": format!("gateway proxy failed: {e}")});
+            let _ = send_ws(&ws_tx, &err.to_string()).await;
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        let err = serde_json::json!({"type": "error", "message": err_body});
+        let _ = send_ws(&ws_tx, &err.to_string()).await;
+        return;
+    }
+
+    // Stream SSE events from the gateway response and forward as WS text frames.
+    // The gateway sends `text/event-stream` with `data: {...}\n\n` lines.
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        buffer.push_str(text);
+
+        // Parse SSE frames: lines starting with "data:" separated by blank lines.
+        while let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+
+            for line in frame.lines() {
+                let data = if let Some(d) = line.strip_prefix("data:") {
+                    d.trim()
+                } else if let Some(d) = line.strip_prefix("data: ") {
+                    d.trim()
+                } else {
+                    continue;
+                };
+                if data.is_empty() {
+                    continue;
+                }
+                if send_ws(&ws_tx, data).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Run the standalone agent for a WebSocket request and stream events back.
+async fn ws_standalone_agent(
+    ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
+    base_agent: Arc<Agent>,
+    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session_id: &str,
+    message: &str,
+    media: Vec<String>,
+) {
+    let session_key = SessionKey::new("api", session_id);
+
+    let history: Vec<Message> = {
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&session_key).await;
+        session.get_history(50).to_vec()
+    };
+
+    // Create per-request channel and reporter
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
+        Arc::new(ChannelReporter::new(tx.clone())),
+    ));
+
+    let request_agent = Agent::new_shared(
+        AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
+        base_agent.llm_provider(),
+        base_agent.tool_registry().clone(),
+        base_agent.memory_store(),
+    )
+    .with_config(base_agent.agent_config())
+    .with_system_prompt(base_agent.system_prompt_snapshot())
+    .with_reporter(reporter);
+
+    let message = message.to_string();
+    let session_id = session_id.to_string();
+    let session_key2 = SessionKey::new("api", &session_id);
+
+    // Spawn the agent task
+    tokio::spawn(async move {
+        let result = request_agent
+            .process_message(&message, &history, media)
+            .await;
+
+        match result {
+            Ok(response) => {
+                // Save conversation messages to session
+                {
+                    let mut sess = sessions.lock().await;
+                    for msg in &response.messages {
+                        let _ = sess.add_message(&session_key2, msg.clone()).await;
+                    }
+                }
+
+                let done = serde_json::json!({
+                    "type": "done",
+                    "content": response.content,
+                    "tokens_in": response.token_usage.input_tokens,
+                    "tokens_out": response.token_usage.output_tokens,
+                });
+                let _ = tx.send(done.to_string());
+            }
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": e.to_string(),
+                });
+                let _ = tx.send(err.to_string());
+            }
+        }
+    });
+
+    // Forward channel events to WebSocket
+    while let Some(data) = rx.recv().await {
+        if send_ws(&ws_tx, &data).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Send a text message through the WebSocket sink.
+async fn send_ws(
+    ws_tx: &Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
+    data: &str,
+) -> Result<(), ()> {
+    use futures::SinkExt;
+    let mut tx = ws_tx.lock().await;
+    tx.send(WsMessage::text(data)).await.map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +1120,56 @@ mod tests {
     #[test]
     fn max_message_len_is_1mb() {
         assert_eq!(MAX_MESSAGE_LEN, 1_048_576);
+    }
+
+    #[test]
+    fn ws_client_msg_send_deserialize() {
+        let json = r#"{"type": "send", "content": "hello"}"#;
+        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMsg::Send {
+                content,
+                media,
+                session,
+            } => {
+                assert_eq!(content, "hello");
+                assert!(media.is_empty());
+                assert!(session.is_none());
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn ws_client_msg_send_with_session_and_media() {
+        let json =
+            r#"{"type": "send", "content": "hi", "session": "s1", "media": ["/tmp/a.png"]}"#;
+        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMsg::Send {
+                content,
+                media,
+                session,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(session.as_deref(), Some("s1"));
+                assert_eq!(media, vec!["/tmp/a.png"]);
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn ws_client_msg_abort_deserialize() {
+        let json = r#"{"type": "abort"}"#;
+        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WsClientMsg::Abort));
+    }
+
+    #[test]
+    fn ws_client_msg_invalid_type() {
+        let json = r#"{"type": "unknown"}"#;
+        let result = serde_json::from_str::<WsClientMsg>(json);
+        assert!(result.is_err());
     }
 }

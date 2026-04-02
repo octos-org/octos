@@ -2054,9 +2054,10 @@ impl SessionActor {
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
         let bg_tasks = self.agent.tool_registry().bg_task_count();
-        // Also check if any spawn_only tools exist — the counter may be zero
-        // if inc_bg_tasks raced with agent completion on a different registry clone.
-        let has_spawn_only = !self.agent.tool_registry().spawn_only_tools().is_empty();
+        // Also check spawn_only_invoked flag — set when a spawn_only tool was
+        // actually called during this agent run. This is more precise than
+        // checking if spawn_only tools are registered (which is overbroad).
+        let spawn_only_invoked = self.agent.tool_registry().spawn_only_was_invoked();
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
@@ -2066,7 +2067,7 @@ impl SessionActor {
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
-                    "has_bg_tasks": bg_tasks > 0 || has_spawn_only,
+                    "has_bg_tasks": bg_tasks > 0 || spawn_only_invoked,
                 })
             }
             Ok(Err(e)) => {

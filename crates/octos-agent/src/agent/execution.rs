@@ -114,7 +114,20 @@ impl Agent {
                         let bg_name = tc_name.clone();
                         let bg_args = effective_args.clone();
                         let bg_sender = tools.background_result_sender();
+                        let bg_tc_id = tc_id.clone();
+                        tools.inc_bg_tasks();
+                        tools.mark_spawn_only_invoked();
+                        let bg_counter = tools.active_bg_tasks();
                         tokio::spawn(async move {
+                            // Ensure counter is decremented on all exit paths.
+                            struct BgGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
+                            impl Drop for BgGuard {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            let _guard = BgGuard(bg_counter);
+
                             let mut result = bg_tools.execute(&bg_name, &bg_args).await;
 
                             // Retry once on transient failure (e.g. ominix-api restart)
@@ -137,7 +150,7 @@ impl Agent {
                                     for file_path in &r.files_to_send {
                                         let path_str = file_path.to_string_lossy().to_string();
                                         tracing::info!(tool = %bg_name, file = %path_str, "background auto-sending file");
-                                        let send_args = serde_json::json!({"file_path": path_str});
+                                        let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": bg_tc_id});
                                         match bg_tools.execute("send_file", &send_args).await {
                                             Ok(sr) if sr.success => {
                                                 tracing::info!(tool = %bg_name, file = %path_str, "background file sent");
@@ -236,7 +249,7 @@ impl Agent {
 
                             for path_str in &files {
                                 info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
-                                let send_args = serde_json::json!({"file_path": path_str});
+                                let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
                                 match tools.execute("send_file", &send_args).await {
                                     Ok(r) if r.success => {
                                         info!(tool = %tc_name, file = %path_str, "file auto-sent");

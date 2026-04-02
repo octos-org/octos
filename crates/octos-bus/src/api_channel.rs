@@ -105,6 +105,10 @@ impl Channel for ApiChannel {
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
             .route("/sessions/{id}/status", get(handle_session_status))
+            .route(
+                "/sessions/{id}/deferred-files",
+                get(handle_deferred_files),
+            )
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
@@ -131,7 +135,12 @@ impl Channel for ApiChannel {
         let mut pending = self.pending.lock().await;
         if let Some(tx) = pending.get(&msg.chat_id) {
             if msg.metadata.get("_completion").is_some() {
-                // Completion signal — send done event with metadata and close the stream
+                let has_bg = msg
+                    .metadata
+                    .get("has_bg_tasks")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // Completion signal — send done event with metadata
                 let done = serde_json::json!({
                     "type": "done",
                     "content": "",
@@ -139,17 +148,41 @@ impl Channel for ApiChannel {
                     "tokens_in": msg.metadata.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
                     "tokens_out": msg.metadata.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "has_bg_tasks": has_bg,
                 });
                 let _ = tx.send(done.to_string());
-                // Remove sender to close the receiver → SSE stream ends
-                pending.remove(&msg.chat_id);
-                drop(pending); // release lock before acquiring last_content
-                self.last_content.lock().await.remove(&msg.chat_id);
+                if has_bg {
+                    // Background tasks still running — keep SSE open with a grace
+                    // period so file events can be delivered on this stream.
+                    let chat_id = msg.chat_id.clone();
+                    let pending_ref = self.pending.clone();
+                    let last_content_ref = self.last_content.clone();
+                    info!(
+                        chat_id = %chat_id,
+                        "keeping SSE open for background task file delivery (grace period: 120s)"
+                    );
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                        let mut pending = pending_ref.lock().await;
+                        if let Some(tx) = pending.remove(&chat_id) {
+                            // Send a final close event so the client knows the grace period ended
+                            let close = serde_json::json!({"type": "bg_done"});
+                            let _ = tx.send(close.to_string());
+                            info!(chat_id = %chat_id, "SSE grace period expired, closing stream");
+                        }
+                        last_content_ref.lock().await.remove(&chat_id);
+                    });
+                } else {
+                    // No background tasks — close immediately
+                    pending.remove(&msg.chat_id);
+                    drop(pending);
+                    self.last_content.lock().await.remove(&msg.chat_id);
+                }
             } else if !msg.media.is_empty() {
                 // File message — send file paths so web client can download
                 let mut all_sent = true;
                 for file_path in &msg.media {
-                    let event = self.make_file_event(file_path, &msg.content);
+                    let event = self.make_file_event(file_path, &msg.content, &msg.metadata);
                     let send_ok = tx.send(event.clone()).is_ok();
                     if send_ok {
                         info!(chat_id = %msg.chat_id, file = %file_path, "sent file SSE event");
@@ -164,6 +197,11 @@ impl Channel for ApiChannel {
                     self.defer_file_events(msg).await;
                 }
             } else if !msg.content.is_empty() {
+                // Check if this is a background task completion notification
+                // (arrives after _completion with grace period). Close the SSE
+                // stream after forwarding the notification.
+                let is_bg_notification = msg.content.starts_with('\u{2713}')
+                    || msg.content.starts_with('\u{2717}');
                 // Regular message — send as replace event (full text replacement).
                 let event = serde_json::json!({
                     "type": "replace",
@@ -171,6 +209,18 @@ impl Channel for ApiChannel {
                 });
                 if tx.send(event.to_string()).is_err() {
                     pending.remove(&msg.chat_id);
+                } else if is_bg_notification {
+                    // Background task completed — close the SSE stream now
+                    // rather than waiting for the full grace period.
+                    info!(
+                        chat_id = %msg.chat_id,
+                        "background task notification received, closing SSE stream"
+                    );
+                    let close = serde_json::json!({"type": "bg_done"});
+                    let _ = tx.send(close.to_string());
+                    pending.remove(&msg.chat_id);
+                    drop(pending);
+                    self.last_content.lock().await.remove(&msg.chat_id);
                 }
             }
         } else if !msg.media.is_empty() {
@@ -255,18 +305,28 @@ impl Channel for ApiChannel {
 
 impl ApiChannel {
     /// Build a JSON string for a file SSE event.
-    fn make_file_event(&self, file_path: &str, caption: &str) -> String {
+    fn make_file_event(
+        &self,
+        file_path: &str,
+        caption: &str,
+        metadata: &serde_json::Value,
+    ) -> String {
         let filename = std::path::Path::new(file_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        serde_json::json!({
+        let mut event = serde_json::json!({
             "type": "file",
             "path": file_path,
             "filename": filename,
             "caption": caption,
-        })
-        .to_string()
+        });
+        // Thread tool_call_id into the SSE event so the web client can link
+        // delivered files to the originating assistant message.
+        if let Some(tc_id) = metadata.get("tool_call_id") {
+            event["tool_call_id"] = tc_id.clone();
+        }
+        event.to_string()
     }
 
     /// Buffer file events for delivery on the next SSE connection.
@@ -279,7 +339,7 @@ impl ApiChannel {
                 file = %file_path,
                 "deferred file event (no active SSE)"
             );
-            buf.push(self.make_file_event(file_path, &msg.content));
+            buf.push(self.make_file_event(file_path, &msg.content, &msg.metadata));
         }
     }
 }
@@ -438,6 +498,33 @@ async fn handle_session_status(
         "has_deferred_files": has_deferred,
     }))
     .into_response()
+}
+
+/// GET /sessions/:id/deferred-files — fetch and flush deferred file events.
+///
+/// Returns a JSON array of file events that were buffered while no SSE connection
+/// was active (e.g. from spawn_only background tasks). The buffer is cleared after
+/// retrieval. Clients can poll this endpoint after the main SSE stream closes.
+async fn handle_deferred_files(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let events = state
+        .deferred_files
+        .lock()
+        .await
+        .remove(&id)
+        .unwrap_or_default();
+    if events.is_empty() {
+        return Json(serde_json::json!([])).into_response();
+    }
+    info!(session = %id, count = events.len(), "flushing deferred files via REST");
+    // Parse the pre-serialized JSON strings back into values
+    let parsed: Vec<serde_json::Value> = events
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect();
+    Json(parsed).into_response()
 }
 
 /// GET /sessions — list all API sessions.
@@ -769,6 +856,106 @@ mod tests {
         assert_eq!(parsed["type"], "done");
 
         // Sender was removed — next recv returns None
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_completion_with_bg_tasks_keeps_stream_open() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-bg".into(), tx);
+        }
+
+        // Send completion with has_bg_tasks = true
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-bg".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({"_completion": true, "has_bg_tasks": true}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        // Should receive done event
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert_eq!(parsed["has_bg_tasks"], true);
+
+        // Stream should still be open — sender NOT removed, so we can send more events
+        let file_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-bg".into(),
+            content: "Audio file".into(),
+            reply_to: None,
+            media: vec!["/tmp/test.mp3".into()],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&file_msg).await.unwrap();
+
+        // Should receive file event on the still-open stream
+        let file_event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&file_event).unwrap();
+        assert_eq!(parsed["type"], "file");
+        assert_eq!(parsed["path"], "/tmp/test.mp3");
+    }
+
+    #[tokio::test]
+    async fn send_bg_notification_closes_stream() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-bg2".into(), tx);
+        }
+
+        // Send completion with background tasks
+        let completion = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-bg2".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({"_completion": true, "has_bg_tasks": true}),
+        };
+        ch.send(&completion).await.unwrap();
+        let _ = rx.recv().await.unwrap(); // consume done event
+
+        // Send background task notification (checkmark)
+        let notify = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-bg2".into(),
+            content: "\u{2713} fm_tts completed \u{2014} file delivered".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&notify).await.unwrap();
+
+        // Should receive the notification text
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "replace");
+
+        // Should receive bg_done event
+        let close_event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&close_event).unwrap();
+        assert_eq!(parsed["type"], "bg_done");
+
+        // Stream should now be closed
         assert!(rx.recv().await.is_none());
     }
 
