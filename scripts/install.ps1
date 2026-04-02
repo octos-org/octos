@@ -21,14 +21,48 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [string]$Prefix = "",
 
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$AuthToken = "",
+
     [Parameter(ParameterSetName = 'Doctor', Mandatory)]
     [switch]$Doctor,
 
     [Parameter(ParameterSetName = 'Uninstall', Mandatory)]
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    [Parameter(ParameterSetName = 'Help')]
+    [Alias("h")]
+    [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
+
+# ── Help ─────────────────────────────────────────────────────────────
+if ($Help) {
+    Write-Host @"
+install.ps1 — Install octos from pre-built binaries on Windows.
+
+USAGE
+  Piped:     irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
+  Download:  .\install.ps1 [options]
+
+OPTIONS
+  -Version <tag>     Release version (default: latest)
+  -Prefix <path>     Install prefix (default: ~\.octos\bin)
+  -AuthToken <token> Auth token for octos serve (default: auto-generated)
+  -Doctor            Diagnose installation and service health
+  -Uninstall         Remove octos binaries, scheduled task, and PATH entry
+  -Help              Show this help message
+
+ENVIRONMENT VARIABLES
+  OCTOS_VERSION      Release version override
+  OCTOS_PREFIX       Install prefix override
+  OCTOS_HOME         Data directory override (default: ~\.octos)
+  OCTOS_AUTH_TOKEN   Auth token override
+  OCTOS_DOWNLOAD_URL Local/self-hosted download directory
+"@
+    exit 0
+}
 
 # ── Defaults ──────────────────────────────────────────────────────────
 $GithubRepo = "octos-org/octos"
@@ -128,7 +162,7 @@ if ($Doctor) {
         Ok "running (PID: $($octosProc.Id))"
     } else {
         Err "octos serve is not running"
-        Hint "Start: octos serve --port 8080"
+        Hint "Start: Start-ScheduledTask -TaskName OctosServe"
     }
 
     # ── Port 8080 ────────────────────────────────────────────────────
@@ -170,7 +204,7 @@ if ($Doctor) {
         switch ($status) {
             401 { Warn "responds 401 (auth required)"; Hint "Pass auth token in request header" }
             403 { Warn "responds 403 (forbidden)"; Hint "Check auth configuration" }
-            404 { Err "responds 404 (admin route not found)"; Hint "Binary may be built without 'api' feature" }
+            404 { Err "responds 404 (admin route not found)"; Hint "Binary may be built without 'api' feature. Rebuild with: cargo build --features api" }
             default { Err "connection failed (server not reachable on localhost:8080)"; Hint "Check 'octos serve' section above" }
         }
     }
@@ -222,6 +256,51 @@ if ($Doctor) {
     }
     if (-not $chromeFound) { Warn "Chrome/Chromium not found (optional)"; Hint (Get-PkgHint "chromium") }
 
+    # ── Service configuration ────────────────────────────────────────
+    Section "Service configuration"
+
+    $task = Get-ScheduledTask -TaskName "OctosServe" -ErrorAction SilentlyContinue
+    if ($task) {
+        Ok "OctosServe task registered"
+        $taskInfo = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+        if ($taskInfo -and $taskInfo.LastRunTime) {
+            Ok "last run: $($taskInfo.LastRunTime)"
+        }
+        if ($taskInfo -and $taskInfo.LastTaskResult -ne 0 -and $taskInfo.LastTaskResult -ne 267009) {
+            Warn "last result code: $($taskInfo.LastTaskResult)"
+        }
+        # Check wrapper script
+        $wrapperPath = Join-Path $DataDir "serve-launcher.cmd"
+        if (Test-Path $wrapperPath) {
+            Ok "launcher: $wrapperPath"
+        } else {
+            Err "serve-launcher.cmd missing"
+            Hint "Re-run install.ps1 to recreate it"
+        }
+    } else {
+        Err "OctosServe scheduled task not found"
+        Hint "Re-run install.ps1 to create it"
+    }
+
+    # ── Recent serve logs ────────────────────────────────────────────
+    Section "Recent serve logs"
+
+    $serveLog = Join-Path $DataDir "serve.log"
+    if (Test-Path $serveLog) {
+        $recentErrors = Get-Content $serveLog -Tail 50 -ErrorAction SilentlyContinue |
+            Select-String -Pattern "ERROR|panic|FATAL" -SimpleMatch |
+            Select-Object -Last 5
+        if ($recentErrors) {
+            Warn "recent errors in serve.log:"
+            $recentErrors | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+        } else {
+            Ok "no recent errors in serve.log"
+        }
+    } else {
+        Warn "serve.log not found at $serveLog"
+        Hint "octos serve may not have started yet"
+    }
+
     # ── Summary ──────────────────────────────────────────────────────
     Section "Summary"
     if ($script:DoctorIssues -eq 0) {
@@ -238,6 +317,13 @@ if ($Doctor) {
 # ══════════════════════════════════════════════════════════════════════
 if ($Uninstall) {
     Section "Uninstalling octos"
+
+    # Remove scheduled task
+    $task = Get-ScheduledTask -TaskName "OctosServe" -ErrorAction SilentlyContinue
+    if ($task) {
+        Unregister-ScheduledTask -TaskName "OctosServe" -Confirm:$false -ErrorAction SilentlyContinue
+        Ok "removed OctosServe scheduled task"
+    }
 
     # Stop octos processes
     Get-Process -Name "octos" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -274,13 +360,18 @@ if ($Uninstall) {
 # ── Detect platform ──────────────────────────────────────────────────
 Section "Detecting platform"
 
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+$arch = $null
+try {
+    $arch = "$(([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture))"
+} catch {}
+if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+
 switch ($arch) {
-    "X64" {
+    { $_ -in "X64", "AMD64" } {
         $Triple = "x86_64-pc-windows-msvc"
         Ok "Windows x64 ($Triple)"
     }
-    "Arm64" {
+    { $_ -in "Arm64", "ARM64" } {
         # ARM64 Windows can run x64 binaries via emulation
         $Triple = "x86_64-pc-windows-msvc"
         Warn "Windows ARM64 detected - using x64 binary (runs via emulation)"
@@ -481,13 +572,15 @@ foreach ($d in $subdirs) {
 # Bootstrap config.json
 $configPath = Join-Path $DataDir "config.json"
 if (-not (Test-Path $configPath)) {
-    @'
+    $configJson = @'
 {
   "provider": "anthropic",
   "model": "claude-sonnet-4-20250514",
   "api_key_env": "ANTHROPIC_API_KEY"
 }
-'@ | Set-Content -Path $configPath -Encoding UTF8
+'@
+    # WriteAllText avoids UTF-8 BOM that PowerShell 5.1 -Encoding UTF8 adds
+    [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.UTF8Encoding]::new($false))
 }
 
 # Bootstrap other files
@@ -518,18 +611,112 @@ if (-not (Test-Path $userPath2)) {
 
 Ok "data directory: $DataDir"
 
+# ── Generate auth token ──────────────────────────────────────────────
+if (-not $AuthToken) { $AuthToken = if ($env:OCTOS_AUTH_TOKEN) { $env:OCTOS_AUTH_TOKEN } else { "" } }
+if (-not $AuthToken) {
+    # Generate 32-byte hex token
+    $bytes = New-Object byte[] 32
+    ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($bytes)
+    $AuthToken = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+# ── Set up octos serve as scheduled task ─────────────────────────────
+Section "Setting up octos serve"
+
+$serveLog = Join-Path $DataDir "serve.log"
+$taskName = "OctosServe"
+
+# Remove existing task if present
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+# Stop any running octos serve processes before re-registering
+Get-Process -Name "octos" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match "serve" } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Seconds 10) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+# Build a wrapper script that sets env vars and launches octos serve
+$wrapperPath = Join-Path $DataDir "serve-launcher.cmd"
+$wrapperContent = @"
+@echo off
+set "OCTOS_HOME=$DataDir"
+set "OCTOS_DATA_DIR=$DataDir"
+set "OCTOS_AUTH_TOKEN=$AuthToken"
+"$octosBin" serve --port 8080 --auth-token $AuthToken >> "$serveLog" 2>&1
+"@
+[System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.UTF8Encoding]::new($false))
+
+$action = New-ScheduledTaskAction `
+    -Execute "cmd.exe" `
+    -Argument "/C `"$wrapperPath`"" `
+    -WorkingDirectory $HOME
+
+Register-ScheduledTask `
+    -TaskName $taskName `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -Description "octos serve (dashboard + gateway)" `
+    -RunLevel Limited `
+    -Force | Out-Null
+
+Ok "registered scheduled task: $taskName"
+
+# Start the task now
+Start-ScheduledTask -TaskName $taskName
+Ok "octos serve starting"
+
+# ── Verify octos serve ───────────────────────────────────────────────
+Section "Verifying octos serve"
+
+$retries = 10
+while ($retries -gt 0) {
+    try {
+        $resp = Invoke-WebRequest -Uri "http://localhost:8080/admin/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        if ($resp.StatusCode -eq 200) {
+            Ok "octos serve is running on http://localhost:8080"
+            break
+        }
+    } catch {}
+    $retries--
+    Start-Sleep -Seconds 1
+}
+if ($retries -eq 0) {
+    Warn "octos serve did not respond within 10 seconds"
+    Write-Host "    Check logs: Get-Content '$serveLog' -Tail 20"
+}
+
 # ── Summary ───────────────────────────────────────────────────────────
 Section "Installation complete!"
 Write-Host ""
-Write-Host "    Binary:   $octosBin"
-Write-Host "    Data dir: $DataDir"
-Write-Host "    Config:   $configPath"
+Write-Host "    Binary:     $octosBin"
+Write-Host "    Data dir:   $DataDir"
+Write-Host "    Config:     $configPath"
+Write-Host "    Auth token: $AuthToken"
+Write-Host "    Serve log:  $serveLog"
 Write-Host ""
 Write-Host "  Next steps:"
 Write-Host "    1. Set your API key:  `$env:ANTHROPIC_API_KEY = 'sk-...'"
 Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
-Write-Host "    4. Open dashboard:    octos serve --port 8080"
+Write-Host "    4. Open dashboard:    http://localhost:8080/admin/"
+Write-Host ""
+Write-Host "  Manage service:"
+Write-Host "    Status:  Get-ScheduledTask -TaskName OctosServe"
+Write-Host "    Stop:    Stop-ScheduledTask -TaskName OctosServe"
+Write-Host "    Start:   Start-ScheduledTask -TaskName OctosServe"
 Write-Host ""
 Write-Host "  Troubleshoot: .\install.ps1 -Doctor"
 Write-Host ""
