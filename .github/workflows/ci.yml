@@ -43,6 +43,12 @@ jobs:
             exit 1
           fi
 
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.33.1
+
   check:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +74,8 @@ jobs:
 
   check-arm:
     runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
     steps:
       - uses: actions/checkout@v4
 
@@ -82,11 +90,16 @@ jobs:
           cargo build --workspace
           cargo build -p octos-cli --features ${{ env.FEATURES }}
 
+      - name: Build test binaries
+        run: cargo test --workspace --no-run
+
       - name: Test
         run: cargo test --workspace
 
   check-riscv:
     runs-on: ubuntu-24.04-riscv
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +113,9 @@ jobs:
         run: |
           cargo build --workspace
           cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Build test binaries
+        run: cargo test --workspace --no-run
 
       - name: Test
         run: cargo test --workspace

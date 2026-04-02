@@ -67,19 +67,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<ApiMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = m.role.as_str();
-                let content = build_api_content(m);
-                ApiMessage {
-                    role,
-                    content,
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls: None,
-                }
-            })
-            .collect();
+        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
@@ -183,18 +171,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let api_messages: Vec<ApiMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = m.role.as_str();
-                ApiMessage {
-                    role,
-                    content: build_api_content(m),
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls: None,
-                }
-            })
-            .collect();
+        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
@@ -315,6 +292,28 @@ enum ApiContentPart {
 #[derive(Serialize)]
 struct ApiImageUrl {
     url: String,
+}
+
+fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
+    let role = msg.role.as_str();
+    let content = build_api_content(msg);
+    let tool_calls = msg.tool_calls.as_ref().map(|tcs| {
+        tcs.iter()
+            .map(|tc| ApiToolCall {
+                id: tc.id.clone(),
+                function: FunctionCall {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.to_string(),
+                },
+            })
+            .collect()
+    });
+    ApiMessage {
+        role,
+        content,
+        tool_call_id: msg.tool_call_id.as_deref(),
+        tool_calls,
+    }
 }
 
 fn build_api_content(msg: &Message) -> Option<ApiContent> {

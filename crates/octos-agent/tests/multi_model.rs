@@ -1029,16 +1029,15 @@ async fn test_custom_system_prompt_reaches_subagent() {
         .find(|m| m.role == octos_core::MessageRole::System)
         .expect("sub-agent should receive a system message");
 
+    // additional_instructions are appended to the default worker prompt
     assert!(
-        system_msg
-            .content
-            .contains("security-focused code reviewer"),
-        "system prompt should be the custom one, got: {}",
+        system_msg.content.contains("OWASP Top 10"),
+        "system prompt should contain additional_instructions, got: {}",
         system_msg.content
     );
     assert!(
-        !system_msg.content.contains("Worker agent"),
-        "should NOT contain the default worker.txt prompt"
+        system_msg.content.contains("Worker agent"),
+        "should also contain the default worker.txt base prompt"
     );
 }
 

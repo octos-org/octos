@@ -241,10 +241,10 @@ async fn poll_loop(state: Arc<BridgeState>) {
                 };
 
                 // Update cursor
-                if let Some(new_buf) = data["get_updates_buf"].as_str() {
-                    if !new_buf.is_empty() {
-                        *state.get_updates_buf.lock().await = new_buf.to_string();
-                    }
+                if let Some(new_buf) = data["get_updates_buf"].as_str()
+                    && !new_buf.is_empty()
+                {
+                    *state.get_updates_buf.lock().await = new_buf.to_string();
                 }
 
                 let errcode = data["errcode"].as_i64().unwrap_or(0);
@@ -284,10 +284,10 @@ async fn poll_loop(state: Arc<BridgeState>) {
                         let mut text = String::new();
                         if let Some(items) = msg["item_list"].as_array() {
                             for item in items {
-                                if item["type"].as_u64() == Some(1) {
-                                    if let Some(t) = item["text_item"]["text"].as_str() {
-                                        text = t.to_string();
-                                    }
+                                if item["type"].as_u64() == Some(1)
+                                    && let Some(t) = item["text_item"]["text"].as_str()
+                                {
+                                    text = t.to_string();
                                 }
                             }
                         }
@@ -348,24 +348,24 @@ async fn handle_ws_client(stream: TcpStream, state: Arc<BridgeState>) {
             frame = ws_rx.next() => {
                 match frame {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if cmd["type"].as_str() == Some("send") {
-                                let to = cmd["to"].as_str().unwrap_or_default();
-                                let text = cmd["text"].as_str().unwrap_or_default();
-                                let ctx = cmd["context_token"].as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| s.to_string());
+                        if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text)
+                            && cmd["type"].as_str() == Some("send")
+                        {
+                            let to = cmd["to"].as_str().unwrap_or_default();
+                            let text = cmd["text"].as_str().unwrap_or_default();
+                            let ctx = cmd["context_token"].as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
 
-                                // Use provided context_token, or look up stored one
-                                let context_token = match ctx {
-                                    Some(ct) => ct,
-                                    None => state.context_tokens.read().await
-                                        .get(to).cloned().unwrap_or_default(),
-                                };
+                            // Use provided context_token, or look up stored one
+                            let context_token = match ctx {
+                                Some(ct) => ct,
+                                None => state.context_tokens.read().await
+                                    .get(to).cloned().unwrap_or_default(),
+                            };
 
-                                if let Err(e) = state.send_to_wechat(to, text, &context_token).await {
-                                    eprintln!("[wechat-bridge] send error: {e}");
-                                }
+                            if let Err(e) = state.send_to_wechat(to, text, &context_token).await {
+                                eprintln!("[wechat-bridge] send error: {e}");
                             }
                         }
                     }

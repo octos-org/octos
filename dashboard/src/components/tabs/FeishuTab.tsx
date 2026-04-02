@@ -22,8 +22,6 @@ export default function FeishuTab({ config, onChange, profileId }: Props) {
             type: 'feishu',
             app_id_env: 'FEISHU_APP_ID',
             app_secret_env: 'FEISHU_APP_SECRET',
-            verification_token_env: 'FEISHU_VERIFICATION_TOKEN',
-            encrypt_key_env: 'FEISHU_ENCRYPT_KEY',
           },
         ],
       })
@@ -54,12 +52,13 @@ export default function FeishuTab({ config, onChange, profileId }: Props) {
         <p>Connect to Feishu (China) or Lark (international) by ByteDance. Supports text, rich text, images, files, and card messages.</p>
         <ol className="list-decimal list-inside space-y-0.5 text-gray-500">
           <li>Go to <a href="https://open.feishu.cn/" target="_blank" rel="noopener" className="text-accent hover:underline">Feishu Open Platform</a> or <a href="https://open.larksuite.com/" target="_blank" rel="noopener" className="text-accent hover:underline">Lark Developer</a> and create a custom app</li>
+          <li>Enable <strong>Bot</strong> capability under App Features</li>
           <li>Copy <strong>App ID</strong> and <strong>App Secret</strong> from the credentials page</li>
-          <li>Under Event Subscriptions, get the <strong>Verification Token</strong> and <strong>Encrypt Key</strong></li>
-          <li>Subscribe to <code className="bg-gray-800 px-1 rounded">im.message.receive_v1</code> event</li>
-          <li>Add permissions: <code className="bg-gray-800 px-1 rounded">im:message</code>, <code className="bg-gray-800 px-1 rounded">im:message:send_as_bot</code></li>
+          <li>Under Event Subscriptions, select <strong>persistent connection</strong> mode and subscribe to <code className="bg-gray-800 px-1 rounded">im.message.receive_v1</code> (Message received)</li>
+          <li>Add permissions: <code className="bg-gray-800 px-1 rounded">im:message</code>, <code className="bg-gray-800 px-1 rounded">im:message:send_as_bot</code>, <code className="bg-gray-800 px-1 rounded">im:message.p2p_msg:readonly</code></li>
+          <li>Publish a version of the app (Create Version)</li>
         </ol>
-        <p className="text-gray-600"><strong>WebSocket mode</strong> (recommended): No public URL needed, the bot connects outbound. <strong>Webhook mode</strong>: Uses the proxy URL below (one ngrok tunnel for all profiles).</p>
+        <p className="text-gray-600"><strong>WebSocket mode</strong> (recommended): No public URL needed, the bot connects outbound. <strong>Webhook mode</strong>: Requires Verification Token, Encrypt Key, and a public URL.</p>
       </div>
 
       <label className="flex items-center gap-2 cursor-pointer">
@@ -96,30 +95,6 @@ export default function FeishuTab({ config, onChange, profileId }: Props) {
               className="input text-xs font-mono"
             />
             <p className="text-[10px] text-gray-600 mt-1">From app credentials page. Stored as FEISHU_APP_SECRET.</p>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1.5">Verification Token</label>
-            <input
-              type="password"
-              value={config.env_vars['FEISHU_VERIFICATION_TOKEN'] || ''}
-              onChange={(e) => updateEnv('FEISHU_VERIFICATION_TOKEN', e.target.value)}
-              placeholder="verification token"
-              className="input text-xs font-mono"
-            />
-            <p className="text-[10px] text-gray-600 mt-1">From Event Subscriptions settings. Stored as FEISHU_VERIFICATION_TOKEN.</p>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1.5">Encrypt Key</label>
-            <input
-              type="password"
-              value={config.env_vars['FEISHU_ENCRYPT_KEY'] || ''}
-              onChange={(e) => updateEnv('FEISHU_ENCRYPT_KEY', e.target.value)}
-              placeholder="encrypt key"
-              className="input text-xs font-mono"
-            />
-            <p className="text-[10px] text-gray-600 mt-1">From Event Subscriptions settings. Stored as FEISHU_ENCRYPT_KEY.</p>
           </div>
 
           <div>
@@ -160,6 +135,30 @@ export default function FeishuTab({ config, onChange, profileId }: Props) {
 
           {(channel as any)?.mode === 'webhook' && (
             <>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1.5">Verification Token</label>
+                <input
+                  type="password"
+                  value={config.env_vars['FEISHU_VERIFICATION_TOKEN'] || ''}
+                  onChange={(e) => updateEnv('FEISHU_VERIFICATION_TOKEN', e.target.value)}
+                  placeholder="verification token (optional)"
+                  className="input text-xs font-mono"
+                />
+                <p className="text-[10px] text-gray-600 mt-1">Optional. From Event Subscriptions settings for signature validation.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1.5">Encrypt Key</label>
+                <input
+                  type="password"
+                  value={config.env_vars['FEISHU_ENCRYPT_KEY'] || ''}
+                  onChange={(e) => updateEnv('FEISHU_ENCRYPT_KEY', e.target.value)}
+                  placeholder="encrypt key (optional)"
+                  className="input text-xs font-mono"
+                />
+                <p className="text-[10px] text-gray-600 mt-1">Optional. From Event Subscriptions settings for AES-256-CBC event decryption.</p>
+              </div>
+
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1.5">Webhook Port</label>
                 <input

@@ -855,7 +855,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(enums, vec!["list", "install", "remove", "search"]);
+        assert_eq!(enums, vec!["list", "install", "update", "remove", "search"]);
     }
 
     #[tokio::test]

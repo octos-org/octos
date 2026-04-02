@@ -17,21 +17,337 @@ use futures::StreamExt;
 use octos_core::{InboundMessage, OutboundMessage};
 use reqwest::Client;
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
+
+// Re-used for explicit TLS connector (avoids CryptoProvider auto-detection panic).
+extern crate rustls;
+extern crate rustls_native_certs;
 
 use crate::channel::Channel;
 use crate::dedup::MessageDedup;
 use crate::media::{download_media, is_image};
 
+use futures::SinkExt;
+
 /// Token refresh interval (slightly under 2 hours).
 const TOKEN_TTL_SECS: u64 = 7000;
+/// Maximum message IDs to track for dedup.
+const MAX_SEEN_IDS: usize = 1000;
+/// Default ping interval for Feishu WS (2 minutes, matching official SDK).
+const FEISHU_PING_INTERVAL_SECS: u64 = 120;
+
+// --- Feishu WebSocket binary frame protocol (protobuf2) ---
+
+/// Frame type: control (ping/pong).
+const FRAME_TYPE_CONTROL: i32 = 0;
+/// Frame type: data (events/cards).
+const FRAME_TYPE_DATA: i32 = 1;
+
+/// Header key constants matching the official SDK.
+const HEADER_TYPE: &str = "type";
+const HEADER_MESSAGE_ID: &str = "message_id";
+const HEADER_SUM: &str = "sum";
+const HEADER_SEQ: &str = "seq";
+const HEADER_BIZ_RT: &str = "biz_rt";
+
+/// Message type constants.
+const MSG_TYPE_EVENT: &str = "event";
+const MSG_TYPE_PING: &str = "ping";
+const MSG_TYPE_PONG: &str = "pong";
+
+/// A key-value header pair in a Feishu WS frame.
+#[derive(Debug, Clone)]
+struct FrameHeader {
+    key: String,
+    value: String,
+}
+
+/// Binary frame used by the Feishu WebSocket protocol.
+/// Protobuf2 wire format with fields:
+///   1: SeqID (varint), 2: LogID (varint), 3: service (varint),
+///   4: method (varint), 5: headers (length-delimited, repeated),
+///   6: payload_encoding (length-delimited), 7: payload_type (length-delimited),
+///   8: payload (length-delimited), 9: LogIDNew (length-delimited)
+#[derive(Debug, Clone)]
+struct Frame {
+    method: i32,
+    headers: Vec<FrameHeader>,
+    payload: Vec<u8>,
+    service: i32,
+    seq_id: u64,
+    log_id: u64,
+    log_id_new: String,
+}
+
+impl Frame {
+    fn get_header(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.key == key)
+            .map(|h| h.value.as_str())
+    }
+
+    fn get_header_int(&self, key: &str) -> i32 {
+        self.get_header(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Decode a Frame from protobuf2 wire format.
+    fn decode(buf: &[u8]) -> Result<Self> {
+        let mut frame = Frame {
+            method: 0,
+            headers: Vec::new(),
+            payload: Vec::new(),
+            service: 0,
+            seq_id: 0,
+            log_id: 0,
+            log_id_new: String::new(),
+        };
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (tag, new_pos) = decode_varint(buf, pos)?;
+            pos = new_pos;
+            let field_number = (tag >> 3) as u32;
+            let wire_type = (tag & 0x7) as u8;
+            match (field_number, wire_type) {
+                (1, 0) => {
+                    // SeqID: varint
+                    let (v, p) = decode_varint(buf, pos)?;
+                    frame.seq_id = v;
+                    pos = p;
+                }
+                (2, 0) => {
+                    // LogID: varint
+                    let (v, p) = decode_varint(buf, pos)?;
+                    frame.log_id = v;
+                    pos = p;
+                }
+                (3, 0) => {
+                    // service: varint
+                    let (v, p) = decode_varint(buf, pos)?;
+                    frame.service = v as i32;
+                    pos = p;
+                }
+                (4, 0) => {
+                    // method: varint
+                    let (v, p) = decode_varint(buf, pos)?;
+                    frame.method = v as i32;
+                    pos = p;
+                }
+                (5, 2) => {
+                    // headers: length-delimited (embedded Header message)
+                    let (data, p) = decode_bytes(buf, pos)?;
+                    pos = p;
+                    let header = decode_header(data)?;
+                    frame.headers.push(header);
+                }
+                (6, 2) => {
+                    // payload_encoding: length-delimited string (skip)
+                    let (_, p) = decode_bytes(buf, pos)?;
+                    pos = p;
+                }
+                (7, 2) => {
+                    // payload_type: length-delimited string (skip)
+                    let (_, p) = decode_bytes(buf, pos)?;
+                    pos = p;
+                }
+                (8, 2) => {
+                    // payload: length-delimited bytes
+                    let (data, p) = decode_bytes(buf, pos)?;
+                    frame.payload = data.to_vec();
+                    pos = p;
+                }
+                (9, 2) => {
+                    // LogIDNew: length-delimited string
+                    let (data, p) = decode_bytes(buf, pos)?;
+                    frame.log_id_new = String::from_utf8(data.to_vec()).unwrap_or_default();
+                    pos = p;
+                }
+                (_, 0) => {
+                    // Unknown varint — skip
+                    let (_, p) = decode_varint(buf, pos)?;
+                    pos = p;
+                }
+                (_, 2) => {
+                    // Unknown length-delimited — skip
+                    let (_, p) = decode_bytes(buf, pos)?;
+                    pos = p;
+                }
+                _ => {
+                    return Err(eyre::eyre!(
+                        "unsupported protobuf wire type {wire_type} for field {field_number}"
+                    ));
+                }
+            }
+        }
+        Ok(frame)
+    }
+
+    /// Encode this Frame to protobuf2 wire format.
+    fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if self.seq_id != 0 {
+            encode_varint_field(&mut buf, 1, self.seq_id);
+        }
+        if self.log_id != 0 {
+            encode_varint_field(&mut buf, 2, self.log_id);
+        }
+        if self.service != 0 {
+            encode_varint_field(&mut buf, 3, self.service as u64);
+        }
+        encode_varint_field(&mut buf, 4, self.method as u64);
+        for h in &self.headers {
+            let header_bytes = encode_header(h);
+            encode_bytes_field(&mut buf, 5, &header_bytes);
+        }
+        if !self.payload.is_empty() {
+            encode_bytes_field(&mut buf, 8, &self.payload);
+        }
+        if !self.log_id_new.is_empty() {
+            encode_bytes_field(&mut buf, 9, self.log_id_new.as_bytes());
+        }
+        buf
+    }
+}
+
+fn decode_varint(buf: &[u8], start: usize) -> Result<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    let mut pos = start;
+    loop {
+        if pos >= buf.len() {
+            return Err(eyre::eyre!("unexpected end of varint"));
+        }
+        let b = buf[pos];
+        pos += 1;
+        result |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Ok((result, pos));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(eyre::eyre!("varint too long"));
+        }
+    }
+}
+
+fn decode_bytes(buf: &[u8], start: usize) -> Result<(&[u8], usize)> {
+    let (len, pos) = decode_varint(buf, start)?;
+    let len = len as usize;
+    if pos + len > buf.len() {
+        return Err(eyre::eyre!("length-delimited field exceeds buffer"));
+    }
+    Ok((&buf[pos..pos + len], pos + len))
+}
+
+fn decode_header(buf: &[u8]) -> Result<FrameHeader> {
+    let mut key = String::new();
+    let mut value = String::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (tag, new_pos) = decode_varint(buf, pos)?;
+        pos = new_pos;
+        let field_number = (tag >> 3) as u32;
+        let wire_type = (tag & 0x7) as u8;
+        if wire_type != 2 {
+            // skip unknown varint
+            let (_, p) = decode_varint(buf, pos)?;
+            pos = p;
+            continue;
+        }
+        let (data, p) = decode_bytes(buf, pos)?;
+        pos = p;
+        match field_number {
+            1 => key = String::from_utf8(data.to_vec()).unwrap_or_default(),
+            2 => value = String::from_utf8(data.to_vec()).unwrap_or_default(),
+            _ => {}
+        }
+    }
+    Ok(FrameHeader { key, value })
+}
+
+fn encode_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        if v < 0x80 {
+            buf.push(v as u8);
+            return;
+        }
+        buf.push((v as u8 & 0x7F) | 0x80);
+        v >>= 7;
+    }
+}
+
+fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
+    encode_varint(buf, ((field as u64) << 3) | 0); // wire type 0
+    encode_varint(buf, value);
+}
+
+fn encode_bytes_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+    encode_varint(buf, ((field as u64) << 3) | 2); // wire type 2
+    encode_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+fn encode_header(h: &FrameHeader) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_bytes_field(&mut buf, 1, h.key.as_bytes());
+    encode_bytes_field(&mut buf, 2, h.value.as_bytes());
+    buf
+}
+
+/// Build a ping frame for the given service_id.
+fn new_ping_frame(service_id: i32) -> Frame {
+    Frame {
+        method: FRAME_TYPE_CONTROL,
+        service: service_id,
+        headers: vec![FrameHeader {
+            key: HEADER_TYPE.to_string(),
+            value: MSG_TYPE_PING.to_string(),
+        }],
+        payload: Vec::new(),
+        seq_id: 0,
+        log_id: 0,
+        log_id_new: String::new(),
+    }
+}
+
+/// Build a response frame echoing the incoming frame's metadata.
+fn new_response_frame(incoming: &Frame, status_code: i32, biz_rt_ms: u64) -> Frame {
+    let mut headers = incoming.headers.clone();
+    headers.push(FrameHeader {
+        key: HEADER_BIZ_RT.to_string(),
+        value: biz_rt_ms.to_string(),
+    });
+    let payload = serde_json::json!({
+        "StatusCode": status_code,
+        "headers": {},
+        "data": null,
+    });
+    Frame {
+        method: incoming.method,
+        service: incoming.service,
+        headers,
+        payload: payload.to_string().into_bytes(),
+        seq_id: incoming.seq_id,
+        log_id: incoming.log_id,
+        log_id_new: incoming.log_id_new.clone(),
+    }
+}
 
 fn base_url_for_region(region: &str) -> String {
     match region {
         "global" | "lark" => "https://open.larksuite.com/open-apis".to_string(),
         _ => "https://open.feishu.cn/open-apis".to_string(),
+    }
+}
+
+/// Domain root (no /open-apis) — used for the WebSocket gateway endpoint.
+fn domain_for_region(region: &str) -> String {
+    match region {
+        "global" | "lark" => "https://open.larksuite.com".to_string(),
+        _ => "https://open.feishu.cn".to_string(),
     }
 }
 
@@ -144,6 +460,8 @@ pub struct FeishuChannel {
     app_id: String,
     app_secret: String,
     base_url: String,
+    /// Domain root (no /open-apis path) for the WS gateway endpoint.
+    domain: String,
     allowed_senders: HashSet<String>,
     shutdown: Arc<AtomicBool>,
     http: Client,
@@ -173,6 +491,7 @@ impl FeishuChannel {
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             base_url: base_url_for_region(region),
+            domain: domain_for_region(region),
             allowed_senders: allowed_senders.into_iter().collect(),
             shutdown,
             http: Client::new(),
@@ -214,6 +533,21 @@ impl FeishuChannel {
         self.allowed_senders.is_empty() || self.allowed_senders.contains(sender_id)
     }
 
+    /// Build a TLS connector for the WebSocket connection.
+    fn make_tls_connector() -> Result<tokio_tungstenite::Connector> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            root_store.add(cert).ok();
+        }
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .wrap_err("Feishu: failed to configure TLS")?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+    }
+
     /// Get or refresh tenant access token.
     async fn get_token(&self) -> Result<String> {
         let mut cache = self.token_cache.lock().await;
@@ -223,7 +557,7 @@ impl FeishuChannel {
             }
         }
 
-        let resp: serde_json::Value = self
+        let http_resp = self
             .http
             .post(format!(
                 "{}/auth/v3/tenant_access_token/internal",
@@ -235,9 +569,22 @@ impl FeishuChannel {
             }))
             .send()
             .await
-            .wrap_err("failed to get tenant token")?
-            .json()
-            .await?;
+            .wrap_err("failed to get tenant token")?;
+
+        let status = http_resp.status();
+        let body = http_resp
+            .text()
+            .await
+            .wrap_err("failed to read token response body")?;
+
+        if !status.is_success() {
+            return Err(eyre::eyre!(
+                "Feishu token request failed (HTTP {status}): {body}"
+            ));
+        }
+
+        let resp: serde_json::Value = serde_json::from_str(&body)
+            .wrap_err_with(|| format!("Feishu token response is not JSON: {body}"))?;
 
         let token = resp
             .get("tenant_access_token")
@@ -256,18 +603,33 @@ impl FeishuChannel {
     }
 
     /// Get WebSocket gateway URL from Feishu bot gateway endpoint.
+    /// Uses the domain root (not /open-apis) matching the official SDK behaviour.
     async fn get_ws_url(&self) -> Result<String> {
-        let token = self.get_token().await?;
-        let resp: serde_json::Value = self
+        let http_resp = self
             .http
-            .post(format!("{}/callback/ws/endpoint", self.base_url))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({}))
+            .post(format!("{}/callback/ws/endpoint", self.domain))
+            .json(&serde_json::json!({
+                "AppID": self.app_id,
+                "AppSecret": self.app_secret,
+            }))
             .send()
             .await
-            .wrap_err("failed to get Feishu WS endpoint")?
-            .json()
-            .await?;
+            .wrap_err("failed to get Feishu WS endpoint")?;
+
+        let status = http_resp.status();
+        let body = http_resp
+            .text()
+            .await
+            .wrap_err("failed to read WS endpoint response body")?;
+
+        if !status.is_success() {
+            return Err(eyre::eyre!(
+                "Feishu WS endpoint request failed (HTTP {status}): {body}"
+            ));
+        }
+
+        let resp: serde_json::Value = serde_json::from_str(&body)
+            .wrap_err_with(|| format!("Feishu WS endpoint response is not JSON: {body}"))?;
 
         let data = resp.get("data").ok_or_else(|| {
             let msg = resp
@@ -281,8 +643,15 @@ impl FeishuChannel {
             .get("URL")
             .or_else(|| data.get("url"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre::eyre!("no URL in Feishu WS endpoint response"))?;
+            .ok_or_else(|| eyre::eyre!("no URL in Feishu WS endpoint response: {data}"))?;
 
+        if url.is_empty() {
+            return Err(eyre::eyre!(
+                "Feishu WS endpoint returned empty URL, full response: {resp}"
+            ));
+        }
+
+        info!(url, "Feishu: got WS gateway URL");
         Ok(url.to_string())
     }
 
@@ -648,7 +1017,7 @@ impl FeishuChannel {
         })
     }
 
-    /// Run WebSocket long connection mode.
+    /// Run WebSocket long connection mode using the Feishu binary frame protocol.
     async fn start_ws(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -664,7 +1033,38 @@ impl FeishuChannel {
                 }
             };
 
-            let (ws_stream, _) = match connect_async(&ws_url).await {
+            // Extract service_id from the WS URL query params.
+            let service_id: i32 = ws_url
+                .split('?')
+                .nth(1)
+                .unwrap_or("")
+                .split('&')
+                .find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    if k == "service_id" {
+                        v.parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+
+            let connector = match Self::make_tls_connector() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Feishu: failed to create TLS connector: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            let (ws_stream, _) = match tokio_tungstenite::connect_async_tls_with_config(
+                &ws_url,
+                None,
+                false,
+                Some(connector),
+            )
+            .await
+            {
                 Ok(conn) => conn,
                 Err(e) => {
                     error!("Failed to connect Feishu WebSocket: {e}");
@@ -674,18 +1074,57 @@ impl FeishuChannel {
             };
 
             info!("Feishu WebSocket connected");
-            let (_ws_tx, mut ws_rx) = ws_stream.split();
+            let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-            while let Some(frame) = ws_rx.next().await {
+            // Spawn a ping loop task.
+            let shutdown_ping = self.shutdown.clone();
+            let ping_handle = tokio::spawn({
+                let (ping_tx, mut ping_rx) = mpsc::channel::<Vec<u8>>(4);
+
+                // Producer: generate pings on interval.
+                let ping_producer = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        FEISHU_PING_INTERVAL_SECS,
+                    ));
+                    loop {
+                        interval.tick().await;
+                        if shutdown_ping.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let ping = new_ping_frame(service_id).encode();
+                        if ping_tx.send(ping).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Consumer: forward pings to the WS sink.
+                async move {
+                    while let Some(data) = ping_rx.recv().await {
+                        if ws_tx.send(WsMessage::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Return the sink so we can close it.
+                    ping_producer.abort();
+                    ws_tx
+                }
+            });
+
+            while let Some(msg) = ws_rx.next().await {
                 if self.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let data = match frame {
-                    Ok(WsMessage::Text(text)) => text,
+                let binary = match msg {
+                    Ok(WsMessage::Binary(bin)) => bin,
                     Ok(WsMessage::Close(_)) => {
                         info!("Feishu WebSocket closed by server");
                         break;
+                    }
+                    Ok(WsMessage::Text(text)) => {
+                        debug!(len = text.len(), "Feishu: unexpected text frame");
+                        continue;
                     }
                     Ok(_) => continue,
                     Err(e) => {
@@ -694,20 +1133,74 @@ impl FeishuChannel {
                     }
                 };
 
-                let envelope: serde_json::Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
+                let frame = match Frame::decode(&binary) {
+                    Ok(f) => f,
                     Err(e) => {
-                        debug!("Failed to parse Feishu envelope: {e}");
+                        debug!("Feishu: failed to decode frame: {e}");
                         continue;
                     }
                 };
 
-                if let Some(inbound) = self.parse_event(&envelope).await {
-                    if inbound_tx.send(inbound).await.is_err() {
-                        return Ok(());
+                let msg_type = frame.get_header(HEADER_TYPE).unwrap_or("");
+                debug!(
+                    method = frame.method,
+                    msg_type,
+                    payload_len = frame.payload.len(),
+                    "Feishu: received frame"
+                );
+
+                if frame.method == FRAME_TYPE_CONTROL {
+                    // Control frame: ping/pong.
+                    if msg_type == MSG_TYPE_PONG {
+                        debug!("Feishu: received pong");
+                    }
+                    continue;
+                }
+
+                if frame.method == FRAME_TYPE_DATA {
+                    // Data frame: event or card callback.
+                    if msg_type != MSG_TYPE_EVENT {
+                        debug!(msg_type, "Feishu: ignoring non-event data frame");
+                        continue;
+                    }
+
+                    // Handle multi-part message assembly.
+                    let sum = frame.get_header_int(HEADER_SUM);
+                    if sum > 1 {
+                        debug!(
+                            sum,
+                            seq = frame.get_header_int(HEADER_SEQ),
+                            "Feishu: multi-part frame (not yet supported), skipping"
+                        );
+                        continue;
+                    }
+
+                    let payload_str = match std::str::from_utf8(&frame.payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!("Feishu: payload is not UTF-8: {e}");
+                            continue;
+                        }
+                    };
+
+                    let envelope: serde_json::Value = match serde_json::from_str(payload_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!("Feishu: failed to parse event payload: {e}");
+                            continue;
+                        }
+                    };
+
+                    if let Some(inbound) = self.parse_event(&envelope).await {
+                        if inbound_tx.send(inbound).await.is_err() {
+                            ping_handle.abort();
+                            return Ok(());
+                        }
                     }
                 }
             }
+
+            ping_handle.abort();
 
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -1075,6 +1568,7 @@ mod tests {
             app_id: "test_id".into(),
             app_secret: "test_secret".into(),
             base_url: base_url_for_region(region),
+            domain: domain_for_region(region),
             allowed_senders: allowed.into_iter().map(String::from).collect(),
             shutdown: Arc::new(AtomicBool::new(false)),
             http: Client::new(),

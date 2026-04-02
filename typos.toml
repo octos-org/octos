@@ -1,0 +1,36 @@
+[default]
+extend-ignore-identifiers-re = [
+    # *sigh* this just isn't worth the cost of fixing
+    "AttributeID.*Supress.*",
+]
+
+[default.extend-identifiers]
+# *sigh* this just isn't worth the cost of fixing
+AttributeIDSupressMenu = "AttributeIDSupressMenu"
+
+[default.extend-words]
+# Don't correct the surname "Teh"
+teh = "teh"
+Hashi = "Hashi"
+consts = "consts"
+# Voice preset name (ono_anna)
+ono = "ono"
+# WeChat API event name
+scaned = "scaned"
+# Timezone abbreviation (IST)
+ist = "ist"
+# Test data fragment in SSE test
+hel = "hel"
+# Homoglyph security test string
+nore = "nore"
+# WhatsApp API field name
+pn = "pn"
+# Both spellings are acceptable
+unparseable = "unparseable"
+# Base64 placeholder token
+iz = "iz"
+# One-Time Passwords (OTPs)
+ot = "ot"
+
+[files]
+extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]

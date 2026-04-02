@@ -57,9 +57,11 @@ Diagnose an existing installation:
 ```bash
 # macOS / Linux
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/octos-doctor.sh | bash
+```
 
+```powershell
 # Windows
-.\install.ps1 -Doctor
+irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor
 ```
 
 ## Quick Start

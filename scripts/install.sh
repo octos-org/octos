@@ -17,6 +17,9 @@
 #   --version TAG            Release version to install (default: latest)
 #   --prefix DIR             Install prefix (default: ~/.octos/bin)
 #   --no-tunnel              Skip frpc tunnel setup
+#   --caddy-domain DOMAIN    Set up Caddy with on-demand TLS for wildcard subdomains
+#                            (e.g. --caddy-domain crew.example.com → *.crew.example.com)
+#                            Requires: wildcard DNS A record pointing to this server
 #   --uninstall              Remove octos and frpc services and binaries
 #   --doctor                 Diagnose installation and service health
 
@@ -37,6 +40,7 @@ SSH_PORT="6001"
 AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
 SKIP_TUNNEL=false
+CADDY_DOMAIN=""
 UNINSTALL=false
 RUN_DOCTOR=false
 
@@ -58,6 +62,7 @@ while [ $# -gt 0 ]; do
         --version)       needval "$@"; VERSION="$2"; shift 2 ;;
         --prefix)        needval "$@"; PREFIX="$2"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
+        --caddy-domain)  needval "$@"; CADDY_DOMAIN="$2"; shift 2 ;;
         --uninstall)     UNINSTALL=true; shift ;;
         --doctor)        RUN_DOCTOR=true; shift ;;
         --help|-h)
@@ -80,6 +85,8 @@ Options:
   --version TAG            Release version to install (default: latest)
   --prefix DIR             Install prefix (default: ~/.octos/bin)
   --no-tunnel              Skip frpc tunnel setup
+  --caddy-domain DOMAIN    Set up Caddy reverse proxy with on-demand TLS
+                           (e.g. --caddy-domain crew.example.com)
   --uninstall              Remove octos and frpc services and binaries
   --doctor                 Diagnose installation and service health
 HELPEOF
@@ -1355,6 +1362,122 @@ if [ "$SKIP_TUNNEL" = false ]; then
     fi
 fi
 
+# ── Caddy reverse proxy (optional) ────────────────────────────────────
+if [ -n "$CADDY_DOMAIN" ]; then
+    section "Setting up Caddy reverse proxy"
+
+    # Install Caddy if missing
+    if ! command -v caddy &>/dev/null; then
+        echo "    Installing Caddy..."
+        case "$OS" in
+            Darwin)
+                brew install caddy 2>/dev/null || err "Failed to install Caddy (brew required)" ;;
+            Linux)
+                sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>/dev/null
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+                sudo apt-get update -qq && sudo apt-get install -y caddy 2>/dev/null || err "Failed to install Caddy" ;;
+            *)
+                err "Caddy auto-install not supported on $OS — install manually: https://caddyserver.com/docs/install" ;;
+        esac
+        ok "Caddy installed"
+    else
+        ok "Caddy already installed: $(caddy version 2>/dev/null | head -1)"
+    fi
+
+    # Determine serve port (match what octos serve uses)
+    CADDY_UPSTREAM="localhost:8080"
+
+    # Write Caddyfile
+    CADDYFILE_PATH="$DATA_DIR/Caddyfile"
+    cat > "$CADDYFILE_PATH" << CADDYEOF
+{
+    on_demand_tls {
+        ask http://localhost:9999/check
+    }
+}
+
+:9999 {
+    respond /check 200
+}
+
+${CADDY_DOMAIN} {
+    handle /api/* {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle /admin* {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle /auth/* {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle /webhook/* {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+}
+
+*.${CADDY_DOMAIN} {
+    tls {
+        on_demand
+    }
+
+    @api path /api/*
+    @admin path /admin*
+    @auth path /auth/*
+
+    handle @api {
+        reverse_proxy ${CADDY_UPSTREAM} {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @admin {
+        reverse_proxy ${CADDY_UPSTREAM} {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @auth {
+        reverse_proxy ${CADDY_UPSTREAM} {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+}
+CADDYEOF
+    caddy fmt --overwrite "$CADDYFILE_PATH" 2>/dev/null || true
+    ok "Caddyfile written to $CADDYFILE_PATH"
+
+    # Validate
+    if caddy validate --config "$CADDYFILE_PATH" 2>/dev/null; then
+        ok "Caddyfile is valid"
+    else
+        warn "Caddyfile validation failed — check $CADDYFILE_PATH"
+    fi
+
+    # Start or reload Caddy
+    if pgrep -x caddy > /dev/null 2>&1; then
+        caddy reload --config "$CADDYFILE_PATH" 2>/dev/null
+        ok "Caddy reloaded"
+    else
+        caddy start --config "$CADDYFILE_PATH" 2>/dev/null
+        ok "Caddy started"
+    fi
+
+    echo ""
+    echo "    Caddy is proxying:"
+    echo "      https://${CADDY_DOMAIN}          → octos dashboard"
+    echo "      https://*.${CADDY_DOMAIN}        → profile subdomains (on-demand TLS)"
+    echo ""
+    echo "    Prerequisites:"
+    echo "      DNS: A record for ${CADDY_DOMAIN} → this server's public IP"
+    echo "      DNS: A record for *.${CADDY_DOMAIN} → this server's public IP"
+    echo "      Ports 80 and 443 must be open"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 section "Installation complete!"
 echo ""
@@ -1374,6 +1497,13 @@ if [ -n "$TENANT_NAME" ]; then
     echo "  Tunnel:"
     echo "    Dashboard:  https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "    SSH access: ssh -p ${SSH_PORT} $(whoami)@${TUNNEL_DOMAIN}"
+fi
+if [ -n "$CADDY_DOMAIN" ]; then
+    echo ""
+    echo "  Caddy (on-demand TLS):"
+    echo "    Dashboard:  https://${CADDY_DOMAIN}"
+    echo "    Profiles:   https://{name}.${CADDY_DOMAIN}"
+    echo "    Caddyfile:  $DATA_DIR/Caddyfile"
 fi
 echo ""
 echo "  Manage services:"

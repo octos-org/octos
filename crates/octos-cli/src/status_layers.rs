@@ -352,6 +352,7 @@ impl StatusComposer {
         let tracker_clone = Arc::clone(&tracker);
         let metrics_visible = user_config.metrics_visible;
         let provider_visible = user_config.provider_visible;
+        let sender_user_id_for_loop = sender_user_id.clone();
 
         tokio::spawn(async move {
             run_compose_loop(
@@ -365,7 +366,7 @@ impl StatusComposer {
                 voice_transcript,
                 metrics_visible,
                 provider_visible,
-                sender_user_id,
+                sender_user_id_for_loop,
             )
             .await;
         });
@@ -377,6 +378,7 @@ impl StatusComposer {
             layers,
             channel,
             chat_id,
+            sender_user_id,
         }
     }
 
@@ -427,6 +429,7 @@ pub struct ComposerHandle {
     layers: Arc<Vec<StatusLayer>>,
     channel: Arc<dyn Channel>,
     chat_id: String,
+    sender_user_id: Option<String>,
 }
 
 impl ComposerHandle {
@@ -498,6 +501,11 @@ impl ComposerHandle {
 
         // Give the loop a moment to notice cancellation
         tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let _ = self
+            .channel
+            .stop_typing_as(&self.chat_id, self.sender_user_id.as_deref())
+            .await;
 
         // Delete the status message if one was sent
         let msg_id = self.status_msg_id.lock().await.take();
@@ -816,6 +824,7 @@ mod tests {
     struct MockChannel {
         sent: Arc<Mutex<Vec<OutboundMessage>>>,
         typing_senders: Arc<Mutex<Vec<Option<String>>>>,
+        stop_typing_senders: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     #[async_trait]
@@ -844,6 +853,18 @@ mod tests {
             sender_user_id: Option<&str>,
         ) -> eyre::Result<()> {
             self.typing_senders
+                .lock()
+                .await
+                .push(sender_user_id.map(str::to_string));
+            Ok(())
+        }
+
+        async fn stop_typing_as(
+            &self,
+            _chat_id: &str,
+            sender_user_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.stop_typing_senders
                 .lock()
                 .await
                 .push(sender_user_id.map(str::to_string));
@@ -1018,6 +1039,30 @@ mod tests {
         let typing = channel.typing_senders.lock().await;
         assert_eq!(
             typing.first().and_then(|v| v.as_deref()),
+            Some("@bot_mybot:localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_typing_on_stop() {
+        let channel = Arc::new(MockChannel::default());
+        let composer = StatusComposer::new(channel.clone(), vec!["✦ Thinking...".to_string()]);
+        let tracker = Arc::new(TokenTracker::new());
+
+        let handle = composer.start(
+            "!room:localhost".to_string(),
+            "hello",
+            tracker,
+            None,
+            &UserStatusConfig::default(),
+            Some("@bot_mybot:localhost".to_string()),
+        );
+
+        handle.stop().await;
+
+        let stop_calls = channel.stop_typing_senders.lock().await;
+        assert_eq!(
+            stop_calls.first().and_then(|v| v.as_deref()),
             Some("@bot_mybot:localhost")
         );
     }

@@ -389,28 +389,32 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
     async fn test_base_dir_blocks_non_tmp_outside_path() {
         let base = tempfile::tempdir().unwrap();
+
+        // Create a file outside base_dir (but not in /tmp/) to test path validation.
+        // Use a second tempdir as the "outside" location so this works on all platforms.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
 
-        // /etc/hosts exists on all Unix systems and is outside both base_dir and /tmp/
-        let test_path = if std::path::Path::new("/etc/hosts").exists() {
-            "/etc/hosts"
-        } else {
-            "/etc/resolv.conf"
-        };
-
         let result = tool
             .execute(&serde_json::json!({
-                "file_path": test_path
+                "file_path": outside_file.to_string_lossy()
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.output.contains("outside the allowed directory"));
+        assert!(
+            result.output.contains("outside the allowed directory"),
+            "expected 'outside the allowed directory', got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

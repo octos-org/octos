@@ -141,6 +141,17 @@ impl HybridIndex {
         }
     }
 
+    /// Tombstone an entry by clearing its ID so search skips it.
+    /// Returns true if the episode was found and removed.
+    pub fn remove(&mut self, episode_id: &str) -> bool {
+        if let Some(pos) = self.ids.iter().position(|id| id == episode_id) {
+            self.ids[pos].clear(); // tombstone — HNSW indices stay stable
+            true
+        } else {
+            false
+        }
+    }
+
     /// Add an embedding to an existing document (by episode_id).
     /// Returns false if the episode_id is not found or dimension mismatches.
     pub fn add_embedding(&mut self, episode_id: &str, embedding: &[f32]) -> bool {
@@ -227,6 +238,7 @@ impl HybridIndex {
 
         let mut results: Vec<(String, f32)> = combined
             .into_iter()
+            .filter(|(idx, _)| !self.ids[*idx].is_empty()) // skip tombstoned
             .map(|(idx, score)| (self.ids[idx].clone(), score))
             .collect();
 
