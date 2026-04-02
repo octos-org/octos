@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eyre::Result;
 use octos_llm::ToolSpec;
@@ -73,6 +74,8 @@ pub struct ToolRegistry {
     spawn_only_messages: HashMap<String, String>,
     /// Callback to notify session actor when background (spawn_only) tasks complete or fail.
     background_result_sender: Option<super::spawn::BackgroundResultSender>,
+    /// Number of spawn_only background tasks currently in flight.
+    active_bg_tasks: Arc<AtomicU32>,
 }
 
 impl Default for ToolRegistry {
@@ -95,6 +98,7 @@ impl ToolRegistry {
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
             background_result_sender: None,
+            active_bg_tasks: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -132,6 +136,31 @@ impl ToolRegistry {
     /// Get background result sender (cloned Arc).
     pub fn background_result_sender(&self) -> Option<super::spawn::BackgroundResultSender> {
         self.background_result_sender.clone()
+    }
+
+    /// Get a shared handle to the active background task counter.
+    pub fn active_bg_tasks(&self) -> Arc<AtomicU32> {
+        self.active_bg_tasks.clone()
+    }
+
+    /// Increment the active background task counter. Returns the previous value.
+    pub fn inc_bg_tasks(&self) -> u32 {
+        self.active_bg_tasks.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Decrement the active background task counter. Returns the previous value.
+    pub fn dec_bg_tasks(&self) -> u32 {
+        self.active_bg_tasks.fetch_sub(1, Ordering::SeqCst)
+    }
+
+    /// Return the number of currently active background tasks.
+    pub fn bg_task_count(&self) -> u32 {
+        self.active_bg_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Return the set of spawn_only tool names.
+    pub fn spawn_only_tools(&self) -> &HashSet<String> {
+        &self.spawn_only
     }
 
     /// Check if a tool came from a plugin binary.
@@ -282,6 +311,7 @@ impl ToolRegistry {
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: self.background_result_sender.clone(),
+            active_bg_tasks: self.active_bg_tasks.clone(),
         }
     }
 

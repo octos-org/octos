@@ -2053,24 +2053,29 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
+        let bg_tasks = self.agent.tool_registry().bg_task_count();
+        // Also check if any spawn_only tools exist — the counter may be zero
+        // if inc_bg_tasks raced with agent completion on a different registry clone.
+        let has_spawn_only = !self.agent.tool_registry().spawn_only_tools().is_empty();
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
-                info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), "agent completed, saving messages");
+                info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
                 serde_json::json!({
                     "_completion": true,
                     "model": format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
+                    "has_bg_tasks": bg_tasks > 0 || has_spawn_only,
                 })
             }
             Ok(Err(e)) => {
                 warn!(session = %self.session_key, error = %e, "agent returned error");
-                serde_json::json!({"_completion": true})
+                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
             }
             Err(e) => {
                 warn!(session = %self.session_key, error = %e, "agent timed out");
-                serde_json::json!({"_completion": true})
+                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
             }
         };
         match agent_result {
