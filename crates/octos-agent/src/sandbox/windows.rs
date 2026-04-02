@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn should_fallback_to_cmd_without_helper() {
+    fn should_use_sandbox_or_fallback() {
         let sandbox = AppContainerSandbox {
             allow_network: true,
             read_allow_paths: vec![r"C:\tools".into()],
@@ -155,7 +155,10 @@ mod tests {
         let cmd = sandbox.wrap_command("dir", Path::new(r"C:\temp"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
 
-        // In test environment, helper won't exist
-        assert_eq!(prog, "cmd");
+        // Either finds octos-sandbox helper or falls back to cmd
+        assert!(
+            prog.contains("octos-sandbox") || prog == "cmd",
+            "expected octos-sandbox or cmd, got: {prog}"
+        );
     }
 }
