@@ -2,6 +2,18 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build (all = full release)'
+        required: true
+        type: choice
+        default: all
+        options: [all, macos-arm, linux-x86, linux-arm, windows, docker]
+      tag:
+        description: 'Tag to release (e.g. v0.1.2-rc5). Required for publish.'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +24,7 @@ env:
 
 jobs:
   build-macos-arm:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos-arm'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +55,7 @@ jobs:
           path: octos-bundle-aarch64-apple-darwin.tar.gz
 
   build-linux-x86:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-x86'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +86,7 @@ jobs:
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
 
   build-linux-arm:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-arm'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -104,6 +119,7 @@ jobs:
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
 
   build-windows:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,6 +188,7 @@ jobs:
   #         cache-to: type=gha,mode=max
 
   publish:
+    if: github.event_name == 'push' || inputs.platform == 'all'
     needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
