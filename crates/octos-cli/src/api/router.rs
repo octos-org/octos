@@ -67,6 +67,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
         .route("/api/files/{filename}", get(handlers::serve_file))
+        .route("/api/files", get(handlers::serve_file_by_query))
         .route("/api/sessions", get(handlers::list_sessions))
         .route(
             "/api/sessions/{id}/messages",

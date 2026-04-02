@@ -552,8 +552,22 @@ pub async fn upload(
     Ok(Json(paths))
 }
 
+/// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
+pub async fn serve_file_by_query(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(filename) = params.get("path") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    serve_file_impl(filename).await
+}
+
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
 pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<String>) -> Response {
+    serve_file_impl(&filename).await
+}
+
+async fn serve_file_impl(filename: &str) -> Response {
     // Try as an absolute path first (for pipeline-generated files)
     let file_path = std::path::Path::new(&filename);
     let path = if file_path.is_absolute() {
@@ -611,7 +625,7 @@ pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<Strin
     let display_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| filename.clone())
+        .unwrap_or_else(|| filename.to_string())
         .replace(['"', '\r', '\n', '\\'], "_");
 
     let mut headers = axum::http::HeaderMap::new();
