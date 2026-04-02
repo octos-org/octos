@@ -36,6 +36,9 @@ jobs:
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
+
       - name: Build
         run: |
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
@@ -66,6 +69,9 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
@@ -100,6 +106,9 @@ jobs:
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
+
       - name: Build
         run: |
           cargo build --release -p octos-cli --features ${{ env.FEATURES }}
@@ -133,6 +142,10 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        shell: bash
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
