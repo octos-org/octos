@@ -126,7 +126,7 @@ impl SwitchModelTool {
         let (current_provider, current_model) = self.swappable.provider_info();
 
         let mut lines = Vec::new();
-        lines.push(format!("## Active Configuration"));
+        lines.push("## Active Configuration".to_string());
         lines.push(String::new());
         lines.push(format!("Primary model: {current_provider}/{current_model}"));
 

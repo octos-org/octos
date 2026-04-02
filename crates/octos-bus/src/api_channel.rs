@@ -104,6 +104,7 @@ impl Channel for ApiChannel {
             .route("/chat", post(handle_chat))
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
+            .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
@@ -417,6 +418,26 @@ struct PaginationParams {
 
 fn default_limit() -> usize {
     100
+}
+
+/// GET /sessions/:id/status — check if a session has an active task.
+async fn handle_session_status(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let pending = state.pending.lock().await;
+    let active = pending.contains_key(&id);
+    let has_deferred = state
+        .deferred_files
+        .lock()
+        .await
+        .get(&id)
+        .is_some_and(|v| !v.is_empty());
+    Json(serde_json::json!({
+        "active": active,
+        "has_deferred_files": has_deferred,
+    }))
+    .into_response()
 }
 
 /// GET /sessions — list all API sessions.

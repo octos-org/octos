@@ -8,7 +8,7 @@ use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use super::message_repair::{
     normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,

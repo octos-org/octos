@@ -28,6 +28,7 @@
 13. [平台技能 (ASR/TTS)](#13-平台技能-asrtts)
 14. [自定义技能安装](#14-自定义技能安装)
 15. [配置参考](#15-配置参考)
+16. [Matrix Appservice（Palpo）](#16-matrix-appservicepalpo)
 
 ---
 
@@ -36,7 +37,7 @@
 Octos 是一个 Rust 原生的 AI 智能体平台，支持以下运行模式：
 
 - **`octos serve`** — 控制面板 + 管理仪表盘。管理多个 **配置文件**（机器人实例），每个实例作为独立的 gateway 子进程运行，拥有独立的配置、记忆、会话和消息通道。
-- **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、飞书、邮件、企业微信）。
+- **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、飞书、邮件、企业微信、Matrix）。
 - **`octos chat`** — 交互式 CLI 聊天，用于开发和测试。
 
 ### 架构
@@ -1969,6 +1970,264 @@ chmod +x .octos/skills/translator/main
 └── history/
     └── chat_history            # Readline 历史（CLI）
 ```
+
+---
+
+## 16. Matrix Appservice（Palpo）
+
+Octos 可以作为 [Matrix Application Service](https://spec.matrix.org/latest/application-service-api/)（应用服务）运行在 Matrix 主服务器后面。本节介绍如何使用 Docker Compose 将 Octos 与 [Palpo](https://github.com/palpo-im/palpo) 一起部署，使用户可以从任何 Matrix 客户端与机器人对话。
+
+### 16.1 工作原理
+
+```
+Matrix 客户端（Element 等）
+       │
+       ▼
+  Palpo（主服务器 :8008）
+       │  通过 Appservice API 推送事件
+       ▼
+  Octos（应用服务监听 :8009）
+       │  通过 Palpo 的 Client-Server API 回复消息
+       ▼
+  Palpo ──► Matrix 客户端
+```
+
+Palpo 在启动时加载一个**注册 YAML 文件**，告诉它哪些用户命名空间属于 Octos，以及将事件转发到哪里。Octos 在专用端口（默认 `8009`）监听这些事件，并通过 Palpo 的 Client-Server API 回复。
+
+### 16.2 目录结构
+
+```
+palpo_with_octos/
+├── compose.yml                        # Docker Compose 文件
+├── palpo.toml                         # Palpo 主服务器配置
+├── appservices/
+│   └── octos-registration.yaml        # 应用服务注册文件
+├── config/
+│   ├── botfather.json                 # Octos 配置文件（Matrix 频道）
+│   └── octos.json                     # Octos 全局配置
+├── data/
+│   ├── pgsql/                         # PostgreSQL 数据
+│   ├── octos/                         # Octos 运行时数据
+│   └── media/                         # Palpo 媒体存储
+└── static/
+    └── index.html                     # Palpo 主页
+```
+
+### 16.3 配置步骤
+
+#### 1. 生成令牌
+
+应用服务注册文件和 Octos 配置文件必须共享两个令牌。只需生成一次：
+
+```bash
+# 生成 as_token 和 hs_token（任意随机十六进制字符串）
+openssl rand -hex 32   # → as_token
+openssl rand -hex 32   # → hs_token
+```
+
+保存好这两个值 — 下面两个文件都需要用到。
+
+#### 2. 创建应用服务注册文件
+
+创建 `appservices/octos-registration.yaml`：
+
+```yaml
+# Matrix 应用服务注册 — octos
+id: octos-matrix-appservice
+
+# Palpo 推送事件到 octos 的 URL（使用 Docker 服务名，不是 localhost）
+url: "http://octos:8009"
+
+# 令牌 — 必须与 config/botfather.json 匹配
+as_token: "<你的-as-token>"
+hs_token: "<你的-hs-token>"
+
+sender_localpart: octosbot
+rate_limited: false
+
+namespaces:
+  users:
+    - exclusive: true
+      regex: "@octosbot_.*:your\\.server\\.name"
+    - exclusive: true
+      regex: "@octosbot:your\\.server\\.name"
+  aliases: []
+  rooms: []
+```
+
+关键字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `url` | Palpo 发送事件的目标地址。使用 Docker 服务名（如 `http://octos:8009`），不要用 `localhost`。 |
+| `as_token` | Octos 调用 Palpo API 时使用的令牌。 |
+| `hs_token` | Palpo 向 Octos 推送事件时使用的令牌。 |
+| `sender_localpart` | 机器人的 Matrix 本地用户名（最终变为 `@octosbot:your.server.name`）。 |
+| `namespaces.users` | 应用服务管理的用户 ID 正则匹配模式。包含机器人本身和桥接用户前缀。 |
+
+#### 3. 配置 Palpo
+
+在 `palpo.toml` 中，指向包含注册文件的目录：
+
+```toml
+server_name = "your.server.name"
+listen_addr = "0.0.0.0:8008"
+
+allow_registration = true
+allow_federation = true
+
+# Palpo 启动时自动加载此目录下所有 .yaml 文件
+appservice_registration_dir = "/var/palpo/appservices"
+
+[db]
+url = "postgres://palpo:<数据库密码>@palpo_postgres:5432/palpo"
+pool_size = 10
+
+[well_known]
+server = "your.server.name"
+client = "https://your.server.name"
+```
+
+#### 4. 创建 Octos 配置文件
+
+创建 `config/botfather.json`，配置使用相同令牌的 Matrix 频道：
+
+```json
+{
+  "id": "botfather",
+  "name": "BotFather",
+  "enabled": true,
+  "config": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "channels": [
+      {
+        "type": "matrix",
+        "homeserver": "http://palpo:8008",
+        "as_token": "<你的-as-token>",
+        "hs_token": "<你的-hs-token>",
+        "server_name": "your.server.name",
+        "sender_localpart": "octosbot",
+        "user_prefix": "octosbot_",
+        "port": 8009,
+        "allowed_senders": ["@alice:your.server.name"]
+      }
+    ],
+    "gateway": {
+      "max_history": 50,
+      "queue_mode": "followup"
+    }
+  }
+}
+```
+
+Matrix 频道字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `type` | 必须为 `"matrix"`。 |
+| `homeserver` | Palpo 的内部 URL（Docker 服务名）。 |
+| `as_token` / `hs_token` | 必须与注册 YAML 文件匹配。 |
+| `server_name` | Matrix 域名（必须与 `palpo.toml` 一致）。 |
+| `sender_localpart` | 机器人用户名（必须与注册文件一致）。 |
+| `user_prefix` | 此应用服务管理的桥接用户 ID 前缀。 |
+| `port` | Octos 监听来自 Palpo 的应用服务事件的端口。 |
+| `allowed_senders` | 允许与机器人对话的 Matrix 用户 ID。空数组 = 允许所有人。 |
+
+#### 5. Docker Compose
+
+```yaml
+services:
+  palpo_postgres:
+    image: postgres:17
+    restart: always
+    volumes:
+      - ./data/pgsql:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: <数据库密码>
+      POSTGRES_USER: palpo
+      POSTGRES_DB: palpo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U palpo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  palpo:
+    image: ghcr.io/palpo-im/palpo:latest
+    restart: unless-stopped
+    ports:
+      - 8128:8008     # Client-Server API
+      - 8348:8448     # Federation API
+    environment:
+      PALPO_CONFIG: "/var/palpo/palpo.toml"
+    volumes:
+      - ./palpo.toml:/var/palpo/palpo.toml:ro
+      - ./appservices:/var/palpo/appservices:ro
+      - ./data/media:/var/palpo/media
+      - ./static:/var/palpo/static:ro
+    depends_on:
+      palpo_postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  octos:
+    build:
+      context: /path/to/octos       # Octos 源码仓库路径
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - 8009:8009     # 应用服务监听（接收 Palpo 推送的事件）
+      - 8010:8080     # Octos 仪表盘 / 管理 API
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      RUST_LOG: octos=debug,info
+    volumes:
+      - ./data/octos:/root/.octos
+      - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
+      - ./config/octos.json:/config/octos.json:ro
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080", "--config", "/config/octos.json"]
+    depends_on:
+      - palpo
+    networks:
+      - internal
+
+networks:
+  internal:
+    attachable: true
+```
+
+#### 6. 启动所有服务
+
+```bash
+docker compose up -d
+```
+
+Palpo 在启动时读取 `appservices/octos-registration.yaml`。当 Matrix 用户在机器人所在的房间发送消息时，Palpo 将事件推送到 `http://octos:8009`，Octos 通过智能体循环处理消息，并通过 Palpo 的 Client-Server API 回复。
+
+### 16.4 令牌匹配检查清单
+
+最常见的配置错误是令牌不匹配。以下三处必须一致：
+
+| 值 | `octos-registration.yaml` | `botfather.json` |
+|----|--------------------------|-------------------|
+| `as_token` | `as_token: "abc..."` | `"as_token": "abc..."` |
+| `hs_token` | `hs_token: "def..."` | `"hs_token": "def..."` |
+| `sender_localpart` | `sender_localpart: octosbot` | `"sender_localpart": "octosbot"` |
+| server name | `regex: "@octosbot:your\\.server\\.name"` | `"server_name": "your.server.name"` |
+
+### 16.5 故障排除
+
+| 症状 | 原因 | 解决方法 |
+|------|------|----------|
+| 机器人无响应 | 注册文件与配置文件之间令牌不匹配 | 检查[令牌匹配清单](#164-令牌匹配检查清单) |
+| Palpo 日志中出现 `Connection refused` | Octos 未运行或注册文件中 `url` 错误 | 确保 Octos 已启动；使用 Docker 服务名（`http://octos:8009`），不要用 `localhost` |
+| `User ID not in namespace` | `sender_localpart` 与注册文件 `namespaces.users` 正则不匹配 | 更新正则以包含机器人的完整用户 ID |
+| 未授权用户的消息被忽略 | `allowed_senders` 过滤 | 将用户的 Matrix ID 添加到数组中，或设置为 `[]` 以允许所有人 |
 
 ---
 

@@ -51,6 +51,17 @@ pub trait Channel: Send + Sync {
         self.send_typing(chat_id).await
     }
 
+    /// Stop a typing/composing indicator. Platforms that don't support it return Ok(()).
+    async fn stop_typing(&self, _chat_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stop a typing/composing indicator as a specific sender identity when supported.
+    /// Default: falls back to `stop_typing()`.
+    async fn stop_typing_as(&self, chat_id: &str, _sender_user_id: Option<&str>) -> Result<()> {
+        self.stop_typing(chat_id).await
+    }
+
     /// Send a "listening" / recording-voice indicator (for voice transcription).
     /// Falls back to typing indicator by default.
     async fn send_listening(&self, chat_id: &str) -> Result<()> {

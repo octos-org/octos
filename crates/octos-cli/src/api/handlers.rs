@@ -422,6 +422,26 @@ pub struct MessageInfo {
     pub timestamp: String,
 }
 
+/// GET /api/sessions/:id/status -- check if session has an active task.
+pub async fn session_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // Proxy to gateway (session actors live there)
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/sessions/{id}/status");
+        return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
+    }
+
+    // Standalone mode — no active task tracking
+    Json(serde_json::json!({
+        "active": false,
+        "has_deferred_files": false,
+    }))
+    .into_response()
+}
+
 /// DELETE /api/sessions/:id -- delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
