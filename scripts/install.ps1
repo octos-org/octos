@@ -30,6 +30,15 @@ param(
     [Parameter(ParameterSetName = 'Uninstall', Mandatory)]
     [switch]$Uninstall,
 
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$Domain = "",
+
+    [Parameter(ParameterSetName = 'Install')]
+    [int]$Port = 8080,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$InstallDeps,
+
     [Parameter(ParameterSetName = 'Help')]
     [Alias("h")]
     [switch]$Help
@@ -245,9 +254,18 @@ if ($Doctor) {
         Ok "Node.js $nodeVer"
     } else { Warn "Node.js not found (optional)"; Hint (Get-PkgHint "node") }
 
+    if (Test-Command "python") {
+        $pyVer = python --version 2>&1
+        Ok "Python $pyVer"
+    } else { Warn "Python not found (optional)" }
+
     if (Test-Command "ffmpeg") {
         Ok "ffmpeg found"
     } else { Warn "ffmpeg not found (optional)"; Hint (Get-PkgHint "ffmpeg") }
+
+    if (Test-Command "caddy") {
+        Ok "Caddy: $(caddy version 2>&1)"
+    } else { Warn "Caddy not found (needed for HTTPS)" }
 
     $chromeFound = $false
     $chromePaths = @(
@@ -392,29 +410,88 @@ switch ($arch) {
     }
 }
 
-# ── Check runtime dependencies ────────────────────────────────────────
-Section "Checking runtime dependencies"
-
-# git - needed for skill installation
-if (Test-Command "git") {
-    $gitVer = (git --version 2>&1) -replace "git version ",""
-    Ok "git $gitVer"
-} else {
-    Warn "git not found"
-    Write-Host "    Enables: skill installation (octos skills install)"
-    Hint (Get-PkgHint "git")
+# ── Auto-install helper ──────────────────────────────────────────────
+function Install-Dep($name, $testCmd, $installBlock) {
+    if (Test-Command $testCmd) { return $true }
+    if (-not $InstallDeps) { return $false }
+    Write-Host "    Installing $name..."
+    try { & $installBlock; return $true } catch { Warn "Failed to install ${name}: $_"; return $false }
 }
 
-# Node.js - optional
+# ── Check/install runtime dependencies ───────────────────────────────
+Section "Runtime dependencies$(if ($InstallDeps) { ' (auto-install)' })"
+
+# git
+if (Test-Command "git") {
+    Ok "git $((git --version 2>&1) -replace 'git version ','')"
+} elseif ($InstallDeps) {
+    Install-Dep "Git" "git" {
+        $url = "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/Git-2.53.0.2-64-bit.exe"
+        $installer = Join-Path $env:TEMP "git-install.exe"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait -FilePath $installer -ArgumentList "/VERYSILENT","/NORESTART","/SP-"
+        $env:PATH = "C:\Program Files\Git\bin;$env:PATH"
+    }
+    if (Test-Command "git") { Ok "git installed" } else { Warn "git install failed" }
+} else {
+    Warn "git not found"; Hint (Get-PkgHint "git")
+}
+
+# Node.js
 if (Test-Command "node") {
     Ok "Node.js $(node --version 2>&1)"
+} elseif ($InstallDeps) {
+    Install-Dep "Node.js" "node" {
+        $url = "https://nodejs.org/dist/v22.15.0/node-v22.15.0-x64.msi"
+        $installer = Join-Path $env:TEMP "node-install.msi"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait msiexec -ArgumentList "/i","$installer","/qn","/norestart"
+        $env:PATH = "C:\Program Files\nodejs;$env:PATH"
+    }
+    if (Test-Command "node") { Ok "Node.js installed" } else { Warn "Node.js install failed" }
 } else {
-    Warn "Node.js not found"
-    Write-Host "    Enables: WhatsApp bridge, custom skills with package.json, pptxgenjs"
-    Hint (Get-PkgHint "node")
+    Warn "Node.js not found (optional)"; Hint (Get-PkgHint "node")
 }
 
-# Chrome - optional
+# Python
+if (Test-Command "python") {
+    Ok "Python $(python --version 2>&1)"
+} elseif ($InstallDeps) {
+    Install-Dep "Python" "python" {
+        $url = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe"
+        $installer = Join-Path $env:TEMP "python-install.exe"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1"
+    }
+    if (Test-Command "python") { Ok "Python installed" } else { Warn "Python install failed" }
+} else {
+    Warn "Python not found (optional)"
+}
+
+# ffmpeg
+if (Test-Command "ffmpeg") {
+    Ok "ffmpeg found"
+} elseif ($InstallDeps) {
+    Install-Dep "ffmpeg" "ffmpeg" {
+        $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        $zip = Join-Path $env:TEMP "ffmpeg.zip"
+        (New-Object System.Net.WebClient).DownloadFile($url, $zip)
+        Expand-Archive -Path $zip -DestinationPath $env:TEMP -Force
+        $extracted = Get-ChildItem "$env:TEMP\ffmpeg-*-essentials_build" | Select-Object -First 1
+        if ($extracted) {
+            $ffDir = "C:\ffmpeg"
+            New-Item -ItemType Directory -Path $ffDir -Force | Out-Null
+            Copy-Item "$($extracted.FullName)\bin\*" $ffDir -Force
+            $env:PATH = "$ffDir;$env:PATH"
+            [Environment]::SetEnvironmentVariable("PATH", "$ffDir;$([Environment]::GetEnvironmentVariable('PATH','Machine'))", "Machine")
+        }
+    }
+    if (Test-Command "ffmpeg") { Ok "ffmpeg installed" } else { Warn "ffmpeg install failed" }
+} else {
+    Warn "ffmpeg not found (optional)"; Hint (Get-PkgHint "ffmpeg")
+}
+
+# Chrome
 $chromeFound = $false
 $chromePaths = @(
     "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
@@ -422,25 +499,41 @@ $chromePaths = @(
     "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
 )
 foreach ($p in $chromePaths) {
-    if (Test-Path $p) {
-        Ok "Browser: Chrome"
-        $chromeFound = $true
-        break
-    }
+    if (Test-Path $p) { Ok "Browser: Chrome"; $chromeFound = $true; break }
 }
-if (-not $chromeFound) {
-    Warn "Chrome not found"
-    Write-Host "    Enables: browser tool (web browsing, screenshots), deep-crawl skill"
-    Hint (Get-PkgHint "chromium")
+if (-not $chromeFound -and $InstallDeps) {
+    Write-Host "    Installing Chrome..."
+    try {
+        $url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+        $installer = Join-Path $env:TEMP "chrome-install.exe"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait -FilePath $installer -ArgumentList "/silent","/install"
+        $chromeFound = $true; Ok "Chrome installed"
+    } catch { Warn "Chrome install failed" }
+} elseif (-not $chromeFound) {
+    Warn "Chrome not found (optional)"; Hint (Get-PkgHint "chromium")
 }
 
-# ffmpeg - optional
-if (Test-Command "ffmpeg") {
-    Ok "ffmpeg found"
+# Caddy (for HTTPS)
+if (Test-Command "caddy") {
+    Ok "Caddy: $(caddy version 2>&1)"
+} elseif ($Domain -or $InstallDeps) {
+    Write-Host "    Installing Caddy..."
+    try {
+        $url = "https://github.com/caddyserver/caddy/releases/download/v2.11.1/caddy_2.11.1_windows_amd64.zip"
+        $zip = Join-Path $env:TEMP "caddy.zip"
+        $caddyDir = "C:\caddy"
+        (New-Object System.Net.WebClient).DownloadFile($url, $zip)
+        New-Item -ItemType Directory -Path $caddyDir -Force | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $caddyDir -Force
+        $env:PATH = "$caddyDir;$env:PATH"
+        [Environment]::SetEnvironmentVariable("PATH", "$caddyDir;$([Environment]::GetEnvironmentVariable('PATH','Machine'))", "Machine")
+        Ok "Caddy installed to $caddyDir"
+    } catch { Warn "Caddy install failed: $_" }
+} elseif (-not $Domain) {
+    # Only warn if domain is requested
 } else {
-    Warn "ffmpeg not found"
-    Write-Host "    Enables: voice/audio skills, media transcoding"
-    Hint (Get-PkgHint "ffmpeg")
+    Warn "Caddy not found (needed for HTTPS with -Domain)"
 }
 
 # ── Resolve download source ──────────────────────────────────────────
@@ -665,7 +758,7 @@ $wrapperContent = @"
 set "OCTOS_HOME=$DataDir"
 set "OCTOS_DATA_DIR=$DataDir"
 set "OCTOS_AUTH_TOKEN=$AuthToken"
-"$octosBin" serve --port 8080 --auth-token $AuthToken >> "$serveLog" 2>&1
+"$octosBin" serve --port $Port --host 0.0.0.0 --auth-token $AuthToken >> "$serveLog" 2>&1
 "@
 [System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.UTF8Encoding]::new($false))
 
@@ -695,9 +788,9 @@ Section "Verifying octos serve"
 $retries = 10
 while ($retries -gt 0) {
     try {
-        $resp = Invoke-WebRequest -Uri "http://localhost:8080/admin/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/admin/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         if ($resp.StatusCode -eq 200) {
-            Ok "octos serve is running on http://localhost:8080"
+            Ok "octos serve is running on http://localhost:${Port}"
             break
         }
     } catch {}
@@ -707,6 +800,57 @@ while ($retries -gt 0) {
 if ($retries -eq 0) {
     Warn "octos serve did not respond within 10 seconds"
     Write-Host "    Check logs: Get-Content '$serveLog' -Tail 20"
+}
+
+# ── Firewall ─────────────────────────────────────────────────────────
+Section "Configuring firewall"
+netsh advfirewall firewall delete rule name="octos-serve" >$null 2>&1
+netsh advfirewall firewall add rule name="octos-serve" dir=in action=allow protocol=TCP localport=$Port >$null 2>&1
+Ok "Firewall: port $Port open"
+if ($Domain) {
+    netsh advfirewall firewall delete rule name="octos-caddy" >$null 2>&1
+    netsh advfirewall firewall add rule name="octos-caddy" dir=in action=allow protocol=TCP localport=80,443 >$null 2>&1
+    Ok "Firewall: ports 80,443 open for Caddy"
+}
+
+# ── Caddy setup (HTTPS) ─────────────────────────────────────────────
+if ($Domain -and (Test-Command "caddy")) {
+    Section "Configuring Caddy for $Domain"
+    $caddyfile = Join-Path $DataDir "Caddyfile"
+    @"
+{
+    on_demand_tls {
+        ask http://localhost:9999/check
+    }
+}
+
+:9999 {
+    respond /check 200
+}
+
+$Domain {
+    reverse_proxy localhost:$Port
+}
+
+*.$Domain {
+    tls {
+        on_demand
+    }
+    reverse_proxy localhost:$Port {
+        header_up X-Profile-Id {labels.2}
+    }
+}
+"@ | Set-Content -Path $caddyfile -Encoding UTF8
+    caddy fmt --overwrite $caddyfile 2>$null
+
+    # Register Caddy as scheduled task
+    $caddyTask = "OctosCaddy"
+    Unregister-ScheduledTask -TaskName $caddyTask -Confirm:$false -ErrorAction SilentlyContinue
+    $caddyAction = New-ScheduledTaskAction -Execute "caddy" -Argument "run --config `"$caddyfile`""
+    $caddyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    Register-ScheduledTask -TaskName $caddyTask -Action $caddyAction -Trigger $caddyTrigger -Settings $settings -Description "Caddy reverse proxy for octos" -RunLevel Limited -Force | Out-Null
+    Start-ScheduledTask -TaskName $caddyTask
+    Ok "Caddy started for $Domain (HTTPS auto-provisioned)"
 }
 
 # ── Summary ───────────────────────────────────────────────────────────
