@@ -1197,13 +1197,31 @@ fi
 # These match what `octos init --defaults` creates (see init.rs).
 mkdir -p "$DATA_DIR"/{profiles,memory,sessions,skills,logs,research,history}
 if [ ! -f "$DATA_DIR/config.json" ]; then
-    cat > "$DATA_DIR/config.json" << 'INITEOF'
+    # Auto-detect provider from available API keys
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        _PROV="openai"; _MODEL="gpt-4.1-mini"; _ENV="OPENAI_API_KEY"
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        _PROV="anthropic"; _MODEL="claude-sonnet-4-20250514"; _ENV="ANTHROPIC_API_KEY"
+    elif [ -n "${GEMINI_API_KEY:-}" ]; then
+        _PROV="gemini"; _MODEL="gemini-2.5-flash"; _ENV="GEMINI_API_KEY"
+    elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+        _PROV="deepseek"; _MODEL="deepseek-chat"; _ENV="DEEPSEEK_API_KEY"
+    elif [ -n "${KIMI_API_KEY:-}" ]; then
+        _PROV="moonshot"; _MODEL="kimi-k2.5"; _ENV="KIMI_API_KEY"
+    elif [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+        _PROV="dashscope"; _MODEL="qwen3.5-plus"; _ENV="DASHSCOPE_API_KEY"
+    else
+        # No key detected — use openai as default, user must configure
+        _PROV="openai"; _MODEL="gpt-4.1-mini"; _ENV="OPENAI_API_KEY"
+    fi
+    cat > "$DATA_DIR/config.json" << INITEOF
 {
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514",
-  "api_key_env": "ANTHROPIC_API_KEY"
+  "provider": "$_PROV",
+  "model": "$_MODEL",
+  "api_key_env": "$_ENV"
 }
 INITEOF
+    ok "auto-detected provider: $_PROV ($_ENV)"
 fi
 [ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'INITEOF'
 # Ignore task state and database files
@@ -1487,7 +1505,7 @@ echo "    Auth token: $AUTH_TOKEN"
 echo "    Logs:       tail -f $DATA_DIR/serve.log"
 echo ""
 echo "  Next steps:"
-echo "    1. Set your API key:  export ANTHROPIC_API_KEY=sk-..."
+echo "    1. Set your API key:  export ${_ENV:-OPENAI_API_KEY}=sk-..."
 echo "    2. Install skills:    octos skills install --all"
 echo "    3. Start chatting:    octos chat"
 echo "    4. Open dashboard:    http://localhost:8080/admin/"

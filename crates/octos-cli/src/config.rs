@@ -838,7 +838,16 @@ impl Config {
         }
 
         // Check API key is set
-        let provider = self.provider.as_deref().unwrap_or("anthropic");
+        let provider = match self.provider.as_deref() {
+            Some(p) => p,
+            None => {
+                warnings.push(
+                    "No provider configured. Run 'octos init' to set up your LLM provider."
+                        .to_string(),
+                );
+                return warnings;
+            }
+        };
         if self.get_api_key(provider).is_err() {
             let env_var = self.api_key_env.clone().unwrap_or_else(|| {
                 octos_llm::registry::lookup(provider)

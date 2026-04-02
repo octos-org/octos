@@ -1,5 +1,6 @@
 //! Init command: create .octos/config.json interactively.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -9,6 +10,129 @@ use eyre::{Result, WrapErr};
 use serde_json::json;
 
 use super::Executable;
+
+/// Known providers with their default env var and base URL.
+/// Ordered by general popularity / accessibility.
+struct ProviderInfo {
+    name: &'static str,
+    display: &'static str,
+    api_key_env: &'static str,
+    base_url: Option<&'static str>,
+    api_type: Option<&'static str>,
+}
+
+const PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: "openai",
+        display: "OpenAI (GPT-4o)",
+        api_key_env: "OPENAI_API_KEY",
+        base_url: None,
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "anthropic",
+        display: "Anthropic (Claude)",
+        api_key_env: "ANTHROPIC_API_KEY",
+        base_url: None,
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "gemini",
+        display: "Google Gemini",
+        api_key_env: "GEMINI_API_KEY",
+        base_url: None,
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "deepseek",
+        display: "DeepSeek",
+        api_key_env: "DEEPSEEK_API_KEY",
+        base_url: Some("https://api.deepseek.com/v1"),
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "moonshot",
+        display: "Moonshot (Kimi)",
+        api_key_env: "KIMI_API_KEY",
+        base_url: Some("https://api.moonshot.ai/v1"),
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "dashscope",
+        display: "Dashscope (Qwen)",
+        api_key_env: "DASHSCOPE_API_KEY",
+        base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "minimax",
+        display: "MiniMax",
+        api_key_env: "MINIMAX_API_KEY",
+        base_url: Some("https://api.minimax.io/v1"),
+        api_type: None,
+    },
+    ProviderInfo {
+        name: "zai",
+        display: "Z.AI (GLM)",
+        api_key_env: "ZAI_API_KEY",
+        base_url: Some("https://api.z.ai/api/anthropic"),
+        api_type: Some("anthropic"),
+    },
+];
+
+/// Load models from model_catalog.json, grouped by provider.
+fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
+    let mut result = BTreeMap::new();
+
+    // Try common locations for model_catalog.json
+    let candidates = [
+        // Next to the binary
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("model_catalog.json"))),
+        // Workspace root (for development)
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent()?.parent()?.parent().map(|d| d.join("model_catalog.json"))),
+        // Current directory
+        Some(PathBuf::from("model_catalog.json")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(&candidate) {
+            if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
+                    for model in models {
+                        if let Some(provider_model) =
+                            model.get("provider").and_then(|p| p.as_str())
+                        {
+                            let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
+                            if parts.len() == 2 {
+                                result
+                                    .entry(parts[0].to_string())
+                                    .or_insert_with(Vec::new)
+                                    .push(parts[1].to_string());
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Auto-detect provider from available environment variables.
+fn detect_from_env() -> Option<usize> {
+    for (i, p) in PROVIDERS.iter().enumerate() {
+        if std::env::var(p.api_key_env).is_ok() {
+            return Some(i);
+        }
+    }
+    None
+}
 
 /// Initialize a new .octos configuration.
 #[derive(Debug, Args)]
@@ -55,94 +179,89 @@ impl Executable for InitCommand {
             }
         }
 
-        let (provider, model, api_key_env) = if self.defaults {
-            (
-                "anthropic".to_string(),
-                "claude-sonnet-4-20250514".to_string(),
-                "ANTHROPIC_API_KEY".to_string(),
-            )
+        // Load model catalog for hints
+        let catalog = load_catalog_models();
+
+        let (provider_info_idx, model, api_key_env) = if self.defaults {
+            // Auto-detect from env vars, or prompt if none found
+            let idx = detect_from_env().unwrap_or(0); // fallback to first (openai)
+            let info = &PROVIDERS[idx];
+            let default_model = catalog
+                .get(info.name)
+                .and_then(|m| m.first().cloned())
+                .unwrap_or_else(|| match info.name {
+                    "openai" => "gpt-4.1-mini".to_string(),
+                    "anthropic" => "claude-sonnet-4-20250514".to_string(),
+                    _ => "auto".to_string(),
+                });
+            (idx, default_model, info.api_key_env.to_string())
         } else {
             // Interactive prompts
             println!("{}", "Configure your LLM provider".green());
             println!();
 
+            // Show auto-detected provider if any
+            if let Some(detected) = detect_from_env() {
+                println!(
+                    "  {} {} detected ({})",
+                    "✓".green(),
+                    PROVIDERS[detected].display,
+                    PROVIDERS[detected].api_key_env
+                );
+                println!();
+            }
+
             // Provider selection
             println!("Available providers:");
-            println!("  1. anthropic (Claude)");
-            println!("  2. openai (GPT-4)");
-            println!("  3. gemini (Google Gemini)");
-            println!("  4. zhipu (GLM)");
-            println!("  5. deepseek (DeepSeek)");
-            println!("  6. dashscope (Qwen)");
-            println!("  7. moonshot (Kimi)");
+            for (i, p) in PROVIDERS.iter().enumerate() {
+                let env_set = std::env::var(p.api_key_env).is_ok();
+                let marker = if env_set {
+                    "✓".green().to_string()
+                } else {
+                    " ".to_string()
+                };
+                println!("  {marker} {}. {}", i + 1, p.display);
+            }
             println!();
-            print!("Select provider [1]: ");
+
+            let default_idx = detect_from_env().unwrap_or(0);
+            print!("Select provider [{}]: ", default_idx + 1);
             io::stdout().flush()?;
 
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
-            let provider = match input.trim() {
-                "" | "1" => "anthropic",
-                "2" => "openai",
-                "3" => "gemini",
-                "4" => "zhipu",
-                "5" => "deepseek",
-                "6" => "dashscope",
-                "7" => "moonshot",
-                _ => {
-                    println!("{}", "Invalid selection, using anthropic".yellow());
-                    "anthropic"
+            let idx = if input.trim().is_empty() {
+                default_idx
+            } else {
+                match input.trim().parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= PROVIDERS.len() => n - 1,
+                    _ => {
+                        println!("{}", "Invalid selection, using detected/default".yellow());
+                        default_idx
+                    }
                 }
             };
 
-            // Model selection
-            let default_model = match provider {
-                "anthropic" => "claude-sonnet-4-20250514",
-                "openai" => "gpt-4o",
-                "gemini" => "gemini-2.0-flash",
-                "zhipu" => "glm-4.7",
-                "deepseek" => "deepseek-chat",
-                "dashscope" => "qwen-max",
-                "moonshot" => "kimi-k2.5",
-                _ => "claude-sonnet-4-20250514",
-            };
+            let info = &PROVIDERS[idx];
+
+            // Model selection — show from catalog if available
+            let catalog_models = catalog.get(info.name);
+            let default_model = catalog_models
+                .and_then(|m| m.first().cloned())
+                .unwrap_or_else(|| "auto".to_string());
 
             println!();
-            println!("Available models for {}:", provider);
-            match provider {
-                "anthropic" => {
-                    println!("  - claude-sonnet-4-20250514 (recommended)");
-                    println!("  - claude-opus-4-20250514");
-                    println!("  - claude-3-5-haiku-20241022");
+            if let Some(models) = catalog_models {
+                println!("Available models for {} (from catalog):", info.display);
+                for (i, m) in models.iter().enumerate() {
+                    let rec = if i == 0 { " (recommended)" } else { "" };
+                    println!("  - {}{}", m, rec);
                 }
-                "openai" => {
-                    println!("  - gpt-4o (recommended)");
-                    println!("  - gpt-4o-mini");
-                    println!("  - gpt-4-turbo");
-                }
-                "gemini" => {
-                    println!("  - gemini-2.0-flash (recommended)");
-                    println!("  - gemini-2.0-flash-lite");
-                    println!("  - gemini-1.5-pro");
-                }
-                "zhipu" => {
-                    println!("  - glm-4.7 (recommended)");
-                    println!("  - glm-4.5");
-                    println!("  - glm-4-flash");
-                }
-                "deepseek" => {
-                    println!("  - deepseek-chat (recommended)");
-                    println!("  - deepseek-reasoner");
-                }
-                "dashscope" => {
-                    println!("  - qwen-max (recommended)");
-                    println!("  - qwen-turbo");
-                    println!("  - qwq-plus");
-                }
-                "moonshot" => {
-                    println!("  - kimi-k2.5 (recommended)");
-                }
-                _ => {}
+            } else {
+                println!(
+                    "No catalog models found for {}. Enter model name manually:",
+                    info.display
+                );
             }
             println!();
             print!("Model [{}]: ", default_model);
@@ -151,44 +270,44 @@ impl Executable for InitCommand {
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             let model = if input.trim().is_empty() {
-                default_model.to_string()
+                default_model
             } else {
                 input.trim().to_string()
             };
 
             // API key env var
-            let default_env = match provider {
-                "anthropic" => "ANTHROPIC_API_KEY",
-                "openai" => "OPENAI_API_KEY",
-                "gemini" => "GEMINI_API_KEY",
-                "zhipu" => "ZHIPU_API_KEY",
-                "deepseek" => "DEEPSEEK_API_KEY",
-                "dashscope" => "DASHSCOPE_API_KEY",
-                "moonshot" => "MOONSHOT_API_KEY",
-                _ => "API_KEY",
-            };
-
             println!();
-            print!("API key environment variable [{}]: ", default_env);
+            print!("API key environment variable [{}]: ", info.api_key_env);
             io::stdout().flush()?;
 
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             let api_key_env = if input.trim().is_empty() {
-                default_env.to_string()
+                info.api_key_env.to_string()
             } else {
                 input.trim().to_string()
             };
 
-            (provider.to_string(), model, api_key_env)
+            (idx, model, api_key_env)
         };
 
+        let info = &PROVIDERS[provider_info_idx];
+
         // Create config
-        let config = json!({
-            "provider": provider,
+        let mut config = json!({
+            "provider": info.name,
             "model": model,
             "api_key_env": api_key_env
         });
+
+        // Add base_url for providers that need it
+        if let Some(base_url) = info.base_url {
+            config["base_url"] = json!(base_url);
+        }
+        // Add api_type for non-OpenAI protocol providers
+        if let Some(api_type) = info.api_type {
+            config["api_type"] = json!(api_type);
+        }
 
         // Create directory
         std::fs::create_dir_all(&config_dir)
@@ -265,9 +384,7 @@ impl Executable for InitCommand {
         println!();
         println!(
             "{}",
-            "Ready! Run 'octos run <goal>' or 'octos chat' to start."
-                .green()
-                .bold()
+            "Ready! Run 'octos chat' to start.".green().bold()
         );
 
         Ok(())
