@@ -50,8 +50,8 @@ function Err($msg) {
     } else {
         Write-Host "    ERROR: $msg" -ForegroundColor Red
         Write-Host ""
-        Write-Host "    Run with -Doctor to diagnose:"
-        Write-Host "      .\install.ps1 -Doctor"
+        Write-Host "    Run diagnostics:"
+        Write-Host "      irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
         exit 1
     }
 }
@@ -71,6 +71,18 @@ function Get-PkgHint($pkg) {
     }
 }
 
+function Get-WindowsArchitecture() {
+    if ($env:PROCESSOR_ARCHITEW6432) {
+        return $env:PROCESSOR_ARCHITEW6432.ToUpperInvariant()
+    }
+
+    if ($env:PROCESSOR_ARCHITECTURE) {
+        return $env:PROCESSOR_ARCHITECTURE.ToUpperInvariant()
+    }
+
+    return [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()
+}
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Doctor mode ──────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
@@ -88,7 +100,7 @@ if ($Doctor) {
             Ok "version: $ver"
         } catch {
             Err "binary exists but failed to run"
-            Hint "Try reinstalling: .\install.ps1"
+            Hint "Try reinstalling: irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex"
         }
     } else {
         if (Test-Command "octos") {
@@ -274,13 +286,17 @@ if ($Uninstall) {
 # ── Detect platform ──────────────────────────────────────────────────
 Section "Detecting platform"
 
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+$arch = Get-WindowsArchitecture
 switch ($arch) {
+    "AMD64" {
+        $Triple = "x86_64-pc-windows-msvc"
+        Ok "Windows x64 ($Triple)"
+    }
     "X64" {
         $Triple = "x86_64-pc-windows-msvc"
         Ok "Windows x64 ($Triple)"
     }
-    "Arm64" {
+    "ARM64" {
         # ARM64 Windows can run x64 binaries via emulation
         $Triple = "x86_64-pc-windows-msvc"
         Warn "Windows ARM64 detected - using x64 binary (runs via emulation)"
@@ -531,5 +547,6 @@ Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
 Write-Host "    4. Open dashboard:    octos serve --port 8080"
 Write-Host ""
-Write-Host "  Troubleshoot: .\install.ps1 -Doctor"
+Write-Host "  Troubleshoot:"
+Write-Host "    irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
 Write-Host ""
