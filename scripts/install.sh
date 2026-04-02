@@ -171,12 +171,49 @@ pkg_hint() {
             esac
             ;;
         Linux)
-            case "$1" in
-                git)       echo "sudo apt-get install -y git (or your package manager)" ;;
-                node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
-                chromium)  echo "sudo apt-get install -y chromium-browser" ;;
-                ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
-                iproute2)  echo "sudo apt-get install -y iproute2" ;;
+            # Detect package manager
+            local pm=""
+            if command -v apt-get &>/dev/null; then pm="apt"
+            elif command -v pacman &>/dev/null; then pm="pacman"
+            elif command -v dnf &>/dev/null; then pm="dnf"
+            elif command -v yum &>/dev/null; then pm="yum"
+            elif command -v apk &>/dev/null; then pm="apk"
+            fi
+            case "$pm" in
+                apt)
+                    case "$1" in
+                        git)       echo "sudo apt-get install -y git" ;;
+                        node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
+                        chromium)  echo "sudo apt-get install -y chromium-browser" ;;
+                        ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
+                        iproute2)  echo "sudo apt-get install -y iproute2" ;;
+                    esac ;;
+                pacman)
+                    case "$1" in
+                        git)       echo "sudo pacman -S --noconfirm git" ;;
+                        node)      echo "sudo pacman -S --noconfirm nodejs npm" ;;
+                        chromium)  echo "sudo pacman -S --noconfirm chromium" ;;
+                        ffmpeg)    echo "sudo pacman -S --noconfirm ffmpeg" ;;
+                        iproute2)  echo "sudo pacman -S --noconfirm iproute2" ;;
+                    esac ;;
+                dnf|yum)
+                    case "$1" in
+                        git)       echo "sudo $pm install -y git" ;;
+                        node)      echo "sudo $pm install -y nodejs npm" ;;
+                        chromium)  echo "sudo $pm install -y chromium" ;;
+                        ffmpeg)    echo "sudo $pm install -y ffmpeg" ;;
+                        iproute2)  echo "sudo $pm install -y iproute" ;;
+                    esac ;;
+                apk)
+                    case "$1" in
+                        git)       echo "sudo apk add git" ;;
+                        node)      echo "sudo apk add nodejs npm" ;;
+                        chromium)  echo "sudo apk add chromium" ;;
+                        ffmpeg)    echo "sudo apk add ffmpeg" ;;
+                        iproute2)  echo "sudo apk add iproute2" ;;
+                    esac ;;
+                *)
+                    echo "install '$1' using your package manager" ;;
             esac
             ;;
         *)
@@ -987,26 +1024,29 @@ case "$ARCH" in
     *)             err "Unsupported architecture: $ARCH" ;;
 esac
 
+# Pre-built binaries are only available for these combinations.
+# Fail early instead of downloading a 404.
+case "$TRIPLE" in
+    aarch64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;; # published in release workflow
+    x86_64-apple-darwin)
+        err "macOS x86_64 does not have pre-built binaries yet."
+        hint "Build from source: cargo install --path crates/octos-cli"
+        ;;
+esac
+
 ok "$OS $ARCH ($TRIPLE)"
 
 # ── Check / install runtime dependencies ─────────────────────────────
 section "Checking runtime dependencies"
 
-# git — required for skill installation
+# git — needed for skill installation
 if command -v git &>/dev/null; then
     ok "git $(git --version | awk '{print $3}')"
 else
-    case "$OS" in
-        Darwin)
-            echo "    Installing Xcode Command Line Tools (provides git)..."
-            xcode-select --install 2>/dev/null || true
-            echo "    Follow the dialog to complete installation, then re-run this script."
-            exit 1
-            ;;
-        *)
-            err "git not found. Install with: $(pkg_hint git)"
-            ;;
-    esac
+    warn "git not found"
+    echo "    Enables: skill installation (octos skills install)"
+    echo "    Install:"
+    echo "      $(pkg_hint git)"
 fi
 
 # Node.js / npm
@@ -1449,8 +1489,9 @@ echo "    Logs:       tail -f $DATA_DIR/serve.log"
 echo ""
 echo "  Next steps:"
 echo "    1. Set your API key:  export ANTHROPIC_API_KEY=sk-..."
-echo "    2. Start chatting:    octos chat"
-echo "    3. Open dashboard:    http://localhost:8080/admin/"
+echo "    2. Install skills:    octos skills install --all"
+echo "    3. Start chatting:    octos chat"
+echo "    4. Open dashboard:    http://localhost:8080/admin/"
 if [ -n "$TENANT_NAME" ]; then
     echo ""
     echo "  Tunnel:"

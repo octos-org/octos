@@ -24,7 +24,6 @@ COPY crates/app-skills/send-email/Cargo.toml crates/app-skills/send-email/Cargo.
 COPY crates/app-skills/account-manager/Cargo.toml crates/app-skills/account-manager/Cargo.toml
 COPY crates/app-skills/time/Cargo.toml crates/app-skills/time/Cargo.toml
 COPY crates/app-skills/weather/Cargo.toml crates/app-skills/weather/Cargo.toml
-COPY crates/app-skills/voice/Cargo.toml crates/app-skills/voice/Cargo.toml
 COPY crates/platform-skills/voice/Cargo.toml crates/platform-skills/voice/Cargo.toml
 
 # Create stub source files for dependency caching
@@ -44,7 +43,6 @@ RUN mkdir -p crates/octos-core/src && echo "" > crates/octos-core/src/lib.rs && 
     mkdir -p crates/app-skills/account-manager/src && echo "fn main() {}" > crates/app-skills/account-manager/src/main.rs && \
     mkdir -p crates/app-skills/time/src && echo "fn main() {}" > crates/app-skills/time/src/main.rs && \
     mkdir -p crates/app-skills/weather/src && echo "fn main() {}" > crates/app-skills/weather/src/main.rs && \
-    mkdir -p crates/app-skills/voice/src && echo "fn main() {}" > crates/app-skills/voice/src/main.rs && \
     mkdir -p crates/platform-skills/voice/src && echo "fn main() {}" > crates/platform-skills/voice/src/main.rs
 
 RUN cargo build --release --bin octos \

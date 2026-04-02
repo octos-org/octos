@@ -29,17 +29,23 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
 - **Sandbox isolation**: bwrap + sandbox-exec + Docker. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
-## Install on a Fresh Mac
+## Install (no dependencies required)
 
-For standalone Mac Mini or other macOS systems — no Rust, Xcode, or development tools required. One command on a fresh machine:
+For standalone machines (Mac Mini, Linux server, etc.) — no Rust, Xcode, or development tools needed:
 
 ```bash
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
 ```
 
-This installs the `octos` binary to `~/.octos/bin`, initializes the workspace, and sets up `octos serve` as a system service via launchd.
+Supported platforms: **macOS ARM64** (Apple Silicon), **Linux x86_64**, and **Linux ARM64**. Installs to `~/.octos/bin`, initializes the workspace, and sets up `octos serve` as a system service (launchd on macOS, systemd on Linux).
 
-With tunnel options (remote access via frpc):
+On **Windows** (PowerShell):
+
+```powershell
+irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
+```
+
+With tunnel options (remote access via frpc, macOS/Linux only):
 
 ```bash
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
@@ -49,7 +55,13 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 Diagnose an existing installation:
 
 ```bash
+# macOS / Linux
 curl -fsSL https://github.com/octos-org/octos/releases/latest/download/octos-doctor.sh | bash
+```
+
+```powershell
+# Windows
+irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor
 ```
 
 ## Quick Start

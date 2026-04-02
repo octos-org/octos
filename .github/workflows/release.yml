@@ -2,6 +2,18 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build (all = full release)'
+        required: true
+        type: choice
+        default: all
+        options: [all, macos-arm, linux-x86, linux-arm, windows, docker]
+      tag:
+        description: 'Tag to release (e.g. v0.1.2-rc5). Required for publish.'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -12,6 +24,7 @@ env:
 
 jobs:
   build-macos-arm:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos-arm'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +35,9 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
@@ -42,6 +58,7 @@ jobs:
           path: octos-bundle-aarch64-apple-darwin.tar.gz
 
   build-linux-x86:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-x86'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +69,9 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
@@ -72,6 +92,7 @@ jobs:
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
 
   build-linux-arm:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-arm'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +105,9 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
@@ -104,6 +128,7 @@ jobs:
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
 
   build-windows:
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +142,10 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Build dashboard
+        shell: bash
+        run: cd dashboard && npm ci && npm run build
 
       - name: Build
         run: |
@@ -137,41 +166,43 @@ jobs:
           name: windows
           path: octos-bundle-x86_64-pc-windows-msvc.zip
 
-  build-docker:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version
-        id: meta
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  # TODO: uncomment after Dockerfile is fixed
+  # build-docker:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: docker/setup-qemu-action@v3
+  #
+  #     - uses: docker/setup-buildx-action@v3
+  #
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #
+  #     - name: Extract version
+  #       id: meta
+  #       run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+  #
+  #     - uses: docker/build-push-action@v6
+  #       with:
+  #         context: .
+  #         platforms: linux/amd64,linux/arm64
+  #         push: true
+  #         tags: |
+  #           ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+  #           ghcr.io/${{ github.repository }}:latest
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max
 
   publish:
-    needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows, build-docker]
+    if: github.event_name == 'push' || inputs.platform == 'all'
+    needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -196,5 +227,6 @@ jobs:
             artifacts/linux-arm/octos-bundle-aarch64-unknown-linux-gnu.tar.gz
             artifacts/windows/octos-bundle-x86_64-pc-windows-msvc.zip
             scripts/install.sh
+            scripts/install.ps1
             scripts/octos-doctor.sh
           body_path: RELEASE_NOTES.md
