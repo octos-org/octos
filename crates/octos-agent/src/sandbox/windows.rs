@@ -107,8 +107,15 @@ fn find_sandbox_helper() -> Option<String> {
         }
     }
 
-    // On PATH
-    if which::which("octos-sandbox").is_ok() {
+    // On PATH (use `where` on Windows to find it)
+    if std::process::Command::new("where")
+        .arg("octos-sandbox")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
         return Some("octos-sandbox".to_string());
     }
 
