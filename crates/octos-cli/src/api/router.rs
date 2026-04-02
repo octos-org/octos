@@ -62,7 +62,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
-        .route("/api/upload", post(handlers::upload))
+        .route(
+            "/api/upload",
+            post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/sessions", get(handlers::list_sessions))
         .route(
