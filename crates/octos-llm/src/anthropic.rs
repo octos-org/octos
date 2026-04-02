@@ -290,7 +290,21 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
-        return AnthropicContent::Text(msg.content.clone());
+        // Include non-image file paths so the agent can use read_file
+        let non_image: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
+        if non_image.is_empty() {
+            return AnthropicContent::Text(msg.content.clone());
+        }
+        let note = format!(
+            "[attached files: {}. Use read_file to access them.]",
+            non_image.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
+        );
+        let text = if msg.content.is_empty() {
+            note
+        } else {
+            format!("{}\n{note}", msg.content)
+        };
+        return AnthropicContent::Text(text);
     }
 
     let mut parts = Vec::new();
@@ -496,10 +510,15 @@ mod tests {
             reasoning_content: None,
             timestamp: chrono::Utc::now(),
         };
-        // Non-image media should fall through to Text
+        // Non-image media should include file paths for read_file
         let content = build_anthropic_content(&m);
         match content {
-            AnthropicContent::Text(t) => assert_eq!(t, "check this"),
+            AnthropicContent::Text(t) => {
+                assert!(t.contains("check this"));
+                assert!(t.contains("file.txt"));
+                assert!(t.contains("data.csv"));
+                assert!(t.contains("read_file"));
+            }
             _ => panic!("expected Text for non-image media"),
         }
     }

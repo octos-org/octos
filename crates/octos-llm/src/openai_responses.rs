@@ -658,7 +658,7 @@ mod tests {
         build_input_items(&m, &mut items);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"].as_str(), Some("function_call_output"));
-        assert_eq!(items[0]["call_id"].as_str(), Some("call_123"));
+        assert_eq!(items[0]["call_id"].as_str(), Some("fc_123"));
         assert_eq!(items[0]["output"].as_str(), Some("file contents"));
     }
 
@@ -690,7 +690,7 @@ mod tests {
         // Second: top-level function_call item
         assert_eq!(items[1]["type"].as_str(), Some("function_call"));
         assert_eq!(items[1]["name"].as_str(), Some("shell"));
-        assert_eq!(items[1]["call_id"].as_str(), Some("call_1"));
+        assert_eq!(items[1]["call_id"].as_str(), Some("fc_1"));
     }
 
     #[test]

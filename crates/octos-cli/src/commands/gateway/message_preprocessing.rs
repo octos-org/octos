@@ -61,7 +61,8 @@ pub async fn process_media(
                 // for voice_clone / voice_save_profile if conversation
                 // context calls for it.
                 inbound.content.push_str(&format!("\n[Audio file: {path}]"));
-            } else if octos_bus::media::is_image(path) {
+            } else {
+                // Include all non-audio files (images, CSVs, PDFs, etc.)
                 image_media.push(path.clone());
             }
         }
@@ -70,7 +71,8 @@ pub async fn process_media(
         for path in &inbound.media {
             if octos_bus::media::is_audio(path) {
                 is_voice_message = true;
-            } else if octos_bus::media::is_image(path) {
+            } else {
+                // Include all non-audio files (images, CSVs, PDFs, etc.)
                 image_media.push(path.clone());
             }
         }
