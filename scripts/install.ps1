@@ -655,7 +655,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Seconds 10) `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 # Build a wrapper script that sets env vars and launches octos serve
