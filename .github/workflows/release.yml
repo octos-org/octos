@@ -201,7 +201,7 @@ jobs:
   #         cache-to: type=gha,mode=max
 
   publish:
-    if: github.event_name == 'push' || inputs.platform == 'all'
+    if: ${{ !failure() && !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
     needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
     steps:

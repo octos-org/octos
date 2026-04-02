@@ -1000,7 +1000,6 @@ if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; };
 
     echo ""
     echo "    Tunnel: https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
-    echo "    SSH:    ssh -p ${SSH_PORT} $(whoami)@${TUNNEL_DOMAIN}"
     echo ""
     exit 0
 fi
@@ -1496,7 +1495,6 @@ if [ -n "$TENANT_NAME" ]; then
     echo ""
     echo "  Tunnel:"
     echo "    Dashboard:  https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
-    echo "    SSH access: ssh -p ${SSH_PORT} $(whoami)@${TUNNEL_DOMAIN}"
 fi
 if [ -n "$CADDY_DOMAIN" ]; then
     echo ""
