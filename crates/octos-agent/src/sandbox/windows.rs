@@ -30,12 +30,12 @@ pub struct AppContainerSandbox {
 }
 
 /// Windows system paths that must be readable for shell commands to work.
+/// Windows system paths that must be readable for shell commands to work.
+/// Only paths that actually exist will be passed to the helper.
 const WINDOWS_READ_ALLOW_PATHS: &[&str] = &[
     r"C:\Windows",
-    r"C:\Windows\System32",
     r"C:\Program Files\Git",
     r"C:\Program Files\nodejs",
-    r"C:\Python",
     r"C:\ProgramData",
 ];
 
@@ -56,22 +56,28 @@ impl Sandbox for AppContainerSandbox {
 
         let mut cmd = Command::new(helper_path);
 
-        // Profile name
-        let profile = self
-            .profile_name
-            .as_deref()
-            .unwrap_or("octos.default");
-        cmd.arg("--profile").arg(profile);
+        // Profile name — prefix with "octos." for AppContainer namespace
+        let raw = self.profile_name.as_deref().unwrap_or("default");
+        let profile = if raw.starts_with("octos.") {
+            raw.to_string()
+        } else {
+            format!("octos.{raw}")
+        };
+        cmd.arg("--profile").arg(&profile);
 
         // Working directory (read-write)
         cmd.arg("--cwd").arg(cwd);
 
-        // Read-only paths
+        // Read-only paths — only pass paths that exist
         for path in WINDOWS_READ_ALLOW_PATHS {
-            cmd.arg("--allow-read").arg(path);
+            if Path::new(path).exists() {
+                cmd.arg("--allow-read").arg(path);
+            }
         }
         for path in &self.read_allow_paths {
-            cmd.arg("--allow-read").arg(path);
+            if Path::new(path).exists() {
+                cmd.arg("--allow-read").arg(path);
+            }
         }
 
         // Network access

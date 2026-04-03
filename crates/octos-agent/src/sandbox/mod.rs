@@ -72,6 +72,10 @@ pub struct SandboxConfig {
     /// Non-empty = only allow reads from cwd + these paths (kernel-enforced on macOS/Linux).
     #[serde(default)]
     pub read_allow_paths: Vec<String>,
+
+    /// Profile name for sandbox isolation (used as AppContainer profile ID on Windows).
+    #[serde(default)]
+    pub profile_name: Option<String>,
 }
 
 /// Default system paths that must be readable for shell commands to work.
@@ -104,6 +108,7 @@ impl Default for SandboxConfig {
             allow_network: false,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
+            profile_name: None,
         }
     }
 }
@@ -244,12 +249,14 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 Box::new(AppContainerSandbox {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
-                    profile_name: None,
+                    profile_name: config.profile_name.clone(),
                 })
             }
             #[cfg(not(windows))]
             {
-                tracing::warn!("AppContainer is only available on Windows, falling back to NoSandbox");
+                tracing::warn!(
+                    "AppContainer is only available on Windows, falling back to NoSandbox"
+                );
                 Box::new(NoSandbox)
             }
         }
@@ -263,13 +270,13 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                 })
-            } else if cfg!(target_os = "windows") {
+            } else if cfg!(target_os = "windows") && has_sandbox_helper() {
                 #[cfg(windows)]
                 {
                     Box::new(AppContainerSandbox {
                         allow_network: config.allow_network,
                         read_allow_paths: config.read_allow_paths.clone(),
-                        profile_name: None,
+                        profile_name: config.profile_name.clone(),
                     })
                 }
                 #[cfg(not(windows))]
@@ -291,6 +298,18 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             }
         }
     }
+}
+
+/// Check if the octos-sandbox helper binary is available.
+fn has_sandbox_helper() -> bool {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join("octos-sandbox.exe").exists() || dir.join("octos-sandbox").exists() {
+                return true;
+            }
+        }
+    }
+    which_exists("octos-sandbox")
 }
 
 /// Check if a binary exists on PATH.
