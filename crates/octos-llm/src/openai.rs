@@ -529,18 +529,14 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         // Build a note for any media the LLM won't see inline:
         // - Non-image files (CSV, PDF, etc.) → include full path so agent can read_file
         // - Images stripped because model lacks vision → include filename
-        let non_image_files: Vec<_> = msg
-            .media
-            .iter()
-            .filter(|p| !vision::is_image(p))
-            .collect();
+        let non_image_files: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
         let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p));
 
         let media_note = if !non_image_files.is_empty() || stripped_images {
             let mut parts = Vec::new();
             for path in &non_image_files {
                 // Include full path so the agent can use read_file to access it
-                parts.push(format!("{path}"));
+                parts.push(path.to_string());
             }
             if stripped_images {
                 for p in msg.media.iter().filter(|p| vision::is_image(p)) {

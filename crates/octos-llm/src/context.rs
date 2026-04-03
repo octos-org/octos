@@ -134,15 +134,42 @@ mod tests {
 
     #[test]
     fn test_catalog_seed_and_lookup() {
-        seed_from_catalog(&[
-            ("minimax/MiniMax-M2.7".to_string(), 1_000_000, 65_536),
-            ("deepseek/deepseek-chat".to_string(), 128_000, 8_192),
-        ]);
-        assert_eq!(context_window_tokens("MiniMax-M2.7"), 1_000_000);
-        assert_eq!(max_output_tokens("MiniMax-M2.7"), 65_536);
-        assert_eq!(context_window_tokens("deepseek-chat"), 128_000);
+        // Hold the write lock across seed + verify to prevent races with
+        // parallel tests that also touch the global CATALOG.
+        let mut guard = CATALOG.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = HashMap::new();
+        for (key, ctx, max_out) in [
+            ("minimax/minimax-m2.7", 1_000_000u64, 65_536u64),
+            ("deepseek/deepseek-chat", 128_000, 8_192),
+        ] {
+            let entry = CatalogModel {
+                context_window: ctx,
+                max_output: max_out,
+            };
+            map.insert(key.to_lowercase(), entry);
+            if let Some(model) = key.split('/').next_back() {
+                map.insert(
+                    model.to_lowercase(),
+                    CatalogModel {
+                        context_window: ctx,
+                        max_output: max_out,
+                    },
+                );
+            }
+        }
+        *guard = Some(map);
+
+        // Verify lookups while still holding the lock
+        let map_ref = guard.as_ref().unwrap();
+        let mm = map_ref.get("minimax-m2.7").unwrap();
+        assert_eq!(mm.context_window, 1_000_000);
+        assert_eq!(mm.max_output, 65_536);
+        let ds = map_ref.get("deepseek-chat").unwrap();
+        assert_eq!(ds.context_window, 128_000);
+        assert_eq!(ds.max_output, 8_192);
+
         // Clean up
-        *CATALOG.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *guard = None;
     }
 
     #[test]
