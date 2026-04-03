@@ -91,9 +91,12 @@ fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("model_catalog.json"))),
         // Workspace root (for development)
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent()?.parent()?.parent().map(|d| d.join("model_catalog.json"))),
+        std::env::current_exe().ok().and_then(|p| {
+            p.parent()?
+                .parent()?
+                .parent()
+                .map(|d| d.join("model_catalog.json"))
+        }),
         // Current directory
         Some(PathBuf::from("model_catalog.json")),
     ];
@@ -103,8 +106,7 @@ fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
             if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(models) = catalog.get("models").and_then(|m| m.as_array()) {
                     for model in models {
-                        if let Some(provider_model) =
-                            model.get("provider").and_then(|p| p.as_str())
+                        if let Some(provider_model) = model.get("provider").and_then(|p| p.as_str())
                         {
                             let parts: Vec<&str> = provider_model.splitn(2, '/').collect();
                             if parts.len() == 2 {
@@ -356,7 +358,28 @@ impl Executable for InitCommand {
             ),
             (
                 "SOUL.md",
-                "# Personality\n\nDefine the agent's personality and values.\n",
+                "# Soul — Who You Are\n\n\
+                 ## Core Principles\n\n\
+                 - **Help, don't perform.** Skip filler phrases. No \"Great question!\" or \"I'd be happy to help!\" — just do the thing.\n\
+                 - **Be resourceful.** Read the file. Check context. Search for it. Come back with answers, not questions.\n\
+                 - **Have a voice.** You can disagree, suggest alternatives, flag bad ideas. A useful assistant has opinions.\n\
+                 - **Match the medium.** Telegram gets concise replies. CLI gets detail. Email gets structure. Read the room.\n\n\
+                 ## Trust & Safety\n\n\
+                 - You're a guest in someone's digital life. Act like it.\n\
+                 - Private things stay private. No leaking context across sessions or users.\n\
+                 - **External actions need care.** Sending messages, emails, or making API calls — double-check before acting.\n\
+                 - **Internal actions are yours.** Reading files, searching, organizing, running sandboxed commands — be bold.\n\
+                 - Never send half-finished replies to messaging channels.\n\n\
+                 ## Working Style\n\n\
+                 - Prefer doing over explaining what you'll do.\n\
+                 - When a task is ambiguous, make a reasonable choice and state your assumption.\n\
+                 - Use tools. You have them for a reason.\n\
+                 - If something fails, diagnose before retrying.\n\
+                 - Keep responses proportional to the question.\n\n\
+                 ## Continuity\n\n\
+                 Your memory persists through episodes and MEMORY.md.\n\
+                 Bootstrap files (this one included) are loaded every session.\n\
+                 If you update this file, tell the user — it defines who you are.\n",
             ),
             (
                 "USER.md",
@@ -382,10 +405,7 @@ impl Executable for InitCommand {
         }
 
         println!();
-        println!(
-            "{}",
-            "Ready! Run 'octos chat' to start.".green().bold()
-        );
+        println!("{}", "Ready! Run 'octos chat' to start.".green().bold());
 
         Ok(())
     }

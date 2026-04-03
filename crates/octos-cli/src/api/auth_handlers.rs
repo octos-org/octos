@@ -385,6 +385,86 @@ pub async fn update_my_profile(
     }))
 }
 
+// ── Soul endpoints ───────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SoulResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// GET /api/my/soul
+pub async fn my_soul(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<SoulResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    let content = crate::soul_service::read_soul(&data_dir);
+    Ok(Json(SoulResponse {
+        ok: true,
+        content,
+        message: None,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSoulRequest {
+    pub content: String,
+}
+
+/// PUT /api/my/soul
+pub async fn update_my_soul(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<UpdateSoulRequest>,
+) -> Result<Json<SoulResponse>, (StatusCode, String)> {
+    if req.content.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "content must not be empty".into()));
+    }
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    crate::soul_service::write_soul(&data_dir, &req.content)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(profile = %profile.id, "soul updated via API");
+    Ok(Json(SoulResponse {
+        ok: true,
+        content: Some(req.content.trim().to_string()),
+        message: Some("Soul updated. Takes effect in new sessions.".into()),
+    }))
+}
+
+/// DELETE /api/my/soul
+pub async fn delete_my_soul(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<SoulResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+    let data_dir = ps.resolve_data_dir(&profile);
+    crate::soul_service::remove_soul(&data_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tracing::info!(profile = %profile.id, "soul reset via API");
+    Ok(Json(SoulResponse {
+        ok: true,
+        content: None,
+        message: Some("Soul reset to default.".into()),
+    }))
+}
+
 /// POST /api/my/profile/start
 pub async fn start_my_gateway(
     State(state): State<Arc<AppState>>,

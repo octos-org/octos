@@ -1270,13 +1270,14 @@ impl GatewayRuntime {
             pending_messages.clone(),
         );
 
-        // Create session command dispatcher (testable extraction of /new, /s, /sessions, /back, /delete)
+        // Create session command dispatcher (testable extraction of /new, /s, /sessions, /back, /delete, /soul)
         let session_dispatcher = crate::gateway_dispatcher::GatewayDispatcher::new(
             session_mgr.clone(),
             active_sessions.clone(),
             pending_messages.clone(),
             out_tx.clone(),
-        );
+        )
+        .with_data_dir(data_dir.clone());
 
         // Drop the original out_tx — factory and registry hold their own clones.
         // This ensures the outbound channel closes properly when actors shut down.

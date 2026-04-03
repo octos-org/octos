@@ -4,6 +4,7 @@
 //! Each method corresponds to a branch in the old monolithic `while let` loop.
 //! The caller (`run_async`) feeds inbound messages and acts on [`DispatchResult`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
@@ -38,6 +39,8 @@ pub struct GatewayDispatcher {
     pub(crate) out_tx: mpsc::Sender<OutboundMessage>,
     /// Profile ID used for building profiled session keys (None = main profile).
     pub(crate) dispatch_profile_id: Option<String>,
+    /// Profile data directory for per-user files (soul.md, etc.).
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl GatewayDispatcher {
@@ -53,12 +56,19 @@ impl GatewayDispatcher {
             pending_messages,
             out_tx,
             dispatch_profile_id: None,
+            data_dir: None,
         }
     }
 
     /// Set the dispatch profile ID for profiled session key construction.
     pub fn with_profile_id(mut self, profile_id: Option<String>) -> Self {
         self.dispatch_profile_id = profile_id;
+        self
+    }
+
+    /// Set the data directory for per-user files (soul.md, etc.).
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
         self
     }
 
@@ -420,6 +430,96 @@ impl GatewayDispatcher {
         Some(DispatchResult::Handled)
     }
 
+    /// Handle `/soul`, `/soul show`, `/soul reset`, `/soul <text>`.
+    pub async fn handle_soul_command(
+        &self,
+        cmd: &str,
+        reply_channel: &str,
+        reply_chat_id: &str,
+    ) -> Option<DispatchResult> {
+        if cmd != "/soul" && !cmd.starts_with("/soul ") {
+            return None;
+        }
+        let data_dir = match &self.data_dir {
+            Some(d) => d,
+            None => {
+                let _ = self
+                    .out_tx
+                    .send(make_reply(
+                        reply_channel,
+                        reply_chat_id,
+                        "Soul not available (no data directory configured).",
+                    ))
+                    .await;
+                return Some(DispatchResult::Handled);
+            }
+        };
+
+        let arg = cmd.strip_prefix("/soul").unwrap_or("").trim();
+
+        if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
+            let reply = match crate::soul_service::read_soul(data_dir) {
+                Some(content) => format!("🪶 Current soul:\n\n{content}"),
+                None => "No custom soul set. Using default.".to_string(),
+            };
+            let _ = self
+                .out_tx
+                .send(make_reply(reply_channel, reply_chat_id, reply))
+                .await;
+        } else if arg.eq_ignore_ascii_case("reset") {
+            match crate::soul_service::remove_soul(data_dir) {
+                Ok(()) => {
+                    let _ = self
+                        .out_tx
+                        .send(make_reply(
+                            reply_channel,
+                            reply_chat_id,
+                            "Soul reset to default. Takes effect in new sessions.",
+                        ))
+                        .await;
+                }
+                Err(e) => {
+                    warn!("failed to remove soul: {e}");
+                    let _ = self
+                        .out_tx
+                        .send(make_reply(
+                            reply_channel,
+                            reply_chat_id,
+                            format!("Failed to reset soul: {e}"),
+                        ))
+                        .await;
+                }
+            }
+        } else {
+            match crate::soul_service::write_soul(data_dir, arg) {
+                Ok(()) => {
+                    info!(soul_len = arg.len(), "user soul updated");
+                    let _ = self
+                        .out_tx
+                        .send(make_reply(
+                            reply_channel,
+                            reply_chat_id,
+                            "Soul updated. Takes effect in new sessions.",
+                        ))
+                        .await;
+                }
+                Err(e) => {
+                    warn!("failed to write soul: {e}");
+                    let _ = self
+                        .out_tx
+                        .send(make_reply(
+                            reply_channel,
+                            reply_chat_id,
+                            format!("Failed to update soul: {e}"),
+                        ))
+                        .await;
+                }
+            }
+        }
+
+        Some(DispatchResult::Handled)
+    }
+
     /// Try all session commands in order. Returns `Handled` if matched,
     /// `Forward` if the message should go to the actor for LLM processing.
     pub async fn try_dispatch_session_command(
@@ -457,6 +557,12 @@ impl GatewayDispatcher {
         }
         if let Some(r) = self
             .handle_delete_command(cmd, inbound, reply_channel, reply_chat_id, base_key_str)
+            .await
+        {
+            return r;
+        }
+        if let Some(r) = self
+            .handle_soul_command(cmd, reply_channel, reply_chat_id)
             .await
         {
             return r;

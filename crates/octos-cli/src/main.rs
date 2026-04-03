@@ -21,6 +21,7 @@ pub mod persona_service;
 pub mod process_manager;
 pub mod profiles;
 pub mod session_actor;
+pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;
 pub mod stream_reporter;

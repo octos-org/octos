@@ -82,6 +82,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let my_api = Router::new()
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
+        .route("/api/my/soul", get(auth_handlers::my_soul))
+        .route("/api/my/soul", put(auth_handlers::update_my_soul))
+        .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
         .route(
             "/api/my/profile/start",
             post(auth_handlers::start_my_gateway),

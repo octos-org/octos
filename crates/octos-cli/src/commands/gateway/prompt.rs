@@ -38,6 +38,12 @@ pub async fn build_system_prompt(
         prompt.push_str(&bootstrap);
     }
 
+    // Per-user soul override (takes precedence over shared SOUL.md)
+    if let Some(user_soul) = crate::soul_service::read_soul(data_dir) {
+        prompt.push_str("\n\n## Soul\n\n");
+        prompt.push_str(&user_soul);
+    }
+
     // Append memory context
     let memory_ctx = memory_store.get_memory_context().await;
     if !memory_ctx.is_empty() {
