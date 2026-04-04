@@ -126,6 +126,17 @@ fn find_chrome_binary() -> Option<String> {
         return Some(mac_chromium.to_string());
     }
 
+    // Windows
+    let win_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    for path in &win_paths {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+
     None
 }
 
