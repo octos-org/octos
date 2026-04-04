@@ -243,14 +243,6 @@ impl ContentCatalog {
             new_paths.push(path.to_path_buf());
         })?;
 
-        // Also scan /tmp/octos-uploads if it exists.
-        let upload_dir = std::env::temp_dir().join("octos-uploads");
-        if upload_dir.exists() {
-            Self::walk_dir(&upload_dir, &known_paths, &mut |path| {
-                new_paths.push(path.to_path_buf());
-            })?;
-        }
-
         let mut indexed = 0;
         for path in &new_paths {
             match self.index_file(path, None, None, None) {
