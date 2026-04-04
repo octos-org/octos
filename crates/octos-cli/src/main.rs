@@ -9,6 +9,8 @@ pub mod auth;
 mod commands;
 pub mod compaction;
 pub mod config;
+#[cfg(feature = "api")]
+pub mod content_catalog;
 pub mod config_watcher;
 pub mod cron_tool;
 pub mod gateway_dispatcher;
@@ -20,6 +22,7 @@ pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
 pub mod profiles;
+pub mod project_templates;
 pub mod session_actor;
 pub mod soul_service;
 pub mod status_indicator;

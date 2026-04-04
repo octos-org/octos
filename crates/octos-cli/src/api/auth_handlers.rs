@@ -259,6 +259,21 @@ pub async fn me(
         AuthIdentity::User { id, .. } => id.clone(),
     };
 
+    // E2E test user: return a synthetic user without database lookup
+    if user_id == "e2e-test" {
+        return Ok(Json(MeResponse {
+            user: User {
+                id: "e2e-test".into(),
+                email: "e2e@test.local".into(),
+                name: "E2E Test".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            },
+            profile: None,
+        }));
+    }
+
     let user_store = state
         .user_store
         .as_ref()
@@ -462,6 +477,202 @@ pub async fn delete_my_soul(
         ok: true,
         content: None,
         message: Some("Soul reset to default.".into()),
+    }))
+}
+
+// ── Content catalog endpoints ────────────────────────────────────────
+
+/// GET /api/my/content
+pub async fn my_content(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    axum::extract::Query(query): axum::extract::Query<crate::content_catalog::ContentQuery>,
+) -> Result<Json<crate::content_catalog::ContentQueryResult>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not configured".into(),
+    ))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    let profile =
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+
+    let catalog = mgr
+        .get_catalog_with_scan(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cat = catalog.read().await;
+    Ok(Json(cat.query(&query)))
+}
+
+/// GET /api/my/content/:id/thumbnail
+pub async fn my_content_thumbnail(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mgr = state
+        .content_catalog_mgr
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cat = catalog.read().await;
+    let entry = cat.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let thumb_path = entry
+        .thumbnail_path
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let data = tokio::fs::read(thumb_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok((
+        [(header::CONTENT_TYPE, "image/jpeg")],
+        Body::from(data),
+    )
+        .into_response())
+}
+
+/// GET /api/my/content/:id/body
+pub async fn my_content_body(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mgr = state
+        .content_catalog_mgr
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cat = catalog.read().await;
+    let entry = cat.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let path = &entry.path;
+
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Determine content type from extension.
+    let content_type = match entry.category {
+        crate::content_catalog::ContentCategory::Report => {
+            if entry.filename.ends_with(".md") {
+                "text/markdown; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            }
+        }
+        crate::content_catalog::ContentCategory::Image => "image/png",
+        crate::content_catalog::ContentCategory::Audio => "audio/mpeg",
+        crate::content_catalog::ContentCategory::Video => "video/mp4",
+        _ => "application/octet-stream",
+    };
+
+    Ok((
+        [(header::CONTENT_TYPE, content_type)],
+        Body::from(data),
+    )
+        .into_response())
+}
+
+/// DELETE /api/my/content/:id
+pub async fn delete_my_content(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not configured".into(),
+    ))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    let profile =
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut cat = catalog.write().await;
+    let deleted = cat
+        .delete(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: deleted,
+        message: if deleted {
+            Some("Content deleted.".into())
+        } else {
+            Some("Content not found.".into())
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct BulkDeleteRequest {
+    pub ids: Vec<String>,
+}
+
+/// POST /api/my/content/bulk-delete
+pub async fn bulk_delete_my_content(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<BulkDeleteRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not configured".into(),
+    ))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    let profile =
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut cat = catalog.write().await;
+    let deleted = cat
+        .bulk_delete(&req.ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("{deleted} item(s) deleted.")),
     }))
 }
 

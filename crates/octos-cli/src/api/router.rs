@@ -75,6 +75,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::session_messages),
         )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
+        .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 
@@ -85,6 +86,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
+        .route("/api/my/content", get(auth_handlers::my_content))
+        .route(
+            "/api/my/content/{id}/thumbnail",
+            get(auth_handlers::my_content_thumbnail),
+        )
+        .route(
+            "/api/my/content/{id}/body",
+            get(auth_handlers::my_content_body),
+        )
+        .route(
+            "/api/my/content/{id}",
+            delete(auth_handlers::delete_my_content),
+        )
+        .route(
+            "/api/my/content/bulk-delete",
+            post(auth_handlers::bulk_delete_my_content),
+        )
         .route(
             "/api/my/profile/start",
             post(auth_handlers::start_my_gateway),
@@ -414,6 +432,16 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
     if let Some(expected) = &state.auth_token {
         if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             return Some(AuthIdentity::Admin);
+        }
+    }
+
+    // 1b. Check OCTOS_TEST_TOKEN for e2e test auth bypass
+    if let Ok(test_token) = std::env::var("OCTOS_TEST_TOKEN") {
+        if !test_token.is_empty() && constant_time_eq(token.as_bytes(), test_token.as_bytes()) {
+            return Some(AuthIdentity::User {
+                id: "e2e-test".into(),
+                role: UserRole::User,
+            });
         }
     }
 

@@ -19,6 +19,7 @@ pub use sse::SseBroadcaster;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::content_catalog::ContentCatalogManager;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
@@ -67,4 +68,6 @@ pub struct AppState {
     pub frps_port: Option<u16>,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
+    /// Content catalog manager for per-profile file indexing.
+    pub content_catalog_mgr: Option<Arc<ContentCatalogManager>>,
 }

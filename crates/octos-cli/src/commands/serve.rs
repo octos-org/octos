@@ -262,6 +262,9 @@ impl ServeCommand {
             frps_server: std::env::var("FRPS_SERVER").ok(),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             allow_admin_shell: config.allow_admin_shell,
+            content_catalog_mgr: Some(Arc::new(
+                crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
+            )),
         });
 
         // Auto-start enabled profiles
