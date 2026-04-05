@@ -4101,6 +4101,8 @@ mod tests {
             queue_mode: QueueMode::Followup,
             adaptive_router: None,
             memory_store: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
         };
 
         let registry = ActorRegistry::new(
