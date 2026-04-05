@@ -694,7 +694,22 @@ pub async fn list_content_files(
     };
 
     let dirs_param = params.get("dirs").cloned().unwrap_or_else(|| "research,slides,skill-output".to_string());
-    let scan_dirs: Vec<&str> = dirs_param.split(',').map(|s| s.trim()).collect();
+    let mut scan_dirs: Vec<String> = dirs_param.split(',').map(|s| s.trim().to_string()).collect();
+
+    // Also scan per-user workspace directories for deep_search reports
+    let users_dir = data_dir.join("users");
+    if let Ok(entries) = std::fs::read_dir(&users_dir) {
+        for entry in entries.flatten() {
+            let ws = entry.path().join("workspace");
+            if ws.exists() {
+                // Add workspace/research if it exists
+                let ws_research = ws.join("research");
+                if ws_research.exists() {
+                    scan_dirs.push(ws_research.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
 
     #[derive(Serialize)]
     struct ContentFile {
@@ -733,12 +748,24 @@ pub async fn list_content_files(
 
     let mut files = Vec::new();
     for dir_name in &scan_dirs {
-        let dir_path = data_dir.join(dir_name);
+        let dir_path = if std::path::Path::new(dir_name.as_str()).is_absolute() {
+            std::path::PathBuf::from(dir_name.as_str())
+        } else {
+            data_dir.join(dir_name.as_str())
+        };
         if !dir_path.exists() { continue; }
         if let Ok(entries) = std::fs::read_dir(&dir_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let group_name = format!("{}/{}", dir_name, path.file_name().unwrap_or_default().to_string_lossy());
+                let display_dir = if std::path::Path::new(dir_name.as_str()).is_absolute() {
+                    // For workspace paths, show "workspace/research"
+                    let p = std::path::Path::new(dir_name.as_str());
+                    let parts: Vec<&str> = p.components().rev().take(2).map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
+                    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+                } else {
+                    dir_name.to_string()
+                };
+                let group_name = format!("{}/{}", display_dir, path.file_name().unwrap_or_default().to_string_lossy());
                 if path.is_dir() {
                     // For skill-output and slides: scan subdirs for final outputs
                     // For research: skip subdirs (they contain intermediate search results)
