@@ -495,6 +495,7 @@ mod tests {
             allow_network: false,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
+            profile_name: None,
         };
         let sb = create_sandbox(&config);
         let tmp = std::env::temp_dir();
