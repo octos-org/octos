@@ -84,13 +84,28 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
             return max_out as u32;
         }
     }
-    // Conservative default
-    8_192
+    // Model-specific defaults when catalog is unavailable.
+    // Use the model's native max output to avoid truncation.
+    let m = model_id.to_lowercase();
+    if m.contains("kimi") || m.contains("qwen") || m.contains("gemini") {
+        65_535
+    } else if m.contains("glm") || m.contains("minimax") {
+        128_000
+    } else if m.contains("gpt-4") || m.contains("gpt-5") {
+        32_768
+    } else if m.contains("claude") {
+        32_768
+    } else if m.contains("deepseek") {
+        8_000
+    } else {
+        // Conservative default for unknown models
+        16_384
+    }
 }
 
 /// Default max tokens per LLM call.
 pub fn default_max_tokens() -> u32 {
-    8_192
+    16_384
 }
 
 /// Estimate token count from text using character heuristic.
@@ -129,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_max_output_default() {
-        assert_eq!(max_output_tokens("unknown-model"), 8_192);
+        assert_eq!(max_output_tokens("unknown-model"), 16_384);
     }
 
     #[test]
