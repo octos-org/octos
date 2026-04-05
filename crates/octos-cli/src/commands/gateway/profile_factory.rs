@@ -303,6 +303,9 @@ impl ProfileActorFactoryBuilder {
         let mut provider_policy = self.provider_policy.clone();
         let mut worker_prompt = self.worker_prompt.clone();
         let mut provider_router = self.provider_router.clone();
+        // Collected for SpawnTool subagents (set inside the else branch below).
+        let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
+        let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -386,6 +389,8 @@ impl ProfileActorFactoryBuilder {
                     Err(e) => warn!(profile_id, "child bot plugin loading failed: {e}"),
                 }
             }
+            actor_plugin_dirs = plugin_dirs.clone();
+            actor_plugin_env = plugin_env;
 
             tools.register(octos_agent::DeepSearchTool::new(
                 profile_data_dir.join("research"),
@@ -507,6 +512,7 @@ impl ProfileActorFactoryBuilder {
                     "group:sessions",
                     "group:web",
                     "group:runtime",
+                    "group:media",
                 ] {
                     tools.defer_group(group);
                 }
@@ -606,6 +612,8 @@ impl ProfileActorFactoryBuilder {
             queue_mode: self.queue_mode,
             adaptive_router,
             memory_store: Some(self.memory_store.clone()),
+            plugin_dirs: actor_plugin_dirs,
+            plugin_extra_env: actor_plugin_env,
         })
     }
 }

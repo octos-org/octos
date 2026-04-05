@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
 use eyre::Result;
-use octos_core::{InboundMessage, OutboundMessage, SessionKey};
+use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
@@ -27,14 +27,17 @@ use tracing::info;
 use crate::SessionManager;
 use crate::channel::Channel;
 
+/// Callback that returns serialized task list for a session key.
+pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
+
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
-    deferred_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sessions: Arc<Mutex<SessionManager>>,
+    task_query: Option<Arc<TaskQueryFn>>,
 }
 
 /// Request body for POST /chat.
@@ -59,11 +62,9 @@ pub struct ApiChannel {
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Track last sent content per chat_id for delta computation.
     last_content: Arc<Mutex<HashMap<String, String>>>,
-    /// Buffered file events for sessions without an active SSE connection.
-    /// Background tasks (spawn_only) may complete after the SSE stream closes;
-    /// their file events are stored here and flushed on the next /chat request.
-    deferred_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sessions: Arc<Mutex<SessionManager>>,
+    /// Optional callback for querying background tasks by session key.
+    task_query: Option<Arc<TaskQueryFn>>,
 }
 
 impl ApiChannel {
@@ -79,9 +80,15 @@ impl ApiChannel {
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
-            deferred_files: Arc::new(Mutex::new(HashMap::new())),
             sessions,
+            task_query: None,
         }
+    }
+
+    /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
+    pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
+        self.task_query = Some(f);
+        self
     }
 }
 
@@ -96,8 +103,8 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
-            deferred_files: self.deferred_files.clone(),
             sessions: self.sessions.clone(),
+            task_query: self.task_query.clone(),
         };
 
         let app = Router::new()
@@ -105,10 +112,7 @@ impl Channel for ApiChannel {
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
             .route("/sessions/{id}/status", get(handle_session_status))
-            .route(
-                "/sessions/{id}/deferred-files",
-                get(handle_deferred_files),
-            )
+            .route("/sessions/{id}/tasks", get(handle_session_tasks))
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
@@ -132,15 +136,80 @@ impl Channel for ApiChannel {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        if !msg.media.is_empty() {
+            // File message — persist to session history.
+            // Client polls /api/sessions/{id}/messages when has_bg_tasks=true.
+            let file_desc = msg
+                .media
+                .iter()
+                .map(|p| {
+                    let name = std::path::Path::new(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if msg.content.is_empty() {
+                        format!("[file:{p}] {name}")
+                    } else {
+                        format!("[file:{p}] {name} — {}", msg.content)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let session_msg = Message {
+                role: MessageRole::Assistant,
+                content: file_desc,
+                media: msg.media.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            };
+            self.persist_to_session(&msg.chat_id, session_msg).await;
+            return Ok(());
+        }
+
+        // Task status change — push raw JSON through SSE
+        if let Some(task_json) = msg.metadata.get("_task_status").and_then(|v| v.as_str()) {
+            let pending = self.pending.lock().await;
+            if let Some(tx) = pending.get(&msg.chat_id) {
+                let event = serde_json::json!({
+                    "type": "task_status",
+                    "task": serde_json::from_str::<serde_json::Value>(task_json).unwrap_or_default(),
+                });
+                let _ = tx.send(event.to_string());
+            }
+            return Ok(());
+        }
+
+        let is_bg_notification =
+            msg.content.starts_with('\u{2713}') || msg.content.starts_with('\u{2717}');
+        if is_bg_notification {
+            // Background task notification — persist to session history.
+            // Client polling will pick this up as the stop signal.
+            let session_msg = Message {
+                role: MessageRole::Assistant,
+                content: msg.content.clone(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            };
+            self.persist_to_session(&msg.chat_id, session_msg).await;
+            return Ok(());
+        }
+
         let mut pending = self.pending.lock().await;
         if let Some(tx) = pending.get(&msg.chat_id) {
             if msg.metadata.get("_completion").is_some() {
+                // Completion signal — send done event with metadata, then close.
+                // When has_bg_tasks=true, the client starts polling session
+                // history for file deliveries and bg_done notifications.
                 let has_bg = msg
                     .metadata
                     .get("has_bg_tasks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // Completion signal — send done event with metadata
                 let done = serde_json::json!({
                     "type": "done",
                     "content": "",
@@ -151,57 +220,10 @@ impl Channel for ApiChannel {
                     "has_bg_tasks": has_bg,
                 });
                 let _ = tx.send(done.to_string());
-                if has_bg {
-                    // Background tasks still running — keep SSE open with a grace
-                    // period so file events can be delivered on this stream.
-                    let chat_id = msg.chat_id.clone();
-                    let pending_ref = self.pending.clone();
-                    let last_content_ref = self.last_content.clone();
-                    info!(
-                        chat_id = %chat_id,
-                        "keeping SSE open for background task file delivery (grace period: 120s)"
-                    );
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                        let mut pending = pending_ref.lock().await;
-                        if let Some(tx) = pending.remove(&chat_id) {
-                            // Send a final close event so the client knows the grace period ended
-                            let close = serde_json::json!({"type": "bg_done"});
-                            let _ = tx.send(close.to_string());
-                            info!(chat_id = %chat_id, "SSE grace period expired, closing stream");
-                        }
-                        last_content_ref.lock().await.remove(&chat_id);
-                    });
-                } else {
-                    // No background tasks — close immediately
-                    pending.remove(&msg.chat_id);
-                    drop(pending);
-                    self.last_content.lock().await.remove(&msg.chat_id);
-                }
-            } else if !msg.media.is_empty() {
-                // File message — send file paths so web client can download
-                let mut all_sent = true;
-                for file_path in &msg.media {
-                    let event = self.make_file_event(file_path, &msg.content, &msg.metadata);
-                    let send_ok = tx.send(event.clone()).is_ok();
-                    if send_ok {
-                        info!(chat_id = %msg.chat_id, file = %file_path, "sent file SSE event");
-                    } else {
-                        info!(chat_id = %msg.chat_id, file = %file_path, "file SSE send failed — deferring");
-                        all_sent = false;
-                    }
-                }
-                if !all_sent {
-                    // SSE closed mid-send — defer remaining files
-                    drop(pending);
-                    self.defer_file_events(msg).await;
-                }
+                pending.remove(&msg.chat_id);
+                drop(pending);
+                self.last_content.lock().await.remove(&msg.chat_id);
             } else if !msg.content.is_empty() {
-                // Check if this is a background task completion notification
-                // (arrives after _completion with grace period). Close the SSE
-                // stream after forwarding the notification.
-                let is_bg_notification = msg.content.starts_with('\u{2713}')
-                    || msg.content.starts_with('\u{2717}');
                 // Regular message — send as replace event (full text replacement).
                 let event = serde_json::json!({
                     "type": "replace",
@@ -209,26 +231,8 @@ impl Channel for ApiChannel {
                 });
                 if tx.send(event.to_string()).is_err() {
                     pending.remove(&msg.chat_id);
-                } else if is_bg_notification {
-                    // Background task completed — close the SSE stream now
-                    // rather than waiting for the full grace period.
-                    info!(
-                        chat_id = %msg.chat_id,
-                        "background task notification received, closing SSE stream"
-                    );
-                    let close = serde_json::json!({"type": "bg_done"});
-                    let _ = tx.send(close.to_string());
-                    pending.remove(&msg.chat_id);
-                    drop(pending);
-                    self.last_content.lock().await.remove(&msg.chat_id);
                 }
             }
-        } else if !msg.media.is_empty() {
-            // No active SSE connection — defer file events for next /chat request.
-            // This happens when spawn_only background tasks complete after the
-            // original SSE stream has closed.
-            drop(pending);
-            self.defer_file_events(msg).await;
         }
         Ok(())
     }
@@ -304,42 +308,53 @@ impl Channel for ApiChannel {
 }
 
 impl ApiChannel {
-    /// Build a JSON string for a file SSE event.
-    fn make_file_event(
-        &self,
-        file_path: &str,
-        caption: &str,
-        metadata: &serde_json::Value,
-    ) -> String {
-        let filename = std::path::Path::new(file_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let mut event = serde_json::json!({
-            "type": "file",
-            "path": file_path,
-            "filename": filename,
-            "caption": caption,
-        });
-        // Thread tool_call_id into the SSE event so the web client can link
-        // delivered files to the originating assistant message.
-        if let Some(tc_id) = metadata.get("tool_call_id") {
-            event["tool_call_id"] = tc_id.clone();
+    /// Persist a message to the session JSONL for the given chat_id.
+    ///
+    /// Tries the `_main:api:{chat_id}` key first (gateway layout), then falls
+    /// back to `api:{chat_id}` (legacy layout).
+    async fn persist_to_session(&self, chat_id: &str, message: Message) {
+        let key = SessionKey(format!("_main:api:{chat_id}"));
+        let alt_key = SessionKey::new("api", chat_id);
+        let mut sess = self.sessions.lock().await;
+        // Try the gateway-style key first; if it has no prior session on disk,
+        // try the legacy key.  If neither exists yet, use the gateway key.
+        let target_key = if sess.session_path(&key).exists() {
+            key
+        } else if sess.session_path(&alt_key).exists() {
+            alt_key
+        } else {
+            key
+        };
+        if let Err(e) = sess.add_message(&target_key, message.clone()).await {
+            tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
+        } else {
+            info!(chat_id = %chat_id, key = %target_key.0, "persisted file/notification to session");
         }
-        event.to_string()
-    }
 
-    /// Buffer file events for delivery on the next SSE connection.
-    async fn defer_file_events(&self, msg: &OutboundMessage) {
-        let mut deferred = self.deferred_files.lock().await;
-        let buf = deferred.entry(msg.chat_id.clone()).or_default();
-        for file_path in &msg.media {
-            info!(
-                chat_id = %msg.chat_id,
-                file = %file_path,
-                "deferred file event (no active SSE)"
-            );
-            buf.push(self.make_file_event(file_path, &msg.content, &msg.metadata));
+        // Also write to the per-user SessionHandle path so the web client
+        // (which reads from per-user JSONL via source=full) can see file deliveries.
+        let data_dir = sess.data_dir();
+        drop(sess);
+        let base_key = target_key.base_key();
+        let encoded = crate::session::encode_path_component(base_key);
+        let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
+        let per_user_path = per_user_dir.join("default.jsonl");
+        if per_user_path.exists() {
+            if let Ok(msg_json) = serde_json::to_string(&message) {
+                let path_clone = per_user_path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new().append(true).open(&per_user_path)?;
+                    writeln!(f, "{}", msg_json)?;
+                    Ok::<_, std::io::Error>(())
+                }).await {
+                    Ok(Ok(())) => info!(chat_id = %chat_id, "persisted to per-user session"),
+                    Ok(Err(e)) => tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed"),
+                    Err(e) => tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed"),
+                }
+            }
+        } else {
+            tracing::debug!(chat_id = %chat_id, path = %per_user_path.display(), "per-user session path not found, skipping");
         }
     }
 }
@@ -386,18 +401,6 @@ async fn handle_chat(
             None
         } else {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
-            // Flush any deferred file events from background tasks that
-            // completed while no SSE connection was active.
-            let deferred = state
-                .deferred_files
-                .lock()
-                .await
-                .remove(&session_id)
-                .unwrap_or_default();
-            for event_json in deferred {
-                info!(session = %session_id, "flushing deferred file event");
-                let _ = tx.send(event_json);
-            }
             pending.insert(session_id.clone(), tx);
             Some(rx)
         }
@@ -463,6 +466,10 @@ struct MessageInfo {
     role: String,
     content: String,
     timestamp: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    media: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -487,44 +494,23 @@ async fn handle_session_status(
 ) -> Response {
     let pending = state.pending.lock().await;
     let active = pending.contains_key(&id);
-    let has_deferred = state
-        .deferred_files
-        .lock()
-        .await
-        .get(&id)
-        .is_some_and(|v| !v.is_empty());
     Json(serde_json::json!({
         "active": active,
-        "has_deferred_files": has_deferred,
     }))
     .into_response()
 }
 
-/// GET /sessions/:id/deferred-files — fetch and flush deferred file events.
-///
-/// Returns a JSON array of file events that were buffered while no SSE connection
-/// was active (e.g. from spawn_only background tasks). The buffer is cleared after
-/// retrieval. Clients can poll this endpoint after the main SSE stream closes.
-async fn handle_deferred_files(
+/// GET /sessions/:id/tasks — list background tasks for a session.
+async fn handle_session_tasks(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let events = state
-        .deferred_files
-        .lock()
-        .await
-        .remove(&id)
-        .unwrap_or_default();
-    if events.is_empty() {
+    let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
-    }
-    info!(session = %id, count = events.len(), "flushing deferred files via REST");
-    // Parse the pre-serialized JSON strings back into values
-    let parsed: Vec<serde_json::Value> = events
-        .iter()
-        .filter_map(|s| serde_json::from_str(s).ok())
-        .collect();
-    Json(parsed).into_response()
+    };
+    let session_key = format!("_main:api:{id}");
+    let tasks = query_fn(&session_key);
+    Json(tasks).into_response()
 }
 
 /// GET /sessions — list all API sessions.
@@ -567,39 +553,92 @@ async fn handle_session_messages(
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
-        let path = sess.session_path(&key);
-        let alt_path = sess.session_path(&alt_key);
+        let flat_path = sess.session_path(&key);
+        let alt_flat_path = sess.session_path(&alt_key);
+        let data_dir = sess.data_dir();
         drop(sess);
-        // Try the primary key path first, fall back to the _main: prefixed path
-        let read_path = if tokio::fs::metadata(&path).await.is_ok() {
-            path
-        } else {
-            alt_path
+
+        // Per-user session path (SessionHandle layout): data/users/{base_key}/sessions/default.jsonl
+        // This is where the session actor writes user + assistant messages.
+        let per_user_path = {
+            let base_key = alt_key.base_key();
+            let encoded = crate::session::encode_path_component(base_key);
+            data_dir
+                .join("users")
+                .join(encoded)
+                .join("sessions")
+                .join("default.jsonl")
         };
-        match tokio::fs::read_to_string(&read_path).await {
-            Ok(content) => {
-                let messages: Vec<MessageInfo> = content
-                    .lines()
-                    .filter_map(|line| {
-                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-                        let role = v.get("role")?.as_str()?;
-                        let content = v.get("content")?.as_str().unwrap_or("");
-                        let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-                        Some(MessageInfo {
-                            role: role.to_string(),
-                            content: content.to_string(),
-                            timestamp: timestamp.to_string(),
-                        })
-                    })
-                    .skip(offset)
-                    .take(limit)
-                    .collect();
-                return Json(messages).into_response();
-            }
-            Err(_) => {
-                return (StatusCode::NOT_FOUND, "session not found").into_response();
+
+        // Read from BOTH paths and merge:
+        // - per-user path has user messages + assistant responses (written by SessionHandle)
+        // - flat path has file deliveries + bg notifications (written by ApiChannel::persist_to_session)
+        // Merge by reading both, deduplicating by content+timestamp.
+        let mut all_lines = Vec::new();
+        // Primary: per-user path (has user messages)
+        if let Ok(content) = tokio::fs::read_to_string(&per_user_path).await {
+            all_lines.extend(content.lines().map(|l| l.to_string()));
+        }
+        // Secondary: flat path (has file deliveries that may not be in per-user)
+        let flat_read = if tokio::fs::metadata(&flat_path).await.is_ok() {
+            flat_path
+        } else {
+            alt_flat_path
+        };
+        if let Ok(content) = tokio::fs::read_to_string(&flat_read).await {
+            // Only add lines from flat that have media (file deliveries) or bg notifications
+            // and aren't already in per-user
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let has_media = v.get("media").and_then(|m| m.as_array()).is_some_and(|a| !a.is_empty());
+                    let is_bg = v.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with('✓') || c.starts_with('✗'));
+                    if has_media || is_bg {
+                        // Check for duplicate by content
+                        let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        if !all_lines.iter().any(|existing| existing.contains(content_str) && !content_str.is_empty()) {
+                            all_lines.push(line.to_string());
+                        }
+                    }
+                }
             }
         }
+        let messages: Vec<MessageInfo> = all_lines
+            .iter()
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                let role = v.get("role")?.as_str()?;
+                let content = v.get("content")?.as_str().unwrap_or("");
+                let timestamp =
+                    v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+                let media: Vec<String> = v
+                    .get("media")
+                    .and_then(|m| m.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tool_calls: Vec<serde_json::Value> = v
+                    .get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|arr| arr.to_vec())
+                    .unwrap_or_default();
+                Some(MessageInfo {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                    timestamp: timestamp.to_string(),
+                    media,
+                    tool_calls,
+                })
+            })
+            .skip(offset)
+            .take(limit)
+            .collect();
+        if !messages.is_empty() {
+            return Json(messages).into_response();
+        }
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
     let mut sess = state.sessions.lock().await;
@@ -623,6 +662,10 @@ async fn handle_session_messages(
             role: m.role.to_string(),
             content: m.content.clone(),
             timestamp: m.timestamp.to_rfc3339(),
+            media: m.media.clone(),
+            tool_calls: m.tool_calls.as_ref()
+                .map(|tcs| tcs.iter().filter_map(|tc| serde_json::to_value(tc).ok()).collect())
+                .unwrap_or_default(),
         })
         .collect();
     Json(messages).into_response()
@@ -860,12 +903,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_completion_with_bg_tasks_keeps_stream_open() {
+    async fn send_completion_with_bg_tasks_closes_and_client_polls() {
+        let sessions = test_sessions();
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
-            test_sessions(),
+            sessions.clone(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -884,55 +928,79 @@ mod tests {
         };
         ch.send(&msg).await.unwrap();
 
-        // Should receive done event
+        // Should receive done event with has_bg_tasks flag
         let event = rx.recv().await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(parsed["type"], "done");
         assert_eq!(parsed["has_bg_tasks"], true);
 
-        // Stream should still be open — sender NOT removed, so we can send more events
+        // SSE closes immediately — client will poll session history
+        assert!(rx.recv().await.is_none());
+
+        // Background file arrives later — persisted to session history
         let file_msg = OutboundMessage {
             channel: "api".into(),
             chat_id: "test-bg".into(),
-            content: "Audio file".into(),
+            content: String::new(),
             reply_to: None,
             media: vec!["/tmp/test.mp3".into()],
             metadata: serde_json::json!({}),
         };
         ch.send(&file_msg).await.unwrap();
 
-        // Should receive file event on the still-open stream
-        let file_event = rx.recv().await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&file_event).unwrap();
-        assert_eq!(parsed["type"], "file");
-        assert_eq!(parsed["path"], "/tmp/test.mp3");
+        // Client polling session history would find it
+        let mut sess = sessions.lock().await;
+        let key = SessionKey("_main:api:test-bg".into());
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        assert!(
+            history
+                .iter()
+                .any(|m| m.media.contains(&"/tmp/test.mp3".to_string()))
+        );
     }
 
     #[tokio::test]
-    async fn send_bg_notification_closes_stream() {
+    async fn send_file_message_persists_to_session() {
+        let sessions = test_sessions();
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
-            test_sessions(),
+            sessions.clone(),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        {
-            let mut pending = ch.pending.lock().await;
-            pending.insert("test-bg2".into(), tx);
-        }
 
-        // Send completion with background tasks
-        let completion = OutboundMessage {
+        // Send a file message (no active SSE needed — goes straight to session)
+        let msg = OutboundMessage {
             channel: "api".into(),
-            chat_id: "test-bg2".into(),
-            content: String::new(),
+            chat_id: "test-file".into(),
+            content: "Audio file".into(),
             reply_to: None,
-            media: vec![],
-            metadata: serde_json::json!({"_completion": true, "has_bg_tasks": true}),
+            media: vec!["/tmp/test.mp3".into()],
+            metadata: serde_json::json!({}),
         };
-        ch.send(&completion).await.unwrap();
-        let _ = rx.recv().await.unwrap(); // consume done event
+        ch.send(&msg).await.unwrap();
+
+        // Verify it was persisted to the session
+        let mut sess = sessions.lock().await;
+        let key = SessionKey(format!("_main:api:test-file"));
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].content.contains("/tmp/test.mp3"));
+        assert!(history[0].content.contains("Audio file"));
+        assert_eq!(history[0].media, vec!["/tmp/test.mp3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn send_bg_notification_persists_to_session() {
+        let sessions = test_sessions();
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+        );
 
         // Send background task notification (checkmark)
         let notify = OutboundMessage {
@@ -945,18 +1013,13 @@ mod tests {
         };
         ch.send(&notify).await.unwrap();
 
-        // Should receive the notification text
-        let event = rx.recv().await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
-        assert_eq!(parsed["type"], "replace");
-
-        // Should receive bg_done event
-        let close_event = rx.recv().await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&close_event).unwrap();
-        assert_eq!(parsed["type"], "bg_done");
-
-        // Stream should now be closed
-        assert!(rx.recv().await.is_none());
+        // Verify it was persisted to the session (not sent via SSE)
+        let mut sess = sessions.lock().await;
+        let key = SessionKey(format!("_main:api:test-bg2"));
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].content.contains("fm_tts completed"));
     }
 
     #[tokio::test]

@@ -102,19 +102,32 @@ VERSIONING RULES:
 - After ANY generation: save output PPTX with version number
 - Version format: v{{NNN}}_{{short-description}}
 
-SLIDES GENERATION:
+SLIDES WORKFLOW:
+- Phase 1: DESIGN — write script.js with slide content. Do NOT call mofa_slides yet.
+  Present the slide plan to the user for review. Show each slide's title and description.
+  Wait for user confirmation or edits.
+- Phase 2: GENERATE — only when user explicitly says "generate", "生成", "make it", "go ahead",
+  or similar confirmation, THEN call mofa_slides.
 - Always use mofa_slides with input parameter pointing to script.js
 - Never inline slides JSON in the tool call
 - Save output to slides/{slug}/output/
 
-INCREMENTAL UPDATES (CRITICAL):
+INCREMENTAL UPDATES (MANDATORY — follow EXACTLY):
 - script.js is the SINGLE SOURCE OF TRUTH
-- NEVER delete and recreate script.js — always read, modify, write back
-- When user says "update slide N": read_file → change ONLY slide N → write_file → mofa_slides
-- NEVER change slides you were not asked to change — any change triggers regeneration
-- ALWAYS preserve exact prompt text for unchanged slides (even whitespace matters)
-- ALWAYS reuse the same out and slide_dir paths so cached PNGs are found
-- mofa detects which slides changed by content hash and only regenerates those
+- NEVER delete and recreate script.js — always read_file, edit, write back
+- When updating slides, you MUST follow ALL 5 steps in order:
+  Step 1: read_file("slides/{slug}/script.js")
+  Step 2: Edit ONLY the changed slides (use edit_file or write_file)
+  Step 3: For EACH changed slide N, run: shell("rm -f slides/{slug}/output/imgs/slide-NN.png")
+          This is MANDATORY — without it, mofa reuses the old cached image!
+          Example: slide 3 changed → shell("rm -f slides/{slug}/output/imgs/slide-03.png")
+  Step 4: Call mofa_slides with same input/out/slide_dir paths
+  Step 5: Send the updated PPTX to user
+
+- NEVER skip Step 3 (PNG deletion) — it is the ONLY way to trigger regeneration
+- NEVER change slides you were not asked to change
+- For adding a new slide: append to script.js, no PNG deletion needed (new slides have no cache)
+- Slide numbering: slide-01.png = slides[0], slide-02.png = slides[1], etc.
 
 Available tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
 

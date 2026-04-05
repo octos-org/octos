@@ -137,6 +137,18 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
         description: "Skill management, tool configuration, and model switching",
         tools: &["manage_skills", "configure_tool", "model_check"],
     },
+    ToolGroupInfo {
+        name: "group:media",
+        description: "Media generation: comics, slides, infographics, cards, and text-to-speech",
+        tools: &[
+            "mofa_comic",
+            "mofa_slides",
+            "mofa_infographic",
+            "mofa_cards",
+            "fm_tts",
+            "fm_voice_list",
+        ],
+    },
 ];
 
 /// Look up group info by name.

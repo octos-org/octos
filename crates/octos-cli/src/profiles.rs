@@ -83,6 +83,9 @@ pub struct ProfileConfig {
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
+    /// Adaptive routing configuration (QoS weights, mode, etc.).
+    #[serde(default)]
+    pub adaptive_routing: Option<crate::config::AdaptiveRoutingConfig>,
 }
 
 /// Email sending tool configuration for a profile.
@@ -791,7 +794,7 @@ pub(crate) fn config_from_profile(
                 feishu_region: e.feishu_region.clone(),
             }),
         auth_token: None,
-        adaptive_routing: None,
+        adaptive_routing: profile.config.adaptive_routing.clone(),
         voice: None,
         allow_admin_shell: false,
         #[cfg(feature = "api")]

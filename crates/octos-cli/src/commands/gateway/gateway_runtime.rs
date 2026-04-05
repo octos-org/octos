@@ -554,6 +554,7 @@ impl GatewayRuntime {
         let mut tools;
         let mut plugin_result;
         let mut sandbox_config = config.sandbox.clone();
+        let plugin_dirs_for_spawn: Vec<std::path::PathBuf>;
         {
             // Full tool registration for all modes.
             // Populate read_allow_paths so the shell sandbox restricts reads to
@@ -866,6 +867,7 @@ impl GatewayRuntime {
                 config.clone(),
                 cmd.profile.clone(),
             ));
+            plugin_dirs_for_spawn = plugin_dirs;
         }
 
         // admin_mode adds admin API tools on top of the full tool set
@@ -984,6 +986,7 @@ impl GatewayRuntime {
                 "group:sessions",
                 "group:web",
                 "group:runtime",
+                "group:media", // mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts
             ] {
                 tools.defer_group(group);
             }
@@ -997,6 +1000,11 @@ impl GatewayRuntime {
         if tools.has_deferred() {
             tools.register(octos_agent::ActivateToolsTool::new());
         }
+
+        // Extract supervisor before consuming tools into the factory snapshot.
+        // Used by the API channel's task query callback (gated behind api feature).
+        #[cfg(feature = "api")]
+        let supervisor = tools.supervisor();
 
         // Create the base tool registry snapshot (excludes session-specific tools)
         let tool_registry_factory = Arc::new(SnapshotToolRegistryFactory::new(tools));
@@ -1050,6 +1058,8 @@ impl GatewayRuntime {
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
             memory_store: Some(memory_store.clone()),
+            plugin_dirs: plugin_dirs_for_spawn.clone(),
+            plugin_extra_env: plugin_env.clone(),
         };
         let profile_factory_builder =
             profile_store
@@ -1467,6 +1477,18 @@ impl GatewayRuntime {
                 )
                 .await
             {
+                // For API channel: send a completion signal so the SSE stream closes
+                // and the web client's assistant message transitions from "streaming" to "complete".
+                if reply_channel == "api" {
+                    let _ = self.agent_handle.send_outbound(octos_core::OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: String::new(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({"_completion": true}),
+                    }).await;
+                }
                 continue;
             }
 
@@ -1584,6 +1606,22 @@ impl GatewayRuntime {
                 (prompt, sender_uid)
             } else {
                 (None, None)
+            };
+
+            // Check for session-specific prompt override (e.g. /new slides <name>)
+            let prompt_override = if let Some(topic) = session_key.topic() {
+                if let Some(session_prompt) =
+                    crate::project_templates::read_session_prompt(&self.data_dir, topic)
+                {
+                    match prompt_override {
+                        Some(base) => Some(format!("{base}\n\n{session_prompt}")),
+                        None => Some(session_prompt),
+                    }
+                } else {
+                    prompt_override
+                }
+            } else {
+                prompt_override
             };
 
             // Dispatch to per-session actor (creates one if needed)

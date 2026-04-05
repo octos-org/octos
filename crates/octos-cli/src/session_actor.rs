@@ -105,6 +105,11 @@ pub enum ActorMessage {
         /// The subagent's final output.
         content: String,
     },
+    /// Background task status changed — push to SSE.
+    TaskStatusChanged {
+        /// Serialized JSON of the BackgroundTask.
+        task_json: String,
+    },
     /// Cancel the current operation.
     Cancel,
 }
@@ -429,6 +434,10 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Plugin directories for SpawnTool subagents to load plugin tools.
+    pub plugin_dirs: Vec<std::path::PathBuf>,
+    /// Extra environment variables for plugin processes in subagents.
+    pub plugin_extra_env: Vec<(String, String)>,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -537,10 +546,7 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
-        // Re-bind plugin tools so OCTOS_WORK_DIR points to the user workspace.
-        // This lets plugins (e.g. voice skill) store per-user data (voice profiles)
-        // inside the sandbox where the agent's tools can see them.
-        tools.rebind_plugin_work_dirs(&user_workspace);
+        tools.set_session_key(session_key.to_string());
         tools.register(message_tool);
         tools.register(send_file_tool);
 
@@ -559,6 +565,10 @@ impl ActorFactory {
         }
         if let Some(ref router) = self.provider_router {
             spawn_tool = spawn_tool.with_provider_router(router.clone());
+        }
+        if !self.plugin_dirs.is_empty() {
+            spawn_tool = spawn_tool
+                .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone());
         }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
@@ -592,6 +602,15 @@ impl ActorFactory {
                 .is_ok()
             })
         }));
+
+        // Wire supervisor on_change callback to push task status via SSE.
+        // Uses try_send to avoid blocking the sync Mutex context.
+        let status_tx = tx.clone();
+        tools.supervisor().set_on_change(move |task| {
+            if let Ok(json) = serde_json::to_string(task) {
+                let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
+            }
+        });
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
@@ -918,6 +937,17 @@ impl SessionActor {
                                 // Cancel any in-flight overflow tasks so their
                                 // responses don't preempt the command reply (#21).
                                 self.overflow_cancelled.store(true, Ordering::Release);
+                                // Send completion signal so the web client's SSE stream closes
+                                if self.channel == "api" {
+                                    let _ = self.out_tx.send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content: String::new(),
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({"_completion": true}),
+                                    }).await;
+                                }
                                 continue;
                             }
 
@@ -973,6 +1003,17 @@ impl SessionActor {
                                 };
                                 self.process_inbound(rewrite_msg, vec![]).await;
                             }
+                        }
+                        Some(ActorMessage::TaskStatusChanged { task_json }) => {
+                            // Push task status change to the web client via SSE
+                            let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: String::new(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({ "_task_status": task_json }),
+                            }).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -1032,7 +1073,23 @@ impl SessionActor {
                 self.handle_thinking_command(&parts[1..]).await;
                 true
             }
-            _ => false, // Unknown slash command — pass through to LLM
+            _ => {
+                // Unknown slash command — show help instead of passing to LLM
+                self.send_reply(
+                    "Unknown command. Available commands:\n\
+                     /new [name] — start a new session\n\
+                     /s [name] — switch to a session\n\
+                     /sessions — list all sessions\n\
+                     /back — return to default session\n\
+                     /delete — delete current session\n\
+                     /soul [text] — view or set persona\n\
+                     /status — show agent status\n\
+                     /adaptive — view adaptive routing\n\
+                     /reset — reset session state\n\
+                     /help — show this help"
+                ).await;
+                true
+            }
         }
     }
 
@@ -1515,6 +1572,9 @@ impl SessionActor {
                             self.inject_background_result(&task_label, &content, true)
                                 .await;
                         }
+                        Ok(ActorMessage::TaskStatusChanged { .. }) => {
+                            // Ignore in drain — status is pushed via the main loop
+                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -1555,6 +1615,9 @@ impl SessionActor {
                         }) => {
                             self.inject_background_result(&task_label, &content, true)
                                 .await;
+                        }
+                        Ok(ActorMessage::TaskStatusChanged { .. }) => {
+                            // Ignore in drain — status is pushed via the main loop
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1955,6 +2018,16 @@ impl SessionActor {
                                 self.inject_background_result(&task_label, &content, true).await;
                             }
                         }
+                        Some(ActorMessage::TaskStatusChanged { task_json }) => {
+                            let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: String::new(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({ "_task_status": task_json }),
+                            }).await;
+                        }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                         }
@@ -2053,11 +2126,24 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        let bg_tasks = self.agent.tool_registry().bg_task_count();
-        // Also check spawn_only_invoked flag — set when a spawn_only tool was
-        // actually called during this agent run. This is more precise than
-        // checking if spawn_only tools are registered (which is overbroad).
-        let spawn_only_invoked = self.agent.tool_registry().spawn_only_was_invoked();
+        let supervisor = self.agent.tool_registry().supervisor();
+        let bg_tasks = supervisor.task_count();
+        let all_tasks = supervisor.get_all_tasks();
+        let had_bg_tasks = !all_tasks.is_empty(); // any task was spawned, even if completed
+        let bg_task_details: Vec<_> = supervisor.get_active_tasks();
+        if !all_tasks.is_empty() {
+            for t in &all_tasks {
+                info!(
+                    session = %self.session_key,
+                    task_id = %t.id,
+                    tool = %t.tool_name,
+                    status = ?t.status,
+                    files = ?t.output_files,
+                    error = ?t.error,
+                    "task supervisor report"
+                );
+            }
+        }
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
@@ -2067,16 +2153,17 @@ impl SessionActor {
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
-                    "has_bg_tasks": bg_tasks > 0 || spawn_only_invoked,
+                    "has_bg_tasks": had_bg_tasks,
+                    "bg_tasks": bg_task_details,
                 })
             }
             Ok(Err(e)) => {
                 warn!(session = %self.session_key, error = %e, "agent returned error");
-                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
+                serde_json::json!({"_completion": true, "has_bg_tasks": had_bg_tasks, "bg_tasks": bg_task_details})
             }
             Err(e) => {
                 warn!(session = %self.session_key, error = %e, "agent timed out");
-                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
+                serde_json::json!({"_completion": true, "has_bg_tasks": had_bg_tasks, "bg_tasks": bg_task_details})
             }
         };
         match agent_result {

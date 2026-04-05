@@ -25,11 +25,8 @@ pub fn register(
         .get("auth_token")
         .and_then(|v| v.as_str())
         .map(String::from);
-    channel_mgr.register(Arc::new(octos_bus::ApiChannel::new(
-        port,
-        auth_token,
-        shutdown.clone(),
-        session_mgr.clone(),
-    )));
+    let channel =
+        octos_bus::ApiChannel::new(port, auth_token, shutdown.clone(), session_mgr.clone());
+    channel_mgr.register(Arc::new(channel));
     Ok(())
 }
