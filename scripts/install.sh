@@ -4,24 +4,28 @@
 #
 # Usage:
 #   curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
-#   curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --tenant-name alice --frps-token <token>
+#   curl -fsSL ... | bash -s -- --tunnel --tenant-name alice --frps-token <token>
 #
 # Options:
-#   --tenant-name NAME       Tenant subdomain (e.g. "alice")
-#   --frps-token TOKEN       frps auth token
-#   --frps-token-file FILE   Read frps auth token from FILE
-#   --frps-server ADDR       frps server address (default: 163.192.33.32)
-#   --ssh-port PORT          SSH tunnel remote port (default: 6001)
-#   --auth-token TOKEN       Dashboard auth token (default: auto-generated)
-#   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
 #   --version TAG            Release version to install (default: latest)
 #   --prefix DIR             Install prefix (default: ~/.octos/bin)
-#   --no-tunnel              Skip frpc tunnel setup
+#   --port PORT              octos serve port (default: 8080)
+#   --auth-token TOKEN       Dashboard auth token (default: auto-generated)
+#   --uninstall              Remove octos and frpc services and binaries
+#   --doctor                 Diagnose installation and service health
+#
+# Optional features:
+#   --install-deps           Auto-install missing runtime dependencies
 #   --caddy-domain DOMAIN    Set up Caddy with on-demand TLS for wildcard subdomains
 #                            (e.g. --caddy-domain crew.example.com → *.crew.example.com)
 #                            Requires: wildcard DNS A record pointing to this server
-#   --uninstall              Remove octos and frpc services and binaries
-#   --doctor                 Diagnose installation and service health
+#   --tunnel                 Enable frpc tunnel setup (also enabled by --tenant-name/--frps-token)
+#     --tenant-name NAME     Tenant subdomain (e.g. "alice")
+#     --frps-token TOKEN     frps auth token
+#     --frps-token-file FILE Read frps auth token from FILE
+#     --frps-server ADDR     frps server address (default: 163.192.33.32)
+#     --ssh-port PORT        SSH tunnel remote port (default: 6001)
+#     --domain DOMAIN        Tunnel domain (default: octos-cloud.org)
 
 set -euo pipefail
 
@@ -39,8 +43,10 @@ FRPS_SERVER="163.192.33.32"
 SSH_PORT="6001"
 AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
-SKIP_TUNNEL=false
+ENABLE_TUNNEL=false
 CADDY_DOMAIN=""
+PORT="8080"
+INSTALL_DEPS=false
 UNINSTALL=false
 RUN_DOCTOR=false
 
@@ -52,17 +58,19 @@ needval() {
 }
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tenant-name)   needval "$@"; TENANT_NAME="$2"; shift 2 ;;
-        --frps-token)    needval "$@"; FRPS_TOKEN="$2"; shift 2 ;;
-        --frps-token-file) needval "$@"; FRPS_TOKEN_FILE="$2"; shift 2 ;;
-        --frps-server)   needval "$@"; FRPS_SERVER="$2"; shift 2 ;;
-        --ssh-port)      needval "$@"; SSH_PORT="$2"; shift 2 ;;
-        --auth-token)    needval "$@"; AUTH_TOKEN="$2"; shift 2 ;;
-        --domain)        needval "$@"; TUNNEL_DOMAIN="$2"; shift 2 ;;
         --version)       needval "$@"; VERSION="$2"; shift 2 ;;
         --prefix)        needval "$@"; PREFIX="$2"; shift 2 ;;
-        --no-tunnel)     SKIP_TUNNEL=true; shift ;;
+        --port)          needval "$@"; PORT="$2"; shift 2 ;;
+        --auth-token)    needval "$@"; AUTH_TOKEN="$2"; shift 2 ;;
         --caddy-domain)  needval "$@"; CADDY_DOMAIN="$2"; shift 2 ;;
+        --tunnel)        ENABLE_TUNNEL=true; shift ;;
+        --tenant-name)   needval "$@"; TENANT_NAME="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --frps-token)    needval "$@"; FRPS_TOKEN="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --frps-token-file) needval "$@"; FRPS_TOKEN_FILE="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --frps-server)   needval "$@"; FRPS_SERVER="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --ssh-port)      needval "$@"; SSH_PORT="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --domain)        needval "$@"; TUNNEL_DOMAIN="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --install-deps)  INSTALL_DEPS=true; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
         --doctor)        RUN_DOCTOR=true; shift ;;
         --help|-h)
@@ -72,23 +80,29 @@ Self-contained: no repo clone, Rust, or Node.js needed.
 
 Usage:
   curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
-  curl -fsSL ... | bash -s -- --tenant-name alice --frps-token <token>
+  curl -fsSL ... | bash -s -- --tunnel --tenant-name alice --frps-token <token>
 
 Options:
+  --version TAG            Release version to install (default: latest)
+  --prefix DIR             Install prefix (default: ~/.octos/bin)
+  --port PORT              octos serve port (default: 8080)
+  --auth-token TOKEN       Dashboard auth token (default: auto-generated)
+  --uninstall              Remove octos and frpc services and binaries
+  --doctor                 Diagnose installation and service health
+
+Optional features:
+  --install-deps           Auto-install missing runtime dependencies
+  --caddy-domain DOMAIN    Set up Caddy reverse proxy with on-demand TLS
+                           (e.g. --caddy-domain crew.example.com)
+
+Tunnel (frpc):
+  --tunnel                 Enable frpc tunnel setup (also enabled by --tenant-name/--frps-token)
   --tenant-name NAME       Tenant subdomain (e.g. "alice")
   --frps-token TOKEN       frps auth token
   --frps-token-file FILE   Read frps auth token from FILE
   --frps-server ADDR       frps server address (default: 163.192.33.32)
   --ssh-port PORT          SSH tunnel remote port (default: 6001)
-  --auth-token TOKEN       Dashboard auth token (default: auto-generated)
   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
-  --version TAG            Release version to install (default: latest)
-  --prefix DIR             Install prefix (default: ~/.octos/bin)
-  --no-tunnel              Skip frpc tunnel setup
-  --caddy-domain DOMAIN    Set up Caddy reverse proxy with on-demand TLS
-                           (e.g. --caddy-domain crew.example.com)
-  --uninstall              Remove octos and frpc services and binaries
-  --doctor                 Diagnose installation and service health
 HELPEOF
             exit 0
             ;;
@@ -140,6 +154,7 @@ validate_inputs() {
     [ -n "$TUNNEL_DOMAIN" ] && validate "domain"      "$TUNNEL_DOMAIN" '[a-zA-Z0-9.-]+'
     [ -n "$FRPS_SERVER" ]   && validate "frps-server" "$FRPS_SERVER" '[a-zA-Z0-9.:-]+'
     [ -n "$SSH_PORT" ]      && validate "ssh-port"    "$SSH_PORT"    '[0-9]+'
+    [ -n "$PORT" ]          && validate "port"        "$PORT"        '[0-9]+'
     [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] && validate "version" "$VERSION" '[a-zA-Z0-9._-]+'
     [ -n "$PREFIX" ]        && validate "prefix"      "$PREFIX"      '/[a-zA-Z0-9/._~-]*'
     [ -n "$DATA_DIR" ]      && validate "data-dir"    "$DATA_DIR"    '/[a-zA-Z0-9/._~-]*'
@@ -166,6 +181,7 @@ pkg_hint() {
             case "$1" in
                 git)       echo "xcode-select --install" ;;
                 node)      echo "brew install node" ;;
+                python)    echo "brew install python" ;;
                 chromium)  echo "brew install --cask google-chrome" ;;
                 ffmpeg)    echo "brew install ffmpeg" ;;
             esac
@@ -184,6 +200,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo apt-get install -y git" ;;
                         node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
+                        python)    echo "sudo apt-get install -y python3" ;;
                         chromium)  echo "sudo apt-get install -y chromium-browser" ;;
                         ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
                         iproute2)  echo "sudo apt-get install -y iproute2" ;;
@@ -192,6 +209,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo pacman -S --noconfirm git" ;;
                         node)      echo "sudo pacman -S --noconfirm nodejs npm" ;;
+                        python)    echo "sudo pacman -S --noconfirm python" ;;
                         chromium)  echo "sudo pacman -S --noconfirm chromium" ;;
                         ffmpeg)    echo "sudo pacman -S --noconfirm ffmpeg" ;;
                         iproute2)  echo "sudo pacman -S --noconfirm iproute2" ;;
@@ -200,6 +218,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo $pm install -y git" ;;
                         node)      echo "sudo $pm install -y nodejs npm" ;;
+                        python)    echo "sudo $pm install -y python3" ;;
                         chromium)  echo "sudo $pm install -y chromium" ;;
                         ffmpeg)    echo "sudo $pm install -y ffmpeg" ;;
                         iproute2)  echo "sudo $pm install -y iproute" ;;
@@ -208,6 +227,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo apk add git" ;;
                         node)      echo "sudo apk add nodejs npm" ;;
+                        python)    echo "sudo apk add python3" ;;
                         chromium)  echo "sudo apk add chromium" ;;
                         ffmpeg)    echo "sudo apk add ffmpeg" ;;
                         iproute2)  echo "sudo apk add iproute2" ;;
@@ -219,6 +239,27 @@ pkg_hint() {
         *)
             echo "(see your OS package manager)" ;;
     esac
+}
+
+# Install a package using the command from pkg_hint.
+# Usage: install_pkg <package>
+# Returns 0 on success, 1 on failure.
+install_pkg() {
+    local pkg="$1"
+    local cmd
+    cmd=$(pkg_hint "$pkg")
+    if [ -z "$cmd" ] || [ "$cmd" = "install '$pkg' using your package manager" ] || [ "$cmd" = "(see your OS package manager)" ]; then
+        warn "don't know how to install $pkg on this system"
+        return 1
+    fi
+    echo "    Installing $pkg..."
+    if eval "$cmd" >/dev/null 2>&1; then
+        return 0
+    else
+        warn "$pkg install failed"
+        hint "$cmd"
+        return 1
+    fi
 }
 
 # Print a service management command.
@@ -267,7 +308,7 @@ log.maxDays = 7
 [[proxies]]
 name = "${TENANT_NAME}-web"
 type = "http"
-localPort = 8080
+localPort = ${PORT}
 customDomains = ["${TENANT_NAME}.${TUNNEL_DOMAIN}"]
 
 [[proxies]]
@@ -416,7 +457,7 @@ write_octos_service() {
         <string>$OCTOS_BIN</string>
         <string>serve</string>
         <string>--port</string>
-        <string>8080</string>
+        <string>$PORT</string>
         <string>--host</string>
         <string>0.0.0.0</string>
         <string>--auth-token</string>
@@ -470,7 +511,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN
+ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN
 Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME
@@ -495,7 +536,7 @@ EOF
 
         *)
             warn "octos serve service setup not supported on $OS"
-            hint "Run manually: $OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN"
+            hint "Run manually: $OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN"
             ;;
     esac
 }
@@ -535,6 +576,32 @@ uninstall_services() {
     esac
 }
 
+# Detect the installed octos serve port from the service definition.
+# Falls back to the current PORT value when no installed service is present.
+detect_installed_port() {
+    local detected=""
+    case "$OS" in
+        Darwin)
+            local plist="/Library/LaunchDaemons/io.octos.serve.plist"
+            if [ -f "$plist" ]; then
+                detected=$(grep -A1 '>--port<' "$plist" 2>/dev/null | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+            fi
+            ;;
+        Linux)
+            local unit="/etc/systemd/system/octos-serve.service"
+            if [ -f "$unit" ]; then
+                detected=$(grep 'ExecStart=' "$unit" 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p')
+            fi
+            ;;
+    esac
+
+    if [ -n "$detected" ]; then
+        printf '%s\n' "$detected"
+    else
+        printf '%s\n' "$PORT"
+    fi
+}
+
 # err() exits during install but not during doctor
 if [ "$RUN_DOCTOR" = true ]; then
     DOCTOR_ISSUES=0
@@ -547,6 +614,11 @@ fi
 # ── Doctor mode ──────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 if [ "$RUN_DOCTOR" = true ]; then
+
+    # Auto-detect port from installed service config (unless user passed --port)
+    if [ "$PORT" = "8080" ]; then
+        PORT="$(detect_installed_port)"
+    fi
 
     # ── Binary ───────────────────────────────────────────────────────
     section "octos binary"
@@ -604,11 +676,11 @@ if [ "$RUN_DOCTOR" = true ]; then
     else
         err "octos serve is not running"
         hint "Start: $(svc_hint start serve)"
-        hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
+        hint "Or manually: $PREFIX/octos serve --port $PORT --host 0.0.0.0"
     fi
 
-    # ── Port 8080 ────────────────────────────────────────────────────
-    section "Port 8080"
+    # ── Port check ───────────────────────────────────────────────────
+    section "Port $PORT"
 
     # Detect port listener using available tool (lsof, ss, or netstat)
     PORT_CMD=""
@@ -616,14 +688,14 @@ if [ "$RUN_DOCTOR" = true ]; then
     PORT_CHECK_AVAILABLE=false
     if command -v lsof &>/dev/null; then
         PORT_CHECK_AVAILABLE=true
-        PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+        PORT_OWNER=$(lsof -i :$PORT -P -n 2>/dev/null | grep LISTEN | head -1 || true)
         if [ -n "$PORT_OWNER" ]; then
             PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $1}')
             PORT_PID=$(echo "$PORT_OWNER" | awk '{print $2}')
         fi
     elif command -v ss &>/dev/null; then
         PORT_CHECK_AVAILABLE=true
-        PORT_OWNER=$(ss -tlnp 'sport = :8080' 2>/dev/null | tail -n +2 | head -1 || true)
+        PORT_OWNER=$(ss -tlnp "sport = :$PORT" 2>/dev/null | tail -n +2 | head -1 || true)
         if [ -n "$PORT_OWNER" ]; then
             # ss output: users:(("octos",pid=1234,fd=5))
             PORT_CMD=$(echo "$PORT_OWNER" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')
@@ -631,14 +703,14 @@ if [ "$RUN_DOCTOR" = true ]; then
         fi
     elif command -v netstat &>/dev/null; then
         PORT_CHECK_AVAILABLE=true
-        PORT_OWNER=$(netstat -tlnp 2>/dev/null | grep ':8080 ' | head -1 || true)
+        PORT_OWNER=$(netstat -tlnp 2>/dev/null | grep ":$PORT " | head -1 || true)
         if [ -n "$PORT_OWNER" ]; then
             # netstat output: ... 1234/octos
             PORT_PID=$(echo "$PORT_OWNER" | awk '{print $NF}' | cut -d/ -f1)
             PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $NF}' | cut -d/ -f2)
         fi
     else
-        warn "cannot check port 8080 (none of lsof, ss, or netstat found)"
+        warn "cannot check port $PORT (none of lsof, ss, or netstat found)"
         _iproute_hint=$(pkg_hint iproute2)
         if [ -n "$_iproute_hint" ]; then
             hint "Install one: $_iproute_hint   # provides ss"
@@ -647,9 +719,9 @@ if [ "$RUN_DOCTOR" = true ]; then
 
     if [ -n "$PORT_CMD" ]; then
         if echo "$PORT_CMD" | grep -qi octos; then
-            ok "port 8080 held by octos (PID: $PORT_PID)"
+            ok "port $PORT held by octos (PID: $PORT_PID)"
         else
-            err "port 8080 held by $PORT_CMD (PID: $PORT_PID) — not octos"
+            err "port $PORT held by $PORT_CMD (PID: $PORT_PID) — not octos"
             hint "Kill it: kill $PORT_PID"
             if [ "$OS" = "Darwin" ]; then
                 hint "If it respawns, find its LaunchAgent/Daemon:"
@@ -658,28 +730,28 @@ if [ "$RUN_DOCTOR" = true ]; then
         fi
     elif [ "$PORT_CHECK_AVAILABLE" = true ]; then
         if [ -n "$OCTOS_PID" ]; then
-            err "octos serve is running but nothing is listening on 8080"
+            err "octos serve is running but nothing is listening on $PORT"
             hint "Check if it's bound to a different port: ps -p $OCTOS_PID -o args="
         else
-            warn "nothing listening on port 8080"
+            warn "nothing listening on port $PORT"
         fi
     fi
 
     # ── Admin portal ─────────────────────────────────────────────────
     section "Admin portal"
 
-    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:8080/admin/ 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${PORT}/admin/" 2>/dev/null || echo "000")
     case "$HTTP_CODE" in
         200)
-            ok "http://localhost:8080/admin/ responds 200"
+            ok "http://localhost:${PORT}/admin/ responds 200"
             ;;
         000)
-            err "connection failed (server not reachable on localhost:8080)"
-            hint "Check 'octos serve' and 'Port 8080' sections above"
+            err "connection failed (server not reachable on localhost:${PORT})"
+            hint "Check 'octos serve' and 'Port ${PORT}' sections above"
             ;;
         401|403)
             warn "responds $HTTP_CODE (auth required)"
-            hint "Pass auth token: curl -H 'Authorization: Bearer <token>' http://localhost:8080/admin/"
+            hint "Pass auth token: curl -H 'Authorization: Bearer <token>' http://localhost:${PORT}/admin/"
             ;;
         404)
             err "responds 404 (admin route not found)"
@@ -752,83 +824,85 @@ if [ "$RUN_DOCTOR" = true ]; then
             ;;
     esac
 
-    # ── frpc tunnel ──────────────────────────────────────────────────
-    section "frpc tunnel"
+    # ── frpc tunnel (only if tunnel was ever configured) ───────────
+    if [ -f /usr/local/bin/frpc ] || [ -f /etc/frp/frpc.toml ]; then
+        section "frpc tunnel"
 
-    TENANT=""
-    if [ -f /usr/local/bin/frpc ]; then
-        ok "frpc installed: $(/usr/local/bin/frpc --version 2>/dev/null || echo 'unknown version')"
-    else
-        warn "frpc not installed (tunnel not configured)"
-        hint "Re-run install.sh with tunnel options, or use --no-tunnel if not needed"
-    fi
-
-    FRPC_PID=$(pgrep -x frpc 2>/dev/null || true)
-    if [ -n "$FRPC_PID" ]; then
-        ok "frpc running (PID: $FRPC_PID)"
-    else
+        TENANT=""
         if [ -f /usr/local/bin/frpc ]; then
-            err "frpc installed but not running"
-            hint "Start: $(svc_hint start frpc)"
-        fi
-    fi
-
-    if [ -f /etc/frp/frpc.toml ]; then
-        ok "frpc config: /etc/frp/frpc.toml"
-        TENANT=$(grep 'customDomains' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*\["\(.*\)"\].*/\1/')
-        if [ -n "$TENANT" ]; then
-            echo "    Tunnel: https://$TENANT"
-        fi
-        # Check for placeholder values
-        if grep -q 'CHANGE_ME' /etc/frp/frpc.toml 2>/dev/null; then
-            warn "frpc config contains placeholder token (CHANGE_ME)"
-            hint "Update: sudo nano /etc/frp/frpc.toml"
-            hint "Or re-run: bash install.sh --tenant-name <name> --frps-token <token>"
-        fi
-    elif [ -f /usr/local/bin/frpc ]; then
-        warn "frpc installed but no config at /etc/frp/frpc.toml"
-        hint "Re-run install.sh with --tenant-name and --frps-token"
-    fi
-
-    # Check frpc logs for errors
-    if [ -f /var/log/frpc.log ]; then
-        FRPC_ERRORS=$(tail -20 /var/log/frpc.log 2>/dev/null | grep -i "error\|failed\|refused" | tail -3)
-        if [ -n "$FRPC_ERRORS" ]; then
-            warn "recent frpc errors:"
-            echo "$FRPC_ERRORS" | while read -r line; do echo "      $line"; done
-            hint "Full log: tail -50 /var/log/frpc.log"
-        fi
-    fi
-
-    # ── Remote access ────────────────────────────────────────────────
-    section "Remote access"
-
-    ADMIN_OK=false
-    [ "$HTTP_CODE" = "200" ] && ADMIN_OK=true
-
-    FRPC_OK=false
-    [ -n "$FRPC_PID" ] && FRPC_OK=true
-
-    if [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = true ]; then
-        ok "admin portal works locally and frpc tunnel is running"
-        if [ -n "$TENANT" ]; then
-            echo "    Remote URL: https://$TENANT"
-        fi
-    elif [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = false ]; then
-        err "admin portal works locally but frpc is NOT running — remote access is down"
-        if [ ! -f /usr/local/bin/frpc ]; then
-            hint "frpc was never installed. Set up the tunnel:"
-            hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
-        elif [ ! -f /etc/frp/frpc.toml ]; then
-            hint "frpc is installed but not configured"
-            hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
+            ok "frpc installed: $(/usr/local/bin/frpc --version 2>/dev/null || echo 'unknown version')"
         else
-            hint "frpc is installed and configured but the process is not running"
-            hint "  Start: $(svc_hint start frpc)"
+            warn "frpc binary not found"
+            hint "Re-run install.sh with --tunnel --tenant-name <name> --frps-token <token>"
         fi
-    elif [ "$ADMIN_OK" = false ]; then
-        err "admin portal is not responding locally — fix octos serve first (see above)"
-        hint "Remote access depends on the local server working first"
+
+        FRPC_PID=$(pgrep -x frpc 2>/dev/null || true)
+        if [ -n "$FRPC_PID" ]; then
+            ok "frpc running (PID: $FRPC_PID)"
+        else
+            if [ -f /usr/local/bin/frpc ]; then
+                err "frpc installed but not running"
+                hint "Start: $(svc_hint start frpc)"
+            fi
+        fi
+
+        if [ -f /etc/frp/frpc.toml ]; then
+            ok "frpc config: /etc/frp/frpc.toml"
+            TENANT=$(grep 'customDomains' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*\["\(.*\)"\].*/\1/')
+            if [ -n "$TENANT" ]; then
+                echo "    Tunnel: https://$TENANT"
+            fi
+            # Check for placeholder values
+            if grep -q 'CHANGE_ME' /etc/frp/frpc.toml 2>/dev/null; then
+                warn "frpc config contains placeholder token (CHANGE_ME)"
+                hint "Update: sudo nano /etc/frp/frpc.toml"
+                hint "Or re-run: bash install.sh --tenant-name <name> --frps-token <token>"
+            fi
+        elif [ -f /usr/local/bin/frpc ]; then
+            warn "frpc installed but no config at /etc/frp/frpc.toml"
+            hint "Re-run install.sh with --tenant-name and --frps-token"
+        fi
+
+        # Check frpc logs for errors
+        if [ -f /var/log/frpc.log ]; then
+            FRPC_ERRORS=$(tail -20 /var/log/frpc.log 2>/dev/null | grep -i "error\|failed\|refused" | tail -3)
+            if [ -n "$FRPC_ERRORS" ]; then
+                warn "recent frpc errors:"
+                echo "$FRPC_ERRORS" | while read -r line; do echo "      $line"; done
+                hint "Full log: tail -50 /var/log/frpc.log"
+            fi
+        fi
+
+        # ── Remote access ────────────────────────────────────────────
+        section "Remote access"
+
+        ADMIN_OK=false
+        [ "$HTTP_CODE" = "200" ] && ADMIN_OK=true
+
+        FRPC_OK=false
+        [ -n "$FRPC_PID" ] && FRPC_OK=true
+
+        if [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = true ]; then
+            ok "admin portal works locally and frpc tunnel is running"
+            if [ -n "$TENANT" ]; then
+                echo "    Remote URL: https://$TENANT"
+            fi
+        elif [ "$ADMIN_OK" = true ] && [ "$FRPC_OK" = false ]; then
+            err "admin portal works locally but frpc is NOT running — remote access is down"
+            if [ ! -f /usr/local/bin/frpc ]; then
+                hint "frpc binary missing — reinstall the tunnel:"
+                hint "  Re-run install.sh with --tunnel --tenant-name <name> --frps-token <token>"
+            elif [ ! -f /etc/frp/frpc.toml ]; then
+                hint "frpc is installed but not configured"
+                hint "  Re-run install.sh with --tenant-name <name> --frps-token <token>"
+            else
+                hint "frpc is installed and configured but the process is not running"
+                hint "  Start: $(svc_hint start frpc)"
+            fi
+        elif [ "$ADMIN_OK" = false ]; then
+            err "admin portal is not responding locally — fix octos serve first (see above)"
+            hint "Remote access depends on the local server working first"
+        fi
     fi
 
     # ── Serve logs ───────────────────────────────────────────────────
@@ -854,6 +928,7 @@ if [ "$RUN_DOCTOR" = true ]; then
 
     command -v git &>/dev/null && ok "git $(git --version | awk '{print $3}')" || warn "git not found"
     command -v node &>/dev/null && ok "Node.js $(node --version)" || warn "Node.js not found (optional)"
+    command -v python3 &>/dev/null && ok "Python $(python3 --version 2>&1 | awk '{print $2}')" || { command -v python &>/dev/null && ok "Python $(python --version 2>&1 | awk '{print $2}')" || warn "Python not found"; }
     command -v ffmpeg &>/dev/null && ok "ffmpeg found" || warn "ffmpeg not found (optional)"
 
     CHROME_FOUND=false
@@ -892,6 +967,10 @@ fi
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
+    if [ "$PORT" = "8080" ]; then
+        PORT="$(detect_installed_port)"
+    fi
+
     uninstall_services
 
     rm -rf "$PREFIX"
@@ -899,6 +978,41 @@ if [ "$UNINSTALL" = true ]; then
     sudo rm -rf /etc/frp
     ok "binaries and config removed"
 
+    # Stop and clean up Caddy
+    HAD_CADDY=false
+    [ -f "$DATA_DIR/Caddyfile" ] && HAD_CADDY=true
+    if pgrep -x caddy > /dev/null 2>&1; then
+        caddy stop 2>/dev/null || true
+        ok "stopped Caddy"
+    fi
+    if [ -f "$DATA_DIR/Caddyfile" ]; then
+        rm -f "$DATA_DIR/Caddyfile"
+        ok "removed Caddyfile"
+    fi
+
+    # Remove firewall rules (serve-port rule may exist from older installs)
+    if [ "$OS" = "Linux" ]; then
+        _fw_ok=true
+        if command -v ufw &>/dev/null; then
+            sudo ufw delete allow "$PORT/tcp" 2>/dev/null || true
+            if [ "$HAD_CADDY" = true ]; then
+                sudo ufw delete allow 80/tcp 2>/dev/null || _fw_ok=false
+                sudo ufw delete allow 443/tcp 2>/dev/null || _fw_ok=false
+            fi
+        elif command -v firewall-cmd &>/dev/null; then
+            sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" 2>/dev/null || true
+            if [ "$HAD_CADDY" = true ]; then
+                sudo firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null || _fw_ok=false
+                sudo firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null || _fw_ok=false
+            fi
+            sudo firewall-cmd --reload 2>/dev/null || _fw_ok=false
+        fi
+        if [ "$_fw_ok" = true ]; then
+            ok "removed firewall rules"
+        else
+            warn "failed to remove some firewall rules (check privileges)"
+        fi
+    fi
     echo ""
     echo "    Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
     echo "      rm -rf $DATA_DIR"
@@ -1036,11 +1150,17 @@ esac
 ok "$OS $ARCH ($TRIPLE)"
 
 # ── Check / install runtime dependencies ─────────────────────────────
-section "Checking runtime dependencies"
+if [ "$INSTALL_DEPS" = true ]; then
+    section "Runtime dependencies (auto-install)"
+else
+    section "Checking runtime dependencies"
+fi
 
 # git — needed for skill installation
 if command -v git &>/dev/null; then
     ok "git $(git --version | awk '{print $3}')"
+elif [ "$INSTALL_DEPS" = true ]; then
+    install_pkg git && ok "git installed" || true
 else
     warn "git not found"
     echo "    Enables: skill installation (octos skills install)"
@@ -1051,11 +1171,27 @@ fi
 # Node.js / npm
 if command -v node &>/dev/null; then
     ok "Node.js $(node --version)"
+elif [ "$INSTALL_DEPS" = true ]; then
+    install_pkg node && ok "Node.js installed" || true
 else
     warn "Node.js not found"
     echo "    Enables: WhatsApp bridge, custom skills with package.json, pptxgenjs"
     echo "    Install:"
     echo "      $(pkg_hint node)"
+fi
+
+# Python
+if command -v python3 &>/dev/null; then
+    ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
+elif command -v python &>/dev/null; then
+    ok "Python $(python --version 2>&1 | awk '{print $2}')"
+elif [ "$INSTALL_DEPS" = true ]; then
+    install_pkg python && ok "Python installed" || true
+else
+    warn "Python not found"
+    echo "    Enables: MCP servers, custom skills, data processing"
+    echo "    Install:"
+    echo "      $(pkg_hint python)"
 fi
 
 # Chromium / Chrome
@@ -1077,15 +1213,21 @@ if [ "$CHROME_FOUND" = false ] && [ "$OS" = "Darwin" ]; then
     done
 fi
 if [ "$CHROME_FOUND" = false ]; then
-    warn "Chromium/Chrome not found"
-    echo "    Enables: browser tool (web browsing, screenshots), deep-crawl skill"
-    echo "    Install:"
-    echo "      $(pkg_hint chromium)"
+    if [ "$INSTALL_DEPS" = true ]; then
+        install_pkg chromium && ok "Chromium installed" || true
+    else
+        warn "Chromium/Chrome not found"
+        echo "    Enables: browser tool (web browsing, screenshots), deep-crawl skill"
+        echo "    Install:"
+        echo "      $(pkg_hint chromium)"
+    fi
 fi
 
 # ffmpeg
 if command -v ffmpeg &>/dev/null; then
     ok "ffmpeg found"
+elif [ "$INSTALL_DEPS" = true ]; then
+    install_pkg ffmpeg && ok "ffmpeg installed" || true
 else
     warn "ffmpeg not found"
     echo "    Enables: voice/audio skills, media transcoding"
@@ -1249,8 +1391,8 @@ write_octos_service
 section "Verifying octos serve"
 RETRIES=10
 while [ $RETRIES -gt 0 ]; do
-    if curl -sf --max-time 2 http://localhost:8080/admin/ > /dev/null 2>&1; then
-        ok "octos serve is running on http://localhost:8080"
+    if curl -sf --max-time 2 "http://localhost:${PORT}/admin/" > /dev/null 2>&1; then
+        ok "octos serve is running on http://localhost:${PORT}"
         break
     fi
     RETRIES=$((RETRIES - 1))
@@ -1261,8 +1403,35 @@ if [ $RETRIES -eq 0 ]; then
     echo "    Check logs: tail -f $DATA_DIR/serve.log"
 fi
 
+# ── Firewall (Caddy only) ─────────────────────────────────────────────
+if [ -n "$CADDY_DOMAIN" ] && [ "$OS" = "Linux" ]; then
+    section "Configuring firewall for Caddy"
+    if command -v ufw &>/dev/null; then
+        _caddy_ok=true
+        echo "    Running: sudo ufw allow 80/tcp"
+        sudo ufw allow 80/tcp >/dev/null 2>&1 || _caddy_ok=false
+        echo "    Running: sudo ufw allow 443/tcp"
+        sudo ufw allow 443/tcp >/dev/null 2>&1 || _caddy_ok=false
+        if [ "$_caddy_ok" = true ]; then
+            ok "ufw: ports 80,443 open for Caddy"
+        else
+            warn "failed to open Caddy ports (requires elevated privileges)"
+        fi
+    elif command -v firewall-cmd &>/dev/null; then
+        echo "    Running: sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp"
+        if sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp >/dev/null 2>&1 \
+            && sudo firewall-cmd --reload >/dev/null 2>&1; then
+            ok "firewalld: ports 80,443 open for Caddy"
+        else
+            warn "failed to open Caddy ports (requires elevated privileges)"
+        fi
+    else
+        warn "no firewall manager found (ufw/firewalld) — ensure ports 80 and 443 are accessible"
+    fi
+fi
+
 # ── Tunnel setup (frpc) ──────────────────────────────────────────────
-if [ "$SKIP_TUNNEL" = false ]; then
+if [ "$ENABLE_TUNNEL" = true ]; then
     section "Tunnel setup"
 
     # Prompt for missing inputs (use placeholders if skipped — frpc still gets installed)
@@ -1334,7 +1503,7 @@ if [ "$SKIP_TUNNEL" = false ]; then
         echo "      frps token:   ${FRPS_TOKEN:0:8}..."
     fi
     echo "      SSH port:     ${SSH_PORT}"
-    echo "      Local port:   8080"
+    echo "      Local port:   ${PORT}"
 
     if [ "$TENANT_PLACEHOLDER" = true ] || [ "$TOKEN_PLACEHOLDER" = true ]; then
         echo ""
@@ -1372,10 +1541,10 @@ if [ "$SKIP_TUNNEL" = false ]; then
         echo "    Check logs: tail -f /var/log/frpc.log"
     fi
 
-    if curl -sf --max-time 3 "http://localhost:8080/api/status" > /dev/null 2>&1; then
-        ok "octos serve is running on port 8080"
+    if curl -sf --max-time 3 "http://localhost:${PORT}/api/status" > /dev/null 2>&1; then
+        ok "octos serve is running on port ${PORT}"
     else
-        warn "octos serve is not responding on port 8080 (tunnel will retry once it starts)"
+        warn "octos serve is not responding on port ${PORT} (tunnel will retry once it starts)"
     fi
 fi
 
@@ -1403,7 +1572,7 @@ if [ -n "$CADDY_DOMAIN" ]; then
     fi
 
     # Determine serve port (match what octos serve uses)
-    CADDY_UPSTREAM="localhost:8080"
+    CADDY_UPSTREAM="localhost:${PORT}"
 
     # Write Caddyfile
     CADDYFILE_PATH="$DATA_DIR/Caddyfile"
@@ -1508,7 +1677,7 @@ echo "  Next steps:"
 echo "    1. Set your API key:  export ${_ENV:-OPENAI_API_KEY}=sk-..."
 echo "    2. Install skills:    octos skills install --all"
 echo "    3. Start chatting:    octos chat"
-echo "    4. Open dashboard:    http://localhost:8080/admin/"
+echo "    4. Open dashboard:    http://localhost:${PORT}/admin/"
 if [ -n "$TENANT_NAME" ]; then
     echo ""
     echo "  Tunnel:"

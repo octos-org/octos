@@ -39,6 +39,27 @@ param(
     [Parameter(ParameterSetName = 'Install')]
     [switch]$InstallDeps,
 
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$Tunnel,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$TenantName = "",
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$FrpsToken = "",
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$FrpsTokenFile = "",
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$FrpsServer = "",
+
+    [Parameter(ParameterSetName = 'Install')]
+    [int]$SshPort = 0,
+
+    [Parameter(ParameterSetName = 'Install')]
+    [string]$TunnelDomain = "",
+
     [Parameter(ParameterSetName = 'Help')]
     [Alias("h")]
     [switch]$Help
@@ -54,14 +75,29 @@ install.ps1 — Install octos from pre-built binaries on Windows.
 USAGE
   Piped:     irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
   Download:  .\install.ps1 [options]
+  Tunnel:    .\install.ps1 -Tunnel -TenantName alice -FrpsToken <token>
 
 OPTIONS
-  -Version <tag>     Release version (default: latest)
-  -Prefix <path>     Install prefix (default: ~\.octos\bin)
-  -AuthToken <token> Auth token for octos serve (default: auto-generated)
-  -Doctor            Diagnose installation and service health
-  -Uninstall         Remove octos binaries, scheduled task, and PATH entry
-  -Help              Show this help message
+  -Version <tag>       Release version (default: latest)
+  -Prefix <path>       Install prefix (default: ~\.octos\bin)
+  -Port <port>         octos serve port (default: 8080)
+  -AuthToken <token>   Auth token for octos serve (default: auto-generated)
+  -Doctor              Diagnose installation and service health
+  -Uninstall           Remove octos binaries, services, and PATH entry
+  -Help                Show this help message
+
+OPTIONAL FEATURES
+  -InstallDeps         Auto-install missing runtime dependencies
+  -Domain <domain>     Set up Caddy reverse proxy with on-demand TLS
+
+TUNNEL (frpc)
+  -Tunnel                Enable frpc tunnel (also enabled by -TenantName/-FrpsToken)
+  -TenantName <name>     Tenant subdomain (e.g. "alice")
+  -FrpsToken <token>     frps auth token
+  -FrpsTokenFile <file>  Read frps auth token from file
+  -FrpsServer <addr>     frps server address (default: 163.192.33.32)
+  -SshPort <port>        SSH tunnel remote port (default: 6001)
+  -TunnelDomain <domain> Tunnel domain (default: octos-cloud.org)
 
 ENVIRONMENT VARIABLES
   OCTOS_VERSION      Release version override
@@ -81,7 +117,32 @@ if (-not $Prefix)    { $Prefix  = if ($env:OCTOS_PREFIX)  { $env:OCTOS_PREFIX } 
 
 $DataDir = if ($env:OCTOS_HOME) { $env:OCTOS_HOME } else { Join-Path $HOME ".octos" }
 
+# ── Tunnel defaults ──────────────────────────────────────────────────
+$FrpcVersion = "0.61.1"
+if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
+if ($SshPort -eq 0)     { $SshPort      = 6001 }
+if (-not $TunnelDomain) { $TunnelDomain = "octos-cloud.org" }
+
+# Auto-enable tunnel when tunnel-specific args are passed
+if ($TenantName -or $FrpsToken -or $FrpsTokenFile) { $Tunnel = [switch]::new($true) }
+
+# Resolve frps token from file
+if (-not $FrpsToken -and $FrpsTokenFile) {
+    if (Test-Path $FrpsTokenFile) {
+        $FrpsToken = (Get-Content $FrpsTokenFile -Raw).Trim()
+    } else {
+        Write-Host "    ERROR: token file not found: $FrpsTokenFile" -ForegroundColor Red
+        exit 1
+    }
+}
+
+# Derived paths (depend on $Prefix/$DataDir which are set above)
+$FrpcBin    = Join-Path $Prefix "frpc.exe"
+$FrpcConfig = Join-Path $DataDir "frpc.toml"
+$FrpcLog    = Join-Path $DataDir "logs\frpc.log"
+
 # ── Helpers ───────────────────────────────────────────────────────────
+# (Validate-Inputs is called after helper definitions below)
 function Section($msg) { Write-Host "`n==> $msg" }
 function Ok($msg)      { Write-Host "    OK: $msg" }
 function Warn($msg)    { Write-Host "    WARN: $msg" -ForegroundColor Yellow }
@@ -103,11 +164,33 @@ function Test-Command($cmd) {
     $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
+# Validate a value against a regex pattern; exit on mismatch.
+function Validate($name, $value, $pattern) {
+    if ($value -and $value -notmatch "^${pattern}$") {
+        Write-Host "    ERROR: invalid ${name}: '${value}'" -ForegroundColor Red
+        Write-Host "           Must match: ${pattern}"
+        exit 1
+    }
+}
+
+function Validate-Inputs {
+    if ($AuthToken) { Validate "auth-token" $AuthToken '[a-zA-Z0-9._-]+' }
+    if ($Domain)    { Validate "domain"     $Domain    '[a-zA-Z0-9.-]+' }
+    if ($Version -and $Version -ne "latest") { Validate "version" $Version '[a-zA-Z0-9._-]+' }
+    if ($Port)      { Validate "port"       $Port      '[0-9]+' }
+    if ($TenantName)   { Validate "tenant-name"   $TenantName   '[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?' }
+    if ($FrpsToken)    { Validate "frps-token"    $FrpsToken    '[a-zA-Z0-9._-]+' }
+    if ($FrpsServer)   { Validate "frps-server"   $FrpsServer   '[a-zA-Z0-9.:-]+' }
+    if ($SshPort)      { Validate "ssh-port"      $SshPort      '[0-9]+' }
+    if ($TunnelDomain) { Validate "tunnel-domain" $TunnelDomain '[a-zA-Z0-9.-]+' }
+}
+
 # Print install hint for a package on Windows
 function Get-PkgHint($pkg) {
     switch ($pkg) {
         "git"      { "winget install Git.Git" }
         "node"     { "winget install OpenJS.NodeJS.LTS" }
+        "python"   { "winget install Python.Python.3.12" }
         "chromium" { "winget install Google.Chrome" }
         "ffmpeg"   { "winget install Gyan.FFmpeg" }
         default    { "install '$pkg' via winget, choco, or scoop" }
@@ -126,11 +209,253 @@ function Get-WindowsArchitecture() {
     return [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()
 }
 
+# ── frpc tunnel helpers ──────────────────────────────────────────────
+
+# Write frpc.toml to $DataDir\frpc.toml.
+function Write-FrpcConfig {
+    $toml = @"
+serverAddr = "$FrpsServer"
+serverPort = 7000
+auth.method = "token"
+auth.token = "$FrpsToken"
+log.to = "$($FrpcLog -replace '\\', '/')"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "$TenantName-web"
+type = "http"
+localPort = $Port
+customDomains = ["$TenantName.$TunnelDomain"]
+
+[[proxies]]
+name = "$TenantName-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = $SshPort
+"@
+    # Ensure logs directory exists
+    $logsDir = Join-Path $DataDir "logs"
+    if (-not (Test-Path $logsDir)) {
+        New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($FrpcConfig, $toml, [System.Text.UTF8Encoding]::new($false))
+}
+
+# Download and install frpc binary to $Prefix.
+function Install-FrpcBinary {
+    if (Test-Path $FrpcBin) {
+        try {
+            $ver = & $FrpcBin --version 2>&1 | Select-Object -First 1
+            Ok "frpc already installed ($ver)"
+        } catch {
+            Ok "frpc already installed (version unknown)"
+        }
+        return
+    }
+    Write-Host "    Installing frpc v${FrpcVersion}..."
+    $frpZip = "frp_${FrpcVersion}_windows_amd64.zip"
+    $frpUrl = "https://github.com/fatedier/frp/releases/download/v${FrpcVersion}/$frpZip"
+    $frpTmp = Join-Path ([System.IO.Path]::GetTempPath()) "frpc-install-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -ItemType Directory -Path $frpTmp -Force | Out-Null
+    try {
+        $zipPath = Join-Path $frpTmp $frpZip
+        Invoke-WebRequest -Uri $frpUrl -OutFile $zipPath -UseBasicParsing
+        Expand-Archive -Path $zipPath -DestinationPath $frpTmp -Force
+        $frpcSrc = Get-ChildItem -Path $frpTmp -Recurse -Filter "frpc.exe" | Select-Object -First 1
+        if (-not $frpcSrc) { Err "frpc.exe not found in downloaded archive"; return }
+        Copy-Item $frpcSrc.FullName -Destination $FrpcBin -Force
+        Ok "frpc installed"
+    } finally {
+        Remove-Item -Recurse -Force $frpTmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Register and start frpc as a Windows Service.
+function Install-FrpcService {
+    # Clean up prior registration (silently)
+    & $FrpcBin uninstall 2>$null
+    Start-Sleep -Seconds 1
+
+    # Register service with config path
+    & $FrpcBin install -c $FrpcConfig
+    if ($LASTEXITCODE -ne 0) {
+        Err "failed to register frpc service"
+        return
+    }
+
+    # Start the service
+    & $FrpcBin start
+    if ($LASTEXITCODE -ne 0) {
+        Warn "frpc service registered but failed to start"
+        Hint "Try: Start-Service frpc"
+        return
+    }
+    Ok "frpc service installed and started"
+}
+
+# Prompt interactively for missing tunnel values.
+# Sets script-scope $TenantName and $FrpsToken if not already set.
+function Invoke-TunnelPrompts {
+    $script:TenantPlaceholder = $false
+    $script:TokenPlaceholder = $false
+
+    if (-not $script:TenantName -or -not $script:FrpsToken) {
+        Write-Host ""
+        Write-Host "    Tunnel setup requires a tenant name, frps token, and SSH port."
+        Write-Host "    If you don't have these yet, register at:"
+        Write-Host "      https://$TunnelDomain"
+        Write-Host "    You'll receive your setup command with all values pre-filled."
+        Write-Host ""
+    }
+
+    if (-not $script:TenantName) {
+        Write-Host "    Enter the tenant subdomain (e.g. 'alice' for alice.${TunnelDomain}):"
+        Write-Host "    (press Enter to use placeholder — you can update later)"
+        $userInput = Read-Host "    > "
+        if ($userInput) {
+            $script:TenantName = $userInput
+        } else {
+            # Derive from computer name
+            $slug = $env:COMPUTERNAME.ToLower() -replace '[^a-z0-9-]', '-' -replace '^-+|-+$', '' -replace '-{2,}', '-'
+            if ($slug) {
+                $script:TenantName = $slug
+                $script:TenantPlaceholder = $true
+                Warn "Using placeholder tenant: $slug"
+            } else {
+                Write-Host "    Could not derive tenant from computer name. Please enter one:"
+                $script:TenantName = Read-Host "    > "
+                if (-not $script:TenantName) { Err "Tenant name is required" }
+            }
+        }
+    }
+
+    if (-not $script:FrpsToken) {
+        Write-Host ""
+        Write-Host "    Enter the frps auth token (press Enter to use placeholder):"
+        $userInput = Read-Host "    > "
+        if ($userInput) {
+            $script:FrpsToken = $userInput
+        } else {
+            $script:FrpsToken = "CHANGE_ME"
+            $script:TokenPlaceholder = $true
+            Warn "Using placeholder token — frpc will not connect until updated"
+        }
+    }
+
+    Validate-Inputs
+
+    # Display config summary
+    Write-Host ""
+    Write-Host "    Tunnel configuration:"
+    Write-Host "      Tenant:       $($script:TenantName).$TunnelDomain"
+    Write-Host "      frps server:  ${FrpsServer}:7000"
+    if ($script:TokenPlaceholder) {
+        Write-Host "      frps token:   CHANGE_ME (placeholder)"
+    } else {
+        Write-Host "      frps token:   $($script:FrpsToken.Substring(0, [Math]::Min(8, $script:FrpsToken.Length)))..."
+    }
+    Write-Host "      SSH port:     $SshPort"
+    Write-Host "      Local port:   $Port"
+
+    if ($script:TenantPlaceholder -or $script:TokenPlaceholder) {
+        Write-Host ""
+        Write-Host "    frpc will be installed with placeholders. Update the config later:"
+        Write-Host "      notepad $FrpcConfig"
+        Write-Host "    Then restart frpc:"
+        Write-Host "      & `"$FrpcBin`" stop; & `"$FrpcBin`" start"
+        Write-Host ""
+        Write-Host "    Or re-run: .\install.ps1 -Tunnel -TenantName <name> -FrpsToken <token>"
+    }
+
+    Write-Host ""
+    Read-Host "    Press Enter to continue, or Ctrl+C to abort"
+}
+
+# ── Validate inputs ──────────────────────────────────────────────────
+Validate-Inputs
+
+# ══════════════════════════════════════════════════════════════════════
+# ── Tunnel-only update (when octos is already installed) ─────────────
+# ══════════════════════════════════════════════════════════════════════
+# If octos binary exists and user passed -TenantName or -FrpsToken,
+# skip the full install and just update the tunnel configuration.
+
+$octosBinCheck = Join-Path $Prefix "octos.exe"
+if ((Test-Path $octosBinCheck) -and ($TenantName -or $FrpsToken)) {
+    Section "Updating tunnel configuration"
+
+    # Fill in missing values from existing frpc config
+    if (Test-Path $FrpcConfig) {
+        $existingConfig = Get-Content $FrpcConfig -Raw -ErrorAction SilentlyContinue
+        if (-not $TenantName -and $existingConfig -match 'customDomains\s*=\s*\["([^.]+)\.') {
+            $TenantName = $Matches[1]
+            Ok "tenant name from existing config: $TenantName"
+        }
+        if (-not $FrpsToken -and $existingConfig -match 'auth\.token\s*=\s*"([^"]+)"') {
+            $FrpsToken = $Matches[1]
+            Ok "frps token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
+        }
+        if ($SshPort -eq 6001 -and $existingConfig -match 'remotePort\s*=\s*(\d+)') {
+            $existingSshPort = [int]$Matches[1]
+            if ($existingSshPort -ne 6001) {
+                $SshPort = $existingSshPort
+                Ok "ssh port from existing config: $SshPort"
+            }
+        }
+    }
+
+    # Prompt for anything still missing
+    Invoke-TunnelPrompts
+
+    # Install frpc if missing
+    Install-FrpcBinary
+
+    # Write config
+    Write-FrpcConfig
+    Ok "frpc config updated"
+
+    # Restart service
+    & $FrpcBin stop 2>$null
+    & $FrpcBin uninstall 2>$null
+    Start-Sleep -Seconds 1
+    & $FrpcBin install -c $FrpcConfig 2>$null
+    & $FrpcBin start 2>$null
+    Ok "frpc restarted"
+
+    # Verify
+    Start-Sleep -Seconds 2
+    $svc = Get-Service frpc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Ok "frpc is running"
+    } else {
+        Warn "frpc does not appear to be running"
+        Write-Host "    Check logs: Get-Content '$FrpcLog' -Tail 20"
+    }
+
+    Write-Host ""
+    Write-Host "    Tunnel: https://${TenantName}.${TunnelDomain}"
+    Write-Host ""
+    exit 0
+}
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Doctor mode ──────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 if ($Doctor) {
     $script:DoctorIssues = 0
+
+    # Auto-detect port from installed service config (unless user passed -Port)
+    if ($Port -eq 8080) {
+        $wrapperPath = Join-Path $DataDir "serve-launcher.cmd"
+        if (Test-Path $wrapperPath) {
+            $wrapperContent = Get-Content $wrapperPath -Raw -ErrorAction SilentlyContinue
+            if ($wrapperContent -match '--port\s+(\d+)') {
+                $Port = [int]$Matches[1]
+            }
+        }
+    }
 
     # ── Binary ───────────────────────────────────────────────────────
     Section "octos binary"
@@ -186,26 +511,26 @@ if ($Doctor) {
         Hint "Start: Start-ScheduledTask -TaskName OctosServe"
     }
 
-    # ── Port 8080 ────────────────────────────────────────────────────
-    Section "Port 8080"
+    # ── Port check ───────────────────────────────────────────────────
+    Section "Port $Port"
 
-    $listener = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue |
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($listener) {
         $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
         if ($proc -and $proc.ProcessName -match "octos") {
-            Ok "port 8080 held by octos (PID: $($proc.Id))"
+            Ok "port $Port held by octos (PID: $($proc.Id))"
         } elseif ($proc) {
-            Err "port 8080 held by $($proc.ProcessName) (PID: $($proc.Id)) - not octos"
+            Err "port $Port held by $($proc.ProcessName) (PID: $($proc.Id)) - not octos"
             Hint "Stop it: Stop-Process -Id $($proc.Id)"
         } else {
-            Warn "port 8080 in use but owning process not found"
+            Warn "port $Port in use but owning process not found"
         }
     } else {
         if ($octosProc) {
-            Err "octos serve is running but nothing is listening on 8080"
+            Err "octos serve is running but nothing is listening on $Port"
         } else {
-            Warn "nothing listening on port 8080"
+            Warn "nothing listening on port $Port"
         }
     }
 
@@ -213,9 +538,9 @@ if ($Doctor) {
     Section "Admin portal"
 
     try {
-        $resp = Invoke-WebRequest -Uri "http://localhost:8080/admin/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/admin/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
         if ($resp.StatusCode -eq 200) {
-            Ok "http://localhost:8080/admin/ responds 200"
+            Ok "http://localhost:${Port}/admin/ responds 200"
         }
     } catch {
         $status = 0
@@ -226,7 +551,7 @@ if ($Doctor) {
             401 { Warn "responds 401 (auth required)"; Hint "Pass auth token in request header" }
             403 { Warn "responds 403 (forbidden)"; Hint "Check auth configuration" }
             404 { Err "responds 404 (admin route not found)"; Hint "Binary may be built without 'api' feature. Rebuild with: cargo build --features api" }
-            default { Err "connection failed (server not reachable on localhost:8080)"; Hint "Check 'octos serve' section above" }
+            default { Err "connection failed (server not reachable on localhost:${Port})"; Hint "Check 'octos serve' section above" }
         }
     }
 
@@ -257,7 +582,7 @@ if ($Doctor) {
     if (Test-Command "python") {
         $pyVer = python --version 2>&1
         Ok "Python $pyVer"
-    } else { Warn "Python not found (optional)" }
+    } else { Warn "Python not found"; Hint (Get-PkgHint "python") }
 
     if (Test-Command "ffmpeg") {
         Ok "ffmpeg found"
@@ -331,6 +656,107 @@ if ($Doctor) {
         Hint "octos serve may not have started yet"
     }
 
+    # ── frpc tunnel (only if tunnel was ever configured) ─────────────
+    $FrpcBinDoc = Join-Path $Prefix "frpc.exe"
+    $FrpcConfigDoc = Join-Path $DataDir "frpc.toml"
+    $FrpcLogDoc = Join-Path $DataDir "logs\frpc.log"
+
+    if ((Test-Path $FrpcBinDoc) -or (Test-Path $FrpcConfigDoc)) {
+        Section "frpc tunnel"
+
+        $TenantDoc = ""
+
+        if (Test-Path $FrpcBinDoc) {
+            try {
+                $frpcVer = & $FrpcBinDoc --version 2>&1 | Select-Object -First 1
+                Ok "frpc installed: $frpcVer"
+            } catch {
+                Ok "frpc installed (version unknown)"
+            }
+        } else {
+            Warn "frpc binary not found"
+            Hint "Re-run install.ps1 with -Tunnel -TenantName <name> -FrpsToken <token>"
+        }
+
+        # frpc service
+        $frpcSvc = Get-Service frpc -ErrorAction SilentlyContinue
+        if ($frpcSvc) {
+            if ($frpcSvc.Status -eq "Running") {
+                Ok "frpc service running"
+            } else {
+                Err "frpc service registered but not running (status: $($frpcSvc.Status))"
+                Hint "Start-Service frpc"
+            }
+        } else {
+            if (Test-Path $FrpcBinDoc) {
+                Err "frpc installed but service not registered"
+                Hint "Re-run install.ps1 with -Tunnel to register the service"
+            }
+        }
+
+        # frpc config
+        if (Test-Path $FrpcConfigDoc) {
+            Ok "frpc config: $FrpcConfigDoc"
+            $configContent = Get-Content $FrpcConfigDoc -Raw -ErrorAction SilentlyContinue
+            if ($configContent -match 'customDomains\s*=\s*\["([^"]+)"\]') {
+                $TenantDoc = $Matches[1]
+                Write-Host "    Tunnel: https://$TenantDoc"
+            }
+            if ($configContent -match 'CHANGE_ME') {
+                Warn "frpc config contains placeholder token (CHANGE_ME)"
+                Hint "Update: notepad $FrpcConfigDoc"
+                Hint "Or re-run: .\install.ps1 -Tunnel -TenantName <name> -FrpsToken <token>"
+            }
+        } elseif (Test-Path $FrpcBinDoc) {
+            Warn "frpc installed but no config at $FrpcConfigDoc"
+            Hint "Re-run install.ps1 with -Tunnel -TenantName <name> -FrpsToken <token>"
+        }
+
+        # frpc logs
+        if (Test-Path $FrpcLogDoc) {
+            $frpcErrors = Get-Content $FrpcLogDoc -Tail 20 -ErrorAction SilentlyContinue |
+                Select-String -Pattern "error|failed|refused" |
+                Select-Object -Last 3
+            if ($frpcErrors) {
+                Warn "recent frpc errors:"
+                $frpcErrors | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+                Hint "Full log: Get-Content '$FrpcLogDoc' -Tail 50"
+            }
+        }
+
+        # ── Remote access ───────────────────────────────────────────
+        Section "Remote access"
+
+        $adminOk = $false
+        try {
+            $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/admin/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) { $adminOk = $true }
+        } catch {}
+
+        $frpcOk = ($frpcSvc -and $frpcSvc.Status -eq "Running")
+
+        if ($adminOk -and $frpcOk) {
+            Ok "admin portal works locally and frpc tunnel is running"
+            if ($TenantDoc) {
+                Write-Host "    Remote URL: https://$TenantDoc"
+            }
+        } elseif ($adminOk -and -not $frpcOk) {
+            if (-not (Test-Path $FrpcBinDoc)) {
+                Err "admin portal works locally but frpc binary is missing"
+                Hint "Re-run: .\install.ps1 -Tunnel -TenantName <name> -FrpsToken <token>"
+            } elseif (-not $frpcSvc) {
+                Err "admin portal works locally but frpc service is NOT registered"
+                Hint "Re-run: .\install.ps1 -Tunnel -TenantName <name> -FrpsToken <token>"
+            } else {
+                Err "admin portal works locally but frpc is NOT running — remote access is down"
+                Hint "Start-Service frpc"
+            }
+        } elseif (-not $adminOk) {
+            Err "admin portal is not responding locally — fix octos serve first (see above)"
+            Hint "Remote access depends on the local server working first"
+        }
+    }
+
     # ── Summary ──────────────────────────────────────────────────────
     Section "Summary"
     if ($script:DoctorIssues -eq 0) {
@@ -348,16 +774,50 @@ if ($Doctor) {
 if ($Uninstall) {
     Section "Uninstalling octos"
 
-    # Remove scheduled task
+    # Remove frpc service and binary
+    $FrpcBinUn = Join-Path $Prefix "frpc.exe"
+    $FrpcConfigUn = Join-Path $DataDir "frpc.toml"
+    $FrpcLogUn = Join-Path $DataDir "logs\frpc.log"
+    if (Test-Path $FrpcBinUn) {
+        & $FrpcBinUn uninstall 2>$null
+        Ok "removed frpc service"
+    }
+    if (Test-Path $FrpcConfigUn) {
+        Remove-Item $FrpcConfigUn -Force -ErrorAction SilentlyContinue
+        Ok "removed $FrpcConfigUn"
+    }
+    if (Test-Path $FrpcLogUn) {
+        Remove-Item $FrpcLogUn -Force -ErrorAction SilentlyContinue
+        Ok "removed frpc log"
+    }
+
+    # Remove scheduled tasks
     $task = Get-ScheduledTask -TaskName "OctosServe" -ErrorAction SilentlyContinue
     if ($task) {
         Unregister-ScheduledTask -TaskName "OctosServe" -Confirm:$false -ErrorAction SilentlyContinue
         Ok "removed OctosServe scheduled task"
     }
+    $caddyTask = Get-ScheduledTask -TaskName "OctosCaddy" -ErrorAction SilentlyContinue
+    if ($caddyTask) {
+        Unregister-ScheduledTask -TaskName "OctosCaddy" -Confirm:$false -ErrorAction SilentlyContinue
+        Ok "removed OctosCaddy scheduled task"
+    }
 
-    # Stop octos processes
+    # Stop octos and caddy processes
     Get-Process -Name "octos" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Ok "stopped octos processes"
+    Get-Process -Name "caddy" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # Remove firewall rules (octos-serve may exist from older installs)
+    netsh advfirewall firewall delete rule name="octos-serve" >$null 2>&1
+    netsh advfirewall firewall delete rule name="octos-caddy" >$null 2>&1
+
+    # Remove Caddyfile
+    $caddyfileUn = Join-Path $DataDir "Caddyfile"
+    if (Test-Path $caddyfileUn) {
+        Remove-Item $caddyfileUn -Force -ErrorAction SilentlyContinue
+        Ok "removed $caddyfileUn"
+    }
 
     # Remove binaries
     if (Test-Path $Prefix) {
@@ -453,21 +913,6 @@ if (Test-Command "node") {
     Warn "Node.js not found (optional)"; Hint (Get-PkgHint "node")
 }
 
-# Python
-if (Test-Command "python") {
-    Ok "Python $(python --version 2>&1)"
-} elseif ($InstallDeps) {
-    Install-Dep "Python" "python" {
-        $url = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe"
-        $installer = Join-Path $env:TEMP "python-install.exe"
-        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
-        Start-Process -Wait -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1"
-    }
-    if (Test-Command "python") { Ok "Python installed" } else { Warn "Python install failed" }
-} else {
-    Warn "Python not found (optional)"
-}
-
 # ffmpeg
 if (Test-Command "ffmpeg") {
     Ok "ffmpeg found"
@@ -489,6 +934,23 @@ if (Test-Command "ffmpeg") {
     if (Test-Command "ffmpeg") { Ok "ffmpeg installed" } else { Warn "ffmpeg install failed" }
 } else {
     Warn "ffmpeg not found (optional)"; Hint (Get-PkgHint "ffmpeg")
+}
+
+# Python
+if (Test-Command "python") {
+    Ok "Python $(python --version 2>&1)"
+} elseif ($InstallDeps) {
+    Install-Dep "Python" "python" {
+        $url = "https://www.python.org/ftp/python/3.13.5/python-3.13.5-amd64.exe"
+        $installer = Join-Path $env:TEMP "python-install.exe"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1"
+        # Refresh PATH so Test-Command can find the newly installed binary
+        $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
+    }
+    if (Test-Command "python") { Ok "Python installed" } else { Warn "Python install failed" }
+} else {
+    Warn "Python not found"; Hint (Get-PkgHint "python")
 }
 
 # Chrome
@@ -673,19 +1135,35 @@ foreach ($d in $subdirs) {
     }
 }
 
-# Bootstrap config.json
+# Bootstrap config.json — auto-detect provider from available API keys
 $configPath = Join-Path $DataDir "config.json"
 if (-not (Test-Path $configPath)) {
-    $configJson = @'
+    if ($env:OPENAI_API_KEY)     { $_prov = "openai";    $_model = "gpt-4.1-mini";            $_env = "OPENAI_API_KEY" }
+    elseif ($env:ANTHROPIC_API_KEY) { $_prov = "anthropic"; $_model = "claude-sonnet-4-20250514"; $_env = "ANTHROPIC_API_KEY" }
+    elseif ($env:GEMINI_API_KEY) { $_prov = "gemini";    $_model = "gemini-2.5-flash";         $_env = "GEMINI_API_KEY" }
+    elseif ($env:DEEPSEEK_API_KEY) { $_prov = "deepseek"; $_model = "deepseek-chat";            $_env = "DEEPSEEK_API_KEY" }
+    elseif ($env:KIMI_API_KEY)   { $_prov = "moonshot";  $_model = "kimi-k2.5";                $_env = "KIMI_API_KEY" }
+    elseif ($env:DASHSCOPE_API_KEY) { $_prov = "dashscope"; $_model = "qwen3.5-plus";           $_env = "DASHSCOPE_API_KEY" }
+    else                         { $_prov = "openai";    $_model = "gpt-4.1-mini";            $_env = "OPENAI_API_KEY" }
+
+    $configJson = @"
 {
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514",
-  "api_key_env": "ANTHROPIC_API_KEY"
+  "provider": "$_prov",
+  "model": "$_model",
+  "api_key_env": "$_env"
 }
-'@
+"@
     # WriteAllText avoids UTF-8 BOM that PowerShell 5.1 -Encoding UTF8 adds
     [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.UTF8Encoding]::new($false))
+    Ok "auto-detected provider: $_prov ($_env)"
+} else {
+    # Read api_key_env from existing config so the summary hint is correct
+    try {
+        $existingCfg = Get-Content $configPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+        $_env = $existingCfg.api_key_env
+    } catch {}
 }
+if (-not $_env) { $_env = "OPENAI_API_KEY" }
 
 # Bootstrap other files
 $gitignorePath = Join-Path $DataDir ".gitignore"
@@ -802,21 +1280,25 @@ if ($retries -eq 0) {
     Write-Host "    Check logs: Get-Content '$serveLog' -Tail 20"
 }
 
-# ── Firewall ─────────────────────────────────────────────────────────
-Section "Configuring firewall"
-netsh advfirewall firewall delete rule name="octos-serve" >$null 2>&1
-netsh advfirewall firewall add rule name="octos-serve" dir=in action=allow protocol=TCP localport=$Port >$null 2>&1
-Ok "Firewall: port $Port open"
+# ── Firewall (Caddy only) ─────────────────────────────────────────────
 if ($Domain) {
+    Section "Configuring firewall for Caddy"
+    Write-Host "    Running: netsh advfirewall firewall add rule name=`"octos-caddy`" dir=in action=allow protocol=TCP localport=80,443"
     netsh advfirewall firewall delete rule name="octos-caddy" >$null 2>&1
     netsh advfirewall firewall add rule name="octos-caddy" dir=in action=allow protocol=TCP localport=80,443 >$null 2>&1
-    Ok "Firewall: ports 80,443 open for Caddy"
+    if ($LASTEXITCODE -eq 0) {
+        Ok "Firewall: ports 80,443 open for Caddy"
+    } else {
+        Warn "Failed to open Caddy ports (requires elevated privileges)"
+        Hint "Run as Administrator, or manually: netsh advfirewall firewall add rule name=`"octos-caddy`" dir=in action=allow protocol=TCP localport=80,443"
+    }
 }
 
 # ── Caddy setup (HTTPS) ─────────────────────────────────────────────
 if ($Domain -and (Test-Command "caddy")) {
     Section "Configuring Caddy for $Domain"
     $caddyfile = Join-Path $DataDir "Caddyfile"
+    $caddyUpstream = "localhost:$Port"
     @"
 {
     on_demand_tls {
@@ -829,28 +1311,118 @@ if ($Domain -and (Test-Command "caddy")) {
 }
 
 $Domain {
-    reverse_proxy localhost:$Port
+    handle /api/* {
+        reverse_proxy $caddyUpstream
+    }
+    handle /admin* {
+        reverse_proxy $caddyUpstream
+    }
+    handle /auth/* {
+        reverse_proxy $caddyUpstream
+    }
+    handle /webhook/* {
+        reverse_proxy $caddyUpstream
+    }
+    handle {
+        reverse_proxy $caddyUpstream
+    }
 }
 
 *.$Domain {
     tls {
         on_demand
     }
-    reverse_proxy localhost:$Port {
-        header_up X-Profile-Id {labels.2}
+
+    @api path /api/*
+    @admin path /admin*
+    @auth path /auth/*
+
+    handle @api {
+        reverse_proxy $caddyUpstream {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @admin {
+        reverse_proxy $caddyUpstream {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @auth {
+        reverse_proxy $caddyUpstream {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle {
+        reverse_proxy $caddyUpstream
     }
 }
 "@ | Set-Content -Path $caddyfile -Encoding UTF8
     caddy fmt --overwrite $caddyfile 2>$null
+    Ok "Caddyfile written to $caddyfile"
+
+    # Validate
+    $validateResult = caddy validate --config $caddyfile 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Ok "Caddyfile is valid"
+    } else {
+        Warn "Caddyfile validation failed — check $caddyfile"
+    }
 
     # Register Caddy as scheduled task
     $caddyTask = "OctosCaddy"
     Unregister-ScheduledTask -TaskName $caddyTask -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Reload if already running, otherwise start via scheduled task
+    $caddyProc = Get-Process -Name "caddy" -ErrorAction SilentlyContinue
+    if ($caddyProc) {
+        caddy reload --config $caddyfile 2>$null
+        Ok "Caddy reloaded"
+    }
+
     $caddyAction = New-ScheduledTaskAction -Execute "caddy" -Argument "run --config `"$caddyfile`""
     $caddyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     Register-ScheduledTask -TaskName $caddyTask -Action $caddyAction -Trigger $caddyTrigger -Settings $settings -Description "Caddy reverse proxy for octos" -RunLevel Limited -Force | Out-Null
-    Start-ScheduledTask -TaskName $caddyTask
-    Ok "Caddy started for $Domain (HTTPS auto-provisioned)"
+    if (-not $caddyProc) {
+        Start-ScheduledTask -TaskName $caddyTask
+    }
+    Ok "Caddy configured for $Domain (HTTPS auto-provisioned)"
+}
+
+# ── Tunnel setup (frpc) ──────────────────────────────────────────────
+if ($Tunnel) {
+    Section "Tunnel setup"
+
+    # Prompt for missing inputs
+    Invoke-TunnelPrompts
+
+    # Install frpc binary
+    Install-FrpcBinary
+
+    # Write frpc config
+    Write-FrpcConfig
+    Ok "frpc config written to $FrpcConfig"
+
+    # Register and start frpc service
+    Write-Host "    (registering frpc as Windows Service)"
+    Install-FrpcService
+
+    # Verify tunnel
+    Section "Verifying tunnel"
+    Start-Sleep -Seconds 3
+    $svc = Get-Service frpc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Ok "frpc is running"
+    } else {
+        Warn "frpc does not appear to be running"
+        Write-Host "    Check logs: Get-Content '$FrpcLog' -Tail 20"
+    }
+
+    try {
+        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/api/status" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        Ok "octos serve is running on port ${Port}"
+    } catch {
+        Warn "octos serve is not responding on port ${Port} (tunnel will retry once it starts)"
+    }
 }
 
 # ── Summary ───────────────────────────────────────────────────────────
@@ -863,16 +1435,27 @@ Write-Host "    Auth token: $AuthToken"
 Write-Host "    Serve log:  $serveLog"
 Write-Host ""
 Write-Host "  Next steps:"
-Write-Host "    1. Set your API key:  `$env:ANTHROPIC_API_KEY = 'sk-...'"
+Write-Host "    1. Set your API key:  `$env:$_env = 'sk-...'"
 Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
-Write-Host "    4. Open dashboard:    http://localhost:8080/admin/"
+Write-Host "    4. Open dashboard:    http://localhost:${Port}/admin/"
 Write-Host ""
 Write-Host "  Manage service:"
 Write-Host "    Status:  Get-ScheduledTask -TaskName OctosServe"
 Write-Host "    Stop:    Stop-ScheduledTask -TaskName OctosServe"
 Write-Host "    Start:   Start-ScheduledTask -TaskName OctosServe"
 Write-Host ""
+if ($Tunnel) {
+    Write-Host "  Tunnel:"
+    Write-Host "    Dashboard:   https://${TenantName}.${TunnelDomain}"
+    Write-Host "    frpc config: $FrpcConfig"
+    Write-Host ""
+    Write-Host "  Manage tunnel:"
+    Write-Host "    Status:  Get-Service frpc"
+    Write-Host "    Stop:    & `"$FrpcBin`" stop"
+    Write-Host "    Start:   & `"$FrpcBin`" start"
+    Write-Host ""
+}
 Write-Host "  Troubleshoot:"
 Write-Host "    irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
 Write-Host ""
