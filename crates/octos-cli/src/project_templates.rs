@@ -107,10 +107,14 @@ SLIDES WORKFLOW:
   Present the slide plan to the user for review. Show each slide's title and description.
   Wait for user confirmation or edits.
 - Phase 2: GENERATE — only when user explicitly says "generate", "生成", "make it", "go ahead",
-  or similar confirmation, THEN call mofa_slides.
-- Always use mofa_slides with input parameter pointing to script.js
-- Never inline slides JSON in the tool call
-- Save output to slides/{slug}/output/
+  or similar confirmation, THEN call mofa_slides tool.
+
+CRITICAL TOOL RULES:
+- ALWAYS use the mofa_slides TOOL to generate slides. NEVER use shell to run mofa manually.
+- NEVER run "mofa slides" or "./mofa" via shell command. Use the mofa_slides tool directly.
+- Call: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+- Never inline slides JSON in the tool call — always point to the script.js file
+- If mofa_slides fails, report the error to the user. Do NOT retry via shell.
 
 INCREMENTAL UPDATES (MANDATORY — follow EXACTLY):
 - script.js is the SINGLE SOURCE OF TRUTH
