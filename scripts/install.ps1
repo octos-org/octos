@@ -190,6 +190,7 @@ function Get-PkgHint($pkg) {
     switch ($pkg) {
         "git"      { "winget install Git.Git" }
         "node"     { "winget install OpenJS.NodeJS.LTS" }
+        "python"   { "winget install Python.Python.3.12" }
         "chromium" { "winget install Google.Chrome" }
         "ffmpeg"   { "winget install Gyan.FFmpeg" }
         default    { "install '$pkg' via winget, choco, or scoop" }
@@ -578,6 +579,11 @@ if ($Doctor) {
         Ok "Node.js $nodeVer"
     } else { Warn "Node.js not found (optional)"; Hint (Get-PkgHint "node") }
 
+    if (Test-Command "python") {
+        $pyVer = python --version 2>&1
+        Ok "Python $pyVer"
+    } else { Warn "Python not found"; Hint (Get-PkgHint "python") }
+
     if (Test-Command "ffmpeg") {
         Ok "ffmpeg found"
     } else { Warn "ffmpeg not found (optional)"; Hint (Get-PkgHint "ffmpeg") }
@@ -935,6 +941,23 @@ if (Test-Command "ffmpeg") {
     if (Test-Command "ffmpeg") { Ok "ffmpeg installed" } else { Warn "ffmpeg install failed" }
 } else {
     Warn "ffmpeg not found (optional)"; Hint (Get-PkgHint "ffmpeg")
+}
+
+# Python
+if (Test-Command "python") {
+    Ok "Python $(python --version 2>&1)"
+} elseif ($InstallDeps) {
+    Install-Dep "Python" "python" {
+        $url = "https://www.python.org/ftp/python/3.13.5/python-3.13.5-amd64.exe"
+        $installer = Join-Path $env:TEMP "python-install.exe"
+        (New-Object System.Net.WebClient).DownloadFile($url, $installer)
+        Start-Process -Wait -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1"
+        # Refresh PATH so Test-Command can find the newly installed binary
+        $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
+    }
+    if (Test-Command "python") { Ok "Python installed" } else { Warn "Python install failed" }
+} else {
+    Warn "Python not found"; Hint (Get-PkgHint "python")
 }
 
 # Chrome

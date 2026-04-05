@@ -181,6 +181,7 @@ pkg_hint() {
             case "$1" in
                 git)       echo "xcode-select --install" ;;
                 node)      echo "brew install node" ;;
+                python)    echo "brew install python" ;;
                 chromium)  echo "brew install --cask google-chrome" ;;
                 ffmpeg)    echo "brew install ffmpeg" ;;
             esac
@@ -199,6 +200,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo apt-get install -y git" ;;
                         node)      echo "curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs" ;;
+                        python)    echo "sudo apt-get install -y python3" ;;
                         chromium)  echo "sudo apt-get install -y chromium-browser" ;;
                         ffmpeg)    echo "sudo apt-get install -y ffmpeg" ;;
                         iproute2)  echo "sudo apt-get install -y iproute2" ;;
@@ -207,6 +209,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo pacman -S --noconfirm git" ;;
                         node)      echo "sudo pacman -S --noconfirm nodejs npm" ;;
+                        python)    echo "sudo pacman -S --noconfirm python" ;;
                         chromium)  echo "sudo pacman -S --noconfirm chromium" ;;
                         ffmpeg)    echo "sudo pacman -S --noconfirm ffmpeg" ;;
                         iproute2)  echo "sudo pacman -S --noconfirm iproute2" ;;
@@ -215,6 +218,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo $pm install -y git" ;;
                         node)      echo "sudo $pm install -y nodejs npm" ;;
+                        python)    echo "sudo $pm install -y python3" ;;
                         chromium)  echo "sudo $pm install -y chromium" ;;
                         ffmpeg)    echo "sudo $pm install -y ffmpeg" ;;
                         iproute2)  echo "sudo $pm install -y iproute" ;;
@@ -223,6 +227,7 @@ pkg_hint() {
                     case "$1" in
                         git)       echo "sudo apk add git" ;;
                         node)      echo "sudo apk add nodejs npm" ;;
+                        python)    echo "sudo apk add python3" ;;
                         chromium)  echo "sudo apk add chromium" ;;
                         ffmpeg)    echo "sudo apk add ffmpeg" ;;
                         iproute2)  echo "sudo apk add iproute2" ;;
@@ -571,6 +576,32 @@ uninstall_services() {
     esac
 }
 
+# Detect the installed octos serve port from the service definition.
+# Falls back to the current PORT value when no installed service is present.
+detect_installed_port() {
+    local detected=""
+    case "$OS" in
+        Darwin)
+            local plist="/Library/LaunchDaemons/io.octos.serve.plist"
+            if [ -f "$plist" ]; then
+                detected=$(grep -A1 '>--port<' "$plist" 2>/dev/null | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+            fi
+            ;;
+        Linux)
+            local unit="/etc/systemd/system/octos-serve.service"
+            if [ -f "$unit" ]; then
+                detected=$(grep 'ExecStart=' "$unit" 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p')
+            fi
+            ;;
+    esac
+
+    if [ -n "$detected" ]; then
+        printf '%s\n' "$detected"
+    else
+        printf '%s\n' "$PORT"
+    fi
+}
+
 # err() exits during install but not during doctor
 if [ "$RUN_DOCTOR" = true ]; then
     DOCTOR_ISSUES=0
@@ -586,22 +617,7 @@ if [ "$RUN_DOCTOR" = true ]; then
 
     # Auto-detect port from installed service config (unless user passed --port)
     if [ "$PORT" = "8080" ]; then
-        case "$OS" in
-            Darwin)
-                _plist="/Library/LaunchDaemons/io.octos.serve.plist"
-                if [ -f "$_plist" ]; then
-                    _detected=$(grep -A1 '>--port<' "$_plist" 2>/dev/null | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
-                    [ -n "$_detected" ] && PORT="$_detected"
-                fi
-                ;;
-            Linux)
-                _unit="/etc/systemd/system/octos-serve.service"
-                if [ -f "$_unit" ]; then
-                    _detected=$(grep 'ExecStart=' "$_unit" 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p')
-                    [ -n "$_detected" ] && PORT="$_detected"
-                fi
-                ;;
-        esac
+        PORT="$(detect_installed_port)"
     fi
 
     # ── Binary ───────────────────────────────────────────────────────
@@ -912,6 +928,7 @@ if [ "$RUN_DOCTOR" = true ]; then
 
     command -v git &>/dev/null && ok "git $(git --version | awk '{print $3}')" || warn "git not found"
     command -v node &>/dev/null && ok "Node.js $(node --version)" || warn "Node.js not found (optional)"
+    command -v python3 &>/dev/null && ok "Python $(python3 --version 2>&1 | awk '{print $2}')" || { command -v python &>/dev/null && ok "Python $(python --version 2>&1 | awk '{print $2}')" || warn "Python not found"; }
     command -v ffmpeg &>/dev/null && ok "ffmpeg found" || warn "ffmpeg not found (optional)"
 
     CHROME_FOUND=false
@@ -950,6 +967,10 @@ fi
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
+    if [ "$PORT" = "8080" ]; then
+        PORT="$(detect_installed_port)"
+    fi
+
     uninstall_services
 
     rm -rf "$PREFIX"
@@ -958,6 +979,8 @@ if [ "$UNINSTALL" = true ]; then
     ok "binaries and config removed"
 
     # Stop and clean up Caddy
+    HAD_CADDY=false
+    [ -f "$DATA_DIR/Caddyfile" ] && HAD_CADDY=true
     if pgrep -x caddy > /dev/null 2>&1; then
         caddy stop 2>/dev/null || true
         ok "stopped Caddy"
@@ -969,17 +992,49 @@ if [ "$UNINSTALL" = true ]; then
 
     # Remove firewall rules
     if [ "$OS" = "Linux" ]; then
+        FW_RULES_REMOVED=false
+        FW_RULES_FAILED=false
         if command -v ufw &>/dev/null; then
-            sudo ufw delete allow "$PORT/tcp" 2>/dev/null || true
-            sudo ufw delete allow 80/tcp 2>/dev/null || true
-            sudo ufw delete allow 443/tcp 2>/dev/null || true
-            ok "removed ufw rules"
+            if sudo ufw delete allow "$PORT/tcp" 2>/dev/null; then
+                FW_RULES_REMOVED=true
+            else
+                FW_RULES_FAILED=true
+            fi
+            if [ "$HAD_CADDY" = true ]; then
+                if ! sudo ufw delete allow 80/tcp 2>/dev/null; then
+                    FW_RULES_FAILED=true
+                fi
+                if ! sudo ufw delete allow 443/tcp 2>/dev/null; then
+                    FW_RULES_FAILED=true
+                fi
+            fi
+            if [ "$FW_RULES_REMOVED" = true ] && [ "$FW_RULES_FAILED" = false ]; then
+                ok "ufw rules removed"
+            else
+                warn "failed to remove some firewall rules (check privileges and existing rules)"
+            fi
         elif command -v firewall-cmd &>/dev/null; then
-            sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" 2>/dev/null || true
-            sudo firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null || true
-            sudo firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null || true
-            sudo firewall-cmd --reload 2>/dev/null || true
-            ok "removed firewalld rules"
+            if sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" 2>/dev/null; then
+                FW_RULES_REMOVED=true
+            else
+                FW_RULES_FAILED=true
+            fi
+            if [ "$HAD_CADDY" = true ]; then
+                if ! sudo firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null; then
+                    FW_RULES_FAILED=true
+                fi
+                if ! sudo firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null; then
+                    FW_RULES_FAILED=true
+                fi
+            fi
+            if ! sudo firewall-cmd --reload 2>/dev/null; then
+                FW_RULES_FAILED=true
+            fi
+            if [ "$FW_RULES_REMOVED" = true ] && [ "$FW_RULES_FAILED" = false ]; then
+                ok "firewalld rules removed"
+            else
+                warn "failed to remove some firewall rules (check privileges and existing rules)"
+            fi
         fi
     fi
     echo ""
@@ -1147,6 +1202,20 @@ else
     echo "    Enables: WhatsApp bridge, custom skills with package.json, pptxgenjs"
     echo "    Install:"
     echo "      $(pkg_hint node)"
+fi
+
+# Python
+if command -v python3 &>/dev/null; then
+    ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
+elif command -v python &>/dev/null; then
+    ok "Python $(python --version 2>&1 | awk '{print $2}')"
+elif [ "$INSTALL_DEPS" = true ]; then
+    install_pkg python && ok "Python installed" || true
+else
+    warn "Python not found"
+    echo "    Enables: MCP servers, custom skills, data processing"
+    echo "    Install:"
+    echo "      $(pkg_hint python)"
 fi
 
 # Chromium / Chrome
