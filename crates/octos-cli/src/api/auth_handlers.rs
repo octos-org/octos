@@ -485,6 +485,7 @@ pub async fn delete_my_soul(
 /// GET /api/my/content
 pub async fn my_content(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     axum::extract::Query(query): axum::extract::Query<crate::content_catalog::ContentQuery>,
 ) -> Result<Json<crate::content_catalog::ContentQueryResult>, (StatusCode, String)> {
@@ -496,8 +497,14 @@ pub async fn my_content(
         StatusCode::SERVICE_UNAVAILABLE,
         "content catalog not configured".into(),
     ))?;
-    let profile =
-        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity
+    let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        ps.get(pid)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "profile store error".into()))?
+            .ok_or((StatusCode::NOT_FOUND, format!("profile '{pid}' not found")))?
+    } else {
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?
+    };
 
     let catalog = mgr
         .get_catalog_with_scan(&profile.id)

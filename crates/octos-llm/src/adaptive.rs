@@ -673,9 +673,15 @@ impl AdaptiveRouter {
                 slot.baseline_tool_avg_ms
                     .store(entry.tool_avg_ms, Ordering::Relaxed);
                 slot.baseline_p95_ms.store(entry.p95_ms, Ordering::Relaxed);
-                slot.context_window
-                    .store(entry.context_window, Ordering::Relaxed);
-                slot.max_output.store(entry.max_output, Ordering::Relaxed);
+                // Only update context_window and max_output if catalog has non-zero values.
+                // Runtime-saved catalogs may have zeros — preserve existing values.
+                if entry.context_window > 0 {
+                    slot.context_window
+                        .store(entry.context_window, Ordering::Relaxed);
+                }
+                if entry.max_output > 0 {
+                    slot.max_output.store(entry.max_output, Ordering::Relaxed);
+                }
                 info!(
                     provider = slot_key,
                     model_type = %entry.model_type,
@@ -754,8 +760,18 @@ impl AdaptiveRouter {
                         let seeded = s.seeded_ds_output.load(Ordering::Relaxed);
                         if runtime > 0 { runtime } else { seeded }
                     },
-                    context_window: s.context_window.load(Ordering::Relaxed),
-                    max_output: s.max_output.load(Ordering::Relaxed),
+                    context_window: {
+                        let v = s.context_window.load(Ordering::Relaxed);
+                        if v > 0 { v } else {
+                            crate::context::context_window_tokens(s.provider.model_id()) as u64
+                        }
+                    },
+                    max_output: {
+                        let v = s.max_output.load(Ordering::Relaxed);
+                        if v > 0 { v } else {
+                            crate::context::max_output_tokens(s.provider.model_id()) as u64
+                        }
+                    },
                 }
             })
             .collect();
