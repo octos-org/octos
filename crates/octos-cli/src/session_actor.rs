@@ -634,13 +634,19 @@ impl ActorFactory {
         // Keep run_pipeline active — it's a core research tool.
         tools.defer(["spawn".to_string(), "cron".to_string()]);
 
-        // For slides sessions, auto-activate media tools (mofa_slides, etc.)
-        // so the LLM can use them without calling activate_tools first.
-        if session_key.topic().is_some_and(|t| t.starts_with("slides")) {
+        // For slides sessions, auto-activate media tools and use primary model
+        // (bypasses adaptive router which may pick a weak model).
+        let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
+        if is_slides {
             tools.activate("group:media");
         }
 
-        // Build per-session Agent
+        // Build per-session Agent — slides sessions use the primary LLM directly
+        let session_llm = if is_slides {
+            self.llm_for_compaction.clone() // primary provider, no adaptive routing
+        } else {
+            self.llm.clone()
+        };
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
         let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
@@ -667,7 +673,7 @@ impl ActorFactory {
         // Per-session cancellation flag: shared with the agent so that
         // interrupt mode can stop a running agent loop mid-iteration.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut agent = Agent::new(agent_id, self.llm.clone(), tools, self.memory.clone())
+        let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
             .with_shutdown(cancelled.clone())
