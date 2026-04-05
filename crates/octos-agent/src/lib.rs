@@ -28,6 +28,7 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod steering;
+pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
 
@@ -48,6 +49,7 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use task_supervisor::{BackgroundTask, TaskStatus, TaskSupervisor};
 pub use tools::{
     ActivateToolsTool, BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
     GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool,

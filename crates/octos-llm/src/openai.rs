@@ -127,7 +127,30 @@ impl OpenAIProvider {
 
     /// Set a custom base URL (for Azure, local proxies, etc.).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        let url = base_url.into();
+        // If using a non-default base URL, tag the provider_label to distinguish
+        // it in the adaptive router (e.g., "moonshot@autodl" vs "moonshot").
+        if url != "https://api.openai.com/v1" {
+            if let Some(domain) = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+            {
+                // Use the domain name (minus TLD) as the tag.
+                // "www.autodl.art" → "autodl", "api.moonshot.ai" → "api"
+                let parts: Vec<&str> = domain.split('.').collect();
+                let short = if parts.len() >= 2 && parts[0] == "www" {
+                    parts[1] // skip "www", use "autodl"
+                } else {
+                    parts[0] // use "api" from "api.moonshot.ai"
+                };
+                if !self.provider_label.contains('@') {
+                    self.provider_label = format!("{}@{}", self.provider_label, short);
+                }
+            }
+        }
+        self.base_url = url;
         self
     }
 

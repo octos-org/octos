@@ -346,6 +346,9 @@ impl Tool for SpawnTool {
                     &self.plugin_extra_env,
                 );
             }
+            // In subagent context, spawn_only tools should be regular tools —
+            // the subagent IS the background, so no need to auto-background again.
+            tools.clear_spawn_only();
             let policy = ToolPolicy {
                 allow: allowed_tools,
                 deny: vec!["spawn".into()],
@@ -423,6 +426,9 @@ impl Tool for SpawnTool {
                         &plugin_extra_env,
                     );
                 }
+                // In subagent context, spawn_only tools should be regular tools —
+                // the subagent IS the background, so no need to auto-background again.
+                tools.clear_spawn_only();
                 let policy = ToolPolicy {
                     allow: allowed_tools,
                     deny: vec!["spawn".into()],

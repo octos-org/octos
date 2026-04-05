@@ -279,6 +279,14 @@ impl SessionManager {
         Self::session_path_static(&self.sessions_dir, key)
     }
 
+    /// Return the data directory (parent of sessions_dir).
+    pub fn data_dir(&self) -> PathBuf {
+        self.sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .to_path_buf()
+    }
+
     /// Static version of `session_path` — used by `SessionHandle` too.
     pub(crate) fn session_path_static(sessions_dir: &Path, key: &SessionKey) -> PathBuf {
         // Max encoded name length: 200 chars + ".jsonl" (6) = 206, well within 255.

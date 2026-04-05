@@ -393,8 +393,14 @@ struct AdaptiveSlot {
     model_type: AtomicU8,
     /// Input cost in USD per million tokens. Set from catalog seed.
     cost_in: AtomicU64,
+    /// Original seeded cost_in — never overwritten by runtime, preserved across exports.
+    seeded_cost_in: AtomicU64,
+    /// Original seeded cost_out — never overwritten by runtime.
+    seeded_cost_out: AtomicU64,
     /// Deep search output quality (token count). Set from catalog seed.
     ds_output: AtomicU64,
+    /// Original seeded ds_output — never overwritten by runtime.
+    seeded_ds_output: AtomicU64,
     /// Baseline stability from system catalog (used when no live data yet).
     baseline_stability: AtomicU64,
     /// Baseline tool_avg_ms from system catalog.
@@ -504,7 +510,10 @@ impl AdaptiveRouter {
                 cost_per_m: costs.get(i).copied().unwrap_or(0.0),
                 model_type: AtomicU8::new(ModelType::Fast.to_u8()), // default, overridden by catalog seed
                 cost_in: AtomicU64::new(0),
+                seeded_cost_in: AtomicU64::new(0),
+                seeded_cost_out: AtomicU64::new(0),
                 ds_output: AtomicU64::new(0),
+                seeded_ds_output: AtomicU64::new(0),
                 baseline_stability: AtomicU64::new(0),
                 baseline_tool_avg_ms: AtomicU64::new(0),
                 baseline_p95_ms: AtomicU64::new(0),
@@ -645,7 +654,19 @@ impl AdaptiveRouter {
                     .store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
                     .store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                if entry.cost_in > 0.0 {
+                    slot.seeded_cost_in
+                        .store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                }
+                if entry.cost_out > 0.0 {
+                    slot.seeded_cost_out
+                        .store(entry.cost_out.to_bits(), Ordering::Relaxed);
+                }
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
+                if entry.ds_output > 0 {
+                    slot.seeded_ds_output
+                        .store(entry.ds_output, Ordering::Relaxed);
+                }
                 // Store baseline values for fallback when no live data exists
                 slot.baseline_stability
                     .store(entry.stability.to_bits(), Ordering::Relaxed);
@@ -685,13 +706,15 @@ impl AdaptiveRouter {
                 let baseline_avg = s.baseline_tool_avg_ms.load(Ordering::Relaxed) as f64;
                 let baseline_p95 = s.baseline_p95_ms.load(Ordering::Relaxed) as f64;
 
-                // EMA blending weight: 0.0 at cold start, ramps to 1.0 after 10 calls
-                let weight = (total as f64 / 10.0).min(1.0);
+                // Micro-adjustment weight: ramps slowly, capped at 0.5 so the
+                // catalog baseline always retains at least 50% influence.
+                // This prevents runtime metrics from zeroing out seeded baselines.
+                let weight = (total as f64 / 20.0).min(0.5);
 
                 let live_stab = if total > 0 {
                     snap.success_count as f64 / total as f64
                 } else {
-                    baseline_stab
+                    baseline_stab // no observations → preserve baseline unchanged
                 };
                 let live_avg = if snap.latency_ema_ms > 0.0 {
                     snap.latency_ema_ms
@@ -704,7 +727,7 @@ impl AdaptiveRouter {
                     baseline_p95
                 };
 
-                // Blend: baseline * (1 - weight) + live * weight
+                // Blend: baseline anchors the score, runtime nudges it
                 let stability = baseline_stab * (1.0 - weight) + live_stab * weight;
                 let tool_avg_ms = (baseline_avg * (1.0 - weight) + live_avg * weight) as u64;
                 let p95_ms = (baseline_p95 * (1.0 - weight) + live_p95 * weight) as u64;
@@ -716,9 +739,21 @@ impl AdaptiveRouter {
                     tool_avg_ms,
                     p95_ms,
                     score: self.score(s),
-                    cost_in: f64::from_bits(s.cost_in.load(Ordering::Relaxed)),
-                    cost_out: s.cost_per_m,
-                    ds_output: s.ds_output.load(Ordering::Relaxed),
+                    cost_in: {
+                        let runtime = f64::from_bits(s.cost_in.load(Ordering::Relaxed));
+                        let seeded = f64::from_bits(s.seeded_cost_in.load(Ordering::Relaxed));
+                        if runtime > 0.0 { runtime } else { seeded }
+                    },
+                    cost_out: {
+                        let runtime = s.cost_per_m;
+                        let seeded = f64::from_bits(s.seeded_cost_out.load(Ordering::Relaxed));
+                        if runtime > 0.0 { runtime } else { seeded }
+                    },
+                    ds_output: {
+                        let runtime = s.ds_output.load(Ordering::Relaxed);
+                        let seeded = s.seeded_ds_output.load(Ordering::Relaxed);
+                        if runtime > 0 { runtime } else { seeded }
+                    },
                     context_window: s.context_window.load(Ordering::Relaxed),
                     max_output: s.max_output.load(Ordering::Relaxed),
                 }
@@ -802,18 +837,33 @@ impl AdaptiveRouter {
 
     /// Normalized cost for a slot (0..1). Providers with unknown cost (0.0) get 0.
     fn norm_cost(&self, slot: &AdaptiveSlot) -> f64 {
-        if self.config.weight_cost <= 0.0 || slot.cost_per_m <= 0.0 {
+        if self.config.weight_cost <= 0.0 {
             return 0.0;
+        }
+        // Use cost_per_m if set, otherwise fall back to catalog cost_in
+        let slot_cost = if slot.cost_per_m > 0.0 {
+            slot.cost_per_m
+        } else {
+            f64::from_bits(slot.cost_in.load(Ordering::Relaxed))
+        };
+        if slot_cost <= 0.0 {
+            return 0.5; // unknown cost — neutral score
         }
         let max_cost = self
             .slots
             .iter()
-            .map(|s| s.cost_per_m)
+            .map(|s| {
+                if s.cost_per_m > 0.0 {
+                    s.cost_per_m
+                } else {
+                    f64::from_bits(s.cost_in.load(Ordering::Relaxed))
+                }
+            })
             .fold(0.0_f64, f64::max);
         if max_cost > 0.0 {
-            slot.cost_per_m / max_cost
+            slot_cost / max_cost
         } else {
-            0.0
+            0.5
         }
     }
 
@@ -829,60 +879,53 @@ impl AdaptiveRouter {
         let total = slot.metrics.success_count.load(Ordering::Relaxed)
             + slot.metrics.failure_count.load(Ordering::Relaxed);
 
-        // EMA blend weight: 0.0 at cold start → 1.0 after 10 calls
-        let weight = (total as f64 / 10.0).min(1.0);
+        // EMA blend weight: ramps from 0 (cold start) to 0.5 (cap) over 20 calls.
+        // Baseline always retains ≥50% influence.
+        let weight = (total as f64 / 20.0).min(0.5);
 
-        // ── Stability (35%) ──
+        // ── Stability ──
+        // No data = neutral (0.5). Only observed data moves the score.
         let baseline_stab = f64::from_bits(slot.baseline_stability.load(Ordering::Relaxed));
-        let live_err_rate = slot.metrics.error_rate();
-        let baseline_err = 1.0 - baseline_stab;
+        let baseline_err = if baseline_stab > 0.0 {
+            1.0 - baseline_stab
+        } else {
+            0.5 // no data → neutral
+        };
+        let live_err_rate = if total > 0 { slot.metrics.error_rate() } else { 0.5 };
         let blended_err = baseline_err * (1.0 - weight) + live_err_rate * weight;
 
-        // ── Quality (30%) ──
+        // ── Quality ──
+        // No data = neutral (0.5). Cost is the differentiator, not unobserved quality.
         let ds = slot.ds_output.load(Ordering::Relaxed) as f64;
-        let quality = ds * baseline_stab;
-        let max_quality = self
-            .slots
-            .iter()
-            .map(|s| {
-                let d = s.ds_output.load(Ordering::Relaxed) as f64;
-                let st = f64::from_bits(s.baseline_stability.load(Ordering::Relaxed));
-                d * st
-            })
+        let max_ds = self.slots.iter()
+            .map(|s| s.ds_output.load(Ordering::Relaxed) as f64)
             .fold(0.0_f64, f64::max);
-        let norm_quality = if max_quality > 0.0 {
-            1.0 - (quality / max_quality)
+        let norm_quality = if max_ds > 0.0 && ds > 0.0 {
+            1.0 - (ds / max_ds)
         } else {
-            0.5
+            0.5 // no data → neutral
         };
 
-        // ── Throughput (20%) ──
-        // Tokens per second — higher is better. Invert for lower-is-better score.
+        // ── Throughput ──
         let throughput = slot.metrics.throughput();
-        let max_throughput = self
-            .slots
-            .iter()
+        let max_throughput = self.slots.iter()
             .map(|s| s.metrics.throughput())
             .fold(0.0_f64, f64::max);
         let norm_throughput = if max_throughput > 0.0 && throughput > 0.0 {
             1.0 - (throughput / max_throughput)
         } else {
-            0.5 // No data yet — neutral
+            0.5 // no data → neutral
         };
 
-        // ── Priority (config weight) ──
-        // Lower priority index = better (0 = primary). Normalize to [0, 1].
+        // ── Priority ──
         let max_priority = self.slots.len().max(1) as f64;
         let norm_priority = slot.priority as f64 / max_priority;
 
-        // ── Cost (config weight) ──
+        // ── Cost ──
         let norm_cost = self.norm_cost(slot);
 
-        // Configured weights (default: stability=0.3, quality=0.3, priority=0.2, cost=0.2).
-        // weight_error_rate → stability (blended baseline + live error rate)
-        // weight_latency    → quality (60% ds_output quality + 40% throughput)
-        let we = self.config.weight_error_rate; // stability
-        let wl = self.config.weight_latency; // quality + throughput
+        let we = self.config.weight_error_rate;
+        let wl = self.config.weight_latency;
         let wp = self.config.weight_priority;
         let wc = self.config.weight_cost;
         we * blended_err
