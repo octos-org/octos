@@ -408,11 +408,16 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    // Fall back to ?token= query param (for SSE / EventSource)
+    // Fall back to ?token= or ?_token= query param (for SSE / EventSource / img tags)
     let query_token = req
         .uri()
         .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .and_then(|q| {
+            q.split('&').find_map(|pair| {
+                pair.strip_prefix("token=")
+                    .or_else(|| pair.strip_prefix("_token="))
+            })
+        })
         .unwrap_or("");
 
     if !header_token.is_empty() {
