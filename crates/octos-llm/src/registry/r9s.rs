@@ -38,14 +38,19 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
             .map(|base| format!("{base}/anthropic"))
             .unwrap_or_else(|| format!("{url}/anthropic"));
         let mut provider = AnthropicProvider::new(&key, &model)
-            .with_base_url(&anthropic_url)
-            .with_provider_label("r9s");
+            .with_provider_label("r9s")
+            .with_base_url(&anthropic_url);
         if let Some((t, c)) = http_timeout {
             provider = provider.with_http_timeout(t, c);
         }
         Ok(Arc::new(provider))
     } else {
-        let mut provider = OpenAIProvider::new(&key, &model).with_base_url(&url);
+        let mut provider = OpenAIProvider::new(&key, &model)
+            .with_provider_label("r9s")
+            .with_base_url(&url);
+        if let Some(hints) = p.model_hints {
+            provider = provider.with_hints(hints);
+        }
         if let Some((t, c)) = http_timeout {
             provider = provider.with_http_timeout(t, c);
         }

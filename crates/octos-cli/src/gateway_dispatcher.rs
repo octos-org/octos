@@ -142,13 +142,23 @@ impl GatewayDispatcher {
                 .await
                 .touch_user_session(base_key_str, name);
 
+            // Check for project templates (e.g. "/new slides <project>")
+            let reply = if name == "slides" || name.starts_with("slides ") {
+                if let Some(data_dir) = &self.data_dir {
+                    match crate::project_templates::try_activate_slides_template(data_dir, name) {
+                        Some(template_reply) => template_reply,
+                        None => format!("Switched to session: {name}"),
+                    }
+                } else {
+                    format!("Switched to session: {name}")
+                }
+            } else {
+                format!("Switched to session: {name}")
+            };
+
             let _ = self
                 .out_tx
-                .send(make_reply(
-                    reply_channel,
-                    reply_chat_id,
-                    format!("Switched to session: {name}"),
-                ))
+                .send(make_reply(reply_channel, reply_chat_id, reply))
                 .await;
         }
         Some(DispatchResult::Handled)
@@ -1127,5 +1137,87 @@ mod tests {
         assert_eq!(msg1.content, "Switched back to session: (default)");
         let msg2 = rx.try_recv().unwrap();
         assert_eq!(msg2.content, "old pending msg");
+    }
+
+    // ── /new slides tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_scaffold_slides_project_on_new_slides() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides my-deck",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        // Should get the slides creation reply, not the generic switch message
+        assert!(msg.content.contains("my-deck"));
+        assert!(msg.content.contains("slides/my-deck/"));
+        assert!(msg.content.contains("What is this presentation about"));
+
+        // Project directory should be scaffolded
+        assert!(tmp.path().join("slides/my-deck/script.js").is_file());
+        assert!(tmp.path().join("slides/my-deck/memory.md").is_file());
+        assert!(tmp.path().join("slides/my-deck/history").is_dir());
+
+        // Session prompt should be written
+        let prompt = crate::project_templates::read_session_prompt(tmp.path(), "slides my-deck");
+        assert!(prompt.is_some());
+        assert!(prompt.unwrap().contains("slides designer"));
+    }
+
+    #[tokio::test]
+    async fn should_scaffold_untitled_slides_on_bare_new_slides() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.content.contains("untitled"));
+        assert!(tmp.path().join("slides/untitled/script.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn should_fall_back_to_generic_reply_without_data_dir() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        // No data_dir set
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides demo",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Switched to session: slides demo");
     }
 }

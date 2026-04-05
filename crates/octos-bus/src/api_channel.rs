@@ -137,8 +137,7 @@ impl Channel for ApiChannel {
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
         if !msg.media.is_empty() {
-            // File message — persist to session history.
-            // Client polls /api/sessions/{id}/messages when has_bg_tasks=true.
+            // File message — persist to session history AND send SSE event.
             let file_desc = msg
                 .media
                 .iter()
@@ -165,6 +164,27 @@ impl Channel for ApiChannel {
                 timestamp: chrono::Utc::now(),
             };
             self.persist_to_session(&msg.chat_id, session_msg).await;
+
+            // Send SSE file event so the web client receives it in real-time
+            let pending = self.pending.lock().await;
+            if let Some(tx) = pending.get(&msg.chat_id) {
+                for path in &msg.media {
+                    let filename = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let tool_call_id = msg.metadata.get("tool_call_id")
+                        .and_then(|v| v.as_str()).unwrap_or("");
+                    let event = serde_json::json!({
+                        "type": "file",
+                        "path": path,
+                        "filename": filename,
+                        "caption": msg.content,
+                        "tool_call_id": tool_call_id,
+                    });
+                    let _ = tx.send(event.to_string());
+                }
+            }
             return Ok(());
         }
 
@@ -558,26 +578,27 @@ async fn handle_session_messages(
         let data_dir = sess.data_dir();
         drop(sess);
 
-        // Per-user session path (SessionHandle layout): data/users/{base_key}/sessions/default.jsonl
-        // This is where the session actor writes user + assistant messages.
-        let per_user_path = {
+        // Per-user session dir: data/users/{base_key}/sessions/
+        // Contains default.jsonl + topic files like 123.jsonl
+        // Read ALL jsonl files to merge messages across topics.
+        let per_user_dir = {
             let base_key = alt_key.base_key();
             let encoded = crate::session::encode_path_component(base_key);
-            data_dir
-                .join("users")
-                .join(encoded)
-                .join("sessions")
-                .join("default.jsonl")
+            data_dir.join("users").join(encoded).join("sessions")
         };
 
-        // Read from BOTH paths and merge:
-        // - per-user path has user messages + assistant responses (written by SessionHandle)
-        // - flat path has file deliveries + bg notifications (written by ApiChannel::persist_to_session)
-        // Merge by reading both, deduplicating by content+timestamp.
+        // Read from ALL per-user JSONL files + flat path and merge.
         let mut all_lines = Vec::new();
-        // Primary: per-user path (has user messages)
-        if let Ok(content) = tokio::fs::read_to_string(&per_user_path).await {
-            all_lines.extend(content.lines().map(|l| l.to_string()));
+
+        // Primary: all per-user JSONL files (user messages + assistant responses)
+        if let Ok(entries) = std::fs::read_dir(&per_user_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|x| x == "jsonl") {
+                    if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                        all_lines.extend(content.lines().map(|l| l.to_string()));
+                    }
+                }
+            }
         }
         // Secondary: flat path (has file deliveries that may not be in per-user)
         let flat_read = if tokio::fs::metadata(&flat_path).await.is_ok() {

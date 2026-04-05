@@ -453,6 +453,7 @@ fn should_restrict_reads_when_configured() {
         allow_network: false,
         docker: octos_agent::sandbox::DockerConfig::default(),
         read_allow_paths: vec!["/usr".into(), "/opt/custom".into()],
+        profile_name: None,
     };
     let sandbox = octos_agent::create_sandbox(&config);
     let dir = tempfile::tempdir().unwrap();
@@ -677,6 +678,7 @@ fn should_block_dangerous_docker_cwd() {
         allow_network: false,
         docker: DockerConfig::default(),
         read_allow_paths: Vec::new(),
+        profile_name: None,
     });
 
     let cmd = sb.wrap_command("ls", std::path::Path::new("/etc"));
