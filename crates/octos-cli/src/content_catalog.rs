@@ -24,11 +24,12 @@ const SKIP_DIRS: &[&str] = &[
     "memory",
     "skills",
     "history",
-    "research",
-    "users",
+    "users",       // per-user dirs scanned separately via workspace/ path
     "logs",
     ".thumbnails",
     "whatsapp-auth",
+    "bundled-app-skills",
+    "voice_profiles",
 ];
 
 // ── Data model ─────────────────────────────────────────────────────────
@@ -242,6 +243,21 @@ impl ContentCatalog {
         Self::walk_dir(data_dir, &known_paths, &mut |path| {
             new_paths.push(path.to_path_buf());
         })?;
+
+        // Also scan per-user workspace directories for agent-generated content
+        let users_dir = data_dir.join("users");
+        if users_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&users_dir) {
+                for entry in entries.flatten() {
+                    let ws = entry.path().join("workspace");
+                    if ws.exists() {
+                        Self::walk_dir(&ws, &known_paths, &mut |path| {
+                            new_paths.push(path.to_path_buf());
+                        })?;
+                    }
+                }
+            }
+        }
 
         let mut indexed = 0;
         for path in &new_paths {
