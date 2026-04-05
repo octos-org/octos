@@ -634,6 +634,12 @@ impl ActorFactory {
         // Keep run_pipeline active — it's a core research tool.
         tools.defer(["spawn".to_string(), "cron".to_string()]);
 
+        // For slides sessions, auto-activate media tools (mofa_slides, etc.)
+        // so the LLM can use them without calling activate_tools first.
+        if session_key.topic().is_some_and(|t| t.starts_with("slides")) {
+            tools.activate("group:media");
+        }
+
         // Build per-session Agent
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
