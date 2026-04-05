@@ -808,16 +808,9 @@ if ($Uninstall) {
     Ok "stopped octos processes"
     Get-Process -Name "caddy" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-    # Remove firewall rules
+    # Remove firewall rules (octos-serve may exist from older installs)
     netsh advfirewall firewall delete rule name="octos-serve" >$null 2>&1
-    $fwServeExit = $LASTEXITCODE
     netsh advfirewall firewall delete rule name="octos-caddy" >$null 2>&1
-    $fwCaddyExit = $LASTEXITCODE
-    if ($fwServeExit -eq 0 -or $fwCaddyExit -eq 0) {
-        Ok "removed firewall rules"
-    } else {
-        Warn "failed to remove some firewall rules (may require Administrator privileges)"
-    }
 
     # Remove Caddyfile
     $caddyfileUn = Join-Path $DataDir "Caddyfile"
@@ -1287,23 +1280,17 @@ if ($retries -eq 0) {
     Write-Host "    Check logs: Get-Content '$serveLog' -Tail 20"
 }
 
-# ── Firewall ─────────────────────────────────────────────────────────
-Section "Configuring firewall"
-netsh advfirewall firewall delete rule name="octos-serve" >$null 2>&1
-netsh advfirewall firewall add rule name="octos-serve" dir=in action=allow protocol=TCP localport=$Port >$null 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Ok "Firewall: port $Port open"
-} else {
-    Warn "Failed to configure firewall (requires elevated privileges)"
-    Hint "Run as Administrator, or manually: netsh advfirewall firewall add rule name=`"octos-serve`" dir=in action=allow protocol=TCP localport=$Port"
-}
+# ── Firewall (Caddy only) ─────────────────────────────────────────────
 if ($Domain) {
+    Section "Configuring firewall for Caddy"
+    Write-Host "    Running: netsh advfirewall firewall add rule name=`"octos-caddy`" dir=in action=allow protocol=TCP localport=80,443"
     netsh advfirewall firewall delete rule name="octos-caddy" >$null 2>&1
     netsh advfirewall firewall add rule name="octos-caddy" dir=in action=allow protocol=TCP localport=80,443 >$null 2>&1
     if ($LASTEXITCODE -eq 0) {
         Ok "Firewall: ports 80,443 open for Caddy"
     } else {
         Warn "Failed to open Caddy ports (requires elevated privileges)"
+        Hint "Run as Administrator, or manually: netsh advfirewall firewall add rule name=`"octos-caddy`" dir=in action=allow protocol=TCP localport=80,443"
     }
 }
 

@@ -990,51 +990,27 @@ if [ "$UNINSTALL" = true ]; then
         ok "removed Caddyfile"
     fi
 
-    # Remove firewall rules
+    # Remove firewall rules (serve-port rule may exist from older installs)
     if [ "$OS" = "Linux" ]; then
-        FW_RULES_REMOVED=false
-        FW_RULES_FAILED=false
+        _fw_ok=true
         if command -v ufw &>/dev/null; then
-            if sudo ufw delete allow "$PORT/tcp" 2>/dev/null; then
-                FW_RULES_REMOVED=true
-            else
-                FW_RULES_FAILED=true
-            fi
+            sudo ufw delete allow "$PORT/tcp" 2>/dev/null || true
             if [ "$HAD_CADDY" = true ]; then
-                if ! sudo ufw delete allow 80/tcp 2>/dev/null; then
-                    FW_RULES_FAILED=true
-                fi
-                if ! sudo ufw delete allow 443/tcp 2>/dev/null; then
-                    FW_RULES_FAILED=true
-                fi
-            fi
-            if [ "$FW_RULES_REMOVED" = true ] && [ "$FW_RULES_FAILED" = false ]; then
-                ok "ufw rules removed"
-            else
-                warn "failed to remove some firewall rules (check privileges and existing rules)"
+                sudo ufw delete allow 80/tcp 2>/dev/null || _fw_ok=false
+                sudo ufw delete allow 443/tcp 2>/dev/null || _fw_ok=false
             fi
         elif command -v firewall-cmd &>/dev/null; then
-            if sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" 2>/dev/null; then
-                FW_RULES_REMOVED=true
-            else
-                FW_RULES_FAILED=true
-            fi
+            sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" 2>/dev/null || true
             if [ "$HAD_CADDY" = true ]; then
-                if ! sudo firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null; then
-                    FW_RULES_FAILED=true
-                fi
-                if ! sudo firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null; then
-                    FW_RULES_FAILED=true
-                fi
+                sudo firewall-cmd --permanent --remove-port=80/tcp 2>/dev/null || _fw_ok=false
+                sudo firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null || _fw_ok=false
             fi
-            if ! sudo firewall-cmd --reload 2>/dev/null; then
-                FW_RULES_FAILED=true
-            fi
-            if [ "$FW_RULES_REMOVED" = true ] && [ "$FW_RULES_FAILED" = false ]; then
-                ok "firewalld rules removed"
-            else
-                warn "failed to remove some firewall rules (check privileges and existing rules)"
-            fi
+            sudo firewall-cmd --reload 2>/dev/null || _fw_ok=false
+        fi
+        if [ "$_fw_ok" = true ]; then
+            ok "removed firewall rules"
+        else
+            warn "failed to remove some firewall rules (check privileges)"
         fi
     fi
     echo ""
@@ -1427,28 +1403,30 @@ if [ $RETRIES -eq 0 ]; then
     echo "    Check logs: tail -f $DATA_DIR/serve.log"
 fi
 
-# ── Firewall ─────────────────────────────────────────────────────────
-if [ "$OS" = "Linux" ]; then
-    section "Configuring firewall"
+# ── Firewall (Caddy only) ─────────────────────────────────────────────
+if [ -n "$CADDY_DOMAIN" ] && [ "$OS" = "Linux" ]; then
+    section "Configuring firewall for Caddy"
     if command -v ufw &>/dev/null; then
-        sudo ufw allow "$PORT/tcp" >/dev/null 2>&1 && ok "ufw: port $PORT open" || warn "failed to configure ufw"
-        if [ -n "$CADDY_DOMAIN" ]; then
-            sudo ufw allow 80/tcp >/dev/null 2>&1
-            sudo ufw allow 443/tcp >/dev/null 2>&1
+        _caddy_ok=true
+        echo "    Running: sudo ufw allow 80/tcp"
+        sudo ufw allow 80/tcp >/dev/null 2>&1 || _caddy_ok=false
+        echo "    Running: sudo ufw allow 443/tcp"
+        sudo ufw allow 443/tcp >/dev/null 2>&1 || _caddy_ok=false
+        if [ "$_caddy_ok" = true ]; then
             ok "ufw: ports 80,443 open for Caddy"
+        else
+            warn "failed to open Caddy ports (requires elevated privileges)"
         fi
     elif command -v firewall-cmd &>/dev/null; then
-        sudo firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 \
-            && sudo firewall-cmd --reload >/dev/null 2>&1 \
-            && ok "firewalld: port $PORT open" \
-            || warn "failed to configure firewalld"
-        if [ -n "$CADDY_DOMAIN" ]; then
-            sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp >/dev/null 2>&1
-            sudo firewall-cmd --reload >/dev/null 2>&1
+        echo "    Running: sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp"
+        if sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp >/dev/null 2>&1 \
+            && sudo firewall-cmd --reload >/dev/null 2>&1; then
             ok "firewalld: ports 80,443 open for Caddy"
+        else
+            warn "failed to open Caddy ports (requires elevated privileges)"
         fi
     else
-        warn "no firewall manager found (ufw/firewalld) — ensure port $PORT is accessible"
+        warn "no firewall manager found (ufw/firewalld) — ensure ports 80 and 443 are accessible"
     fi
 fi
 
