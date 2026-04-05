@@ -30,8 +30,8 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         .base_url
         .unwrap_or_else(|| "https://dashscope.aliyuncs.com/compatible-mode/v1".into());
     let mut provider = OpenAIProvider::new(&key, &model)
-        .with_base_url(&url)
-        .with_provider_label("dashscope");
+        .with_provider_label("dashscope")
+        .with_base_url(&url);
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }

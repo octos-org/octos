@@ -297,7 +297,11 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
         }
         let note = format!(
             "[attached files: {}. Use read_file to access them.]",
-            non_image.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
+            non_image
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let text = if msg.content.is_empty() {
             note

@@ -3747,7 +3747,6 @@ name = "octos-sandbox"
 version = "0.1.0"
 dependencies = [
  "clap",
- "color-eyre",
  "eyre",
  "rappct",
  "windows 0.62.2",

@@ -659,10 +659,7 @@ fn fetch_registry() -> Result<Vec<RegistryEntry>> {
 }
 
 fn cmd_install_all(skills_dir: &Path, force: bool, branch: &str) -> Result<()> {
-    println!(
-        "{} Fetching skill registry...",
-        "INFO".cyan()
-    );
+    println!("{} Fetching skill registry...", "INFO".cyan());
     let entries = fetch_registry()?;
 
     if entries.is_empty() {

@@ -122,10 +122,11 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
     // 4. Build capabilities
     let mut caps_builder = SecurityCapabilitiesBuilder::new(&profile.sid);
     if args.allow_network {
-        caps_builder =
-            caps_builder.with_known(&[rappct::KnownCapability::InternetClient]);
+        caps_builder = caps_builder.with_known(&[rappct::KnownCapability::InternetClient]);
     }
-    let caps = caps_builder.build().wrap_err("failed to build security capabilities")?;
+    let caps = caps_builder
+        .build()
+        .wrap_err("failed to build security capabilities")?;
 
     // 5. Build command line
     let cmdline = args.command.join(" ");
@@ -153,7 +154,9 @@ fn run_sandboxed(args: &Args) -> eyre::Result<u8> {
         launch_in_container_with_io(&caps, &opts).wrap_err("failed to launch sandboxed process")?;
 
     // 7. Wait for completion (no timeout — let the caller handle that)
-    let exit_code = child.wait(None).wrap_err("failed to wait for sandboxed process")?;
+    let exit_code = child
+        .wait(None)
+        .wrap_err("failed to wait for sandboxed process")?;
 
     Ok(exit_code as u8)
 }
