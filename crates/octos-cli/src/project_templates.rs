@@ -50,19 +50,23 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
     // Initialize changelog.md
     std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n").ok();
 
-    // Template script.js
+    // Empty script.js — LLM MUST write real content before mofa_slides can run.
+    // mofa_slides will fail with "missing 'slides' array" on an empty file,
+    // forcing the LLM to go through the design phase first.
     let template = format!(
         r#"// {} -- Slides Generation Script
-// Style: nb-pro (default)
-// Edit this file to define your slides, then run via mofa_slides.
+// EMPTY: The agent must write slide content here before generating.
+// Use mofa_slides with input pointing to this file after writing content.
+//
+// Example format:
+// module.exports = [
+//   {{ prompt: "Cover slide description", style: "cover" }},
+//   {{ prompt: "Content slide description", style: "normal" }},
+// ];
 
-module.exports = [
-  {{ prompt: "Cover slide: {}", style: "cover" }},
-  {{ prompt: "Introduction and overview", style: "normal" }},
-  // Add more slides here...
-];
+module.exports = [];
 "#,
-        project_name, project_name
+        project_name
     );
     std::fs::write(project_dir.join("script.js"), &template).ok();
 
@@ -109,12 +113,16 @@ SLIDES WORKFLOW:
 - Phase 2: GENERATE — only when user explicitly says "generate", "生成", "make it", "go ahead",
   or similar confirmation, THEN call mofa_slides tool.
 
-CRITICAL TOOL RULES:
-- ALWAYS use the mofa_slides TOOL to generate slides. NEVER use shell to run mofa manually.
-- NEVER run "mofa slides" or "./mofa" via shell command. Use the mofa_slides tool directly.
-- Call: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
-- Never inline slides JSON in the tool call — always point to the script.js file
-- If mofa_slides fails, report the error to the user. Do NOT retry via shell.
+CRITICAL RULES (MUST FOLLOW):
+1. DESIGN FIRST: You MUST ask the user what they want BEFORE writing any slides.
+   Do NOT generate slides immediately. Ask about topic, style, and slide count.
+2. WRITE BEFORE GENERATE: After the user describes what they want, write_file("slides/{slug}/script.js")
+   with the full slide content. Show the user a summary. Wait for "generate" confirmation.
+3. TOOL ONLY: ALWAYS use the mofa_slides TOOL. NEVER use shell to run mofa.
+   NEVER run "mofa slides" or "./mofa" via shell. NEVER.
+4. INPUT FILE: Call mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+5. NO INLINE JSON: Never pass slides array directly in the tool call. Always use the input parameter.
+6. ON FAILURE: Report the error. Do NOT retry via shell.
 
 INCREMENTAL UPDATES (MANDATORY — follow EXACTLY):
 - script.js is the SINGLE SOURCE OF TRUTH
