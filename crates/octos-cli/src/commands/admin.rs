@@ -111,6 +111,7 @@ impl Executable for AdminCommand {
                     ssh_port,
                     local_port,
                     auth_token: auth_token.clone(),
+                    owner: String::new(),
                     status: TenantStatus::Pending,
                     created_at: now,
                     updated_at: now,

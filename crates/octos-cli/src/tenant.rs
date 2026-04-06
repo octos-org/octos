@@ -37,6 +37,9 @@ pub struct TenantConfig {
     /// Dashboard auth token for this tenant's octos serve instance.
     #[serde(default)]
     pub auth_token: String,
+    /// User ID of the owner who registered this tenant (empty for admin-created).
+    #[serde(default, alias = "email")]
+    pub owner: String,
     /// Current tunnel status.
     #[serde(default)]
     pub status: TenantStatus,
@@ -188,6 +191,19 @@ impl TenantStore {
         bail!("SSH port pool exhausted ({SSH_PORT_START}–{SSH_PORT_END})")
     }
 
+    /// Find tenant(s) belonging to a user.
+    ///
+    /// Checks the `owner` field against all provided identifiers (user ID,
+    /// email, etc.) to handle legacy tenants that stored the full email
+    /// address instead of the user ID slug.
+    pub fn find_by_owner(&self, identifiers: &[&str]) -> Result<Vec<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all
+            .into_iter()
+            .filter(|t| !t.owner.is_empty() && identifiers.iter().any(|id| t.owner == *id))
+            .collect())
+    }
+
     fn tenant_path(&self, id: &str) -> PathBuf {
         self.tenants_dir.join(format!("{id}.json"))
     }
@@ -305,6 +321,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -341,6 +358,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -368,6 +386,7 @@ mod tests {
                 ssh_port: 6001 + id.len() as u16,
                 local_port: 8080,
                 auth_token: format!("auth-{id}"),
+                owner: String::new(),
                 status: TenantStatus::Pending,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -399,6 +418,7 @@ mod tests {
             ssh_port: SSH_PORT_START,
             local_port: 8080,
             auth_token: "test-auth".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -422,6 +442,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),

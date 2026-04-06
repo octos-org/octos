@@ -11,7 +11,6 @@
 #   TUNNEL_DOMAIN         (optional) Base domain (default: octos-cloud.org)
 #   FRPS_VHOST_HTTP_PORT  (optional) frps HTTP vhost port (default: 8080)
 #   CF_API_TOKEN          (required for --dns-provider cloudflare)
-#   STATIC_ROOT           (optional) Path to landing page files (default: /var/www/octos-cloud)
 #
 # DNS Providers:
 #   cloudflare   — requires CF_API_TOKEN (Zone:DNS:Edit)
@@ -24,7 +23,6 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-octos-cloud.org}"
 FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8080}"
-STATIC_ROOT="${STATIC_ROOT:-/var/www/octos-cloud}"
 ENABLE_HTTPS=false
 DNS_PROVIDER=""
 
@@ -177,9 +175,6 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/caddy 2>/dev/null || true
 
 echo "    Caddy: $(caddy version)"
 
-# ── Create static root for landing page ───────────────────────────────
-sudo mkdir -p "$STATIC_ROOT"
-
 # ── Write Caddyfile ───────────────────────────────────────────────────
 sudo mkdir -p /etc/caddy
 
@@ -190,15 +185,9 @@ if [ "$ENABLE_HTTPS" = true ]; then
 # Caddyfile — managed by setup-caddy.sh
 # HTTPS with wildcard cert via __DNS_PROVIDER__ DNS challenge.
 
-# Main site: landing page + API fallback
+# Main site: all requests proxied to octos serve (landing page embedded)
 www.__DOMAIN__, __DOMAIN__ {
-    handle / {
-        root * __STATIC_ROOT__
-        file_server
-    }
-    handle {
-        reverse_proxy localhost:__VHOST_PORT__
-    }
+    reverse_proxy localhost:__VHOST_PORT__
 }
 
 # Tenant subdomains: HTTPS with wildcard cert
@@ -232,13 +221,7 @@ else
 #   ./setup-caddy.sh --https --dns-provider cloudflare
 
 www.__DOMAIN__, __DOMAIN__ {
-    handle / {
-        root * __STATIC_ROOT__
-        file_server
-    }
-    handle {
-        reverse_proxy localhost:__VHOST_PORT__
-    }
+    reverse_proxy localhost:__VHOST_PORT__
 }
 
 :80 {
@@ -263,7 +246,6 @@ sudo sed -i \
     -e "s|__DOMAIN__|${TUNNEL_DOMAIN}|g" \
     -e "s|__ESCAPED_DOMAIN__|${ESCAPED_DOMAIN}|g" \
     -e "s|__VHOST_PORT__|${FRPS_VHOST_HTTP_PORT}|g" \
-    -e "s|__STATIC_ROOT__|${STATIC_ROOT}|g" \
     -e "s|__DNS_PROVIDER__|${DNS_PROVIDER}|g" \
     -e "s|__DNS_CONFIG_BLOCK__|${DNS_CONFIG_BLOCK}|g" \
     /etc/caddy/Caddyfile

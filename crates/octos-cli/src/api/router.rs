@@ -150,6 +150,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/my/profile/accounts/{id}/stop",
             post(auth_handlers::stop_my_sub_gateway),
+        )
+        // Self-service tenant registration (user-auth level)
+        .route("/api/register", post(admin::register_tenant))
+        .route(
+            "/api/register/setup-script",
+            get(admin::register_setup_script),
         );
 
     // Admin API routes (admin auth only, 1MB body limit)

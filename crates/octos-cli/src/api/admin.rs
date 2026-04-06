@@ -2922,12 +2922,13 @@ pub async fn create_tenant(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<crate::tenant::TenantConfig>, (StatusCode, String)> {
-    // Validate tenant name - only allow safe characters for shell interpolation
+    // Validate tenant name (must match TenantStore rules: lowercase alnum + hyphens,
+    // no leading/trailing hyphens, max 64 chars)
     use std::sync::LazyLock;
     static TENANT_NAME_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap());
     if !TENANT_NAME_RE.is_match(&req.name) {
-        return Err((StatusCode::BAD_REQUEST, "Tenant name must be 1-63 alphanumeric characters, hyphens, or underscores, starting with alphanumeric".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Tenant name must be 1-64 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen".to_string()));
     }
 
     let store = state.tenant_store.as_ref().ok_or((
@@ -2964,6 +2965,7 @@ pub async fn create_tenant(
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         ),
+        owner: String::new(),
         status: crate::tenant::TenantStatus::Pending,
         created_at: now,
         updated_at: now,
@@ -3064,6 +3066,229 @@ curl -fsSL "{install_url}" | bash -s -- \
         server = server,
         ssh_port = tenant.ssh_port,
         id = tenant.id,
+        install_url = install_url,
+        auth_token = tenant.auth_token,
+    );
+
+    Ok(script)
+}
+
+// ── Self-service tenant registration (user-auth level) ──────────────
+
+/// POST /api/register — create a tenant for the authenticated user.
+///
+/// Limited to one tenant per email. Accepts the same `CreateTenantRequest`
+/// body as the admin endpoint but associates the tenant with the caller's
+/// email and enforces a one-tenant-per-user limit.
+pub async fn register_tenant(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<super::router::AuthIdentity>,
+    Json(req): Json<CreateTenantRequest>,
+) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
+    let user_id = match &identity {
+        super::router::AuthIdentity::Admin => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "admin token cannot self-register; use /api/admin/tenants instead".into(),
+            ));
+        }
+        super::router::AuthIdentity::User { id, .. } => id.clone(),
+    };
+
+    // Validate tenant name (must match TenantStore rules: lowercase alnum + hyphens,
+    // no leading/trailing hyphens, max 64 chars)
+    use std::sync::LazyLock;
+    static TENANT_NAME_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap());
+    if !TENANT_NAME_RE.is_match(&req.name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Tenant name must be 1-64 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen".into(),
+        ));
+    }
+
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    // Resolve user's email for legacy tenant matching
+    let user_email = state.user_store.as_ref()
+        .and_then(|us| us.get(&user_id).ok().flatten())
+        .map(|u| u.email)
+        .unwrap_or_default();
+    let owner_ids: Vec<&str> = [user_id.as_str(), user_email.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // One tenant per user
+    let existing = store
+        .find_by_owner(&owner_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !existing.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "you already have a tenant: '{}'. Only one tenant per account.",
+                existing[0].id
+            ),
+        ));
+    }
+
+    // Check for duplicate tenant name
+    if store
+        .get(&req.name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("tenant name '{}' is already taken", req.name),
+        ));
+    }
+
+    let ssh_port = store
+        .next_ssh_port()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    let tenant = crate::tenant::TenantConfig {
+        id: req.name.clone(),
+        name: req.name.clone(),
+        subdomain: req.name.clone(),
+        tunnel_token: uuid::Uuid::new_v4().to_string(),
+        ssh_port,
+        local_port: req.local_port,
+        auth_token: format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        owner: user_id.clone(),
+        status: crate::tenant::TenantStatus::Pending,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .save(&tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
+    let dashboard_url = format!("https://{}.{}", tenant.subdomain, domain);
+
+    Ok(Json(RegisterResponse {
+        id: tenant.id.clone(),
+        subdomain: tenant.subdomain.clone(),
+        ssh_port: tenant.ssh_port,
+        auth_token: tenant.auth_token.clone(),
+        dashboard_url,
+        status: tenant.status.clone(),
+    }))
+}
+
+/// Response from POST /api/register — only fields the client needs.
+/// Excludes tunnel_token and owner (internal/secret).
+#[derive(Serialize)]
+pub struct RegisterResponse {
+    pub id: String,
+    pub subdomain: String,
+    pub ssh_port: u16,
+    pub auth_token: String,
+    pub dashboard_url: String,
+    pub status: crate::tenant::TenantStatus,
+}
+
+/// GET /api/register/setup-script — returns the setup script for the
+/// authenticated user's tenant.
+pub async fn register_setup_script(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<super::router::AuthIdentity>,
+) -> Result<String, (StatusCode, String)> {
+    let user_id = match &identity {
+        super::router::AuthIdentity::Admin => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "admin token cannot self-register; use /api/admin/tenants/{id}/setup-script instead"
+                    .into(),
+            ));
+        }
+        super::router::AuthIdentity::User { id, .. } => id.clone(),
+    };
+
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    // Resolve user's email for legacy tenant matching
+    let user_email = state.user_store.as_ref()
+        .and_then(|us| us.get(&user_id).ok().flatten())
+        .map(|u| u.email)
+        .unwrap_or_default();
+    let owner_ids: Vec<&str> = [user_id.as_str(), user_email.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let tenants = store
+        .find_by_owner(&owner_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let tenant = tenants.into_iter().next().ok_or((
+        StatusCode::NOT_FOUND,
+        "no tenant found for your account — register one first via POST /api/register".into(),
+    ))?;
+
+    let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
+    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+
+    let install_url =
+        "https://github.com/octos-org/octos/releases/latest/download/install.sh";
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh with your tenant configuration pre-filled.
+#
+# Usage:
+#   curl -fsSL https://{domain}/api/register/setup-script -H "Authorization: Bearer <token>" | FRPS_TOKEN=<token> bash
+set -euo pipefail
+
+# frps auth token — must be provided as env var, flag, or positional argument
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
+        *)            FRPS_TOKEN="${{FRPS_TOKEN:-$1}}"; shift ;;
+    esac
+done
+FRPS_TOKEN="${{FRPS_TOKEN:-}}"
+if [ -z "$FRPS_TOKEN" ]; then
+    echo ""
+    echo "ERROR: frps auth token required."
+    echo ""
+    echo "Usage:"
+    echo "  curl ... | FRPS_TOKEN=<token> bash"
+    echo "  curl ... | bash -s -- --frps-token <token>"
+    echo "  curl ... | bash -s -- <token>"
+    echo ""
+    echo "Your admin should provide this token during onboarding."
+    exit 1
+fi
+
+curl -fsSL "{install_url}" | bash -s -- \
+    --tenant-name "{subdomain}" \
+    --frps-token "$FRPS_TOKEN" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}" \
+    --auth-token "{auth_token}"
+"#,
+        subdomain = tenant.subdomain,
+        domain = domain,
+        server = server,
+        ssh_port = tenant.ssh_port,
         install_url = install_url,
         auth_token = tenant.auth_token,
     );

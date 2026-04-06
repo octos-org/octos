@@ -8,6 +8,19 @@ use serde::{Deserialize, Serialize};
 /// Current config version.
 const CURRENT_CONFIG_VERSION: u32 = 1;
 
+/// Deployment mode determines how octos serve behaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentMode {
+    /// Standalone install — no tunnel, dashboard at /admin/.
+    #[default]
+    Local,
+    /// Connected to a cloud server via frpc tunnel.
+    Tenant,
+    /// VPS relay server with tenant management and landing page.
+    Cloud,
+}
+
 /// LLM provider configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -108,6 +121,24 @@ pub struct Config {
     /// voice messages and auto-TTS replies for voice conversations.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+
+    /// Deployment mode: "local" (default), "tenant", or "cloud".
+    ///
+    /// - `local`:  Standalone install, no tunnel, dashboard at /admin/
+    /// - `tenant`: Connected to a cloud server via frpc tunnel
+    /// - `cloud`:  VPS relay server with tenant management and landing page at /
+    #[serde(default)]
+    pub mode: DeploymentMode,
+
+    /// Tunnel domain for cloud mode (e.g. "octos-cloud.org").
+    /// Also read from TUNNEL_DOMAIN env var. Cloud mode requires this.
+    #[serde(default)]
+    pub tunnel_domain: Option<String>,
+
+    /// frps server address for cloud/tenant mode (e.g. "163.192.33.32").
+    /// Also read from FRPS_SERVER env var.
+    #[serde(default)]
+    pub frps_server: Option<String>,
 
     /// Enable the admin shell endpoint (POST /api/admin/shell).
     /// Default: false. Only enable for development/debugging.
@@ -660,17 +691,32 @@ impl Config {
         // Try project-local config first
         let local_config = cwd.join(".octos").join("config.json");
         if local_config.exists() {
+            tracing::info!(path = %local_config.display(), "loading config (project-local)");
             return Self::from_file(&local_config);
         }
 
-        // Try global config
+        // Try data dir config ($OCTOS_HOME or ~/.octos)
         if let Some(global_config) = Self::global_config_path() {
             if global_config.exists() {
+                tracing::info!(path = %global_config.display(), "loading config (data dir)");
                 return Self::from_file(&global_config);
             }
         }
 
+        // Try legacy platform config dir (~/Library/Application Support/octos/ or ~/.config/octos/)
+        if let Some(legacy_config) = dirs::config_dir().map(|d| d.join("octos").join("config.json"))
+        {
+            if legacy_config.exists() {
+                tracing::warn!(
+                    path = %legacy_config.display(),
+                    "loading config from legacy location — consider moving to ~/.octos/config.json"
+                );
+                return Self::from_file(&legacy_config);
+            }
+        }
+
         // No config found, use defaults
+        tracing::info!("no config.json found, using defaults");
         Ok(Self::default())
     }
 
@@ -704,9 +750,13 @@ impl Config {
         Ok(config)
     }
 
-    /// Get global config path (~/.config/octos/config.json).
+    /// Get global config path ($OCTOS_HOME/config.json or ~/.octos/config.json).
     pub fn global_config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("octos").join("config.json"))
+        if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
+            Some(PathBuf::from(env_dir).join("config.json"))
+        } else {
+            dirs::home_dir().map(|d| d.join(".octos").join("config.json"))
+        }
     }
 
     /// Expand environment variables in config values.

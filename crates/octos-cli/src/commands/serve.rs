@@ -77,22 +77,54 @@ impl ServeCommand {
         };
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
+            tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
-            // Resolve config path the same way Config::load does
+            // Resolution order:
+            // 1. <cwd>/.octos/config.json (project-local)
+            // 2. $OCTOS_HOME/config.json or ~/.octos/config.json (data dir)
+            // 3. Legacy platform config dir (~/Library/Application Support/octos/ etc.)
             let local_config = cwd.join(".octos").join("config.json");
+            let legacy_config = dirs::config_dir()
+                .map(|d| d.join("octos").join("config.json"));
             if local_config.exists() {
+                tracing::info!(path = %local_config.display(), "loading config (project-local)");
                 (Config::from_file(&local_config)?, Some(local_config))
             } else if let Some(global_config) = Config::global_config_path() {
                 if global_config.exists() {
+                    tracing::info!(path = %global_config.display(), "loading config (data dir)");
                     (Config::from_file(&global_config)?, Some(global_config))
+                } else if let Some(ref lc) = legacy_config {
+                    if lc.exists() {
+                        tracing::warn!(path = %lc.display(), "loading config from legacy location — consider moving to ~/.octos/config.json");
+                        (Config::from_file(lc)?, Some(lc.clone()))
+                    } else {
+                        tracing::info!("no config.json found, using defaults");
+                        (Config::default(), None)
+                    }
                 } else {
+                    tracing::info!("no config.json found, using defaults");
                     (Config::default(), None)
                 }
             } else {
+                tracing::info!("no config.json found, using defaults");
                 (Config::default(), None)
             }
         };
+
+        // Infer deployment mode from tunnel infrastructure if not explicitly set.
+        // tunnel_domain or frps_server are unambiguously cloud-only signals.
+        let mut config = config;
+        if matches!(config.mode, crate::config::DeploymentMode::Local) {
+            let has_tunnel = config.tunnel_domain.is_some()
+                || std::env::var("TUNNEL_DOMAIN").is_ok();
+            let has_frps = config.frps_server.is_some()
+                || std::env::var("FRPS_SERVER").is_ok();
+            if has_tunnel || has_frps {
+                tracing::info!("tunnel infrastructure detected, auto-setting mode to cloud");
+                config.mode = crate::config::DeploymentMode::Cloud;
+            }
+        }
 
         // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
@@ -258,9 +290,12 @@ impl ServeCommand {
             tenant_store: crate::tenant::TenantStore::open(&data_dir)
                 .ok()
                 .map(Arc::new),
-            tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
-            frps_server: std::env::var("FRPS_SERVER").ok(),
+            tunnel_domain: config.tunnel_domain.clone()
+                .or_else(|| std::env::var("TUNNEL_DOMAIN").ok()),
+            frps_server: config.frps_server.clone()
+                .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
+            deployment_mode: config.mode.clone(),
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),

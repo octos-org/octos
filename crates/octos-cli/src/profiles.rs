@@ -796,6 +796,9 @@ pub(crate) fn config_from_profile(
         auth_token: None,
         adaptive_routing: profile.config.adaptive_routing.clone(),
         voice: None,
+        mode: Default::default(),
+        tunnel_domain: None,
+        frps_server: None,
         allow_admin_shell: false,
         #[cfg(feature = "api")]
         dashboard_auth: None,
