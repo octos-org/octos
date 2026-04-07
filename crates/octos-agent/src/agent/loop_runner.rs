@@ -232,28 +232,34 @@ impl Agent {
                 }
                 StopReason::ToolUse => {
                     // Check for loop detection before executing
+                    let mut loop_detected = false;
                     for tc in &response.tool_calls {
                         if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments) {
-                            warn!("loop detected in tool calls");
-                            messages.push(Message {
-                                role: MessageRole::System,
+                            warn!("loop detected — breaking agent loop");
+                            loop_detected = true;
+                            // Don't execute the tools — break out with a message
+                            self.emit_cost_update(&total_usage, &response.usage);
+                            let new_start = (1 + history.len()).min(messages.len());
+                            return Ok(ConversationResponse {
                                 content: warning,
-                                media: vec![],
-                                tool_calls: None,
-                                tool_call_id: None,
                                 reasoning_content: None,
-                                timestamp: chrono::Utc::now(),
+                                token_usage: total_usage,
+                                files_modified,
+                                streamed,
+                                messages: messages[new_start..].to_vec(),
                             });
                         }
                     }
-                    self.handle_tool_use(
-                        &response,
-                        &mut messages,
-                        &mut files_modified,
-                        &mut total_usage,
-                        tracker,
-                    )
-                    .await?;
+                    if !loop_detected {
+                        self.handle_tool_use(
+                            &response,
+                            &mut messages,
+                            &mut files_modified,
+                            &mut total_usage,
+                            tracker,
+                        )
+                        .await?;
+                    }
                 }
                 StopReason::MaxTokens => {
                     self.emit_cost_update(&total_usage, &response.usage);
