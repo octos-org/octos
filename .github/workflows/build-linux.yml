@@ -11,11 +11,14 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref }}
 
@@ -31,7 +34,7 @@ jobs:
         run: cargo build --release -p octos-cli --features "api,telegram,discord,feishu,twilio,wecom,wecom-bot"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: octos-linux-x86_64
           path: target/release/octos
