@@ -67,6 +67,22 @@ The install script saves itself locally, so you can re-run without downloading a
 
 Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, SSH port, and tunnel token pre-filled — for both macOS/Linux and Windows. The registration flow enables the tunnel by default. If SMTP is configured on the server, the setup details are also emailed as backup.
 
+### Cloud host bootstrap
+
+To bootstrap the relay/host server itself, run the new host bootstrap script on a Linux VPS:
+
+```bash
+bash scripts/cloud-deploy.sh
+```
+
+It wraps the three host-side steps in order:
+
+- `scripts/install.sh` for `octos serve`
+- `scripts/frp/setup-frps.sh` for the relay
+- `scripts/frp/setup-caddy.sh` for apex and wildcard routing
+
+For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `~/.octos/cloud-bootstrap.env`.
+
 ### Deployment modes
 
 octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
@@ -75,7 +91,7 @@ octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
 - **`tenant`** — End-user machine with optional tunnel to a cloud relay.
 - **`cloud`** — VPS relay server with tenant management and public signup page.
 
-The installer sets the mode automatically based on the flags used.
+`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. Direct installers such as `scripts/install.sh` and `scripts/install.ps1` create it for local or tenant machines; `scripts/cloud-deploy.sh` now creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
 
 ### Optional features
 
