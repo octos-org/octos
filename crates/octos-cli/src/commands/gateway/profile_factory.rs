@@ -29,7 +29,8 @@ use crate::session_actor::{
 };
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
-pub(crate) type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>);
+/// (full LLM, provider name, adaptive router, strong-only LLM for slides)
+pub(crate) type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>, Arc<dyn LlmProvider>);
 
 pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
     let model = config.model.clone();
@@ -105,7 +106,54 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
         }
     };
 
-    Ok((llm, provider_name, adaptive_router_ref))
+    let llm_strong = build_strong_chain(config, &provider_name, no_retry)?;
+
+    Ok((llm, provider_name, adaptive_router_ref, llm_strong))
+}
+
+/// Build a provider chain using only fallback models marked `strong: true`.
+/// Used by slides sessions that need reliable providers for 30+ tool payloads.
+pub(crate) fn build_strong_chain(
+    config: &Config,
+    provider_name: &str,
+    no_retry: bool,
+) -> Result<Arc<dyn LlmProvider>> {
+    use crate::commands::chat::create_provider;
+    let primary = create_provider(
+        provider_name,
+        config,
+        config.model.clone(),
+        config.base_url.clone(),
+    )?;
+    let strong_fallbacks: Vec<_> = config
+        .fallback_models
+        .iter()
+        .filter(|fb| fb.strong)
+        .collect();
+    if strong_fallbacks.is_empty() || no_retry {
+        return Ok(Arc::new(RetryProvider::new(primary)));
+    }
+    let mut providers: Vec<Arc<dyn LlmProvider>> =
+        vec![Arc::new(RetryProvider::new(primary))];
+    for fallback in strong_fallbacks {
+        let fallback_config = if fallback.api_key_env.is_some() {
+            let mut cloned = config.clone();
+            cloned.api_key_env = fallback.api_key_env.clone();
+            cloned
+        } else {
+            config.clone()
+        };
+        if let Ok(provider) = crate::commands::chat::create_provider_with_api_type(
+            &fallback.provider,
+            &fallback_config,
+            fallback.model.clone(),
+            fallback.base_url.clone(),
+            fallback.api_type.as_deref(),
+        ) {
+            providers.push(Arc::new(RetryProvider::new(provider)));
+        }
+    }
+    Ok(Arc::new(ProviderChain::new(providers)))
 }
 
 pub(crate) fn build_plugin_env(
@@ -253,7 +301,7 @@ impl ProfileActorFactoryBuilder {
         let effective_profile =
             crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
         let profile_config = crate::profiles::config_from_profile(&effective_profile, None, None);
-        let (llm, provider_name, adaptive_router) =
+        let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
         let model_id = llm.model_id().to_string();
@@ -614,6 +662,7 @@ impl ProfileActorFactoryBuilder {
             memory_store: Some(self.memory_store.clone()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
+            llm_strong,
         })
     }
 }

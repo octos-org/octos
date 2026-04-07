@@ -147,11 +147,10 @@ impl Tool for PluginTool {
             cmd.env(key, val);
         }
 
-        // Expose a work directory for plugin output files via OCTOS_WORK_DIR.
-        // Plugins find style/config files relative to their executable location
-        // (via std::env::current_exe()), not cwd.  The OS cwd is inherited from
-        // the gateway subprocess which is already narrowed to data_dir by
-        // process_manager.rs (.current_dir(&data_dir)).
+        // Set working directory so relative paths in tool args (e.g.
+        // input="slides/my-deck/script.js") resolve against the per-user
+        // workspace — the same directory that write_file/read_file use.
+        // OCTOS_WORK_DIR is kept for backward compat with plugins that read it.
         if let Some(ref dir) = self.work_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!(
@@ -160,6 +159,7 @@ impl Tool for PluginTool {
                     "failed to create plugin work_dir"
                 );
             }
+            cmd.current_dir(dir);
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 

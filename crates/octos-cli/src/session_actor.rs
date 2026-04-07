@@ -392,6 +392,8 @@ pub struct ActorFactory {
     pub agent_config: AgentConfig,
     pub llm: Arc<dyn LlmProvider>,
     pub llm_for_compaction: Arc<dyn LlmProvider>,
+    /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
+    pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<String>>,
     pub hooks: Option<Arc<HookExecutor>>,
@@ -546,6 +548,7 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
+        tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
         tools.register(message_tool);
         tools.register(send_file_tool);
@@ -639,11 +642,42 @@ impl ActorFactory {
         let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
         if is_slides {
             tools.activate("group:media");
+
+            // Scaffold slides project INTO the workspace so file tools
+            // (read_file, write_file, mofa_slides) all resolve the same paths.
+            // The earlier scaffold in gateway_dispatcher writes to data_dir
+            // which is unreachable from the sandboxed workspace.
+            let topic = session_key.topic().unwrap_or("slides");
+            let project_name = topic.strip_prefix("slides").unwrap_or("").trim();
+            let project_name = if project_name.is_empty() { "untitled" } else { project_name };
+            crate::project_templates::scaffold_slides_project(&user_workspace, project_name);
+
+            // Copy built-in style templates into workspace/styles/ so the
+            // agent's glob("styles/*.toml") can discover them.
+            let builtin_styles = self.data_dir.join("skills/mofa-slides/styles");
+            let ws_styles = user_workspace.join("styles");
+            if builtin_styles.exists() {
+                std::fs::create_dir_all(&ws_styles).ok();
+                if let Ok(entries) = std::fs::read_dir(&builtin_styles) {
+                    for entry in entries.flatten() {
+                        let src = entry.path();
+                        if src.extension().is_some_and(|e| e == "toml") {
+                            let dst = ws_styles.join(entry.file_name());
+                            // Don't overwrite custom styles the user created
+                            if !dst.exists() {
+                                std::fs::copy(&src, &dst).ok();
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Build per-session Agent — slides sessions use the primary LLM directly
+        // Slides sessions use the strong-only provider chain — failover
+        // between kimi/deepseek/minimax only, excluding weak providers that
+        // hang on 30+ tools. Normal sessions use the full adaptive router.
         let session_llm = if is_slides {
-            self.llm_for_compaction.clone() // primary provider, no adaptive routing
+            self.llm_strong.clone()
         } else {
             self.llm.clone()
         };
