@@ -377,7 +377,7 @@ if [ "$(uname -s)" != "Linux" ]; then
     if [ "$DRY_RUN" = true ]; then
         warn "dry-run mode on non-Linux host; real cloud bootstrap requires Linux/systemd"
     else
-        err "cloud host bootstrap currently supports Linux/systemd hosts only"
+        err "cloud host bootstrap currently supports Linux/systemd hosts only. Run this on a Linux VPS. Use --dry-run locally to preview the commands."
     fi
 fi
 

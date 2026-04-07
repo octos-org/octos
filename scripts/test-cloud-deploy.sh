@@ -53,6 +53,23 @@ EOF
     grep -q 'scripts/frp/setup-frps.sh' "$output_file" || fail "dry run did not include setup-frps.sh"
     grep -q 'scripts/frp/setup-caddy.sh --https --dns-provider cloudflare --domain octos.example.com' "$output_file" || fail "dry run did not include expected setup-caddy.sh command"
 
+    if [ "$(uname -s)" != "Linux" ]; then
+        local error_file="$test_root/cloud-deploy-error.out"
+        set +e
+        bash "$CLOUD_DEPLOY" \
+            --config "$config_file" \
+            --non-interactive \
+            --data-dir "$data_dir-err" \
+            --prefix "$prefix-err" \
+            --state-file "$state_file-err" \
+            >"$error_file" 2>&1
+        local status=$?
+        set -e
+        [ "$status" -ne 0 ] || fail "non-linux host run should fail without --dry-run"
+        grep -q 'Run this on a Linux VPS. Use --dry-run locally to preview the commands.' "$error_file" \
+            || fail "non-linux failure did not explain how to proceed"
+    fi
+
     echo "cloud deploy tests passed"
 }
 
