@@ -148,7 +148,7 @@ impl ToolRegistry {
         let base = self.spawn_only_messages
             .get(name)
             .cloned()
-            .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string());
+            .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. STOP — do NOT call this tool again. Do NOT retry. Just tell the user it is generating and move on.".to_string());
         // Include output dir from OCTOS_DATA_DIR so LLM can reference files if needed
         let output_dir = std::env::var("OCTOS_DATA_DIR")
             .map(|d| format!("{d}/skill-output/"))
