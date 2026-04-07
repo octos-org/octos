@@ -163,6 +163,13 @@ INCREMENTAL UPDATES:
 - Skipping PNG deletion causes mofa to reuse stale images
 - New slides need no PNG deletion (no cache yet)
 
+TASK STATUS CHECK:
+When user asks about progress ("做完了吗", "done?", "status"):
+  glob("slides/{slug}/output/imgs/slide-*.png") to count generated slides
+  glob("slides/{slug}/output/*.pptx") to check if PPTX exists
+  shell("ps aux | grep mofa_slides | grep -v grep") to check if still generating
+Report: X/N slides done, PPTX ready/not ready, generation running/finished.
+
 Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
 "#
     )
