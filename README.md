@@ -72,7 +72,7 @@ Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized ins
 To bootstrap the relay/host server itself, run the new host bootstrap script on a Linux VPS:
 
 ```bash
-bash scripts/cloud-deploy.sh
+bash scripts/cloud-host-deploy.sh
 ```
 
 It wraps the three host-side steps in order:
@@ -91,7 +91,7 @@ octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
 - **`tenant`** — End-user machine with optional tunnel to a cloud relay.
 - **`cloud`** — VPS relay server with tenant management and public signup page.
 
-`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. Direct installers such as `scripts/install.sh` and `scripts/install.ps1` create it for local or tenant machines; `scripts/cloud-deploy.sh` now creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
+`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. Direct installers such as `scripts/install.sh` and `scripts/install.ps1` create it for local or tenant machines; `scripts/cloud-host-deploy.sh` now creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
 
 ### Optional features
 

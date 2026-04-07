@@ -83,14 +83,14 @@ Deployment behavior depends on `config.mode`:
 - `tenant` — Default end-user machine setup. Direct installs stay local at `/admin/`; managed registration setup can also configure the machine's public tunnel.
 - `cloud` — Advanced relay-host setup. `/` serves the landing page and `/admin/` remains the admin dashboard.
 
-`~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
+`~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-host-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
 
 ### 2.1.1 Cloud Host Bootstrap
 
 For the relay/host VPS itself, use:
 
 ```bash
-bash scripts/cloud-deploy.sh
+bash scripts/cloud-host-deploy.sh
 ```
 
 That script:

@@ -49,13 +49,13 @@ octos --version
 
 ```bash
 # 最小安装（仅 CLI + 对话）
-./scripts/local-deploy.sh --minimal
+./scripts/local-tenant-deploy.sh --minimal
 
 # 完整安装（所有渠道 + 仪表板 + 应用技能）
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # 自定义渠道
-./scripts/local-deploy.sh --channels telegram,discord,api
+./scripts/local-tenant-deploy.sh --channels telegram,discord,api
 ```
 
 ## 各平台安装指南
@@ -74,23 +74,26 @@ brew install --cask libreoffice
 # 3. 克隆并部署
 git clone https://github.com/octos-org/octos.git
 cd octos
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # 4. 设置 API 密钥并运行
 export ANTHROPIC_API_KEY=sk-ant-...
 octos chat
 ```
 
-**后台服务（launchd）：**
+**后台服务（launchd 系统守护进程）：**
 
-部署脚本会创建 `~/Library/LaunchAgents/io.octos.octos-serve.plist`。
+部署脚本会创建 `/Library/LaunchDaemons/io.octos.serve.plist`。
 
 ```bash
-# 启动服务（重启后自动恢复）
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+# 启动服务（需要 sudo）
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
 # 停止服务
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+
+# 查看状态
+sudo launchctl print system/io.octos.serve
 
 # 查看日志
 tail -f ~/.octos/serve.log
@@ -113,30 +116,32 @@ sudo apt install -y nodejs npm ffmpeg poppler-utils
 # 4. 克隆并部署
 git clone https://github.com/octos-org/octos.git
 cd octos
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # 5. 设置 API 密钥并运行
 export ANTHROPIC_API_KEY=sk-ant-...
 octos chat
 ```
 
-**后台服务（systemd 用户单元）：**
+**后台服务（systemd 系统单元）：**
 
-部署脚本会创建 `~/.config/systemd/user/octos-serve.service`。
+部署脚本会创建 `/etc/systemd/system/octos-serve.service`。
 
 ```bash
 # 启动服务
-systemctl --user start octos-serve
+sudo systemctl start octos-serve
 
-# 开机自启（需要启用 lingering）
-loginctl enable-linger $USER
-systemctl --user enable octos-serve
+# 开机自启
+sudo systemctl enable octos-serve
+
+# 查看状态
+sudo systemctl status octos-serve
 
 # 查看日志
-journalctl --user -u octos-serve -f
+sudo journalctl -u octos-serve -f
 
 # 停止服务
-systemctl --user stop octos-serve
+sudo systemctl stop octos-serve
 ```
 
 ### Linux (Fedora/RHEL)
@@ -194,7 +199,7 @@ docker compose --profile gateway up -d
 ## 部署脚本参考
 
 ```
-./scripts/local-deploy.sh [OPTIONS]
+./scripts/local-tenant-deploy.sh [OPTIONS]
 
 Options:
   --minimal          仅 CLI + 对话（不含渠道和仪表板）
@@ -205,9 +210,16 @@ Options:
   --uninstall        移除二进制文件和服务文件
   --debug            以 debug 模式编译（编译更快，二进制更大）
   --prefix DIR       安装路径前缀（默认：~/.cargo/bin）
+  --no-tunnel        即使在 --full 模式下也跳过 frpc 隧道配置
+  --tenant-name NAME 租户子域名（例如 "alice"）
+  --frps-token TOKEN frps 认证令牌
+  --frps-server ADDR frps 服务器地址（默认：163.192.33.32）
+  --ssh-port PORT    SSH 隧道远端端口（默认：6001）
+  --domain DOMAIN    隧道域名（默认：octos-cloud.org）
+  --auth-token TOKEN 仪表板认证令牌（默认：自动生成）
 ```
 
-在 Windows 上使用 `.\scripts\local-deploy.ps1`（PowerShell），选项相同。
+在 Windows 原生环境中，请使用 `.\scripts\install.ps1`（PowerShell）。
 
 **脚本执行流程：**
 
@@ -215,13 +227,14 @@ Options:
 2. 使用所选特性编译 `octos` 二进制文件
 3. 编译应用技能二进制文件（除非指定了 `--no-skills`）
 4. 在 macOS 上对二进制文件进行签名（ad-hoc codesign）
-5. 如果 `~/.octos` 不存在，运行 `octos init`
-6. 创建后台服务文件（macOS 用 launchd，Linux 用 systemd）
+5. 创建运行时数据目录，并写入 `~/.octos/config.json`，其中 `mode` 为 `"local"` 或 `"tenant"`
+6. 在启用 dashboard/API 功能时创建后台服务
+7. 在租户部署场景下可选配置 `frpc` 隧道
 
 **卸载：**
 
 ```bash
-./scripts/local-deploy.sh --uninstall
+./scripts/local-tenant-deploy.sh --uninstall
 # 数据目录（~/.octos）不会被移除。如需删除请手动执行：
 rm -rf ~/.octos
 ```
@@ -254,14 +267,14 @@ octos chat --message "Hello" # 快速测试
 ```bash
 cd octos
 git pull origin main
-./scripts/local-deploy.sh --full   # 重新编译并安装
+./scripts/local-tenant-deploy.sh --full   # 重新编译并安装
 
 # 如果以服务方式运行，需要重启：
 # macOS：
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 # Linux：
-systemctl --user restart octos-serve
+sudo systemctl restart octos-serve
 ```
 
 ## 常见问题

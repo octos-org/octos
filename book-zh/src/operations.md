@@ -11,7 +11,7 @@
 ```bash
 cd octos
 git pull origin main
-./scripts/local-deploy.sh --full   # Rebuilds and reinstalls
+./scripts/local-tenant-deploy.sh --full   # Rebuilds and reinstalls
 ```
 
 如果以服务方式运行，升级后需要重启：

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLOUD_DEPLOY="$ROOT_DIR/scripts/cloud-deploy.sh"
+CLOUD_DEPLOY="$ROOT_DIR/scripts/cloud-host-deploy.sh"
 
 fail() {
     echo "FAIL: $1" >&2
