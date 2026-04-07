@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod auth_handlers;
+mod frps_plugin;
 mod handlers;
 pub mod metrics;
 mod router;

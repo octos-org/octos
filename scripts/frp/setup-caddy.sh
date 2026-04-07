@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-caddy.sh — Install Caddy on VPS as reverse proxy to frps vhost.
+# setup-caddy.sh — Install Caddy on VPS as reverse proxy for octos serve and frps.
 # Supports HTTP-only mode (default) or HTTPS with wildcard certs via DNS challenge.
 # Idempotent: safe to re-run.
 #
@@ -9,7 +9,8 @@
 #
 # Environment:
 #   TUNNEL_DOMAIN         (optional) Base domain (default: octos-cloud.org)
-#   FRPS_VHOST_HTTP_PORT  (optional) frps HTTP vhost port (default: 8080)
+#   OCTOS_SERVE_PORT      (optional) octos serve port for apex site (default: 8080)
+#   FRPS_VHOST_HTTP_PORT  (optional) frps HTTP vhost port for tenant subdomains (default: 8081)
 #   CF_API_TOKEN          (required for --dns-provider cloudflare)
 #
 # DNS Providers:
@@ -22,7 +23,8 @@ set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-octos-cloud.org}"
-FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8080}"
+OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
+FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8081}"
 ENABLE_HTTPS=false
 DNS_PROVIDER=""
 
@@ -187,7 +189,7 @@ if [ "$ENABLE_HTTPS" = true ]; then
 
 # Main site: all requests proxied to octos serve (landing page embedded)
 www.__DOMAIN__, __DOMAIN__ {
-    reverse_proxy localhost:__VHOST_PORT__
+    reverse_proxy localhost:__SERVE_PORT__
 }
 
 # Tenant subdomains: HTTPS with wildcard cert
@@ -195,12 +197,12 @@ www.__DOMAIN__, __DOMAIN__ {
     tls {
         __DNS_CONFIG_BLOCK__
     }
-    reverse_proxy localhost:__VHOST_PORT__ {
+    reverse_proxy localhost:__FRPS_VHOST_PORT__ {
         header_up Host {host}
     }
 }
 
-# HTTP fallback: redirect tenants to HTTPS, proxy others to frps
+# HTTP fallback: redirect tenant subdomains and the apex site to HTTPS
 :80 {
     @tenant {
         not header_regexp Host ^(www\.)?__ESCAPED_DOMAIN__$
@@ -210,7 +212,7 @@ www.__DOMAIN__, __DOMAIN__ {
         redir https://{host}{uri} permanent
     }
     handle {
-        reverse_proxy localhost:__VHOST_PORT__
+        redir https://{host}{uri} permanent
     }
 }
 CADDYEOF
@@ -221,7 +223,7 @@ else
 #   ./setup-caddy.sh --https --dns-provider cloudflare
 
 www.__DOMAIN__, __DOMAIN__ {
-    reverse_proxy localhost:__VHOST_PORT__
+    reverse_proxy localhost:__SERVE_PORT__
 }
 
 :80 {
@@ -230,12 +232,12 @@ www.__DOMAIN__, __DOMAIN__ {
         not header_regexp Host ^[0-9]
     }
     handle @tenant {
-        reverse_proxy localhost:__VHOST_PORT__ {
+        reverse_proxy localhost:__FRPS_VHOST_PORT__ {
             header_up Host {host}
         }
     }
     handle {
-        reverse_proxy localhost:__VHOST_PORT__
+        reverse_proxy localhost:__SERVE_PORT__
     }
 }
 CADDYEOF
@@ -245,7 +247,8 @@ fi
 sudo sed -i \
     -e "s|__DOMAIN__|${TUNNEL_DOMAIN}|g" \
     -e "s|__ESCAPED_DOMAIN__|${ESCAPED_DOMAIN}|g" \
-    -e "s|__VHOST_PORT__|${FRPS_VHOST_HTTP_PORT}|g" \
+    -e "s|__SERVE_PORT__|${OCTOS_SERVE_PORT}|g" \
+    -e "s|__FRPS_VHOST_PORT__|${FRPS_VHOST_HTTP_PORT}|g" \
     -e "s|__DNS_PROVIDER__|${DNS_PROVIDER}|g" \
     -e "s|__DNS_CONFIG_BLOCK__|${DNS_CONFIG_BLOCK}|g" \
     /etc/caddy/Caddyfile
@@ -304,11 +307,13 @@ VPS_IP=$(curl -s ifconfig.me 2>/dev/null || echo "<VPS_IP>")
 echo ""
 echo "==> Caddy is running"
 if [ "$ENABLE_HTTPS" = true ]; then
+    echo "    HTTPS: ${TUNNEL_DOMAIN} → localhost:${OCTOS_SERVE_PORT} (octos serve)"
     echo "    HTTPS: *.${TUNNEL_DOMAIN} → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
     echo "    DNS challenge: ${DNS_PROVIDER}"
     echo "    Certs: auto-provisioned via Let's Encrypt"
 else
-    echo "    HTTP: :80 → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
+    echo "    HTTP: ${TUNNEL_DOMAIN} → localhost:${OCTOS_SERVE_PORT} (octos serve)"
+    echo "    HTTP: *.${TUNNEL_DOMAIN} → localhost:${FRPS_VHOST_HTTP_PORT} (frps vhost)"
 fi
 echo ""
 echo "==> DNS: Point these A records to ${VPS_IP}:"

@@ -442,14 +442,14 @@
             <div class="step">
                 <h3 data-lang="en">Name Your Node</h3>
                 <h3 data-lang="zh">命名节点</h3>
-                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token and tunnel credentials.</p>
-                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统自动生成认证令牌和隧道凭证。</p>
+                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token, tunnel token, and public address for this registered machine.</p>
+                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统会为这台已注册机器生成认证令牌、隧道令牌和公网地址。</p>
             </div>
             <div class="step">
-                <h3 data-lang="en">Setup Mac Mini</h3>
-                <h3 data-lang="zh">配置 Mac Mini</h3>
-                <p data-lang="en">Run the one-line setup command on your Mac Mini. It installs octos, configures the tunnel, and starts all services.</p>
-                <p data-lang="zh">在你的 Mac Mini 上运行一行安装命令，自动安装 octos、配置隧道并启动所有服务。</p>
+                <h3 data-lang="en">Setup Your Machine</h3>
+                <h3 data-lang="zh">配置你的机器</h3>
+                <p data-lang="en">Run the one-line setup command on your Mac, Linux server, or Windows PC. It installs octos, configures the tunnel, and brings your public node online.</p>
+                <p data-lang="zh">在你的 Mac、Linux 服务器或 Windows 电脑上运行一行安装命令，自动安装 octos、配置隧道，并让你的公网节点上线。</p>
             </div>
             <div class="step">
                 <h3 data-lang="en">Go Live</h3>
@@ -516,7 +516,7 @@
                     <span data-lang="zh">你的 Octos Cloud 账号已创建！</span>
                 </p>
                 <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
-                    <span data-lang="en">Dashboard URL</span><span data-lang="zh">面板地址</span>
+                    <span data-lang="en">Reserved Public URL</span><span data-lang="zh">预留公网地址</span>
                 </p>
                 <p style="margin-bottom: 12px;"><b id="resultUrl"></b></p>
                 <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
@@ -528,24 +528,30 @@
                 </p>
                 <p class="token" id="resultSshPort"></p>
                 <p style="margin-top: 16px; font-size: 13px; color: var(--text-dim);">
-                    <span data-lang="en">Run this on your Mac Mini to install octos + tunnel:</span>
-                    <span data-lang="zh">在你的 Mac Mini 上运行以下命令安装 octos + 隧道：</span>
+                    <span data-lang="en">Run this on your machine to install octos and activate the tunnel:</span>
+                    <span data-lang="zh">在你的机器上运行以下命令安装 octos 并启用隧道：</span>
                 </p>
-                <div style="background: var(--bg); border-radius: 8px; padding: 12px; margin-top: 8px; overflow-x: auto;">
-                    <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
+                <div style="margin-top: 8px;">
+                    <div style="display: flex; gap: 8px; margin-bottom: 4px;">
+                        <button onclick="showCmd('unix')" id="tabUnix" style="background: var(--green); color: var(--bg); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">macOS / Linux</button>
+                        <button onclick="showCmd('win')" id="tabWin" style="background: var(--card); color: var(--text-dim); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">Windows</button>
+                    </div>
+                    <div style="background: var(--bg); border-radius: 8px; padding: 12px; overflow-x: auto;">
+                        <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
+                    </div>
                 </div>
-                <p style="margin-top: 12px; font-size: 12px; color: var(--text-dim);">
-                    <span data-lang="en">Note: You'll need the frps token from your admin to complete tunnel setup.</span>
-                    <span data-lang="zh">注意：你需要管理员提供的 frps 令牌来完成隧道配置。</span>
+                <p id="emailNote" style="margin-top: 12px; font-size: 12px; color: var(--text-dim); display: none;">
+                    <span data-lang="en">We also emailed the same setup command to you for reinstall and backup.</span>
+                    <span data-lang="zh">我们也将相同的安装命令通过邮件发送给了你，用于重装和备份。</span>
                 </p>
             </div>
         </div>
         <!-- Installation code block -->
         <div class="code-block">
-            <pre><span class="comment" data-lang="en"># After registration, run the install command on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，在你的 Mac Mini 上运行安装命令：</span>
+            <pre><span class="comment" data-lang="en"># After registration, run the install command on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行安装命令：</span>
 
-<span class="cmd">curl -fsSL</span> https://github.com/octos-org/octos/releases/latest/download/install.sh <span class="cmd">| bash -s --</span> \
-  <span class="flag">--tenant-name</span> alice <span class="flag">--ssh-port</span> 6001 <span class="flag">--frps-token</span> &lt;token&gt;
+<span class="cmd">curl -fsSL</span> https://github.com/.../install.sh <span class="cmd">| bash -s --</span> \
+  <span class="flag">--auth-token</span> &lt;token&gt; <span class="flag">--tenant-name</span> &lt;name&gt; <span class="flag">--frps-token</span> &lt;token&gt; ...
 
 <span class="output">  ==> Detecting platform
       OK: Darwin arm64 (aarch64-apple-darwin)
@@ -688,6 +694,30 @@ function toggleLang() {
     }
 })();
 
+// --- Platform tab switching ---
+function showCmd(platform) {
+    const cmdEl = document.getElementById('resultCmd');
+    const tabUnix = document.getElementById('tabUnix');
+    const tabWin = document.getElementById('tabWin');
+    if (platform === 'win') {
+        cmdEl.textContent = window._setupCmdWin || '';
+        tabWin.style.background = 'var(--green)';
+        tabWin.style.color = 'var(--bg)';
+        tabWin.style.border = 'none';
+        tabUnix.style.background = 'var(--card)';
+        tabUnix.style.color = 'var(--text-dim)';
+        tabUnix.style.border = '1px solid var(--border)';
+    } else {
+        cmdEl.textContent = window._setupCmdUnix || '';
+        tabUnix.style.background = 'var(--green)';
+        tabUnix.style.color = 'var(--bg)';
+        tabUnix.style.border = 'none';
+        tabWin.style.background = 'var(--card)';
+        tabWin.style.color = 'var(--text-dim)';
+        tabWin.style.border = '1px solid var(--border)';
+    }
+}
+
 // --- Send verification code ---
 let codeTimer = null;
 async function sendCode() {
@@ -774,26 +804,9 @@ async function handleRegister(e) {
 
         const tenant = await tenantRes.json();
 
-        // Fetch the setup script from the API (includes correct domain/server)
-        let setupCmd = '';
-        try {
-            const scriptRes = await fetch('/api/register/setup-script', {
-                headers: { 'Authorization': 'Bearer ' + token }
-            });
-            if (scriptRes.ok) {
-                setupCmd = await scriptRes.text();
-            }
-        } catch (_) {}
-        if (!setupCmd) {
-            // Fallback: construct from tenant data using current hostname
-            const domain = window.location.hostname;
-            setupCmd = 'curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \\\n' +
-                '  --tenant-name ' + tenant.subdomain + ' \\\n' +
-                '  --auth-token ' + tenant.auth_token + ' \\\n' +
-                '  --ssh-port ' + tenant.ssh_port + ' \\\n' +
-                '  --domain ' + domain + ' \\\n' +
-                '  --frps-token <YOUR_FRPS_TOKEN>';
-        }
+        // Use setup commands from API response (platform-specific)
+        window._setupCmdUnix = tenant.setup_command_unix || '';
+        window._setupCmdWin = tenant.setup_command_windows || '';
 
         // Use dashboard URL from API response (includes correct tunnel domain)
         const dashboardUrl = tenant.dashboard_url ||
@@ -806,7 +819,15 @@ async function handleRegister(e) {
         document.getElementById('resultUrl').textContent = dashboardUrl;
         document.getElementById('resultToken').textContent = tenant.auth_token;
         document.getElementById('resultSshPort').textContent = tenant.ssh_port;
-        document.getElementById('resultCmd').textContent = setupCmd;
+
+        // Show email note only if server actually sent it
+        if (tenant.email_sent) {
+            document.getElementById('emailNote').style.display = 'block';
+        }
+
+        // Auto-detect OS and show appropriate command
+        const isWindows = navigator.platform.indexOf('Win') > -1;
+        showCmd(isWindows ? 'win' : 'unix');
 
     } catch (e) {
         const isZh = document.body.getAttribute('data-active-lang') === 'zh';

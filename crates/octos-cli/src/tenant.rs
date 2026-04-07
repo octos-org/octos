@@ -191,6 +191,12 @@ impl TenantStore {
         bail!("SSH port pool exhausted ({SSH_PORT_START}–{SSH_PORT_END})")
     }
 
+    /// Find a tenant by its tunnel auth token.
+    pub fn find_by_tunnel_token(&self, token: &str) -> Result<Option<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all.into_iter().find(|t| t.tunnel_token == token))
+    }
+
     /// Find tenant(s) belonging to a user.
     ///
     /// Checks the `owner` field against all provided identifiers (user ID,
@@ -231,19 +237,18 @@ fn validate_tenant_id(id: &str) -> Result<()> {
 
 /// Generate the frpc TOML config for a tenant by filling the template.
 ///
-/// `frps_token` is the shared frps master token (NOT the per-tenant tunnel_token).
+/// Uses the tenant's `tunnel_token` for per-tenant frps authentication.
 pub fn render_frpc_config(
     tenant: &TenantConfig,
     frps_server: &str,
     frps_port: u16,
-    frps_token: &str,
     tunnel_domain: &str,
 ) -> String {
     let template = include_str!("../../../scripts/frp/tenant-frpc.toml.template");
     template
         .replace("{{FRPS_SERVER}}", frps_server)
         .replace("{{FRPS_PORT}}", &frps_port.to_string())
-        .replace("{{FRPS_TOKEN}}", frps_token)
+        .replace("{{FRPS_TOKEN}}", &tenant.tunnel_token)
         .replace("{{SUBDOMAIN}}", &tenant.subdomain)
         .replace("{{LOCAL_PORT}}", &tenant.local_port.to_string())
         .replace("{{SSH_REMOTE_PORT}}", &tenant.ssh_port.to_string())
@@ -330,14 +335,12 @@ mod tests {
             &tenant,
             "163.192.33.32",
             7000,
-            "master-secret",
             "octos-cloud.org",
         );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        assert!(config.contains("auth.token = \"master-secret\""));
-        // Must NOT contain the per-tenant token
-        assert!(!config.contains("test-token-123"));
+        // Uses the per-tenant tunnel_token for auth
+        assert!(config.contains("auth.token = \"test-token-123\""));
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));

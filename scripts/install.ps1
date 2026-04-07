@@ -90,9 +90,9 @@ OPTIONAL FEATURES
   -InstallDeps         Auto-install missing runtime dependencies
   -Domain <domain>     Set up Caddy reverse proxy with on-demand TLS
 
-TUNNEL (frpc)
-  -Tunnel                Enable frpc tunnel (also enabled by -TenantName/-FrpsToken)
-  -TenantName <name>     Tenant subdomain (e.g. "alice")
+OPTIONAL TUNNEL (frpc)
+  -Tunnel                Enable optional frpc tunnel
+  -TenantName <name>     Tenant subdomain (e.g. "alice") for public access
   -FrpsToken <token>     frps auth token
   -FrpsTokenFile <file>  Read frps auth token from file
   -FrpsServer <addr>     frps server address (default: 163.192.33.32)
@@ -123,8 +123,8 @@ if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
 if ($SshPort -eq 0)     { $SshPort      = 6001 }
 if (-not $TunnelDomain) { $TunnelDomain = "octos-cloud.org" }
 
-# Auto-enable tunnel when tunnel-specific args are passed
-if ($TenantName -or $FrpsToken -or $FrpsTokenFile) { $Tunnel = [switch]::new($true) }
+# Auto-enable tunnel only when frps token is provided (implies intent to connect)
+if ($FrpsToken -or $FrpsTokenFile) { $Tunnel = [switch]::new($true) }
 
 # Resolve frps token from file
 if (-not $FrpsToken -and $FrpsTokenFile) {
@@ -379,11 +379,11 @@ Validate-Inputs
 # ══════════════════════════════════════════════════════════════════════
 # ── Tunnel-only update (when octos is already installed) ─────────────
 # ══════════════════════════════════════════════════════════════════════
-# If octos binary exists and user passed -TenantName or -FrpsToken,
+# If octos binary exists and tunnel is explicitly enabled,
 # skip the full install and just update the tunnel configuration.
 
 $octosBinCheck = Join-Path $Prefix "octos.exe"
-if ((Test-Path $octosBinCheck) -and ($TenantName -or $FrpsToken)) {
+if ((Test-Path $octosBinCheck) -and $Tunnel) {
     Section "Updating tunnel configuration"
 
     # Fill in missing values from existing frpc config
@@ -393,9 +393,23 @@ if ((Test-Path $octosBinCheck) -and ($TenantName -or $FrpsToken)) {
             $TenantName = $Matches[1]
             Ok "tenant name from existing config: $TenantName"
         }
+        if ($TunnelDomain -eq "octos-cloud.org" -and $existingConfig -match 'customDomains\s*=\s*\["[^"]+\.([^"]+)"\]') {
+            $existingTunnelDomain = $Matches[1]
+            if ($existingTunnelDomain -and $existingTunnelDomain -ne "octos-cloud.org") {
+                $TunnelDomain = $existingTunnelDomain
+                Ok "tunnel domain from existing config: $TunnelDomain"
+            }
+        }
         if (-not $FrpsToken -and $existingConfig -match 'auth\.token\s*=\s*"([^"]+)"') {
             $FrpsToken = $Matches[1]
             Ok "frps token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
+        }
+        if ($FrpsServer -eq "163.192.33.32" -and $existingConfig -match 'serverAddr\s*=\s*"([^"]+)"') {
+            $existingFrpsServer = $Matches[1]
+            if ($existingFrpsServer -and $existingFrpsServer -ne "163.192.33.32") {
+                $FrpsServer = $existingFrpsServer
+                Ok "frps server from existing config: $FrpsServer"
+            }
         }
         if ($SshPort -eq 6001 -and $existingConfig -match 'remotePort\s*=\s*(\d+)') {
             $existingSshPort = [int]$Matches[1]
@@ -1082,8 +1096,26 @@ try {
     }
     Ok "$binCount binaries installed to $Prefix"
 
+    # Save install script for later use.
+    # Try copying the running script; fall back to downloading from release.
+    $installDest = Join-Path $Prefix "install.ps1"
+    $scriptSelf = $PSCommandPath
+    if ($scriptSelf -and (Test-Path $scriptSelf)) {
+        Copy-Item $scriptSelf -Destination $installDest -Force
+    } else {
+        try {
+            $releaseBase = "https://github.com/$GithubRepo/releases/latest/download"
+            Invoke-WebRequest -Uri "$releaseBase/install.ps1" -OutFile $installDest -UseBasicParsing
+        } catch {}
+    }
+
 } finally {
     Remove-Item -Recurse -Force $installTmp -ErrorAction SilentlyContinue
+}
+if (Test-Path (Join-Path $Prefix "install.ps1")) {
+    Ok "install script saved to $Prefix"
+} else {
+    Warn "could not save install script to $Prefix"
 }
 
 # ── Add to PATH ───────────────────────────────────────────────────────
@@ -1146,11 +1178,22 @@ if (-not (Test-Path $configPath)) {
     elseif ($env:DASHSCOPE_API_KEY) { $_prov = "dashscope"; $_model = "qwen3.5-plus";           $_env = "DASHSCOPE_API_KEY" }
     else                         { $_prov = "openai";    $_model = "gpt-4.1-mini";            $_env = "OPENAI_API_KEY" }
 
+    $_mode = "local"
+    $_extraConfig = ""
+    if ($TenantName -or $Tunnel) { $_mode = "tenant" }
+    if ($Tunnel) {
+        $_extraConfig = @"
+,
+  "tunnel_domain": "$TunnelDomain",
+  "frps_server": "$FrpsServer"
+"@
+    }
     $configJson = @"
 {
   "provider": "$_prov",
   "model": "$_model",
-  "api_key_env": "$_env"
+  "api_key_env": "$_env",
+  "mode": "$_mode"$_extraConfig
 }
 "@
     # WriteAllText avoids UTF-8 BOM that PowerShell 5.1 -Encoding UTF8 adds
@@ -1438,15 +1481,15 @@ Write-Host "  Next steps:"
 Write-Host "    1. Set your API key:  `$env:$_env = 'sk-...'"
 Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
-Write-Host "    4. Open dashboard:    http://localhost:${Port}/admin/"
+Write-Host "    4. Open local dashboard: http://localhost:${Port}/admin/"
 Write-Host ""
 Write-Host "  Manage service:"
 Write-Host "    Status:  Get-ScheduledTask -TaskName OctosServe"
 Write-Host "    Stop:    Stop-ScheduledTask -TaskName OctosServe"
 Write-Host "    Start:   Start-ScheduledTask -TaskName OctosServe"
 Write-Host ""
-if ($Tunnel) {
-    Write-Host "  Tunnel:"
+if ($Tunnel -and $TenantName) {
+    Write-Host "  Public tunnel:"
     Write-Host "    Dashboard:   https://${TenantName}.${TunnelDomain}"
     Write-Host "    frpc config: $FrpcConfig"
     Write-Host ""
@@ -1455,7 +1498,19 @@ if ($Tunnel) {
     Write-Host "    Stop:    & `"$FrpcBin`" stop"
     Write-Host "    Start:   & `"$FrpcBin`" start"
     Write-Host ""
+} elseif ($TenantName) {
+    Write-Host "  Reserved public name:"
+    Write-Host "    ${TenantName}.${TunnelDomain}"
+    Write-Host "    To enable public access, re-run with -Tunnel"
+    Write-Host ""
 }
-Write-Host "  Troubleshoot:"
-Write-Host "    irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
+Write-Host "  Later:"
+$savedScript = Join-Path $Prefix "install.ps1"
+if (Test-Path $savedScript) {
+    Write-Host "    Enable tunnel:  & `"$savedScript`" -Tunnel"
+    Write-Host "    Diagnose:       & `"$savedScript`" -Doctor"
+} else {
+    Write-Host "    Enable tunnel:  irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Tunnel"
+    Write-Host "    Diagnose:       irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
+}
 Write-Host ""

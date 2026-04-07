@@ -130,8 +130,8 @@ pub struct Config {
     #[serde(default)]
     pub mode: DeploymentMode,
 
-    /// Tunnel domain for cloud mode (e.g. "octos-cloud.org").
-    /// Also read from TUNNEL_DOMAIN env var. Cloud mode requires this.
+    /// Tunnel domain for cloud-host or tenant tunnel setups (e.g. "octos-cloud.org").
+    /// Also read from TUNNEL_DOMAIN env var.
     #[serde(default)]
     pub tunnel_domain: Option<String>,
 

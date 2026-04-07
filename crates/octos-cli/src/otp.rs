@@ -66,6 +66,14 @@ pub struct ActiveSession {
     pub expires_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestEmail {
+    pub to: String,
+    pub subject: String,
+    pub html: String,
+}
+
 /// OTP and session manager with optional disk persistence.
 pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
@@ -79,6 +87,8 @@ pub struct AuthManager {
     user_store: Arc<UserStore>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
+    #[cfg(test)]
+    sent_emails: RwLock<Vec<TestEmail>>,
 }
 
 impl AuthManager {
@@ -100,6 +110,8 @@ impl AuthManager {
             allow_self_registration,
             user_store,
             sessions_path: None,
+            #[cfg(test)]
+            sent_emails: RwLock::new(Vec::new()),
         }
     }
 
@@ -128,11 +140,30 @@ impl AuthManager {
         self
     }
 
+    #[cfg(test)]
+    pub async fn test_sent_emails(&self) -> Vec<TestEmail> {
+        self.sent_emails.read().await.clone()
+    }
+
     /// Persist current sessions to disk (best-effort).
     fn persist_sessions_blocking(sessions: &HashMap<String, ActiveSession>, path: &PathBuf) {
         if let Ok(data) = serde_json::to_string(sessions) {
             let _ = std::fs::write(path, data);
         }
+    }
+
+    /// Send an arbitrary HTML email through the configured SMTP transport.
+    ///
+    /// Returns `Ok(true)` when an email was sent, `Ok(false)` when SMTP is not
+    /// configured and the email was intentionally skipped.
+    pub async fn send_html_email(&self, email: &str, subject: &str, html: &str) -> Result<bool> {
+        let Some(ref smtp) = self.smtp_config else {
+            tracing::warn!(email = %email, subject = %subject, "email skipped — no SMTP configured");
+            return Ok(false);
+        };
+
+        self.deliver_html_email(smtp, email, subject, html).await?;
+        Ok(true)
     }
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
@@ -345,6 +376,44 @@ impl AuthManager {
     /// Send OTP email via SMTP.
     #[cfg(feature = "api")]
     async fn send_otp_email(&self, smtp: &SmtpConfig, email: &str, code: &str) -> Result<()> {
+        let html = format!(
+            r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+                    <h2 style="color: #1a1a2e; margin-bottom: 8px;">octos Login</h2>
+                    <p style="color: #666; margin-bottom: 24px;">Use this code to sign in. It expires in 5 minutes.</p>
+                    <div style="background: #f5f5f5; border-radius: 8px; padding: 24px; text-align: center; margin-bottom: 24px;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a1a2e;">{code}</span>
+                    </div>
+                    <p style="color: #999; font-size: 12px;">If you didn't request this code, you can safely ignore this email.</p>
+                </div>"#
+        );
+        self.deliver_html_email(smtp, email, "Your octos login code", &html)
+            .await
+    }
+
+    #[cfg(all(feature = "api", test))]
+    async fn deliver_html_email(
+        &self,
+        _smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<()> {
+        self.sent_emails.write().await.push(TestEmail {
+            to: email.to_string(),
+            subject: subject.to_string(),
+            html: html.to_string(),
+        });
+        Ok(())
+    }
+
+    #[cfg(all(feature = "api", not(test)))]
+    async fn deliver_html_email(
+        &self,
+        smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<()> {
         use lettre::message::header::ContentType;
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -362,18 +431,9 @@ impl AuthManager {
         let email_msg = Message::builder()
             .from(smtp.from_address.parse().map_err(|e| eyre::eyre!("invalid from address: {e}"))?)
             .to(email.parse().map_err(|e| eyre::eyre!("invalid to address: {e}"))?)
-            .subject("Your octos login code")
+            .subject(subject)
             .header(ContentType::TEXT_HTML)
-            .body(format!(
-                r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
-                    <h2 style="color: #1a1a2e; margin-bottom: 8px;">octos Login</h2>
-                    <p style="color: #666; margin-bottom: 24px;">Use this code to sign in. It expires in 5 minutes.</p>
-                    <div style="background: #f5f5f5; border-radius: 8px; padding: 24px; text-align: center; margin-bottom: 24px;">
-                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a1a2e;">{code}</span>
-                    </div>
-                    <p style="color: #999; font-size: 12px;">If you didn't request this code, you can safely ignore this email.</p>
-                </div>"#
-            ))
+            .body(html.to_string())
             .map_err(|e| eyre::eyre!("failed to build email: {e}"))?;
 
         let creds = Credentials::new(smtp.username.clone(), password);
@@ -393,14 +453,26 @@ impl AuthManager {
         mailer
             .send(email_msg)
             .await
-            .map_err(|e| eyre::eyre!("failed to send OTP email: {e}"))?;
-        tracing::info!(email = %email, "OTP email sent");
+            .map_err(|e| eyre::eyre!("failed to send email: {e}"))?;
+        tracing::info!(email = %email, subject = %subject, "email sent");
         Ok(())
     }
 
     #[cfg(not(feature = "api"))]
     async fn send_otp_email(&self, _smtp: &SmtpConfig, email: &str, _code: &str) -> Result<()> {
         tracing::info!(email = %email, "OTP sent (code redacted, lettre not available)");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "api"))]
+    async fn deliver_html_email(
+        &self,
+        _smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        _html: &str,
+    ) -> Result<()> {
+        tracing::info!(email = %email, subject = %subject, "email sent (content redacted, lettre not available)");
         Ok(())
     }
 }

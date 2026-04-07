@@ -13,6 +13,7 @@ use tower_http::trace::TraceLayer;
 use super::AppState;
 use super::admin;
 use super::auth_handlers;
+use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::static_files;
@@ -378,12 +379,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/version", get(handlers::version))
         .route("/health", get(handlers::health));
 
-    // Unauthenticated routes (static files + auth endpoints + webhook proxy)
+    // Internal endpoint for frps server plugin (no auth — called by frps on localhost)
+    let internal_routes = Router::new()
+        .route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
+
+    // Unauthenticated routes (static files + auth endpoints + webhook proxy + internal)
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
         .merge(webhook_routes)
-        .merge(version_routes);
+        .merge(version_routes)
+        .merge(internal_routes);
 
     public
         .merge(protected)

@@ -111,21 +111,6 @@ impl ServeCommand {
                 (Config::default(), None)
             }
         };
-
-        // Infer deployment mode from tunnel infrastructure if not explicitly set.
-        // tunnel_domain or frps_server are unambiguously cloud-only signals.
-        let mut config = config;
-        if matches!(config.mode, crate::config::DeploymentMode::Local) {
-            let has_tunnel = config.tunnel_domain.is_some()
-                || std::env::var("TUNNEL_DOMAIN").is_ok();
-            let has_frps = config.frps_server.is_some()
-                || std::env::var("FRPS_SERVER").is_ok();
-            if has_tunnel || has_frps {
-                tracing::info!("tunnel infrastructure detected, auto-setting mode to cloud");
-                config.mode = crate::config::DeploymentMode::Cloud;
-            }
-        }
-
         // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
@@ -704,5 +689,34 @@ impl ServeCommand {
         ));
 
         Ok((agent, sessions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_mode_is_explicit_and_ignores_tunnel_settings() {
+        let config = Config {
+            mode: crate::config::DeploymentMode::Local,
+            tunnel_domain: Some("octos-cloud.org".to_string()),
+            frps_server: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.mode, crate::config::DeploymentMode::Local);
+    }
+
+    #[test]
+    fn deployment_mode_preserves_explicit_cloud_mode() {
+        let config = Config {
+            mode: crate::config::DeploymentMode::Cloud,
+            tunnel_domain: None,
+            frps_server: None,
+            ..Default::default()
+        };
+
+        assert_eq!(config.mode, crate::config::DeploymentMode::Cloud);
     }
 }

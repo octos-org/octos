@@ -77,13 +77,19 @@ octos serve --host 0.0.0.0 --port 3000
 
 If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to forward to the serve port.
 
+Deployment behavior depends on `config.mode`:
+
+- `local` — Standalone machine. `/` redirects to `/admin/`.
+- `tenant` — Default end-user machine setup. Direct installs stay local at `/admin/`; managed registration setup can also configure the machine's public tunnel.
+- `cloud` — Advanced relay-host setup. `/` serves the landing page and `/admin/` remains the admin dashboard.
+
 ### 2.2 OTP Email Authentication
 
 The dashboard uses email-based One-Time Password (OTP) authentication. No passwords are stored — a 6-digit code is emailed to the user each time they log in.
 
 #### Configure SMTP for OTP Emails
 
-Add `dashboard_auth` to your serve config (`~/.octos/config.json` or per-profile):
+Add `dashboard_auth` to your serve config (`~/.octos/config.json` or `<cwd>/.octos/config.json`):
 
 ```json
 {
@@ -1908,6 +1914,11 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Email (for email channel)
   "email": null,
 
+  // Deployment role for octos serve
+  "mode": "local",           // local | tenant | cloud
+  "tunnel_domain": null,      // optional for tenant/cloud tunnel setups
+  "frps_server": null,        // optional for tenant/cloud tunnel setups
+
   // Dashboard auth (serve mode only)
   "dashboard_auth": null,
 
@@ -1962,6 +1973,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
+| `OCTOS_HOME` | Override the global data/config directory (default: `~/.octos`) |
+| `TUNNEL_DOMAIN` | Tunnel base domain for tenant/cloud deployments |
+| `FRPS_SERVER` | frps relay host for tenant/cloud deployments |
 
 ### 15.3 File Layout
 
