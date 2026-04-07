@@ -45,7 +45,7 @@ All notable changes to octos will be documented in this file.
 - Add NLSpec features technical documentation
 - Update user guides
 - Update README and ARCHITECTURE for NLSpec features
-- Add local deployment guide, ci.sh, and local-deploy.sh
+- Add local deployment guide, ci.sh, and local-tenant-deploy.sh
 - Add measured sandbox performance benchmarks to security architecture
 - Add Docker per-user bind mount model and isolation comparison
 - OpenClaw gap analysis and search racing improvement plan
@@ -254,4 +254,3 @@ All notable changes to octos will be documented in this file.
 
 - Remove task mode (run/resume/list) and coordinator pattern
 - Deduplicate truncation, configurable threshold, ~user expansion
-

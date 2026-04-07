@@ -22,8 +22,14 @@ struct Assets;
 pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
-    // Root "/" → redirect to /admin/
+    // Root "/" → serve landing page only in cloud mode,
+    // otherwise redirect to /admin/
     if path.is_empty() {
+        if matches!(_state.deployment_mode, crate::config::DeploymentMode::Cloud) {
+            if let Some(file) = Assets::get("landing.html") {
+                return serve_file("landing.html", &file.data);
+            }
+        }
         return (
             StatusCode::TEMPORARY_REDIRECT,
             [(header::LOCATION, "/admin/")],

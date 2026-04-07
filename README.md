@@ -31,37 +31,76 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 
 ## Install (no dependencies required)
 
-For standalone machines (Mac Mini, Linux server, etc.) — no Rust, Xcode, or development tools needed:
-
-```bash
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
-```
-
-Supported platforms: **macOS ARM64** (Apple Silicon), **Linux x86_64**, and **Linux ARM64**. Installs to `~/.octos/bin`, initializes the workspace, and sets up `octos serve` as a system service (launchd on macOS, systemd on Linux).
-
-On **Windows** (PowerShell):
-
-```powershell
-irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
-```
-
-With tunnel options (remote access via frpc, macOS/Linux only):
-
-```bash
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
-  --tenant-name alice --frps-token <token>
-```
-
-Diagnose an existing installation:
+One command installs octos on your Mac Mini, Linux server, or Windows PC — no Rust, Xcode, or development tools needed:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/octos-doctor.sh | bash
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 | iex
+```
+
+This installs the binary, sets up `octos serve` as a system service, and starts the local dashboard at `http://localhost:8080/admin/`.
+
+Supported platforms: **macOS ARM64** (Apple Silicon), **Linux x86_64**, **Linux ARM64**, and **Windows x64**.
+
+### After install
+
+The install script saves itself locally, so you can re-run without downloading again:
+
+```bash
+# macOS / Linux
+~/.octos/bin/install.sh --tunnel    # Enable public tunnel
+~/.octos/bin/install.sh --doctor    # Diagnose issues
 ```
 
 ```powershell
 # Windows
-irm https://github.com/octos-org/octos/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor
+& "$HOME\.octos\bin\install.ps1" -Tunnel    # Enable public tunnel
+& "$HOME\.octos\bin\install.ps1" -Doctor    # Diagnose issues
+```
+
+### Cloud signup
+
+Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, SSH port, and tunnel token pre-filled — for both macOS/Linux and Windows. The registration flow enables the tunnel by default. If SMTP is configured on the server, the setup details are also emailed as backup.
+
+### Cloud host bootstrap
+
+To bootstrap the relay/host server itself, run the new host bootstrap script on a Linux VPS:
+
+```bash
+bash scripts/cloud-host-deploy.sh
+```
+
+It wraps the three host-side steps in order:
+
+- `scripts/install.sh` for `octos serve`
+- `scripts/frp/setup-frps.sh` for the relay
+- `scripts/frp/setup-caddy.sh` for apex and wildcard routing
+
+For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `~/.octos/cloud-bootstrap.env`.
+
+### Deployment modes
+
+octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
+
+- **`local`** (default) — Standalone machine. Dashboard at `/admin/`.
+- **`tenant`** — End-user machine with optional tunnel to a cloud relay.
+- **`cloud`** — VPS relay server with tenant management and public signup page.
+
+`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. Direct installers such as `scripts/install.sh` and `scripts/install.ps1` create it for local or tenant machines; `scripts/cloud-host-deploy.sh` now creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
+
+### Optional features
+
+```bash
+# Auto-install runtime dependencies (git, node, python, ffmpeg, chromium)
+curl ... | bash -s -- --install-deps
+
+# Set up Caddy reverse proxy with HTTPS (for self-hosted deployments)
+curl ... | bash -s -- --caddy-domain crew.example.com
 ```
 
 ## Quick Start
@@ -73,8 +112,8 @@ cargo install --path crates/octos-cli
 # Initialize workspace
 octos init
 
-# Set API key
-export ANTHROPIC_API_KEY=your-key-here
+# Set API key (any supported provider — auto-detected during install)
+export OPENAI_API_KEY=your-key-here    # or ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.
 
 # Interactive chat
 octos chat

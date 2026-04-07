@@ -19,6 +19,7 @@ permissions:
   contents: write
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard"
 
@@ -27,7 +28,7 @@ jobs:
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos-arm'
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -52,7 +53,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-arm
           path: octos-bundle-aarch64-apple-darwin.tar.gz
@@ -61,7 +62,7 @@ jobs:
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-x86'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -86,7 +87,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-x86
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
@@ -95,7 +96,7 @@ jobs:
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-arm'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -122,7 +123,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-arm
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
@@ -131,7 +132,7 @@ jobs:
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -161,7 +162,7 @@ jobs:
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: octos-bundle-x86_64-pc-windows-msvc.zip
@@ -173,7 +174,7 @@ jobs:
   #     contents: read
   #     packages: write
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #
   #     - uses: docker/setup-qemu-action@v3
   #
@@ -205,7 +206,7 @@ jobs:
     needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -215,7 +216,7 @@ jobs:
       - name: Generate release notes
         run: git-cliff --latest --strip header -o RELEASE_NOTES.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 

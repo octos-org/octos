@@ -3,22 +3,22 @@
 # Idempotent: safe to re-run.
 #
 # Usage:
-#   FRPS_TOKEN=<secret> ./setup-frps.sh
-#   FRPS_TOKEN=<secret> FRPS_DASHBOARD_PASSWORD=<pw> ./setup-frps.sh
+#   ./setup-frps.sh
+#   FRPS_DASHBOARD_PASSWORD=<pw> ./setup-frps.sh
 #
 # Environment:
-#   FRPS_TOKEN               (required) Auth token shared with frpc clients
 #   FRPS_DASHBOARD_PASSWORD  (optional) Dashboard password (default: random)
 #   FRPS_VERSION             (optional) frp version to install (default: 0.61.1)
+#   OCTOS_SERVE_PORT         (optional) octos serve port for auth plugin (default: 8080)
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
 FRPS_VERSION="${FRPS_VERSION:-0.61.1}"
-FRPS_TOKEN="${FRPS_TOKEN:?'FRPS_TOKEN env var is required'}"
 FRPS_DASHBOARD_PASSWORD="${FRPS_DASHBOARD_PASSWORD:-$(openssl rand -hex 16)}"
+OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
 FRPS_BIND_PORT="${FRPS_BIND_PORT:-7000}"
-FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8080}"
+FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8081}"
 FRPS_VHOST_HTTPS_PORT="${FRPS_VHOST_HTTPS_PORT:-8443}"
 FRPS_DASHBOARD_PORT="${FRPS_DASHBOARD_PORT:-7500}"
 FRPS_SSH_PORT_START="${FRPS_SSH_PORT_START:-6001}"
@@ -77,8 +77,12 @@ vhostHTTPPort = ${FRPS_VHOST_HTTP_PORT}
 vhostHTTPSPort = ${FRPS_VHOST_HTTPS_PORT}
 custom_404_page = "${CONFIG_DIR}/404.html"
 
-auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
+# Per-tenant auth via octos serve plugin (no shared master token)
+[[httpPlugins]]
+name = "octos-auth"
+addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
+path = "/api/internal/frps-auth"
+ops = ["Login", "NewProxy"]
 
 webServer.port = ${FRPS_DASHBOARD_PORT}
 webServer.user = "admin"

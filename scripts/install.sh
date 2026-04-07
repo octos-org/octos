@@ -19,8 +19,8 @@
 #   --caddy-domain DOMAIN    Set up Caddy with on-demand TLS for wildcard subdomains
 #                            (e.g. --caddy-domain crew.example.com → *.crew.example.com)
 #                            Requires: wildcard DNS A record pointing to this server
-#   --tunnel                 Enable frpc tunnel setup (also enabled by --tenant-name/--frps-token)
-#     --tenant-name NAME     Tenant subdomain (e.g. "alice")
+#   --tunnel                 Enable optional frpc tunnel setup
+#     --tenant-name NAME     Tenant subdomain (e.g. "alice") for public access
 #     --frps-token TOKEN     frps auth token
 #     --frps-token-file FILE Read frps auth token from FILE
 #     --frps-server ADDR     frps server address (default: 163.192.33.32)
@@ -64,12 +64,12 @@ while [ $# -gt 0 ]; do
         --auth-token)    needval "$@"; AUTH_TOKEN="$2"; shift 2 ;;
         --caddy-domain)  needval "$@"; CADDY_DOMAIN="$2"; shift 2 ;;
         --tunnel)        ENABLE_TUNNEL=true; shift ;;
-        --tenant-name)   needval "$@"; TENANT_NAME="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --tenant-name)   needval "$@"; TENANT_NAME="$2"; shift 2 ;;
         --frps-token)    needval "$@"; FRPS_TOKEN="$2"; ENABLE_TUNNEL=true; shift 2 ;;
         --frps-token-file) needval "$@"; FRPS_TOKEN_FILE="$2"; ENABLE_TUNNEL=true; shift 2 ;;
-        --frps-server)   needval "$@"; FRPS_SERVER="$2"; ENABLE_TUNNEL=true; shift 2 ;;
-        --ssh-port)      needval "$@"; SSH_PORT="$2"; ENABLE_TUNNEL=true; shift 2 ;;
-        --domain)        needval "$@"; TUNNEL_DOMAIN="$2"; ENABLE_TUNNEL=true; shift 2 ;;
+        --frps-server)   needval "$@"; FRPS_SERVER="$2"; shift 2 ;;
+        --ssh-port)      needval "$@"; SSH_PORT="$2"; shift 2 ;;
+        --domain)        needval "$@"; TUNNEL_DOMAIN="$2"; shift 2 ;;
         --install-deps)  INSTALL_DEPS=true; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
         --doctor)        RUN_DOCTOR=true; shift ;;
@@ -95,9 +95,9 @@ Optional features:
   --caddy-domain DOMAIN    Set up Caddy reverse proxy with on-demand TLS
                            (e.g. --caddy-domain crew.example.com)
 
-Tunnel (frpc):
-  --tunnel                 Enable frpc tunnel setup (also enabled by --tenant-name/--frps-token)
-  --tenant-name NAME       Tenant subdomain (e.g. "alice")
+Optional tunnel (frpc):
+  --tunnel                 Enable optional frpc tunnel setup
+  --tenant-name NAME       Tenant subdomain (e.g. "alice") for public access
   --frps-token TOKEN       frps auth token
   --frps-token-file FILE   Read frps auth token from FILE
   --frps-server ADDR       frps server address (default: 163.192.33.32)
@@ -1032,10 +1032,10 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 # ── Tunnel-only update (when octos is already installed) ─────────────
 # ══════════════════════════════════════════════════════════════════════
-# If octos binary exists and user passed --tenant-name or --frps-token,
+# If octos binary exists and tunnel is explicitly enabled,
 # skip the full install and just update the tunnel configuration.
 
-if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; }; then
+if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
     section "Updating tunnel configuration"
 
     # Fill in missing values from existing frpc config
@@ -1046,10 +1046,24 @@ if [ -f "$PREFIX/octos" ] && { [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; };
                 ok "tenant name from existing config: $TENANT_NAME"
             fi
         fi
+        if [ "$TUNNEL_DOMAIN" = "octos-cloud.org" ]; then
+            EXISTING_TUNNEL_DOMAIN=$(grep 'customDomains' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*\["[^"]*\.\([^"]*\)"\].*/\1/')
+            if [ -n "$EXISTING_TUNNEL_DOMAIN" ] && [ "$EXISTING_TUNNEL_DOMAIN" != "octos-cloud.org" ]; then
+                TUNNEL_DOMAIN="$EXISTING_TUNNEL_DOMAIN"
+                ok "tunnel domain from existing config: $TUNNEL_DOMAIN"
+            fi
+        fi
         if [ -z "$FRPS_TOKEN" ]; then
             FRPS_TOKEN=$(grep 'auth.token' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
             if [ -n "$FRPS_TOKEN" ]; then
                 ok "frps token from existing config: ${FRPS_TOKEN:0:8}..."
+            fi
+        fi
+        if [ "$FRPS_SERVER" = "163.192.33.32" ]; then
+            EXISTING_FRPS_SERVER=$(grep 'serverAddr' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            if [ -n "$EXISTING_FRPS_SERVER" ] && [ "$EXISTING_FRPS_SERVER" != "163.192.33.32" ]; then
+                FRPS_SERVER="$EXISTING_FRPS_SERVER"
+                ok "frps server from existing config: $FRPS_SERVER"
             fi
         fi
         if [ "$SSH_PORT" = "6001" ]; then
@@ -1297,6 +1311,26 @@ for bin in "$INSTALL_TMP"/*; do
 done
 ok "binaries installed to $PREFIX"
 
+# Save install and doctor scripts for later use.
+# Try copying the running script first; fall back to downloading from the release.
+SCRIPT_SELF="${BASH_SOURCE[0]:-$0}"
+RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases/latest/download"
+if [ -f "$SCRIPT_SELF" ] && [ "$(wc -l < "$SCRIPT_SELF" 2>/dev/null)" -gt 10 ]; then
+    cp "$SCRIPT_SELF" "$PREFIX/install.sh"
+else
+    curl -fsSL -o "$PREFIX/install.sh" "${RELEASE_BASE}/install.sh" 2>/dev/null || true
+fi
+[ -f "$PREFIX/install.sh" ] && chmod +x "$PREFIX/install.sh"
+if [ ! -f "$PREFIX/octos-doctor.sh" ]; then
+    curl -fsSL -o "$PREFIX/octos-doctor.sh" "${RELEASE_BASE}/octos-doctor.sh" 2>/dev/null || true
+fi
+[ -f "$PREFIX/octos-doctor.sh" ] && chmod +x "$PREFIX/octos-doctor.sh"
+if [ -f "$PREFIX/install.sh" ]; then
+    ok "scripts saved to $PREFIX"
+else
+    warn "could not save helper scripts to $PREFIX"
+fi
+
 # Clear quarantine and sign on macOS
 if [ "$OS" = "Darwin" ]; then
     for bin in "$PREFIX"/*; do
@@ -1356,13 +1390,28 @@ if [ ! -f "$DATA_DIR/config.json" ]; then
         # No key detected — use openai as default, user must configure
         _PROV="openai"; _MODEL="gpt-4.1-mini"; _ENV="OPENAI_API_KEY"
     fi
+    _MODE="local"
+    _EXTRA_CONFIG=""
+    if [ -n "$TENANT_NAME" ] || [ "$ENABLE_TUNNEL" = true ]; then
+        _MODE="tenant"
+    fi
+    if [ "$ENABLE_TUNNEL" = true ]; then
+        _EXTRA_CONFIG=$(cat <<INITEOF
+,
+  "tunnel_domain": "$TUNNEL_DOMAIN",
+  "frps_server": "$FRPS_SERVER"
+INITEOF
+)
+    fi
     cat > "$DATA_DIR/config.json" << INITEOF
 {
   "provider": "$_PROV",
   "model": "$_MODEL",
-  "api_key_env": "$_ENV"
+  "api_key_env": "$_ENV",
+  "mode": "$_MODE"$_EXTRA_CONFIG
 }
 INITEOF
+    chmod 600 "$DATA_DIR/config.json"
     ok "auto-detected provider: $_PROV ($_ENV)"
 fi
 [ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'INITEOF'
@@ -1429,6 +1478,7 @@ if [ -n "$CADDY_DOMAIN" ] && [ "$OS" = "Linux" ]; then
         warn "no firewall manager found (ufw/firewalld) — ensure ports 80 and 443 are accessible"
     fi
 fi
+
 
 # ── Tunnel setup (frpc) ──────────────────────────────────────────────
 if [ "$ENABLE_TUNNEL" = true ]; then
@@ -1677,11 +1727,16 @@ echo "  Next steps:"
 echo "    1. Set your API key:  export ${_ENV:-OPENAI_API_KEY}=sk-..."
 echo "    2. Install skills:    octos skills install --all"
 echo "    3. Start chatting:    octos chat"
-echo "    4. Open dashboard:    http://localhost:${PORT}/admin/"
-if [ -n "$TENANT_NAME" ]; then
+echo "    4. Open local dashboard: http://localhost:${PORT}/admin/"
+if [ "$ENABLE_TUNNEL" = true ] && [ -n "$TENANT_NAME" ]; then
     echo ""
-    echo "  Tunnel:"
+    echo "  Public tunnel:"
     echo "    Dashboard:  https://${TENANT_NAME}.${TUNNEL_DOMAIN}"
+elif [ -n "$TENANT_NAME" ]; then
+    echo ""
+    echo "  Reserved public name:"
+    echo "    ${TENANT_NAME}.${TUNNEL_DOMAIN}"
+    echo "    To enable public access, re-run with --tunnel"
 fi
 if [ -n "$CADDY_DOMAIN" ]; then
     echo ""
@@ -1696,5 +1751,12 @@ echo "    Status:  $(svc_hint status serve)"
 echo "    Stop:    $(svc_hint stop serve)"
 echo "    Start:   $(svc_hint start serve)"
 echo ""
-echo "  Troubleshoot: curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- --doctor"
+echo "  Later:"
+if [ -f "$PREFIX/install.sh" ]; then
+    echo "    Enable tunnel:  $PREFIX/install.sh --tunnel"
+    echo "    Diagnose:       $PREFIX/install.sh --doctor"
+else
+    echo "    Enable tunnel:  curl -fsSL ${RELEASE_BASE}/install.sh | bash -s -- --tunnel"
+    echo "    Diagnose:       curl -fsSL ${RELEASE_BASE}/install.sh | bash -s -- --doctor"
+fi
 echo ""

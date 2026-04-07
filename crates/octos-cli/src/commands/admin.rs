@@ -58,9 +58,6 @@ pub enum AdminAction {
     ShowTenantConfig {
         /// Tenant ID.
         name: String,
-        /// frps master auth token (or set FRPS_TOKEN env var).
-        #[arg(long)]
-        frps_token: Option<String>,
         /// Base domain for the tunnel.
         #[arg(long, default_value = "octos-cloud.org")]
         domain: String,
@@ -111,6 +108,7 @@ impl Executable for AdminCommand {
                     ssh_port,
                     local_port,
                     auth_token: auth_token.clone(),
+                    owner: String::new(),
                     status: TenantStatus::Pending,
                     created_at: now,
                     updated_at: now,
@@ -179,7 +177,6 @@ impl Executable for AdminCommand {
             }
             AdminAction::ShowTenantConfig {
                 name,
-                frps_token,
                 domain,
                 server,
                 port,
@@ -192,11 +189,7 @@ impl Executable for AdminCommand {
                     .get(&name)?
                     .ok_or_else(|| eyre::eyre!("tenant '{name}' not found"))?;
 
-                let frps_token = frps_token
-                    .or_else(|| std::env::var("FRPS_TOKEN").ok())
-                    .ok_or_else(|| eyre::eyre!("--frps-token or FRPS_TOKEN env var required"))?;
-
-                let config = render_frpc_config(&tenant, &server, port, &frps_token, &domain);
+                let config = render_frpc_config(&tenant, &server, port, &domain);
                 println!("{config}");
 
                 Ok(())

@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod auth_handlers;
+mod frps_plugin;
 mod handlers;
 pub mod metrics;
 mod router;
@@ -66,6 +67,8 @@ pub struct AppState {
     pub frps_server: Option<String>,
     /// frps control port.
     pub frps_port: Option<u16>,
+    /// Deployment mode (local, tenant, or cloud).
+    pub deployment_mode: crate::config::DeploymentMode,
     /// Whether the admin shell endpoint is enabled (default: false).
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.

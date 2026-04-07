@@ -6,6 +6,7 @@ on:
     branches: [main]
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
   FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard"
@@ -14,9 +15,9 @@ jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -46,13 +47,13 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.33.1
 
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -77,7 +78,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -101,7 +102,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -123,7 +124,7 @@ jobs:
   check-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -145,7 +146,7 @@ jobs:
     needs: check
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -162,7 +163,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-aarch64-apple-darwin
           path: octos-bundle-aarch64-apple-darwin.tar.gz
@@ -173,7 +174,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -190,7 +191,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-x86_64-unknown-linux-gnu
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
@@ -201,7 +202,7 @@ jobs:
     needs: check-arm
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -220,7 +221,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-aarch64-unknown-linux-gnu
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
@@ -231,7 +232,7 @@ jobs:
     needs: check-windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -251,7 +252,7 @@ jobs:
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-x86_64-pc-windows-msvc
           path: octos-bundle-x86_64-pc-windows-msvc.zip
@@ -267,13 +268,13 @@ jobs:
       contains(github.event.pull_request.title, 'sandbox') ||
       contains(github.event.pull_request.title, 'activate')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -335,7 +336,7 @@ jobs:
       contains(github.event.pull_request.title, 'security') ||
       contains(github.event.pull_request.title, 'sandbox')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 2
 

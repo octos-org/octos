@@ -11,7 +11,7 @@ Pull the latest source and rebuild:
 ```bash
 cd octos
 git pull origin main
-./scripts/local-deploy.sh --full   # Rebuilds and reinstalls
+./scripts/local-tenant-deploy.sh --full   # Rebuilds and reinstalls
 ```
 
 If running as a service, restart it after the upgrade:

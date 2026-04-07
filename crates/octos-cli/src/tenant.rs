@@ -37,6 +37,9 @@ pub struct TenantConfig {
     /// Dashboard auth token for this tenant's octos serve instance.
     #[serde(default)]
     pub auth_token: String,
+    /// User ID of the owner who registered this tenant (empty for admin-created).
+    #[serde(default, alias = "email")]
+    pub owner: String,
     /// Current tunnel status.
     #[serde(default)]
     pub status: TenantStatus,
@@ -188,6 +191,25 @@ impl TenantStore {
         bail!("SSH port pool exhausted ({SSH_PORT_START}–{SSH_PORT_END})")
     }
 
+    /// Find a tenant by its tunnel auth token.
+    pub fn find_by_tunnel_token(&self, token: &str) -> Result<Option<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all.into_iter().find(|t| t.tunnel_token == token))
+    }
+
+    /// Find tenant(s) belonging to a user.
+    ///
+    /// Checks the `owner` field against all provided identifiers (user ID,
+    /// email, etc.) to handle legacy tenants that stored the full email
+    /// address instead of the user ID slug.
+    pub fn find_by_owner(&self, identifiers: &[&str]) -> Result<Vec<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all
+            .into_iter()
+            .filter(|t| !t.owner.is_empty() && identifiers.iter().any(|id| t.owner == *id))
+            .collect())
+    }
+
     fn tenant_path(&self, id: &str) -> PathBuf {
         self.tenants_dir.join(format!("{id}.json"))
     }
@@ -215,19 +237,18 @@ fn validate_tenant_id(id: &str) -> Result<()> {
 
 /// Generate the frpc TOML config for a tenant by filling the template.
 ///
-/// `frps_token` is the shared frps master token (NOT the per-tenant tunnel_token).
+/// Uses the tenant's `tunnel_token` for per-tenant frps authentication.
 pub fn render_frpc_config(
     tenant: &TenantConfig,
     frps_server: &str,
     frps_port: u16,
-    frps_token: &str,
     tunnel_domain: &str,
 ) -> String {
     let template = include_str!("../../../scripts/frp/tenant-frpc.toml.template");
     template
         .replace("{{FRPS_SERVER}}", frps_server)
         .replace("{{FRPS_PORT}}", &frps_port.to_string())
-        .replace("{{FRPS_TOKEN}}", frps_token)
+        .replace("{{FRPS_TOKEN}}", &tenant.tunnel_token)
         .replace("{{SUBDOMAIN}}", &tenant.subdomain)
         .replace("{{LOCAL_PORT}}", &tenant.local_port.to_string())
         .replace("{{SSH_REMOTE_PORT}}", &tenant.ssh_port.to_string())
@@ -305,6 +326,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -313,14 +335,12 @@ mod tests {
             &tenant,
             "163.192.33.32",
             7000,
-            "master-secret",
             "octos-cloud.org",
         );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        assert!(config.contains("auth.token = \"master-secret\""));
-        // Must NOT contain the per-tenant token
-        assert!(!config.contains("test-token-123"));
+        // Uses the per-tenant tunnel_token for auth
+        assert!(config.contains("auth.token = \"test-token-123\""));
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));
@@ -341,6 +361,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -368,6 +389,7 @@ mod tests {
                 ssh_port: 6001 + id.len() as u16,
                 local_port: 8080,
                 auth_token: format!("auth-{id}"),
+                owner: String::new(),
                 status: TenantStatus::Pending,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -399,6 +421,7 @@ mod tests {
             ssh_port: SSH_PORT_START,
             local_port: 8080,
             auth_token: "test-auth".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -422,6 +445,7 @@ mod tests {
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
+            owner: String::new(),
             status: TenantStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),

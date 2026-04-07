@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local deployment for octos on macOS and Linux.
-# Usage: ./scripts/local-deploy.sh [OPTIONS]
+# Usage: ./scripts/local-tenant-deploy.sh [OPTIONS]
 #
 # Options:
 #   --minimal          CLI + chat only (no channels, no dashboard)
@@ -77,6 +77,93 @@ section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
 err()     { echo "    ERROR: $1"; exit 1; }
+
+detect_provider_defaults() {
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="anthropic"; DETECTED_MODEL="claude-sonnet-4-20250514"; DETECTED_ENV="ANTHROPIC_API_KEY"
+    elif [ -n "${GEMINI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="gemini"; DETECTED_MODEL="gemini-2.5-flash"; DETECTED_ENV="GEMINI_API_KEY"
+    elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="deepseek"; DETECTED_MODEL="deepseek-chat"; DETECTED_ENV="DEEPSEEK_API_KEY"
+    elif [ -n "${KIMI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="moonshot"; DETECTED_MODEL="kimi-k2.5"; DETECTED_ENV="KIMI_API_KEY"
+    elif [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="dashscope"; DETECTED_MODEL="qwen3.5-plus"; DETECTED_ENV="DASHSCOPE_API_KEY"
+    else
+        DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
+    fi
+}
+
+write_runtime_config() {
+    local config_path="$DATA_DIR/config.json"
+    local mode="local"
+    detect_provider_defaults
+
+    if { [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; } || [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; then
+        mode="tenant"
+    fi
+
+    if [ -f "$config_path" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$config_path" "$mode" "$TUNNEL_DOMAIN" "$FRPS_SERVER" \
+            "$DETECTED_PROVIDER" "$DETECTED_MODEL" "$DETECTED_ENV" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+tunnel_domain = sys.argv[3]
+frps_server = sys.argv[4]
+provider = sys.argv[5]
+model = sys.argv[6]
+api_key_env = sys.argv[7]
+
+data = {}
+if config_path.exists():
+    with config_path.open() as fh:
+        data = json.load(fh)
+
+data.setdefault("provider", provider)
+data.setdefault("model", model)
+data.setdefault("api_key_env", api_key_env)
+data["mode"] = mode
+if mode == "tenant":
+    data["tunnel_domain"] = tunnel_domain
+    data["frps_server"] = frps_server
+else:
+    data.pop("tunnel_domain", None)
+    data.pop("frps_server", None)
+
+config_path.write_text(json.dumps(data, indent=2) + "\n")
+PYEOF
+    elif [ ! -f "$config_path" ]; then
+        local extra_config=""
+        if [ "$mode" = "tenant" ]; then
+            extra_config=$(cat <<EOF
+,
+  "tunnel_domain": "$TUNNEL_DOMAIN",
+  "frps_server": "$FRPS_SERVER"
+EOF
+)
+        fi
+        cat > "$config_path" <<EOF
+{
+  "provider": "$DETECTED_PROVIDER",
+  "model": "$DETECTED_MODEL",
+  "api_key_env": "$DETECTED_ENV",
+  "mode": "$mode"$extra_config
+}
+EOF
+    else
+        warn "python3 not found; leaving existing $config_path unchanged"
+        return 0
+    fi
+
+    chmod 600 "$config_path"
+    ok "runtime config: $config_path"
+}
 
 # ── Uninstall ─────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
@@ -257,12 +344,18 @@ fi
 # ── Initialize ────────────────────────────────────────────────────────
 section "Initializing octos workspace"
 
-if [ ! -d "$DATA_DIR" ]; then
-    "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
-    ok "created $DATA_DIR"
-else
-    ok "$DATA_DIR already exists (skipping init)"
-fi
+mkdir -p "$DATA_DIR"/{profiles,memory,sessions,skills,logs,research,history}
+write_runtime_config
+[ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'EOF'
+# Ignore task state and database files
+tasks/
+sessions/
+*.redb
+EOF
+[ ! -f "$DATA_DIR/AGENTS.md" ] && printf '# Agent Instructions\n\nCustomize agent behavior and guidelines here.\n' > "$DATA_DIR/AGENTS.md"
+[ ! -f "$DATA_DIR/SOUL.md" ]   && printf '# Soul — Who You Are\n\n## Core Principles\n\n- Help, don'\''t perform. Skip filler phrases — just do the thing.\n- Be resourceful. Come back with answers, not questions.\n- Have a voice. You can disagree and suggest alternatives.\n- Match the medium. Telegram gets concise replies. CLI gets detail.\n\n## Trust & Safety\n\n- Private things stay private.\n- External actions need care. Internal actions are yours.\n- Never send half-finished replies to messaging channels.\n' > "$DATA_DIR/SOUL.md"
+[ ! -f "$DATA_DIR/USER.md" ]   && printf '# User Info\n\nAdd your information and preferences here.\n' > "$DATA_DIR/USER.md"
+ok "data dir ready: $DATA_DIR"
 
 # ── Service setup ─────────────────────────────────────────────────────
 if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
@@ -426,17 +519,11 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     fi
 
     if [ -z "$FRPS_TOKEN" ]; then
-        TOKEN_FILE="$HOME/home/orcl-vps/frps-token.txt"
-        if [ -f "$TOKEN_FILE" ]; then
-            FRPS_TOKEN=$(cat "$TOKEN_FILE")
-            echo "    frps token loaded from $TOKEN_FILE"
-        else
-            echo ""
-            echo "    Enter the frps auth token (shared secret from VPS setup):"
-            printf "    > "
-            read -r FRPS_TOKEN < /dev/tty
-            [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
-        fi
+        echo ""
+        echo "    Enter the frps auth token from your registration email or setup command:"
+        printf "    > "
+        read -r FRPS_TOKEN < /dev/tty
+        [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
     fi
 
     # ── Show summary before proceeding ────────────────────────────────
