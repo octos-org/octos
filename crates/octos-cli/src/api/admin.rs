@@ -3221,7 +3221,7 @@ pub async fn register_tenant(
 
 /// Response from POST /api/register — only fields the client needs.
 /// Excludes tunnel_token and owner (internal/secret).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     pub id: String,
     pub subdomain: String,
@@ -3596,6 +3596,298 @@ mod register_tenant_email_tests {
 
         assert_eq!(response.0.subdomain, "macmini");
         assert_eq!(response.0.dashboard_url, "https://macmini.octos-cloud.org");
+    }
+}
+
+#[cfg(test)]
+mod register_flow_tests {
+    use super::*;
+    use crate::api::{AppState, SseBroadcaster};
+    use crate::api::router::AuthIdentity;
+    use crate::config::DeploymentMode;
+    use crate::user_store::{User, UserRole, UserStore};
+    use std::sync::Arc;
+
+    fn test_state(dir: &tempfile::TempDir, mode: DeploymentMode) -> (Arc<AppState>, Arc<UserStore>) {
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            started_at: chrono::Utc::now(),
+            auth_token: None,
+            metrics_handle: None,
+            profile_store: None,
+            process_manager: None,
+            user_store: Some(user_store.clone()),
+            auth_manager: None,
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            tenant_store: Some(Arc::new(crate::tenant::TenantStore::open(dir.path()).unwrap())),
+            tunnel_domain: Some("octos-cloud.org".into()),
+            frps_server: Some("163.192.33.32".into()),
+            frps_port: Some(7000),
+            deployment_mode: mode,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        });
+        (state, user_store)
+    }
+
+    fn alice_identity() -> axum::Extension<AuthIdentity> {
+        axum::Extension(AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        })
+    }
+
+    fn save_alice(user_store: &UserStore) {
+        user_store.save(&User {
+            id: "alice".into(),
+            email: "alice@example.com".into(),
+            name: "Alice".into(),
+            role: UserRole::User,
+            created_at: chrono::Utc::now(),
+            last_login_at: None,
+        }).unwrap();
+    }
+
+    // ── Happy path ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_register_tenant_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let resp = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap();
+
+        assert_eq!(resp.0.subdomain, "macmini");
+        assert_eq!(resp.0.ssh_port, 6001);
+        assert_eq!(resp.0.dashboard_url, "https://macmini.octos-cloud.org");
+        assert!(!resp.0.auth_token.is_empty());
+        assert!(resp.0.setup_command_unix.contains("--tenant-name"));
+        assert!(resp.0.setup_command_unix.contains("macmini"));
+        assert!(resp.0.setup_command_windows.contains("-TenantName"));
+        assert!(resp.0.setup_command_windows.contains("macmini"));
+    }
+
+    // ── Duplicate tenant name ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_duplicate_tenant_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+        // Save bob so alice's second attempt uses a different user
+        user_store.save(&User {
+            id: "bob".into(),
+            email: "bob@example.com".into(),
+            name: "Bob".into(),
+            role: UserRole::User,
+            created_at: chrono::Utc::now(),
+            last_login_at: None,
+        }).unwrap();
+
+        // Alice registers "macmini"
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap();
+
+        // Bob tries the same name
+        let err = register_tenant(
+            axum::extract::State(state),
+            axum::Extension(AuthIdentity::User { id: "bob".into(), role: UserRole::User }),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("already taken"));
+    }
+
+    // ── One tenant per user ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_second_tenant_for_same_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "first".into(), local_port: 8080 }),
+        ).await.unwrap();
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "second".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("already have a tenant"));
+    }
+
+    // ── Name validation ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_invalid_tenant_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        for bad_name in &["-leading", "trailing-", "UPPER", "under_score", "a b", ""] {
+            let err = register_tenant(
+                axum::extract::State(state.clone()),
+                alice_identity(),
+                Json(CreateTenantRequest { name: bad_name.to_string(), local_port: 8080 }),
+            ).await.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "expected 400 for name '{bad_name}'");
+        }
+    }
+
+    // ── Non-cloud mode blocked ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_registration_in_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Local);
+        save_alice(&user_store);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn should_reject_registration_in_tenant_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Tenant);
+        save_alice(&user_store);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ── Admin token blocked ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_admin_token_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = test_state(&dir, DeploymentMode::Cloud);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            axum::Extension(AuthIdentity::Admin),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Setup script: no tenant ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn setup_script_should_404_when_no_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let err = register_setup_script(
+            axum::extract::State(state),
+            alice_identity(),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ── Setup script: happy path ────────────────────────────────────
+
+    #[tokio::test]
+    async fn setup_script_should_return_script_for_registered_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "macmini".into(), local_port: 8080 }),
+        ).await.unwrap();
+
+        let script = register_setup_script(
+            axum::extract::State(state),
+            alice_identity(),
+        ).await.unwrap();
+
+        assert!(script.contains("--tenant-name \"macmini\""));
+        assert!(script.contains("--domain \"octos-cloud.org\""));
+        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--ssh-port"));
+        assert!(script.contains("--frps-token"));
+    }
+
+    // ── Legacy email owner matching ─────────────────────────────────
+
+    #[tokio::test]
+    async fn should_find_tenant_by_legacy_email_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        // Simulate a legacy tenant with full email as owner
+        let store = state.tenant_store.as_ref().unwrap();
+        let now = chrono::Utc::now();
+        store.save(&crate::tenant::TenantConfig {
+            id: "legacy".into(),
+            name: "legacy".into(),
+            subdomain: "legacy".into(),
+            tunnel_token: uuid::Uuid::new_v4().to_string(),
+            ssh_port: 6005,
+            local_port: 8080,
+            auth_token: "tok".into(),
+            owner: "alice@example.com".into(), // legacy format
+            status: crate::tenant::TenantStatus::Pending,
+            created_at: now,
+            updated_at: now,
+        }).unwrap();
+
+        // Alice (user_id="alice") should find the legacy tenant
+        let err = register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest { name: "new-one".into(), local_port: 8080 }),
+        ).await.unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("legacy"));
+
+        // Setup script should also find it
+        let script = register_setup_script(
+            axum::extract::State(state),
+            alice_identity(),
+        ).await.unwrap();
+
+        assert!(script.contains("--tenant-name \"legacy\""));
     }
 }
 

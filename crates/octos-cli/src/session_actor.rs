@@ -4120,6 +4120,7 @@ mod tests {
                 ..Default::default()
             },
             llm: provider.clone(),
+            llm_strong: provider.clone(),
             llm_for_compaction: provider.clone(),
             memory,
             system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),

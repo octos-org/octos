@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# cloud-host-deploy.sh — Bootstrap a Linux VPS as an Octos cloud/host server.
+# cloud-host-deploy.sh — Bootstrap a server as an Octos cloud/host relay.
+# Supports Linux (systemd) and macOS (launchd).
 # Reuses install.sh for octos serve, then provisions frps and Caddy.
 #
 # Usage:
@@ -88,7 +89,7 @@ while [ $# -gt 0 ]; do
         --dry-run)           DRY_RUN=true; shift ;;
         --help|-h)
             cat <<'HELPEOF'
-cloud-host-deploy.sh — Bootstrap a Linux VPS as an Octos cloud/host server.
+cloud-host-deploy.sh — Bootstrap a server (Linux or macOS) as an Octos cloud/host relay.
 
 Usage:
   ./scripts/cloud-host-deploy.sh
@@ -373,13 +374,17 @@ run_setup_caddy() {
     fi
 }
 
-if [ "$(uname -s)" != "Linux" ]; then
-    if [ "$DRY_RUN" = true ]; then
-        warn "dry-run mode on non-Linux host; real cloud bootstrap requires Linux/systemd"
-    else
-        err "cloud host bootstrap currently supports Linux/systemd hosts only. Run this on a Linux VPS. Use --dry-run locally to preview the commands."
-    fi
-fi
+OS="$(uname -s)"
+case "$OS" in
+    Linux|Darwin) ;;
+    *)
+        if [ "$DRY_RUN" = true ]; then
+            warn "dry-run mode on unsupported OS ($OS); cloud bootstrap supports Linux and macOS"
+        else
+            err "cloud host bootstrap supports Linux and macOS only (detected: $OS)"
+        fi
+        ;;
+esac
 
 [ -f "$INSTALL_SCRIPT" ] || err "missing install script: $INSTALL_SCRIPT"
 [ -f "$FRPS_SCRIPT" ] || err "missing frps setup script: $FRPS_SCRIPT"

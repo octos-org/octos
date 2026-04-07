@@ -122,8 +122,41 @@ fi
 
 echo "    Wrote config to ${CONFIG_FILE}"
 
-# ── Create systemd service ────────────────────────────────────────────
-sudo tee /etc/systemd/system/frps.service > /dev/null << EOF
+# ── Create system service ─────────────────────────────────────────────
+case "$(uname -s)" in
+    Darwin)
+        PLIST="/Library/LaunchDaemons/io.octos.frps.plist"
+        sudo tee "$PLIST" > /dev/null << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frps</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/frps</string>
+        <string>-c</string>
+        <string>${CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/frps.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/frps.log</string>
+</dict>
+</plist>
+EOF
+        sudo launchctl unload "$PLIST" 2>/dev/null || true
+        sudo chown root:wheel "$PLIST"
+        sudo chmod 644 "$PLIST"
+        sudo launchctl load "$PLIST"
+        ;;
+    *)
+        sudo tee /etc/systemd/system/frps.service > /dev/null << EOF
 [Unit]
 Description=frps tunnel relay server
 After=network.target
@@ -138,16 +171,17 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable frps
-sudo systemctl restart frps
+        sudo systemctl daemon-reload
+        sudo systemctl enable frps
+        sudo systemctl restart frps
+        ;;
+esac
 
 echo "==> frps is running"
 echo "    Control port: ${FRPS_BIND_PORT}"
 echo "    vHost HTTP:   ${FRPS_VHOST_HTTP_PORT}"
 echo "    vHost HTTPS:  ${FRPS_VHOST_HTTPS_PORT}"
-echo "    Dashboard:    http://$(hostname -I | awk '{print $1}'):${FRPS_DASHBOARD_PORT}"
+echo "    Dashboard:    http://localhost:${FRPS_DASHBOARD_PORT}"
 echo "    Dashboard pw: ${FRPS_DASHBOARD_PASSWORD}"
 echo ""
 echo "==> Firewall: ensure these ports are open:"

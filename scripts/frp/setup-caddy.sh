@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-caddy.sh — Install Caddy on VPS as reverse proxy for octos serve and frps.
+# setup-caddy.sh — Install Caddy as reverse proxy for octos serve and frps (Linux/macOS).
 # Supports HTTP-only mode (default) or HTTPS with wildcard certs via DNS challenge.
 # Idempotent: safe to re-run.
 #
@@ -27,6 +27,20 @@ OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
 FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8081}"
 ENABLE_HTTPS=false
 DNS_PROVIDER=""
+
+sed_in_place() {
+    local file="$1"
+    shift
+    local tmp
+    tmp=$(mktemp /tmp/caddy-sed.XXXXXX)
+    sed "$@" "$file" >"$tmp"
+    if [ -w "$file" ]; then
+        cat "$tmp" >"$file"
+    else
+        sudo install -m 0644 "$tmp" "$file"
+    fi
+    rm -f "$tmp"
+}
 
 # ── Parse arguments ───────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -101,6 +115,52 @@ if [ "$ENABLE_HTTPS" = true ]; then
     esac
 fi
 
+launchd_env_dict() {
+    cat <<EOF
+        <key>XDG_DATA_HOME</key>
+        <string>/var/lib/caddy/data</string>
+        <key>XDG_CONFIG_HOME</key>
+        <string>/var/lib/caddy/config</string>
+EOF
+
+    case "$DNS_PROVIDER" in
+        cloudflare)
+            [ -n "${CF_API_TOKEN:-}" ] && cat <<EOF
+        <key>CF_API_TOKEN</key>
+        <string>${CF_API_TOKEN}</string>
+EOF
+            ;;
+        route53)
+            [ -n "${AWS_ACCESS_KEY_ID:-}" ] && cat <<EOF
+        <key>AWS_ACCESS_KEY_ID</key>
+        <string>${AWS_ACCESS_KEY_ID}</string>
+EOF
+            [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && cat <<EOF
+        <key>AWS_SECRET_ACCESS_KEY</key>
+        <string>${AWS_SECRET_ACCESS_KEY}</string>
+EOF
+            ;;
+        digitalocean)
+            [ -n "${DO_AUTH_TOKEN:-}" ] && cat <<EOF
+        <key>DO_AUTH_TOKEN</key>
+        <string>${DO_AUTH_TOKEN}</string>
+EOF
+            ;;
+        godaddy)
+            [ -n "${GODADDY_API_KEY:-}" ] && cat <<EOF
+        <key>GODADDY_API_KEY</key>
+        <string>${GODADDY_API_KEY}</string>
+EOF
+            [ -n "${GODADDY_API_SECRET:-}" ] && cat <<EOF
+        <key>GODADDY_API_SECRET</key>
+        <string>${GODADDY_API_SECRET}</string>
+EOF
+            ;;
+    esac
+}
+
+LAUNCHD_ENV_DICT="$(launchd_env_dict)"
+
 # ── Install Caddy ────────────────────────────────────────────────────
 install_caddy() {
     if [ "$ENABLE_HTTPS" = true ]; then
@@ -121,7 +181,8 @@ install_caddy() {
     else
         # Standard Caddy binary (no plugins needed)
         echo "    Downloading standard Caddy..."
-        curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}" -o /tmp/caddy
+        CADDY_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        curl -fsSL "https://caddyserver.com/api/download?os=${CADDY_OS}&arch=${CADDY_ARCH}" -o /tmp/caddy
         sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
         rm -f /tmp/caddy
     fi
@@ -155,7 +216,7 @@ TESTEOF
             route53)       TEST_TOKEN="test" ;;
             godaddy)       TEST_TOKEN="${GODADDY_API_KEY}" ;;
         esac
-        sed -i "s|__TEST_TOKEN__|${TEST_TOKEN}|g" "$TEST_CADDYFILE"
+        sed_in_place "$TEST_CADDYFILE" -e "s|__TEST_TOKEN__|${TEST_TOKEN}|g"
         if caddy validate --config "$TEST_CADDYFILE" 2>&1 | grep -qi "invalid\|error"; then
             echo "    Module rejects token format, rebuilding with latest version..."
             NEEDS_INSTALL=true
@@ -244,26 +305,66 @@ CADDYEOF
 fi
 
 # Substitute shell variables into the Caddyfile (Caddy placeholders like {host} are preserved)
-sudo sed -i \
+sed_in_place /etc/caddy/Caddyfile \
     -e "s|__DOMAIN__|${TUNNEL_DOMAIN}|g" \
     -e "s|__ESCAPED_DOMAIN__|${ESCAPED_DOMAIN}|g" \
     -e "s|__SERVE_PORT__|${OCTOS_SERVE_PORT}|g" \
     -e "s|__FRPS_VHOST_PORT__|${FRPS_VHOST_HTTP_PORT}|g" \
     -e "s|__DNS_PROVIDER__|${DNS_PROVIDER}|g" \
-    -e "s|__DNS_CONFIG_BLOCK__|${DNS_CONFIG_BLOCK}|g" \
-    /etc/caddy/Caddyfile
+    -e "s|__DNS_CONFIG_BLOCK__|${DNS_CONFIG_BLOCK}|g"
 
 echo "    Wrote Caddyfile to /etc/caddy/Caddyfile"
 
-# ── Create caddy user if doesn't exist ────────────────────────────────
-if ! id caddy &>/dev/null; then
-    sudo useradd --system --home /var/lib/caddy --shell /usr/sbin/nologin caddy || true
-fi
-sudo mkdir -p /var/lib/caddy
-sudo chown caddy:caddy /var/lib/caddy
+# ── Create system service ─────────────────────────────────────────────
+CADDY_BIN="$(command -v caddy)"
 
-# ── Create systemd service ────────────────────────────────────────────
-sudo tee /etc/systemd/system/caddy.service > /dev/null << EOF
+case "$(uname -s)" in
+    Darwin)
+        PLIST="/Library/LaunchDaemons/io.octos.caddy.plist"
+        sudo tee "$PLIST" > /dev/null << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.caddy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CADDY_BIN}</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>/etc/caddy/Caddyfile</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/caddy.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+${LAUNCHD_ENV_DICT}
+    </dict>
+</dict>
+</plist>
+EOF
+        sudo mkdir -p /var/lib/caddy
+        sudo launchctl unload "$PLIST" 2>/dev/null || true
+        sudo chown root:wheel "$PLIST"
+        sudo chmod 644 "$PLIST"
+        sudo launchctl load "$PLIST"
+        ;;
+    *)
+        # Create caddy user if doesn't exist (Linux)
+        if ! id caddy &>/dev/null; then
+            sudo useradd --system --home /var/lib/caddy --shell /usr/sbin/nologin caddy || true
+        fi
+        sudo mkdir -p /var/lib/caddy
+        sudo chown caddy:caddy /var/lib/caddy
+
+        sudo tee /etc/systemd/system/caddy.service > /dev/null << EOF
 [Unit]
 Description=Caddy reverse proxy for octos tunnel
 After=network.target frps.service
@@ -272,8 +373,8 @@ After=network.target frps.service
 Type=simple
 User=caddy
 Group=caddy
-ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
-ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile
+ExecStart=${CADDY_BIN} run --config /etc/caddy/Caddyfile
+ExecReload=${CADDY_BIN} reload --config /etc/caddy/Caddyfile
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
@@ -285,20 +386,25 @@ $([ -n "$DNS_ENV_LINE" ] && echo -e "$DNS_ENV_LINE" || true)
 [Install]
 WantedBy=multi-user.target
 EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable caddy
-sudo systemctl restart caddy
+        sudo systemctl daemon-reload
+        sudo systemctl enable caddy
+        sudo systemctl restart caddy
+        ;;
+esac
 
 # ── Verify Caddy is running ──────────────────────────────────────────
 echo ""
 echo "==> Verifying Caddy..."
 sleep 2
-if systemctl is-active --quiet caddy; then
+if pgrep -x caddy > /dev/null 2>&1; then
     echo "    Caddy is running"
 else
     echo "    WARNING: Caddy failed to start. Check logs:"
-    echo "    sudo journalctl -u caddy --no-pager -n 20"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "    tail -50 /var/log/caddy.log"
+    else
+        echo "    sudo journalctl -u caddy --no-pager -n 20"
+    fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────
