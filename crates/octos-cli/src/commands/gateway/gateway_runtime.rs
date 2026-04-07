@@ -1060,6 +1060,9 @@ impl GatewayRuntime {
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
+            llm_strong: super::profile_factory::build_strong_chain(
+                &config, &config.provider.clone().unwrap_or_else(|| "anthropic".to_string()), false,
+            ).unwrap_or_else(|_| llm_for_compaction.clone()),
         };
         let profile_factory_builder =
             profile_store

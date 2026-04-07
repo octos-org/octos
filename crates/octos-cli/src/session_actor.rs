@@ -392,6 +392,8 @@ pub struct ActorFactory {
     pub agent_config: AgentConfig,
     pub llm: Arc<dyn LlmProvider>,
     pub llm_for_compaction: Arc<dyn LlmProvider>,
+    /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
+    pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<String>>,
     pub hooks: Option<Arc<HookExecutor>>,
@@ -671,10 +673,11 @@ impl ActorFactory {
             }
         }
 
-        // Slides sessions use the primary provider directly — the adaptive
-        // router may pick providers that silently hang on 30+ tools / 32KB payloads.
+        // Slides sessions use the strong-only provider chain — failover
+        // between kimi/deepseek/minimax only, excluding weak providers that
+        // hang on 30+ tools. Normal sessions use the full adaptive router.
         let session_llm = if is_slides {
-            self.llm_for_compaction.clone()
+            self.llm_strong.clone()
         } else {
             self.llm.clone()
         };

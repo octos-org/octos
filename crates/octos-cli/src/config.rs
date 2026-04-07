@@ -150,6 +150,15 @@ pub struct FallbackModel {
     /// Published output price in USD per million tokens (for cost-aware routing).
     #[serde(default)]
     pub cost_per_m: Option<f64>,
+    /// Mark as strong model (reliable with 30+ tools, large payloads).
+    /// Used by slides sessions to filter failover candidates.
+    /// Defaults to true for backward compat — set false for weak/proxy providers.
+    #[serde(default = "default_true")]
+    pub strong: bool,
+}
+
+pub fn default_true() -> bool {
+    true
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.

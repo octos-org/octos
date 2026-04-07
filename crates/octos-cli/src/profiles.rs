@@ -191,6 +191,9 @@ pub struct FallbackModelConfig {
     /// Published output price in USD per million tokens (for cost-aware routing).
     #[serde(default)]
     pub cost_per_m: Option<f64>,
+    /// Mark as strong model (reliable with 30+ tools, large payloads).
+    #[serde(default = "crate::config::default_true")]
+    pub strong: bool,
 }
 
 /// Channel-specific credentials (tagged by type).
@@ -744,6 +747,7 @@ pub(crate) fn config_from_profile(
             model_hints: None,
             api_type: fb.api_type.clone(),
             cost_per_m: fb.cost_per_m,
+            strong: fb.strong,
         })
         .collect();
 
