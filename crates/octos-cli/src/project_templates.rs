@@ -39,22 +39,27 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
     std::fs::create_dir_all(project_dir.join("output")).ok();
     std::fs::create_dir_all(project_dir.join("assets")).ok();
 
-    // Initialize memory.md
-    let today = chrono::Utc::now().format("%Y-%m-%d");
-    let memory = format!(
-        "# {} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {}\n- Slides: 0\n",
-        project_name, today
-    );
-    std::fs::write(project_dir.join("memory.md"), &memory).ok();
+    // Only write template files if they don't exist yet — avoid
+    // overwriting LLM-written content on session actor restart.
+    let memory_path = project_dir.join("memory.md");
+    if !memory_path.exists() {
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let memory = format!(
+            "# {} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {}\n- Slides: 0\n",
+            project_name, today
+        );
+        std::fs::write(&memory_path, &memory).ok();
+    }
 
-    // Initialize changelog.md
-    std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n").ok();
+    if !project_dir.join("changelog.md").exists() {
+        std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n").ok();
+    }
 
     // Empty script.js — LLM MUST write real content before mofa_slides can run.
-    // mofa_slides will fail with "missing 'slides' array" on an empty file,
-    // forcing the LLM to go through the design phase first.
-    let template = format!(
-        r#"// {} -- Slides Generation Script
+    let script_path = project_dir.join("script.js");
+    if !script_path.exists() {
+        let template = format!(
+            r#"// {} -- Slides Generation Script
 // EMPTY: The agent must write slide content here before generating.
 // Use mofa_slides with input pointing to this file after writing content.
 //
@@ -66,9 +71,10 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
 
 module.exports = [];
 "#,
-        project_name
-    );
-    std::fs::write(project_dir.join("script.js"), &template).ok();
+            project_name
+        );
+        std::fs::write(&script_path, &template).ok();
+    }
 
     info!(project = %project_name, slug = %slug, "scaffolded slides project");
     project_dir
@@ -82,11 +88,8 @@ pub fn slides_creation_reply(project_name: &str) -> String {
          Project directory: slides/{slug}/\n\
          Script: slides/{slug}/script.js\n\
          Memory: slides/{slug}/memory.md\n\n\
-         Let me help you design your slides. To get started:\n\
-         1. What is this presentation about?\n\
-         2. Preferred visual style? (nb-pro, cyberpunk-neon, or describe your own)\n\
-         3. Approximately how many slides?\n\
-         4. Any images, logos, or branding to include?"
+         Let me help you design your slides. I'll check available style templates first,\n\
+         then we'll design the content together."
     )
 }
 
@@ -94,60 +97,73 @@ pub fn slides_creation_reply(project_name: &str) -> String {
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
     format!(
-        r#"You are a slides designer working on the "{project_name}" project.
-Project directory: slides/{slug}/
+        r#"You are a slides designer for the "{project_name}" project.
+Project dir: slides/{slug}/
 
-BEFORE every response:
-- Read slides/{slug}/memory.md for project context
+ON FIRST MESSAGE:
+1. glob("styles/*.toml") — list available style templates with their [meta].description
+2. Ask the user: topic, style (pick template or describe custom), slide count, any branding/images
 
-VERSIONING RULES:
-- Before ANY edit to script.js: copy to history/v{{NNN}}_{{summary}}.js
-- After ANY edit: update memory.md with what changed and why
-- After ANY generation: save output PPTX with version number
-- Version format: v{{NNN}}_{{short-description}}
+WORKFLOW (follow in order):
+1. STYLE — if user picks a template, use it. If custom, create styles/{{name}}.toml first.
+2. DESIGN — write slides/{slug}/script.js. Show outline to user. Wait for confirmation.
+3. GENERATE — on user confirmation ("生成"/"generate"/"go"), call mofa_slides.
 
-SLIDES WORKFLOW:
-- Phase 1: DESIGN — write script.js with slide content. Do NOT call mofa_slides yet.
-  Present the slide plan to the user for review. Show each slide's title and description.
-  Wait for user confirmation or edits.
-- Phase 2: GENERATE — only when user explicitly says "generate", "生成", "make it", "go ahead",
-  or similar confirmation, THEN call mofa_slides tool.
+RULES:
+- ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
+- BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
+- ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+- NEVER pass slides array inline. ALWAYS use the input file.
+- On failure: report error, do NOT retry via shell.
+- Read slides/{slug}/memory.md before each response for context.
+- After edits: update memory.md. Before edits: copy script.js to history/v{{NNN}}_{{desc}}.js.
 
-CRITICAL RULES (MUST FOLLOW):
-1. DESIGN FIRST: You MUST ask the user what they want BEFORE writing any slides.
-   Do NOT generate slides immediately. Ask about topic, style, and slide count.
-2. WRITE BEFORE GENERATE: After the user describes what they want, write_file("slides/{slug}/script.js")
-   with the full slide content. Show the user a summary. Wait for "generate" confirmation.
-3. TOOL ONLY: ALWAYS use the mofa_slides TOOL. NEVER use shell to run mofa.
-   NEVER run "mofa slides" or "./mofa" via shell. NEVER.
-4. INPUT FILE: Call mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
-5. NO INLINE JSON: Never pass slides array directly in the tool call. Always use the input parameter.
-6. ON FAILURE: Report the error. Do NOT retry via shell.
+STYLE TOML — create at styles/{{name}}.toml when user wants a custom style:
+```toml
+[meta]
+name = "{{name}}"
+display_name = "Display Name"
+description = "One-line description"
+category = "custom"
+tags = ["custom"]
 
-INCREMENTAL UPDATES (MANDATORY — follow EXACTLY):
-- script.js is the SINGLE SOURCE OF TRUTH
-- NEVER delete and recreate script.js — always read_file, edit, write back
-- When updating slides, you MUST follow ALL 5 steps in order:
-  Step 1: read_file("slides/{slug}/script.js")
-  Step 2: Edit ONLY the changed slides (use edit_file or write_file)
-  Step 3: For EACH changed slide N, run: shell("rm -f slides/{slug}/output/imgs/slide-NN.png")
-          This is MANDATORY — without it, mofa reuses the old cached image!
-          Example: slide 3 changed → shell("rm -f slides/{slug}/output/imgs/slide-03.png")
-  Step 4: Call mofa_slides with same input/out/slide_dir paths
-  Step 5: Send the updated PPTX to user
+[variants]
+default = "normal"
 
-- NEVER skip Step 3 (PNG deletion) — it is the ONLY way to trigger regeneration
-- NEVER change slides you were not asked to change
-- For adding a new slide: append to script.js, no PNG deletion needed (new slides have no cache)
-- Slide numbering: slide-01.png = slides[0], slide-02.png = slides[1], etc.
+[variants.normal]
+prompt = """
+Create a slide image. 1920×1080, 16:9 landscape.
+BACKGROUND: <hex colors, gradients>
+TYPOGRAPHY: <fonts, weights, sizes, hex colors>
+LAYOUT: <margins in px, alignment>
+ELEMENTS: <decorations, shapes — specific>
+Text must be PIXEL-PERFECT and EXACTLY as specified.
+"""
 
-Available tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
+[variants.cover]
+prompt = """
+Create a cover slide. 1920×1080, 16:9.
+<dramatic title layout, same palette>
+"""
 
-When the user first creates this project, ask them:
-1. What is this presentation about?
-2. Preferred style (nb-pro, cyberpunk-neon, or custom)?
-3. How many slides approximately?
-4. Any specific images or branding to include?
+[variants.data]
+prompt = """
+Create a data slide. 1920×1080, 16:9.
+<tables, charts layout, same palette>
+"""
+```
+Prompts are Gemini image-gen instructions — use hex colors, px margins, font names. Be concrete.
+Custom styles persist in styles/ and appear as templates for future projects.
+
+INCREMENTAL UPDATES:
+- script.js is the SINGLE SOURCE OF TRUTH — never recreate, always edit
+- To update slides: read → edit changed slides only → delete their cached PNGs → regenerate
+  shell("rm -f slides/{slug}/output/imgs/slide-NN.png") for each changed slide N
+  (slide-01.png = slides[0], slide-02.png = slides[1], etc.)
+- Skipping PNG deletion causes mofa to reuse stale images
+- New slides need no PNG deletion (no cache yet)
+
+Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
 "#
     )
 }
@@ -192,7 +208,9 @@ pub fn try_activate_slides_template(data_dir: &Path, session_topic: &str) -> Opt
         project_name
     };
 
-    scaffold_slides_project(data_dir, project_name);
+    // NOTE: File scaffolding is done in session_actor.rs (into the per-user
+    // workspace) so tools can reach the files.  We only write the session
+    // prompt and return the reply text here.
 
     // Write session-scoped system prompt
     let prompt = slides_system_prompt(project_name);
@@ -274,8 +292,9 @@ mod tests {
         assert!(reply.contains("my-deck"));
         assert!(reply.contains("slides/my-deck/"));
 
-        // Check project was scaffolded
-        assert!(tmp.path().join("slides/my-deck/script.js").is_file());
+        // File scaffolding is now done by session_actor (into workspace),
+        // so try_activate_slides_template only writes the session prompt.
+        assert!(!tmp.path().join("slides/my-deck/script.js").is_file());
 
         // Check session prompt was written
         let prompt = read_session_prompt(tmp.path(), "slides my-deck");
@@ -289,7 +308,8 @@ mod tests {
         let reply = try_activate_slides_template(tmp.path(), "slides");
         assert!(reply.is_some());
         assert!(reply.unwrap().contains("untitled"));
-        assert!(tmp.path().join("slides/untitled/script.js").is_file());
+        // Scaffolding happens in session_actor, not here
+        assert!(!tmp.path().join("slides/untitled/script.js").is_file());
     }
 
     #[test]

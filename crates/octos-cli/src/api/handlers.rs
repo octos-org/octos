@@ -696,16 +696,20 @@ pub async fn list_content_files(
     let dirs_param = params.get("dirs").cloned().unwrap_or_else(|| "research,slides,skill-output".to_string());
     let mut scan_dirs: Vec<String> = dirs_param.split(',').map(|s| s.trim().to_string()).collect();
 
-    // Also scan per-user workspace directories for deep_search reports
+    // Scan per-user workspace directories that match the requested dirs.
+    // Only use original relative dir names — absolute paths from prior
+    // iterations would bypass ws.join() (Path::join replaces on absolute).
+    let requested_dirs: Vec<String> = scan_dirs.clone();
     let users_dir = data_dir.join("users");
     if let Ok(entries) = std::fs::read_dir(&users_dir) {
         for entry in entries.flatten() {
             let ws = entry.path().join("workspace");
-            if ws.exists() {
-                // Add workspace/research if it exists
-                let ws_research = ws.join("research");
-                if ws_research.exists() {
-                    scan_dirs.push(ws_research.to_string_lossy().to_string());
+            if !ws.exists() { continue; }
+            for dir_name in &requested_dirs {
+                if std::path::Path::new(dir_name.as_str()).is_absolute() { continue; }
+                let ws_dir = ws.join(dir_name);
+                if ws_dir.exists() && ws_dir.is_dir() {
+                    scan_dirs.push(ws_dir.to_string_lossy().to_string());
                 }
             }
         }
@@ -729,12 +733,13 @@ pub async fn list_content_files(
         if lower.starts_with('.') { return false; }
         // Skip research intermediate files
         if lower.starts_with('_') { return false; } // _report.md, _search_results.md, _sources.json
-        // Skip panel/slide intermediates
-        if lower.starts_with("panel-") || lower.starts_with("slide-") { return false; }
+        // Skip intermediates
+        if lower.starts_with("panel-") { return false; }
+        if lower.contains("-ref.") { return false; } // mofa reference images
         // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
-            "md" | "txt" | "pptx" | "pdf" | "docx" | "xlsx" | "png" | "jpg" | "mp3" | "wav" | "mp4" | "pptx"
+            "md" | "txt" | "pptx" | "pdf" | "docx" | "xlsx" | "png" | "jpg" | "mp3" | "wav" | "mp4" | "js" | "json"
         )
     }
 
@@ -770,21 +775,32 @@ pub async fn list_content_files(
                     // For skill-output and slides: scan subdirs for final outputs
                     // For research: skip subdirs (they contain intermediate search results)
                     if *dir_name != "research" {
+                        // Collect dirs to scan (up to 2 levels: output/ and output/imgs/)
+                        let mut subdirs = vec![path.clone()];
                         if let Ok(sub_entries) = std::fs::read_dir(&path) {
                             for sub in sub_entries.flatten() {
-                                let sp = sub.path();
-                                if sp.is_file() {
-                                    let filename = sp.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                    if !is_output_file(&filename) { continue; }
-                                    if let Ok(meta) = sp.metadata() {
-                                        files.push(ContentFile {
-                                            category: categorize(&filename),
-                                            filename,
-                                            path: sp.to_string_lossy().to_string(),
-                                            size: meta.len(),
-                                            modified: modified_rfc3339(&meta),
-                                            group: group_name.clone(),
-                                        });
+                                if sub.path().is_dir() {
+                                    subdirs.push(sub.path());
+                                }
+                            }
+                        }
+                        for subdir in &subdirs {
+                            if let Ok(sub_entries) = std::fs::read_dir(subdir) {
+                                for sub in sub_entries.flatten() {
+                                    let sp = sub.path();
+                                    if sp.is_file() {
+                                        let filename = sp.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        if !is_output_file(&filename) { continue; }
+                                        if let Ok(meta) = sp.metadata() {
+                                            files.push(ContentFile {
+                                                category: categorize(&filename),
+                                                filename,
+                                                path: sp.to_string_lossy().to_string(),
+                                                size: meta.len(),
+                                                modified: modified_rfc3339(&meta),
+                                                group: group_name.clone(),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -800,7 +816,7 @@ pub async fn list_content_files(
                             path: path.to_string_lossy().to_string(),
                             size: meta.len(),
                             modified: modified_rfc3339(&meta),
-                            group: dir_name.to_string(),
+                            group: display_dir.clone(),
                         });
                     }
                 }
