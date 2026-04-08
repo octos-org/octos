@@ -56,6 +56,12 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/pipeline-guard/SKILL.md"),
         include_str!("../../app-skills/pipeline-guard/manifest.json"),
     ),
+    (
+        "skill-evolve",
+        "skill-evolve",
+        include_str!("../../app-skills/skill-evolve/SKILL.md"),
+        include_str!("../../app-skills/skill-evolve/manifest.json"),
+    ),
 ];
 
 /// Platform skills: bootstrapped once by `octos serve` (admin bot) at startup,

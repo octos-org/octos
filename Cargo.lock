@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "async-imap",
@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "eyre",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "octos-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "chrono",
@@ -3711,7 +3711,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3732,7 +3732,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eyre",
  "serde",
@@ -5112,6 +5112,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1e9a774a6c28142ac54bb25d25562e6bcf957493a184f15ad4eebccb23e410a"
 
 [[package]]
+name = "skill-evolve"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6220,7 +6230,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "futures-util",

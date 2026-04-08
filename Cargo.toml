@@ -16,6 +16,7 @@ members = [
     "crates/app-skills/weather",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/pipeline-guard",
+    "crates/app-skills/skill-evolve",
     "crates/platform-skills/voice",
     "crates/octos-pipeline",
     "crates/octos-plugin",

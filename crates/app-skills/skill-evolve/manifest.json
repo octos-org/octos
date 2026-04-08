@@ -1,0 +1,33 @@
+{
+  "name": "skill-evolve",
+  "version": "0.1.0",
+  "tools": [
+    {
+      "name": "skill_evolve",
+      "description": "Manage skill evolution patches: list pending corrections, apply them to SKILL.md, or discard them. Patches are auto-generated when plugin tools fail.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["list", "apply", "discard"],
+            "description": "list = show pending patches, apply = write patches to SKILL.md, discard = clear pending patches"
+          },
+          "skill": {
+            "type": "string",
+            "description": "Skill directory name (required for apply/discard)"
+          }
+        },
+        "required": ["action"]
+      }
+    }
+  ],
+  "hooks": [
+    {
+      "event": "after_tool_call",
+      "command": ["./main", "--hook"],
+      "timeout_ms": 30000,
+      "tool_filter": []
+    }
+  ]
+}
