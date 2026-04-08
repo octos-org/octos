@@ -118,7 +118,7 @@ if (-not $Prefix)    { $Prefix  = if ($env:OCTOS_PREFIX)  { $env:OCTOS_PREFIX } 
 $DataDir = if ($env:OCTOS_HOME) { $env:OCTOS_HOME } else { Join-Path $HOME ".octos" }
 
 # ── Tunnel defaults ──────────────────────────────────────────────────
-$FrpcVersion = "0.61.1"
+$FrpcVersion = "0.65.0"
 if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
 if ($SshPort -eq 0)     { $SshPort      = 6001 }
 if (-not $TunnelDomain) { $TunnelDomain = "octos-cloud.org" }

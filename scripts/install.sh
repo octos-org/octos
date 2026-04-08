@@ -34,7 +34,7 @@ GITHUB_REPO="octos-org/octos"
 VERSION="latest"
 PREFIX="${OCTOS_PREFIX:-$HOME/.octos/bin}"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
-FRPC_VERSION="0.61.1"
+FRPC_VERSION="0.65.0"
 
 TENANT_NAME=""
 FRPS_TOKEN=""
@@ -165,6 +165,29 @@ validate_inputs
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+
+xml_escape() {
+    printf '%s' "$1" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&apos;/g"
+}
+
+launchd_env_var_xml() {
+    local key="$1" value="$2"
+    [ -n "$value" ] || return 0
+    printf '        <key>%s</key>\n        <string>%s</string>\n' "$key" "$(xml_escape "$value")"
+}
+
+systemd_env_var_line() {
+    local key="$1" value="$2"
+    [ -n "$value" ] || return 0
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf 'Environment="%s=%s"\n' "$key" "$value"
+}
 
 section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
@@ -483,6 +506,11 @@ write_octos_service() {
         <string>$DATA_DIR</string>
         <key>OCTOS_AUTH_TOKEN</key>
         <string>$AUTH_TOKEN</string>
+$(launchd_env_var_xml "SMTP_HOST" "${SMTP_HOST:-}")
+$(launchd_env_var_xml "SMTP_PORT" "${SMTP_PORT:-}")
+$(launchd_env_var_xml "SMTP_USERNAME" "${SMTP_USERNAME:-}")
+$(launchd_env_var_xml "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
+$(launchd_env_var_xml "SMTP_FROM" "${SMTP_FROM:-}")
     </dict>
     <key>WorkingDirectory</key>
     <string>$HOME</string>
@@ -519,6 +547,11 @@ Environment=OCTOS_DATA_DIR=$DATA_DIR
 Environment=OCTOS_HOME=$DATA_DIR
 Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
+$(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
+$(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
+$(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
+$(systemd_env_var_line "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
+$(systemd_env_var_line "SMTP_FROM" "${SMTP_FROM:-}")
 WorkingDirectory=$HOME
 
 [Install]
@@ -1321,7 +1354,9 @@ else
     curl -fsSL -o "$PREFIX/install.sh" "${RELEASE_BASE}/install.sh" 2>/dev/null || true
 fi
 [ -f "$PREFIX/install.sh" ] && chmod +x "$PREFIX/install.sh"
-if [ ! -f "$PREFIX/octos-doctor.sh" ]; then
+if [[ "$SCRIPT_SELF" == /* ]] && [ -f "$(dirname "$SCRIPT_SELF")/octos-doctor.sh" ]; then
+    cp "$(dirname "$SCRIPT_SELF")/octos-doctor.sh" "$PREFIX/octos-doctor.sh"
+else
     curl -fsSL -o "$PREFIX/octos-doctor.sh" "${RELEASE_BASE}/octos-doctor.sh" 2>/dev/null || true
 fi
 [ -f "$PREFIX/octos-doctor.sh" ] && chmod +x "$PREFIX/octos-doctor.sh"

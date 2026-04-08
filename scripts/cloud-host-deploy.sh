@@ -8,7 +8,7 @@
 #   ./scripts/cloud-host-deploy.sh --domain octos.example.com --https --dns-provider cloudflare
 #   ./scripts/cloud-host-deploy.sh --config ~/.octos/cloud-bootstrap.env --non-interactive
 
-set -euo pipefail
+set -eEuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_SCRIPT="$ROOT_DIR/scripts/install.sh"
@@ -24,6 +24,13 @@ TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-}"
 FRPS_SERVER="${FRPS_SERVER:-}"
 ENABLE_HTTPS="${ENABLE_HTTPS:-}"
 DNS_PROVIDER="${DNS_PROVIDER:-}"
+ENABLE_SMTP="${ENABLE_SMTP:-}"
+SMTP_HOST="${SMTP_HOST:-}"
+SMTP_PORT="${SMTP_PORT:-}"
+SMTP_USERNAME="${SMTP_USERNAME:-}"
+SMTP_FROM="${SMTP_FROM:-}"
+SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+ALLOW_SELF_REGISTRATION="${ALLOW_SELF_REGISTRATION:-}"
 INSTALL_DEPS=false
 NONINTERACTIVE=false
 DRY_RUN=false
@@ -70,11 +77,13 @@ load_config_file() {
     . "$path"
 }
 
-# Auto-load saved state from previous run (provides defaults, CLI flags override)
-_DEFAULT_STATE="${OCTOS_HOME:-$HOME/.octos}/cloud-bootstrap.env"
-if [ -z "$CONFIG_FILE" ] && [ -f "$_DEFAULT_STATE" ]; then
-    load_config_file "$_DEFAULT_STATE"
-fi
+CURRENT_STEP=""
+trap 'echo ""; echo "    FAILED${CURRENT_STEP:+ during: $CURRENT_STEP}" >&2; echo "    The deploy did not complete. Fix the error above and re-run." >&2' ERR
+
+section() { CURRENT_STEP="$1"; echo ""; echo "==> $1"; }
+ok()      { echo "    OK: $1"; }
+warn()    { echo "    WARN: $1"; }
+err()     { echo "    ERROR: $1" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -90,6 +99,8 @@ while [ $# -gt 0 ]; do
         --https)             ENABLE_HTTPS=true; shift ;;
         --http-only)         ENABLE_HTTPS=false; shift ;;
         --dns-provider)      needval "$@"; DNS_PROVIDER="$2"; shift 2 ;;
+        --smtp)              ENABLE_SMTP=true; shift ;;
+        --no-smtp)           ENABLE_SMTP=false; shift ;;
         --install-deps)      INSTALL_DEPS=true; shift ;;
         --non-interactive|--yes) NONINTERACTIVE=true; shift ;;
         --dry-run)           DRY_RUN=true; shift ;;
@@ -115,6 +126,8 @@ Options:
   --https                Enable HTTPS with wildcard certs via setup-caddy.sh
   --http-only            Force HTTP-only Caddy setup
   --dns-provider NAME    DNS provider for HTTPS: cloudflare, route53, digitalocean, godaddy
+  --smtp                 Configure SMTP for dashboard OTP emails
+  --no-smtp              Disable SMTP for dashboard OTP emails
   --install-deps         Forward to install.sh to install missing runtime deps
   --non-interactive      Fail instead of prompting for missing values
   --dry-run              Write config files but print commands instead of executing them
@@ -126,6 +139,12 @@ Config file format:
     ENABLE_HTTPS=true
     DNS_PROVIDER=cloudflare
     CF_API_TOKEN=...
+    ENABLE_SMTP=true
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=465
+    SMTP_USERNAME=your-email@gmail.com
+    SMTP_FROM=your-email@gmail.com
+    SMTP_PASSWORD=your-app-password
 HELPEOF
             exit 0
             ;;
@@ -141,10 +160,11 @@ DATA_DIR="$(normalize_path "$DATA_DIR")"
 STATE_FILE="${STATE_FILE:-$DATA_DIR/cloud-bootstrap.env}"
 STATE_FILE="$(normalize_path "$STATE_FILE")"
 
-section() { echo ""; echo "==> $1"; }
-ok()      { echo "    OK: $1"; }
-warn()    { echo "    WARN: $1"; }
-err()     { echo "    ERROR: $1" >&2; exit 1; }
+# Auto-load previous state file on re-runs (unless --config was already given)
+if [ -z "$CONFIG_FILE" ] && [ -f "$STATE_FILE" ]; then
+    load_config_file "$STATE_FILE"
+    ok "loaded previous settings from $STATE_FILE"
+fi
 
 validate() {
     local name="$1" value="$2" pattern="$3"
@@ -159,7 +179,7 @@ prompt_value() {
     local default_value="${3:-}"
     local current="${!var_name:-}"
     if [ -n "$current" ]; then
-        return 0
+        default_value="$current"
     fi
     if [ "$NONINTERACTIVE" = true ]; then
         if [ -n "$default_value" ]; then
@@ -188,7 +208,7 @@ prompt_yes_no() {
     local default_value="$3"
     local current="${!var_name:-}"
     if [ "$current" = true ] || [ "$current" = false ]; then
-        return 0
+        default_value="$current"
     fi
     if [ "$NONINTERACTIVE" = true ]; then
         printf -v "$var_name" '%s' "$default_value"
@@ -209,13 +229,92 @@ prompt_yes_no() {
     esac
 }
 
+prompt_secret() {
+    local var_name="$1"
+    local prompt="$2"
+    local current="${!var_name:-}"
+    if [ -n "$current" ]; then
+        return 0
+    fi
+    if [ "$NONINTERACTIVE" = true ]; then
+        err "missing required secret for $var_name"
+    fi
+    printf "    %s: " "$prompt"
+    local answer=""
+    read -rs answer < /dev/tty
+    printf '\n'
+    [ -n "$answer" ] || err "$var_name is required"
+    printf -v "$var_name" '%s' "$answer"
+}
+
 export_dns_env() {
-    [ -n "${CF_API_TOKEN:-}" ] && export CF_API_TOKEN
-    [ -n "${AWS_ACCESS_KEY_ID:-}" ] && export AWS_ACCESS_KEY_ID
-    [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && export AWS_SECRET_ACCESS_KEY
-    [ -n "${DO_AUTH_TOKEN:-}" ] && export DO_AUTH_TOKEN
-    [ -n "${GODADDY_API_KEY:-}" ] && export GODADDY_API_KEY
-    [ -n "${GODADDY_API_SECRET:-}" ] && export GODADDY_API_SECRET
+    [ -n "${CF_API_TOKEN:-}" ] && export CF_API_TOKEN || true
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ] && export AWS_ACCESS_KEY_ID || true
+    [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && export AWS_SECRET_ACCESS_KEY || true
+    [ -n "${DO_AUTH_TOKEN:-}" ] && export DO_AUTH_TOKEN || true
+    [ -n "${GODADDY_API_KEY:-}" ] && export GODADDY_API_KEY || true
+    [ -n "${GODADDY_API_SECRET:-}" ] && export GODADDY_API_SECRET || true
+}
+
+export_smtp_env() {
+    [ -n "${SMTP_HOST:-}" ] && export SMTP_HOST || true
+    [ -n "${SMTP_PORT:-}" ] && export SMTP_PORT || true
+    [ -n "${SMTP_USERNAME:-}" ] && export SMTP_USERNAME || true
+    [ -n "${SMTP_FROM:-}" ] && export SMTP_FROM || true
+    [ -n "${SMTP_PASSWORD:-}" ] && export SMTP_PASSWORD || true
+}
+
+load_smtp_defaults_from_config() {
+    local config_path="$DATA_DIR/config.json"
+    [ -f "$config_path" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    local smtp_values=""
+    smtp_values="$(python3 - "$config_path" <<'PYEOF'
+import json
+import sys
+
+config_path = sys.argv[1]
+with open(config_path) as fh:
+    data = json.load(fh)
+
+dashboard_auth = data.get("dashboard_auth")
+if not isinstance(dashboard_auth, dict):
+    sys.exit(0)
+
+smtp = dashboard_auth.get("smtp")
+if not isinstance(smtp, dict):
+    sys.exit(0)
+
+def emit(key, value):
+    if value is None:
+        value = ""
+    print(f"{key}={value}")
+
+emit("ENABLE_SMTP", "true")
+emit("SMTP_HOST", smtp.get("host", ""))
+emit("SMTP_PORT", smtp.get("port", ""))
+emit("SMTP_USERNAME", smtp.get("username", ""))
+emit("SMTP_FROM", smtp.get("from_address", ""))
+emit("ALLOW_SELF_REGISTRATION", "true" if dashboard_auth.get("allow_self_registration") else "false")
+PYEOF
+    )"
+
+    [ -n "$smtp_values" ] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ENABLE_SMTP) [ -n "${ENABLE_SMTP:-}" ] || ENABLE_SMTP="$value" ;;
+            SMTP_HOST) [ -n "${SMTP_HOST:-}" ] || SMTP_HOST="$value" ;;
+            SMTP_PORT) [ -n "${SMTP_PORT:-}" ] || SMTP_PORT="$value" ;;
+            SMTP_USERNAME) [ -n "${SMTP_USERNAME:-}" ] || SMTP_USERNAME="$value" ;;
+            SMTP_FROM) [ -n "${SMTP_FROM:-}" ] || SMTP_FROM="$value" ;;
+            ALLOW_SELF_REGISTRATION)
+                [ -n "${ALLOW_SELF_REGISTRATION:-}" ] || ALLOW_SELF_REGISTRATION="$value"
+                ;;
+        esac
+    done <<EOF
+$smtp_values
+EOF
 }
 
 detect_provider_defaults() {
@@ -244,7 +343,8 @@ write_cloud_config() {
     if [ -f "$config_path" ]; then
         if command -v python3 >/dev/null 2>&1; then
             python3 - "$config_path" "$TUNNEL_DOMAIN" "$FRPS_SERVER" "$AUTH_TOKEN" \
-                "$DETECTED_PROVIDER" "$DETECTED_MODEL" "$DETECTED_ENV" <<'PYEOF'
+                "$DETECTED_PROVIDER" "$DETECTED_MODEL" "$DETECTED_ENV" \
+                "$ENABLE_SMTP" "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USERNAME" "$SMTP_FROM" "$ALLOW_SELF_REGISTRATION" <<'PYEOF'
 import json
 import pathlib
 import sys
@@ -256,6 +356,12 @@ auth_token = sys.argv[4]
 provider = sys.argv[5]
 model = sys.argv[6]
 api_key_env = sys.argv[7]
+enable_smtp = sys.argv[8].lower() == "true"
+smtp_host = sys.argv[9]
+smtp_port = int(sys.argv[10]) if sys.argv[10] else 465
+smtp_username = sys.argv[11]
+smtp_from = sys.argv[12]
+allow_self_registration = sys.argv[13].lower() == "true"
 
 data = {}
 if config_path.exists():
@@ -270,13 +376,58 @@ data["tunnel_domain"] = tunnel_domain
 data["frps_server"] = frps_server
 data["auth_token"] = auth_token
 
+dashboard_auth = data.get("dashboard_auth")
+if enable_smtp:
+    if not isinstance(dashboard_auth, dict):
+        dashboard_auth = {}
+    dashboard_auth["smtp"] = {
+        "host": smtp_host,
+        "port": smtp_port,
+        "username": smtp_username,
+        "password_env": "SMTP_PASSWORD",
+        "from_address": smtp_from,
+    }
+    dashboard_auth["session_expiry_hours"] = dashboard_auth.get("session_expiry_hours", 24)
+    dashboard_auth["allow_self_registration"] = allow_self_registration
+    data["dashboard_auth"] = dashboard_auth
+elif isinstance(dashboard_auth, dict) and "smtp" in dashboard_auth:
+    dashboard_auth.pop("smtp", None)
+    if dashboard_auth:
+        data["dashboard_auth"] = dashboard_auth
+    else:
+        data.pop("dashboard_auth", None)
+
 config_path.write_text(json.dumps(data, indent=2) + "\n")
 PYEOF
         else
             err "python3 is required to update existing $config_path safely"
         fi
     else
-        cat >"$config_path" <<EOF
+        if [ "$ENABLE_SMTP" = true ]; then
+            cat >"$config_path" <<EOF
+{
+  "provider": "$DETECTED_PROVIDER",
+  "model": "$DETECTED_MODEL",
+  "api_key_env": "$DETECTED_ENV",
+  "mode": "cloud",
+  "tunnel_domain": "$TUNNEL_DOMAIN",
+  "frps_server": "$FRPS_SERVER",
+  "auth_token": "$AUTH_TOKEN",
+  "dashboard_auth": {
+    "smtp": {
+      "host": "$SMTP_HOST",
+      "port": $SMTP_PORT,
+      "username": "$SMTP_USERNAME",
+      "password_env": "SMTP_PASSWORD",
+      "from_address": "$SMTP_FROM"
+    },
+    "session_expiry_hours": 24,
+    "allow_self_registration": $ALLOW_SELF_REGISTRATION
+  }
+}
+EOF
+        else
+            cat >"$config_path" <<EOF
 {
   "provider": "$DETECTED_PROVIDER",
   "model": "$DETECTED_MODEL",
@@ -287,6 +438,7 @@ PYEOF
   "auth_token": "$AUTH_TOKEN"
 }
 EOF
+        fi
     fi
     chmod 600 "$config_path"
     ok "cloud config written to $config_path"
@@ -332,9 +484,14 @@ run_install() {
     [ "$INSTALL_DEPS" = true ] && cmd+=(--install-deps)
     if [ "$DRY_RUN" = true ]; then
         printf '    DRY RUN: OCTOS_HOME=%q' "$DATA_DIR"
+        if [ "$ENABLE_SMTP" = true ]; then
+            printf ' SMTP_HOST=%q SMTP_PORT=%q SMTP_USERNAME=%q SMTP_FROM=%q SMTP_PASSWORD=%q' \
+                "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USERNAME" "$SMTP_FROM" "***"
+        fi
         printf ' %q' "${cmd[@]}"
         printf '\n'
     else
+        [ "$ENABLE_SMTP" = true ] && export_smtp_env
         OCTOS_HOME="$DATA_DIR" "${cmd[@]}"
     fi
 }
@@ -380,6 +537,8 @@ run_setup_caddy() {
     fi
 }
 
+load_smtp_defaults_from_config
+
 OS="$(uname -s)"
 case "$OS" in
     Linux|Darwin) ;;
@@ -402,6 +561,28 @@ prompt_value FRPS_SERVER "Address tenants use to reach frps" "$TUNNEL_DOMAIN"
 prompt_yes_no ENABLE_HTTPS "Enable HTTPS with wildcard certificates via Caddy DNS challenge" false
 if [ "$ENABLE_HTTPS" = true ]; then
     prompt_value DNS_PROVIDER "DNS provider (cloudflare, route53, digitalocean, godaddy)"
+    # Validate DNS credentials early so we don't fail silently after frps install
+    case "${DNS_PROVIDER:-}" in
+        cloudflare)
+            [ -n "${CF_API_TOKEN:-}" ] || err "CF_API_TOKEN is required for cloudflare HTTPS. Export it and re-run." ;;
+        route53)
+            [ -n "${AWS_ACCESS_KEY_ID:-}" ] || err "AWS_ACCESS_KEY_ID is required for route53 HTTPS."
+            [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || err "AWS_SECRET_ACCESS_KEY is required for route53 HTTPS." ;;
+        digitalocean)
+            [ -n "${DO_AUTH_TOKEN:-}" ] || err "DO_AUTH_TOKEN is required for digitalocean HTTPS." ;;
+        godaddy)
+            [ -n "${GODADDY_API_KEY:-}" ] || err "GODADDY_API_KEY is required for godaddy HTTPS."
+            [ -n "${GODADDY_API_SECRET:-}" ] || err "GODADDY_API_SECRET is required for godaddy HTTPS." ;;
+    esac
+fi
+prompt_yes_no ENABLE_SMTP "Configure SMTP for dashboard OTP emails" false
+if [ "$ENABLE_SMTP" = true ]; then
+    prompt_value SMTP_HOST "SMTP host" "smtp.gmail.com"
+    prompt_value SMTP_PORT "SMTP port" "465"
+    prompt_value SMTP_USERNAME "SMTP username"
+    prompt_value SMTP_FROM "SMTP from address" "$SMTP_USERNAME"
+    prompt_yes_no ALLOW_SELF_REGISTRATION "Allow self-registration via email OTP" false
+    prompt_secret SMTP_PASSWORD "SMTP password or app password"
 fi
 if [ -z "$AUTH_TOKEN" ]; then
     AUTH_TOKEN="$(openssl rand -hex 32)"
@@ -417,9 +598,22 @@ validate "frps-vhost-https-port" "$FRPS_VHOST_HTTPS_PORT" '[0-9]+'
 validate "frps-dashboard-port" "$FRPS_DASHBOARD_PORT" '[0-9]+'
 validate "frps-ssh-port-start" "$FRPS_SSH_PORT_START" '[0-9]+'
 validate "frps-ssh-port-end" "$FRPS_SSH_PORT_END" '[0-9]+'
+if [ "$ENABLE_SMTP" = true ]; then
+    validate "smtp-host" "$SMTP_HOST" '[a-zA-Z0-9.-]+'
+    validate "smtp-port" "$SMTP_PORT" '[0-9]+'
+    validate "smtp-from" "$SMTP_FROM" '[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+'
+fi
 case "$ENABLE_HTTPS" in
     true|false) ;;
     *) err "ENABLE_HTTPS must be true or false" ;;
+esac
+case "$ENABLE_SMTP" in
+    true|false) ;;
+    *) err "ENABLE_SMTP must be true or false" ;;
+esac
+case "$ALLOW_SELF_REGISTRATION" in
+    true|false) ;;
+    *) err "ALLOW_SELF_REGISTRATION must be true or false" ;;
 esac
 if [ -n "$DNS_PROVIDER" ]; then
     case "$DNS_PROVIDER" in
@@ -439,6 +633,14 @@ echo "    HTTPS:               $ENABLE_HTTPS"
 if [ "$ENABLE_HTTPS" = true ]; then
     echo "    DNS provider:        $DNS_PROVIDER"
 fi
+echo "    SMTP:                $ENABLE_SMTP"
+if [ "$ENABLE_SMTP" = true ]; then
+    echo "    SMTP host:           $SMTP_HOST"
+    echo "    SMTP port:           $SMTP_PORT"
+    echo "    SMTP username:       $SMTP_USERNAME"
+    echo "    SMTP from:           $SMTP_FROM"
+    echo "    Self-registration:   $ALLOW_SELF_REGISTRATION"
+fi
 echo "    Data dir:            $DATA_DIR"
 echo "    Prefix:              $PREFIX"
 if [ "$DRY_RUN" = false ] && [ "$NONINTERACTIVE" = false ]; then
@@ -447,12 +649,23 @@ if [ "$DRY_RUN" = false ] && [ "$NONINTERACTIVE" = false ]; then
     read -r < /dev/tty
 fi
 
+if [ "$DRY_RUN" = false ]; then
+    section "Checking sudo access"
+    if ! sudo -v 2>/dev/null; then
+        err "sudo access is required to install system services (frps, Caddy, octos serve). Run with sudo privileges or ensure your user is in the sudoers file."
+    fi
+    ok "sudo credentials cached"
+fi
+
 section "Writing local state"
 write_cloud_config
 write_state_file
 
 run_install
+# Refresh sudo credentials between long-running steps (macOS default timeout is 5 min)
+[ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
 run_setup_frps
+[ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
 run_setup_caddy
 
 section "Complete"

@@ -8,13 +8,13 @@
 #
 # Environment:
 #   FRPS_DASHBOARD_PASSWORD  (optional) Dashboard password (default: random)
-#   FRPS_VERSION             (optional) frp version to install (default: 0.61.1)
+#   FRPS_VERSION             (optional) frp version to install (default: 0.65.0)
 #   OCTOS_SERVE_PORT         (optional) octos serve port for auth plugin (default: 8080)
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
-FRPS_VERSION="${FRPS_VERSION:-0.61.1}"
+FRPS_VERSION="${FRPS_VERSION:-0.65.0}"
 FRPS_DASHBOARD_PASSWORD="${FRPS_DASHBOARD_PASSWORD:-$(openssl rand -hex 16)}"
 OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
 FRPS_BIND_PORT="${FRPS_BIND_PORT:-7000}"
@@ -62,6 +62,7 @@ echo "    Downloading ${URL}"
 curl -fsSL -o "${FRP_TMPDIR}/${TARBALL}" "$URL"
 tar -xzf "${FRP_TMPDIR}/${TARBALL}" -C "$FRP_TMPDIR"
 
+sudo mkdir -p "${INSTALL_DIR}"
 sudo cp "${FRP_TMPDIR}/frp_${FRPS_VERSION}_${OS}_${FRP_ARCH}/frps" "${INSTALL_DIR}/frps"
 sudo chmod 0755 "${INSTALL_DIR}/frps"
 echo "    Installed frps to ${INSTALL_DIR}/frps"
@@ -75,20 +76,13 @@ sudo tee "$CONFIG_FILE" > /dev/null << EOF
 bindPort = ${FRPS_BIND_PORT}
 vhostHTTPPort = ${FRPS_VHOST_HTTP_PORT}
 vhostHTTPSPort = ${FRPS_VHOST_HTTPS_PORT}
-custom_404_page = "${CONFIG_DIR}/404.html"
-
-# Per-tenant auth via octos serve plugin (no shared master token)
-[[httpPlugins]]
-name = "octos-auth"
-addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
-path = "/api/internal/frps-auth"
-ops = ["Login", "NewProxy"]
+custom404Page = "${CONFIG_DIR}/404.html"
 
 webServer.port = ${FRPS_DASHBOARD_PORT}
 webServer.user = "admin"
 webServer.password = "${FRPS_DASHBOARD_PASSWORD}"
 
-# Allow SSH tunnel port range
+# Restrict remotely exposed TCP ports to the configured SSH range.
 allowPorts = [
   { start = ${FRPS_SSH_PORT_START}, end = ${FRPS_SSH_PORT_END} }
 ]
@@ -97,6 +91,13 @@ allowPorts = [
 log.to = "/var/log/frps.log"
 log.level = "info"
 log.maxDays = 7
+
+# Per-tenant auth via octos serve plugin (no shared master token)
+[[httpPlugins]]
+name = "octos-auth"
+addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
+path = "/api/internal/frps-auth"
+ops = ["Login", "NewProxy"]
 EOF
 
 # Install custom 404 page

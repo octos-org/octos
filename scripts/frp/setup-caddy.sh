@@ -42,6 +42,197 @@ sed_in_place() {
     rm -f "$tmp"
 }
 
+pkg_hint() {
+    case "$(uname -s)" in
+        Darwin)
+            case "$1" in
+                go) echo "brew install go" ;;
+                *) echo "install '$1' using your package manager" ;;
+            esac
+            ;;
+        Linux)
+            if command -v apt-get >/dev/null 2>&1; then
+                case "$1" in
+                    go) echo "sudo apt-get install -y golang-go" ;;
+                    *) echo "install '$1' using your package manager" ;;
+                esac
+            elif command -v dnf >/dev/null 2>&1; then
+                case "$1" in
+                    go) echo "sudo dnf install -y golang" ;;
+                    *) echo "install '$1' using your package manager" ;;
+                esac
+            elif command -v yum >/dev/null 2>&1; then
+                case "$1" in
+                    go) echo "sudo yum install -y golang" ;;
+                    *) echo "install '$1' using your package manager" ;;
+                esac
+            elif command -v pacman >/dev/null 2>&1; then
+                case "$1" in
+                    go) echo "sudo pacman -S --noconfirm go" ;;
+                    *) echo "install '$1' using your package manager" ;;
+                esac
+            elif command -v apk >/dev/null 2>&1; then
+                case "$1" in
+                    go) echo "sudo apk add go" ;;
+                    *) echo "install '$1' using your package manager" ;;
+                esac
+            else
+                echo "install '$1' using your package manager"
+            fi
+            ;;
+        *)
+            echo "install '$1' using your package manager"
+            ;;
+    esac
+}
+
+manual_install_hint() {
+    case "$(uname -s)" in
+        Darwin)
+            case "$1" in
+                go)
+                    echo "Install Homebrew first, then run 'brew install go', or install Go manually from https://go.dev/dl/"
+                    ;;
+                *)
+                    echo "Install '$1' manually using your system package manager"
+                    ;;
+            esac
+            ;;
+        Linux)
+            case "$1" in
+                go)
+                    echo "Install Go using your distro package manager, or install it manually from https://go.dev/dl/"
+                    ;;
+                *)
+                    echo "Install '$1' manually using your distro package manager"
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Install '$1' manually for your system"
+            ;;
+    esac
+}
+
+can_auto_install_pkg() {
+    local pkg="$1"
+    case "$(uname -s)" in
+        Darwin)
+            case "$pkg" in
+                go) command -v brew >/dev/null 2>&1 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        Linux)
+            case "$pkg" in
+                go)
+                    command -v apt-get >/dev/null 2>&1 ||
+                    command -v dnf >/dev/null 2>&1 ||
+                    command -v yum >/dev/null 2>&1 ||
+                    command -v pacman >/dev/null 2>&1 ||
+                    command -v apk >/dev/null 2>&1
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+install_pkg() {
+    local pkg="$1"
+    local cmd
+    can_auto_install_pkg "$pkg" || return 1
+    cmd="$(pkg_hint "$pkg")"
+    case "$cmd" in
+        ""|"install '"*"' using your package manager")
+            echo "ERROR: don't know how to install $pkg automatically on this system"
+            return 1
+            ;;
+    esac
+    eval "$cmd"
+}
+
+prompt_install_pkg() {
+    local pkg="$1"
+    local cmd
+    local answer
+    local os_name
+    os_name="$(uname -s)"
+    cmd="$(pkg_hint "$pkg")"
+    if ! can_auto_install_pkg "$pkg"; then
+        echo "ERROR: $pkg is required, but automatic install is not available on this system."
+        case "$os_name" in
+            Darwin)
+                if ! command -v brew >/dev/null 2>&1; then
+                    echo "       Homebrew is not installed, so the script cannot install $pkg for you."
+                    echo "       $(manual_install_hint "$pkg")"
+                    echo "       Homebrew installer:"
+                    echo '       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                    return 1
+                fi
+                ;;
+            Linux)
+                echo "       No supported package manager was detected."
+                echo "       $(manual_install_hint "$pkg")"
+                return 1
+                ;;
+            *)
+                echo "       $(manual_install_hint "$pkg")"
+                return 1
+                ;;
+        esac
+    fi
+
+    if [ ! -r /dev/tty ]; then
+        echo "ERROR: $pkg is required and this run is non-interactive."
+        echo "       Install it first, then re-run."
+        echo "       Suggested command: $cmd"
+        return 1
+    fi
+
+    printf "    %s is required. Install it now? [Y/n]: " "$pkg" > /dev/tty
+    read -r answer < /dev/tty
+    case "$answer" in
+        ""|y|Y|yes|YES)
+            echo "    Installing $pkg..."
+            install_pkg "$pkg" || {
+                echo "ERROR: automatic $pkg install failed."
+                echo "       Try running: $cmd"
+                return 1
+            }
+            ;;
+        n|N|no|NO)
+            echo "ERROR: $pkg is required to continue."
+            echo "       Install it first, then re-run."
+            echo "       Suggested command: $cmd"
+            return 1
+            ;;
+        *)
+            echo "ERROR: please answer yes or no"
+            return 1
+            ;;
+    esac
+}
+
+find_xcaddy() {
+    if command -v xcaddy >/dev/null 2>&1; then
+        command -v xcaddy
+        return 0
+    fi
+    if command -v go >/dev/null 2>&1; then
+        local gopath_bin
+        gopath_bin="$(go env GOPATH 2>/dev/null)/bin/xcaddy"
+        if [ -n "$gopath_bin" ] && [ -x "$gopath_bin" ]; then
+            printf '%s\n' "$gopath_bin"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # ── Parse arguments ───────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -163,18 +354,22 @@ LAUNCHD_ENV_DICT="$(launchd_env_dict)"
 
 # ── Install Caddy ────────────────────────────────────────────────────
 install_caddy() {
+    sudo mkdir -p /usr/local/bin
     if [ "$ENABLE_HTTPS" = true ]; then
         # Build custom Caddy with DNS plugin using xcaddy
         echo "    Building Caddy with ${DNS_PROVIDER} DNS plugin..."
-        if ! command -v xcaddy &>/dev/null; then
-            if command -v go &>/dev/null; then
-                go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-            else
-                echo "ERROR: xcaddy requires Go. Install Go first: https://go.dev/dl/"
-                exit 1
+        if ! XCADDY="$(find_xcaddy)"; then
+            if ! command -v go >/dev/null 2>&1; then
+                prompt_install_pkg go || exit 1
             fi
+            go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+            XCADDY="$(find_xcaddy)" || {
+                echo "ERROR: installed xcaddy but could not find it."
+                echo "       Re-run after adding \$(go env GOPATH)/bin to PATH, or invoke:"
+                echo "       $(go env GOPATH)/bin/xcaddy"
+                exit 1
+            }
         fi
-        XCADDY=$(command -v xcaddy)
         "$XCADDY" build --with "$DNS_PLUGIN" --output /tmp/caddy
         sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
         rm -f /tmp/caddy

@@ -15,7 +15,7 @@
 #   --local-port <port>   Local octos serve port (default: 8080)
 #   --ssh-port <port>     SSH tunnel remote port (default: 6001)
 #   --domain <domain>     Base domain (default: octos-cloud.org)
-#   --frpc-version <ver>  frpc version (default: 0.61.1)
+#   --frpc-version <ver>  frpc version (default: 0.65.0)
 
 set -euo pipefail
 
@@ -42,7 +42,7 @@ FRPS_PORT=7000
 LOCAL_PORT=8080
 SSH_PORT=6001
 TUNNEL_DOMAIN="octos-cloud.org"
-FRPC_VERSION="0.61.1"
+FRPC_VERSION="0.65.0"
 
 # Parse optional flags
 while [ $# -gt 0 ]; do

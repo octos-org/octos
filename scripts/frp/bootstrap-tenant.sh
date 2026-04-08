@@ -39,7 +39,7 @@ SSH_AUTH_VAL=""
 SKIP_BUILD=false
 SKIP_TENANT=false
 LOCAL_DATA_DIR=""
-FRPC_VERSION="0.61.1"
+FRPC_VERSION="0.65.0"
 PLIST_LABEL="io.octos.serve"
 PLIST_FRPC="io.octos.frpc"
 
