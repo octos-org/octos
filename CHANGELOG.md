@@ -3,108 +3,107 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
-### Bug Fixes
+## [0.1.1] - 2026-04-07
 
-- Add GITHUB_TOKEN auth for private repo release checks
-- Pass github_token through API for private repo update checks
-- Address security review findings and CI hygiene
-- Char-safe truncation for voice transcript in status indicator
-- Address review findings from Phase 1 audit
-- Address review findings from Phase 3 audit
-- Address MEDIUM and LOW review findings from Phase 3
-- Install skill binaries to ~/.cargo/bin and fix platform_key for macOS
-- Treat provider/model changes as hot-reloadable to prevent gateway restart
-- Asr uses correct field name and auto-discovers ominix-api URL
-- Deploy script auto-detects ASR/TTS models for ominix-api plist
-- Strip <think> tags from streaming output before showing to user
-- Register /adaptive and /queue in Telegram command menu
-- Persist full tool-call context in session history
-- Normalize messages before LLM calls and fix speculative overflow
-- Prevent tool_call ID collisions in speculative overflow tasks
-- Format tool_call_conversation.rs to pass CI
-- Resolve clippy warnings breaking CI
-- Stabilize flaky speculative overflow test
-- Format r9s.rs to pass CI
-- WeComBot reconnect counter reset and send error propagation
-- Voice-skill clone endpoint and skill-registry URL
-- Remove OMINIX_API_URL fallback from voice-skill, use per-service env vars only
-- Prevent duplicate message delivery and same-provider hedging
-- Use UpdateId.0 accessor for Telegram dedup cast
-- Resolve clippy warnings across workspace to pass CI (-D warnings)
-- Session switching, streaming bypass, and status indicator deadlock
-- Send_file path validation prevents cross-profile file exfiltration
-- Reject unresolvable paths in send_file base_dir check (TOCTOU)
+### Highlights
 
-### CI
-
-- Add conditional security sandbox test job
-
-### Documentation
-
-- Align documentation with current codebase (#3)
-- Add NLSpec features technical documentation
-- Update user guides
-- Update README and ARCHITECTURE for NLSpec features
-- Add local deployment guide, ci.sh, and local-tenant-deploy.sh
-- Add measured sandbox performance benchmarks to security architecture
-- Add Docker per-user bind mount model and isolation comparison
-- OpenClaw gap analysis and search racing improvement plan
+- **Slides Studio** — End-to-end AI slide generation pipeline with policy-driven provider chains and task status tracking
+- **Content Management** — Per-profile content catalog, directory tree browser, and workspace scanner
+- **Multi-Platform Channels** — Matrix Appservice, QQ Bot (Official API v2), WeCom Group Robot WebSocket
+- **Deep Search** — Exa neural search, Serper.dev, Tavily, Google CDP fallback with smart engine routing
+- **Sandbox by Default** — AppContainer sandbox for Windows, per-profile isolation, sandbox enabled by default
+- **Deployment** — Auto-HTTPS with `--caddy-domain`, Windows installer, tenant self-registration, cloud/local/tenant modes
+- **Skill Version Check** — Pre-clone registry version comparison skips unnecessary downloads on `skills update`
 
 ### Features
 
-- Add per-session actor model and voice_synthesize tool
-- Attractor spec Phase 1 - caching, thinking, loop detection, typed DOT
-- Attractor spec Phase 2 - APIs, observability, pipeline infrastructure
-- Attractor spec Phase 3 - advanced features and extensibility
-- Add manage_skills tool for in-chat skill install/search/remove
-- Add metadata support to message tool and forward Telegram callback queries to agent
-- Refactor gateway into modules, fix admin plugin loading, add SKILL.md frontmatter
-- Adaptive routing, queue modes, streaming, abort, voice skill
-- Per-session actor model, voice skill, pipeline, and API improvements
-- Voice cloning with x-vector profiles, API channel, plugin SDK, and multi-crate improvements
-- Add r9s.ai as a registered LLM provider
-- **discord**: Add message edit/delete ops and dashboard Discord tab
-- WeCom Group Robot WebSocket channel and streaming dedup fix
-- **dashboard**: Add WeCom Bot messaging tab
-- Two-tier deferred tool dispatch with activate_tools meta-tool
-- **security**: Per-user workspace isolation, /tmp loophole fix, and CI security tests
-- **bus**: Channel improvements and telegram fixes
-- CLI improvements, deploy script overhaul, and misc fixes
-- Add reactions, embeds, and message dedup to Discord channel
-- Change default Docker sandbox image to ubuntu:24.04
-- **dashboard**: Add Sandbox tab to profile system settings
-- Sandbox management via admin bot + deploy Docker/Colima support
-- Composable multi-layer status system with per-user config
-- Persist OTP auth sessions to disk across server restarts
-- Add Exa neural search as top-priority web search provider
-- Inject provider env vars and work_dir into plugin processes
-- Inline DOT pipeline generation, model QoS metadata, and prompt fixes
-- Plugin loader returns MCP servers, hooks, and prompt fragments from skills
+- Slides studio end-to-end pipeline with policy-driven provider chain and task status checks
+- Content panel with directory tree, workspace scan, and markdown viewer
+- Per-profile content catalog with REST API
+- Per-user soul/personality customization via /soul command and API
+- AppContainer sandbox for Windows
 - Per-profile sandbox isolation and skill directory layering
+- Matrix Appservice channel with BotFather architecture
+- QQ Bot channel with Official API v2 WebSocket gateway
+- WeCom Group Robot WebSocket channel
+- Discord reactions, embeds, and message dedup
+- Exa neural search as top-priority web search provider
+- Serper.dev as first-priority search engine in deep-search
+- Tavily web search provider
+- Google CDP search fallback via headless Chrome
+- Smart search engine routing exposed to parent LLM
+- Delta streaming for API channel (token appends instead of full replace)
+- SSE progress events forwarded through API channel for web client
+- MSC4357 live message markers for streaming edits
+- Auto-HTTPS with `--caddy-domain` and on-demand TLS
+- Windows install.ps1 auto-installs deps, Caddy, and firewall rules
+- Playwright e2e testing via `--test` flag in deploy.sh
+- Tenant self-registration with POST /api/register and setup scripts
+- Cloud/local/tenant deployment modes via config.json
+- spawn_only tools — deferred in main session, available in subagents
+- Auto-redirect spawn_only tools to background spawn with retry and notify lifecycle
+- spawn_only_message configurable per tool in manifest.json
+- Universal auto-send hook — detect and deliver files from any plugin output
+- Two-tier deferred tool dispatch with activate_tools meta-tool
+- Composable multi-layer status system with per-user config
+- Bot owner and visibility model with default-private enforcement
+- Message metadata annotations and QoS model catalog
+- Profile-scoped routing and sender identity infrastructure
+- Pipeline executor observability and model catalog baseline
+- API channel file download endpoint and SSE file events
+- Pipeline-guard hook owns model selection
+- Unified QoS model catalog as single source of truth
+- Default to top-2 engine racing instead of single-best
+- Native Windows support
+- Dashboard skills page and sidebar refactor
+- Per-profile sandbox isolation and skill directory layering
+- Plugin loader returns MCP servers, hooks, and prompt fragments from skills
+- Version check on skill install, add update action
+- Pre-clone version check for skill updates — skip clone if already up to date
+- Deep-search saves to OCTOS_WORK_DIR, agent sends report via send_file
+- HTML boilerplate cleaning, adaptive stream timeout, GLM-5 provider
+- Voice cloning with x-vector profiles
+- Streaming support for WeCom bot channel
+- Persist OTP auth sessions to disk across server restarts
 
-### Refactor
+### Security
 
-- Layered skills architecture, remove hardcoded TTS/deep-research tools
-- Add make_reply helper and verify_sub_account to reduce boilerplate
-- Session compaction improvements and architecture doc update
-- **voice-skill**: Direct port routing, remove Caddy dependency
-- **voice**: Update voice platform skill routing
+- SSRF redirect bypass and DNS failure fallthrough hardened in web_fetch
+- CORS wildcard replaced with explicit origin allowlist
+- Path traversal in hook tilde expansion validated
+- admin_shell endpoint disabled by default via config flag
+- X-Profile-Id auth restricted to loopback origin
+- Sandbox enabled by default (SandboxMode::Auto)
+- Spawn tool restricted to append-only prompt instructions
+- Sensitive data redacted from hook payloads
+- Send_file path validation prevents cross-profile file exfiltration
 
-### Testing
+### Bug Fixes
 
-- Comprehensive test coverage (+518 tests) and pre-release smoke script (#2)
-- Adaptive routing UX tests and session switching architecture doc
+- Loop detection breaks agent loop instead of just warning
+- Stronger spawn_only message to prevent LLM retry loops
+- Model-specific max_output_tokens defaults instead of 8192
+- SSE byte-buffer prevents UTF-8 corruption of CJK characters
+- Concurrency cap added to pipeline parallel fan-out
+- Global timeout cap added to ProviderChain (default 120s)
+- Process allocation race in ProcessManager
+- HNSW capacity fallback to BM25-only search
+- Eliminate production unwrap/expect calls
+- Report_late_failure penalizes correct provider slot
+- Wrap blocking I/O in spawn_blocking (cron_service, session)
+- Plugin auto-deliver checks work_dir, cwd, and output text
+- SSE grace period now triggers when spawn_only tools exist
+- Upload body limit raised to 100MB for file attachments
+- Forward all non-audio media to agent
+- Content catalog only scans profile data_dir
+- Deferred file events for web clients when SSE connection is closed
 
-### Merge
+### Infrastructure
 
-- Resolve conflicts with origin/main
-- Integrate remote main (WeCom Bot PR #12) with local changes
-
-### Style
-
-- Fix cargo fmt formatting
-- Fix cargo fmt formatting
-- Cargo fmt
+- Version management with cargo-release and git-cliff
+- GitHub Actions bumped: checkout@v6, upload-artifact@v7, download-artifact@v8, setup-node@v6
+- Caddy config updated to proxy all requests to octos serve
+- Cloud host deploy script and local-tenant-deploy.sh added
 
 ## [0.1.0] - 2026-03-05
 

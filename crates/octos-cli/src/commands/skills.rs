@@ -991,6 +991,21 @@ fn extract_fm_value(content: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Simple semver comparison: is `a` newer than `b`?
+fn version_newer(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
+    let va = parse(a);
+    let vb = parse(b);
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false // equal
+}
+
 fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
     let skill_dir = skills_dir.join(name);
     let skill_file = skill_dir.join("SKILL.md");
@@ -1112,6 +1127,48 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
     }
 
     let source: SourceInfo = serde_json::from_str(&std::fs::read_to_string(&source_path)?)?;
+
+    // Pre-clone version check: compare local version against registry
+    let local_ver = if skill_dir.join("SKILL.md").exists() {
+        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).ok();
+        content.and_then(|c| extract_fm_value(&c, "version"))
+    } else {
+        None
+    };
+
+    if let Some(ref lv) = local_ver {
+        // Try fetching registry to compare versions before cloning
+        if let Ok(entries) = fetch_registry() {
+            let registry_ver = entries
+                .iter()
+                .find(|e| {
+                    e.repo == source.repo
+                        || e.skills.contains(&name.to_string())
+                        || e.name == name
+                })
+                .and_then(|e| e.version.as_ref());
+
+            if let Some(rv) = registry_ver {
+                if !version_newer(rv, lv) {
+                    println!(
+                        "  {} '{}' is up to date (v{})",
+                        "OK".green(),
+                        name,
+                        lv
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "  {} '{}' update available: v{} → v{}",
+                    "INFO".cyan(),
+                    name,
+                    lv,
+                    rv
+                );
+            }
+        }
+        // If registry fetch fails or entry not found, fall through to clone
+    }
 
     let branch = branch_override.unwrap_or(&source.branch);
     let repo = if let Some(subdir) = &source.subdir {

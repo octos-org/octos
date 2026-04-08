@@ -99,9 +99,10 @@ impl Tool for ManageSkillsTool {
             "remove" => do_remove(&skills_dir, &input),
             "search" => do_search(&input),
             "update" => {
-                // Update = install with force
+                // Update = install with force, but first check registry version
                 let mut force_input = input.clone();
                 force_input.force = true;
+                let mut source_repo = String::new();
                 if force_input.repo.is_none() {
                     if let Some(ref name) = force_input.name {
                         // Read .source to get the original repo
@@ -109,6 +110,7 @@ impl Tool for ManageSkillsTool {
                         if let Ok(src) = std::fs::read_to_string(&source_file) {
                             if let Ok(info) = serde_json::from_str::<serde_json::Value>(&src) {
                                 let repo = info.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+                                source_repo = repo.to_string();
                                 let subdir = info.get("subdir").and_then(|v| v.as_str());
                                 force_input.repo = Some(if let Some(sub) = subdir {
                                     format!("{repo}/{sub}")
@@ -126,6 +128,27 @@ impl Tool for ManageSkillsTool {
                         ..Default::default()
                     });
                 }
+
+                // Pre-clone version check: compare local vs registry
+                if let Some(ref name) = input.name {
+                    let local_ver = skill_version(&skills_dir.join(name));
+                    if let Some(ref lv) = local_ver {
+                        let registry_ver = registry_version_for(
+                            if source_repo.is_empty() { force_input.repo.as_deref().unwrap_or("") } else { &source_repo },
+                            Some(name),
+                        );
+                        if let Some(ref rv) = registry_ver {
+                            if !version_newer(rv, lv) {
+                                return Ok(ToolResult {
+                                    output: format!("'{name}' is up to date (v{lv})"),
+                                    success: true,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+
                 do_install(&skills_dir, &force_input)
             }
             other => Ok(ToolResult {
@@ -532,6 +555,42 @@ fn do_search(input: &Input) -> Result<ToolResult> {
         ),
         success: true,
         ..Default::default()
+    })
+}
+
+/// Fetch the registry version for a repo (e.g. "mofa-org/mofa-skills") or skill name.
+fn registry_version_for(repo: &str, skill_name: Option<&str>) -> Option<String> {
+    let url = "https://raw.githubusercontent.com/octos-org/octos-hub/main/registry.json";
+    let entries: Vec<serde_json::Value> = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+
+    entries.iter().find_map(|e| {
+        let e_repo = e.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        let e_name = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let e_skills: Vec<&str> = e
+            .get("skills")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        let matches = e_repo == repo
+            || e_name == repo
+            || skill_name.map_or(false, |sn| e_skills.contains(&sn));
+
+        if matches {
+            e.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
+        } else {
+            None
+        }
     })
 }
 
