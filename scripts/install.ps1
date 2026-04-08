@@ -1478,7 +1478,7 @@ Write-Host "    Auth token: $AuthToken"
 Write-Host "    Serve log:  $serveLog"
 Write-Host ""
 Write-Host "  Next steps:"
-Write-Host "    1. Set your API key:  `$env:$_env = 'sk-...'"
+Write-Host "    1. Setup LLM models:  octos init"
 Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
 Write-Host "    4. Open local dashboard: http://localhost:${Port}/admin/"
@@ -1507,10 +1507,10 @@ if ($Tunnel -and $TenantName) {
 Write-Host "  Later:"
 $savedScript = Join-Path $Prefix "install.ps1"
 if (Test-Path $savedScript) {
-    Write-Host "    Enable tunnel:  & `"$savedScript`" -Tunnel"
+    if (-not $Tunnel) { Write-Host "    Enable tunnel:  & `"$savedScript`" -Tunnel" }
     Write-Host "    Diagnose:       & `"$savedScript`" -Doctor"
 } else {
-    Write-Host "    Enable tunnel:  irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Tunnel"
+    if (-not $Tunnel) { Write-Host "    Enable tunnel:  irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Tunnel" }
     Write-Host "    Diagnose:       irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
 }
 Write-Host ""

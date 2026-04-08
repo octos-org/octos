@@ -70,6 +70,12 @@ load_config_file() {
     . "$path"
 }
 
+# Auto-load saved state from previous run (provides defaults, CLI flags override)
+_DEFAULT_STATE="${OCTOS_HOME:-$HOME/.octos}/cloud-bootstrap.env"
+if [ -z "$CONFIG_FILE" ] && [ -f "$_DEFAULT_STATE" ]; then
+    load_config_file "$_DEFAULT_STATE"
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --config)            needval "$@"; CONFIG_FILE="$2"; load_config_file "$2"; shift 2 ;;
