@@ -177,6 +177,12 @@ is_service_active() {
     esac
 }
 
+find_octos_serve_pid() {
+    local pid=""
+    pid=$(ps ax -o pid= -o command= 2>/dev/null | grep -E '(^|/| )octos( |$).* serve( |$)|(^| )octos serve( |$)' | grep -v grep | head -1 | awk '{print $1}' || true)
+    printf '%s\n' "$pid"
+}
+
 check_listener() {
     local port="$1"
     local expected_name="$2"
@@ -300,15 +306,20 @@ fi
 # ── octos serve process ──────────────────────────────────────────
 section "octos serve"
 
-OCTOS_PID=$(pgrep -f "octos serve" 2>/dev/null | head -1 || true)
+OCTOS_PID="$(find_octos_serve_pid)"
 if [ -n "$OCTOS_PID" ]; then
     OCTOS_CMD=$(ps -p "$OCTOS_PID" -o args= 2>/dev/null || true)
     ok "running (PID: $OCTOS_PID)"
     echo "    CMD: $OCTOS_CMD"
 else
-    err "octos serve is not running"
-    hint "Start: $(svc_hint start serve)"
-    hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
+    if is_service_active serve; then
+        warn "service appears active but process match failed"
+        hint "Check: $(svc_hint status serve)"
+    else
+        err "octos serve is not running"
+        hint "Start: $(svc_hint start serve)"
+        hint "Or manually: $PREFIX/octos serve --port 8080 --host 0.0.0.0"
+    fi
 fi
 
 # ── Port 8080 ────────────────────────────────────────────────────
@@ -319,7 +330,11 @@ PORT_PID=""
 PORT_CHECK_AVAILABLE=false
 if command -v lsof &>/dev/null; then
     PORT_CHECK_AVAILABLE=true
-    PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+    if [ "$OS" = "Darwin" ] && [ "$CAN_SUDO_LSOF" = true ]; then
+        PORT_OWNER=$(sudo lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+    else
+        PORT_OWNER=$(lsof -i :8080 -P -n 2>/dev/null | grep LISTEN | head -1 || true)
+    fi
     if [ -n "$PORT_OWNER" ]; then
         PORT_CMD=$(echo "$PORT_OWNER" | awk '{print $1}')
         PORT_PID=$(echo "$PORT_OWNER" | awk '{print $2}')
@@ -349,6 +364,10 @@ fi
 if [ -n "$PORT_CMD" ]; then
     if echo "$PORT_CMD" | grep -qi octos; then
         ok "port 8080 held by octos (PID: $PORT_PID)"
+        if [ -z "$OCTOS_PID" ]; then
+            OCTOS_PID="$PORT_PID"
+            OCTOS_CMD=$(ps -p "$OCTOS_PID" -o args= 2>/dev/null || true)
+        fi
     else
         err "port 8080 held by $PORT_CMD (PID: $PORT_PID) — not octos"
         hint "Kill it: kill $PORT_PID"
@@ -374,7 +393,7 @@ case "$HTTP_CODE" in
     200)
         ok "http://localhost:8080/admin/ responds 200"
         ;;
-    000)
+    000|000000)
         err "connection failed (server not reachable on localhost:8080)"
         hint "Check 'octos serve' and 'Port 8080' sections above"
         ;;
@@ -500,7 +519,7 @@ if [ "$CLOUD_MODE" = true ]; then
     # ── Cloud routing ──────────────────────────────────────────────
     section "Cloud routing"
     APEX_HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1/ 2>/dev/null || echo "000")
-    if [ "$APEX_HTTP_CODE" != "000" ]; then
+    if [ "$APEX_HTTP_CODE" != "000" ] && [ "$APEX_HTTP_CODE" != "000000" ]; then
         ok "http://127.0.0.1/ responds $APEX_HTTP_CODE"
     else
         err "http://127.0.0.1/ is not reachable through Caddy"
@@ -509,7 +528,7 @@ if [ "$CLOUD_MODE" = true ]; then
 
     if [ -n "$CLOUD_DOMAIN" ]; then
         TENANT_HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 -H "Host: test.$CLOUD_DOMAIN" http://127.0.0.1/ 2>/dev/null || echo "000")
-        if [ "$TENANT_HTTP_CODE" != "000" ]; then
+        if [ "$TENANT_HTTP_CODE" != "000" ] && [ "$TENANT_HTTP_CODE" != "000000" ]; then
             ok "tenant routing via Host header responds $TENANT_HTTP_CODE"
         else
             err "tenant routing via Caddy/frps is not reachable locally"
@@ -518,7 +537,7 @@ if [ "$CLOUD_MODE" = true ]; then
 
         if [ "$CLOUD_HTTPS_ENABLED" = true ]; then
             HTTPS_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://127.0.0.1/" -H "Host: $CLOUD_DOMAIN" 2>/dev/null || echo "000")
-            if [ "$HTTPS_CODE" != "000" ]; then
+            if [ "$HTTPS_CODE" != "000" ] && [ "$HTTPS_CODE" != "000000" ]; then
                 ok "HTTPS listener responds locally with Host: $CLOUD_DOMAIN ($HTTPS_CODE)"
             else
                 warn "local HTTPS check failed"
@@ -555,6 +574,13 @@ if [ "$CLOUD_MODE" = true ]; then
                     fi
                     ;;
             esac
+        fi
+        if [ -f "$DATA_DIR/serve.log" ]; then
+            SMTP_AUTH_ERRORS=$(grep -i 'send_otp failed.*535\|send_otp failed.*authentication failed' "$DATA_DIR/serve.log" 2>/dev/null | tail -1 || true)
+            if [ -n "$SMTP_AUTH_ERRORS" ]; then
+                err "recent SMTP authentication failure detected in serve.log"
+                hint "Verify SMTP_USERNAME / SMTP_PASSWORD and reload io.octos.serve"
+            fi
         fi
     else
         warn "dashboard_auth.smtp not configured"
@@ -665,7 +691,7 @@ section "Recent serve logs"
 
 SERVE_LOG="$DATA_DIR/serve.log"
 if [ -f "$SERVE_LOG" ]; then
-    SERVE_ERRORS=$(tail -30 "$SERVE_LOG" 2>/dev/null | grep -i "error\|panic\|Address already in use" | tail -5)
+    SERVE_ERRORS=$(tail -30 "$SERVE_LOG" 2>/dev/null | grep -i "error\|panic\|Address already in use\|send_otp failed" | tail -5)
     if [ -n "$SERVE_ERRORS" ]; then
         warn "recent errors in serve.log:"
         echo "$SERVE_ERRORS" | while read -r line; do echo "      $line"; done
