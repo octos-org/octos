@@ -165,8 +165,8 @@ EOF
     local no_smtp_secret_status=$?
     set -e
     [ "$no_smtp_secret_status" -ne 0 ] || fail "missing SMTP_PASSWORD should fail"
-    grep -q 'missing required secret for SMTP_PASSWORD' "$no_smtp_secret_out" \
-        || fail "missing SMTP_PASSWORD should produce a clear error message"
+    grep -q 'SMTP_PASSWORD is required for SMTP. Export it and re-run.' "$no_smtp_secret_out" \
+        || fail "missing SMTP_PASSWORD should produce a clear environment-based error message"
 
     local mock_bin="$test_root/mock-bin"
     mkdir -p "$mock_bin"

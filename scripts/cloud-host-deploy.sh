@@ -153,7 +153,7 @@ Config file format:
     SMTP_PORT=465
     SMTP_USERNAME=your-email@gmail.com
     SMTP_FROM=your-email@gmail.com
-    SMTP_PASSWORD=your-app-password
+    # Export SMTP_PASSWORD in your shell before running the script
 HELPEOF
             exit 0
             ;;
@@ -764,7 +764,7 @@ if [ "$ENABLE_SMTP" = true ]; then
     prompt_value SMTP_USERNAME "SMTP username"
     prompt_value SMTP_FROM "SMTP from address" "$SMTP_USERNAME"
     prompt_yes_no ALLOW_SELF_REGISTRATION "Allow self-registration via email OTP" false
-    prompt_secret SMTP_PASSWORD "SMTP password or app password"
+    [ -n "${SMTP_PASSWORD:-}" ] || err "SMTP_PASSWORD is required for SMTP. Export it and re-run."
 fi
 if [ -z "$AUTH_TOKEN" ]; then
     AUTH_TOKEN="$(openssl rand -hex 32)"
