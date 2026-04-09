@@ -15,5 +15,8 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [package.metadata.release]
 release = false
