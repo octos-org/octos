@@ -6,7 +6,7 @@
 # Usage:
 #   ./scripts/cloud-host-deploy.sh
 #   ./scripts/cloud-host-deploy.sh --domain octos.example.com --https --dns-provider cloudflare
-#   ./scripts/cloud-host-deploy.sh --config ~/.octos/cloud-bootstrap.env --non-interactive
+#   ./scripts/cloud-host-deploy.sh --config ./cloud-bootstrap.env --non-interactive
 
 set -eEuo pipefail
 
@@ -117,14 +117,14 @@ cloud-host-deploy.sh — Bootstrap a server (Linux or macOS) as an Octos cloud/h
 Usage:
   ./scripts/cloud-host-deploy.sh
   ./scripts/cloud-host-deploy.sh --domain octos.example.com --https --dns-provider cloudflare
-  ./scripts/cloud-host-deploy.sh --config ~/.octos/cloud-bootstrap.env --non-interactive
+  ./scripts/cloud-host-deploy.sh --config ./cloud-bootstrap.env --non-interactive
 
 Options:
   --config PATH          Source a shell-style config file for silent install
   --version TAG          octos release version passed to install.sh (default: latest)
   --prefix DIR           Binary install prefix (default: ~/.octos/bin)
   --data-dir DIR         Octos data dir and config home (default: ~/.octos)
-  --state-file PATH      Persist rerun settings (default: <data-dir>/cloud-bootstrap.env)
+  --state-file PATH      Persist rerun settings (default: ./cloud-bootstrap.env)
   --port PORT            octos serve port behind Caddy (default: 8080)
   --auth-token TOKEN     Admin auth token for the dashboard
   --frps-token TOKEN     Shared FRPS auth token for all tenant tunnels
@@ -166,7 +166,7 @@ done
 
 PREFIX="$(normalize_path "$PREFIX")"
 DATA_DIR="$(normalize_path "$DATA_DIR")"
-STATE_FILE="${STATE_FILE:-$DATA_DIR/cloud-bootstrap.env}"
+STATE_FILE="${STATE_FILE:-$PWD/cloud-bootstrap.env}"
 STATE_FILE="$(normalize_path "$STATE_FILE")"
 
 # Auto-load previous state file on re-runs (unless --config was already given)

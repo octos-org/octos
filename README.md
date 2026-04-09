@@ -81,7 +81,7 @@ It wraps the three host-side steps in order:
 - `scripts/frp/setup-frps.sh` for the relay
 - `scripts/frp/setup-caddy.sh` for apex and wildcard routing
 
-For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `~/.octos/cloud-bootstrap.env`.
+For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `./cloud-bootstrap.env` in the current working directory by default.
 
 ### Deployment modes
 
