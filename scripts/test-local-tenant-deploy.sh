@@ -63,6 +63,18 @@ main() {
     grep -Fq 'bash scripts/local-tenant-deploy.sh --uninstall --purge' "$SCRIPT" \
         || fail "local tenant deploy should direct users to rerun with --uninstall --purge"
 
+    grep -Fq 'io.octos.frpc.plist' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the macOS frpc service"
+
+    grep -Fq 'frpc.service' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the Linux frpc service"
+
+    grep -Fq 'sudo rm -f /etc/frp/frpc.toml' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the frpc config"
+
+    grep -Fq 'sudo rm -f /var/log/frpc.log' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the frpc log"
+
     echo "local tenant deploy tests passed"
 }
 

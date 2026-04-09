@@ -176,35 +176,45 @@ EOF
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
-    # Stop and remove service
-    echo "    (sudo is needed to remove the system service)"
+    # Stop and remove octos serve + frpc system services
+    echo "    (sudo is needed to remove the system services)"
     case "$OS" in
         Darwin)
             sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
             sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.frpc.plist
             # Also clean up legacy LaunchAgent if present
             launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
             rm -f ~/Library/LaunchAgents/io.octos.octos-serve.plist
-            ok "launchd service removed"
+            launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/io.octos.frpc.plist
+            ok "launchd services removed"
             ;;
         Linux)
             sudo systemctl stop octos-serve.service 2>/dev/null || true
             sudo systemctl disable octos-serve.service 2>/dev/null || true
             sudo rm -f /etc/systemd/system/octos-serve.service
+            sudo systemctl stop frpc.service 2>/dev/null || true
+            sudo systemctl disable frpc.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/frpc.service
             sudo systemctl daemon-reload 2>/dev/null || true
-            ok "systemd service removed"
+            ok "systemd services removed"
             ;;
     esac
 
     # Remove binaries
-    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather)
+    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather frpc)
     for bin in "${BINS[@]}"; do
         rm -f "$PREFIX/$bin"
     done
+    sudo rm -f /usr/local/bin/frpc
+    sudo rm -f /etc/frp/frpc.toml
+    sudo rm -f /var/log/frpc.log
     ok "binaries removed from $PREFIX"
 
     echo ""
-    echo "Binaries and service files removed."
+    echo "Binaries, frpc config, and service files removed."
     if [ "$PURGE" = true ]; then
         echo "Purging data directory ($DATA_DIR)"
         sudo rm -rf "$DATA_DIR"
