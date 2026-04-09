@@ -93,6 +93,48 @@ EOF
     grep -q 'scripts/frp/setup-caddy.sh --https --dns-provider cloudflare --domain octos.example.com' "$output_file" || fail "dry run did not include expected setup-caddy.sh command"
     grep -q 'SMTP_HOST=smtp.example.com' "$output_file" || fail "dry run did not include SMTP env for install.sh"
 
+    local uninstall_out="$test_root/uninstall.out"
+    bash "$CLOUD_DEPLOY" \
+        --uninstall \
+        --dry-run \
+        --data-dir "$data_dir" \
+        --prefix "$prefix" \
+        --state-file "$state_file" \
+        >"$uninstall_out" 2>&1
+    grep -q 'install.sh' "$uninstall_out" || fail "uninstall dry run did not include install.sh"
+    grep -q -- '--uninstall' "$uninstall_out" || fail "uninstall dry run did not include install.sh --uninstall"
+    grep -q 'io.octos.frps' "$uninstall_out" || fail "uninstall dry run did not include frps service removal"
+    grep -q 'io.octos.caddy' "$uninstall_out" || fail "uninstall dry run did not include caddy service removal"
+    grep -q '/etc/frp' "$uninstall_out" || fail "uninstall dry run did not include frps config removal"
+    grep -q '/etc/caddy/Caddyfile' "$uninstall_out" || fail "uninstall dry run did not include caddy config removal"
+
+    local purge_out="$test_root/purge.out"
+    bash "$CLOUD_DEPLOY" \
+        --uninstall \
+        --purge \
+        --dry-run \
+        --data-dir "$data_dir" \
+        --prefix "$prefix" \
+        --state-file "$state_file" \
+        >"$purge_out" 2>&1
+    grep -q "rm -f $state_file" "$purge_out" || fail "purge dry run did not include state file removal"
+    grep -q "rm -rf $data_dir" "$purge_out" || fail "purge dry run did not include data dir removal"
+
+    local bad_purge_out="$test_root/bad-purge.out"
+    set +e
+    bash "$CLOUD_DEPLOY" \
+        --purge \
+        --dry-run \
+        --data-dir "$data_dir" \
+        --prefix "$prefix" \
+        --state-file "$state_file" \
+        >"$bad_purge_out" 2>&1
+    local bad_purge_status=$?
+    set -e
+    [ "$bad_purge_status" -ne 0 ] || fail "--purge without --uninstall should fail"
+    grep -q -- '--purge requires --uninstall' "$bad_purge_out" \
+        || fail "--purge without --uninstall should explain the required pairing"
+
     # ── Test: missing SMTP_PASSWORD fails early with clear message ───────
     local no_smtp_secret_config="$test_root/no-smtp-secret.env"
     cat >"$no_smtp_secret_config" <<'EOF'

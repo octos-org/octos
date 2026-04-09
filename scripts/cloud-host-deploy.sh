@@ -35,6 +35,8 @@ ALLOW_SELF_REGISTRATION="${ALLOW_SELF_REGISTRATION:-}"
 INSTALL_DEPS=false
 NONINTERACTIVE=false
 DRY_RUN=false
+UNINSTALL=false
+PURGE=false
 CONFIG_FILE=""
 STATE_FILE=""
 
@@ -104,6 +106,8 @@ while [ $# -gt 0 ]; do
         --smtp)              ENABLE_SMTP=true; shift ;;
         --no-smtp)           ENABLE_SMTP=false; shift ;;
         --install-deps)      INSTALL_DEPS=true; shift ;;
+        --uninstall)         UNINSTALL=true; shift ;;
+        --purge)             PURGE=true; shift ;;
         --non-interactive|--yes) NONINTERACTIVE=true; shift ;;
         --dry-run)           DRY_RUN=true; shift ;;
         --help|-h)
@@ -132,6 +136,8 @@ Options:
   --smtp                 Configure SMTP for dashboard OTP emails
   --no-smtp              Disable SMTP for dashboard OTP emails
   --install-deps         Forward to install.sh to install missing runtime deps
+  --uninstall            Remove octos serve, frps, and Caddy host services/config
+  --purge                With --uninstall, also delete the data dir and bootstrap state
   --non-interactive      Fail instead of prompting for missing values
   --dry-run              Write config files but print commands instead of executing them
 
@@ -482,6 +488,16 @@ run_cmd() {
     fi
 }
 
+run_cmd_best_effort() {
+    if [ "$DRY_RUN" = true ]; then
+        printf '    DRY RUN:'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@" 2>/dev/null || true
+    fi
+}
+
 run_install() {
     section "Installing octos serve"
     local cmd=("$INSTALL_SCRIPT" --version "$VERSION" --prefix "$PREFIX" --port "$PORT" --auth-token "$AUTH_TOKEN")
@@ -542,6 +558,93 @@ run_setup_caddy() {
     fi
 }
 
+run_install_uninstall() {
+    section "Removing octos serve"
+    local cmd=("$INSTALL_SCRIPT" --prefix "$PREFIX" --uninstall)
+    if [ -n "$PORT" ]; then
+        cmd+=(--port "$PORT")
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        printf '    DRY RUN: OCTOS_HOME=%q' "$DATA_DIR"
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+    else
+        OCTOS_HOME="$DATA_DIR" "${cmd[@]}"
+    fi
+}
+
+run_uninstall_frps() {
+    section "Removing frps"
+    case "$OS" in
+        Darwin)
+            run_cmd_best_effort sudo launchctl unload /Library/LaunchDaemons/io.octos.frps.plist
+            run_cmd_best_effort sudo rm -f /Library/LaunchDaemons/io.octos.frps.plist
+            ;;
+        Linux)
+            run_cmd_best_effort sudo systemctl stop frps.service
+            run_cmd_best_effort sudo systemctl disable frps.service
+            run_cmd_best_effort sudo rm -f /etc/systemd/system/frps.service
+            run_cmd_best_effort sudo systemctl daemon-reload
+            ;;
+    esac
+    run_cmd_best_effort sudo rm -f /usr/local/bin/frps
+    run_cmd_best_effort sudo rm -rf /etc/frp
+    run_cmd_best_effort sudo rm -f /var/log/frps.log
+}
+
+run_uninstall_caddy() {
+    section "Removing Caddy host service"
+    case "$OS" in
+        Darwin)
+            run_cmd_best_effort sudo launchctl unload /Library/LaunchDaemons/io.octos.caddy.plist
+            run_cmd_best_effort sudo rm -f /Library/LaunchDaemons/io.octos.caddy.plist
+            ;;
+        Linux)
+            run_cmd_best_effort sudo systemctl stop caddy.service
+            run_cmd_best_effort sudo systemctl disable caddy.service
+            run_cmd_best_effort sudo rm -f /etc/systemd/system/caddy.service
+            run_cmd_best_effort sudo systemctl daemon-reload
+            ;;
+    esac
+    run_cmd_best_effort sudo rm -f /etc/caddy/Caddyfile
+    run_cmd_best_effort sudo rmdir /etc/caddy
+    run_cmd_best_effort sudo rm -f /var/log/caddy.log
+}
+
+run_host_uninstall() {
+    if [ "$DRY_RUN" = false ]; then
+        section "Checking sudo access"
+        if ! sudo -v 2>/dev/null; then
+            err "sudo access is required to remove system services (frps, Caddy, octos serve)."
+        fi
+        ok "sudo credentials cached"
+    fi
+
+    run_install_uninstall
+    [ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
+    run_uninstall_frps
+    [ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
+    run_uninstall_caddy
+
+    if [ "$PURGE" = true ]; then
+        section "Purging local state"
+        run_cmd_best_effort rm -f "$STATE_FILE"
+        run_cmd_best_effort rm -rf "$DATA_DIR"
+    fi
+
+    section "Complete"
+    echo "    Removed host services for octos serve, frps, and Caddy."
+    if [ "$PURGE" = true ]; then
+        echo "    Purged data dir:    $DATA_DIR"
+        echo "    Purged state file:  $STATE_FILE"
+    else
+        echo "    Preserved data dir: $DATA_DIR"
+        echo "    Preserved bootstrap state: $STATE_FILE"
+        echo "    Delete manually if desired:"
+        echo "      rm -rf $DATA_DIR"
+    fi
+}
+
 load_smtp_defaults_from_config
 
 OS="$(uname -s)"
@@ -559,6 +662,15 @@ esac
 [ -f "$INSTALL_SCRIPT" ] || err "missing install script: $INSTALL_SCRIPT"
 [ -f "$FRPS_SCRIPT" ] || err "missing frps setup script: $FRPS_SCRIPT"
 [ -f "$CADDY_SCRIPT" ] || err "missing Caddy setup script: $CADDY_SCRIPT"
+
+if [ "$PURGE" = true ] && [ "$UNINSTALL" = false ]; then
+    err "--purge requires --uninstall"
+fi
+
+if [ "$UNINSTALL" = true ]; then
+    run_host_uninstall
+    exit 0
+fi
 
 section "Collecting configuration"
 prompt_value TUNNEL_DOMAIN "Base domain for signup and tenant subdomains"
