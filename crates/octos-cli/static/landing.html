@@ -184,6 +184,18 @@
             display: block; font-size: 13px; font-weight: 600;
             margin-bottom: 6px; color: var(--text-dim);
         }
+        .label-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .field-help {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 18px; height: 18px; border-radius: 999px;
+            border: 1px solid var(--border); background: var(--bg-card-hover);
+            color: var(--text-dim); font-size: 11px; font-weight: 700; cursor: help;
+        }
+        .field-help:focus { outline: 1px solid var(--accent); outline-offset: 2px; }
+        .doc-link {
+            font-size: 12px; color: var(--accent-light); text-decoration: none;
+        }
+        .doc-link:hover { text-decoration: underline; }
         .form-row { display: flex; gap: 8px; }
         .form-input {
             width: 100%; padding: 10px 14px; border-radius: 8px;
@@ -442,8 +454,8 @@
             <div class="step">
                 <h3 data-lang="en">Name Your Node</h3>
                 <h3 data-lang="zh">命名节点</h3>
-                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token, SSH tunnel port, and public address for this registered machine, and your operator provides the shared FRPS token.</p>
-                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统会为这台已注册机器生成认证令牌、SSH 隧道端口和公网地址，共享 FRPS 令牌则由运维方提供。</p>
+                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.<span data-configured-domain>your-cloud.example</span>). We generate the auth token, SSH tunnel port, public address, and one-line setup command for this registered machine.</p>
+                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.<span data-configured-domain>your-cloud.example</span>），系统会为这台已注册机器生成认证令牌、SSH 隧道端口、公网地址和一行安装命令。</p>
             </div>
             <div class="step">
                 <h3 data-lang="en">Setup Your Machine</h3>
@@ -485,14 +497,18 @@
                         <p class="form-hint" data-lang="zh">60 秒后可重新发送。每个验证码有效期为 5 分钟。</p>
                     </div>
                     <div class="form-group">
-                        <label>
+                        <label class="label-row">
                             <span data-lang="en">Node Name</span>
                             <span data-lang="zh">节点名称</span>
+                            <span class="field-help" tabindex="0" data-lang="en" title="Node Name becomes your public subdomain and tenant id. Use 1 to 64 lowercase letters, numbers, or hyphens. Choose something stable and easy to remember, because reinstall and support flows may refer to the same name.">?</span>
+                            <span class="field-help" tabindex="0" data-lang="zh" title="节点名称会成为你的公网子域名和租户标识。请使用 1 到 64 位小写字母、数字或连字符。建议选择稳定、容易记住的名字，因为重装和排障时都会引用它。">?</span>
+                            <a class="doc-link" data-lang="en" href="https://octos-org.github.io/octos/installation.html#node-name-guidelines" target="_blank" rel="noreferrer">Naming guide</a>
+                            <a class="doc-link" data-lang="zh" href="https://octos-org.github.io/octos/zh/installation.html#node-name-guidelines" target="_blank" rel="noreferrer">命名说明</a>
                         </label>
                         <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
                         <p class="form-hint">
-                            <span data-lang="en">Lowercase letters, numbers, hyphens. You can decide this while waiting for the email. It becomes <b>{name}.octos-cloud.org</b></span>
-                            <span data-lang="zh">小写字母、数字、连字符。可以在等待邮件时先想好这个名字。将成为 <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="en">Lowercase letters, numbers, hyphens. You can decide this while waiting for the email. It becomes <b>{name}.<span data-configured-domain>your-cloud.example</span></b></span>
+                            <span data-lang="zh">小写字母、数字、连字符。可以在等待邮件时先想好这个名字。将成为 <b>{name}.<span data-configured-domain>your-cloud.example</span></b></span>
                         </p>
                     </div>
                     <div class="form-group">
@@ -582,7 +598,7 @@
   ==> Installation complete!</span>
 
 <span class="comment" data-lang="en"># Your dashboard is live!</span><span class="comment" data-lang="zh"># 你的面板已上线！</span>
-<span class="cmd">open</span> https://alice.octos-cloud.org
+<span class="cmd">open</span> https://alice.<span data-configured-domain>your-cloud.example</span>
 
 <span class="comment" data-lang="en"># Troubleshoot anytime:</span><span class="comment" data-lang="zh"># 随时诊断问题：</span>
 <span class="cmd">curl</span> -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | <span class="cmd">bash</span> -s -- <span class="flag">--doctor</span></pre>
@@ -610,7 +626,7 @@
   <span class="gr">Internet</span>
      |
      v
-  <span class="hl">Caddy</span>  (octos-cloud.org, SSL)
+  <span class="hl">Caddy</span>  (<span data-configured-domain>your-cloud.example</span>, SSL)
      |
      v
   <span class="hl">frps</span>   (<span data-lang="en">tunnel relay</span><span data-lang="zh">隧道中继</span>)
@@ -671,6 +687,27 @@
 </footer>
 
 <script>
+const DEFAULT_CONFIGURED_DOMAIN = 'your-cloud.example';
+
+function applyConfiguredDomain(domain) {
+    const resolved = (domain || '').trim() || DEFAULT_CONFIGURED_DOMAIN;
+    document.querySelectorAll('[data-configured-domain]').forEach((el) => {
+        el.textContent = resolved;
+    });
+}
+
+async function loadConfiguredDomain() {
+    applyConfiguredDomain(DEFAULT_CONFIGURED_DOMAIN);
+    try {
+        const res = await fetch('/api/version');
+        if (!res.ok) return;
+        const data = await res.json();
+        applyConfiguredDomain(data.tunnel_domain || DEFAULT_CONFIGURED_DOMAIN);
+    } catch (e) {
+        console.log('load-configured-domain:', e.message);
+    }
+}
+
 // --- Theme toggle ---
 function toggleTheme() {
     const html = document.documentElement;
@@ -706,6 +743,8 @@ function toggleLang() {
         document.documentElement.lang = 'zh';
     }
 })();
+
+loadConfiguredDomain();
 
 // --- Platform tab switching ---
 function showCmd(platform) {
@@ -862,8 +901,14 @@ async function handleRegister(e) {
 
         const tenant = await tenantRes.json();
 
-        // Use setup commands from API response (platform-specific)
-        window._setupCmdUnix = tenant.setup_command_unix || '';
+        // Always show the short hosted Unix bootstrap in the portal UI.
+        // This avoids regressing back to the older raw-flag install command.
+        const setupPath = tenant.id && tenant.auth_token
+            ? `/api/register/setup-script/${encodeURIComponent(tenant.id)}/${encodeURIComponent(tenant.auth_token)}`
+            : '';
+        window._setupCmdUnix = setupPath
+            ? `curl -fsSL "${window.location.origin}${setupPath}" | bash`
+            : (tenant.setup_command_unix || '');
         window._setupCmdWin = tenant.setup_command_windows || '';
 
         // Use dashboard URL from API response (includes correct tunnel domain)

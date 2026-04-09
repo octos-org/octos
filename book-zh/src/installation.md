@@ -58,6 +58,17 @@ octos --version
 ./scripts/local-tenant-deploy.sh --channels telegram,discord,api
 ```
 
+<a id="node-name-guidelines"></a>
+### 节点名称说明
+
+在云端注册和托管租户安装场景下，节点名称会同时作为租户 ID 和公网子域名的一部分，例如 `alice.your-cloud.example`。
+
+- 长度为 1 到 64 个字符。
+- 仅允许小写字母、数字和连字符。
+- 名称不能以连字符开头或结尾。
+- 建议选择稳定、容易记住的名称，因为重装、支持和排障时通常会继续使用同一个节点名称。
+- 如果你希望保留同一个公网地址，尽量不要使用只适合当前临时状态的一次性名称。
+
 ## 各平台安装指南
 
 ### macOS
