@@ -137,7 +137,7 @@ Options:
   --no-smtp              Disable SMTP for dashboard OTP emails
   --install-deps         Forward to install.sh to install missing runtime deps
   --uninstall            Remove octos serve, frps, and Caddy host services/config
-  --purge                With --uninstall, also delete the data dir and bootstrap state
+  --purge                Delete the data dir and bootstrap state
   --non-interactive      Fail instead of prompting for missing values
   --dry-run              Write config files but print commands instead of executing them
 
@@ -653,6 +653,30 @@ run_uninstall_caddy() {
     run_cmd_best_effort sudo rm -f /var/log/caddy.log
 }
 
+run_host_purge() {
+    if [ "$DRY_RUN" = false ]; then
+        section "Checking sudo access"
+        if ! sudo -v 2>/dev/null; then
+            err "sudo access is required to remove local state under $DATA_DIR."
+        fi
+        ok "sudo credentials cached"
+    fi
+
+    section "Purging local state"
+    run_cmd_best_effort sudo rm -f "$STATE_FILE"
+    run_cmd_best_effort sudo rm -rf "$DATA_DIR"
+
+    section "Complete"
+    if [ "$UNINSTALL" = true ]; then
+        echo "    Removed host services for octos serve, frps, and Caddy."
+    else
+        echo "    Purged local state only."
+        echo "    Preserved installed services and binaries."
+    fi
+    echo "    Purged data dir:    $DATA_DIR"
+    echo "    Purged state file:  $STATE_FILE"
+}
+
 run_host_uninstall() {
     if [ "$DRY_RUN" = false ]; then
         section "Checking sudo access"
@@ -668,18 +692,9 @@ run_host_uninstall() {
     [ "$DRY_RUN" = true ] || sudo -v 2>/dev/null || true
     run_uninstall_caddy
 
-    if [ "$PURGE" = true ]; then
-        section "Purging local state"
-        run_cmd_best_effort sudo rm -f "$STATE_FILE"
-        run_cmd_best_effort sudo rm -rf "$DATA_DIR"
-    fi
-
-    section "Complete"
-    echo "    Removed host services for octos serve, frps, and Caddy."
-    if [ "$PURGE" = true ]; then
-        echo "    Purged data dir:    $DATA_DIR"
-        echo "    Purged state file:  $STATE_FILE"
-    else
+    if [ "$PURGE" = false ]; then
+        section "Complete"
+        echo "    Removed host services for octos serve, frps, and Caddy."
         echo "    Preserved data dir: $DATA_DIR"
         echo "    Preserved bootstrap state: $STATE_FILE"
         echo "    To remove them too, re-run with:"
@@ -705,12 +720,16 @@ esac
 [ -f "$FRPS_SCRIPT" ] || err "missing frps setup script: $FRPS_SCRIPT"
 [ -f "$CADDY_SCRIPT" ] || err "missing Caddy setup script: $CADDY_SCRIPT"
 
-if [ "$PURGE" = true ] && [ "$UNINSTALL" = false ]; then
-    err "--purge requires --uninstall"
-fi
-
 if [ "$UNINSTALL" = true ]; then
     run_host_uninstall
+    if [ "$PURGE" = true ]; then
+        run_host_purge
+    fi
+    exit 0
+fi
+
+if [ "$PURGE" = true ]; then
+    run_host_purge
     exit 0
 fi
 

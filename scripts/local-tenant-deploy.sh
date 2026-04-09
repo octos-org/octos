@@ -9,7 +9,7 @@
 #   --no-skills        Skip building app-skills
 #   --no-service       Skip launchd/systemd service setup
 #   --uninstall        Remove binaries and service files
-#   --purge            With --uninstall, also delete the data dir
+#   --purge            Delete the data dir
 #   --debug            Build in debug mode (faster, larger binary)
 #   --prefix DIR       Install prefix (default: ~/.cargo/bin)
 #
@@ -72,10 +72,6 @@ while [ $# -gt 0 ]; do
             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
-
-if [ "$PURGE" = true ] && [ "$UNINSTALL" = false ]; then
-    err "--purge requires --uninstall"
-fi
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -172,6 +168,13 @@ EOF
     ok "runtime config: $config_path"
 }
 
+run_purge_data() {
+    section "Purging local data"
+    echo "    (sudo may be needed if previous runs created root-owned files)"
+    sudo rm -rf "$DATA_DIR"
+    ok "data directory removed"
+}
+
 # ── Uninstall ─────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
@@ -216,14 +219,20 @@ if [ "$UNINSTALL" = true ]; then
     echo ""
     echo "Binaries, frpc config, and service files removed."
     if [ "$PURGE" = true ]; then
-        echo "Purging data directory ($DATA_DIR)"
-        sudo rm -rf "$DATA_DIR"
-        echo "Data directory removed."
+        run_purge_data
     else
         echo "Data directory ($DATA_DIR) was NOT removed."
         echo "To remove it too, re-run with:"
         echo "  bash scripts/local-tenant-deploy.sh --uninstall --purge"
     fi
+    exit 0
+fi
+
+if [ "$PURGE" = true ]; then
+    run_purge_data
+    echo ""
+    echo "Local data removed."
+    echo "Installed binaries and services were preserved."
     exit 0
 fi
 

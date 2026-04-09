@@ -123,20 +123,22 @@ EOF
     grep -q "sudo rm -f $state_file" "$purge_out" || fail "purge dry run did not include sudo state file removal"
     grep -q "sudo rm -rf $data_dir" "$purge_out" || fail "purge dry run did not include sudo data dir removal"
 
-    local bad_purge_out="$test_root/bad-purge.out"
-    set +e
+    local purge_only_out="$test_root/purge-only.out"
     bash "$CLOUD_DEPLOY" \
         --purge \
         --dry-run \
         --data-dir "$data_dir" \
         --prefix "$prefix" \
         --state-file "$state_file" \
-        >"$bad_purge_out" 2>&1
-    local bad_purge_status=$?
-    set -e
-    [ "$bad_purge_status" -ne 0 ] || fail "--purge without --uninstall should fail"
-    grep -q -- '--purge requires --uninstall' "$bad_purge_out" \
-        || fail "--purge without --uninstall should explain the required pairing"
+        >"$purge_only_out" 2>&1
+    grep -q "sudo rm -f $state_file" "$purge_only_out" || fail "standalone purge should remove the state file"
+    grep -q "sudo rm -rf $data_dir" "$purge_only_out" || fail "standalone purge should remove the data dir"
+    if grep -q 'install.sh' "$purge_only_out"; then
+        fail "standalone purge should not uninstall octos serve"
+    fi
+    if grep -q 'io.octos.frps' "$purge_only_out"; then
+        fail "standalone purge should not remove frps service"
+    fi
 
     # ── Test: missing SMTP_PASSWORD fails early with clear message ───────
     local no_smtp_secret_config="$test_root/no-smtp-secret.env"
