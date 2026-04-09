@@ -3017,14 +3017,49 @@ pub async fn tenant_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let script =
+        build_admin_tenant_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
 
-    // Generate a wrapper script that downloads and runs install.sh with
-    // all tenant-specific values pre-filled. The shared FRPS token still
-    // needs to be provided by the operator or user at install time.
+    Ok(script)
+}
+
+fn shared_frps_token() -> Option<String> {
+    std::env::var("FRPS_TOKEN").ok().filter(|v| !v.is_empty())
+}
+
+fn build_admin_tenant_setup_script(
+    tenant: &crate::tenant::TenantConfig,
+    domain: &str,
+    server: &str,
+    frps_token: Option<&str>,
+) -> String {
     let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
+    match frps_token {
+        Some(frps_token) => format!(
+            r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh with your tenant configuration pre-filled.
+# The shared FRPS token is injected server-side by the host.
+set -euo pipefail
 
-    let script = format!(
-        r#"#!/usr/bin/env bash
+curl -fsSL "{install_url}" | bash -s -- \
+    --tenant-name "{subdomain}" \
+    --frps-token "{frps_token}" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}" \
+    --auth-token "{auth_token}"
+"#,
+            subdomain = tenant.subdomain,
+            domain = domain,
+            server = server,
+            ssh_port = tenant.ssh_port,
+            install_url = install_url,
+            frps_token = frps_token,
+            auth_token = tenant.auth_token,
+        ),
+        None => format!(
+            r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh with your tenant configuration pre-filled.
 #
@@ -3062,16 +3097,15 @@ curl -fsSL "{install_url}" | bash -s -- \
     --frps-server "{server}" \
     --auth-token "{auth_token}"
 "#,
-        subdomain = tenant.subdomain,
-        domain = domain,
-        server = server,
-        ssh_port = tenant.ssh_port,
-        id = tenant.id,
-        install_url = install_url,
-        auth_token = tenant.auth_token,
-    );
-
-    Ok(script)
+            subdomain = tenant.subdomain,
+            domain = domain,
+            server = server,
+            ssh_port = tenant.ssh_port,
+            id = tenant.id,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+        ),
+    }
 }
 
 // ── Self-service tenant registration (user-auth level) ──────────────
@@ -3191,7 +3225,8 @@ pub async fn register_tenant(
     let mut email_sent = false;
     if !user_email.is_empty() {
         if let Some(auth_manager) = state.auth_manager.as_ref() {
-            let (subject, html) = build_register_setup_email(&tenant, domain, server);
+            let (subject, html) =
+                build_register_setup_email(&tenant, domain, server, shared_frps_token().as_deref());
             match auth_manager
                 .send_html_email(&user_email, &subject, &html)
                 .await
@@ -3212,8 +3247,14 @@ pub async fn register_tenant(
         }
     }
 
-    let unix_cmd = build_register_setup_command_unix(&tenant, domain);
-    let win_cmd = build_register_setup_command_windows(&tenant, domain, server);
+    let unix_cmd =
+        build_register_setup_command_unix(&tenant, domain, shared_frps_token().as_deref());
+    let win_cmd = build_register_setup_command_windows(
+        &tenant,
+        domain,
+        server,
+        shared_frps_token().as_deref(),
+    );
 
     Ok(Json(RegisterResponse {
         id: tenant.id.clone(),
@@ -3295,7 +3336,8 @@ pub async fn register_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script = build_register_setup_script(&tenant, domain, server);
+    let script =
+        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
 
     Ok(script)
 }
@@ -3326,12 +3368,17 @@ pub async fn register_setup_script_public(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script = build_register_setup_script(&tenant, domain, server);
+    let script =
+        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
 
     Ok(script)
 }
 
-fn build_register_setup_command_unix(tenant: &crate::tenant::TenantConfig, domain: &str) -> String {
+fn build_register_setup_command_unix(
+    tenant: &crate::tenant::TenantConfig,
+    domain: &str,
+    frps_token: Option<&str>,
+) -> String {
     let setup_url = format!(
         "https://{domain}/api/register/setup-script/{id}/{auth_token}",
         domain = domain,
@@ -3339,26 +3386,30 @@ fn build_register_setup_command_unix(tenant: &crate::tenant::TenantConfig, domai
         auth_token = tenant.auth_token,
     );
 
-    format!(
-        r#"curl -fsSL "{setup_url}" | FRPS_TOKEN=<shared-frps-token> bash"#,
-        setup_url = setup_url,
-    )
+    match frps_token {
+        Some(_) => format!(r#"curl -fsSL "{setup_url}" | bash"#, setup_url = setup_url),
+        None => format!(
+            r#"curl -fsSL "{setup_url}" | FRPS_TOKEN=<shared-frps-token> bash"#,
+            setup_url = setup_url,
+        ),
+    }
 }
 
 fn build_register_setup_command_windows(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> String {
-    let shared_token_placeholder = "<shared-frps-token>";
+    let frps_token = frps_token.unwrap_or("<shared-frps-token>");
     format!(
-        r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{shared_token_placeholder}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
+        r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{frps_token}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
         subdomain = tenant.subdomain,
         domain = domain,
         server = server,
         ssh_port = tenant.ssh_port,
         auth_token = tenant.auth_token,
-        shared_token_placeholder = shared_token_placeholder,
+        frps_token = frps_token,
         local_port = tenant.local_port,
     )
 }
@@ -3367,10 +3418,39 @@ fn build_register_setup_script(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> String {
     let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
-    format!(
-        r#"#!/usr/bin/env bash
+    match frps_token {
+        Some(frps_token) => format!(
+            r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh as a managed tenant bootstrap.
+# Tunnel is required for this registered machine. The shared FRPS token
+# is injected server-side by the host.
+set -euo pipefail
+
+curl -fsSL "{install_url}" | bash -s -- \
+    --tunnel \
+    --auth-token "{auth_token}" \
+    --port {local_port} \
+    --tenant-name "{subdomain}" \
+    --frps-token "{frps_token}" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}"
+"#,
+            subdomain = tenant.subdomain,
+            domain = domain,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+            local_port = tenant.local_port,
+            frps_token = frps_token,
+            ssh_port = tenant.ssh_port,
+            server = server,
+        ),
+        None => format!(
+            r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh as a managed tenant bootstrap.
 # Tunnel is required for this registered machine and the shared FRPS token
@@ -3407,14 +3487,15 @@ curl -fsSL "{install_url}" | bash -s -- \
     --domain "{domain}" \
     --frps-server "{server}"
 "#,
-        subdomain = tenant.subdomain,
-        domain = domain,
-        install_url = install_url,
-        auth_token = tenant.auth_token,
-        local_port = tenant.local_port,
-        ssh_port = tenant.ssh_port,
-        server = server,
-    )
+            subdomain = tenant.subdomain,
+            domain = domain,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+            local_port = tenant.local_port,
+            ssh_port = tenant.ssh_port,
+            server = server,
+        ),
+    }
 }
 
 /// Minimal HTML escaping for values interpolated into email HTML.
@@ -3429,10 +3510,13 @@ fn build_register_setup_email(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> (String, String) {
-    let unix_command = html_escape(&build_register_setup_command_unix(tenant, domain));
+    let unix_command = html_escape(&build_register_setup_command_unix(
+        tenant, domain, frps_token,
+    ));
     let windows_command = html_escape(&build_register_setup_command_windows(
-        tenant, domain, server,
+        tenant, domain, server, frps_token,
     ));
     let public_url = format!(
         "https://{}.{}",
@@ -3449,7 +3533,7 @@ fn build_register_setup_email(
         <p style="margin: 0 0 8px 0;"><strong>Public URL:</strong> {public_url}</p>
         <p style="margin: 0 0 8px 0;"><strong>SSH port:</strong> {ssh_port}</p>
         <p style="margin: 0 0 8px 0;"><strong>Auth token:</strong> {auth_token}</p>
-        <p style="margin: 0;"><strong>Shared FRPS token:</strong> replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator.</p>
+        <p style="margin: 0;"><strong>Shared FRPS token:</strong> {frps_token_note}</p>
     </div>
     <p style="color: #444; margin-bottom: 8px;">macOS / Linux install command:</p>
     <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{unix_command}</pre>
@@ -3461,6 +3545,12 @@ fn build_register_setup_email(
         public_url = public_url,
         ssh_port = tenant.ssh_port,
         auth_token = html_escape(&tenant.auth_token),
+        frps_token_note = if let Some(token) = frps_token {
+            format!(r#"<code>{}</code>"#, html_escape(token))
+        } else {
+            "replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator."
+                .to_string()
+        },
         unix_command = unix_command,
         windows_command = windows_command,
     );
@@ -3488,7 +3578,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32", None);
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("Tunnel is required for this registered machine"));
@@ -3520,17 +3610,62 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32", None);
 
-        assert!(html.contains("install.sh"));
-        assert!(html.contains("--tunnel"));
-        assert!(html.contains("--port 9090"));
+        assert!(html.contains("/api/register/setup-script/alice/"));
+        assert!(html.contains("FRPS_TOKEN=&lt;shared-frps-token&gt; bash"));
         assert!(html.contains("install.ps1"));
         assert!(html.contains("-Tunnel"));
         assert!(html.contains("-Port 9090"));
-        assert!(html.contains("--frps-token &quot;&lt;shared-frps-token&gt;&quot;"));
         assert!(html.contains("-FrpsToken &quot;&lt;shared-frps-token&gt;&quot;"));
         assert!(!html.contains("<strong>FRP token:</strong> secret"));
+    }
+
+    #[test]
+    fn register_setup_script_embeds_real_shared_frps_token_when_available() {
+        let tenant = crate::tenant::TenantConfig {
+            id: "alice".into(),
+            name: "alice".into(),
+            subdomain: "alice".into(),
+            tunnel_token: String::new(),
+            ssh_port: 6001,
+            local_port: 8080,
+            auth_token: "auth-token".into(),
+            owner: "alice".into(),
+            status: crate::tenant::TenantStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let script = build_register_setup_script(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+        let unix_command =
+            build_register_setup_command_unix(&tenant, "octos-cloud.org", Some("shared-token"));
+        let windows_command = build_register_setup_command_windows(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+        let (_subject, html) = build_register_setup_email(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+
+        assert!(script.contains("--frps-token \"shared-token\""));
+        assert!(!script.contains("FRPS_TOKEN=\"${FRPS_TOKEN:-}\""));
+        assert_eq!(
+            unix_command,
+            r#"curl -fsSL "https://octos-cloud.org/api/register/setup-script/alice/auth-token" | bash"#
+        );
+        assert!(windows_command.contains("-FrpsToken \"shared-token\""));
+        assert!(html.contains("<code>shared-token</code>"));
     }
 }
 

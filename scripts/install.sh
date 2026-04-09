@@ -504,8 +504,9 @@ write_octos_service() {
         <string>$HOME</string>
         <key>OCTOS_DATA_DIR</key>
         <string>$DATA_DIR</string>
-        <key>OCTOS_AUTH_TOKEN</key>
-        <string>$AUTH_TOKEN</string>
+    <key>OCTOS_AUTH_TOKEN</key>
+    <string>$AUTH_TOKEN</string>
+$(launchd_env_var_xml "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(launchd_env_var_xml "SMTP_HOST" "${SMTP_HOST:-}")
 $(launchd_env_var_xml "SMTP_PORT" "${SMTP_PORT:-}")
 $(launchd_env_var_xml "SMTP_USERNAME" "${SMTP_USERNAME:-}")
@@ -547,6 +548,7 @@ Environment=OCTOS_DATA_DIR=$DATA_DIR
 Environment=OCTOS_HOME=$DATA_DIR
 Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
+$(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
 $(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
 $(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")

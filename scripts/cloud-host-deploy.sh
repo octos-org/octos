@@ -554,7 +554,7 @@ run_install() {
         printf '\n'
     else
         [ "$ENABLE_SMTP" = true ] && export_smtp_env
-        OCTOS_HOME="$DATA_DIR" "${cmd[@]}"
+        OCTOS_HOME="$DATA_DIR" FRPS_TOKEN="$FRPS_TOKEN" "${cmd[@]}"
     fi
 }
 
