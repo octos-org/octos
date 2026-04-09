@@ -45,8 +45,35 @@ main() {
         fail "local tenant deploy still references the old hardcoded shared-token path"
     fi
 
-    grep -Fq 'registration email or setup command' "$SCRIPT" \
-        || fail "local tenant deploy should prompt for the managed tenant token source"
+    grep -Fq 'shared frps auth token from your operator or cloud host' "$SCRIPT" \
+        || fail "local tenant deploy should prompt for the shared FRPS token source"
+
+    grep -Fq '#   --purge            Delete the data dir' "$SCRIPT" \
+        || fail "local tenant deploy should document the --purge option"
+
+    grep -Fq 'run_purge_data() {' "$SCRIPT" \
+        || fail "local tenant deploy should define a standalone purge helper"
+
+    grep -Fq 'sudo rm -rf "$DATA_DIR"' "$SCRIPT" \
+        || fail "local tenant deploy should delete the data dir during purge"
+
+    grep -Fq 'bash scripts/local-tenant-deploy.sh --uninstall --purge' "$SCRIPT" \
+        || fail "local tenant deploy should direct users to rerun with --uninstall --purge"
+
+    grep -Fq 'Installed binaries and services were preserved.' "$SCRIPT" \
+        || fail "local tenant deploy should explain standalone purge preserves binaries and services"
+
+    grep -Fq 'io.octos.frpc.plist' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the macOS frpc service"
+
+    grep -Fq 'frpc.service' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the Linux frpc service"
+
+    grep -Fq 'sudo rm -f /etc/frp/frpc.toml' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the frpc config"
+
+    grep -Fq 'sudo rm -f /var/log/frpc.log' "$SCRIPT" \
+        || fail "local tenant deploy uninstall should remove the frpc log"
 
     echo "local tenant deploy tests passed"
 }

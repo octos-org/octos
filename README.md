@@ -65,7 +65,7 @@ The install script saves itself locally, so you can re-run without downloading a
 
 ### Cloud signup
 
-Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, SSH port, and tunnel token pre-filled — for both macOS/Linux and Windows. The registration flow enables the tunnel by default. If SMTP is configured on the server, the setup details are also emailed as backup.
+Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, and SSH port pre-filled — for both macOS/Linux and Windows. In the normal hosted flow, the macOS/Linux setup command is a single `curl ... | bash` one-liner; the shared FRPS token is injected server-side by the host and does not need to be typed manually. If SMTP is configured on the server, the setup details are also emailed as backup.
 
 ### Cloud host bootstrap
 
@@ -81,7 +81,12 @@ It wraps the three host-side steps in order:
 - `scripts/frp/setup-frps.sh` for the relay
 - `scripts/frp/setup-caddy.sh` for apex and wildcard routing
 
-For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `~/.octos/cloud-bootstrap.env`.
+For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `./cloud-bootstrap.env` in the current working directory by default.
+
+For production DNS, use two hostnames:
+
+- `octos.example.com` and `*.octos.example.com` proxied through Cloudflare for the portal and tenant sites
+- `frps.octos.example.com` as `DNS only` for the raw FRP control connection on port `7000`
 
 ### Deployment modes
 

@@ -212,8 +212,8 @@ Options:
   --prefix DIR       Install prefix (default: ~/.cargo/bin)
   --no-tunnel        Skip frpc tunnel setup even in --full mode
   --tenant-name NAME Tenant subdomain (e.g. "alice")
-  --frps-token TOKEN frps auth token
-  --frps-server ADDR frps server address (default: 163.192.33.32)
+  --frps-token TOKEN shared frps auth token
+  --frps-server ADDR frps server address (recommend a DNS-only host such as frps.example.com)
   --ssh-port PORT    SSH tunnel remote port (default: 6001)
   --domain DOMAIN    Tunnel domain (default: octos-cloud.org)
   --auth-token TOKEN Dashboard auth token (default: auto-generated)
@@ -231,13 +231,19 @@ For Windows native installs, use `.\scripts\install.ps1` (PowerShell).
 6. Creates a background service when dashboard/API features are enabled
 7. Optionally configures the `frpc` tunnel for tenant deployments
 
-**Uninstall:**
+For hosted deployments behind Cloudflare, keep the public site on the apex/wildcard domain and use a separate DNS-only hostname such as `frps.example.com` for the raw `frps` control port.
+
+**Uninstall / purge:**
 
 ```bash
 ./scripts/local-tenant-deploy.sh --uninstall
-# Data directory (~/.octos) is NOT removed. Delete manually:
-rm -rf ~/.octos
+./scripts/local-tenant-deploy.sh --purge
+./scripts/local-tenant-deploy.sh --uninstall --purge
 ```
+
+- `--uninstall` removes binaries, `octos serve`, and `frpc` service files.
+- `--purge` removes the local data directory only.
+- `--uninstall --purge` does both.
 
 ## Post-Install Verification
 

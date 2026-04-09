@@ -93,8 +93,8 @@ OPTIONAL FEATURES
 OPTIONAL TUNNEL (frpc)
   -Tunnel                Enable optional frpc tunnel
   -TenantName <name>     Tenant subdomain (e.g. "alice") for public access
-  -FrpsToken <token>     frps auth token
-  -FrpsTokenFile <file>  Read frps auth token from file
+  -FrpsToken <token>     shared frps auth token
+  -FrpsTokenFile <file>  Read shared frps auth token from file
   -FrpsServer <addr>     frps server address (default: 163.192.33.32)
   -SshPort <port>        SSH tunnel remote port (default: 6001)
   -TunnelDomain <domain> Tunnel domain (default: octos-cloud.org)
@@ -118,7 +118,7 @@ if (-not $Prefix)    { $Prefix  = if ($env:OCTOS_PREFIX)  { $env:OCTOS_PREFIX } 
 $DataDir = if ($env:OCTOS_HOME) { $env:OCTOS_HOME } else { Join-Path $HOME ".octos" }
 
 # ── Tunnel defaults ──────────────────────────────────────────────────
-$FrpcVersion = "0.61.1"
+$FrpcVersion = "0.65.0"
 if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
 if ($SshPort -eq 0)     { $SshPort      = 6001 }
 if (-not $TunnelDomain) { $TunnelDomain = "octos-cloud.org" }
@@ -303,7 +303,7 @@ function Invoke-TunnelPrompts {
 
     if (-not $script:TenantName -or -not $script:FrpsToken) {
         Write-Host ""
-        Write-Host "    Tunnel setup requires a tenant name, frps token, and SSH port."
+        Write-Host "    Tunnel setup requires a tenant name, shared frps token, and SSH port."
         Write-Host "    If you don't have these yet, register at:"
         Write-Host "      https://$TunnelDomain"
         Write-Host "    You'll receive your setup command with all values pre-filled."
@@ -333,7 +333,7 @@ function Invoke-TunnelPrompts {
 
     if (-not $script:FrpsToken) {
         Write-Host ""
-        Write-Host "    Enter the frps auth token (press Enter to use placeholder):"
+        Write-Host "    Enter the shared frps auth token (press Enter to use placeholder):"
         $userInput = Read-Host "    > "
         if ($userInput) {
             $script:FrpsToken = $userInput
@@ -352,9 +352,9 @@ function Invoke-TunnelPrompts {
     Write-Host "      Tenant:       $($script:TenantName).$TunnelDomain"
     Write-Host "      frps server:  ${FrpsServer}:7000"
     if ($script:TokenPlaceholder) {
-        Write-Host "      frps token:   CHANGE_ME (placeholder)"
+        Write-Host "      shared frps token: CHANGE_ME (placeholder)"
     } else {
-        Write-Host "      frps token:   $($script:FrpsToken.Substring(0, [Math]::Min(8, $script:FrpsToken.Length)))..."
+        Write-Host "      shared frps token: $($script:FrpsToken.Substring(0, [Math]::Min(8, $script:FrpsToken.Length)))..."
     }
     Write-Host "      SSH port:     $SshPort"
     Write-Host "      Local port:   $Port"
@@ -402,7 +402,7 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
         }
         if (-not $FrpsToken -and $existingConfig -match 'auth\.token\s*=\s*"([^"]+)"') {
             $FrpsToken = $Matches[1]
-            Ok "frps token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
+            Ok "shared frps token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
         }
         if ($FrpsServer -eq "163.192.33.32" -and $existingConfig -match 'serverAddr\s*=\s*"([^"]+)"') {
             $existingFrpsServer = $Matches[1]
@@ -1478,7 +1478,7 @@ Write-Host "    Auth token: $AuthToken"
 Write-Host "    Serve log:  $serveLog"
 Write-Host ""
 Write-Host "  Next steps:"
-Write-Host "    1. Set your API key:  `$env:$_env = 'sk-...'"
+Write-Host "    1. Setup LLM models:  octos init"
 Write-Host "    2. Install skills:    octos skills install --all"
 Write-Host "    3. Start chatting:    octos chat"
 Write-Host "    4. Open local dashboard: http://localhost:${Port}/admin/"
@@ -1507,10 +1507,10 @@ if ($Tunnel -and $TenantName) {
 Write-Host "  Later:"
 $savedScript = Join-Path $Prefix "install.ps1"
 if (Test-Path $savedScript) {
-    Write-Host "    Enable tunnel:  & `"$savedScript`" -Tunnel"
+    if (-not $Tunnel) { Write-Host "    Enable tunnel:  & `"$savedScript`" -Tunnel" }
     Write-Host "    Diagnose:       & `"$savedScript`" -Doctor"
 } else {
-    Write-Host "    Enable tunnel:  irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Tunnel"
+    if (-not $Tunnel) { Write-Host "    Enable tunnel:  irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Tunnel" }
     Write-Host "    Diagnose:       irm https://github.com/$GithubRepo/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Doctor"
 }
 Write-Host ""

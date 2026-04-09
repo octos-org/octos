@@ -11,6 +11,21 @@ fn octos_binary() -> std::path::PathBuf {
     path
 }
 
+fn clear_provider_env(cmd: &mut Command) {
+    for key in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "KIMI_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "MINIMAX_API_KEY",
+        "ZAI_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 #[test]
 fn test_help_command() {
     let output = Command::new(octos_binary())
@@ -137,7 +152,10 @@ fn test_completions_fish() {
 fn test_init_defaults_in_temp_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let output = Command::new(octos_binary())
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("ANTHROPIC_API_KEY", "test-ant-key")
         .args(["init", "--defaults", "--cwd"])
         .arg(temp_dir.path())
         .output()
@@ -153,6 +171,40 @@ fn test_init_defaults_in_temp_dir() {
     let content = std::fs::read_to_string(&config_path).unwrap();
     assert!(content.contains("anthropic"));
     assert!(content.contains("claude-sonnet-4-20250514"));
+}
+
+#[test]
+fn test_init_defaults_uses_octos_home_when_cwd_not_provided() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let octos_home = temp_dir.path().join("custom-home");
+    let unrelated_cwd = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&unrelated_cwd).unwrap();
+
+    let mut cmd = Command::new(octos_binary());
+    clear_provider_env(&mut cmd);
+    let output = cmd
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .env("OCTOS_HOME", &octos_home)
+        .current_dir(&unrelated_cwd)
+        .args(["init", "--defaults"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+
+    let home_config = octos_home.join("config.json");
+    assert!(
+        home_config.exists(),
+        "expected init to write config into OCTOS_HOME"
+    );
+    assert!(
+        !unrelated_cwd.join(".octos").join("config.json").exists(),
+        "init should not create a separate cwd/.octos config when OCTOS_HOME is set"
+    );
+
+    let content = std::fs::read_to_string(&home_config).unwrap();
+    assert!(content.contains("openai"));
+    assert!(content.contains("gpt-4.1-mini"));
 }
 
 #[test]

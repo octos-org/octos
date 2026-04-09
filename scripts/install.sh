@@ -21,8 +21,8 @@
 #                            Requires: wildcard DNS A record pointing to this server
 #   --tunnel                 Enable optional frpc tunnel setup
 #     --tenant-name NAME     Tenant subdomain (e.g. "alice") for public access
-#     --frps-token TOKEN     frps auth token
-#     --frps-token-file FILE Read frps auth token from FILE
+#     --frps-token TOKEN     shared frps auth token
+#     --frps-token-file FILE Read shared frps auth token from FILE
 #     --frps-server ADDR     frps server address (default: 163.192.33.32)
 #     --ssh-port PORT        SSH tunnel remote port (default: 6001)
 #     --domain DOMAIN        Tunnel domain (default: octos-cloud.org)
@@ -34,10 +34,10 @@ GITHUB_REPO="octos-org/octos"
 VERSION="latest"
 PREFIX="${OCTOS_PREFIX:-$HOME/.octos/bin}"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
-FRPC_VERSION="0.61.1"
+FRPC_VERSION="0.65.0"
 
 TENANT_NAME=""
-FRPS_TOKEN=""
+FRPS_TOKEN="${FRPS_TOKEN:-}"
 FRPS_TOKEN_FILE=""
 FRPS_SERVER="163.192.33.32"
 SSH_PORT="6001"
@@ -98,8 +98,8 @@ Optional features:
 Optional tunnel (frpc):
   --tunnel                 Enable optional frpc tunnel setup
   --tenant-name NAME       Tenant subdomain (e.g. "alice") for public access
-  --frps-token TOKEN       frps auth token
-  --frps-token-file FILE   Read frps auth token from FILE
+  --frps-token TOKEN       shared frps auth token
+  --frps-token-file FILE   Read shared frps auth token from FILE
   --frps-server ADDR       frps server address (default: 163.192.33.32)
   --ssh-port PORT          SSH tunnel remote port (default: 6001)
   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
@@ -165,6 +165,29 @@ validate_inputs
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+
+xml_escape() {
+    printf '%s' "$1" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&apos;/g"
+}
+
+launchd_env_var_xml() {
+    local key="$1" value="$2"
+    [ -n "$value" ] || return 0
+    printf '        <key>%s</key>\n        <string>%s</string>\n' "$key" "$(xml_escape "$value")"
+}
+
+systemd_env_var_line() {
+    local key="$1" value="$2"
+    [ -n "$value" ] || return 0
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf 'Environment="%s=%s"\n' "$key" "$value"
+}
 
 section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
@@ -481,8 +504,14 @@ write_octos_service() {
         <string>$HOME</string>
         <key>OCTOS_DATA_DIR</key>
         <string>$DATA_DIR</string>
-        <key>OCTOS_AUTH_TOKEN</key>
-        <string>$AUTH_TOKEN</string>
+    <key>OCTOS_AUTH_TOKEN</key>
+    <string>$AUTH_TOKEN</string>
+$(launchd_env_var_xml "FRPS_TOKEN" "${FRPS_TOKEN:-}")
+$(launchd_env_var_xml "SMTP_HOST" "${SMTP_HOST:-}")
+$(launchd_env_var_xml "SMTP_PORT" "${SMTP_PORT:-}")
+$(launchd_env_var_xml "SMTP_USERNAME" "${SMTP_USERNAME:-}")
+$(launchd_env_var_xml "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
+$(launchd_env_var_xml "SMTP_FROM" "${SMTP_FROM:-}")
     </dict>
     <key>WorkingDirectory</key>
     <string>$HOME</string>
@@ -519,6 +548,12 @@ Environment=OCTOS_DATA_DIR=$DATA_DIR
 Environment=OCTOS_HOME=$DATA_DIR
 Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
+$(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
+$(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
+$(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
+$(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
+$(systemd_env_var_line "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
+$(systemd_env_var_line "SMTP_FROM" "${SMTP_FROM:-}")
 WorkingDirectory=$HOME
 
 [Install]
@@ -1013,9 +1048,11 @@ if [ "$UNINSTALL" = true ]; then
             warn "failed to remove some firewall rules (check privileges)"
         fi
     fi
-    echo ""
-    echo "    Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
-    echo "      rm -rf $DATA_DIR"
+    if [ "${INSTALL_SUPPRESS_DATA_DIR_HINT:-}" != "1" ]; then
+        echo ""
+        echo "    Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
+        echo "      rm -rf $DATA_DIR"
+    fi
     exit 0
 fi
 
@@ -1056,7 +1093,7 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
         if [ -z "$FRPS_TOKEN" ]; then
             FRPS_TOKEN=$(grep 'auth.token' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
             if [ -n "$FRPS_TOKEN" ]; then
-                ok "frps token from existing config: ${FRPS_TOKEN:0:8}..."
+                ok "shared frps token from existing config: ${FRPS_TOKEN:0:8}..."
             fi
         fi
         if [ "$FRPS_SERVER" = "163.192.33.32" ]; then
@@ -1083,10 +1120,10 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
         [ -z "$TENANT_NAME" ] && err "Tenant name is required"
     fi
     if [ -z "$FRPS_TOKEN" ]; then
-        echo "    Enter the frps auth token:"
+        echo "    Enter the shared frps auth token:"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
-        [ -z "$FRPS_TOKEN" ] && err "frps token is required"
+        [ -z "$FRPS_TOKEN" ] && err "shared frps token is required"
     fi
 
     validate_inputs
@@ -1102,7 +1139,7 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
     echo "    Tunnel configuration:"
     echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "      frps server:  ${FRPS_SERVER}:7000"
-    echo "      frps token:   ${FRPS_TOKEN:0:8}..."
+    echo "      shared frps token: ${FRPS_TOKEN:0:8}..."
     echo "      SSH port:     ${SSH_PORT}"
 
     # Install frpc if missing
@@ -1321,7 +1358,9 @@ else
     curl -fsSL -o "$PREFIX/install.sh" "${RELEASE_BASE}/install.sh" 2>/dev/null || true
 fi
 [ -f "$PREFIX/install.sh" ] && chmod +x "$PREFIX/install.sh"
-if [ ! -f "$PREFIX/octos-doctor.sh" ]; then
+if [[ "$SCRIPT_SELF" == /* ]] && [ -f "$(dirname "$SCRIPT_SELF")/octos-doctor.sh" ]; then
+    cp "$(dirname "$SCRIPT_SELF")/octos-doctor.sh" "$PREFIX/octos-doctor.sh"
+else
     curl -fsSL -o "$PREFIX/octos-doctor.sh" "${RELEASE_BASE}/octos-doctor.sh" 2>/dev/null || true
 fi
 [ -f "$PREFIX/octos-doctor.sh" ] && chmod +x "$PREFIX/octos-doctor.sh"
@@ -1490,7 +1529,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
 
     if [ -z "$TENANT_NAME" ] || [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Tunnel setup requires a tenant name, frps token, and SSH port."
+        echo "    Tunnel setup requires a tenant name, shared frps token, and SSH port."
         echo "    If you don't have these yet, register at:"
         echo "      https://${TUNNEL_DOMAIN}"
         echo "    You'll receive your setup command with all values pre-filled."
@@ -1522,7 +1561,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
     if [ -z "$FRPS_TOKEN" ] && [ -n "$FRPS_TOKEN_FILE" ]; then
         if [ -f "$FRPS_TOKEN_FILE" ]; then
             FRPS_TOKEN=$(cat "$FRPS_TOKEN_FILE")
-            echo "    frps token loaded from $FRPS_TOKEN_FILE"
+            echo "    shared frps token loaded from $FRPS_TOKEN_FILE"
         else
             err "token file not found: $FRPS_TOKEN_FILE"
         fi
@@ -1530,7 +1569,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the frps auth token (press Enter to use placeholder):"
+        echo "    Enter the shared frps auth token (press Enter to use placeholder):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
         if [ -z "$FRPS_TOKEN" ]; then
@@ -1548,9 +1587,9 @@ if [ "$ENABLE_TUNNEL" = true ]; then
     echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "      frps server:  ${FRPS_SERVER}:7000"
     if [ "$TOKEN_PLACEHOLDER" = true ]; then
-        echo "      frps token:   CHANGE_ME (placeholder)"
+        echo "      shared frps token: CHANGE_ME (placeholder)"
     else
-        echo "      frps token:   ${FRPS_TOKEN:0:8}..."
+        echo "      shared frps token: ${FRPS_TOKEN:0:8}..."
     fi
     echo "      SSH port:     ${SSH_PORT}"
     echo "      Local port:   ${PORT}"
@@ -1724,7 +1763,7 @@ echo "    Auth token: $AUTH_TOKEN"
 echo "    Logs:       tail -f $DATA_DIR/serve.log"
 echo ""
 echo "  Next steps:"
-echo "    1. Set your API key:  export ${_ENV:-OPENAI_API_KEY}=sk-..."
+echo "    1. Setup LLM models:  octos init"
 echo "    2. Install skills:    octos skills install --all"
 echo "    3. Start chatting:    octos chat"
 echo "    4. Open local dashboard: http://localhost:${PORT}/admin/"
@@ -1753,10 +1792,10 @@ echo "    Start:   $(svc_hint start serve)"
 echo ""
 echo "  Later:"
 if [ -f "$PREFIX/install.sh" ]; then
-    echo "    Enable tunnel:  $PREFIX/install.sh --tunnel"
+    [ "$ENABLE_TUNNEL" != true ] && echo "    Enable tunnel:  $PREFIX/install.sh --tunnel"
     echo "    Diagnose:       $PREFIX/install.sh --doctor"
 else
-    echo "    Enable tunnel:  curl -fsSL ${RELEASE_BASE}/install.sh | bash -s -- --tunnel"
+    [ "$ENABLE_TUNNEL" != true ] && echo "    Enable tunnel:  curl -fsSL ${RELEASE_BASE}/install.sh | bash -s -- --tunnel"
     echo "    Diagnose:       curl -fsSL ${RELEASE_BASE}/install.sh | bash -s -- --doctor"
 fi
 echo ""

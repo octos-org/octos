@@ -8,14 +8,16 @@
 #
 # Environment:
 #   FRPS_DASHBOARD_PASSWORD  (optional) Dashboard password (default: random)
-#   FRPS_VERSION             (optional) frp version to install (default: 0.61.1)
+#   FRPS_TOKEN               (optional) Shared FRPS auth token (default: random)
+#   FRPS_VERSION             (optional) frp version to install (default: 0.65.0)
 #   OCTOS_SERVE_PORT         (optional) octos serve port for auth plugin (default: 8080)
 
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────
-FRPS_VERSION="${FRPS_VERSION:-0.61.1}"
+FRPS_VERSION="${FRPS_VERSION:-0.65.0}"
 FRPS_DASHBOARD_PASSWORD="${FRPS_DASHBOARD_PASSWORD:-$(openssl rand -hex 16)}"
+FRPS_TOKEN="${FRPS_TOKEN:-$(openssl rand -hex 32)}"
 OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
 FRPS_BIND_PORT="${FRPS_BIND_PORT:-7000}"
 FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8081}"
@@ -62,6 +64,7 @@ echo "    Downloading ${URL}"
 curl -fsSL -o "${FRP_TMPDIR}/${TARBALL}" "$URL"
 tar -xzf "${FRP_TMPDIR}/${TARBALL}" -C "$FRP_TMPDIR"
 
+sudo mkdir -p "${INSTALL_DIR}"
 sudo cp "${FRP_TMPDIR}/frp_${FRPS_VERSION}_${OS}_${FRP_ARCH}/frps" "${INSTALL_DIR}/frps"
 sudo chmod 0755 "${INSTALL_DIR}/frps"
 echo "    Installed frps to ${INSTALL_DIR}/frps"
@@ -75,20 +78,13 @@ sudo tee "$CONFIG_FILE" > /dev/null << EOF
 bindPort = ${FRPS_BIND_PORT}
 vhostHTTPPort = ${FRPS_VHOST_HTTP_PORT}
 vhostHTTPSPort = ${FRPS_VHOST_HTTPS_PORT}
-custom_404_page = "${CONFIG_DIR}/404.html"
-
-# Per-tenant auth via octos serve plugin (no shared master token)
-[[httpPlugins]]
-name = "octos-auth"
-addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
-path = "/api/internal/frps-auth"
-ops = ["Login", "NewProxy"]
+custom404Page = "${CONFIG_DIR}/404.html"
 
 webServer.port = ${FRPS_DASHBOARD_PORT}
 webServer.user = "admin"
 webServer.password = "${FRPS_DASHBOARD_PASSWORD}"
 
-# Allow SSH tunnel port range
+# Restrict remotely exposed TCP ports to the configured SSH range.
 allowPorts = [
   { start = ${FRPS_SSH_PORT_START}, end = ${FRPS_SSH_PORT_END} }
 ]
@@ -97,6 +93,16 @@ allowPorts = [
 log.to = "/var/log/frps.log"
 log.level = "info"
 log.maxDays = 7
+
+# Shared FRPS token auth plus tenant-specific NewProxy authorization via octos
+auth.method = "token"
+auth.token = "${FRPS_TOKEN}"
+
+[[httpPlugins]]
+name = "octos-auth"
+addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
+path = "/api/internal/frps-auth"
+ops = ["NewProxy"]
 EOF
 
 # Install custom 404 page
@@ -122,8 +128,41 @@ fi
 
 echo "    Wrote config to ${CONFIG_FILE}"
 
-# ── Create systemd service ────────────────────────────────────────────
-sudo tee /etc/systemd/system/frps.service > /dev/null << EOF
+# ── Create system service ─────────────────────────────────────────────
+case "$(uname -s)" in
+    Darwin)
+        PLIST="/Library/LaunchDaemons/io.octos.frps.plist"
+        sudo tee "$PLIST" > /dev/null << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.frps</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/frps</string>
+        <string>-c</string>
+        <string>${CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/frps.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/frps.log</string>
+</dict>
+</plist>
+EOF
+        sudo launchctl unload "$PLIST" 2>/dev/null || true
+        sudo chown root:wheel "$PLIST"
+        sudo chmod 644 "$PLIST"
+        sudo launchctl load "$PLIST"
+        ;;
+    *)
+        sudo tee /etc/systemd/system/frps.service > /dev/null << EOF
 [Unit]
 Description=frps tunnel relay server
 After=network.target
@@ -138,16 +177,18 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable frps
-sudo systemctl restart frps
+        sudo systemctl daemon-reload
+        sudo systemctl enable frps
+        sudo systemctl restart frps
+        ;;
+esac
 
 echo "==> frps is running"
 echo "    Control port: ${FRPS_BIND_PORT}"
+echo "    Shared token: ${FRPS_TOKEN}"
 echo "    vHost HTTP:   ${FRPS_VHOST_HTTP_PORT}"
 echo "    vHost HTTPS:  ${FRPS_VHOST_HTTPS_PORT}"
-echo "    Dashboard:    http://$(hostname -I | awk '{print $1}'):${FRPS_DASHBOARD_PORT}"
+echo "    Dashboard:    http://localhost:${FRPS_DASHBOARD_PORT}"
 echo "    Dashboard pw: ${FRPS_DASHBOARD_PASSWORD}"
 echo ""
 echo "==> Firewall: ensure these ports are open:"

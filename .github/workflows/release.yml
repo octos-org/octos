@@ -220,15 +220,18 @@ jobs:
         with:
           path: artifacts
 
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          # Copy whichever platform bundles were built
+          find artifacts -name 'octos-bundle-*' -exec cp {} release-assets/ \;
+          # Always include install scripts
+          cp scripts/install.sh scripts/install.ps1 scripts/octos-doctor.sh release-assets/
+          echo "Assets to upload:"
+          ls -la release-assets/
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: |
-            artifacts/macos-arm/octos-bundle-aarch64-apple-darwin.tar.gz
-            artifacts/linux-x86/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
-            artifacts/linux-arm/octos-bundle-aarch64-unknown-linux-gnu.tar.gz
-            artifacts/windows/octos-bundle-x86_64-pc-windows-msvc.zip
-            scripts/install.sh
-            scripts/install.ps1
-            scripts/octos-doctor.sh
+          files: release-assets/*
           body_path: RELEASE_NOTES.md

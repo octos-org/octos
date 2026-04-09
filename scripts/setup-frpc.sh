@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-FRP_VERSION="0.61.1"
+FRP_VERSION="0.65.0"
 VPS_IP="${1:-}"
 TOKEN="${2:-}"
 DOMAIN="${3:-}"

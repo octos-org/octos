@@ -442,8 +442,8 @@
             <div class="step">
                 <h3 data-lang="en">Name Your Node</h3>
                 <h3 data-lang="zh">命名节点</h3>
-                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token, tunnel token, and public address for this registered machine.</p>
-                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统会为这台已注册机器生成认证令牌、隧道令牌和公网地址。</p>
+                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token, SSH tunnel port, and public address for this registered machine, and your operator provides the shared FRPS token.</p>
+                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统会为这台已注册机器生成认证令牌、SSH 隧道端口和公网地址，共享 FRPS 令牌则由运维方提供。</p>
             </div>
             <div class="step">
                 <h3 data-lang="en">Setup Your Machine</h3>
@@ -481,15 +481,8 @@
                                 <span data-lang="zh">发送验证码</span>
                             </button>
                         </div>
-                    </div>
-                    <div class="form-group">
-                        <label>
-                            <span data-lang="en">Verification Code</span>
-                            <span data-lang="zh">验证码</span>
-                        </label>
-                        <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
-                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email.</p>
-                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。</p>
+                        <p class="form-hint" data-lang="en">You can resend after 60 seconds. Each code stays valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">60 秒后可重新发送。每个验证码有效期为 5 分钟。</p>
                     </div>
                     <div class="form-group">
                         <label>
@@ -498,14 +491,27 @@
                         </label>
                         <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
                         <p class="form-hint">
-                            <span data-lang="en">Lowercase letters, numbers, hyphens. This becomes <b>{name}.octos-cloud.org</b></span>
-                            <span data-lang="zh">小写字母、数字、连字符。将成为 <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="en">Lowercase letters, numbers, hyphens. You can decide this while waiting for the email. It becomes <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="zh">小写字母、数字、连字符。可以在等待邮件时先想好这个名字。将成为 <b>{name}.octos-cloud.org</b></span>
                         </p>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <span data-lang="en">Verification Code</span>
+                            <span data-lang="zh">验证码</span>
+                        </label>
+                        <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
+                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email. The code remains valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。验证码在 5 分钟内有效。</p>
                     </div>
                     <button type="submit" class="btn btn-primary form-submit">
                         <span data-lang="en">Register &amp; Get Token</span>
                         <span data-lang="zh">注册并获取令牌</span>
                     </button>
+                    <p class="form-hint" id="registerStatus" style="display: none; margin-top: 10px;">
+                        <span data-lang="en">Creating your account...</span>
+                        <span data-lang="zh">正在创建你的账号...</span>
+                    </p>
                 </div>
             </form>
 
@@ -532,13 +538,21 @@
                     <span data-lang="zh">在你的机器上运行以下命令安装 octos 并启用隧道：</span>
                 </p>
                 <div style="margin-top: 8px;">
-                    <div style="display: flex; gap: 8px; margin-bottom: 4px;">
+                    <div style="display: flex; gap: 8px; margin-bottom: 4px; align-items: center;">
                         <button onclick="showCmd('unix')" id="tabUnix" style="background: var(--green); color: var(--bg); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">macOS / Linux</button>
                         <button onclick="showCmd('win')" id="tabWin" style="background: var(--card); color: var(--text-dim); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">Windows</button>
+                        <button onclick="copySetupCommand()" id="copyCmdBtn" style="margin-left: auto; background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                            <span data-lang="en">Copy</span>
+                            <span data-lang="zh">复制</span>
+                        </button>
                     </div>
                     <div style="background: var(--bg); border-radius: 8px; padding: 12px; overflow-x: auto;">
                         <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
                     </div>
+                    <p id="copyCmdStatus" style="display: none; margin-top: 8px; font-size: 12px; color: var(--text-dim);">
+                        <span data-lang="en">Copied to clipboard.</span>
+                        <span data-lang="zh">已复制到剪贴板。</span>
+                    </p>
                 </div>
                 <p id="emailNote" style="margin-top: 12px; font-size: 12px; color: var(--text-dim); display: none;">
                     <span data-lang="en">We also emailed the same setup command to you for reinstall and backup.</span>
@@ -548,10 +562,9 @@
         </div>
         <!-- Installation code block -->
         <div class="code-block">
-            <pre><span class="comment" data-lang="en"># After registration, run the install command on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行安装命令：</span>
+            <pre><span class="comment" data-lang="en"># After registration, run the tenant setup script on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行租户安装脚本：</span>
 
-<span class="cmd">curl -fsSL</span> https://github.com/.../install.sh <span class="cmd">| bash -s --</span> \
-  <span class="flag">--auth-token</span> &lt;token&gt; <span class="flag">--tenant-name</span> &lt;name&gt; <span class="flag">--frps-token</span> &lt;token&gt; ...
+<span class="cmd">curl -fsSL</span> https://octos.bot/api/register/setup-script/&lt;tenant&gt;/&lt;auth-token&gt; <span class="cmd">| bash</span>
 
 <span class="output">  ==> Detecting platform
       OK: Darwin arm64 (aarch64-apple-darwin)
@@ -718,8 +731,44 @@ function showCmd(platform) {
     }
 }
 
+async function copySetupCommand() {
+    const cmd = document.getElementById('resultCmd').textContent.trim();
+    if (!cmd) return;
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(cmd);
+        } else {
+            const temp = document.createElement('textarea');
+            temp.value = cmd;
+            temp.setAttribute('readonly', '');
+            temp.style.position = 'absolute';
+            temp.style.left = '-9999px';
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand('copy');
+            document.body.removeChild(temp);
+        }
+
+        const status = document.getElementById('copyCmdStatus');
+        status.style.display = 'block';
+        window.clearTimeout(window._copyCmdStatusTimer);
+        window._copyCmdStatusTimer = window.setTimeout(() => {
+            status.style.display = 'none';
+        }, 1800);
+    } catch (e) {
+        console.log('copy command:', e.message);
+    }
+}
+
 // --- Send verification code ---
 let codeTimer = null;
+function sendCodeCooldownLabel(sec) {
+    return document.body.getAttribute('data-active-lang') === 'zh'
+        ? `${sec}s后重发`
+        : `Resend in ${sec}s`;
+}
+
 async function sendCode() {
     const email = document.getElementById('regEmail').value.trim();
     if (!email || !email.includes('@')) {
@@ -730,10 +779,10 @@ async function sendCode() {
     const btn = document.getElementById('sendCodeBtn');
     btn.disabled = true;
     let sec = 60;
-    btn.textContent = sec + 's';
+    btn.textContent = sendCodeCooldownLabel(sec);
     codeTimer = setInterval(() => {
         sec--;
-        btn.textContent = sec + 's';
+        btn.textContent = sendCodeCooldownLabel(sec);
         if (sec <= 0) {
             clearInterval(codeTimer);
             btn.disabled = false;
@@ -761,11 +810,22 @@ async function sendCode() {
 // --- Register ---
 async function handleRegister(e) {
     e.preventDefault();
+    const form = document.getElementById('registerForm');
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const status = document.getElementById('registerStatus');
     const email = document.getElementById('regEmail').value.trim();
     const code = document.getElementById('regCode').value.trim();
     const node = document.getElementById('regNode').value.trim().toLowerCase();
 
     if (!email || !code || !node) return false;
+    if (submitBtn.disabled) return false;
+
+    const isZh = document.body.getAttribute('data-active-lang') === 'zh';
+    submitBtn.disabled = true;
+    submitBtn.style.opacity = '0.7';
+    submitBtn.style.cursor = 'wait';
+    submitBtn.innerHTML = isZh ? '正在创建...' : 'Creating account...';
+    status.style.display = 'block';
 
     try {
         // Step 1: Verify OTP
@@ -777,8 +837,7 @@ async function handleRegister(e) {
 
         if (!verifyRes.ok) {
             const msg = await verifyRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '验证失败: ' + msg : 'Verification failed: ' + msg);
+            alert(isZh ? '验证失败: ' + msg : 'Verification failed: ' + msg);
             return false;
         }
 
@@ -797,8 +856,7 @@ async function handleRegister(e) {
 
         if (!tenantRes.ok) {
             const msg = await tenantRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
+            alert(isZh ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
             return false;
         }
 
@@ -830,10 +888,19 @@ async function handleRegister(e) {
         showCmd(isWindows ? 'win' : 'unix');
 
     } catch (e) {
-        const isZh = document.body.getAttribute('data-active-lang') === 'zh';
         alert(isZh
             ? '注册服务暂不可用，请稍后重试。'
             : 'Registration service unavailable. Please try again later.');
+    } finally {
+        if (document.getElementById('formStep1').style.display !== 'none') {
+            submitBtn.disabled = false;
+            submitBtn.style.opacity = '';
+            submitBtn.style.cursor = '';
+            submitBtn.innerHTML = isZh
+                ? '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>'
+                : '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>';
+            status.style.display = 'none';
+        }
     }
     return false;
 }

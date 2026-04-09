@@ -2925,8 +2925,9 @@ pub async fn create_tenant(
     // Validate tenant name (must match TenantStore rules: lowercase alnum + hyphens,
     // no leading/trailing hyphens, max 64 chars)
     use std::sync::LazyLock;
-    static TENANT_NAME_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap());
+    static TENANT_NAME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap()
+    });
     if !TENANT_NAME_RE.is_match(&req.name) {
         return Err((StatusCode::BAD_REQUEST, "Tenant name must be 1-64 lowercase alphanumeric characters or hyphens, cannot start or end with a hyphen".to_string()));
     }
@@ -2957,7 +2958,7 @@ pub async fn create_tenant(
         id: req.name.clone(),
         name: req.name.clone(),
         subdomain: req.name.clone(),
-        tunnel_token: uuid::Uuid::new_v4().to_string(),
+        tunnel_token: String::new(),
         ssh_port,
         local_port: req.local_port,
         auth_token: format!(
@@ -3016,14 +3017,49 @@ pub async fn tenant_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let script =
+        build_admin_tenant_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
 
-    // Generate a wrapper script that downloads and runs install.sh with
-    // all tenant-specific values pre-filled. The frps master token must
-    // still be provided by the user for security.
+    Ok(script)
+}
+
+fn shared_frps_token() -> Option<String> {
+    std::env::var("FRPS_TOKEN").ok().filter(|v| !v.is_empty())
+}
+
+fn build_admin_tenant_setup_script(
+    tenant: &crate::tenant::TenantConfig,
+    domain: &str,
+    server: &str,
+    frps_token: Option<&str>,
+) -> String {
     let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
+    match frps_token {
+        Some(frps_token) => format!(
+            r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh with your tenant configuration pre-filled.
+# The shared FRPS token is injected server-side by the host.
+set -euo pipefail
 
-    let script = format!(
-        r#"#!/usr/bin/env bash
+curl -fsSL "{install_url}" | bash -s -- \
+    --tenant-name "{subdomain}" \
+    --frps-token "{frps_token}" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}" \
+    --auth-token "{auth_token}"
+"#,
+            subdomain = tenant.subdomain,
+            domain = domain,
+            server = server,
+            ssh_port = tenant.ssh_port,
+            install_url = install_url,
+            frps_token = frps_token,
+            auth_token = tenant.auth_token,
+        ),
+        None => format!(
+            r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh with your tenant configuration pre-filled.
 #
@@ -3032,7 +3068,7 @@ pub async fn tenant_setup_script(
 #   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash -s -- --frps-token <token>
 set -euo pipefail
 
-# frps auth token — must be provided as env var, flag, or positional argument
+# shared FRPS auth token — must be provided as env var, flag, or positional argument
 while [ $# -gt 0 ]; do
     case "$1" in
         --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
@@ -3042,14 +3078,14 @@ done
 FRPS_TOKEN="${{FRPS_TOKEN:-}}"
 if [ -z "$FRPS_TOKEN" ]; then
     echo ""
-    echo "ERROR: frps auth token required."
+    echo "ERROR: shared FRPS token required."
     echo ""
     echo "Usage:"
     echo "  curl ... | FRPS_TOKEN=<token> bash"
     echo "  curl ... | bash -s -- --frps-token <token>"
     echo "  curl ... | bash -s -- <token>"
     echo ""
-    echo "Your admin should provide this token during onboarding."
+    echo "Your operator should provide the shared FRPS token during onboarding."
     exit 1
 fi
 
@@ -3061,16 +3097,15 @@ curl -fsSL "{install_url}" | bash -s -- \
     --frps-server "{server}" \
     --auth-token "{auth_token}"
 "#,
-        subdomain = tenant.subdomain,
-        domain = domain,
-        server = server,
-        ssh_port = tenant.ssh_port,
-        id = tenant.id,
-        install_url = install_url,
-        auth_token = tenant.auth_token,
-    );
-
-    Ok(script)
+            subdomain = tenant.subdomain,
+            domain = domain,
+            server = server,
+            ssh_port = tenant.ssh_port,
+            id = tenant.id,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+        ),
+    }
 }
 
 // ── Self-service tenant registration (user-auth level) ──────────────
@@ -3103,8 +3138,9 @@ pub async fn register_tenant(
     // Validate tenant name (must match TenantStore rules: lowercase alnum + hyphens,
     // no leading/trailing hyphens, max 64 chars)
     use std::sync::LazyLock;
-    static TENANT_NAME_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap());
+    static TENANT_NAME_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$").unwrap()
+    });
     if !TENANT_NAME_RE.is_match(&req.name) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -3118,7 +3154,9 @@ pub async fn register_tenant(
     ))?;
 
     // Resolve user's email for legacy tenant matching
-    let user_email = state.user_store.as_ref()
+    let user_email = state
+        .user_store
+        .as_ref()
         .and_then(|us| us.get(&user_id).ok().flatten())
         .map(|u| u.email)
         .unwrap_or_default();
@@ -3162,7 +3200,7 @@ pub async fn register_tenant(
         id: req.name.clone(),
         name: req.name.clone(),
         subdomain: req.name.clone(),
-        tunnel_token: uuid::Uuid::new_v4().to_string(),
+        tunnel_token: String::new(),
         ssh_port,
         local_port: req.local_port,
         auth_token: format!(
@@ -3187,9 +3225,15 @@ pub async fn register_tenant(
     let mut email_sent = false;
     if !user_email.is_empty() {
         if let Some(auth_manager) = state.auth_manager.as_ref() {
-            let (subject, html) = build_register_setup_email(&tenant, domain, server);
-            match auth_manager.send_html_email(&user_email, &subject, &html).await {
-                Ok(true) => { email_sent = true; }
+            let (subject, html) =
+                build_register_setup_email(&tenant, domain, server, shared_frps_token().as_deref());
+            match auth_manager
+                .send_html_email(&user_email, &subject, &html)
+                .await
+            {
+                Ok(true) => {
+                    email_sent = true;
+                }
                 Ok(false) => { /* SMTP not configured — skip silently */ }
                 Err(e) => {
                     tracing::warn!(
@@ -3203,8 +3247,14 @@ pub async fn register_tenant(
         }
     }
 
-    let unix_cmd = build_register_setup_command_unix(&tenant, domain, server);
-    let win_cmd = build_register_setup_command_windows(&tenant, domain, server);
+    let unix_cmd =
+        build_register_setup_command_unix(&tenant, domain, shared_frps_token().as_deref());
+    let win_cmd = build_register_setup_command_windows(
+        &tenant,
+        domain,
+        server,
+        shared_frps_token().as_deref(),
+    );
 
     Ok(Json(RegisterResponse {
         id: tenant.id.clone(),
@@ -3221,7 +3271,7 @@ pub async fn register_tenant(
 
 /// Response from POST /api/register — only fields the client needs.
 /// Excludes tunnel_token and owner (internal/secret).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     pub id: String,
     pub subdomain: String,
@@ -3264,7 +3314,9 @@ pub async fn register_setup_script(
     ))?;
 
     // Resolve user's email for legacy tenant matching
-    let user_email = state.user_store.as_ref()
+    let user_email = state
+        .user_store
+        .as_ref()
         .and_then(|us| us.get(&user_id).ok().flatten())
         .map(|u| u.email)
         .unwrap_or_default();
@@ -3284,7 +3336,40 @@ pub async fn register_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script = build_register_setup_script(&tenant, domain, server);
+    let script =
+        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
+
+    Ok(script)
+}
+
+/// GET /api/register/setup-script/{id}/{auth_token} — returns the setup
+/// script for a specific tenant using that tenant's auth token.
+pub async fn register_setup_script_public(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((tenant_id, auth_token)): axum::extract::Path<(String, String)>,
+) -> Result<String, (StatusCode, String)> {
+    if !matches!(state.deployment_mode, crate::config::DeploymentMode::Cloud) {
+        return Err((StatusCode::NOT_FOUND, "not found".into()));
+    }
+
+    let store = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    let tenant = store
+        .get(&tenant_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "tenant not found".into()))?;
+
+    if tenant.auth_token != auth_token {
+        return Err((StatusCode::UNAUTHORIZED, "invalid auth token".into()));
+    }
+
+    let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
+    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let script =
+        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
 
     Ok(script)
 }
@@ -3292,44 +3377,39 @@ pub async fn register_setup_script(
 fn build_register_setup_command_unix(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
-    server: &str,
+    frps_token: Option<&str>,
 ) -> String {
-    let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
-
-    format!(
-        r#"curl -fsSL "{install_url}" | bash -s -- \
-    --tunnel \
-    --auth-token "{auth_token}" \
-    --port {local_port} \
-    --tenant-name "{subdomain}" \
-    --frps-token "{tunnel_token}" \
-    --ssh-port {ssh_port} \
-    --domain "{domain}" \
-    --frps-server "{server}""#,
-        subdomain = tenant.subdomain,
+    let setup_url = format!(
+        "https://{domain}/api/register/setup-script/{id}/{auth_token}",
         domain = domain,
-        server = server,
-        ssh_port = tenant.ssh_port,
-        install_url = install_url,
+        id = tenant.id,
         auth_token = tenant.auth_token,
-        tunnel_token = tenant.tunnel_token,
-        local_port = tenant.local_port,
-    )
+    );
+
+    match frps_token {
+        Some(_) => format!(r#"curl -fsSL "{setup_url}" | bash"#, setup_url = setup_url),
+        None => format!(
+            r#"curl -fsSL "{setup_url}" | FRPS_TOKEN=<shared-frps-token> bash"#,
+            setup_url = setup_url,
+        ),
+    }
 }
 
 fn build_register_setup_command_windows(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> String {
+    let frps_token = frps_token.unwrap_or("<shared-frps-token>");
     format!(
-        r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{tunnel_token}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
+        r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{frps_token}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
         subdomain = tenant.subdomain,
         domain = domain,
         server = server,
         ssh_port = tenant.ssh_port,
         auth_token = tenant.auth_token,
-        tunnel_token = tenant.tunnel_token,
+        frps_token = frps_token,
         local_port = tenant.local_port,
     )
 }
@@ -3338,21 +3418,84 @@ fn build_register_setup_script(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> String {
-    let command = build_register_setup_command_unix(tenant, domain, server);
-    format!(
-        r#"#!/usr/bin/env bash
+    let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
+    match frps_token {
+        Some(frps_token) => format!(
+            r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh as a managed tenant bootstrap.
-# Tunnel is required for this registered machine and all values are pre-filled.
+# Tunnel is required for this registered machine. The shared FRPS token
+# is injected server-side by the host.
 set -euo pipefail
 
-{command}
+curl -fsSL "{install_url}" | bash -s -- \
+    --tunnel \
+    --auth-token "{auth_token}" \
+    --port {local_port} \
+    --tenant-name "{subdomain}" \
+    --frps-token "{frps_token}" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}"
 "#,
-        subdomain = tenant.subdomain,
-        domain = domain,
-        command = command,
-    )
+            subdomain = tenant.subdomain,
+            domain = domain,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+            local_port = tenant.local_port,
+            frps_token = frps_token,
+            ssh_port = tenant.ssh_port,
+            server = server,
+        ),
+        None => format!(
+            r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh as a managed tenant bootstrap.
+# Tunnel is required for this registered machine and the shared FRPS token
+# must be provided by your operator.
+set -euo pipefail
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
+        *)            FRPS_TOKEN="${{FRPS_TOKEN:-$1}}"; shift ;;
+    esac
+done
+FRPS_TOKEN="${{FRPS_TOKEN:-}}"
+if [ -z "$FRPS_TOKEN" ]; then
+    echo ""
+    echo "ERROR: shared FRPS token required."
+    echo ""
+    echo "Usage:"
+    echo "  curl ... | FRPS_TOKEN=<token> bash"
+    echo "  curl ... | bash -s -- --frps-token <token>"
+    echo "  curl ... | bash -s -- <token>"
+    echo ""
+    echo "Your operator should provide the shared FRPS token."
+    exit 1
+fi
+
+curl -fsSL "{install_url}" | bash -s -- \
+    --tunnel \
+    --auth-token "{auth_token}" \
+    --port {local_port} \
+    --tenant-name "{subdomain}" \
+    --frps-token "$FRPS_TOKEN" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}"
+"#,
+            subdomain = tenant.subdomain,
+            domain = domain,
+            install_url = install_url,
+            auth_token = tenant.auth_token,
+            local_port = tenant.local_port,
+            ssh_port = tenant.ssh_port,
+            server = server,
+        ),
+    }
 }
 
 /// Minimal HTML escaping for values interpolated into email HTML.
@@ -3367,10 +3510,24 @@ fn build_register_setup_email(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
+    frps_token: Option<&str>,
 ) -> (String, String) {
-    let unix_command = html_escape(&build_register_setup_command_unix(tenant, domain, server));
-    let windows_command = html_escape(&build_register_setup_command_windows(tenant, domain, server));
-    let public_url = format!("https://{}.{}", html_escape(&tenant.subdomain), html_escape(domain));
+    let unix_command = html_escape(&build_register_setup_command_unix(
+        tenant, domain, frps_token,
+    ));
+    let windows_command = html_escape(&build_register_setup_command_windows(
+        tenant, domain, server, frps_token,
+    ));
+    let public_url = format!(
+        "https://{}.{}",
+        html_escape(&tenant.subdomain),
+        html_escape(domain)
+    );
+    let frps_note_html = if frps_token.is_some() {
+        String::new()
+    } else {
+        r#"<p style="margin: 0;"><strong>Shared FRPS token:</strong> replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator.</p>"#.to_string()
+    };
     let subject = format!("octos setup for {}", tenant.subdomain);
     let html = format!(
         r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px;">
@@ -3381,8 +3538,8 @@ fn build_register_setup_email(
         <p style="margin: 0 0 8px 0;"><strong>Public URL:</strong> {public_url}</p>
         <p style="margin: 0 0 8px 0;"><strong>SSH port:</strong> {ssh_port}</p>
         <p style="margin: 0 0 8px 0;"><strong>Auth token:</strong> {auth_token}</p>
-        <p style="margin: 0;"><strong>FRP token:</strong> {tunnel_token}</p>
     </div>
+    {frps_note_html}
     <p style="color: #444; margin-bottom: 8px;">macOS / Linux install command:</p>
     <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{unix_command}</pre>
     <p style="color: #444; margin: 16px 0 8px 0;">Windows install command:</p>
@@ -3393,7 +3550,7 @@ fn build_register_setup_email(
         public_url = public_url,
         ssh_port = tenant.ssh_port,
         auth_token = html_escape(&tenant.auth_token),
-        tunnel_token = html_escape(&tenant.tunnel_token),
+        frps_note_html = frps_note_html,
         unix_command = unix_command,
         windows_command = windows_command,
     );
@@ -3421,14 +3578,15 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32", None);
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("Tunnel is required for this registered machine"));
         assert!(script.contains("--tunnel"));
         assert!(script.contains("--auth-token \"auth-token\""));
         assert!(script.contains("--tenant-name \"alice\""));
-        assert!(script.contains("--frps-token \"secret\""));
+        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
+        assert!(!script.contains("--frps-token \"secret\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
         assert!(script.contains("--frps-server \"163.192.33.32\""));
@@ -3451,24 +3609,74 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let (_subject, html) = build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+        let (_subject, html) =
+            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32", None);
 
-        assert!(html.contains("install.sh"));
-        assert!(html.contains("--tunnel"));
-        assert!(html.contains("--port 9090"));
+        assert!(html.contains("/api/register/setup-script/alice/"));
+        assert!(html.contains("FRPS_TOKEN=&lt;shared-frps-token&gt; bash"));
         assert!(html.contains("install.ps1"));
         assert!(html.contains("-Tunnel"));
         assert!(html.contains("-Port 9090"));
+        assert!(html.contains("-FrpsToken &quot;&lt;shared-frps-token&gt;&quot;"));
+        assert!(html.contains("<strong>Shared FRPS token:</strong>"));
+        assert!(!html.contains("<strong>FRP token:</strong> secret"));
+    }
+
+    #[test]
+    fn register_setup_script_embeds_real_shared_frps_token_when_available() {
+        let tenant = crate::tenant::TenantConfig {
+            id: "alice".into(),
+            name: "alice".into(),
+            subdomain: "alice".into(),
+            tunnel_token: String::new(),
+            ssh_port: 6001,
+            local_port: 8080,
+            auth_token: "auth-token".into(),
+            owner: "alice".into(),
+            status: crate::tenant::TenantStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let script = build_register_setup_script(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+        let unix_command =
+            build_register_setup_command_unix(&tenant, "octos-cloud.org", Some("shared-token"));
+        let windows_command = build_register_setup_command_windows(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+        let (_subject, html) = build_register_setup_email(
+            &tenant,
+            "octos-cloud.org",
+            "163.192.33.32",
+            Some("shared-token"),
+        );
+
+        assert!(script.contains("--frps-token \"shared-token\""));
+        assert!(!script.contains("FRPS_TOKEN=\"${FRPS_TOKEN:-}\""));
+        assert_eq!(
+            unix_command,
+            r#"curl -fsSL "https://octos-cloud.org/api/register/setup-script/alice/auth-token" | bash"#
+        );
+        assert!(windows_command.contains("-FrpsToken \"shared-token\""));
+        assert!(!html.contains("Shared FRPS token:"));
     }
 }
 
 #[cfg(test)]
 mod register_tenant_email_tests {
     use super::*;
+    use crate::api::router::AuthIdentity;
     use crate::api::{AppState, SseBroadcaster};
     use crate::config::DeploymentMode;
     use crate::otp::{AuthManager, DashboardAuthConfig, SmtpConfig};
-    use crate::api::router::AuthIdentity;
     use crate::user_store::{User, UserRole, UserStore};
     use std::sync::Arc;
 
@@ -3493,7 +3701,9 @@ mod register_tenant_email_tests {
             watchdog_enabled: None,
             alerts_enabled: None,
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
-            tenant_store: Some(Arc::new(crate::tenant::TenantStore::open(dir.path()).unwrap())),
+            tenant_store: Some(Arc::new(
+                crate::tenant::TenantStore::open(dir.path()).unwrap(),
+            )),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
@@ -3560,14 +3770,29 @@ mod register_tenant_email_tests {
         assert_eq!(email.to, "alice@example.com");
         assert!(email.subject.contains("macmini"));
         assert!(email.html.contains("https://macmini.octos-cloud.org"));
-        assert!(email.html.contains("--tunnel"));
-        assert!(email.html.contains("--frps-token"));
+        assert!(email.html.contains("/api/register/setup-script/macmini/"));
+        assert!(email.html.contains("&lt;shared-frps-token&gt;"));
         assert!(email.html.contains("-Tunnel"));
-        assert!(email.html.contains("--port 9090"));
         assert!(email.html.contains("-Port 9090"));
         assert!(email.html.contains(&response.0.dashboard_url));
-        assert!(response.0.setup_command_unix.contains("--tunnel"));
-        assert!(response.0.setup_command_unix.contains("--port 9090"));
+        assert!(
+            response
+                .0
+                .setup_command_unix
+                .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
+        );
+        assert!(
+            response
+                .0
+                .setup_command_unix
+                .contains("FRPS_TOKEN=<shared-frps-token> bash")
+        );
+        assert!(
+            response
+                .0
+                .setup_command_windows
+                .contains("-FrpsToken \"<shared-frps-token>\"")
+        );
         assert!(response.0.setup_command_windows.contains("-Tunnel"));
         assert!(response.0.setup_command_windows.contains("-Port 9090"));
     }
@@ -3596,6 +3821,445 @@ mod register_tenant_email_tests {
 
         assert_eq!(response.0.subdomain, "macmini");
         assert_eq!(response.0.dashboard_url, "https://macmini.octos-cloud.org");
+    }
+}
+
+#[cfg(test)]
+mod register_flow_tests {
+    use super::*;
+    use crate::api::router::AuthIdentity;
+    use crate::api::{AppState, SseBroadcaster};
+    use crate::config::DeploymentMode;
+    use crate::user_store::{User, UserRole, UserStore};
+    use std::sync::Arc;
+
+    fn test_state(
+        dir: &tempfile::TempDir,
+        mode: DeploymentMode,
+    ) -> (Arc<AppState>, Arc<UserStore>) {
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            started_at: chrono::Utc::now(),
+            auth_token: None,
+            metrics_handle: None,
+            profile_store: None,
+            process_manager: None,
+            user_store: Some(user_store.clone()),
+            auth_manager: None,
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            tenant_store: Some(Arc::new(
+                crate::tenant::TenantStore::open(dir.path()).unwrap(),
+            )),
+            tunnel_domain: Some("octos-cloud.org".into()),
+            frps_server: Some("163.192.33.32".into()),
+            frps_port: Some(7000),
+            deployment_mode: mode,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        });
+        (state, user_store)
+    }
+
+    fn alice_identity() -> axum::Extension<AuthIdentity> {
+        axum::Extension(AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        })
+    }
+
+    fn save_alice(user_store: &UserStore) {
+        user_store
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+    }
+
+    // ── Happy path ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_register_tenant_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let resp = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.0.subdomain, "macmini");
+        assert_eq!(resp.0.ssh_port, 6001);
+        assert_eq!(resp.0.dashboard_url, "https://macmini.octos-cloud.org");
+        assert!(!resp.0.auth_token.is_empty());
+        assert!(
+            resp.0
+                .setup_command_unix
+                .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
+        );
+        assert!(
+            resp.0
+                .setup_command_unix
+                .contains("FRPS_TOKEN=<shared-frps-token> bash")
+        );
+        assert!(resp.0.setup_command_windows.contains("-TenantName"));
+        assert!(resp.0.setup_command_windows.contains("macmini"));
+        assert!(
+            resp.0
+                .setup_command_windows
+                .contains("-FrpsToken \"<shared-frps-token>\"")
+        );
+    }
+
+    // ── Duplicate tenant name ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_duplicate_tenant_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+        // Save bob so alice's second attempt uses a different user
+        user_store
+            .save(&User {
+                id: "bob".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        // Alice registers "macmini"
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Bob tries the same name
+        let err = register_tenant(
+            axum::extract::State(state),
+            axum::Extension(AuthIdentity::User {
+                id: "bob".into(),
+                role: UserRole::User,
+            }),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("already taken"));
+    }
+
+    // ── One tenant per user ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_second_tenant_for_same_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "first".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "second".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("already have a tenant"));
+    }
+
+    // ── Name validation ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_invalid_tenant_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        for bad_name in &["-leading", "trailing-", "UPPER", "under_score", "a b", ""] {
+            let err = register_tenant(
+                axum::extract::State(state.clone()),
+                alice_identity(),
+                Json(CreateTenantRequest {
+                    name: bad_name.to_string(),
+                    local_port: 8080,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.0,
+                StatusCode::BAD_REQUEST,
+                "expected 400 for name '{bad_name}'"
+            );
+        }
+    }
+
+    // ── Non-cloud mode blocked ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_registration_in_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Local);
+        save_alice(&user_store);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn should_reject_registration_in_tenant_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Tenant);
+        save_alice(&user_store);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ── Admin token blocked ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_reject_admin_token_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = test_state(&dir, DeploymentMode::Cloud);
+
+        let err = register_tenant(
+            axum::extract::State(state),
+            axum::Extension(AuthIdentity::Admin),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Setup script: no tenant ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn setup_script_should_404_when_no_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let err = register_setup_script(axum::extract::State(state), alice_identity())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // ── Setup script: happy path ────────────────────────────────────
+
+    #[tokio::test]
+    async fn setup_script_should_return_script_for_registered_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let script = register_setup_script(axum::extract::State(state.clone()), alice_identity())
+            .await
+            .unwrap();
+        let saved_tunnel_token = state
+            .tenant_store
+            .as_ref()
+            .unwrap()
+            .get("macmini")
+            .unwrap()
+            .unwrap()
+            .tunnel_token;
+
+        assert!(script.contains("--tenant-name \"macmini\""));
+        assert!(script.contains("--domain \"octos-cloud.org\""));
+        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--ssh-port"));
+        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
+        assert!(saved_tunnel_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_setup_script_should_return_script_for_valid_tenant_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let response = register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let script = register_setup_script_public(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((response.0.id.clone(), response.0.auth_token.clone())),
+        )
+        .await
+        .unwrap();
+
+        assert!(script.contains("--tenant-name \"macmini\""));
+        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
+    }
+
+    #[tokio::test]
+    async fn public_setup_script_should_reject_wrong_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        let response = register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "macmini".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = register_setup_script_public(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((response.0.id.clone(), "wrong-token".into())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Legacy email owner matching ─────────────────────────────────
+
+    #[tokio::test]
+    async fn should_find_tenant_by_legacy_email_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, user_store) = test_state(&dir, DeploymentMode::Cloud);
+        save_alice(&user_store);
+
+        // Simulate a legacy tenant with full email as owner
+        let store = state.tenant_store.as_ref().unwrap();
+        let now = chrono::Utc::now();
+        store
+            .save(&crate::tenant::TenantConfig {
+                id: "legacy".into(),
+                name: "legacy".into(),
+                subdomain: "legacy".into(),
+                tunnel_token: uuid::Uuid::new_v4().to_string(),
+                ssh_port: 6005,
+                local_port: 8080,
+                auth_token: "tok".into(),
+                owner: "alice@example.com".into(), // legacy format
+                status: crate::tenant::TenantStatus::Pending,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        // Alice (user_id="alice") should find the legacy tenant
+        let err = register_tenant(
+            axum::extract::State(state.clone()),
+            alice_identity(),
+            Json(CreateTenantRequest {
+                name: "new-one".into(),
+                local_port: 8080,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("legacy"));
+
+        // Setup script should also find it
+        let script = register_setup_script(axum::extract::State(state), alice_identity())
+            .await
+            .unwrap();
+
+        assert!(script.contains("--tenant-name \"legacy\""));
     }
 }
 

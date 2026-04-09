@@ -16,7 +16,7 @@ pub struct AdminCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AdminAction {
-    /// Create a new tunnel tenant (assigns subdomain, token, SSH port).
+    /// Create a new tunnel tenant (assigns subdomain, auth token, and SSH port).
     CreateTenant {
         /// Tenant name (used as subdomain and ID).
         #[arg(long)]
@@ -67,6 +67,9 @@ pub enum AdminAction {
         /// frps control port.
         #[arg(long, default_value = "7000")]
         port: u16,
+        /// Shared FRPS auth token for the central host.
+        #[arg(long)]
+        frps_token: Option<String>,
         /// Data directory override.
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
@@ -94,7 +97,6 @@ impl Executable for AdminCommand {
                 }
 
                 let ssh_port = store.next_ssh_port()?;
-                let tunnel_token = Uuid::new_v4().to_string();
                 let auth_token = auth_token_arg.unwrap_or_else(|| {
                     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
                 });
@@ -104,7 +106,7 @@ impl Executable for AdminCommand {
                     id: name.clone(),
                     name: name.clone(),
                     subdomain: name.clone(),
-                    tunnel_token: tunnel_token.clone(),
+                    tunnel_token: String::new(),
                     ssh_port,
                     local_port,
                     auth_token: auth_token.clone(),
@@ -121,7 +123,6 @@ impl Executable for AdminCommand {
                 println!("  Subdomain:  {}.{}", tenant.subdomain, domain);
                 println!("  SSH port:   {}", tenant.ssh_port);
                 println!("  Auth token: {}", auth_token);
-                println!("  Tunnel tok: {}", tunnel_token);
                 println!();
                 println!("Bootstrap the Mac Mini:");
                 println!(
@@ -180,6 +181,7 @@ impl Executable for AdminCommand {
                 domain,
                 server,
                 port,
+                frps_token,
                 data_dir,
             } => {
                 let data_dir = super::resolve_data_dir(data_dir)?;
@@ -189,7 +191,15 @@ impl Executable for AdminCommand {
                     .get(&name)?
                     .ok_or_else(|| eyre::eyre!("tenant '{name}' not found"))?;
 
-                let config = render_frpc_config(&tenant, &server, port, &domain);
+                let frps_token = frps_token
+                    .or_else(|| std::env::var("FRPS_TOKEN").ok())
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "shared FRPS token is required; pass --frps-token or set FRPS_TOKEN"
+                        )
+                    })?;
+
+                let config = render_frpc_config(&tenant, &server, port, &domain, &frps_token);
                 println!("{config}");
 
                 Ok(())

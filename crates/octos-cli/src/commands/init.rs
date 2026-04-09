@@ -1,4 +1,4 @@
-//! Init command: create .octos/config.json interactively.
+//! Init command: create config.json interactively in the resolved octos home.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -136,10 +136,11 @@ fn detect_from_env() -> Option<usize> {
     None
 }
 
-/// Initialize a new .octos configuration.
+/// Initialize a new octos configuration.
 #[derive(Debug, Args)]
 pub struct InitCommand {
-    /// Working directory (defaults to current directory).
+    /// Project working directory. When set, init writes to `<cwd>/.octos/`.
+    /// Otherwise it writes to `$OCTOS_HOME` or `~/.octos`.
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
 
@@ -153,12 +154,10 @@ impl Executable for InitCommand {
         println!("{}", "octos init".cyan().bold());
         println!();
 
-        let cwd = match self.cwd {
-            Some(p) => p,
-            None => std::env::current_dir().wrap_err("failed to get current directory")?,
+        let config_dir = match self.cwd {
+            Some(cwd) => cwd.join(".octos"),
+            None => super::resolve_data_dir(None)?,
         };
-
-        let config_dir = cwd.join(".octos");
         let config_path = config_dir.join("config.json");
 
         // Check if config already exists
@@ -279,7 +278,10 @@ impl Executable for InitCommand {
 
             // API key env var
             println!();
-            print!("API key environment variable [{}]: ", info.api_key_env);
+            print!(
+                "Environment variable containing the API Key [{}]: ",
+                info.api_key_env
+            );
             io::stdout().flush()?;
 
             let mut input = String::new();

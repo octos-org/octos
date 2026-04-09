@@ -9,13 +9,14 @@
 #   --no-skills        Skip building app-skills
 #   --no-service       Skip launchd/systemd service setup
 #   --uninstall        Remove binaries and service files
+#   --purge            Delete the data dir
 #   --debug            Build in debug mode (faster, larger binary)
 #   --prefix DIR       Install prefix (default: ~/.cargo/bin)
 #
 # Tunnel options (auto-enabled with --full, set up frpc to connect to VPS relay):
 #   --no-tunnel              Skip frpc tunnel setup even in --full mode
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
-#   --frps-token TOKEN       frps auth token
+#   --frps-token TOKEN       shared frps auth token
 #   --frps-server ADDR       frps server address (default: 163.192.33.32)
 #   --ssh-port PORT          SSH tunnel remote port (default: 6001)
 #   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
@@ -31,6 +32,7 @@ CHANNELS=""
 BUILD_SKILLS=true
 SETUP_SERVICE=true
 UNINSTALL=false
+PURGE=false
 PROFILE="release"
 PREFIX="${CARGO_HOME:-$HOME/.cargo}/bin"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
@@ -52,6 +54,7 @@ while [ $# -gt 0 ]; do
         --no-skills)     BUILD_SKILLS=false; shift ;;
         --no-service)    SETUP_SERVICE=false; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
+        --purge)         PURGE=true; shift ;;
         --debug)         PROFILE="dev"; shift ;;
         --prefix)        PREFIX="${2:-$PREFIX}"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
@@ -165,41 +168,71 @@ EOF
     ok "runtime config: $config_path"
 }
 
+run_purge_data() {
+    section "Purging local data"
+    echo "    (sudo may be needed if previous runs created root-owned files)"
+    sudo rm -rf "$DATA_DIR"
+    ok "data directory removed"
+}
+
 # ── Uninstall ─────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
-    # Stop and remove service
-    echo "    (sudo is needed to remove the system service)"
+    # Stop and remove octos serve + frpc system services
+    echo "    (sudo is needed to remove the system services)"
     case "$OS" in
         Darwin)
             sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
             sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.frpc.plist
             # Also clean up legacy LaunchAgent if present
             launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
             rm -f ~/Library/LaunchAgents/io.octos.octos-serve.plist
-            ok "launchd service removed"
+            launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/io.octos.frpc.plist
+            ok "launchd services removed"
             ;;
         Linux)
             sudo systemctl stop octos-serve.service 2>/dev/null || true
             sudo systemctl disable octos-serve.service 2>/dev/null || true
             sudo rm -f /etc/systemd/system/octos-serve.service
+            sudo systemctl stop frpc.service 2>/dev/null || true
+            sudo systemctl disable frpc.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/frpc.service
             sudo systemctl daemon-reload 2>/dev/null || true
-            ok "systemd service removed"
+            ok "systemd services removed"
             ;;
     esac
 
     # Remove binaries
-    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather)
+    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather frpc)
     for bin in "${BINS[@]}"; do
         rm -f "$PREFIX/$bin"
     done
+    sudo rm -f /usr/local/bin/frpc
+    sudo rm -f /etc/frp/frpc.toml
+    sudo rm -f /var/log/frpc.log
     ok "binaries removed from $PREFIX"
 
     echo ""
-    echo "Binaries and service files removed."
-    echo "Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
-    echo "  rm -rf $DATA_DIR"
+    echo "Binaries, frpc config, and service files removed."
+    if [ "$PURGE" = true ]; then
+        run_purge_data
+    else
+        echo "Data directory ($DATA_DIR) was NOT removed."
+        echo "To remove it too, re-run with:"
+        echo "  bash scripts/local-tenant-deploy.sh --uninstall --purge"
+    fi
+    exit 0
+fi
+
+if [ "$PURGE" = true ]; then
+    run_purge_data
+    echo ""
+    echo "Local data removed."
+    echo "Installed binaries and services were preserved."
     exit 0
 fi
 
@@ -520,10 +553,10 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the frps auth token from your registration email or setup command:"
+        echo "    Enter the shared frps auth token from your operator or cloud host:"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
-        [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
+        [ -z "$FRPS_TOKEN" ] && err "shared frps token is required for tunnel setup"
     fi
 
     # ── Show summary before proceeding ────────────────────────────────
@@ -531,7 +564,7 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     echo ""
     echo "    Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "    frps server:  ${FRPS_SERVER}:7000"
-    echo "    frps token:   ${FRPS_TOKEN:0:8}..."
+    echo "    shared frps token: ${FRPS_TOKEN:0:8}..."
     echo "    SSH port:     ${SSH_PORT}"
     echo "    Local port:   8080"
     echo ""
