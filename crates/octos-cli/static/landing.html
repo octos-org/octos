@@ -538,13 +538,21 @@
                     <span data-lang="zh">在你的机器上运行以下命令安装 octos 并启用隧道：</span>
                 </p>
                 <div style="margin-top: 8px;">
-                    <div style="display: flex; gap: 8px; margin-bottom: 4px;">
+                    <div style="display: flex; gap: 8px; margin-bottom: 4px; align-items: center;">
                         <button onclick="showCmd('unix')" id="tabUnix" style="background: var(--green); color: var(--bg); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">macOS / Linux</button>
                         <button onclick="showCmd('win')" id="tabWin" style="background: var(--card); color: var(--text-dim); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">Windows</button>
+                        <button onclick="copySetupCommand()" id="copyCmdBtn" style="margin-left: auto; background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                            <span data-lang="en">Copy</span>
+                            <span data-lang="zh">复制</span>
+                        </button>
                     </div>
                     <div style="background: var(--bg); border-radius: 8px; padding: 12px; overflow-x: auto;">
                         <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
                     </div>
+                    <p id="copyCmdStatus" style="display: none; margin-top: 8px; font-size: 12px; color: var(--text-dim);">
+                        <span data-lang="en">Copied to clipboard.</span>
+                        <span data-lang="zh">已复制到剪贴板。</span>
+                    </p>
                 </div>
                 <p id="emailNote" style="margin-top: 12px; font-size: 12px; color: var(--text-dim); display: none;">
                     <span data-lang="en">We also emailed the same setup command to you for reinstall and backup.</span>
@@ -720,6 +728,36 @@ function showCmd(platform) {
         tabWin.style.background = 'var(--card)';
         tabWin.style.color = 'var(--text-dim)';
         tabWin.style.border = '1px solid var(--border)';
+    }
+}
+
+async function copySetupCommand() {
+    const cmd = document.getElementById('resultCmd').textContent.trim();
+    if (!cmd) return;
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(cmd);
+        } else {
+            const temp = document.createElement('textarea');
+            temp.value = cmd;
+            temp.setAttribute('readonly', '');
+            temp.style.position = 'absolute';
+            temp.style.left = '-9999px';
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand('copy');
+            document.body.removeChild(temp);
+        }
+
+        const status = document.getElementById('copyCmdStatus');
+        status.style.display = 'block';
+        window.clearTimeout(window._copyCmdStatusTimer);
+        window._copyCmdStatusTimer = window.setTimeout(() => {
+            status.style.display = 'none';
+        }, 1800);
+    } catch (e) {
+        console.log('copy command:', e.message);
     }
 }
 

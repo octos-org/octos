@@ -1046,9 +1046,11 @@ if [ "$UNINSTALL" = true ]; then
             warn "failed to remove some firewall rules (check privileges)"
         fi
     fi
-    echo ""
-    echo "    Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
-    echo "      rm -rf $DATA_DIR"
+    if [ "${INSTALL_SUPPRESS_DATA_DIR_HINT:-}" != "1" ]; then
+        echo ""
+        echo "    Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
+        echo "      rm -rf $DATA_DIR"
+    fi
     exit 0
 fi
 

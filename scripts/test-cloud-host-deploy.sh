@@ -60,11 +60,14 @@ EOF
     grep -q '^ENABLE_HTTPS=true$' "$state_file" || fail "state file missing ENABLE_HTTPS"
     grep -q '^DNS_PROVIDER=cloudflare$' "$state_file" || fail "state file missing DNS_PROVIDER"
     grep -q '^FRPS_TOKEN=test-shared-frps-token$' "$state_file" || fail "state file missing FRPS_TOKEN"
-    if grep -q '^ENABLE_SMTP=' "$state_file"; then
-        fail "state file should not store SMTP settings"
-    fi
-    if grep -q '^SMTP_HOST=' "$state_file"; then
-        fail "state file should not store SMTP settings"
+    grep -q '^ENABLE_SMTP=true$' "$state_file" || fail "state file missing ENABLE_SMTP"
+    grep -q '^SMTP_HOST=smtp.example.com$' "$state_file" || fail "state file missing SMTP_HOST"
+    grep -q '^SMTP_PORT=465$' "$state_file" || fail "state file missing SMTP_PORT"
+    grep -q '^SMTP_USERNAME=noreply@example.com$' "$state_file" || fail "state file missing SMTP_USERNAME"
+    grep -q '^SMTP_FROM=noreply@example.com$' "$state_file" || fail "state file missing SMTP_FROM"
+    grep -q '^ALLOW_SELF_REGISTRATION=true$' "$state_file" || fail "state file missing ALLOW_SELF_REGISTRATION"
+    if grep -q '^SMTP_PASSWORD=' "$state_file"; then
+        fail "state file should not store SMTP_PASSWORD"
     fi
 
     local rerun_out="$test_root/rerun.out"

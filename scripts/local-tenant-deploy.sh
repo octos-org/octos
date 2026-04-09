@@ -9,6 +9,7 @@
 #   --no-skills        Skip building app-skills
 #   --no-service       Skip launchd/systemd service setup
 #   --uninstall        Remove binaries and service files
+#   --purge            With --uninstall, also delete the data dir
 #   --debug            Build in debug mode (faster, larger binary)
 #   --prefix DIR       Install prefix (default: ~/.cargo/bin)
 #
@@ -31,6 +32,7 @@ CHANNELS=""
 BUILD_SKILLS=true
 SETUP_SERVICE=true
 UNINSTALL=false
+PURGE=false
 PROFILE="release"
 PREFIX="${CARGO_HOME:-$HOME/.cargo}/bin"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
@@ -52,6 +54,7 @@ while [ $# -gt 0 ]; do
         --no-skills)     BUILD_SKILLS=false; shift ;;
         --no-service)    SETUP_SERVICE=false; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
+        --purge)         PURGE=true; shift ;;
         --debug)         PROFILE="dev"; shift ;;
         --prefix)        PREFIX="${2:-$PREFIX}"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
@@ -69,6 +72,10 @@ while [ $# -gt 0 ]; do
             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [ "$PURGE" = true ] && [ "$UNINSTALL" = false ]; then
+    err "--purge requires --uninstall"
+fi
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -198,8 +205,15 @@ if [ "$UNINSTALL" = true ]; then
 
     echo ""
     echo "Binaries and service files removed."
-    echo "Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
-    echo "  rm -rf $DATA_DIR"
+    if [ "$PURGE" = true ]; then
+        echo "Purging data directory ($DATA_DIR)"
+        sudo rm -rf "$DATA_DIR"
+        echo "Data directory removed."
+    else
+        echo "Data directory ($DATA_DIR) was NOT removed."
+        echo "To remove it too, re-run with:"
+        echo "  bash scripts/local-tenant-deploy.sh --uninstall --purge"
+    fi
     exit 0
 fi
 

@@ -48,6 +48,21 @@ main() {
     grep -Fq 'shared frps auth token from your operator or cloud host' "$SCRIPT" \
         || fail "local tenant deploy should prompt for the shared FRPS token source"
 
+    grep -Fq '#   --purge            With --uninstall, also delete the data dir' "$SCRIPT" \
+        || fail "local tenant deploy should document the --purge option"
+
+    grep -Fq 'if [ "$PURGE" = true ] && [ "$UNINSTALL" = false ]; then' "$SCRIPT" \
+        || fail "local tenant deploy should require --purge to be paired with --uninstall"
+
+    grep -Fq 'err "--purge requires --uninstall"' "$SCRIPT" \
+        || fail "local tenant deploy should explain that --purge requires --uninstall"
+
+    grep -Fq 'sudo rm -rf "$DATA_DIR"' "$SCRIPT" \
+        || fail "local tenant deploy should delete the data dir during purge"
+
+    grep -Fq 'bash scripts/local-tenant-deploy.sh --uninstall --purge' "$SCRIPT" \
+        || fail "local tenant deploy should direct users to rerun with --uninstall --purge"
+
     echo "local tenant deploy tests passed"
 }
 
