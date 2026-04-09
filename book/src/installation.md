@@ -58,6 +58,17 @@ For a streamlined installation, use the deploy script:
 ./scripts/local-tenant-deploy.sh --channels telegram,discord,api
 ```
 
+<a id="node-name-guidelines"></a>
+### Node Name Guidelines
+
+For cloud signup and managed tenant installs, the node name becomes both the tenant id and the public subdomain, for example `alice.your-cloud.example`.
+
+- Use 1 to 64 characters.
+- Allowed characters are lowercase letters, numbers, and hyphens.
+- Do not start or end the name with a hyphen.
+- Choose something stable and easy to remember, because reinstall, support, and diagnostics may refer to the same node name later.
+- Avoid temporary names tied to a one-off machine state if you expect to reuse the same public address.
+
 ## Platform-Specific Instructions
 
 ### macOS

@@ -869,7 +869,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
 }
 
 /// GET /api/version — public version endpoint (no auth required).
-pub async fn version() -> Json<serde_json::Value> {
+pub async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let version = env!("CARGO_PKG_VERSION");
     let git_hash = option_env!("OCTOS_GIT_HASH").unwrap_or("");
     let build_date = option_env!("OCTOS_BUILD_DATE").unwrap_or("");
@@ -882,6 +882,7 @@ pub async fn version() -> Json<serde_json::Value> {
         "service": "octos",
         "version": full,
         "build_date": build_date,
+        "tunnel_domain": state.tunnel_domain,
     }))
 }
 
