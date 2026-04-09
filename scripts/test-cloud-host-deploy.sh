@@ -35,6 +35,7 @@ SMTP_FROM=noreply@example.com
 SMTP_PASSWORD=test-smtp-password
 ALLOW_SELF_REGISTRATION=true
 AUTH_TOKEN=test-auth-token
+FRPS_TOKEN=test-shared-frps-token
 EOF
 
     bash "$CLOUD_DEPLOY" \
@@ -58,6 +59,7 @@ EOF
     [ -f "$state_file" ] || fail "state file was not written"
     grep -q '^ENABLE_HTTPS=true$' "$state_file" || fail "state file missing ENABLE_HTTPS"
     grep -q '^DNS_PROVIDER=cloudflare$' "$state_file" || fail "state file missing DNS_PROVIDER"
+    grep -q '^FRPS_TOKEN=test-shared-frps-token$' "$state_file" || fail "state file missing FRPS_TOKEN"
     if grep -q '^ENABLE_SMTP=' "$state_file"; then
         fail "state file should not store SMTP settings"
     fi
@@ -77,6 +79,8 @@ EOF
         || fail "rerun should load settings from the existing state file"
     grep -q -- '--auth-token test-auth-token' "$rerun_out" \
         || fail "rerun should reuse the saved auth token as the default in non-interactive mode"
+    grep -q 'FRPS_TOKEN=\*\*\*' "$rerun_out" \
+        || fail "rerun should reuse the saved shared FRPS token for setup-frps.sh"
     grep -q 'scripts/frp/setup-caddy.sh --https --dns-provider cloudflare --domain octos.example.com' "$rerun_out" \
         || fail "rerun should reuse the saved HTTPS settings as defaults in non-interactive mode"
     grep -q 'SMTP_HOST=smtp.example.com' "$rerun_out" \
@@ -85,6 +89,7 @@ EOF
     grep -q 'scripts/install.sh' "$output_file" || fail "dry run did not include install.sh"
     grep -q -- '--auth-token test-auth-token' "$output_file" || fail "dry run did not include auth token"
     grep -q 'scripts/frp/setup-frps.sh' "$output_file" || fail "dry run did not include setup-frps.sh"
+    grep -q 'FRPS_TOKEN=\*\*\*' "$output_file" || fail "dry run did not include shared FRPS token env for setup-frps.sh"
     grep -q 'scripts/frp/setup-caddy.sh --https --dns-provider cloudflare --domain octos.example.com' "$output_file" || fail "dry run did not include expected setup-caddy.sh command"
     grep -q 'SMTP_HOST=smtp.example.com' "$output_file" || fail "dry run did not include SMTP env for install.sh"
 

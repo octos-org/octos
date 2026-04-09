@@ -19,7 +19,7 @@
 #   --domain <domain>     Base tunnel domain (default: octos-cloud.org)
 #   --server <addr>       frps VPS address (default: 163.192.33.32)
 #   --frps-port <port>    frps control port (default: 7000)
-#   --frps-token <tok>    frps auth token (default: read from ~/home/orcl-vps/frps-token.txt)
+#   --frps-token <tok>    shared frps auth token (default: read from ~/home/orcl-vps/frps-token.txt)
 #   --auth-token <tok>    Dashboard auth token (default: auto-generated)
 #   --skip-build          Skip local cargo build (use existing binaries)
 #   --skip-tenant         Skip tenant creation (already exists)
@@ -56,7 +56,7 @@ if [ $# -lt 2 ]; then
     echo "  --serve-port <port>   octos serve port (default: 8080)"
     echo "  --domain <domain>     Tunnel domain (default: octos-cloud.org)"
     echo "  --server <addr>       frps address (default: 163.192.33.32)"
-    echo "  --frps-token <tok>    frps auth token"
+    echo "  --frps-token <tok>    shared frps auth token"
     echo "  --auth-token <tok>    Dashboard auth token"
     echo "  --skip-build          Use existing binaries"
     echo "  --skip-tenant         Tenant already created"

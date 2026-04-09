@@ -695,21 +695,31 @@ fn default_max_history() -> usize {
 }
 
 impl Config {
-    /// Load config from file, returns default if not found.
-    pub fn load(cwd: &Path) -> Result<Self> {
+    /// Path to the runtime config file under the resolved data dir.
+    pub fn data_dir_config_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("config.json")
+    }
+
+    /// Load config from the current project plus the already-resolved data dir.
+    pub fn load(cwd: &Path, data_dir: &Path) -> Result<Self> {
+        Self::load_with_path(cwd, data_dir).map(|(config, _)| config)
+    }
+
+    /// Load config and return the resolved config path when one exists.
+    pub fn load_with_path(cwd: &Path, data_dir: &Path) -> Result<(Self, Option<PathBuf>)> {
         // Try project-local config first
         let local_config = cwd.join(".octos").join("config.json");
         if local_config.exists() {
             tracing::info!(path = %local_config.display(), "loading config (project-local)");
-            return Self::from_file(&local_config);
+            return Ok((Self::from_file(&local_config)?, Some(local_config)));
         }
 
-        // Try data dir config ($OCTOS_HOME or ~/.octos)
-        if let Some(global_config) = Self::global_config_path() {
-            if global_config.exists() {
-                tracing::info!(path = %global_config.display(), "loading config (data dir)");
-                return Self::from_file(&global_config);
-            }
+        // The caller resolves --data-dir > OCTOS_HOME > ~/.octos exactly once
+        // and passes the canonical data dir here.
+        let data_dir_config = Self::data_dir_config_path(data_dir);
+        if data_dir_config.exists() {
+            tracing::info!(path = %data_dir_config.display(), "loading config (data dir)");
+            return Ok((Self::from_file(&data_dir_config)?, Some(data_dir_config)));
         }
 
         // Try legacy platform config dir (~/Library/Application Support/octos/ or ~/.config/octos/)
@@ -720,13 +730,13 @@ impl Config {
                     path = %legacy_config.display(),
                     "loading config from legacy location — consider moving to ~/.octos/config.json"
                 );
-                return Self::from_file(&legacy_config);
+                return Ok((Self::from_file(&legacy_config)?, Some(legacy_config)));
             }
         }
 
         // No config found, use defaults
         tracing::info!("no config.json found, using defaults");
-        Ok(Self::default())
+        Ok((Self::default(), None))
     }
 
     /// Load config from a specific file.
@@ -757,15 +767,6 @@ impl Config {
         }
 
         Ok(config)
-    }
-
-    /// Get global config path ($OCTOS_HOME/config.json or ~/.octos/config.json).
-    pub fn global_config_path() -> Option<PathBuf> {
-        if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
-            Some(PathBuf::from(env_dir).join("config.json"))
-        } else {
-            dirs::home_dir().map(|d| d.join(".octos").join("config.json"))
-        }
     }
 
     /// Expand environment variables in config values.
@@ -1101,6 +1102,48 @@ mod tests {
         };
         let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("Unknown channel type")));
+    }
+
+    #[test]
+    fn test_load_uses_resolved_data_dir_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_dir_config = data_dir.path().join("config.json");
+        std::fs::write(
+            &data_dir_config,
+            r#"{"provider":"openai","model":"gpt-4o"}"#,
+        )
+        .unwrap();
+
+        let (config, path) = Config::load_with_path(cwd.path(), data_dir.path()).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(path.as_deref(), Some(data_dir_config.as_path()));
+    }
+
+    #[test]
+    fn test_load_prefers_project_local_over_data_dir_config() {
+        let cwd = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let local_dir = cwd.path().join(".octos");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        let local_config = local_dir.join("config.json");
+        let data_dir_config = data_dir.path().join("config.json");
+
+        std::fs::write(
+            &local_config,
+            r#"{"provider":"anthropic","model":"claude-sonnet-4-20250514"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &data_dir_config,
+            r#"{"provider":"openai","model":"gpt-4o"}"#,
+        )
+        .unwrap();
+
+        let (config, path) = Config::load_with_path(cwd.path(), data_dir.path()).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(path.as_deref(), Some(local_config.as_path()));
     }
 
     #[test]

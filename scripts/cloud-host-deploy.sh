@@ -20,6 +20,7 @@ PREFIX="${OCTOS_PREFIX:-$HOME/.octos/bin}"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 PORT="8080"
 AUTH_TOKEN=""
+FRPS_TOKEN="${FRPS_TOKEN:-}"
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-}"
 FRPS_SERVER="${FRPS_SERVER:-}"
 ENABLE_HTTPS="${ENABLE_HTTPS:-}"
@@ -94,6 +95,7 @@ while [ $# -gt 0 ]; do
         --state-file)        needval "$@"; STATE_FILE="$2"; shift 2 ;;
         --port)              needval "$@"; PORT="$2"; shift 2 ;;
         --auth-token)        needval "$@"; AUTH_TOKEN="$2"; shift 2 ;;
+        --frps-token)        needval "$@"; FRPS_TOKEN="$2"; shift 2 ;;
         --domain)            needval "$@"; TUNNEL_DOMAIN="$2"; shift 2 ;;
         --frps-server)       needval "$@"; FRPS_SERVER="$2"; shift 2 ;;
         --https)             ENABLE_HTTPS=true; shift ;;
@@ -121,6 +123,7 @@ Options:
   --state-file PATH      Persist rerun settings (default: <data-dir>/cloud-bootstrap.env)
   --port PORT            octos serve port behind Caddy (default: 8080)
   --auth-token TOKEN     Admin auth token for the dashboard
+  --frps-token TOKEN     Shared FRPS auth token for all tenant tunnels
   --domain DOMAIN        Base public domain for signup and tenant subdomains
   --frps-server ADDR     Address tenants use to reach frps (default: same as --domain)
   --https                Enable HTTPS with wildcard certs via setup-caddy.sh
@@ -453,6 +456,7 @@ PREFIX=$PREFIX
 DATA_DIR=$DATA_DIR
 PORT=$PORT
 AUTH_TOKEN=$AUTH_TOKEN
+FRPS_TOKEN=$FRPS_TOKEN
 TUNNEL_DOMAIN=$TUNNEL_DOMAIN
 FRPS_SERVER=$FRPS_SERVER
 ENABLE_HTTPS=$ENABLE_HTTPS
@@ -485,8 +489,8 @@ run_install() {
     if [ "$DRY_RUN" = true ]; then
         printf '    DRY RUN: OCTOS_HOME=%q' "$DATA_DIR"
         if [ "$ENABLE_SMTP" = true ]; then
-            printf ' SMTP_HOST=%q SMTP_PORT=%q SMTP_USERNAME=%q SMTP_FROM=%q SMTP_PASSWORD=%q' \
-                "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USERNAME" "$SMTP_FROM" "***"
+            printf ' SMTP_HOST=%q SMTP_PORT=%q SMTP_USERNAME=%q SMTP_FROM=%q SMTP_PASSWORD=***' \
+                "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USERNAME" "$SMTP_FROM"
         fi
         printf ' %q' "${cmd[@]}"
         printf '\n'
@@ -499,12 +503,13 @@ run_install() {
 run_setup_frps() {
     section "Installing frps"
     if [ "$DRY_RUN" = true ]; then
-        printf '    DRY RUN: TUNNEL_DOMAIN=%q OCTOS_SERVE_PORT=%q FRPS_BIND_PORT=%q FRPS_VHOST_HTTP_PORT=%q FRPS_VHOST_HTTPS_PORT=%q FRPS_DASHBOARD_PORT=%q FRPS_SSH_PORT_START=%q FRPS_SSH_PORT_END=%q %q\n' \
+        printf '    DRY RUN: TUNNEL_DOMAIN=%q OCTOS_SERVE_PORT=%q FRPS_TOKEN=*** FRPS_BIND_PORT=%q FRPS_VHOST_HTTP_PORT=%q FRPS_VHOST_HTTPS_PORT=%q FRPS_DASHBOARD_PORT=%q FRPS_SSH_PORT_START=%q FRPS_SSH_PORT_END=%q %q\n' \
             "$TUNNEL_DOMAIN" "$PORT" "$FRPS_BIND_PORT" "$FRPS_VHOST_HTTP_PORT" "$FRPS_VHOST_HTTPS_PORT" \
             "$FRPS_DASHBOARD_PORT" "$FRPS_SSH_PORT_START" "$FRPS_SSH_PORT_END" "$FRPS_SCRIPT"
     else
         TUNNEL_DOMAIN="$TUNNEL_DOMAIN" \
         OCTOS_SERVE_PORT="$PORT" \
+        FRPS_TOKEN="$FRPS_TOKEN" \
         FRPS_BIND_PORT="$FRPS_BIND_PORT" \
         FRPS_VHOST_HTTP_PORT="$FRPS_VHOST_HTTP_PORT" \
         FRPS_VHOST_HTTPS_PORT="$FRPS_VHOST_HTTPS_PORT" \
@@ -558,6 +563,10 @@ esac
 section "Collecting configuration"
 prompt_value TUNNEL_DOMAIN "Base domain for signup and tenant subdomains"
 prompt_value FRPS_SERVER "Address tenants use to reach frps" "$TUNNEL_DOMAIN"
+if [ -z "$FRPS_TOKEN" ]; then
+    FRPS_TOKEN="$(openssl rand -hex 32)"
+fi
+prompt_secret FRPS_TOKEN "Shared FRPS auth token for tenant tunnels"
 prompt_yes_no ENABLE_HTTPS "Enable HTTPS with wildcard certificates via Caddy DNS challenge" false
 if [ "$ENABLE_HTTPS" = true ]; then
     prompt_value DNS_PROVIDER "DNS provider (cloudflare, route53, digitalocean, godaddy)"
@@ -592,6 +601,7 @@ validate "domain" "$TUNNEL_DOMAIN" '[a-zA-Z0-9.-]+'
 validate "frps-server" "$FRPS_SERVER" '[a-zA-Z0-9.:-]+'
 validate "port" "$PORT" '[0-9]+'
 validate "auth-token" "$AUTH_TOKEN" '[a-zA-Z0-9._-]+'
+validate "frps-token" "$FRPS_TOKEN" '[a-zA-Z0-9._-]+'
 validate "frps-bind-port" "$FRPS_BIND_PORT" '[0-9]+'
 validate "frps-vhost-http-port" "$FRPS_VHOST_HTTP_PORT" '[0-9]+'
 validate "frps-vhost-https-port" "$FRPS_VHOST_HTTPS_PORT" '[0-9]+'
@@ -625,6 +635,7 @@ fi
 section "Configuration summary"
 echo "    Domain:              $TUNNEL_DOMAIN"
 echo "    frps server:         $FRPS_SERVER"
+echo "    shared frps token:   ${FRPS_TOKEN:0:8}..."
 echo "    octos serve port:    $PORT"
 echo "    frps bind port:      $FRPS_BIND_PORT"
 echo "    frps vhost HTTP:     $FRPS_VHOST_HTTP_PORT"

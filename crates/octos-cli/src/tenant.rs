@@ -27,7 +27,11 @@ pub struct TenantConfig {
     pub name: String,
     /// Subdomain for tunnel routing (defaults to `id` at creation).
     pub subdomain: String,
-    /// Unique tunnel auth token (UUID v4).
+    /// Legacy per-tenant tunnel auth token from the old FRPS auth model.
+    ///
+    /// Kept only for backward-compatible deserialization of existing tenant
+    /// JSON files. New shared-token flows should leave this empty.
+    #[serde(default)]
     pub tunnel_token: String,
     /// Allocated SSH tunnel port on the VPS (6001–6999).
     pub ssh_port: u16,
@@ -155,7 +159,7 @@ impl TenantStore {
         std::fs::rename(&tmp_path, &path)
             .wrap_err_with(|| format!("failed to rename tenant: {}", path.display()))?;
 
-        // Restrict file permissions to owner-only (mode 0600) — contains tunnel token
+        // Restrict file permissions to owner-only (mode 0600) — contains tenant auth metadata
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -191,10 +195,22 @@ impl TenantStore {
         bail!("SSH port pool exhausted ({SSH_PORT_START}–{SSH_PORT_END})")
     }
 
-    /// Find a tenant by its tunnel auth token.
+    /// Legacy helper for the old per-tenant tunnel auth model.
     pub fn find_by_tunnel_token(&self, token: &str) -> Result<Option<TenantConfig>> {
         let all = self.list()?;
         Ok(all.into_iter().find(|t| t.tunnel_token == token))
+    }
+
+    /// Find a tenant by assigned subdomain.
+    pub fn find_by_subdomain(&self, subdomain: &str) -> Result<Option<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all.into_iter().find(|t| t.subdomain == subdomain))
+    }
+
+    /// Find a tenant by allocated SSH remote port.
+    pub fn find_by_ssh_port(&self, port: u16) -> Result<Option<TenantConfig>> {
+        let all = self.list()?;
+        Ok(all.into_iter().find(|t| t.ssh_port == port))
     }
 
     /// Find tenant(s) belonging to a user.
@@ -237,18 +253,19 @@ fn validate_tenant_id(id: &str) -> Result<()> {
 
 /// Generate the frpc TOML config for a tenant by filling the template.
 ///
-/// Uses the tenant's `tunnel_token` for per-tenant frps authentication.
+/// Uses the shared FRPS auth token for host-wide frps authentication.
 pub fn render_frpc_config(
     tenant: &TenantConfig,
     frps_server: &str,
     frps_port: u16,
     tunnel_domain: &str,
+    frps_token: &str,
 ) -> String {
     let template = include_str!("../../../scripts/frp/tenant-frpc.toml.template");
     template
         .replace("{{FRPS_SERVER}}", frps_server)
         .replace("{{FRPS_PORT}}", &frps_port.to_string())
-        .replace("{{FRPS_TOKEN}}", &tenant.tunnel_token)
+        .replace("{{FRPS_TOKEN}}", frps_token)
         .replace("{{SUBDOMAIN}}", &tenant.subdomain)
         .replace("{{LOCAL_PORT}}", &tenant.local_port.to_string())
         .replace("{{SSH_REMOTE_PORT}}", &tenant.ssh_port.to_string())
@@ -322,7 +339,7 @@ mod tests {
             id: "alice".into(),
             name: "Alice".into(),
             subdomain: "alice".into(),
-            tunnel_token: "test-token-123".into(),
+            tunnel_token: String::new(),
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "test-auth-token".into(),
@@ -336,11 +353,11 @@ mod tests {
             "163.192.33.32",
             7000,
             "octos-cloud.org",
+            "shared-frps-token-123",
         );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        // Uses the per-tenant tunnel_token for auth
-        assert!(config.contains("auth.token = \"test-token-123\""));
+        assert!(config.contains("auth.token = \"shared-frps-token-123\""));
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));
@@ -373,6 +390,37 @@ mod tests {
         assert_eq!(loaded.id, "test");
         assert_eq!(loaded.tunnel_token, "tok-abc");
         assert_eq!(loaded.ssh_port, 6001);
+    }
+
+    #[test]
+    fn should_find_tenant_by_subdomain_and_ssh_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TenantStore::open(dir.path()).unwrap();
+
+        let tenant = TenantConfig {
+            id: "test".into(),
+            name: "Test Tenant".into(),
+            subdomain: "tenant-a".into(),
+            tunnel_token: String::new(),
+            ssh_port: 6123,
+            local_port: 8080,
+            auth_token: "test-auth-token".into(),
+            owner: String::new(),
+            status: TenantStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&tenant).unwrap();
+
+        let by_subdomain = store.find_by_subdomain("tenant-a").unwrap().unwrap();
+        assert_eq!(by_subdomain.id, "test");
+
+        let by_port = store.find_by_ssh_port(6123).unwrap().unwrap();
+        assert_eq!(by_port.id, "test");
+
+        assert!(store.find_by_subdomain("missing").unwrap().is_none());
+        assert!(store.find_by_ssh_port(6999).unwrap().is_none());
     }
 
     #[test]

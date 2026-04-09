@@ -109,6 +109,7 @@ impl GatewayRuntime {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
+        let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
 
         let mut profile_id: Option<String> = None;
         eprintln!(
@@ -157,7 +158,7 @@ impl GatewayRuntime {
         } else if let Some(config_path) = &cmd.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd)?
+            Config::load(&cwd, &data_dir)?
         };
 
         let model = cmd.model.or(config.model.clone());
@@ -256,9 +257,6 @@ impl GatewayRuntime {
         // Wrap LLM in SwappableProvider for runtime model switching
         let swappable = Arc::new(SwappableProvider::new(llm));
         let llm: Arc<dyn LlmProvider> = swappable.clone();
-
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = resolve_data_dir(cmd.data_dir)?;
 
         // Seed adaptive router with baseline benchmark data (if available)
         if let Some(ref router) = adaptive_router_ref {
@@ -1061,8 +1059,14 @@ impl GatewayRuntime {
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
             llm_strong: super::profile_factory::build_strong_chain(
-                &config, &config.provider.clone().unwrap_or_else(|| "anthropic".to_string()), false,
-            ).unwrap_or_else(|_| llm_for_compaction.clone()),
+                &config,
+                &config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "anthropic".to_string()),
+                false,
+            )
+            .unwrap_or_else(|_| llm_for_compaction.clone()),
         };
         let profile_factory_builder =
             profile_store
@@ -1107,10 +1111,9 @@ impl GatewayRuntime {
                 if local.exists() {
                     paths.push(local);
                 }
-                if let Some(global) = Config::global_config_path() {
-                    if global.exists() {
-                        paths.push(global);
-                    }
+                let data_dir_config = Config::data_dir_config_path(&data_dir);
+                if data_dir_config.exists() {
+                    paths.push(data_dir_config);
                 }
             }
             paths
@@ -1483,14 +1486,17 @@ impl GatewayRuntime {
                 // For API channel: send a completion signal so the SSE stream closes
                 // and the web client's assistant message transitions from "streaming" to "complete".
                 if reply_channel == "api" {
-                    let _ = self.agent_handle.send_outbound(octos_core::OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: String::new(),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({"_completion": true}),
-                    }).await;
+                    let _ = self
+                        .agent_handle
+                        .send_outbound(octos_core::OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: String::new(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({"_completion": true}),
+                        })
+                        .await;
                 }
                 continue;
             }

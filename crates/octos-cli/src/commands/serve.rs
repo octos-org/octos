@@ -75,44 +75,16 @@ impl ServeCommand {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
+        // Resolve data directory once and treat it as the canonical home for
+        // runtime state and config unless an explicit --config path is given.
+        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
-            // Resolution order:
-            // 1. <cwd>/.octos/config.json (project-local)
-            // 2. $OCTOS_HOME/config.json or ~/.octos/config.json (data dir)
-            // 3. Legacy platform config dir (~/Library/Application Support/octos/ etc.)
-            let local_config = cwd.join(".octos").join("config.json");
-            let legacy_config = dirs::config_dir()
-                .map(|d| d.join("octos").join("config.json"));
-            if local_config.exists() {
-                tracing::info!(path = %local_config.display(), "loading config (project-local)");
-                (Config::from_file(&local_config)?, Some(local_config))
-            } else if let Some(global_config) = Config::global_config_path() {
-                if global_config.exists() {
-                    tracing::info!(path = %global_config.display(), "loading config (data dir)");
-                    (Config::from_file(&global_config)?, Some(global_config))
-                } else if let Some(ref lc) = legacy_config {
-                    if lc.exists() {
-                        tracing::warn!(path = %lc.display(), "loading config from legacy location — consider moving to ~/.octos/config.json");
-                        (Config::from_file(lc)?, Some(lc.clone()))
-                    } else {
-                        tracing::info!("no config.json found, using defaults");
-                        (Config::default(), None)
-                    }
-                } else {
-                    tracing::info!("no config.json found, using defaults");
-                    (Config::default(), None)
-                }
-            } else {
-                tracing::info!("no config.json found, using defaults");
-                (Config::default(), None)
-            }
+            Config::load_with_path(&cwd, &data_dir)?
         };
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         let broadcaster = Arc::new(SseBroadcaster::new(256));
@@ -275,9 +247,13 @@ impl ServeCommand {
             tenant_store: crate::tenant::TenantStore::open(&data_dir)
                 .ok()
                 .map(Arc::new),
-            tunnel_domain: config.tunnel_domain.clone()
+            tunnel_domain: config
+                .tunnel_domain
+                .clone()
                 .or_else(|| std::env::var("TUNNEL_DOMAIN").ok()),
-            frps_server: config.frps_server.clone()
+            frps_server: config
+                .frps_server
+                .clone()
                 .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),

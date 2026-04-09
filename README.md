@@ -65,7 +65,7 @@ The install script saves itself locally, so you can re-run without downloading a
 
 ### Cloud signup
 
-Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, SSH port, and tunnel token pre-filled — for both macOS/Linux and Windows. The registration flow enables the tunnel by default. If SMTP is configured on the server, the setup details are also emailed as backup.
+Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, and SSH port pre-filled — for both macOS/Linux and Windows. The registration flow enables the tunnel by default and prompts you to supply the host's shared FRPS token. If SMTP is configured on the server, the setup details are also emailed as backup.
 
 ### Cloud host bootstrap
 

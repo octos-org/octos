@@ -47,8 +47,8 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!();
 
     let config_path = cwd.join(".octos").join("config.json");
-    let global_config = Config::global_config_path();
-    let data_dir = cwd.join(".octos");
+    let data_dir = super::resolve_data_dir(None)?;
+    let data_dir_config = Config::data_dir_config_path(&data_dir);
 
     // Config location
     if config_path.exists() {
@@ -58,21 +58,13 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
             config_path.display(),
             "(found)".green()
         );
-    } else if let Some(ref gp) = global_config {
-        if gp.exists() {
-            println!(
-                "{}: {} {}",
-                "Config".green(),
-                gp.display(),
-                "(found)".green()
-            );
-        } else {
-            println!(
-                "{}: {}",
-                "Config".yellow(),
-                "not found (run 'octos init')".dimmed()
-            );
-        }
+    } else if data_dir_config.exists() {
+        println!(
+            "{}: {} {}",
+            "Config".green(),
+            data_dir_config.display(),
+            "(found)".green()
+        );
     } else {
         println!(
             "{}: {}",
@@ -94,7 +86,7 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     }
 
     // Load config for provider/model info
-    let config = Config::load(cwd).unwrap_or_default();
+    let config = Config::load(cwd, &data_dir).unwrap_or_default();
 
     let provider = config.provider.as_deref().unwrap_or("anthropic");
     let model = config

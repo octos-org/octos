@@ -45,8 +45,8 @@ main() {
         fail "local tenant deploy still references the old hardcoded shared-token path"
     fi
 
-    grep -Fq 'registration email or setup command' "$SCRIPT" \
-        || fail "local tenant deploy should prompt for the managed tenant token source"
+    grep -Fq 'shared frps auth token from your operator or cloud host' "$SCRIPT" \
+        || fail "local tenant deploy should prompt for the shared FRPS token source"
 
     echo "local tenant deploy tests passed"
 }

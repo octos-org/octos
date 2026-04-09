@@ -3,11 +3,11 @@
 # Idempotent: safe to re-run.
 #
 # Usage:
-#   ./setup-frpc.sh <subdomain> <token> [options]
+#   ./setup-frpc.sh <subdomain> <shared-frps-token> [options]
 #
 # Arguments:
 #   subdomain   Tenant subdomain (e.g. "alice")
-#   token       Tunnel auth token (from octos admin create-tenant)
+#   shared-frps-token  Shared FRPS auth token from the cloud host operator
 #
 # Options:
 #   --server <addr>       frps server address (default: 163.192.33.32)
@@ -21,7 +21,7 @@ set -euo pipefail
 
 # ── Parse arguments ───────────────────────────────────────────────────
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <subdomain> <token> [options]"
+    echo "Usage: $0 <subdomain> <shared-frps-token> [options]"
     echo ""
     echo "Options:"
     echo "  --server <addr>       frps server (default: 163.192.33.32)"
@@ -33,7 +33,7 @@ if [ $# -lt 2 ]; then
 fi
 
 SUBDOMAIN="$1"
-TUNNEL_TOKEN="$2"
+FRPS_TOKEN="$2"
 shift 2
 
 # Defaults
@@ -100,7 +100,7 @@ serverAddr = "${FRPS_SERVER}"
 serverPort = ${FRPS_PORT}
 
 auth.method = "token"
-auth.token = "${TUNNEL_TOKEN}"
+auth.token = "${FRPS_TOKEN}"
 
 log.to = "/var/log/frpc.log"
 log.level = "info"
