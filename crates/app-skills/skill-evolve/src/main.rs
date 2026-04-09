@@ -56,6 +56,10 @@ struct ToolArgs {
 /// Maximum pending patches per skill before oldest are evicted.
 const MAX_PATCHES: usize = 20;
 
+/// Maximum applied notes kept in SKILL.md `## Learned Notes` section.
+/// Oldest notes are dropped when this limit is exceeded.
+const MAX_APPLIED_NOTES: usize = 10;
+
 /// Minimum seconds between patches for the same skill.
 const COOLDOWN_SECS: i64 = 600; // 10 minutes
 
@@ -189,6 +193,7 @@ fn run_tool(args: &[String]) {
         "list" => cmd_list(&skills_dirs),
         "apply" => cmd_apply(&skills_dirs, &tool_args.skill),
         "discard" => cmd_discard(&skills_dirs, &tool_args.skill),
+        "consolidate" => cmd_consolidate(&skills_dirs, &tool_args.skill),
         other => print_result(false, &format!("unknown action: {other}")),
     }
 }
@@ -250,18 +255,40 @@ fn cmd_apply(skills_dirs: &[PathBuf], skill: &str) {
         return;
     }
 
-    // Append to SKILL.md under ## Learned Notes
+    // Rebuild SKILL.md with capped Learned Notes section.
     let skill_md_path = skill_dir.join("SKILL.md");
-    let mut content = fs::read_to_string(&skill_md_path).unwrap_or_default();
+    let content = fs::read_to_string(&skill_md_path).unwrap_or_default();
 
-    if !content.contains("## Learned Notes") {
-        content.push_str("\n\n## Learned Notes\n");
-    }
+    // Split content into body (before ## Learned Notes) and existing notes.
+    let (body, existing_notes) = split_learned_notes(&content);
+
+    // Collect existing + new notes, dedup, cap at MAX_APPLIED_NOTES (keep newest).
+    let mut all_notes: Vec<String> = existing_notes;
     for patch in &store.patches {
-        content.push_str(&format!("- {}\n", patch.suggestion));
+        let note = patch.suggestion.clone();
+        // Simple dedup: skip if any existing note contains this as substring or vice versa.
+        let dominated = all_notes.iter().any(|existing| {
+            existing.contains(&note) || note.contains(existing.as_str())
+        });
+        if !dominated {
+            all_notes.push(note);
+        }
+    }
+    // Keep only the last MAX_APPLIED_NOTES (newest).
+    if all_notes.len() > MAX_APPLIED_NOTES {
+        all_notes.drain(0..all_notes.len() - MAX_APPLIED_NOTES);
     }
 
-    if fs::write(&skill_md_path, &content).is_err() {
+    // Reassemble SKILL.md.
+    let mut new_content = body.to_string();
+    if !all_notes.is_empty() {
+        new_content.push_str("\n\n## Learned Notes\n");
+        for note in &all_notes {
+            new_content.push_str(&format!("- {}\n", note));
+        }
+    }
+
+    if fs::write(&skill_md_path, &new_content).is_err() {
         print_result(false, "failed to write SKILL.md");
         return;
     }
@@ -292,6 +319,138 @@ fn cmd_discard(skills_dirs: &[PathBuf], skill: &str) {
         serde_json::to_string_pretty(&EvolutionStore::default()).unwrap_or_default(),
     );
     print_result(true, &format!("Discarded patches for '{skill}'."));
+}
+
+fn cmd_consolidate(skills_dirs: &[PathBuf], skill: &str) {
+    if skill.is_empty() {
+        print_result(false, "skill name required for consolidate");
+        return;
+    }
+
+    let Some(skill_dir) = find_skill_dir(skills_dirs, skill) else {
+        print_result(false, &format!("skill '{skill}' not found"));
+        return;
+    };
+
+    let skill_md_path = skill_dir.join("SKILL.md");
+    let content = fs::read_to_string(&skill_md_path).unwrap_or_default();
+    let (body, notes) = split_learned_notes(&content);
+
+    if notes.len() < 3 {
+        print_result(true, "Not enough notes to consolidate (need at least 3).");
+        return;
+    }
+
+    let (endpoint, key, model) = match resolve_llm_config() {
+        Some(c) => c,
+        None => {
+            print_result(false, "no LLM API key found in environment");
+            return;
+        }
+    };
+
+    let notes_text = notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{}. {}", i + 1, n))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        r#"You are consolidating learned notes for an AI skill called "{skill}".
+
+These notes were accumulated from individual tool failures over time:
+
+{notes_text}
+
+Consolidate these into fewer, more general rules. Merge duplicates, combine related notes, and remove notes that are subsumed by more general ones. Keep the language concise (1 sentence each).
+
+Return ONLY a JSON array of strings, each being one consolidated rule. Example:
+["Rule one.", "Rule two."]
+
+Return at most 5 rules."#
+    );
+
+    let llm_body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 500,
+        "temperature": 0.3,
+    });
+
+    let response = match reqwest::blocking::Client::new()
+        .post(format!("{endpoint}/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&llm_body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            print_result(false, "LLM call failed");
+            return;
+        }
+    };
+
+    let json: serde_json::Value = match response.json() {
+        Ok(j) => j,
+        Err(_) => {
+            print_result(false, "failed to parse LLM response");
+            return;
+        }
+    };
+
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("[]")
+        .trim();
+
+    // Parse the JSON array from LLM response.
+    let consolidated: Vec<String> = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => {
+            // Try to extract JSON array from markdown code block.
+            let cleaned = text
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            match serde_json::from_str(cleaned) {
+                Ok(v) => v,
+                Err(_) => {
+                    print_result(false, &format!("LLM returned unparseable response: {text}"));
+                    return;
+                }
+            }
+        }
+    };
+
+    if consolidated.is_empty() {
+        print_result(false, "LLM returned empty consolidation");
+        return;
+    }
+
+    // Rewrite SKILL.md with consolidated notes.
+    let mut new_content = body.to_string();
+    new_content.push_str("\n\n## Learned Notes\n");
+    for note in &consolidated {
+        new_content.push_str(&format!("- {}\n", note));
+    }
+
+    if fs::write(&skill_md_path, &new_content).is_err() {
+        print_result(false, "failed to write SKILL.md");
+        return;
+    }
+
+    print_result(
+        true,
+        &format!(
+            "Consolidated {} notes into {} rules for '{skill}'",
+            notes.len(),
+            consolidated.len()
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +655,28 @@ fn read_stdin_payload<T: serde::de::DeserializeOwned>() -> Option<T> {
     serde_json::from_str(&input).ok()
 }
 
+/// Split SKILL.md content into (body before `## Learned Notes`, vec of note strings).
+fn split_learned_notes(content: &str) -> (&str, Vec<String>) {
+    let marker = "## Learned Notes";
+    let Some(pos) = content.find(marker) else {
+        return (content.trim_end(), Vec::new());
+    };
+    let body = content[..pos].trim_end();
+    let notes_section = &content[pos + marker.len()..];
+    let notes: Vec<String> = notes_section
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                Some(trimmed[2..].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    (body, notes)
+}
+
 fn load_store(path: &Path) -> EvolutionStore {
     fs::read_to_string(path)
         .ok()
@@ -688,51 +869,64 @@ mod tests {
     }
 
     #[test]
-    fn should_apply_patches_to_skill_md() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join("test-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("SKILL.md"), "# Test Skill\n\nDoes stuff.\n").unwrap();
-        fs::write(
-            skill_dir.join("evolutions.json"),
-            serde_json::to_string(&EvolutionStore {
-                patches: vec![
-                    EvolutionPatch {
-                        tool_name: "my_tool".into(),
-                        error_excerpt: "timeout".into(),
-                        suggestion: "Use timeout of 30s for slow APIs".into(),
-                        timestamp: "2026-04-07T12:00:00Z".into(),
-                    },
-                    EvolutionPatch {
-                        tool_name: "my_tool".into(),
-                        error_excerpt: "parse error".into(),
-                        suggestion: "Always return valid JSON".into(),
-                        timestamp: "2026-04-07T13:00:00Z".into(),
-                    },
-                ],
-            })
-            .unwrap(),
-        )
-        .unwrap();
+    fn should_split_learned_notes() {
+        let content = "# Skill\n\nBody.\n\n## Learned Notes\n- Note one\n- Note two\n";
+        let (body, notes) = split_learned_notes(content);
+        assert_eq!(body, "# Skill\n\nBody.");
+        assert_eq!(notes, vec!["Note one", "Note two"]);
+    }
 
-        // Simulate apply.
-        let store_path = skill_dir.join("evolutions.json");
-        let store = load_store(&store_path);
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let mut content = fs::read_to_string(&skill_md_path).unwrap();
+    #[test]
+    fn should_split_when_no_learned_notes() {
+        let content = "# Skill\n\nBody only.\n";
+        let (body, notes) = split_learned_notes(content);
+        assert_eq!(body, "# Skill\n\nBody only.");
+        assert!(notes.is_empty());
+    }
 
-        if !content.contains("## Learned Notes") {
-            content.push_str("\n\n## Learned Notes\n");
+    #[test]
+    fn should_cap_applied_notes_at_max() {
+        // Simulate a SKILL.md with existing notes + new patches that exceed MAX_APPLIED_NOTES.
+        let mut existing = "# Skill\n\nBody.\n\n## Learned Notes\n".to_string();
+        for i in 0..MAX_APPLIED_NOTES {
+            existing.push_str(&format!("- Old note {}\n", i));
         }
-        for patch in &store.patches {
-            content.push_str(&format!("- {}\n", patch.suggestion));
-        }
-        fs::write(&skill_md_path, &content).unwrap();
+        let (body, mut all_notes) = split_learned_notes(&existing);
+        assert_eq!(all_notes.len(), MAX_APPLIED_NOTES);
 
-        let result = fs::read_to_string(&skill_md_path).unwrap();
-        assert!(result.contains("## Learned Notes"));
-        assert!(result.contains("Use timeout of 30s for slow APIs"));
-        assert!(result.contains("Always return valid JSON"));
-        assert!(result.contains("# Test Skill")); // original content preserved
+        // Add 3 new notes.
+        all_notes.push("New note A".to_string());
+        all_notes.push("New note B".to_string());
+        all_notes.push("New note C".to_string());
+
+        // Cap.
+        if all_notes.len() > MAX_APPLIED_NOTES {
+            all_notes.drain(0..all_notes.len() - MAX_APPLIED_NOTES);
+        }
+        assert_eq!(all_notes.len(), MAX_APPLIED_NOTES);
+        // Oldest should be dropped, newest kept.
+        assert!(all_notes.last().unwrap().contains("New note C"));
+        assert!(!all_notes.iter().any(|n| n.contains("Old note 0")));
+
+        // Reassemble.
+        let mut new_content = body.to_string();
+        new_content.push_str("\n\n## Learned Notes\n");
+        for note in &all_notes {
+            new_content.push_str(&format!("- {}\n", note));
+        }
+        assert!(new_content.contains("# Skill"));
+        assert!(new_content.contains("New note C"));
+        assert!(!new_content.contains("Old note 0"));
+    }
+
+    #[test]
+    fn should_dedup_similar_notes() {
+        let all_notes: Vec<String> = vec!["Use JSON format".into()];
+        let new_note = "Use JSON format for all responses";
+        // The new note contains the existing one -> dominated
+        let dominated = all_notes.iter().any(|existing| {
+            existing.contains(new_note) || new_note.contains(existing.as_str())
+        });
+        assert!(dominated, "should detect substring overlap as duplicate");
     }
 }

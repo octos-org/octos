@@ -10,8 +10,8 @@
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["list", "apply", "discard"],
-            "description": "list = show pending patches, apply = write patches to SKILL.md, discard = clear pending patches"
+            "enum": ["list", "apply", "discard", "consolidate"],
+            "description": "list = show pending patches, apply = write patches to SKILL.md, discard = clear pending, consolidate = merge existing notes into fewer rules via LLM"
           },
           "skill": {
             "type": "string",
