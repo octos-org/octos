@@ -157,10 +157,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/register/setup-script",
             get(admin::register_setup_script),
-        )
-        .route(
-            "/api/register/setup-script/{id}/{auth_token}",
-            get(admin::register_setup_script_public),
         );
 
     // Admin API routes (admin auth only, 1MB body limit)
@@ -391,6 +387,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
+        .route(
+            "/api/register/setup-script/{id}/{auth_token}",
+            get(admin::register_setup_script_public),
+        )
         .merge(webhook_routes)
         .merge(version_routes)
         .merge(internal_routes);
@@ -598,7 +598,12 @@ async fn admin_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AppState, SseBroadcaster};
+    use crate::config::DeploymentMode;
+    use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;
+    use chrono::Utc;
+    use std::sync::Arc;
 
     #[test]
     fn test_constant_time_eq_equal() {
@@ -687,5 +692,74 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
+    }
+
+    #[tokio::test]
+    async fn public_register_setup_script_route_bypasses_user_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TenantStore::open(dir.path()).unwrap());
+        let now = Utc::now();
+        store
+            .save(&TenantConfig {
+                id: "edward".into(),
+                name: "edward".into(),
+                subdomain: "edward".into(),
+                tunnel_token: String::new(),
+                ssh_port: 6001,
+                local_port: 8080,
+                auth_token: "public-auth-token".into(),
+                owner: "edward".into(),
+                status: TenantStatus::Pending,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            started_at: Utc::now(),
+            auth_token: Some("admin-secret".into()),
+            metrics_handle: None,
+            profile_store: None,
+            process_manager: None,
+            user_store: None,
+            auth_manager: None,
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            tenant_store: Some(store),
+            tunnel_domain: Some("octos-cloud.org".into()),
+            frps_server: Some("127.0.0.1".into()),
+            frps_port: Some(7000),
+            deployment_mode: DeploymentMode::Cloud,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/register/setup-script/edward/public-auth-token"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("install.sh"));
+
+        server.abort();
     }
 }
