@@ -554,10 +554,9 @@
         </div>
         <!-- Installation code block -->
         <div class="code-block">
-            <pre><span class="comment" data-lang="en"># After registration, run the install command on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行安装命令：</span>
+            <pre><span class="comment" data-lang="en"># After registration, run the tenant setup script on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行租户安装脚本：</span>
 
-<span class="cmd">curl -fsSL</span> https://github.com/.../install.sh <span class="cmd">| bash -s --</span> \
-  <span class="flag">--auth-token</span> &lt;token&gt; <span class="flag">--tenant-name</span> &lt;name&gt; <span class="flag">--frps-token</span> &lt;token&gt; ...
+<span class="cmd">curl -fsSL</span> https://octos.bot/api/register/setup-script/&lt;tenant&gt;/&lt;auth-token&gt; <span class="cmd">|</span> <span class="flag">FRPS_TOKEN</span>=&lt;shared-frps-token&gt; <span class="cmd">bash</span>
 
 <span class="output">  ==> Detecting platform
       OK: Darwin arm64 (aarch64-apple-darwin)
