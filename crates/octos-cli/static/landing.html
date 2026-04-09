@@ -481,15 +481,8 @@
                                 <span data-lang="zh">发送验证码</span>
                             </button>
                         </div>
-                    </div>
-                    <div class="form-group">
-                        <label>
-                            <span data-lang="en">Verification Code</span>
-                            <span data-lang="zh">验证码</span>
-                        </label>
-                        <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
-                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email.</p>
-                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。</p>
+                        <p class="form-hint" data-lang="en">You can resend after 60 seconds. Each code stays valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">60 秒后可重新发送。每个验证码有效期为 5 分钟。</p>
                     </div>
                     <div class="form-group">
                         <label>
@@ -498,14 +491,27 @@
                         </label>
                         <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
                         <p class="form-hint">
-                            <span data-lang="en">Lowercase letters, numbers, hyphens. This becomes <b>{name}.octos-cloud.org</b></span>
-                            <span data-lang="zh">小写字母、数字、连字符。将成为 <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="en">Lowercase letters, numbers, hyphens. You can decide this while waiting for the email. It becomes <b>{name}.octos-cloud.org</b></span>
+                            <span data-lang="zh">小写字母、数字、连字符。可以在等待邮件时先想好这个名字。将成为 <b>{name}.octos-cloud.org</b></span>
                         </p>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <span data-lang="en">Verification Code</span>
+                            <span data-lang="zh">验证码</span>
+                        </label>
+                        <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
+                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email. The code remains valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。验证码在 5 分钟内有效。</p>
                     </div>
                     <button type="submit" class="btn btn-primary form-submit">
                         <span data-lang="en">Register &amp; Get Token</span>
                         <span data-lang="zh">注册并获取令牌</span>
                     </button>
+                    <p class="form-hint" id="registerStatus" style="display: none; margin-top: 10px;">
+                        <span data-lang="en">Creating your account...</span>
+                        <span data-lang="zh">正在创建你的账号...</span>
+                    </p>
                 </div>
             </form>
 
@@ -720,6 +726,12 @@ function showCmd(platform) {
 
 // --- Send verification code ---
 let codeTimer = null;
+function sendCodeCooldownLabel(sec) {
+    return document.body.getAttribute('data-active-lang') === 'zh'
+        ? `${sec}s后重发`
+        : `Resend in ${sec}s`;
+}
+
 async function sendCode() {
     const email = document.getElementById('regEmail').value.trim();
     if (!email || !email.includes('@')) {
@@ -730,10 +742,10 @@ async function sendCode() {
     const btn = document.getElementById('sendCodeBtn');
     btn.disabled = true;
     let sec = 60;
-    btn.textContent = sec + 's';
+    btn.textContent = sendCodeCooldownLabel(sec);
     codeTimer = setInterval(() => {
         sec--;
-        btn.textContent = sec + 's';
+        btn.textContent = sendCodeCooldownLabel(sec);
         if (sec <= 0) {
             clearInterval(codeTimer);
             btn.disabled = false;
@@ -761,11 +773,22 @@ async function sendCode() {
 // --- Register ---
 async function handleRegister(e) {
     e.preventDefault();
+    const form = document.getElementById('registerForm');
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const status = document.getElementById('registerStatus');
     const email = document.getElementById('regEmail').value.trim();
     const code = document.getElementById('regCode').value.trim();
     const node = document.getElementById('regNode').value.trim().toLowerCase();
 
     if (!email || !code || !node) return false;
+    if (submitBtn.disabled) return false;
+
+    const isZh = document.body.getAttribute('data-active-lang') === 'zh';
+    submitBtn.disabled = true;
+    submitBtn.style.opacity = '0.7';
+    submitBtn.style.cursor = 'wait';
+    submitBtn.innerHTML = isZh ? '正在创建...' : 'Creating account...';
+    status.style.display = 'block';
 
     try {
         // Step 1: Verify OTP
@@ -777,8 +800,7 @@ async function handleRegister(e) {
 
         if (!verifyRes.ok) {
             const msg = await verifyRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '验证失败: ' + msg : 'Verification failed: ' + msg);
+            alert(isZh ? '验证失败: ' + msg : 'Verification failed: ' + msg);
             return false;
         }
 
@@ -797,8 +819,7 @@ async function handleRegister(e) {
 
         if (!tenantRes.ok) {
             const msg = await tenantRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
+            alert(isZh ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
             return false;
         }
 
@@ -830,10 +851,19 @@ async function handleRegister(e) {
         showCmd(isWindows ? 'win' : 'unix');
 
     } catch (e) {
-        const isZh = document.body.getAttribute('data-active-lang') === 'zh';
         alert(isZh
             ? '注册服务暂不可用，请稍后重试。'
             : 'Registration service unavailable. Please try again later.');
+    } finally {
+        if (document.getElementById('formStep1').style.display !== 'none') {
+            submitBtn.disabled = false;
+            submitBtn.style.opacity = '';
+            submitBtn.style.cursor = '';
+            submitBtn.innerHTML = isZh
+                ? '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>'
+                : '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>';
+            status.style.display = 'none';
+        }
     }
     return false;
 }

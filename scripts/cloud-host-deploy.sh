@@ -628,8 +628,8 @@ run_host_uninstall() {
 
     if [ "$PURGE" = true ]; then
         section "Purging local state"
-        run_cmd_best_effort rm -f "$STATE_FILE"
-        run_cmd_best_effort rm -rf "$DATA_DIR"
+        run_cmd_best_effort sudo rm -f "$STATE_FILE"
+        run_cmd_best_effort sudo rm -rf "$DATA_DIR"
     fi
 
     section "Complete"
@@ -640,8 +640,8 @@ run_host_uninstall() {
     else
         echo "    Preserved data dir: $DATA_DIR"
         echo "    Preserved bootstrap state: $STATE_FILE"
-        echo "    Delete manually if desired:"
-        echo "      rm -rf $DATA_DIR"
+        echo "    To remove them too, re-run with:"
+        echo "      bash scripts/cloud-host-deploy.sh --uninstall --purge"
     fi
 }
 

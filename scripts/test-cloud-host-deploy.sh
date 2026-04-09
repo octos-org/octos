@@ -117,8 +117,8 @@ EOF
         --prefix "$prefix" \
         --state-file "$state_file" \
         >"$purge_out" 2>&1
-    grep -q "rm -f $state_file" "$purge_out" || fail "purge dry run did not include state file removal"
-    grep -q "rm -rf $data_dir" "$purge_out" || fail "purge dry run did not include data dir removal"
+    grep -q "sudo rm -f $state_file" "$purge_out" || fail "purge dry run did not include sudo state file removal"
+    grep -q "sudo rm -rf $data_dir" "$purge_out" || fail "purge dry run did not include sudo data dir removal"
 
     local bad_purge_out="$test_root/bad-purge.out"
     set +e
