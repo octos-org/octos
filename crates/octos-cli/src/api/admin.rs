@@ -3523,6 +3523,11 @@ fn build_register_setup_email(
         html_escape(&tenant.subdomain),
         html_escape(domain)
     );
+    let frps_note_html = if frps_token.is_some() {
+        String::new()
+    } else {
+        r#"<p style="margin: 0;"><strong>Shared FRPS token:</strong> replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator.</p>"#.to_string()
+    };
     let subject = format!("octos setup for {}", tenant.subdomain);
     let html = format!(
         r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px;">
@@ -3533,8 +3538,8 @@ fn build_register_setup_email(
         <p style="margin: 0 0 8px 0;"><strong>Public URL:</strong> {public_url}</p>
         <p style="margin: 0 0 8px 0;"><strong>SSH port:</strong> {ssh_port}</p>
         <p style="margin: 0 0 8px 0;"><strong>Auth token:</strong> {auth_token}</p>
-        <p style="margin: 0;"><strong>Shared FRPS token:</strong> {frps_token_note}</p>
     </div>
+    {frps_note_html}
     <p style="color: #444; margin-bottom: 8px;">macOS / Linux install command:</p>
     <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{unix_command}</pre>
     <p style="color: #444; margin: 16px 0 8px 0;">Windows install command:</p>
@@ -3545,12 +3550,7 @@ fn build_register_setup_email(
         public_url = public_url,
         ssh_port = tenant.ssh_port,
         auth_token = html_escape(&tenant.auth_token),
-        frps_token_note = if let Some(token) = frps_token {
-            format!(r#"<code>{}</code>"#, html_escape(token))
-        } else {
-            "replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator."
-                .to_string()
-        },
+        frps_note_html = frps_note_html,
         unix_command = unix_command,
         windows_command = windows_command,
     );
@@ -3618,6 +3618,7 @@ mod register_setup_script_tests {
         assert!(html.contains("-Tunnel"));
         assert!(html.contains("-Port 9090"));
         assert!(html.contains("-FrpsToken &quot;&lt;shared-frps-token&gt;&quot;"));
+        assert!(html.contains("<strong>Shared FRPS token:</strong>"));
         assert!(!html.contains("<strong>FRP token:</strong> secret"));
     }
 
@@ -3665,7 +3666,7 @@ mod register_setup_script_tests {
             r#"curl -fsSL "https://octos-cloud.org/api/register/setup-script/alice/auth-token" | bash"#
         );
         assert!(windows_command.contains("-FrpsToken \"shared-token\""));
-        assert!(html.contains("<code>shared-token</code>"));
+        assert!(!html.contains("Shared FRPS token:"));
     }
 }
 
