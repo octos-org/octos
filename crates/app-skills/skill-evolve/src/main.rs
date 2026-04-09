@@ -266,11 +266,14 @@ fn cmd_apply(skills_dirs: &[PathBuf], skill: &str) {
     let mut all_notes: Vec<String> = existing_notes;
     for patch in &store.patches {
         let note = patch.suggestion.clone();
-        // Simple dedup: skip if any existing note contains this as substring or vice versa.
-        let dominated = all_notes.iter().any(|existing| {
-            existing.contains(&note) || note.contains(existing.as_str())
-        });
-        if !dominated {
+        // Dedup: skip if normalized text matches an existing note exactly.
+        // We only deduplicate exact matches (after lowercasing + trimming) to avoid
+        // false positives from aggressive substring matching.
+        let note_normalized = note.trim().to_lowercase();
+        let is_duplicate = all_notes
+            .iter()
+            .any(|existing| existing.trim().to_lowercase() == note_normalized);
+        if !is_duplicate {
             all_notes.push(note);
         }
     }
@@ -356,19 +359,31 @@ fn cmd_consolidate(skills_dirs: &[PathBuf], skill: &str) {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let body_trunc = truncate(body, MAX_SKILL_MD_LEN);
+
     let prompt = format!(
         r#"You are consolidating learned notes for an AI skill called "{skill}".
 
-These notes were accumulated from individual tool failures over time:
+The skill's original instructions (DO NOT contradict or alter these):
+```
+{body_trunc}
+```
+
+These supplementary notes were accumulated from runtime tool failures:
 
 {notes_text}
 
-Consolidate these into fewer, more general rules. Merge duplicates, combine related notes, and remove notes that are subsumed by more general ones. Keep the language concise (1 sentence each).
+Rules for consolidation:
+1. Merge duplicates and combine closely related notes.
+2. Remove notes that are already covered by the original instructions above.
+3. Preserve ALL specific values (timeouts, formats, model names, parameter names) — do not generalize away concrete details.
+4. Do not invent new rules. Only rephrase or merge existing notes.
+5. Keep each rule to 1 sentence.
 
 Return ONLY a JSON array of strings, each being one consolidated rule. Example:
 ["Rule one.", "Rule two."]
 
-Return at most 5 rules."#
+Return at most 5 rules. If all notes are redundant with the original instructions, return an empty array []."#
     );
 
     let llm_body = serde_json::json!({
@@ -920,13 +935,22 @@ mod tests {
     }
 
     #[test]
-    fn should_dedup_similar_notes() {
+    fn should_dedup_exact_match_case_insensitive() {
         let all_notes: Vec<String> = vec!["Use JSON format".into()];
-        let new_note = "Use JSON format for all responses";
-        // The new note contains the existing one -> dominated
-        let dominated = all_notes.iter().any(|existing| {
-            existing.contains(new_note) || new_note.contains(existing.as_str())
-        });
-        assert!(dominated, "should detect substring overlap as duplicate");
+        let note_normalized = "use json format";
+        let is_dup = all_notes
+            .iter()
+            .any(|existing| existing.trim().to_lowercase() == note_normalized);
+        assert!(is_dup, "should detect case-insensitive exact match");
+    }
+
+    #[test]
+    fn should_not_dedup_different_notes() {
+        let all_notes: Vec<String> = vec!["Use JSON format".into()];
+        let note_normalized = "use json format for all responses";
+        let is_dup = all_notes
+            .iter()
+            .any(|existing| existing.trim().to_lowercase() == note_normalized);
+        assert!(!is_dup, "different notes should not be deduped");
     }
 }
