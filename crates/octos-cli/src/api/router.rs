@@ -55,6 +55,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Public auth endpoints (no auth required)
     let auth_api = Router::new()
+        .route("/api/auth/status", get(auth_handlers::auth_status))
         .route("/api/auth/send-code", post(auth_handlers::send_code))
         .route("/api/auth/verify", post(auth_handlers::verify))
         .route("/api/auth/logout", post(auth_handlers::logout));
