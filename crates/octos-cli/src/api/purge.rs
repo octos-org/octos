@@ -310,4 +310,11 @@ mod tests {
 
         drop(temp);
     }
+
+    #[tokio::test]
+    async fn should_return_none_when_profile_does_not_exist() {
+        let (_temp, state) = build_test_state();
+        let result = purge_by_profile_id(&state, "ghost").await.expect("no error");
+        assert!(result.is_none());
+    }
 }
