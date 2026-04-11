@@ -105,6 +105,18 @@ else
         fail "adaptive routing"
     fi
 
+    # QoS cold-start/runtime catalog and pipeline fallback ordering
+    echo "  Running: QoS/runtime catalog regression tests"
+    if cargo test -p octos-llm test_qos_ranking_changes_lane_selection $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-qos.log | tail -5 \
+        && cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores $TEST_THREADS_FLAG 2>&1 | tee -a /tmp/octos-ci-qos.log | tail -5 \
+        && cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score $TEST_THREADS_FLAG 2>&1 | tee -a /tmp/octos-ci-qos.log | tail -5 \
+        && cargo test -p octos-cli gateway_runtime::tests --features api $TEST_THREADS_FLAG 2>&1 | tee -a /tmp/octos-ci-qos.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-qos.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+        pass "QoS/runtime catalog regressions ($N tests)"
+    else
+        fail "QoS/runtime catalog regressions"
+    fi
+
     # Responsiveness observer (baseline, degradation, recovery)
     echo "  Running: responsiveness observer tests"
     if cargo test -p octos-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-resp.log | tail -5; then
@@ -121,6 +133,15 @@ else
         pass "session actor ($N tests)"
     else
         fail "session actor"
+    fi
+
+    # Security sandbox (write isolation, /tmp loophole, Python escapes, SSRF, symlinks)
+    echo "  Running: security sandbox tests"
+    if cargo test -p octos-agent --test security_sandbox $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-security.log | tail -5; then
+        N=$(grep "^test result:" /tmp/octos-ci-security.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
+        pass "security sandbox ($N tests)"
+    else
+        fail "security sandbox"
     fi
 
     # Session persistence (JSONL, LRU, fork, rewrite, sort)
@@ -153,54 +174,6 @@ if [ "$QUICK" = false ] && [ -z "$SUBSYSTEM" ]; then
     fi
 fi
 
-# 3b. Focused test groups — verify critical subsystems explicitly
-section "Focused Test Groups"
-
-# Adaptive routing (Off/Hedge/Lane, circuit breaker, scoring, metrics)
-echo "  Running: adaptive routing tests"
-if cargo test -p octos-llm --lib adaptive::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-adaptive.log | tail -5; then
-    N=$(grep "^test result:" /tmp/octos-ci-adaptive.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    pass "adaptive routing ($N tests)"
-else
-    fail "adaptive routing"
-fi
-
-# Responsiveness observer (baseline, degradation, recovery)
-echo "  Running: responsiveness observer tests"
-if cargo test -p octos-llm --lib responsiveness::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-resp.log | tail -5; then
-    N=$(grep "^test result:" /tmp/octos-ci-resp.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    pass "responsiveness observer ($N tests)"
-else
-    fail "responsiveness observer"
-fi
-
-# Queue modes + speculative overflow + auto-escalation
-echo "  Running: session actor tests (queue modes, speculative, escalation)"
-if cargo test -p octos-cli session_actor::tests -- --test-threads=1 2>&1 | tee /tmp/octos-ci-actor.log | tail -5; then
-    N=$(grep "^test result:" /tmp/octos-ci-actor.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    pass "session actor ($N tests)"
-else
-    fail "session actor"
-fi
-
-# Security sandbox (write isolation, /tmp loophole, Python escapes, SSRF, symlinks)
-echo "  Running: security sandbox tests"
-if cargo test -p octos-agent --test security_sandbox $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-security.log | tail -5; then
-    N=$(grep "^test result:" /tmp/octos-ci-security.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    pass "security sandbox ($N tests)"
-else
-    fail "security sandbox"
-fi
-
-# Session persistence (JSONL, LRU, fork, rewrite, sort)
-echo "  Running: session persistence tests"
-if cargo test -p octos-bus session::tests $TEST_THREADS_FLAG 2>&1 | tee /tmp/octos-ci-session.log | tail -5; then
-    N=$(grep "^test result:" /tmp/octos-ci-session.log | awk -F'[;.]' '{for(i=1;i<=NF;i++){if($i~/passed/){gsub(/[^0-9]/,"",$i);p+=$i}}}END{print p+0}')
-    pass "session persistence ($N tests)"
-else
-    fail "session persistence"
-fi
-
 # ── Summary ───────────────────────────────────────────────────────────
 ELAPSED=$(( $(date +%s) - STARTED ))
 section "Done"
@@ -209,6 +182,7 @@ echo ""
 echo "  Test coverage:"
 echo "    • Adaptive routing: Off, Hedge (racing), Lane (score-based)"
 echo "    • Circuit breaker, failover, metrics, scoring"
+echo "    • QoS cold-start/runtime catalog materialization and pipeline fallback ordering"
 echo "    • Responsiveness: baseline learning, degradation, recovery"
 echo "    • Queue modes: Followup, Collect, Steer, Speculative"
 echo "    • Speculative overflow: concurrent, patience threshold, background tasks"

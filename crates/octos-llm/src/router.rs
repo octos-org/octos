@@ -659,6 +659,46 @@ mod tests {
     }
 
     #[test]
+    fn test_compatible_fallbacks_prefers_lower_seeded_qos_score() {
+        let router = ProviderRouter::new();
+        router.register_with_full_meta(
+            "gpt-4o-mini",
+            Arc::new(MockProvider::new("gpt-4o-mini", 128_000)),
+            Some("Primary".into()),
+            None,
+            Some(8_192),
+        );
+        router.register_with_full_meta(
+            "deepseek-chat",
+            Arc::new(MockProvider::new("deepseek-chat", 128_000)),
+            Some("Better fallback".into()),
+            None,
+            Some(16_384),
+        );
+        router.register_with_full_meta(
+            "gemini-3-flash",
+            Arc::new(MockProvider::new("gemini-3-flash", 1_000_000)),
+            Some("Worse fallback".into()),
+            None,
+            Some(16_384),
+        );
+
+        router.seed_qos_scores(&[
+            ("openai/gpt-4o-mini".to_string(), 0.91),
+            ("deepseek/deepseek-chat".to_string(), 0.18),
+            ("gemini/gemini-3-flash".to_string(), 0.47),
+        ]);
+
+        let fallbacks = router.compatible_fallbacks("gpt-4o-mini");
+        let ordered_models: Vec<&str> = fallbacks
+            .iter()
+            .map(|provider| provider.model_id())
+            .collect();
+
+        assert_eq!(ordered_models, vec!["deepseek-chat", "gemini-3-flash"]);
+    }
+
+    #[test]
     fn test_resolve_slash_in_key() {
         // NVIDIA model IDs contain a slash: "moonshotai/kimi-k2.5"
         // The full string is the key, not a prefix/model split.
