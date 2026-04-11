@@ -101,12 +101,17 @@ pub struct GatewayCommand {
 }
 
 fn resolve_dispatch_profile_id(
+    current_gateway_profile_id: Option<&str>,
     target_profile_id: Option<&str>,
     profile_store: Option<&crate::profiles::ProfileStore>,
 ) -> Result<Option<String>> {
     let Some(profile_id) = target_profile_id.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
+
+    if current_gateway_profile_id.is_some_and(|current| current == profile_id) {
+        return Ok(Some(profile_id.to_string()));
+    }
 
     let Some(store) = profile_store else {
         warn!(
@@ -407,7 +412,9 @@ mod tests {
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
 
-        let resolved = resolve_dispatch_profile_id(Some("missing-profile"), Some(&store)).unwrap();
+        let resolved =
+            resolve_dispatch_profile_id(Some("weather"), Some("missing-profile"), Some(&store))
+                .unwrap();
 
         assert_eq!(resolved, None);
     }
@@ -420,9 +427,19 @@ mod tests {
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
 
-        let resolved = resolve_dispatch_profile_id(Some("weather"), Some(&store)).unwrap();
+        let resolved =
+            resolve_dispatch_profile_id(Some("botfather"), Some("weather"), Some(&store)).unwrap();
 
         assert_eq!(resolved.as_deref(), Some("weather"));
+    }
+
+    #[test]
+    fn test_dispatch_current_gateway_profile_keeps_target_without_lookup() {
+        let resolved =
+            resolve_dispatch_profile_id(Some("dspfac--newsbot"), Some("dspfac--newsbot"), None)
+                .unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("dspfac--newsbot"));
     }
 
     #[cfg(unix)]

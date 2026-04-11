@@ -19,7 +19,6 @@ use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegi
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
-use octos_core::MAIN_PROFILE_ID;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     RetryProvider, SwappableProvider,
@@ -1390,11 +1389,16 @@ impl GatewayRuntime {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let mut dispatch_profile_id = resolve_dispatch_profile_id(
+                self.profile_id.as_deref(),
                 target_profile.as_deref(),
                 self.profile_store.as_deref(),
             )?;
             if let Some(ref pid) = dispatch_profile_id {
-                if !self.actor_registry.has_profile_factory(pid) {
+                let is_current_gateway_profile = self
+                    .profile_id
+                    .as_deref()
+                    .is_some_and(|current| current == pid);
+                if !is_current_gateway_profile && !self.actor_registry.has_profile_factory(pid) {
                     if let Some(ref builder) = self.profile_factory_builder {
                         match builder.build(pid).await {
                             Ok(factory) => self

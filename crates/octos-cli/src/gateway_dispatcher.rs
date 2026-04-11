@@ -145,8 +145,26 @@ impl GatewayDispatcher {
             // Check for project templates (e.g. "/new slides <project>")
             let reply = if name == "slides" || name.starts_with("slides ") {
                 if let Some(data_dir) = &self.data_dir {
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+
                     match crate::project_templates::try_activate_slides_template(data_dir, name) {
-                        Some(template_reply) => template_reply,
+                        Some(template_reply) => {
+                            let project_name = name.strip_prefix("slides").unwrap_or("").trim();
+                            let project_name = if project_name.is_empty() {
+                                "untitled"
+                            } else {
+                                project_name
+                            };
+                            crate::project_templates::scaffold_slides_project(
+                                &workspace_root,
+                                project_name,
+                            );
+                            template_reply
+                        }
                         None => format!("Switched to session: {name}"),
                     }
                 } else {
