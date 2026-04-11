@@ -7,6 +7,7 @@ pub mod auth_handlers;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
+pub mod purge;
 mod router;
 mod sse;
 mod static_files;
