@@ -88,7 +88,7 @@ impl AppState {
     ///     ..AppState::empty_for_tests()
     /// };
     /// ```
-    pub fn empty_for_tests() -> Self {
+    pub(crate) fn empty_for_tests() -> Self {
         Self {
             agent: None,
             sessions: None,

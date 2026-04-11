@@ -48,7 +48,6 @@ pub async fn purge_by_profile_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::AppState;
     use crate::profiles::{ProfileStore, UserProfile};
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use crate::user_store::{User, UserRole, UserStore};
