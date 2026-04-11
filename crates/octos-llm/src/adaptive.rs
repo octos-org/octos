@@ -343,6 +343,73 @@ pub struct QosCatalog {
     pub models: Vec<ModelCatalogEntry>,
 }
 
+/// Derive cold-start runtime scores from catalog metadata.
+///
+/// The heuristic model catalog is seed data, not a live score file. This
+/// materializes an initial runtime catalog so downstream fallback code can use
+/// the same score semantics before any live traffic has been observed.
+pub fn derive_cold_start_catalog(
+    entries: &[ModelCatalogEntry],
+    config: &AdaptiveConfig,
+    qos_ranking: bool,
+) -> QosCatalog {
+    let max_quality = entries
+        .iter()
+        .map(|entry| entry.ds_output as f64 * entry.stability.clamp(0.0, 1.0))
+        .fold(0.0_f64, f64::max);
+    let max_cost = if config.weight_cost > 0.0 {
+        entries
+            .iter()
+            .map(|entry| entry.cost_out)
+            .fold(0.0_f64, f64::max)
+    } else {
+        0.0
+    };
+    let max_priority = entries.len().max(1) as f64;
+
+    let models = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let baseline_stab = entry.stability.clamp(0.0, 1.0);
+            let blended_err = 1.0 - baseline_stab;
+
+            let quality = entry.ds_output as f64 * baseline_stab;
+            let norm_quality = if max_quality > 0.0 {
+                1.0 - (quality / max_quality)
+            } else {
+                0.5
+            };
+
+            // No live throughput at cold start, so keep the throughput term neutral.
+            let norm_throughput = 0.5;
+            let norm_priority = idx as f64 / max_priority;
+            let norm_cost = if max_cost > 0.0 && entry.cost_out > 0.0 {
+                entry.cost_out / max_cost
+            } else {
+                0.0
+            };
+            let ranking_component = if qos_ranking {
+                0.6 * norm_quality + 0.4 * norm_throughput
+            } else {
+                norm_throughput
+            };
+
+            let mut model = entry.clone();
+            model.score = config.weight_error_rate * blended_err
+                + config.weight_latency * ranking_component
+                + config.weight_priority * norm_priority
+                + config.weight_cost * norm_cost;
+            model
+        })
+        .collect();
+
+    QosCatalog {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        models,
+    }
+}
+
 /// Adaptive routing policy parameters for observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedPolicy {
@@ -887,7 +954,7 @@ impl AdaptiveRouter {
     ///
     /// Four factors:
     ///   - **Stability** (35%): blended baseline + live error rate. Does it complete reliably?
-    ///   - **Quality** (30%): catalog ds_output × stability. Does it produce good output?
+    ///   - **Quality** (30%, only when QoS ranking is on): catalog ds_output × stability.
     ///   - **Throughput** (20%): output tokens per second. Task-normalized speed.
     ///     Raw latency is NOT used — it depends on task complexity, not provider quality.
     ///   - **Cost** (15%): normalized output cost. Cheaper is better when quality is similar.
@@ -940,12 +1007,18 @@ impl AdaptiveRouter {
         // ── Cost ──
         let norm_cost = self.norm_cost(slot);
 
+        let ranking_component = if self.qos_ranking.load(Ordering::Relaxed) {
+            0.6 * norm_quality + 0.4 * norm_throughput
+        } else {
+            norm_throughput
+        };
+
         let we = self.config.weight_error_rate;
         let wl = self.config.weight_latency;
         let wp = self.config.weight_priority;
         let wc = self.config.weight_cost;
         we * blended_err
-            + wl * (0.6 * norm_quality + 0.4 * norm_throughput)
+            + wl * ranking_component
             + wp * norm_priority
             + wc * norm_cost
     }
@@ -2171,6 +2244,110 @@ mod tests {
         // Next call should skip circuit-broken primary and go to fallback
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_qos_ranking_changes_lane_selection() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "priority-primary",
+                    model: "m1",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "quality-fallback",
+                    model: "m2",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[0.0, 0.0],
+            AdaptiveConfig::default(),
+        );
+        router.seed_catalog(&[
+            ModelCatalogEntry {
+                provider: "priority-primary/m1".into(),
+                model_type: ModelType::Strong,
+                stability: 1.0,
+                tool_avg_ms: 200,
+                p95_ms: 300,
+                score: 0.0,
+                cost_in: 0.0,
+                cost_out: 0.0,
+                ds_output: 1000,
+                context_window: 128_000,
+                max_output: 8_192,
+            },
+            ModelCatalogEntry {
+                provider: "quality-fallback/m2".into(),
+                model_type: ModelType::Strong,
+                stability: 1.0,
+                tool_avg_ms: 200,
+                p95_ms: 300,
+                score: 0.0,
+                cost_in: 0.0,
+                cost_out: 0.0,
+                ds_output: 5000,
+                context_window: 128_000,
+                max_output: 8_192,
+            },
+        ]);
+
+        router.set_mode(AdaptiveMode::Lane);
+        router.set_qos_ranking(false);
+        let without_qos = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(
+            without_qos.content.as_deref(),
+            Some("from-priority-primary")
+        );
+
+        router.set_qos_ranking(true);
+        let with_qos = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(with_qos.content.as_deref(), Some("from-quality-fallback"));
+    }
+
+    #[test]
+    fn test_derive_cold_start_catalog_assigns_non_zero_scores() {
+        let catalog = derive_cold_start_catalog(
+            &[
+                ModelCatalogEntry {
+                    provider: "moonshot/kimi-k2.5".into(),
+                    model_type: ModelType::Strong,
+                    stability: 0.93,
+                    tool_avg_ms: 1200,
+                    p95_ms: 2200,
+                    score: 0.0,
+                    cost_in: 2.0,
+                    cost_out: 10.0,
+                    ds_output: 4200,
+                    context_window: 128_000,
+                    max_output: 8_192,
+                },
+                ModelCatalogEntry {
+                    provider: "deepseek/deepseek-chat".into(),
+                    model_type: ModelType::Fast,
+                    stability: 1.0,
+                    tool_avg_ms: 1400,
+                    p95_ms: 2600,
+                    score: 0.0,
+                    cost_in: 1.0,
+                    cost_out: 4.0,
+                    ds_output: 4300,
+                    context_window: 64_000,
+                    max_output: 8_192,
+                },
+            ],
+            &AdaptiveConfig::default(),
+            true,
+        );
+
+        assert_eq!(catalog.models.len(), 2);
+        assert!(catalog.models.iter().all(|model| model.score > 0.0));
+        assert_ne!(catalog.models[0].score, catalog.models[1].score);
     }
 
     /// Hedge mode should NOT race the same provider against itself.

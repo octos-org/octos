@@ -8,7 +8,7 @@
 //! 5. Main message loop
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,7 +21,7 @@ use octos_bus::{
 };
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
-    RetryProvider, SwappableProvider,
+    QosCatalog, RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -90,6 +90,36 @@ pub(super) struct GatewayRuntime {
     // Matrix (feature-gated)
     #[cfg(feature = "matrix")]
     matrix_channel: Option<Arc<octos_bus::MatrixChannel>>,
+}
+
+fn load_seed_qos_catalog(data_dir: &Path) -> Option<QosCatalog> {
+    let candidates = [
+        data_dir.join("model_catalog.json"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".octos/model_catalog.json"),
+    ];
+    for path in &candidates {
+        if let Ok(json) = std::fs::read_to_string(path) {
+            if let Ok(catalog) = serde_json::from_str::<QosCatalog>(&json) {
+                return Some(catalog);
+            }
+        }
+    }
+    None
+}
+
+fn persist_qos_catalog(path: &Path, catalog: &QosCatalog) {
+    match serde_json::to_string_pretty(catalog) {
+        Ok(json) => {
+            if let Err(error) = std::fs::write(path, json) {
+                warn!(path = %path.display(), %error, "failed to persist runtime model catalog");
+            }
+        }
+        Err(error) => {
+            warn!(path = %path.display(), %error, "failed to serialize runtime model catalog");
+        }
+    }
 }
 
 impl GatewayRuntime {
@@ -255,6 +285,19 @@ impl GatewayRuntime {
         // Wrap LLM in SwappableProvider for runtime model switching
         let swappable = Arc::new(SwappableProvider::new(llm));
         let llm: Arc<dyn LlmProvider> = swappable.clone();
+        let catalog_path = data_dir.join("model_catalog.json");
+        let qos_scoring_config = config
+            .adaptive_routing
+            .as_ref()
+            .map(AdaptiveConfig::from)
+            .unwrap_or_default();
+        let qos_ranking_enabled = config
+            .adaptive_routing
+            .as_ref()
+            .map(|cfg| cfg.qos_ranking)
+            .unwrap_or(true);
+        let seed_catalog = load_seed_qos_catalog(&data_dir);
+        let mut runtime_qos_catalog: Option<QosCatalog> = None;
 
         // Seed adaptive router with baseline benchmark data (if available)
         if let Some(ref router) = adaptive_router_ref {
@@ -289,41 +332,46 @@ impl GatewayRuntime {
                 info!("no provider_baseline.json found, using cold-start scoring");
             }
 
-            // Seed static catalog fields (type, cost, ds_output) from model_catalog.json
-            // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
-            let catalog_candidates = [
-                data_dir.join("model_catalog.json"),
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".octos/model_catalog.json"),
-            ];
-            for catalog_path in &catalog_candidates {
-                if let Ok(json) = std::fs::read_to_string(catalog_path) {
-                    if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
-                        router.seed_catalog(&catalog.models);
-                        // Seed the global runtime catalog for context.rs lookups
-                        let ctx_entries: Vec<(String, u64, u64)> = catalog
-                            .models
-                            .iter()
-                            .map(|m| (m.provider.clone(), m.context_window, m.max_output))
-                            .collect();
-                        octos_llm::context::seed_from_catalog(&ctx_entries);
-                        // Seed pricing catalog
-                        let price_entries: Vec<(String, f64, f64)> = catalog
-                            .models
-                            .iter()
-                            .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
-                            .collect();
-                        octos_llm::pricing::seed_pricing_catalog(&price_entries);
-                        info!(
-                            path = %catalog_path.display(),
-                            models = catalog.models.len(),
-                            "loaded model catalog"
-                        );
-                        break;
-                    }
-                }
+            if let Some(ref catalog) = seed_catalog {
+                router.seed_catalog(&catalog.models);
+                let ctx_entries: Vec<(String, u64, u64)> = catalog
+                    .models
+                    .iter()
+                    .map(|m| (m.provider.clone(), m.context_window, m.max_output))
+                    .collect();
+                octos_llm::context::seed_from_catalog(&ctx_entries);
+                let price_entries: Vec<(String, f64, f64)> = catalog
+                    .models
+                    .iter()
+                    .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
+                    .collect();
+                octos_llm::pricing::seed_pricing_catalog(&price_entries);
+                info!(models = catalog.models.len(), "loaded model catalog");
             }
+
+            let live_catalog = router.export_model_catalog();
+            persist_qos_catalog(&catalog_path, &live_catalog);
+            runtime_qos_catalog = Some(live_catalog);
+        } else if let Some(ref catalog) = seed_catalog {
+            let derived = octos_llm::derive_cold_start_catalog(
+                &catalog.models,
+                &qos_scoring_config,
+                qos_ranking_enabled,
+            );
+            let ctx_entries: Vec<(String, u64, u64)> = derived
+                .models
+                .iter()
+                .map(|m| (m.provider.clone(), m.context_window, m.max_output))
+                .collect();
+            octos_llm::context::seed_from_catalog(&ctx_entries);
+            let price_entries: Vec<(String, f64, f64)> = derived
+                .models
+                .iter()
+                .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
+                .collect();
+            octos_llm::pricing::seed_pricing_catalog(&price_entries);
+            persist_qos_catalog(&catalog_path, &derived);
+            runtime_qos_catalog = Some(derived);
         }
 
         // Open ProfileStore for /account commands and bot management.
@@ -352,7 +400,7 @@ impl GatewayRuntime {
         // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
-            let catalog_path = data_dir.join("model_catalog.json");
+            let catalog_path = catalog_path.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
@@ -767,26 +815,17 @@ impl GatewayRuntime {
 
             // Seed QoS scores on the router for fallback ranking
             if let Some(ref router) = provider_router {
-                let catalog_path = data_dir.join("pipeline_models.json");
-                let system_catalog = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".octos/model_catalog.json");
-                for path in &[catalog_path, system_catalog] {
-                    if let Ok(json) = std::fs::read_to_string(path) {
-                        if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
-                            let score_entries: Vec<(String, f64)> = catalog
-                                .models
-                                .iter()
-                                .map(|m| (m.provider.clone(), m.score))
-                                .collect();
-                            router.seed_qos_scores(&score_entries);
-                            info!(
-                                models = score_entries.len(),
-                                "seeded scores for fallback ranking"
-                            );
-                            break;
-                        }
-                    }
+                if let Some(ref catalog) = runtime_qos_catalog {
+                    let score_entries: Vec<(String, f64)> = catalog
+                        .models
+                        .iter()
+                        .map(|m| (m.provider.clone(), m.score))
+                        .collect();
+                    router.seed_qos_scores(&score_entries);
+                    info!(
+                        models = score_entries.len(),
+                        "seeded scores for fallback ranking"
+                    );
                 }
             }
 
