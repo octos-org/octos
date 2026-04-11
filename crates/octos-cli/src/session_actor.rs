@@ -78,6 +78,46 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
 
+fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let current_profile_id = data_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let family_root_profile = current_profile_id
+        .as_deref()
+        .and_then(|value| value.split("--").next())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let octos_home = data_dir
+        .ancestors()
+        .nth(3)
+        .map(std::path::Path::to_path_buf);
+
+    let mut candidates = Vec::new();
+    candidates.push(data_dir.join("skills").join("mofa-slides").join("styles"));
+
+    if let Some(ref home) = octos_home {
+        candidates.push(home.join("skills").join("mofa-slides").join("styles"));
+
+        if let Some(ref root_profile) = family_root_profile {
+            candidates.push(
+                home.join("profiles")
+                    .join(root_profile)
+                    .join("data")
+                    .join("skills")
+                    .join("mofa-slides")
+                    .join("styles"),
+            );
+        }
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_dir())
+}
+
 /// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
@@ -661,9 +701,9 @@ impl ActorFactory {
 
             // Copy built-in style templates into workspace/styles/ so the
             // agent's glob("styles/*.toml") can discover them.
-            let builtin_styles = self.data_dir.join("skills/mofa-slides/styles");
+            let builtin_styles = resolve_builtin_slides_styles_dir(&self.data_dir);
             let ws_styles = user_workspace.join("styles");
-            if builtin_styles.exists() {
+            if let Some(builtin_styles) = builtin_styles {
                 std::fs::create_dir_all(&ws_styles).ok();
                 if let Ok(entries) = std::fs::read_dir(&builtin_styles) {
                     for entry in entries.flatten() {
@@ -677,6 +717,12 @@ impl ActorFactory {
                         }
                     }
                 }
+            } else {
+                warn!(
+                    session = %session_key,
+                    data_dir = %self.data_dir.display(),
+                    "builtin mofa-slides styles directory not found"
+                );
             }
         }
 
@@ -3173,6 +3219,56 @@ mod tests {
             "beforeafter"
         );
         assert_eq!(strip_think_tags("<think>unclosed"), "");
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_falls_back_to_root_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let root_styles = octos_home
+            .join("profiles")
+            .join("dspfac")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&root_styles).unwrap();
+        std::fs::write(root_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data).unwrap();
+
+        assert_eq!(resolved, root_styles);
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_does_not_use_unrelated_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let unrelated_styles = octos_home
+            .join("profiles")
+            .join("someone-else")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&unrelated_styles).unwrap();
+        std::fs::write(unrelated_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data);
+
+        assert!(resolved.is_none());
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
