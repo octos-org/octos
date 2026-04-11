@@ -39,10 +39,127 @@ pub struct PurgeReport {
 /// 4. Delete user record.
 /// 5. Find and delete the tenant record (releases SSH port implicitly).
 pub async fn purge_by_profile_id(
-    _state: &Arc<AppState>,
-    _profile_id: &str,
+    state: &Arc<AppState>,
+    profile_id: &str,
 ) -> eyre::Result<Option<PurgeReport>> {
-    todo!("implement in task 3")
+    let Some(profile_store) = state.profile_store.as_ref() else {
+        return Ok(None);
+    };
+
+    // Load profile first — if it doesn't exist, return Ok(None) so the
+    // handler can map to 404. Storage errors propagate via `?`.
+    let Some(profile) = profile_store.get(profile_id)? else {
+        return Ok(None);
+    };
+
+    let mut report = PurgeReport {
+        profile_id: profile_id.to_string(),
+        user_email: None,
+        tenant_id: None,
+        node_name: None,
+        port_released: None,
+        files_removed: Vec::new(),
+        bytes_freed: 0,
+    };
+
+    // 1. Stop the gateway (no-op if not running, no-op if no process manager)
+    if let Some(pm) = state.process_manager.as_ref() {
+        let _ = pm.stop(profile_id).await;
+    }
+
+    // 2. Cascade sub-accounts: stop, remove data dir, delete profile JSON
+    if let Ok(subs) = profile_store.list_sub_accounts(profile_id) {
+        for sub in &subs {
+            if let Some(pm) = state.process_manager.as_ref() {
+                let _ = pm.stop(&sub.id).await;
+            }
+            let sub_data_dir = profile_store.resolve_data_dir(sub);
+            if sub_data_dir.exists() {
+                let bytes = dir_size(&sub_data_dir);
+                if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
+                    tracing::warn!(
+                        sub_account = %sub.id,
+                        dir = %sub_data_dir.display(),
+                        error = %e,
+                        "purge: failed to remove sub-account data dir"
+                    );
+                } else {
+                    report.bytes_freed += bytes;
+                    report.files_removed.push(sub_data_dir.display().to_string());
+                }
+            }
+            let _ = profile_store.delete(&sub.id);
+            report.files_removed.push(format!("profiles/{}.json", sub.id));
+        }
+    }
+
+    // 3. Delete profile data dir + profile JSON
+    let data_dir = profile_store.resolve_data_dir(&profile);
+    if data_dir.exists() {
+        let bytes = dir_size(&data_dir);
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(profile = %profile_id, dir = %data_dir.display(), error = %e, "purge: failed to remove data dir");
+        } else {
+            report.bytes_freed += bytes;
+            report.files_removed.push(data_dir.display().to_string());
+        }
+    }
+    let _ = profile_store.delete(profile_id);
+    report.files_removed.push(format!("profiles/{profile_id}.json"));
+
+    // 4. Delete user record (capture email first for the report)
+    if let Some(us) = state.user_store.as_ref() {
+        if let Ok(Some(user)) = us.get(profile_id) {
+            report.user_email = Some(user.email);
+        }
+        if let Ok(true) = us.delete(profile_id) {
+            report.files_removed.push(format!("users/{profile_id}.json"));
+        }
+    }
+
+    // 5. Find and delete tenant record (releases SSH port implicitly)
+    if let Some(ts) = state.tenant_store.as_ref() {
+        let owner_keys: &[&str] = &[profile_id];
+        if let Ok(tenants) = ts.find_by_owner(owner_keys) {
+            for tenant in tenants {
+                report.tenant_id = Some(tenant.id.clone());
+                report.node_name = Some(tenant.subdomain.clone());
+                report.port_released = Some(tenant.ssh_port);
+                if let Ok(true) = ts.delete(&tenant.id) {
+                    report.files_removed.push(format!("tenants/{}.json", tenant.id));
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        profile = %profile_id,
+        files_removed = report.files_removed.len(),
+        bytes_freed = report.bytes_freed,
+        "purge complete"
+    );
+
+    Ok(Some(report))
+}
+
+/// Compute the recursive size of a directory in bytes. Returns 0 on any error.
+fn dir_size(path: &std::path::Path) -> u64 {
+    fn walk(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total += walk(&entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+        total
+    }
+    walk(path)
 }
 
 #[cfg(test)]
