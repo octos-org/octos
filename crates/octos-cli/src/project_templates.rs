@@ -2,7 +2,9 @@
 //! session types like `/new slides <name>`.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// Slugify a project name for use as a directory name.
@@ -228,6 +230,574 @@ pub fn try_activate_slides_template(data_dir: &Path, session_topic: &str) -> Opt
     Some(slides_creation_reply(project_name))
 }
 
+// ── Site project ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SitePlanPage {
+    pub title: String,
+    pub slug: String,
+    pub goal: String,
+    pub sections: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteProjectMetadata {
+    pub version: u32,
+    pub command: String,
+    pub preset_key: String,
+    pub template: String,
+    pub site_kind: String,
+    pub site_name: String,
+    pub description: String,
+    pub accent: String,
+    pub reference: String,
+    pub reference_label: String,
+    pub site_slug: String,
+    pub preview_base_path: String,
+    pub preview_url: String,
+    pub build_output_dir: String,
+    pub project_dir: String,
+    pub pages: Vec<SitePlanPage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SitePreset {
+    preset_key: &'static str,
+    template: &'static str,
+    site_kind: &'static str,
+    site_name: &'static str,
+    description: &'static str,
+    accent: &'static str,
+    reference: &'static str,
+    reference_label: &'static str,
+}
+
+const SITE_SESSION_FILE: &str = "mofa-site-session.json";
+
+fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
+    if !(session_topic == "site" || session_topic.starts_with("site ")) {
+        return None;
+    }
+
+    let token = session_topic
+        .strip_prefix("site")
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    let preset = match token.as_str() {
+        "" | "learning" | "lesson" | "course" | "math" | "physics" => SitePreset {
+            preset_key: "learning",
+            template: "quarto-lesson",
+            site_kind: "course",
+            site_name: "Physics Learning Studio",
+            description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
+            accent: "#2563eb",
+            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference_label: "3b1b-calculus",
+        },
+        "astro" | "docs" | "documentation" | "guide" => SitePreset {
+            preset_key: "astro",
+            template: "astro-site",
+            site_kind: "docs",
+            site_name: "Signal Atlas",
+            description: "Structured content site for guides, onboarding, changelogs, and reference pages.",
+            accent: "#d97706",
+            reference: "/Users/yuechen/home/origin2025",
+            reference_label: "origin2025",
+        },
+        "next" | "nextjs" | "app" | "product" | "event" => SitePreset {
+            preset_key: "nextjs",
+            template: "nextjs-app",
+            site_kind: "product",
+            site_name: "Vision Forum",
+            description: "App-like landing shell for events, products, and structured call-to-action flows.",
+            accent: "#0f766e",
+            reference: "/Users/yuechen/home/ai-vision-forum-paris-2026",
+            reference_label: "ai-vision-forum-paris-2026",
+        },
+        "react" | "vite" | "prototype" | "tool" => SitePreset {
+            preset_key: "react",
+            template: "react-vite",
+            site_kind: "tool",
+            site_name: "React Lab",
+            description: "Lean React/Vite shell for prototypes, interface experiments, and lightweight tools.",
+            accent: "#be123c",
+            reference: "/Users/yuechen/home/adora-website",
+            reference_label: "adora-website",
+        },
+        _ => SitePreset {
+            preset_key: "learning",
+            template: "quarto-lesson",
+            site_kind: "course",
+            site_name: "Physics Learning Studio",
+            description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
+            accent: "#2563eb",
+            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference_label: "3b1b-calculus",
+        },
+    };
+
+    Some(preset)
+}
+
+fn site_pages_for_preset(preset_key: &str) -> Vec<SitePlanPage> {
+    match preset_key {
+        "astro" => vec![
+            SitePlanPage {
+                title: "Overview".into(),
+                slug: "overview".into(),
+                goal: "Show the product story, navigation, and first-run guidance.".into(),
+                sections: vec!["Hero".into(), "Why it exists".into(), "Quickstart".into()],
+            },
+            SitePlanPage {
+                title: "Guide".into(),
+                slug: "guide".into(),
+                goal: "Lay out the primary walkthrough and the action sequence for new users."
+                    .into(),
+                sections: vec!["Install".into(), "Workflow".into(), "Examples".into()],
+            },
+            SitePlanPage {
+                title: "Reference".into(),
+                slug: "reference".into(),
+                goal: "Hold the stable API, commands, and integration notes.".into(),
+                sections: vec!["Routes".into(), "Settings".into(), "Troubleshooting".into()],
+            },
+        ],
+        "nextjs" => vec![
+            SitePlanPage {
+                title: "Home".into(),
+                slug: "home".into(),
+                goal: "Present the main story, top CTA, and feature grid.".into(),
+                sections: vec!["Hero".into(), "Program".into(), "Highlights".into()],
+            },
+            SitePlanPage {
+                title: "Contact".into(),
+                slug: "contact".into(),
+                goal: "Collect inbound requests, venue info, and partnership details.".into(),
+                sections: vec!["Contact form".into(), "Location".into(), "FAQ".into()],
+            },
+            SitePlanPage {
+                title: "Privacy".into(),
+                slug: "privacy".into(),
+                goal: "Surface policy links and trust language for the site shell.".into(),
+                sections: vec!["Policy".into(), "Data use".into(), "Contact".into()],
+            },
+        ],
+        "react" => vec![
+            SitePlanPage {
+                title: "Home".into(),
+                slug: "home".into(),
+                goal: "Anchor the shell with a clear entry point and one primary CTA.".into(),
+                sections: vec!["Header".into(), "Hero".into(), "Feature cards".into()],
+            },
+            SitePlanPage {
+                title: "Workspace".into(),
+                slug: "workspace".into(),
+                goal: "Expose the main interactive surface for the prototype.".into(),
+                sections: vec!["Canvas".into(), "Controls".into(), "Status".into()],
+            },
+            SitePlanPage {
+                title: "Roadmap".into(),
+                slug: "roadmap".into(),
+                goal: "Document what comes next and what is still mocked.".into(),
+                sections: vec!["Scope".into(), "Milestones".into(), "Notes".into()],
+            },
+        ],
+        _ => vec![
+            SitePlanPage {
+                title: "Course Home".into(),
+                slug: "home".into(),
+                goal: "Frame the course arc and sequence the first chapters.".into(),
+                sections: vec![
+                    "Hero".into(),
+                    "Learning path".into(),
+                    "Course logistics".into(),
+                ],
+            },
+            SitePlanPage {
+                title: "Lesson 1".into(),
+                slug: "lesson-1".into(),
+                goal: "Introduce the opening concept with a visual explanation and one exercise."
+                    .into(),
+                sections: vec![
+                    "Video".into(),
+                    "Frames".into(),
+                    "Core idea".into(),
+                    "Interactive".into(),
+                    "Recap".into(),
+                ],
+            },
+            SitePlanPage {
+                title: "Lesson 2".into(),
+                slug: "lesson-2".into(),
+                goal: "Extend the concept with a worked example and a practice prompt.".into(),
+                sections: vec![
+                    "Hook".into(),
+                    "Example".into(),
+                    "Visual proof".into(),
+                    "Exercise".into(),
+                ],
+            },
+        ],
+    }
+}
+
+fn site_build_output_dir(template: &str) -> &'static str {
+    match template {
+        "astro-site" => "dist",
+        "nextjs-app" => "out",
+        "react-vite" => "dist",
+        _ => "docs",
+    }
+}
+
+fn site_preview_base_path(profile_id: &str, session_id: &str, site_slug: &str) -> String {
+    format!("/api/preview/{profile_id}/{session_id}/{site_slug}")
+}
+
+fn site_preview_root_url(profile_id: &str, session_id: &str, site_slug: &str) -> String {
+    format!(
+        "{}/index.html",
+        site_preview_base_path(profile_id, session_id, site_slug)
+    )
+}
+
+fn site_system_prompt(session_topic: &str) -> Option<String> {
+    let preset = site_preset_from_topic(session_topic)?;
+    let site_slug = slugify(preset.site_name);
+    let build_output_dir = site_build_output_dir(preset.template);
+
+    Some(format!(
+        r#"You are a website builder for the "{site_name}" project.
+Project dir: sites/{site_slug}/
+
+ON FIRST MESSAGE:
+1. Read sites/{site_slug}/{session_file}
+2. Read sites/{site_slug}/site-plan.json
+3. Read the relevant source files before editing
+
+WORKFLOW:
+1. Keep edits inside sites/{site_slug}/ only
+2. Preserve the selected framework: {template}
+3. Maintain the extracted structure while removing private/source-specific branding
+4. After source edits, rebuild the site so the iframe preview stays current
+
+BUILD RULES:
+- {template}: build output dir is sites/{site_slug}/{build_output_dir}/
+- Preview route shape: /api/preview/<profile-id>/<session-id>/{site_slug}/
+- If template is quarto-lesson, run shell(\"quarto render\") from sites/{site_slug}/ when Quarto is available
+- If template is astro-site, nextjs-app, or react-vite:
+  - run shell(\"test -d node_modules || npm install\") from sites/{site_slug}/
+  - then run shell(\"npm run build\") from sites/{site_slug}/
+- Never write outside the project dir
+- Treat sites/{site_slug}/{session_file} as the source of truth for template, preview path, and build output
+
+EXPECTATIONS:
+- Keep the preview working under a session-scoped subpath
+- Prefer editing existing scaffold files over recreating the project
+- When adding pages, keep navigation and internal links aligned with the build path
+
+Tools: read_file, write_file, edit_file, shell, glob
+"#,
+        site_name = preset.site_name,
+        site_slug = site_slug,
+        session_file = SITE_SESSION_FILE,
+        template = preset.template,
+        build_output_dir = build_output_dir,
+    ))
+}
+
+fn render_site_prompt(metadata: &SiteProjectMetadata) -> String {
+    let mut lines = vec![
+        format!("Template: {}", metadata.template),
+        format!("Site kind: {}", metadata.site_kind),
+        format!("Site name: {}", metadata.site_name),
+        format!("Description: {}", metadata.description),
+        format!("Reference pattern: {}", metadata.reference),
+        format!("Accent: {}", metadata.accent),
+        format!("Preview URL: {}", metadata.preview_url),
+        String::new(),
+        "Pages:".into(),
+    ];
+
+    for (index, page) in metadata.pages.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} ({}) -> {} [{}]",
+            index + 1,
+            page.title,
+            page.slug,
+            page.goal,
+            page.sections.join(", ")
+        ));
+    }
+
+    lines.extend([
+        String::new(),
+        "Studio contract:".into(),
+        "- build a starter scaffold first".into(),
+        "- keep the file tree inspectable in real time".into(),
+        format!(
+            "- keep the preview route stable under {}",
+            metadata.preview_url
+        ),
+    ]);
+
+    lines.join("\n")
+}
+
+fn resolve_mofa_site_skill_dir(data_dir: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os("MOFA_SITE_SKILL_DIR").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.push(data_dir.join("skills").join("mofa-site"));
+    candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../mofa-skills/mofa-site"));
+
+    candidates
+        .into_iter()
+        .find(|path| path.join("scripts").join("bootstrap_template.sh").exists())
+}
+
+pub fn build_site_project_metadata(
+    profile_id: &str,
+    session_id: &str,
+    session_topic: &str,
+    _project_dir: &Path,
+) -> Option<SiteProjectMetadata> {
+    let preset = site_preset_from_topic(session_topic)?;
+    let site_slug = slugify(preset.site_name);
+    let preview_base_path = site_preview_base_path(profile_id, session_id, &site_slug);
+    let preview_url = site_preview_root_url(profile_id, session_id, &site_slug);
+    let build_output_dir = site_build_output_dir(preset.template).to_string();
+
+    Some(SiteProjectMetadata {
+        version: 1,
+        command: format!("/new site {}", preset.preset_key),
+        preset_key: preset.preset_key.to_string(),
+        template: preset.template.to_string(),
+        site_kind: preset.site_kind.to_string(),
+        site_name: preset.site_name.to_string(),
+        description: preset.description.to_string(),
+        accent: preset.accent.to_string(),
+        reference: preset.reference.to_string(),
+        reference_label: preset.reference_label.to_string(),
+        site_slug: site_slug.clone(),
+        preview_base_path,
+        preview_url,
+        build_output_dir,
+        project_dir: format!("sites/{site_slug}"),
+        pages: site_pages_for_preset(preset.preset_key),
+    })
+}
+
+pub fn read_site_project_metadata(project_dir: &Path) -> Option<SiteProjectMetadata> {
+    let path = project_dir.join(SITE_SESSION_FILE);
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_site_support_files(
+    project_dir: &Path,
+    metadata: &SiteProjectMetadata,
+) -> Result<(), String> {
+    let content_dir = project_dir.join("content");
+    std::fs::create_dir_all(&content_dir)
+        .map_err(|e| format!("create site content dir failed: {e}"))?;
+
+    std::fs::write(
+        project_dir.join(SITE_SESSION_FILE),
+        serde_json::to_string_pretty(metadata)
+            .map_err(|e| format!("serialize {SITE_SESSION_FILE} failed: {e}"))?,
+    )
+    .map_err(|e| format!("write {SITE_SESSION_FILE} failed: {e}"))?;
+
+    let site_plan = serde_json::json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "template": metadata.template,
+        "site_name": metadata.site_name,
+        "pages": metadata.pages,
+    });
+    std::fs::write(
+        project_dir.join("site-plan.json"),
+        serde_json::to_string_pretty(&site_plan)
+            .map_err(|e| format!("serialize site-plan.json failed: {e}"))?,
+    )
+    .map_err(|e| format!("write site-plan.json failed: {e}"))?;
+
+    std::fs::write(
+        project_dir.join("optimized-prompt.md"),
+        render_site_prompt(metadata),
+    )
+    .map_err(|e| format!("write optimized-prompt.md failed: {e}"))?;
+
+    let overview = format!(
+        "# {site_name}\n\n{description}\n\n- template: {template}\n- site kind: {site_kind}\n- reference: {reference}\n- preview: {preview}\n\n## Pages\n{pages}\n",
+        site_name = metadata.site_name,
+        description = metadata.description,
+        template = metadata.template,
+        site_kind = metadata.site_kind,
+        reference = metadata.reference,
+        preview = metadata.preview_url,
+        pages = metadata
+            .pages
+            .iter()
+            .map(|page| format!("- {}: {}", page.title, page.goal))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    std::fs::write(content_dir.join("overview.md"), overview)
+        .map_err(|e| format!("write content/overview.md failed: {e}"))?;
+
+    for page in &metadata.pages {
+        let doc = format!(
+            "# {title}\n\nSlug: `{slug}`\n\nGoal: {goal}\n\nSections:\n{sections}\n",
+            title = page.title,
+            slug = page.slug,
+            goal = page.goal,
+            sections = page
+                .sections
+                .iter()
+                .map(|section| format!("- {section}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        std::fs::write(content_dir.join(format!("{}.md", page.slug)), doc)
+            .map_err(|e| format!("write content/{}.md failed: {e}", page.slug))?;
+    }
+
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    std::fs::write(
+        project_dir.join("memory.md"),
+        format!(
+            "# {} -- Site Project\n\n## Current state\n- Created: {}\n- Template: {}\n- Preview: {}\n",
+            metadata.site_name, today, metadata.template, metadata.preview_url
+        ),
+    )
+    .map_err(|e| format!("write memory.md failed: {e}"))?;
+
+    std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n")
+        .map_err(|e| format!("write changelog.md failed: {e}"))?;
+
+    Ok(())
+}
+
+fn run_site_bootstrap(
+    skill_dir: &Path,
+    project_dir: &Path,
+    metadata: &SiteProjectMetadata,
+) -> Result<(), String> {
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(project_dir)
+        .map_err(|e| format!("create site project dir failed: {e}"))?;
+
+    let status = if metadata.template == "quarto-lesson" {
+        Command::new("bash")
+            .arg(scripts_dir.join("bootstrap_quarto_lesson.sh"))
+            .arg("--out-dir")
+            .arg(project_dir)
+            .arg("--title")
+            .arg(&metadata.site_name)
+            .arg("--description")
+            .arg(&metadata.description)
+            .status()
+            .map_err(|e| format!("spawn Quarto bootstrap failed: {e}"))?
+    } else {
+        Command::new("bash")
+            .arg(scripts_dir.join("bootstrap_template.sh"))
+            .arg("--template")
+            .arg(&metadata.template)
+            .arg("--out-dir")
+            .arg(project_dir)
+            .arg("--site-name")
+            .arg(&metadata.site_name)
+            .arg("--description")
+            .arg(&metadata.description)
+            .arg("--accent")
+            .arg(&metadata.accent)
+            .arg("--locale")
+            .arg("en")
+            .arg("--base-path")
+            .arg(&metadata.preview_base_path)
+            .status()
+            .map_err(|e| format!("spawn site bootstrap failed: {e}"))?
+    };
+
+    if !status.success() {
+        return Err(format!(
+            "site bootstrap failed for {} with status {}",
+            metadata.template, status
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn scaffold_site_project(
+    workspace_root: &Path,
+    profile_id: &str,
+    session_id: &str,
+    session_topic: &str,
+    data_dir: &Path,
+) -> Result<SiteProjectMetadata, String> {
+    let metadata =
+        build_site_project_metadata(profile_id, session_id, session_topic, workspace_root)
+            .ok_or_else(|| format!("unsupported site template request: {session_topic}"))?;
+
+    let project_dir = workspace_root.join(&metadata.project_dir);
+    if project_dir.exists() {
+        std::fs::remove_dir_all(&project_dir)
+            .map_err(|e| format!("clear site project dir failed: {e}"))?;
+    }
+
+    let skill_dir = resolve_mofa_site_skill_dir(data_dir)
+        .ok_or_else(|| "mofa-site skill directory not found".to_string())?;
+    run_site_bootstrap(&skill_dir, &project_dir, &metadata)?;
+    write_site_support_files(&project_dir, &metadata)?;
+
+    info!(
+        session_id = %session_id,
+        preset = %metadata.preset_key,
+        template = %metadata.template,
+        slug = %metadata.site_slug,
+        "scaffolded site project"
+    );
+
+    Ok(metadata)
+}
+
+pub fn site_creation_reply(metadata: &SiteProjectMetadata) -> String {
+    format!(
+        "Site project \"{site_name}\" created!\n\n\
+         Project directory: {project_dir}/\n\
+         Template: {template}\n\
+         Preview route: {preview_url}\n\
+         Session metadata: {project_dir}/{session_file}\n\n\
+         The scaffold is ready. Edit the source files and refresh the iframe preview to see the built site.",
+        site_name = metadata.site_name,
+        project_dir = metadata.project_dir,
+        template = metadata.template,
+        preview_url = metadata.preview_url,
+        session_file = SITE_SESSION_FILE,
+    )
+}
+
+pub fn try_activate_site_template(data_dir: &Path, session_topic: &str) -> Option<String> {
+    let prompt = site_system_prompt(session_topic)?;
+    if let Err(e) = write_session_prompt(data_dir, session_topic, &prompt) {
+        tracing::warn!(error = %e, "failed to write site session prompt");
+    }
+
+    let metadata =
+        build_site_project_metadata("profile-id", "session-id", session_topic, Path::new("."))?;
+    Some(site_creation_reply(&metadata))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +895,39 @@ mod tests {
         assert!(reply.contains("Q4 Report"));
         assert!(reply.contains("slides/q4-report/"));
         assert!(reply.contains("What is this presentation about"));
+    }
+
+    #[test]
+    fn should_build_site_project_metadata_for_astro() {
+        let metadata =
+            build_site_project_metadata("dspfac", "site-session-123", "site astro", Path::new("."))
+                .expect("astro metadata");
+
+        assert_eq!(metadata.preset_key, "astro");
+        assert_eq!(metadata.template, "astro-site");
+        assert_eq!(metadata.site_slug, "signal-atlas");
+        assert_eq!(
+            metadata.preview_base_path,
+            "/api/preview/dspfac/site-session-123/signal-atlas"
+        );
+        assert_eq!(
+            metadata.preview_url,
+            "/api/preview/dspfac/site-session-123/signal-atlas/index.html"
+        );
+        assert_eq!(metadata.build_output_dir, "dist");
+    }
+
+    #[test]
+    fn should_activate_site_template_and_write_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reply = try_activate_site_template(tmp.path(), "site nextjs").expect("site reply");
+
+        assert!(reply.contains("Vision Forum"));
+        assert!(reply.contains("sites/vision-forum/"));
+
+        let prompt = read_session_prompt(tmp.path(), "site nextjs").expect("site prompt");
+        assert!(prompt.contains("website builder"));
+        assert!(prompt.contains("sites/vision-forum/mofa-site-session.json"));
+        assert!(prompt.contains("/api/preview/<profile-id>/<session-id>/vision-forum/"));
     }
 }

@@ -1,7 +1,9 @@
 //! API request handlers.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -10,14 +12,17 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
 use octos_agent::Agent;
-use octos_core::{AgentId, Message, SessionKey};
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
 use axum::http::HeaderMap;
 
 use super::AppState;
+use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
+use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
+use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -38,6 +43,17 @@ pub struct ChatResponse {
     pub content: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ContentFileEntry {
+    filename: String,
+    path: String,
+    size: u64,
+    modified: String,
+    category: String,
+    /// Parent directory name for grouping in the UI.
+    group: String,
 }
 
 /// Maximum message length (1MB).
@@ -64,6 +80,18 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
+fn api_profile_id_from_headers(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-profile-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MAIN_PROFILE_ID)
+}
+
+fn standalone_api_session_key(headers: &HeaderMap, session_id: &str) -> SessionKey {
+    SessionKey::with_profile(api_profile_id_from_headers(headers), "api", session_id)
+}
+
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -73,10 +101,11 @@ pub async fn chat(
     // The gateway's stream forwarder now sends discrete SSE events (thinking,
     // tool_start, tool_progress, cost_update) via send_raw_sse alongside
     // the text-based streaming updates.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    if let Some((profile_id, port)) = resolve_api_port(&state, &headers).await {
         return super::webhook_proxy::api_chat_proxy(
             &state,
             port,
+            Some(&profile_id),
             &req.message,
             req.session_id.as_deref(),
             &req.media,
@@ -86,12 +115,12 @@ pub async fn chat(
 
     // No gateway with API channel — use standalone agent
     if req.stream {
-        match chat_streaming(state, req).await {
+        match chat_streaming(state, headers, req).await {
             Ok(sse) => sse.into_response(),
             Err((status, msg)) => (status, msg).into_response(),
         }
     } else {
-        match chat_sync(state, req).await {
+        match chat_sync(state, headers, req).await {
             Ok(json) => json.into_response(),
             Err((status, msg)) => (status, msg).into_response(),
         }
@@ -130,6 +159,7 @@ fn validate_chat_request(
 
 async fn chat_sync(
     state: Arc<AppState>,
+    headers: HeaderMap,
     req: ChatRequest,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
     let (agent, sessions) = validate_chat_request(&state, &req)?;
@@ -140,7 +170,8 @@ async fn chat_sync(
         "chat: processing message"
     );
 
-    let session_key = SessionKey::new("api", req.session_id.as_deref().unwrap_or("default"));
+    let session_key =
+        standalone_api_session_key(&headers, req.session_id.as_deref().unwrap_or("default"));
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -179,6 +210,7 @@ async fn chat_sync(
 
 async fn chat_streaming(
     state: Arc<AppState>,
+    headers: HeaderMap,
     req: ChatRequest,
 ) -> Result<
     Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
@@ -193,7 +225,7 @@ async fn chat_streaming(
         "chat: streaming message"
     );
 
-    let session_key = SessionKey::new("api", &session_id);
+    let session_key = standalone_api_session_key(&headers, &session_id);
 
     // Load history before spawning
     let history: Vec<Message> = {
@@ -312,15 +344,14 @@ pub struct SessionInfo {
 }
 
 pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    // Collect sessions from both the standalone store and gateway profiles,
-    // since streaming uses the standalone agent but old sessions may live
-    // in gateway stores.
+    // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
+        let prefix = format!("{}:api:", api_profile_id_from_headers(&headers));
         all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
-            let chat_id = id.strip_prefix("api:")?;
+            let chat_id = id.strip_prefix(&prefix)?;
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -328,7 +359,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
         }));
     }
 
-    // Also fetch from gateway if available (old sessions live there)
+    // Also fetch from gateway if available.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
         if proxy_resp.status().is_success() {
@@ -384,38 +415,38 @@ pub async fn session_messages(
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
 
-    // source=full: always proxy to gateway (has per-user + flat JSONL merge)
+    // source=full: always proxy to gateway, which owns the canonical JSONL history.
     let use_full = params.source.as_deref() == Some("full");
 
-    // Try standalone store first (skip for source=full — gateway has the merge logic)
+    // Try standalone store first in local mode.
     if !use_full {
-    if let Some(sessions) = &state.sessions {
-        let fetch_count = match offset.checked_add(limit) {
-            Some(n) => n,
-            None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
-        };
-        let key = SessionKey::new("api", &id);
-        let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&key).await;
-        let messages: Vec<MessageInfo> = session
-            .get_history(fetch_count)
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(|m| MessageInfo {
-                role: m.role.to_string(),
-                content: m.content.clone(),
-                timestamp: m.timestamp.to_rfc3339(),
-            })
-            .collect();
-        if !messages.is_empty() {
-            return Json(messages).into_response();
+        if let Some(sessions) = &state.sessions {
+            let fetch_count = match offset.checked_add(limit) {
+                Some(n) => n,
+                None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
+            };
+            let key = standalone_api_session_key(&headers, &id);
+            let mut sess = sessions.lock().await;
+            let session = sess.get_or_create(&key).await;
+            let messages: Vec<MessageInfo> = session
+                .get_history(fetch_count)
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|m| MessageInfo {
+                    role: m.role.to_string(),
+                    content: m.content.clone(),
+                    timestamp: m.timestamp.to_rfc3339(),
+                })
+                .collect();
+            if !messages.is_empty() {
+                return Json(messages).into_response();
+            }
+            // Fall through to gateway if the standalone store has no history.
         }
-        // Fall through to gateway for old sessions
-    }
     } // !use_full
 
-    // Proxy to gateway (old sessions live there)
+    // Proxy to gateway.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let path = format!(
             "/sessions/{id}/messages?limit={}&offset={}&source=full",
@@ -476,7 +507,7 @@ pub async fn delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if let Some(sessions) = &state.sessions {
-        let key = SessionKey::new("api", &id);
+        let key = standalone_api_session_key(&headers, &id);
         let mut sess = sessions.lock().await;
         return match sess.clear(&key).await {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -501,7 +532,7 @@ pub async fn delete_session(
 /// Accepts multipart/form-data with one or more `file` fields.
 /// Returns JSON array of server-side file paths.
 pub async fn upload(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     // Determine upload directory
@@ -577,6 +608,171 @@ pub async fn upload(
     }
 
     Ok(Json(paths))
+}
+
+/// POST /api/site-files/upload -- upload files directly into a site workspace.
+///
+/// Accepts multipart/form-data with:
+/// - `session_id` (text)
+/// - `site_slug` (text)
+/// - `target_dir` (optional text, defaults by template)
+/// - one or more `file` fields
+pub async fn upload_site_files(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<Vec<ContentFileEntry>>, (StatusCode, String)> {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = resolve_profile_data_dir(&state, &headers, identity)
+        .await
+        .map_err(|response| {
+            (
+                response.status(),
+                "failed to resolve profile data dir".into(),
+            )
+        })?;
+
+    let mut session_id: Option<String> = None;
+    let mut site_slug: Option<String> = None;
+    let mut target_dir: Option<String> = None;
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut total_size: u64 = 0;
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+    const MAX_TOTAL_SIZE: u64 = 100 * 1024 * 1024;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or_default().to_string();
+        if let Some(filename) = field.file_name() {
+            if field_name != "file" {
+                let _ = field.bytes().await;
+                continue;
+            }
+
+            let filename = filename.to_string();
+            if !seen_names.insert(filename.clone()) {
+                let _ = field.bytes().await;
+                continue;
+            }
+
+            let data = field.bytes().await.map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read uploaded file: {error}"),
+                )
+            })?;
+            if data.len() as u64 > MAX_FILE_SIZE {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("file exceeds {MAX_FILE_SIZE} byte limit"),
+                ));
+            }
+            total_size += data.len() as u64;
+            if total_size > MAX_TOTAL_SIZE {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "total upload exceeds 100MB".into(),
+                ));
+            }
+
+            uploads.push((filename, data.to_vec()));
+            continue;
+        }
+
+        let value = field.text().await.map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read form field `{field_name}`: {error}"),
+            )
+        })?;
+        let value = value.trim().to_string();
+        match field_name.as_str() {
+            "session_id" if !value.is_empty() => session_id = Some(value),
+            "site_slug" if !value.is_empty() => site_slug = Some(value),
+            "target_dir" if !value.is_empty() => target_dir = Some(value),
+            _ => {}
+        }
+    }
+
+    if uploads.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no files in request".into()));
+    }
+
+    let session_id = session_id.ok_or((StatusCode::BAD_REQUEST, "missing session_id".into()))?;
+    let site_slug = site_slug.ok_or((StatusCode::BAD_REQUEST, "missing site_slug".into()))?;
+
+    let project_dir = api_session_workspace_dirs(&data_dir, &session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&site_slug))
+        .find(|candidate| candidate.exists())
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("site workspace not found for session `{session_id}` and `{site_slug}`"),
+        ))?;
+
+    let metadata = read_site_project_metadata(&project_dir);
+    let requested_target =
+        target_dir.unwrap_or_else(|| default_site_upload_dir(metadata.as_ref()).to_string());
+    let target_relative = safe_relative_subdir(&requested_target)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid target_dir".into()))?;
+    let destination_dir = project_dir.join(&target_relative);
+    tokio::fs::create_dir_all(&destination_dir)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create destination directory: {error}"),
+            )
+        })?;
+
+    let group_root = format!("sites/{site_slug}");
+    let group = if target_relative.as_os_str().is_empty() {
+        group_root.clone()
+    } else {
+        format!(
+            "{group_root}/{}",
+            target_relative.to_string_lossy().replace('\\', "/")
+        )
+    };
+
+    let mut saved = Vec::new();
+    for (filename, data) in uploads {
+        let safe_name = sanitize_upload_filename(&filename);
+        let destination = dedupe_destination(&destination_dir, &safe_name);
+        tokio::fs::write(&destination, &data)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to write uploaded file: {error}"),
+                )
+            })?;
+
+        let meta = std::fs::metadata(&destination).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to stat uploaded file: {error}"),
+            )
+        })?;
+
+        let saved_name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&safe_name)
+            .to_string();
+
+        saved.push(ContentFileEntry {
+            filename: saved_name.clone(),
+            path: destination.to_string_lossy().to_string(),
+            size: meta.len(),
+            modified: modified_rfc3339(&meta),
+            category: categorize(&saved_name),
+            group: group.clone(),
+        });
+    }
+
+    Ok(Json(saved))
 }
 
 /// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
@@ -667,49 +863,745 @@ async fn serve_file_impl(filename: &str) -> Response {
     (StatusCode::OK, headers, data).into_response()
 }
 
-/// GET /api/files/list?dirs=research,slides,skill-output — list files in profile content directories.
+fn api_session_workspace_dirs(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    let profile_id = infer_profile_id_from_data_dir(data_dir);
+    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
+    let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+    vec![data_dir.join("users").join(encoded_base).join("workspace")]
+}
+
+#[cfg(test)]
+fn api_session_workspace_dir(data_dir: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    api_session_workspace_dirs(data_dir, session_id)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| data_dir.join("users").join("workspace"))
+}
+
+fn infer_profile_id_from_data_dir(data_dir: &std::path::Path) -> String {
+    data_dir
+        .file_name()
+        .and_then(|name| (name == "data").then_some(data_dir))
+        .and_then(|_| data_dir.parent())
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MAIN_PROFILE_ID)
+        .to_string()
+}
+
+async fn resolve_profile_data_dir(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<std::path::PathBuf, Response> {
+    if let Some((_profile_id, _port)) = resolve_api_port(state, headers).await {
+        if let Some(ref ps) = state.profile_store {
+            let header_profile_id = headers.get("x-profile-id").and_then(|v| v.to_str().ok());
+            let identity_profile_id = match identity {
+                Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
+                Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
+                None => None,
+            };
+
+            if let Some(pid) = header_profile_id.or(identity_profile_id) {
+                match ps.get(pid) {
+                    Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
+                    Ok(None) => {
+                        return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
+                    }
+                    Err(error) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("profile lookup failed: {error}"),
+                        )
+                            .into_response());
+                    }
+                }
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing X-Profile-Id and no authenticated profile context",
+            )
+                .into_response());
+        }
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response());
+    }
+
+    Err((StatusCode::SERVICE_UNAVAILABLE, "no gateway").into_response())
+}
+
+fn resolve_profile_data_dir_by_id(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<std::path::PathBuf, Response> {
+    let profile_id = if profile_id.is_empty() {
+        MAIN_PROFILE_ID
+    } else {
+        profile_id
+    };
+
+    let Some(ref store) = state.profile_store else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response());
+    };
+
+    match store.get(profile_id) {
+        Ok(Some(profile)) => Ok(store.resolve_data_dir(&profile)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "profile not found").into_response()),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("profile lookup failed: {error}"),
+        )
+            .into_response()),
+    }
+}
+
+fn sanitize_upload_filename(filename: &str) -> String {
+    filename
+        .replace(['/', '\\', '\0'], "_")
+        .chars()
+        .take(200)
+        .collect::<String>()
+}
+
+fn safe_relative_subdir(dir: &str) -> Option<std::path::PathBuf> {
+    let normalized = dir.trim().replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return Some(std::path::PathBuf::new());
+    }
+
+    let mut relative = std::path::PathBuf::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            std::path::Component::Normal(segment) => relative.push(segment),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+
+    Some(relative)
+}
+
+fn default_site_upload_dir(metadata: Option<&SiteProjectMetadata>) -> &'static str {
+    match metadata.map(|meta| meta.template.as_str()) {
+        Some("quarto-lesson") => "images/uploads",
+        _ => "public/uploads",
+    }
+}
+
+fn dedupe_destination(dest_dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let candidate = dest_dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("file");
+    let extension = std::path::Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
+
+    for index in 2..10_000 {
+        let deduped = match extension {
+            Some(extension) => format!("{stem}-{index}.{extension}"),
+            None => format!("{stem}-{index}"),
+        };
+        let deduped_path = dest_dir.join(&deduped);
+        if !deduped_path.exists() {
+            return deduped_path;
+        }
+    }
+
+    candidate
+}
+
+fn modified_rfc3339(meta: &std::fs::Metadata) -> String {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| {
+            chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+fn site_preview_html(status: StatusCode, title: &str, body: &str) -> Response {
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <style>
+      :root {{
+        color-scheme: light dark;
+        --bg: #0f172a;
+        --panel: rgba(15, 23, 42, 0.78);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --border: rgba(148, 163, 184, 0.18);
+        --accent: #38bdf8;
+        --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        color: var(--text);
+        font-family: var(--font);
+        background:
+          radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 22rem),
+          linear-gradient(180deg, #0f172a 0%, #111827 100%);
+      }}
+      .card {{
+        width: min(820px, 100%);
+        padding: 24px;
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        background: var(--panel);
+        backdrop-filter: blur(18px);
+      }}
+      h1 {{
+        margin: 0 0 12px;
+        font-size: clamp(1.6rem, 3vw, 2.4rem);
+        letter-spacing: -0.04em;
+      }}
+      p {{
+        margin: 0;
+        line-height: 1.75;
+        color: var(--muted);
+        white-space: pre-wrap;
+      }}
+      code {{
+        color: var(--text);
+      }}
+    </style>
+  </head>
+  <body>
+    <article class="card">
+      <h1>{title}</h1>
+      <p>{body}</p>
+    </article>
+  </body>
+</html>"#,
+        title = title,
+        body = body,
+    );
+
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+fn preview_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js" | "mjs" | "cjs") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn output_dir_for_site(
+    project_dir: &std::path::Path,
+    metadata: &SiteProjectMetadata,
+) -> std::path::PathBuf {
+    project_dir.join(&metadata.build_output_dir)
+}
+
+fn newest_tree_mtime(
+    root: &std::path::Path,
+    skip_dir_names: &[&str],
+) -> Option<std::time::SystemTime> {
+    fn walk(
+        dir: &std::path::Path,
+        skip_dir_names: &[&str],
+        latest: &mut Option<std::time::SystemTime>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if path.is_dir() {
+                if skip_dir_names.iter().any(|skip| *skip == file_name) {
+                    continue;
+                }
+                walk(&path, skip_dir_names, latest);
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if latest.map(|current| modified > current).unwrap_or(true) {
+                        *latest = Some(modified);
+                    }
+                }
+            }
+        }
+    }
+
+    if root.is_file() {
+        return root.metadata().ok()?.modified().ok();
+    }
+
+    let mut latest = None;
+    walk(root, skip_dir_names, &mut latest);
+    latest
+}
+
+fn site_build_needed(project_dir: &std::path::Path, output_dir: &std::path::Path) -> bool {
+    if !output_dir.exists() {
+        return true;
+    }
+
+    let output_time = newest_tree_mtime(output_dir, &[]);
+    let source_time = newest_tree_mtime(
+        project_dir,
+        &[
+            "node_modules",
+            ".git",
+            ".next",
+            ".astro",
+            "dist",
+            "out",
+            "docs",
+        ],
+    );
+
+    match (source_time, output_time) {
+        (Some(source_time), Some(output_time)) => source_time > output_time,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn run_build_command(command: &mut std::process::Command, label: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|e| format!("{label} failed to start: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = format!("{stdout}\n{stderr}").trim().to_string();
+    if detail.is_empty() {
+        Err(format!("{label} failed with status {}", output.status))
+    } else {
+        Err(format!("{label} failed:\n{detail}"))
+    }
+}
+
+fn ensure_site_build_output(
+    project_dir: &std::path::Path,
+    metadata: &SiteProjectMetadata,
+) -> Result<std::path::PathBuf, String> {
+    fn site_build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+        static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+        LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn site_build_lock(project_dir: &std::path::Path) -> Arc<Mutex<()>> {
+        let key = std::fs::canonicalize(project_dir)
+            .unwrap_or_else(|_| project_dir.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+        let mut locks = site_build_locks().lock().unwrap();
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    let build_lock = site_build_lock(project_dir);
+    let _build_guard = build_lock.lock().unwrap();
+    let output_dir = output_dir_for_site(project_dir, metadata);
+    if !site_build_needed(project_dir, &output_dir) {
+        return Ok(output_dir);
+    }
+
+    match metadata.template.as_str() {
+        "quarto-lesson" => {
+            let mut render = std::process::Command::new("quarto");
+            render.current_dir(project_dir).arg("render");
+            run_build_command(&mut render, "quarto render")?;
+        }
+        "astro-site" | "nextjs-app" | "react-vite" => {
+            if !project_dir.join("node_modules").exists() {
+                let mut install = std::process::Command::new("npm");
+                install.current_dir(project_dir).arg("install");
+                run_build_command(&mut install, "npm install")?;
+            }
+            let mut build = std::process::Command::new("npm");
+            build.current_dir(project_dir).arg("run").arg("build");
+            run_build_command(&mut build, "npm run build")?;
+        }
+        other => return Err(format!("unsupported site template: {other}")),
+    }
+
+    if !output_dir.exists() {
+        return Err(format!(
+            "site build completed but {} was not created",
+            output_dir.display()
+        ));
+    }
+
+    Ok(output_dir)
+}
+
+fn safe_preview_join(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+    let mut joined = root.to_path_buf();
+    for segment in request_path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains('\\') {
+            return None;
+        }
+        joined.push(segment);
+    }
+    Some(joined)
+}
+
+fn resolve_preview_asset_path(
+    output_dir: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    fn resolve_direct(
+        output_dir: &std::path::Path,
+        request_path: &str,
+    ) -> Option<std::path::PathBuf> {
+        let candidate = safe_preview_join(output_dir, request_path)?;
+        if request_path.is_empty() {
+            Some(output_dir.join("index.html"))
+        } else if candidate.is_dir() {
+            Some(candidate.join("index.html"))
+        } else if candidate.exists() {
+            Some(candidate)
+        } else {
+            let nested_index = candidate.join("index.html");
+            if nested_index.exists() {
+                Some(nested_index)
+            } else if !request_path.contains('.') {
+                let html = candidate.with_extension("html");
+                if html.exists() { Some(html) } else { None }
+            } else {
+                None
+            }
+        }
+    }
+
+    let request_path = request_path.trim_start_matches('/');
+    let resolved = resolve_direct(output_dir, request_path).or_else(|| {
+        if request_path.contains('.') {
+            return None;
+        }
+
+        let segments: Vec<&str> = request_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.len() < 2 {
+            return None;
+        }
+
+        // Legacy generated sites sometimes emit page-relative links such as
+        // "./capabilities/" from "/concepts/". When that happens, the
+        // browser requests "concepts/capabilities/". Fall back to the
+        // rightmost route segment at the preview root if it exists there.
+        for start in 1..segments.len() {
+            let fallback_path = segments[start..].join("/");
+            if let Some(path) = resolve_direct(output_dir, &fallback_path) {
+                return Some(path);
+            }
+        }
+
+        None
+    })?;
+
+    let canonical_root = std::fs::canonicalize(output_dir).ok()?;
+    let canonical_resolved = std::fs::canonicalize(resolved).ok()?;
+    if !canonical_resolved.starts_with(&canonical_root) {
+        return None;
+    }
+
+    Some(canonical_resolved)
+}
+
+async fn serve_preview_file(path: std::path::PathBuf) -> Response {
+    let data = match tokio::fs::read(&path).await {
+        Ok(data) => data,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let cache_control = if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+        "no-cache, no-store, must-revalidate"
+    } else {
+        "public, max-age=30"
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                preview_content_type(&path),
+            ),
+            (axum::http::header::CACHE_CONTROL, cache_control),
+        ],
+        data,
+    )
+        .into_response()
+}
+
+async fn serve_site_preview_impl(
+    data_dir: std::path::PathBuf,
+    session_id: String,
+    site_slug: String,
+    request_path: String,
+) -> Response {
+    let project_dir = api_session_workspace_dirs(&data_dir, &session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&site_slug))
+        .find(|candidate| candidate.exists());
+
+    let Some(project_dir) = project_dir else {
+        return site_preview_html(
+            StatusCode::NOT_FOUND,
+            "Site Preview Not Found",
+            &format!(
+                "No scaffold exists yet for session `{session_id}` and site `{site_slug}`.\n\nCreate the site session first so Octos can scaffold the project workspace."
+            ),
+        );
+    };
+
+    let Some(metadata) = read_site_project_metadata(&project_dir) else {
+        return site_preview_html(
+            StatusCode::NOT_FOUND,
+            "Missing Site Metadata",
+            &format!(
+                "The project exists at `{}` but `{}` is missing or invalid.",
+                project_dir.display(),
+                "mofa-site-session.json",
+            ),
+        );
+    };
+
+    let build_task = {
+        let project_dir = project_dir.clone();
+        let metadata = metadata.clone();
+        tokio::task::spawn_blocking(move || ensure_site_build_output(&project_dir, &metadata))
+    };
+
+    let output_dir = match build_task.await {
+        Ok(Ok(output_dir)) => output_dir,
+        Ok(Err(error)) => {
+            return site_preview_html(
+                StatusCode::OK,
+                "Preview Build Failed",
+                &format!(
+                    "Octos could not build the preview for `{}`.\n\n{}",
+                    metadata.template, error
+                ),
+            );
+        }
+        Err(error) => {
+            return site_preview_html(
+                StatusCode::OK,
+                "Preview Build Failed",
+                &format!("The preview worker crashed: {error}"),
+            );
+        }
+    };
+
+    let Some(path) = resolve_preview_asset_path(&output_dir, &request_path) else {
+        return site_preview_html(
+            StatusCode::NOT_FOUND,
+            "Preview Asset Missing",
+            &format!(
+                "The built preview exists, but `{}` was not found under `{}`.",
+                request_path,
+                output_dir.display(),
+            ),
+        );
+    };
+
+    serve_preview_file(path).await
+}
+
+/// GET /api/site-preview/{session_id}/{site_slug} — serve the preview root for a site session.
+pub async fn serve_site_preview_root(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path((session_id, site_slug)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_site_preview_impl(data_dir, session_id, site_slug, String::new()).await
+}
+
+/// GET /api/site-preview/{session_id}/{site_slug}/{*path} — serve built preview assets.
+pub async fn serve_site_preview_path(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path((session_id, site_slug, request_path)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
+}
+
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug} — public preview root for site iframes.
+pub async fn serve_public_site_preview_root(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((profile_id, session_id, site_slug)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Response {
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_site_preview_impl(data_dir, session_id, site_slug, String::new()).await
+}
+
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug}/{*path} — public preview assets.
+pub async fn serve_public_site_preview_path(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((profile_id, session_id, site_slug, request_path)): axum::extract::Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Response {
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
+}
+
+/// GET /api/files/list?dirs=research,slides,skill-output&session_id=... — list files in profile content directories.
+fn should_skip_listing_dir(dir_name: &str, include_build: bool) -> bool {
+    let lower = dir_name.to_ascii_lowercase();
+    lower.starts_with('.')
+        || matches!(lower.as_str(), "node_modules" | "coverage" | "target")
+        || (!include_build && matches!(lower.as_str(), "dist" | "out" | "docs" | "build"))
+}
+
 pub async fn list_content_files(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Resolve profile data dir
-    let data_dir = if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        // Proxy approach: ask the gateway. But simpler: derive from profile store.
-        if let Some(ref ps) = state.profile_store {
-            if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
-                if let Ok(Some(p)) = ps.get(pid) {
-                    ps.resolve_data_dir(&p)
-                } else {
-                    return (StatusCode::NOT_FOUND, "profile not found").into_response();
-                }
-            } else {
-                return (StatusCode::BAD_REQUEST, "missing X-Profile-Id").into_response();
-            }
-        } else {
-            return (StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response();
-        }
-    } else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no gateway").into_response();
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
     };
 
-    let dirs_param = params.get("dirs").cloned().unwrap_or_else(|| "research,slides,skill-output".to_string());
-    let mut scan_dirs: Vec<String> = dirs_param.split(',').map(|s| s.trim().to_string()).collect();
+    let dirs_param = params
+        .get("dirs")
+        .cloned()
+        .unwrap_or_else(|| "research,slides,skill-output".to_string());
+    let requested_dirs: Vec<String> = dirs_param
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let session_id = params
+        .get("session_id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let include_build = params
+        .get("include_build")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let session_scoped = session_id.is_some();
 
-    // Scan per-user workspace directories that match the requested dirs.
-    // Only use original relative dir names — absolute paths from prior
-    // iterations would bypass ws.join() (Path::join replaces on absolute).
-    let requested_dirs: Vec<String> = scan_dirs.clone();
-    let users_dir = data_dir.join("users");
-    if let Ok(entries) = std::fs::read_dir(&users_dir) {
-        for entry in entries.flatten() {
-            let ws = entry.path().join("workspace");
-            if !ws.exists() { continue; }
-            for dir_name in &requested_dirs {
-                if std::path::Path::new(dir_name.as_str()).is_absolute() { continue; }
-                let ws_dir = ws.join(dir_name);
-                if ws_dir.exists() && ws_dir.is_dir() {
-                    scan_dirs.push(ws_dir.to_string_lossy().to_string());
+    let mut scan_dirs = requested_dirs.clone();
+    if let Some(session_id) = session_id {
+        scan_dirs.clear();
+        for workspace in api_session_workspace_dirs(&data_dir, session_id) {
+            if workspace.exists() {
+                for dir_name in &requested_dirs {
+                    if std::path::Path::new(dir_name.as_str()).is_absolute() {
+                        continue;
+                    }
+                    let ws_dir = workspace.join(dir_name);
+                    if ws_dir.exists() && ws_dir.is_dir() {
+                        scan_dirs.push(ws_dir.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        // Scan per-user workspace directories that match the requested dirs.
+        // Only use original relative dir names — absolute paths from prior
+        // iterations would bypass ws.join() (Path::join replaces on absolute).
+        let users_dir = data_dir.join("users");
+        if let Ok(entries) = std::fs::read_dir(&users_dir) {
+            for entry in entries.flatten() {
+                let ws = entry.path().join("workspace");
+                if !ws.exists() {
+                    continue;
+                }
+                for dir_name in &requested_dirs {
+                    if std::path::Path::new(dir_name.as_str()).is_absolute() {
+                        continue;
+                    }
+                    let ws_dir = ws.join(dir_name);
+                    if ws_dir.exists() && ws_dir.is_dir() {
+                        scan_dirs.push(ws_dir.to_string_lossy().to_string());
+                    }
                 }
             }
         }
@@ -726,29 +1618,149 @@ pub async fn list_content_files(
         group: String,
     }
 
-    // Only show final output files, skip all intermediate/internal files
+    fn display_dir_for_scan(dir_name: &str) -> String {
+        if !std::path::Path::new(dir_name).is_absolute() {
+            return dir_name.trim_matches('/').to_string();
+        }
+
+        let normalized = dir_name.replace('\\', "/");
+        if let Some((_, suffix)) = normalized.rsplit_once("/workspace/") {
+            let trimmed = suffix.trim_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        let path = std::path::Path::new(dir_name);
+        let parts: Vec<&str> = path
+            .components()
+            .rev()
+            .take(2)
+            .map(|component| component.as_os_str().to_str().unwrap_or(""))
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            "files".into()
+        } else {
+            parts.into_iter().rev().collect::<Vec<_>>().join("/")
+        }
+    }
+
+    // Keep meaningful session files while filtering obvious intermediates.
     fn is_output_file(filename: &str) -> bool {
         let lower = filename.to_lowercase();
         // Skip hidden files
-        if lower.starts_with('.') { return false; }
+        if lower.starts_with('.') {
+            return false;
+        }
         // Skip research intermediate files
-        if lower.starts_with('_') { return false; } // _report.md, _search_results.md, _sources.json
+        if lower.starts_with('_') {
+            return false;
+        } // _report.md, _search_results.md, _sources.json
         // Skip intermediates
-        if lower.starts_with("panel-") { return false; }
-        if lower.contains("-ref.") { return false; } // mofa reference images
+        if lower.starts_with("panel-") {
+            return false;
+        }
+        if lower.contains("-ref.") {
+            return false;
+        } // mofa reference images
         // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
-            "md" | "txt" | "pptx" | "pdf" | "docx" | "xlsx" | "png" | "jpg" | "mp3" | "wav" | "mp4" | "js" | "json"
+            "md" | "markdown"
+                | "txt"
+                | "pptx"
+                | "pdf"
+                | "docx"
+                | "xlsx"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "webp"
+                | "gif"
+                | "svg"
+                | "avif"
+                | "mp3"
+                | "wav"
+                | "mp4"
+                | "js"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "json"
+                | "css"
+                | "html"
+                | "astro"
+                | "qmd"
+                | "yaml"
+                | "yml"
+                | "sh"
+                | "mjs"
+                | "cjs"
         )
     }
 
-    fn modified_rfc3339(meta: &std::fs::Metadata) -> String {
-        meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-                .map(|dt| dt.to_rfc3339()).unwrap_or_default())
-            .unwrap_or_default()
+    fn collect_files_recursive(
+        current_dir: &std::path::Path,
+        display_root: &str,
+        relative_dir: &std::path::Path,
+        include_build: bool,
+        allow_nested_dirs: bool,
+        files: &mut Vec<ContentFile>,
+    ) {
+        let entries = match std::fs::read_dir(current_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if path.is_dir() {
+                if !allow_nested_dirs || should_skip_listing_dir(&name, include_build) {
+                    continue;
+                }
+                let mut next_relative = relative_dir.to_path_buf();
+                next_relative.push(&name);
+                collect_files_recursive(
+                    &path,
+                    display_root,
+                    &next_relative,
+                    include_build,
+                    allow_nested_dirs,
+                    files,
+                );
+                continue;
+            }
+
+            if !path.is_file() || !is_output_file(&name) {
+                continue;
+            }
+
+            let meta = match path.metadata() {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+
+            let group = if relative_dir.as_os_str().is_empty() {
+                display_root.to_string()
+            } else {
+                format!(
+                    "{display_root}/{}",
+                    relative_dir.to_string_lossy().replace('\\', "/")
+                )
+            };
+
+            files.push(ContentFile {
+                category: categorize(&name),
+                filename: name,
+                path: path.to_string_lossy().to_string(),
+                size: meta.len(),
+                modified: modified_rfc3339(&meta),
+                group,
+            });
+        }
     }
 
     let mut files = Vec::new();
@@ -758,86 +1770,67 @@ pub async fn list_content_files(
         } else {
             data_dir.join(dir_name.as_str())
         };
-        if !dir_path.exists() { continue; }
-        if let Ok(entries) = std::fs::read_dir(&dir_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let display_dir = if std::path::Path::new(dir_name.as_str()).is_absolute() {
-                    // For workspace paths, show "workspace/research"
-                    let p = std::path::Path::new(dir_name.as_str());
-                    let parts: Vec<&str> = p.components().rev().take(2).map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
-                    parts.into_iter().rev().collect::<Vec<_>>().join("/")
-                } else {
-                    dir_name.to_string()
-                };
-                let group_name = format!("{}/{}", display_dir, path.file_name().unwrap_or_default().to_string_lossy());
-                if path.is_dir() {
-                    // For skill-output and slides: scan subdirs for final outputs
-                    // For research: skip subdirs (they contain intermediate search results)
-                    if *dir_name != "research" {
-                        // Collect dirs to scan (up to 2 levels: output/ and output/imgs/)
-                        let mut subdirs = vec![path.clone()];
-                        if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                            for sub in sub_entries.flatten() {
-                                if sub.path().is_dir() {
-                                    subdirs.push(sub.path());
-                                }
-                            }
-                        }
-                        for subdir in &subdirs {
-                            if let Ok(sub_entries) = std::fs::read_dir(subdir) {
-                                for sub in sub_entries.flatten() {
-                                    let sp = sub.path();
-                                    if sp.is_file() {
-                                        let filename = sp.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                        if !is_output_file(&filename) { continue; }
-                                        if let Ok(meta) = sp.metadata() {
-                                            files.push(ContentFile {
-                                                category: categorize(&filename),
-                                                filename,
-                                                path: sp.to_string_lossy().to_string(),
-                                                size: meta.len(),
-                                                modified: modified_rfc3339(&meta),
-                                                group: group_name.clone(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if path.is_file() {
-                    let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    if !is_output_file(&filename) { continue; }
-                    if let Ok(meta) = path.metadata() {
-                        files.push(ContentFile {
-                            category: categorize(&filename),
-                            filename,
-                            path: path.to_string_lossy().to_string(),
-                            size: meta.len(),
-                            modified: modified_rfc3339(&meta),
-                            group: display_dir.clone(),
-                        });
-                    }
-                }
-            }
+        if !dir_path.exists() {
+            continue;
         }
+        let display_dir = display_dir_for_scan(dir_name);
+        let allow_nested_dirs = display_dir != "research";
+        collect_files_recursive(
+            &dir_path,
+            &display_dir,
+            std::path::Path::new(""),
+            include_build,
+            allow_nested_dirs,
+            &mut files,
+        );
     }
 
-    // Sort by modified desc, limit to 100 most recent
+    // Sort by modified desc; session-scoped project views need a larger ceiling
+    // so the source tree remains inspectable.
     files.sort_by(|a, b| b.modified.cmp(&a.modified));
-    files.truncate(100);
+    files.truncate(if session_scoped { 1000 } else { 100 });
     Json(files).into_response()
 }
 
 fn categorize(filename: &str) -> String {
     let lower = filename.to_lowercase();
-    if lower.ends_with(".md") || lower.ends_with(".txt") { "report".into() }
-    else if lower.ends_with(".pptx") || lower.ends_with(".pdf") { "slides".into() }
-    else if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") { "image".into() }
-    else if lower.ends_with(".mp3") || lower.ends_with(".wav") || lower.ends_with(".ogg") { "audio".into() }
-    else if lower.ends_with(".mp4") || lower.ends_with(".webm") { "video".into() }
-    else { "other".into() }
+    if lower.ends_with(".md")
+        || lower.ends_with(".markdown")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".json")
+        || lower.ends_with(".css")
+        || lower.ends_with(".html")
+        || lower.ends_with(".astro")
+        || lower.ends_with(".qmd")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".cjs")
+    {
+        "report".into()
+    } else if lower.ends_with(".pptx") || lower.ends_with(".pdf") {
+        "slides".into()
+    } else if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".avif")
+    {
+        "image".into()
+    } else if lower.ends_with(".mp3") || lower.ends_with(".wav") || lower.ends_with(".ogg") {
+        "audio".into()
+    } else if lower.ends_with(".mp4") || lower.ends_with(".webm") {
+        "video".into()
+    } else {
+        "other".into()
+    }
 }
 
 /// GET /api/status -- server status.
@@ -984,7 +1977,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                 let session_id = session.unwrap_or_else(|| "default".into());
 
                 // If a gateway is running, proxy through it (same as chat handler).
-                if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+                if let Some((profile_id, port)) = resolve_api_port(&state, &headers).await {
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let http_client = state.http_client.clone();
@@ -993,6 +1986,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                             ws_tx2,
                             &http_client,
                             port,
+                            Some(&profile_id),
                             &content,
                             Some(&session_id),
                             &media,
@@ -1042,6 +2036,7 @@ async fn ws_proxy_to_gateway(
     ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
     http_client: &reqwest::Client,
     port: u16,
+    profile_id: Option<&str>,
     message: &str,
     session_id: Option<&str>,
     media: &[String],
@@ -1053,6 +2048,7 @@ async fn ws_proxy_to_gateway(
         "message": message,
         "session_id": session_id,
         "media": media,
+        "target_profile_id": profile_id,
     });
 
     let resp = match http_client
@@ -1127,7 +2123,7 @@ async fn ws_standalone_agent(
     message: &str,
     media: Vec<String>,
 ) {
-    let session_key = SessionKey::new("api", session_id);
+    let session_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id);
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -1153,7 +2149,7 @@ async fn ws_standalone_agent(
 
     let message = message.to_string();
     let session_id = session_id.to_string();
-    let session_key2 = SessionKey::new("api", &session_id);
+    let session_key2 = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &session_id);
 
     // Spawn the agent task
     tokio::spawn(async move {
@@ -1287,6 +2283,103 @@ mod tests {
         assert_eq!(json["provider"], "openai");
         assert_eq!(json["uptime_secs"], 120);
         assert_eq!(json["agent_configured"], true);
+    }
+
+    #[test]
+    fn api_session_workspace_dir_uses_base_session_key() {
+        let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
+        let path = api_session_workspace_dir(base, "slides-123");
+        assert_eq!(
+            path,
+            base.join("users")
+                .join("dspfac%3Aapi%3Aslides-123")
+                .join("workspace")
+        );
+    }
+
+    #[test]
+    fn api_session_workspace_dir_encodes_session_id_safely() {
+        let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
+        let path = api_session_workspace_dir(base, "web:abc/123");
+        assert_eq!(
+            path,
+            base.join("users")
+                .join("dspfac%3Aapi%3Aweb%3Aabc%2F123")
+                .join("workspace")
+        );
+    }
+
+    #[test]
+    fn api_session_workspace_dirs_use_current_profile_scope() {
+        let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
+        let dirs = api_session_workspace_dirs(base, "slides-123");
+
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            dirs[0],
+            base.join("users")
+                .join("dspfac%3Aapi%3Aslides-123")
+                .join("workspace")
+        );
+    }
+
+    #[test]
+    fn resolve_preview_asset_path_falls_back_to_root_route_for_legacy_relative_links() {
+        let base = std::env::temp_dir().join(format!(
+            "octos-preview-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(base.join("capabilities")).unwrap();
+        std::fs::write(base.join("capabilities").join("index.html"), "ok").unwrap();
+
+        let resolved = resolve_preview_asset_path(&base, "concepts/capabilities/").unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(base.join("capabilities").join("index.html")).unwrap()
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn resolve_preview_asset_path_does_not_fallback_for_missing_assets() {
+        let base = std::env::temp_dir().join(format!(
+            "octos-preview-fallback-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let resolved = resolve_preview_asset_path(&base, "concepts/missing/");
+        assert!(resolved.is_none());
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn site_file_listing_hides_build_dirs_by_default() {
+        assert!(should_skip_listing_dir("dist", false));
+        assert!(should_skip_listing_dir("out", false));
+        assert!(should_skip_listing_dir("docs", false));
+        assert!(should_skip_listing_dir("build", false));
+        assert!(should_skip_listing_dir("node_modules", false));
+        assert!(should_skip_listing_dir(".cache", false));
+    }
+
+    #[test]
+    fn site_file_listing_can_include_build_dirs_for_session_views() {
+        assert!(!should_skip_listing_dir("dist", true));
+        assert!(!should_skip_listing_dir("out", true));
+        assert!(!should_skip_listing_dir("docs", true));
+        assert!(!should_skip_listing_dir("build", true));
+        assert!(should_skip_listing_dir("node_modules", true));
+        assert!(should_skip_listing_dir("target", true));
     }
 
     #[test]

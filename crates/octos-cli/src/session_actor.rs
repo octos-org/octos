@@ -640,6 +640,9 @@ impl ActorFactory {
         // For slides sessions, auto-activate media tools and use primary model
         // (bypasses adaptive router which may pick a weak model).
         let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
+        let is_site = session_key
+            .topic()
+            .is_some_and(|t| t == "site" || t.starts_with("site "));
         if is_slides {
             tools.activate("group:media");
 
@@ -649,7 +652,11 @@ impl ActorFactory {
             // which is unreachable from the sandboxed workspace.
             let topic = session_key.topic().unwrap_or("slides");
             let project_name = topic.strip_prefix("slides").unwrap_or("").trim();
-            let project_name = if project_name.is_empty() { "untitled" } else { project_name };
+            let project_name = if project_name.is_empty() {
+                "untitled"
+            } else {
+                project_name
+            };
             crate::project_templates::scaffold_slides_project(&user_workspace, project_name);
 
             // Copy built-in style templates into workspace/styles/ so the
@@ -670,6 +677,20 @@ impl ActorFactory {
                         }
                     }
                 }
+            }
+        }
+
+        if is_site {
+            let topic = session_key.topic().unwrap_or("site");
+            let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
+            if let Err(error) = crate::project_templates::scaffold_site_project(
+                &user_workspace,
+                profile_id,
+                session_key.chat_id(),
+                topic,
+                &self.data_dir,
+            ) {
+                warn!(session = %session_key, "site scaffold failed in workspace: {error}");
             }
         }
 
@@ -1132,8 +1153,9 @@ impl SessionActor {
                      /status — show agent status\n\
                      /adaptive — view adaptive routing\n\
                      /reset — reset session state\n\
-                     /help — show this help"
-                ).await;
+                     /help — show this help",
+                )
+                .await;
                 true
             }
         }

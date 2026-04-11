@@ -36,6 +36,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
+    profile_id: String,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
 }
@@ -49,6 +50,8 @@ struct ChatRequest {
     /// File paths from prior upload.
     #[serde(default)]
     media: Vec<String>,
+    #[serde(default)]
+    target_profile_id: Option<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -58,6 +61,7 @@ struct ChatRequest {
 pub struct ApiChannel {
     port: u16,
     auth_token: Option<String>,
+    profile_id: String,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Track last sent content per chat_id for delta computation.
@@ -73,10 +77,12 @@ impl ApiChannel {
         auth_token: Option<String>,
         shutdown: Arc<AtomicBool>,
         sessions: Arc<Mutex<SessionManager>>,
+        profile_id: String,
     ) -> Self {
         Self {
             port,
             auth_token,
+            profile_id,
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
@@ -103,6 +109,7 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
+            profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
         };
@@ -173,8 +180,11 @@ impl Channel for ApiChannel {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let tool_call_id = msg.metadata.get("tool_call_id")
-                        .and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_call_id = msg
+                        .metadata
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let event = serde_json::json!({
                         "type": "file",
                         "path": path,
@@ -329,33 +339,20 @@ impl Channel for ApiChannel {
 
 impl ApiChannel {
     /// Persist a message to the session JSONL for the given chat_id.
-    ///
-    /// Tries the `_main:api:{chat_id}` key first (gateway layout), then falls
-    /// back to `api:{chat_id}` (legacy layout).
     async fn persist_to_session(&self, chat_id: &str, message: Message) {
-        let key = SessionKey(format!("_main:api:{chat_id}"));
-        let alt_key = SessionKey::new("api", chat_id);
+        let key = SessionKey::with_profile(&self.profile_id, "api", chat_id);
         let mut sess = self.sessions.lock().await;
-        // Try the gateway-style key first; if it has no prior session on disk,
-        // try the legacy key.  If neither exists yet, use the gateway key.
-        let target_key = if sess.session_path(&key).exists() {
-            key
-        } else if sess.session_path(&alt_key).exists() {
-            alt_key
-        } else {
-            key
-        };
-        if let Err(e) = sess.add_message(&target_key, message.clone()).await {
+        if let Err(e) = sess.add_message(&key, message.clone()).await {
             tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
         } else {
-            info!(chat_id = %chat_id, key = %target_key.0, "persisted file/notification to session");
+            info!(chat_id = %chat_id, key = %key.0, "persisted file/notification to session");
         }
 
         // Also write to the per-user SessionHandle path so the web client
         // (which reads from per-user JSONL via source=full) can see file deliveries.
         let data_dir = sess.data_dir();
         drop(sess);
-        let base_key = target_key.base_key();
+        let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
         let per_user_path = per_user_dir.join("default.jsonl");
@@ -364,13 +361,21 @@ impl ApiChannel {
                 let path_clone = per_user_path.clone();
                 match tokio::task::spawn_blocking(move || {
                     use std::io::Write;
-                    let mut f = std::fs::OpenOptions::new().append(true).open(&per_user_path)?;
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&per_user_path)?;
                     writeln!(f, "{}", msg_json)?;
                     Ok::<_, std::io::Error>(())
-                }).await {
+                })
+                .await
+                {
                     Ok(Ok(())) => info!(chat_id = %chat_id, "persisted to per-user session"),
-                    Ok(Err(e)) => tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed"),
-                    Err(e) => tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed"),
+                    Ok(Err(e)) => {
+                        tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed")
+                    }
+                    Err(e) => {
+                        tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed")
+                    }
                 }
             }
         } else {
@@ -434,7 +439,10 @@ async fn handle_chat(
         content: req.message,
         timestamp: Utc::now(),
         media: req.media,
-        metadata: serde_json::json!({}),
+        metadata: match req.target_profile_id.filter(|value| !value.is_empty()) {
+            Some(profile_id) => serde_json::json!({ "target_profile_id": profile_id }),
+            None => serde_json::json!({}),
+        },
         message_id: None,
     };
 
@@ -528,22 +536,20 @@ async fn handle_session_tasks(
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = format!("_main:api:{id}");
-    let tasks = query_fn(&session_key);
+    let session_key = SessionKey::with_profile(&state.profile_id, "api", &id);
+    let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
 
 /// GET /sessions — list all API sessions.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
+    let prefix = format!("{}:api:", state.profile_id);
     let list: Vec<SessionInfo> = sess
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            // Session keys may be "api:{id}" (legacy) or "_main:api:{id}" (per-user layout)
-            let chat_id = id
-                .strip_prefix("api:")
-                .or_else(|| id.strip_prefix("_main:api:"))?;
+            let chat_id = id.strip_prefix(&prefix)?;
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -565,16 +571,13 @@ async fn handle_session_messages(
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
-    let key = SessionKey::new("api", &id);
-    // Sessions created through the gateway use "_main:api:{id}" as the key
-    let alt_key = SessionKey(format!("_main:api:{id}"));
+    let key = SessionKey::with_profile(&state.profile_id, "api", &id);
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
         let flat_path = sess.session_path(&key);
-        let alt_flat_path = sess.session_path(&alt_key);
         let data_dir = sess.data_dir();
         drop(sess);
 
@@ -582,7 +585,7 @@ async fn handle_session_messages(
         // Contains default.jsonl + topic files like 123.jsonl
         // Read ALL jsonl files to merge messages across topics.
         let per_user_dir = {
-            let base_key = alt_key.base_key();
+            let base_key = key.base_key();
             let encoded = crate::session::encode_path_component(base_key);
             data_dir.join("users").join(encoded).join("sessions")
         };
@@ -601,22 +604,25 @@ async fn handle_session_messages(
             }
         }
         // Secondary: flat path (has file deliveries that may not be in per-user)
-        let flat_read = if tokio::fs::metadata(&flat_path).await.is_ok() {
-            flat_path
-        } else {
-            alt_flat_path
-        };
-        if let Ok(content) = tokio::fs::read_to_string(&flat_read).await {
+        if let Ok(content) = tokio::fs::read_to_string(&flat_path).await {
             // Only add lines from flat that have media (file deliveries) or bg notifications
             // and aren't already in per-user
             for line in content.lines() {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let has_media = v.get("media").and_then(|m| m.as_array()).is_some_and(|a| !a.is_empty());
-                    let is_bg = v.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with('✓') || c.starts_with('✗'));
+                    let has_media = v
+                        .get("media")
+                        .and_then(|m| m.as_array())
+                        .is_some_and(|a| !a.is_empty());
+                    let is_bg = v
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.starts_with('✓') || c.starts_with('✗'));
                     if has_media || is_bg {
                         // Check for duplicate by content
                         let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if !all_lines.iter().any(|existing| existing.contains(content_str) && !content_str.is_empty()) {
+                        if !all_lines.iter().any(|existing| {
+                            existing.contains(content_str) && !content_str.is_empty()
+                        }) {
                             all_lines.push(line.to_string());
                         }
                     }
@@ -629,8 +635,7 @@ async fn handle_session_messages(
                 let v: serde_json::Value = serde_json::from_str(line).ok()?;
                 let role = v.get("role")?.as_str()?;
                 let content = v.get("content")?.as_str().unwrap_or("");
-                let timestamp =
-                    v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+                let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
                 let media: Vec<String> = v
                     .get("media")
                     .and_then(|m| m.as_array())
@@ -663,18 +668,8 @@ async fn handle_session_messages(
     }
 
     let mut sess = state.sessions.lock().await;
-    // Try primary key first, fall back to _main: prefixed key
     let session = sess.get_or_create(&key).await;
-    let history = session.get_history(fetch_count);
-    let use_alt = history.is_empty();
-    let history = if use_alt {
-        sess.get_or_create(&alt_key)
-            .await
-            .get_history(fetch_count)
-            .to_vec()
-    } else {
-        history.to_vec()
-    };
+    let history = session.get_history(fetch_count).to_vec();
     let messages: Vec<MessageInfo> = history
         .iter()
         .skip(offset)
@@ -684,8 +679,14 @@ async fn handle_session_messages(
             content: m.content.clone(),
             timestamp: m.timestamp.to_rfc3339(),
             media: m.media.clone(),
-            tool_calls: m.tool_calls.as_ref()
-                .map(|tcs| tcs.iter().filter_map(|tc| serde_json::to_value(tc).ok()).collect())
+            tool_calls: m
+                .tool_calls
+                .as_ref()
+                .map(|tcs| {
+                    tcs.iter()
+                        .filter_map(|tc| serde_json::to_value(tc).ok())
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
         .collect();
@@ -697,13 +698,9 @@ async fn handle_delete_session(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let key = SessionKey::new("api", &id);
-    let alt_key = SessionKey(format!("_main:api:{id}"));
+    let key = SessionKey::with_profile(&state.profile_id, "api", &id);
     let mut sess = state.sessions.lock().await;
-    // Try both key formats (legacy api:{id} and per-user _main:api:{id})
-    let r1 = sess.clear(&key).await;
-    let r2 = sess.clear(&alt_key).await;
-    match r1.or(r2) {
+    match sess.clear(&key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -818,6 +815,8 @@ async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
 mod tests {
     use super::*;
 
+    const TEST_PROFILE_ID: &str = "dspfac";
+
     fn test_sessions() -> Arc<Mutex<SessionManager>> {
         let dir = tempfile::tempdir().unwrap();
         Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()))
@@ -845,6 +844,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            TEST_PROFILE_ID.to_string(),
         );
         assert_eq!(ch.name(), "api");
     }
@@ -856,6 +856,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            TEST_PROFILE_ID.to_string(),
         );
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
@@ -867,6 +868,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            TEST_PROFILE_ID.to_string(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -897,6 +899,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            TEST_PROFILE_ID.to_string(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -931,6 +934,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            TEST_PROFILE_ID.to_string(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -971,7 +975,7 @@ mod tests {
 
         // Client polling session history would find it
         let mut sess = sessions.lock().await;
-        let key = SessionKey("_main:api:test-bg".into());
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert!(
@@ -989,6 +993,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            TEST_PROFILE_ID.to_string(),
         );
 
         // Send a file message (no active SSE needed — goes straight to session)
@@ -1004,7 +1009,7 @@ mod tests {
 
         // Verify it was persisted to the session
         let mut sess = sessions.lock().await;
-        let key = SessionKey(format!("_main:api:test-file"));
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-file");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert_eq!(history.len(), 1);
@@ -1021,6 +1026,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            TEST_PROFILE_ID.to_string(),
         );
 
         // Send background task notification (checkmark)
@@ -1036,7 +1042,7 @@ mod tests {
 
         // Verify it was persisted to the session (not sent via SSE)
         let mut sess = sessions.lock().await;
-        let key = SessionKey(format!("_main:api:test-bg2"));
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg2");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert_eq!(history.len(), 1);
@@ -1050,6 +1056,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            TEST_PROFILE_ID.to_string(),
         );
         let msg = OutboundMessage {
             channel: "api".into(),

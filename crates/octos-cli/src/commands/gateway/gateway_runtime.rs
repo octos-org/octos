@@ -19,7 +19,6 @@ use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegi
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
-#[cfg(feature = "matrix")]
 use octos_core::MAIN_PROFILE_ID;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
@@ -1141,6 +1140,7 @@ impl GatewayRuntime {
                 media_dir: &media_dir,
                 data_dir: &data_dir,
                 session_mgr: &session_mgr,
+                gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
                 #[cfg(feature = "matrix")]
@@ -1414,7 +1414,7 @@ impl GatewayRuntime {
             // Update dispatcher's profile ID for this message.
             self.session_dispatcher.dispatch_profile_id = dispatch_profile_id.clone();
 
-            // Resolve session key with active topic, isolated per effective profile.
+            // Resolve session key with the current profile-scoped base key only.
             let base_session_key = build_profiled_session_key(
                 dispatch_profile_id.as_deref(),
                 &inbound.channel,
@@ -1678,4 +1678,10 @@ impl GatewayRuntime {
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // Canonical profile-scoped API session routing is exercised in higher-level
+    // gateway/session tests. No legacy fallback behavior remains here.
 }

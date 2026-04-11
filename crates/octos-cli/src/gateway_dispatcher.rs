@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
-use octos_core::{InboundMessage, OutboundMessage, SessionKey};
+use octos_core::{InboundMessage, MAIN_PROFILE_ID, OutboundMessage, SessionKey};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
@@ -148,6 +148,34 @@ impl GatewayDispatcher {
                     match crate::project_templates::try_activate_slides_template(data_dir, name) {
                         Some(template_reply) => template_reply,
                         None => format!("Switched to session: {name}"),
+                    }
+                } else {
+                    format!("Switched to session: {name}")
+                }
+            } else if name == "site" || name.starts_with("site ") {
+                if let Some(data_dir) = &self.data_dir {
+                    let _ = crate::project_templates::try_activate_site_template(data_dir, name);
+                    let profile_id = self
+                        .dispatch_profile_id
+                        .clone()
+                        .unwrap_or_else(|| MAIN_PROFILE_ID.to_string());
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+                    match crate::project_templates::scaffold_site_project(
+                        &workspace_root,
+                        &profile_id,
+                        session_key.chat_id(),
+                        name,
+                        data_dir,
+                    ) {
+                        Ok(metadata) => crate::project_templates::site_creation_reply(&metadata),
+                        Err(error) => {
+                            warn!(topic = name, "site scaffold failed: {error}");
+                            format!("Switched to session: {name}\n\nSite scaffold failed: {error}")
+                        }
                     }
                 } else {
                     format!("Switched to session: {name}")
