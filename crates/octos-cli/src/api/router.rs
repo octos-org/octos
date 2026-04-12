@@ -762,6 +762,7 @@ mod tests {
             alerts_enabled: None,
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(store),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),

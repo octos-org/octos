@@ -1,21 +1,27 @@
-//! frps server plugin handler for shared-token tunnel authorization.
+//! frps server plugin handler for per-tenant tunnel authorization.
 //!
 //! frps sends HTTP requests to this endpoint for Login and NewProxy operations.
-//! Login is allowed with the host's shared FRPS token, and NewProxy is checked
-//! against the tenant store to ensure the requested subdomain or SSH port
-//! belongs to a registered tenant.
+//! Login verifies the client's `privilege_key` (MD5 of tenant token + timestamp)
+//! against all registered tenants, caching the `run_id → tenant_id` mapping.
+//! NewProxy cross-checks the cached tenant against the requested resource.
 //!
 //! Protocol: <https://github.com/fatedier/frp/blob/dev/doc/server_plugin.md>
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::AppState;
+
+const LOGIN_TIMESTAMP_MAX_DRIFT_SECS: i64 = 15 * 60;
+const RUN_ID_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// frps plugin request envelope.
 #[derive(Debug, Deserialize)]
@@ -51,12 +57,26 @@ impl PluginResponse {
     }
 }
 
+/// Login content from frps — sent when a client connects.
+#[derive(Debug, Deserialize)]
+struct LoginContent {
+    /// MD5(auth.token + timestamp) computed by the frpc client.
+    #[serde(default)]
+    privilege_key: String,
+    /// Unix timestamp string sent by frpc.
+    #[serde(default)]
+    timestamp: String,
+    /// Unique identifier for this frpc session.
+    #[serde(default)]
+    run_id: String,
+}
+
 /// NewProxy content from frps — contains the proxy configuration being registered.
 #[derive(Debug, Deserialize)]
 struct NewProxyContent {
-    /// The shared auth token from the original login.
+    /// The run_id from the session's Login.
     #[serde(default)]
-    privilege_key: String,
+    run_id: String,
     /// Proxy type (http, tcp, etc.).
     #[serde(default)]
     proxy_type: String,
@@ -99,7 +119,63 @@ pub async fn frps_auth(
     };
 
     match req.op.as_str() {
-        "Login" => Ok(Json(PluginResponse::allow())),
+        "Login" => {
+            let content: LoginContent = serde_json::from_value(req.content).map_err(|e| {
+                tracing::warn!(error = %e, "frps Login: invalid request content");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(PluginResponse::deny("invalid login content")),
+                )
+            })?;
+
+            let client_ts: i64 = content.timestamp.parse().unwrap_or(0);
+            let now_ts = chrono::Utc::now().timestamp();
+            if (now_ts - client_ts).abs() > LOGIN_TIMESTAMP_MAX_DRIFT_SECS {
+                tracing::warn!(
+                    drift = now_ts - client_ts,
+                    "frps Login: timestamp drift exceeds limit"
+                );
+                return Err((
+                    StatusCode::OK,
+                    Json(PluginResponse::deny("timestamp too far from server time")),
+                ));
+            }
+
+            let tenants = store.list().map_err(|e| {
+                tracing::error!(error = %e, "frps Login: failed to list tenants");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(PluginResponse::deny("internal error")),
+                )
+            })?;
+
+            let client_key_bytes = content.privilege_key.as_bytes();
+            for tenant in &tenants {
+                if tenant.tunnel_token.is_empty() {
+                    continue;
+                }
+                let mut hasher = Md5::new();
+                hasher.update(format!("{}{}", tenant.tunnel_token, content.timestamp));
+                let expected = format!("{:x}", hasher.finalize());
+                if expected.as_bytes().ct_eq(client_key_bytes).into() {
+                    tracing::info!(
+                        tenant = %tenant.id,
+                        run_id = %content.run_id,
+                        "frps Login: authenticated"
+                    );
+                    state
+                        .run_id_cache
+                        .insert(content.run_id, tenant.id.clone(), RUN_ID_CACHE_TTL);
+                    return Ok(Json(PluginResponse::allow()));
+                }
+            }
+
+            tracing::warn!("frps Login: no tenant matched privilege_key");
+            Err((
+                StatusCode::OK,
+                Json(PluginResponse::deny("authentication failed")),
+            ))
+        }
 
         "NewProxy" => {
             let content: NewProxyContent = serde_json::from_value(req.content).map_err(|e| {
@@ -109,6 +185,9 @@ pub async fn frps_auth(
                     Json(PluginResponse::deny("invalid proxy content")),
                 )
             })?;
+
+            // If we have a cached run_id from Login, enforce tenant ownership
+            let authenticated_tenant = state.run_id_cache.get_tenant(&content.run_id);
 
             if content.proxy_type == "http" {
                 let tunnel_domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
@@ -133,6 +212,19 @@ pub async fn frps_auth(
 
                 match store.find_by_subdomain(subdomain) {
                     Ok(Some(tenant)) => {
+                        if let Some(ref auth_id) = authenticated_tenant {
+                            if auth_id != &tenant.id {
+                                tracing::warn!(
+                                    authenticated = %auth_id,
+                                    requested = %tenant.id,
+                                    "frps NewProxy: tenant mismatch"
+                                );
+                                return Err((
+                                    StatusCode::OK,
+                                    Json(PluginResponse::deny("subdomain not authorized")),
+                                ));
+                            }
+                        }
                         tracing::info!(
                             tenant = %tenant.id,
                             proxy_type = %content.proxy_type,
@@ -163,6 +255,22 @@ pub async fn frps_auth(
             if content.proxy_type == "tcp" {
                 match store.find_by_ssh_port(content.remote_port) {
                     Ok(Some(tenant)) => {
+                        if let Some(ref auth_id) = authenticated_tenant {
+                            if auth_id != &tenant.id {
+                                tracing::warn!(
+                                    authenticated = %auth_id,
+                                    requested = %tenant.id,
+                                    "frps NewProxy: tenant mismatch on SSH port"
+                                );
+                                return Err((
+                                    StatusCode::OK,
+                                    Json(PluginResponse::deny(format!(
+                                        "remote port {} not authorized",
+                                        content.remote_port
+                                    ))),
+                                ));
+                            }
+                        }
                         tracing::info!(
                             tenant = %tenant.id,
                             proxy_type = %content.proxy_type,
@@ -204,16 +312,23 @@ pub async fn frps_auth(
 #[cfg(test)]
 mod tests {
     use crate::api::admin::{CreateTenantRequest, create_tenant};
-    use crate::api::{AppState, SseBroadcaster, build_router};
+    use crate::api::{AppState, RunIdCache, SseBroadcaster, build_router};
     use crate::config::DeploymentMode;
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
     use chrono::Utc;
+    use md5::{Digest, Md5};
     use serde_json::{Value, json};
     use std::net::SocketAddr;
     use std::sync::Arc;
+
+    fn compute_privilege_key(token: &str, timestamp: i64) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(format!("{token}{timestamp}"));
+        format!("{:x}", hasher.finalize())
+    }
 
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
         Arc::new(AppState {
@@ -233,6 +348,7 @@ mod tests {
             alerts_enabled: None,
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(TenantStore::open(dir.path()).unwrap())),
+            run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
@@ -290,7 +406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_is_allowed_without_per_tenant_token_lookup() {
+    async fn should_reject_login_with_arbitrary_shared_token() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -309,13 +425,13 @@ mod tests {
         )
         .await;
         assert_eq!(login_status, StatusCode::OK);
-        assert_eq!(login_body, json!({"reject": false, "unchange": true}));
+        assert!(login_body["reject"].as_bool().unwrap());
 
         server.abort();
     }
 
     #[tokio::test]
-    async fn newproxy_is_authorized_by_subdomain_and_ssh_port_in_shared_token_mode() {
+    async fn should_authorize_newproxy_by_subdomain_and_ssh_port_without_login() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -328,7 +444,6 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
                     "proxy_type": "http",
                     "custom_domains": ["alice.octos-cloud.org"]
                 }
@@ -343,7 +458,6 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
                     "proxy_type": "tcp",
                     "remote_port": 6001
                 }
@@ -357,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_subdomains_and_wrong_ssh_ports_even_with_shared_token() {
+    async fn should_reject_newproxy_for_unknown_subdomain_and_wrong_ssh_port() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -370,7 +484,6 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
                     "proxy_type": "http",
                     "custom_domains": ["mallory.octos-cloud.org"]
                 }
@@ -392,7 +505,6 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
                     "proxy_type": "tcp",
                     "remote_port": 6002
                 }
@@ -413,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tenant_output_is_enforced_by_newproxy_without_using_tunnel_token() {
+    async fn should_enforce_newproxy_by_subdomain_and_ssh_port_for_created_tenant() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
 
@@ -437,15 +549,25 @@ mod tests {
             .unwrap();
         assert_eq!(saved.subdomain, tenant.subdomain);
         assert_eq!(saved.ssh_port, tenant.ssh_port);
+        assert!(
+            !saved.tunnel_token.is_empty(),
+            "create_tenant should generate tunnel_token"
+        );
 
         let (base_url, server) = spawn_test_server(state).await;
+
+        let timestamp = Utc::now().timestamp();
+        let privilege_key = compute_privilege_key(&saved.tunnel_token, timestamp);
 
         let (login_status, login_body) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
                 "content": {
-                    "privilege_key": "shared-host-token"
+                    "privilege_key": privilege_key,
+                    "timestamp": timestamp.to_string(),
+                    "run_id": "run-created-alice",
+                    "version": "0.65.0"
                 }
             }),
         )
@@ -458,7 +580,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
+                    "run_id": "run-created-alice",
                     "proxy_type": "http",
                     "custom_domains": [format!("{}.octos-cloud.org", tenant.subdomain)]
                 }
@@ -473,7 +595,7 @@ mod tests {
             json!({
                 "op": "NewProxy",
                 "content": {
-                    "privilege_key": "shared-host-token",
+                    "run_id": "run-created-alice",
                     "proxy_type": "tcp",
                     "remote_port": tenant.ssh_port
                 }
@@ -482,6 +604,204 @@ mod tests {
         .await;
         assert_eq!(ssh_status, StatusCode::OK);
         assert_eq!(ssh_body, json!({"reject": false, "unchange": true}));
+
+        server.abort();
+    }
+
+    // ── Per-tenant token (v2) tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn should_allow_login_when_privilege_key_matches_tenant_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "per-tenant-secret-alice", 6001);
+
+        let (base_url, server) = spawn_test_server(state).await;
+
+        let timestamp = Utc::now().timestamp();
+        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
+
+        let (status, body) = post_plugin(
+            &base_url,
+            json!({
+                "op": "Login",
+                "content": {
+                    "privilege_key": privilege_key,
+                    "timestamp": timestamp.to_string(),
+                    "run_id": "run-alice-001",
+                    "version": "0.65.0"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"reject": false, "unchange": true}));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_deny_login_when_privilege_key_matches_no_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "per-tenant-secret-alice", 6001);
+
+        let (base_url, server) = spawn_test_server(state).await;
+
+        let timestamp = Utc::now().timestamp();
+        let privilege_key = compute_privilege_key("wrong-token", timestamp);
+
+        let (status, body) = post_plugin(
+            &base_url,
+            json!({
+                "op": "Login",
+                "content": {
+                    "privilege_key": privilege_key,
+                    "timestamp": timestamp.to_string(),
+                    "run_id": "run-mallory-001",
+                    "version": "0.65.0"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["reject"].as_bool().unwrap(),
+            "should reject unknown token"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_deny_login_when_timestamp_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "per-tenant-secret-alice", 6001);
+
+        let (base_url, server) = spawn_test_server(state).await;
+
+        let stale_timestamp = Utc::now().timestamp() - 16 * 60; // 16 minutes ago
+        let privilege_key = compute_privilege_key("per-tenant-secret-alice", stale_timestamp);
+
+        let (status, body) = post_plugin(
+            &base_url,
+            json!({
+                "op": "Login",
+                "content": {
+                    "privilege_key": privilege_key,
+                    "timestamp": stale_timestamp.to_string(),
+                    "run_id": "run-replay-001",
+                    "version": "0.65.0"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["reject"].as_bool().unwrap(),
+            "should reject stale timestamp"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_authorize_newproxy_when_run_id_cached_from_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "per-tenant-secret-alice", 6001);
+
+        let (base_url, server) = spawn_test_server(state).await;
+
+        let timestamp = Utc::now().timestamp();
+        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
+
+        // Login first — should cache run_id → alice
+        let (login_status, _) = post_plugin(
+            &base_url,
+            json!({
+                "op": "Login",
+                "content": {
+                    "privilege_key": privilege_key,
+                    "timestamp": timestamp.to_string(),
+                    "run_id": "run-alice-002",
+                    "version": "0.65.0"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK);
+
+        // NewProxy for alice's subdomain — should pass
+        let (proxy_status, proxy_body) = post_plugin(
+            &base_url,
+            json!({
+                "op": "NewProxy",
+                "content": {
+                    "run_id": "run-alice-002",
+                    "proxy_type": "http",
+                    "custom_domains": ["alice.octos-cloud.org"]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(proxy_status, StatusCode::OK);
+        assert_eq!(proxy_body, json!({"reject": false, "unchange": true}));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn should_deny_newproxy_when_run_id_tenant_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(&dir);
+        let store = state.tenant_store.as_ref().unwrap().clone();
+        save_tenant(&store, "alice", "per-tenant-secret-alice", 6001);
+        save_tenant(&store, "bob", "per-tenant-secret-bob", 6002);
+
+        let (base_url, server) = spawn_test_server(state).await;
+
+        let timestamp = Utc::now().timestamp();
+        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
+
+        // Login as alice
+        post_plugin(
+            &base_url,
+            json!({
+                "op": "Login",
+                "content": {
+                    "privilege_key": privilege_key,
+                    "timestamp": timestamp.to_string(),
+                    "run_id": "run-alice-003",
+                    "version": "0.65.0"
+                }
+            }),
+        )
+        .await;
+
+        // Try to claim bob's subdomain with alice's run_id
+        let (proxy_status, proxy_body) = post_plugin(
+            &base_url,
+            json!({
+                "op": "NewProxy",
+                "content": {
+                    "run_id": "run-alice-003",
+                    "proxy_type": "http",
+                    "custom_domains": ["bob.octos-cloud.org"]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(proxy_status, StatusCode::OK);
+        assert!(
+            proxy_body["reject"].as_bool().unwrap(),
+            "alice should not claim bob's subdomain"
+        );
 
         server.abort();
     }

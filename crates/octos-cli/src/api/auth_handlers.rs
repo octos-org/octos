@@ -1389,6 +1389,7 @@ mod tests {
             alerts_enabled: None,
             sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
             tenant_store: None,
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: None,
             frps_server: None,
             frps_port: None,

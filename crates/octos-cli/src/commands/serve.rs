@@ -247,6 +247,7 @@ impl ServeCommand {
             tenant_store: crate::tenant::TenantStore::open(&data_dir)
                 .ok()
                 .map(Arc::new),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: config
                 .tunnel_domain
                 .clone()
