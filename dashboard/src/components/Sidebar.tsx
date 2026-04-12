@@ -52,7 +52,7 @@ export default function Sidebar() {
               <>
                 <div className="border-t border-gray-700/30 my-3" />
                 <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
-                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+                <SidebarLink to="/users" icon={<UsersIcon />} label="Access" />
                 <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
                 <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
               </>

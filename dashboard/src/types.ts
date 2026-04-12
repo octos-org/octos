@@ -171,6 +171,18 @@ export interface OtpVerifyResponse {
   message?: string
 }
 
+export interface AllowlistEntry {
+  email: string
+  note?: string | null
+  created_at: string
+  claimed_user_id?: string | null
+  claimed_at?: string | null
+  registered: boolean
+  registered_user_id?: string | null
+  registered_name?: string | null
+  last_login_at?: string | null
+}
+
 export interface MeResponse {
   user: User
   profile: ProfileResponse | null

@@ -9,6 +9,7 @@ import type {
   OtpVerifyResponse,
   MeResponse,
   User,
+  AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
   SystemMetrics,
@@ -132,10 +133,17 @@ export const api = {
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
 
-  createUser: (data: { email: string; name: string; role?: string }) =>
-    request<{ user: User }>('/users', {
+  listAllowedEmails: () => request<{ entries: AllowlistEntry[] }>('/allowed-emails'),
+
+  addAllowedEmail: (data: { email: string; note?: string }) =>
+    request<AllowlistEntry>('/allowed-emails', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+
+  deleteAllowedEmail: (email: string) =>
+    request<ActionResponse>(`/allowed-emails/${encodeURIComponent(email)}`, {
+      method: 'DELETE',
     }),
 
   deleteUser: (id: string) =>
