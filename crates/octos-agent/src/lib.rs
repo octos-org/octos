@@ -32,6 +32,7 @@ pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
 pub mod workspace_git;
+pub mod workspace_policy;
 
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, TokenTracker, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -62,6 +63,11 @@ pub use turn::{turns_to_messages, Turn, TurnKind};
 pub use workspace_git::{
     commit_all_if_dirty, detect_workspace_repo, init_workspace_repo, initialize_and_commit,
     list_workspace_repos, snapshot_workspace_change, snapshot_workspace_turn, WorkspaceProjectKind,
+};
+pub use workspace_policy::{
+    read_workspace_policy, workspace_policy_path, write_workspace_policy, WorkspacePolicy,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy,
+    WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider, WORKSPACE_POLICY_FILE,
 };
 
 #[cfg(test)]
