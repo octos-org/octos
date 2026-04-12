@@ -13,7 +13,9 @@ use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
-use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
+use octos_agent::{
+    Agent, AgentConfig, HookContext, HookExecutor, TokenTracker, TurnAttachmentContext,
+};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
 use octos_core::{
@@ -37,6 +39,7 @@ use crate::status_layers::{StatusComposer, UserStatusConfig};
 pub struct DispatchParams<'a> {
     pub message: InboundMessage,
     pub image_media: Vec<String>,
+    pub attachment_media: Vec<String>,
     pub session_key: SessionKey,
     pub reply_channel: &'a str,
     pub reply_chat_id: &'a str,
@@ -235,6 +238,7 @@ pub enum ActorMessage {
     Inbound {
         message: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
     },
     /// Result from a background subagent task — injected as a system message
     /// into the conversation without triggering an extra LLM call.
@@ -341,6 +345,7 @@ impl ActorRegistry {
         let DispatchParams {
             message,
             image_media,
+            attachment_media,
             session_key,
             reply_channel,
             reply_chat_id,
@@ -387,6 +392,7 @@ impl ActorRegistry {
         let actor_msg = ActorMessage::Inbound {
             message,
             image_media,
+            attachment_media,
         };
 
         match handle.tx.try_send(actor_msg) {
@@ -1154,7 +1160,11 @@ impl SessionActor {
             tokio::select! {
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media,
+                            attachment_media,
+                        }) => {
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -1200,21 +1210,32 @@ impl SessionActor {
                             }
 
                             // Drain any queued messages according to queue mode
-                            let (final_message, final_media) =
-                                self.drain_queue(message, image_media).await;
+                            let (final_message, final_media, final_attachment_media) =
+                                self.drain_queue(message, image_media, attachment_media).await;
 
-                            // Copy uploaded media files into the agent's sandboxed
-                            // working directory so read_file can access them.
-                            let final_media = self.copy_media_to_workspace(final_media);
+                            // Copy non-image attachments into the agent workspace so
+                            // tools can resolve them by filename without path hints.
+                            let final_attachment_media =
+                                self.copy_media_to_workspace(final_attachment_media);
 
                             // Use speculative path for API channel (web client) and
                             // Speculative queue mode. The speculative path spawns the
                             // agent call and handles overflow messages concurrently,
                             // so users aren't blocked during long tool calls (pipelines).
                             if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
-                                self.process_inbound_speculative(final_message, final_media).await;
+                                self.process_inbound_speculative(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                )
+                                .await;
                             } else {
-                                self.process_inbound(final_message, final_media).await;
+                                self.process_inbound(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                )
+                                .await;
                             }
                         }
                         Some(ActorMessage::BackgroundResult {
@@ -1253,7 +1274,7 @@ impl SessionActor {
                                     metadata: serde_json::json!({}),
                                     message_id: None,
                                 };
-                                self.process_inbound(rewrite_msg, vec![]).await;
+                                self.process_inbound(rewrite_msg, vec![], vec![]).await;
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -1793,12 +1814,16 @@ impl SessionActor {
         &mut self,
         message: InboundMessage,
         image_media: Vec<String>,
-    ) -> (InboundMessage, Vec<String>) {
+        attachment_media: Vec<String>,
+    ) -> (InboundMessage, Vec<String>, Vec<String>) {
         match self.queue_mode {
-            QueueMode::Followup | QueueMode::Speculative => (message, image_media),
+            QueueMode::Followup | QueueMode::Speculative => {
+                (message, image_media, attachment_media)
+            }
             QueueMode::Collect => {
                 let mut combined_content = message.content.clone();
                 let mut combined_media = image_media;
+                let mut combined_attachment_media = attachment_media;
                 let mut count = 0u32;
 
                 // Non-blocking drain of queued inbound messages
@@ -1807,6 +1832,7 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling batch");
@@ -1817,6 +1843,7 @@ impl SessionActor {
                             combined_content
                                 .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
                             combined_media.extend(queued_media);
+                            combined_attachment_media.extend(queued_attachment_media);
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
@@ -1852,7 +1879,7 @@ impl SessionActor {
                 }
                 let mut msg = message;
                 msg.content = combined_content;
-                (msg, combined_media)
+                (msg, combined_media, combined_attachment_media)
             }
             QueueMode::Steer | QueueMode::Interrupt => {
                 // Coalescing delay: give rapid follow-up messages time to arrive
@@ -1860,6 +1887,7 @@ impl SessionActor {
 
                 let mut latest_message = message;
                 let mut latest_media = image_media;
+                let mut latest_attachment_media = attachment_media;
 
                 // Non-blocking drain: keep only the newest inbound message
                 loop {
@@ -1867,6 +1895,7 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling");
@@ -1876,6 +1905,7 @@ impl SessionActor {
                             debug!(session = %self.session_key, "steer: replacing with newer message");
                             latest_message = queued;
                             latest_media = queued_media;
+                            latest_attachment_media = queued_attachment_media;
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
@@ -1909,7 +1939,7 @@ impl SessionActor {
                         Err(_) => break,
                     }
                 }
-                (latest_message, latest_media)
+                (latest_message, latest_media, latest_attachment_media)
             }
         }
     }
@@ -2042,6 +2072,27 @@ impl SessionActor {
             .collect()
     }
 
+    fn build_turn_attachment_context(
+        &self,
+        attachment_media: Vec<String>,
+    ) -> TurnAttachmentContext {
+        let mut audio_attachment_paths = Vec::new();
+        let mut file_attachment_paths = Vec::new();
+        for path in &attachment_media {
+            if octos_bus::media::is_audio(path) {
+                audio_attachment_paths.push(path.clone());
+            } else {
+                file_attachment_paths.push(path.clone());
+            }
+        }
+
+        TurnAttachmentContext {
+            attachment_paths: attachment_media,
+            audio_attachment_paths,
+            file_attachment_paths,
+        }
+    }
+
     /// Speculative processing: runs the LLM call but monitors the inbox.
     /// If the call exceeds 2× responsiveness baseline and a new user message
     /// arrives, the new message gets a quick LLM response via the adaptive
@@ -2051,6 +2102,7 @@ impl SessionActor {
         &mut self,
         inbound: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
     ) {
         // Reset overflow cancellation from any prior command handling (#21).
         self.overflow_cancelled.store(false, Ordering::Release);
@@ -2193,6 +2245,7 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
+        let attachments = self.build_turn_attachment_context(attachment_media);
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
 
@@ -2222,7 +2275,13 @@ impl SessionActor {
             let start = Instant::now();
             let result = tokio::time::timeout(
                 session_timeout,
-                agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
+                agent.process_message_tracked_with_attachments(
+                    &content,
+                    &history_for_agent,
+                    media,
+                    attachments,
+                    &tracker,
+                ),
             )
             .await;
             eprintln!(
@@ -2263,7 +2322,7 @@ impl SessionActor {
                 // New message arrived in inbox
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media: _ }) => {
+                        Some(ActorMessage::Inbound { message, image_media: _, attachment_media: _ }) => {
                             if octos_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
                                 self.send_reply(octos_core::abort_response(&message.content)).await;
@@ -2987,7 +3046,12 @@ impl SessionActor {
         });
     }
 
-    async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
+    async fn process_inbound(
+        &mut self,
+        inbound: InboundMessage,
+        image_media: Vec<String>,
+        attachment_media: Vec<String>,
+    ) {
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
 
@@ -3086,10 +3150,11 @@ impl SessionActor {
         let llm_start = Instant::now();
         let result = tokio::time::timeout(
             self.session_timeout,
-            self.agent.process_message_tracked(
+            self.agent.process_message_tracked_with_attachments(
                 &inbound.content,
                 &history,
                 image_media,
+                self.build_turn_attachment_context(attachment_media),
                 &token_tracker,
             ),
         )
@@ -3567,6 +3632,7 @@ mod tests {
                 message_id: None,
             },
             image_media: vec![],
+            attachment_media: vec![],
         }
     }
 
@@ -4510,6 +4576,7 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4550,6 +4617,7 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4590,6 +4658,7 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg1,
                 image_media: vec![],
+                attachment_media: vec![],
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4614,6 +4683,7 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg2,
                 image_media: vec![],
+                attachment_media: vec![],
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4661,6 +4731,7 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",

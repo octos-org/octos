@@ -9,15 +9,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use colored::Colorize;
 use eyre::{Result, WrapErr};
 use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
-    create_bus, ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager,
+    ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
@@ -29,12 +29,12 @@ use tracing::{info, warn};
 
 use super::build_system_prompt;
 use super::message_preprocessing;
-use super::profile_factory::{build_plugin_env, ProfileActorFactoryBuilder};
+use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
-use crate::config::{detect_provider, Config};
+use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::qos_catalog::{
@@ -715,11 +715,7 @@ impl GatewayRuntime {
                     }
                 }
 
-                if registered > 0 {
-                    Some(router)
-                } else {
-                    None
-                }
+                if registered > 0 { Some(router) } else { None }
             };
 
             // Capture config for per-session SpawnTool and PipelineTool creation
@@ -1319,6 +1315,7 @@ impl GatewayRuntime {
             )
             .await;
             let image_media = media_result.image_media;
+            let attachment_media = media_result.attachment_media;
 
             // Route cron-triggered messages to their target channel
             let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
@@ -1591,6 +1588,7 @@ impl GatewayRuntime {
                 .dispatch(crate::session_actor::DispatchParams {
                     message: inbound,
                     image_media,
+                    attachment_media,
                     session_key,
                     reply_channel: &reply_channel,
                     reply_chat_id: &reply_chat_id,

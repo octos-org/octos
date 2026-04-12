@@ -17,11 +17,26 @@ use crate::progress::ProgressReporter;
 pub struct ToolContext {
     pub tool_id: String,
     pub reporter: Arc<dyn ProgressReporter>,
+    pub attachment_paths: Vec<String>,
+    pub audio_attachment_paths: Vec<String>,
+    pub file_attachment_paths: Vec<String>,
 }
 
 tokio::task_local! {
     /// Task-local tool context, scoped per tool invocation in agent.rs.
     pub static TOOL_CTX: ToolContext;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TurnAttachmentContext {
+    pub attachment_paths: Vec<String>,
+    pub audio_attachment_paths: Vec<String>,
+    pub file_attachment_paths: Vec<String>,
+}
+
+tokio::task_local! {
+    /// Task-local per-turn attachment context, scoped to the current agent run.
+    pub static TURN_ATTACHMENT_CTX: TurnAttachmentContext;
 }
 
 /// Progress update from a long-running tool execution.

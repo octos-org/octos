@@ -57,8 +57,8 @@ pub use tools::{
     CheckBackgroundTasksTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
     GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool,
     SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool,
-    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext,
+    WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};

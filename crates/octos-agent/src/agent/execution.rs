@@ -11,7 +11,7 @@ use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
-use crate::tools::{TOOL_CTX, ToolContext};
+use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 
 impl Agent {
     pub(super) async fn execute_tools(
@@ -124,9 +124,16 @@ impl Agent {
                             bg_supervisor.mark_running(&task_id);
 
                             // Helper to create TOOL_CTX for plugin stderr progress streaming
+                            let attachment_ctx =
+                                TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
+                                attachment_paths: attachment_ctx.attachment_paths.clone(),
+                                audio_attachment_paths: attachment_ctx
+                                    .audio_attachment_paths
+                                    .clone(),
+                                file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
                             };
 
                             let mut result = TOOL_CTX
@@ -272,9 +279,14 @@ impl Agent {
                         );
                     }
 
+                    let attachment_ctx =
+                        TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        attachment_paths: attachment_ctx.attachment_paths.clone(),
+                        audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
+                        file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
                     };
                     let result = TOOL_CTX
                         .scope(ctx, tools.execute(&tc_name, &effective_args))

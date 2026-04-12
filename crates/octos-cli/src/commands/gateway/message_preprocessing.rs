@@ -14,6 +14,8 @@ use tracing::warn;
 pub struct MediaResult {
     /// Image file paths extracted from `inbound.media`.
     pub image_media: Vec<String>,
+    /// Non-image attachments copied into the workspace for tool access.
+    pub attachment_media: Vec<String>,
     /// Whether any audio attachment was detected (for auto-TTS downstream).
     #[allow(dead_code)]
     pub is_voice_message: bool,
@@ -30,12 +32,17 @@ pub async fn process_media(
     channel_mgr: &ChannelManager,
 ) -> MediaResult {
     let mut image_media = Vec::new();
+    let mut attachment_media = Vec::new();
     let mut is_voice_message = false;
+    let mut audio_filenames = Vec::new();
+    let mut attachment_filenames = Vec::new();
 
     if let Some(asr_bin) = asr_binary {
         for path in &inbound.media {
             if octos_bus::media::is_audio(path) {
                 is_voice_message = true;
+                attachment_media.push(path.clone());
+                audio_filenames.push(attachment_display_name(path));
                 // Show "listening" indicator while transcribing voice
                 if let Some(ch) = channel_mgr.get_channel(&inbound.channel) {
                     let _ = ch.send_listening(&inbound.chat_id).await;
@@ -52,18 +59,17 @@ pub async fn process_media(
                                 serde_json::Value::String(text.clone()),
                             );
                         }
-                        let prefix = format!("[Voice transcription: {text}]\n\n");
-                        inbound.content = format!("{prefix}{}", inbound.content);
+                        inbound.content = merge_transcript_into_content(&inbound.content, &text);
                     }
                     Err(e) => warn!("transcription failed: {e}"),
                 }
-                // Always append audio file path so agent can use it
-                // for voice_clone / voice_save_profile if conversation
-                // context calls for it.
-                inbound.content.push_str(&format!("\n[Audio file: {path}]"));
             } else {
-                // Include all non-audio files (images, CSVs, PDFs, etc.)
-                image_media.push(path.clone());
+                route_non_audio_attachment(
+                    path,
+                    &mut image_media,
+                    &mut attachment_media,
+                    &mut attachment_filenames,
+                );
             }
         }
     } else {
@@ -71,12 +77,29 @@ pub async fn process_media(
         for path in &inbound.media {
             if octos_bus::media::is_audio(path) {
                 is_voice_message = true;
+                attachment_media.push(path.clone());
+                audio_filenames.push(attachment_display_name(path));
             } else {
-                // Include all non-audio files (images, CSVs, PDFs, etc.)
-                image_media.push(path.clone());
+                route_non_audio_attachment(
+                    path,
+                    &mut image_media,
+                    &mut attachment_media,
+                    &mut attachment_filenames,
+                );
             }
         }
     }
+
+    append_attachment_summary(
+        &mut inbound.content,
+        "Attached audio files",
+        &audio_filenames,
+    );
+    append_attachment_summary(
+        &mut inbound.content,
+        "Attached files",
+        &attachment_filenames,
+    );
 
     // Tag voice messages in metadata for auto-TTS downstream
     if is_voice_message {
@@ -87,7 +110,60 @@ pub async fn process_media(
 
     MediaResult {
         image_media,
+        attachment_media,
         is_voice_message,
+    }
+}
+
+fn route_non_audio_attachment(
+    path: &str,
+    image_media: &mut Vec<String>,
+    attachment_media: &mut Vec<String>,
+    attachment_filenames: &mut Vec<String>,
+) {
+    if octos_bus::media::is_image(path) {
+        image_media.push(path.to_string());
+    } else {
+        attachment_media.push(path.to_string());
+        attachment_filenames.push(attachment_display_name(path));
+    }
+}
+
+fn merge_transcript_into_content(existing: &str, transcript: &str) -> String {
+    if existing.trim().is_empty() {
+        transcript.to_string()
+    } else {
+        format!("Transcribed audio:\n{transcript}\n\n{existing}")
+    }
+}
+
+fn attachment_display_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn append_attachment_summary(content: &mut String, heading: &str, filenames: &[String]) {
+    if filenames.is_empty() {
+        return;
+    }
+
+    let section = format!(
+        "[{heading}]\n{}",
+        filenames
+            .iter()
+            .map(|name| format!("- {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    if content.trim().is_empty() {
+        *content = section;
+    } else {
+        content.push_str("\n\n");
+        content.push_str(&section);
     }
 }
 
@@ -205,5 +281,66 @@ async fn transcribe_via_skill(voice_binary: &Path, input_json: &str) -> eyre::Re
     } else {
         let msg = result["output"].as_str().unwrap_or("unknown error");
         eyre::bail!("voice skill failed: {msg}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn inbound_with_media(content: &str, media: Vec<&str>) -> InboundMessage {
+        InboundMessage {
+            channel: "api".to_string(),
+            sender_id: "user".to_string(),
+            chat_id: "chat-1".to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            media: media.into_iter().map(|path| path.to_string()).collect(),
+            metadata: serde_json::json!({}),
+            message_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn process_media_routes_audio_to_attachment_media_without_path_hints() {
+        let mut inbound = inbound_with_media("", vec!["/tmp/uploads/voice-note.ogg"]);
+        let channels = ChannelManager::new();
+
+        let result = process_media(&mut inbound, None, None, &channels).await;
+
+        assert!(result.image_media.is_empty());
+        assert_eq!(result.attachment_media, vec!["/tmp/uploads/voice-note.ogg"]);
+        assert!(result.is_voice_message);
+        assert!(inbound.content.contains("voice-note.ogg"));
+        assert!(!inbound.content.contains("[Audio file:"));
+        assert!(!inbound.content.contains("/tmp/uploads/voice-note.ogg"));
+    }
+
+    #[tokio::test]
+    async fn process_media_routes_non_image_files_to_attachment_media() {
+        let mut inbound =
+            inbound_with_media("Please summarize this", vec!["/tmp/uploads/report.pdf"]);
+        let channels = ChannelManager::new();
+
+        let result = process_media(&mut inbound, None, None, &channels).await;
+
+        assert!(result.image_media.is_empty());
+        assert_eq!(result.attachment_media, vec!["/tmp/uploads/report.pdf"]);
+        assert!(inbound.content.contains("[Attached files]"));
+        assert!(inbound.content.contains("report.pdf"));
+        assert!(!inbound.content.contains("/tmp/uploads/report.pdf"));
+    }
+
+    #[test]
+    fn merge_transcript_into_content_keeps_existing_user_text() {
+        assert_eq!(
+            merge_transcript_into_content("Please help", "hello world"),
+            "Transcribed audio:\nhello world\n\nPlease help"
+        );
+        assert_eq!(
+            merge_transcript_into_content("", "hello world"),
+            "hello world"
+        );
     }
 }
