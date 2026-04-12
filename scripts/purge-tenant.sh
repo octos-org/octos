@@ -61,7 +61,7 @@ if [[ "$FORCE" != true ]]; then
 fi
 
 URL="${API_BASE}/api/admin/profiles/by-node/${NODE_NAME}/purge"
-RESPONSE=$(curl -sS -X POST "${AUTH_HEADER[@]}" "$URL" -w "\n%{http_code}")
+RESPONSE=$(curl -sS -X POST ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$URL" -w "\n%{http_code}")
 HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
 BODY=$(echo "$RESPONSE" | sed '$d')
 
