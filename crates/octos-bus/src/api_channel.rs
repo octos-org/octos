@@ -198,6 +198,27 @@ impl ApiChannel {
     }
 }
 
+fn initial_sse_events(has_media: bool) -> Vec<String> {
+    let mut events = vec![serde_json::json!({
+        "type": "thinking",
+        "iteration": 0,
+    })
+    .to_string()];
+
+    if has_media {
+        events.push(
+            serde_json::json!({
+                "type": "tool_progress",
+                "tool": "preprocessing",
+                "message": "Processing attachments...",
+            })
+            .to_string(),
+        );
+    }
+
+    events
+}
+
 #[async_trait]
 impl Channel for ApiChannel {
     fn name(&self) -> &str {
@@ -532,6 +553,9 @@ async fn handle_chat(
             None
         } else {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
+            for event in initial_sse_events(!req.media.is_empty()) {
+                let _ = tx.send(event);
+            }
             pending.insert(session_id.clone(), tx);
             Some(rx)
         }
@@ -989,6 +1013,28 @@ mod tests {
             Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.max_message_length(), 1_000_000);
+    }
+
+    #[test]
+    fn initial_sse_events_include_thinking() {
+        let events = initial_sse_events(false);
+        assert_eq!(events.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(parsed["type"], "thinking");
+        assert_eq!(parsed["iteration"], 0);
+    }
+
+    #[test]
+    fn initial_sse_events_include_preprocessing_for_media() {
+        let events = initial_sse_events(true);
+        assert_eq!(events.len(), 2);
+        let parsed: Vec<serde_json::Value> = events
+            .iter()
+            .map(|event| serde_json::from_str(event).unwrap())
+            .collect();
+        assert_eq!(parsed[0]["type"], "thinking");
+        assert_eq!(parsed[1]["type"], "tool_progress");
+        assert_eq!(parsed[1]["tool"], "preprocessing");
     }
 
     #[tokio::test]
