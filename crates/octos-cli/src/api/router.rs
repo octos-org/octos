@@ -173,6 +173,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/profiles/{id}/purge",
             post(purge::purge_profile_handler),
         )
+        .route(
+            "/api/admin/profiles/by-node/{node_name}/purge",
+            post(purge::purge_by_node_handler),
+        )
         .route("/api/admin/profiles/{id}/start", post(admin::start_gateway))
         .route("/api/admin/profiles/{id}/stop", post(admin::stop_gateway))
         .route(

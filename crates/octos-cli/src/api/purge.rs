@@ -166,6 +166,25 @@ pub async fn purge_profile_handler(
     }
 }
 
+/// POST /api/admin/profiles/by-node/{node_name}/purge — look up tenant by
+/// subdomain, then purge its owner profile. Convenience for the CLI script.
+pub async fn purge_by_node_handler(
+    State(state): State<Arc<AppState>>,
+    Path(node_name): Path<String>,
+) -> Result<Json<PurgeReport>, (StatusCode, String)> {
+    let ts = state.tenant_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "tenant store not configured".into(),
+    ))?;
+
+    let tenant = ts
+        .find_by_subdomain(&node_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("no node '{node_name}'")))?;
+
+    purge_profile_handler(State(state), Path(tenant.owner)).await
+}
+
 /// Compute the recursive size of a directory in bytes. Returns 0 on any error.
 fn dir_size(path: &std::path::Path) -> u64 {
     fn walk(path: &std::path::Path) -> u64 {
