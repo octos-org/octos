@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use eyre::{bail, Result};
+use eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -598,11 +598,12 @@ mod tests {
         };
 
         // Wrong code
-        assert!(mgr
-            .verify_otp("alice@example.com", "000000")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            mgr.verify_otp("alice@example.com", "000000")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Correct code
         let token = mgr.verify_otp("alice@example.com", &code).await.unwrap();
@@ -660,18 +661,20 @@ mod tests {
 
         // Use wrong code 3 times
         for _ in 0..3 {
-            assert!(mgr
-                .verify_otp("carol@test.com", "000000")
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                mgr.verify_otp("carol@test.com", "000000")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         // 4th attempt fails (OTP removed after 3 attempts)
-        assert!(mgr
-            .verify_otp("carol@test.com", "000000")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            mgr.verify_otp("carol@test.com", "000000")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

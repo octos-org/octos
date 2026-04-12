@@ -4,15 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::admin::ProfileResponse;
 use super::AppState;
+use super::admin::ProfileResponse;
 use crate::profiles::mask_secrets;
 use crate::user_store::{User, UserRole};
 

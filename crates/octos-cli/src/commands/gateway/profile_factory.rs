@@ -5,8 +5,8 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use eyre::Result;
@@ -17,12 +17,12 @@ use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, ProviderRouter, RetryProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
-use crate::config::{detect_provider, Config};
+use crate::config::{Config, detect_provider};
 use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
     ToolRegistryFactory,
@@ -534,11 +534,7 @@ impl ProfileActorFactoryBuilder {
                         ),
                     }
                 }
-                if registered > 1 {
-                    Some(router)
-                } else {
-                    None
-                }
+                if registered > 1 { Some(router) } else { None }
             };
             provider_router = child_router.clone();
 

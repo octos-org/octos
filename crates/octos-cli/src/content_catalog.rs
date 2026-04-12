@@ -592,14 +592,16 @@ mod tests {
         std::fs::write(&test_file, "hello").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        assert!(cat
-            .index_file(&test_file, None, None, None)
-            .unwrap()
-            .is_some());
-        assert!(cat
-            .index_file(&test_file, None, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            cat.index_file(&test_file, None, None, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cat.index_file(&test_file, None, None, None)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(cat.len(), 1);
     }
 
