@@ -62,5 +62,6 @@ pub use router::{ProviderRouter, SubProviderMeta};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use types::{
-    ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec, strip_think_tags,
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+    strip_think_tags,
 };

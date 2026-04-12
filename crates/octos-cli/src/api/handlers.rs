@@ -3,29 +3,29 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::Extension;
+use axum::Json;
 use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
-use axum::Json;
 use futures::stream::StreamExt;
 use octos_agent::Agent;
-use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
+use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
-use super::AppState;
-use crate::project_templates::{read_site_project_metadata, SiteProjectMetadata};
+use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -67,7 +67,10 @@ pub(crate) fn response_path_for_profile_file(
         .or_else(|| encode_tmp_upload_handle(path, path.file_name().and_then(|name| name.to_str())))
 }
 
-fn resolve_scoped_download_path(base_dir: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+fn resolve_scoped_download_path(
+    base_dir: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
     resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
 }
@@ -294,9 +297,14 @@ async fn chat_streaming(
                 }
 
                 // Send final done event (field names match what octos-web expects)
+                let provider_metadata = response.provider_metadata.clone();
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
+                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                 });
@@ -1492,11 +1500,7 @@ fn resolve_preview_asset_path(
                 Some(nested_index)
             } else if !request_path.contains('.') {
                 let html = candidate.with_extension("html");
-                if html.exists() {
-                    Some(html)
-                } else {
-                    None
-                }
+                if html.exists() { Some(html) } else { None }
             } else {
                 None
             }
@@ -1838,14 +1842,14 @@ pub async fn list_content_files(
         if lower.starts_with('_') {
             return false;
         } // _report.md, _search_results.md, _sources.json
-          // Skip intermediates
+        // Skip intermediates
         if lower.starts_with("panel-") {
             return false;
         }
         if lower.contains("-ref.") {
             return false;
         } // mofa reference images
-          // Only keep meaningful output extensions
+        // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
             "md" | "markdown"
@@ -2354,9 +2358,14 @@ async fn ws_standalone_agent(
                     }
                 }
 
+                let provider_metadata = response.provider_metadata.clone();
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
+                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                 });
@@ -2542,7 +2551,9 @@ mod tests {
         let other_file = other.path().join("secret.txt");
         std::fs::write(&other_file, b"secret").unwrap();
 
-        assert!(resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none());
+        assert!(
+            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none()
+        );
     }
 
     #[test]

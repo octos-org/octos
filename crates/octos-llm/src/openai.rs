@@ -13,9 +13,11 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::sse::SseEvent;
-use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::types::{
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+};
 
 /// Declarative hints about model API behavior.
 ///
@@ -457,6 +459,19 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let (provider, tagged_endpoint) = self
+            .provider_label
+            .split_once('@')
+            .map(|(provider, endpoint)| (provider.to_string(), Some(endpoint.to_string())))
+            .unwrap_or_else(|| (self.provider_label.clone(), None));
+        let endpoint = match tagged_endpoint.as_deref() {
+            Some("api") | None => None,
+            Some(_) => endpoint_label_from_base_url(&self.base_url).or(tagged_endpoint),
+        };
+        ProviderMetadata::new(provider, self.model.clone(), endpoint)
     }
 }
 
@@ -905,6 +920,19 @@ mod tests {
         assert!(p.hints.fixed_temperature);
         assert!(p.hints.lacks_vision);
         assert!(!p.hints.merge_system_messages);
+    }
+
+    #[test]
+    fn test_provider_metadata_uses_custom_endpoint_label() {
+        let provider = OpenAIProvider::new("key", "kimi-k2.5")
+            .with_provider_label("moonshot")
+            .with_base_url("https://www.autodl.art/api/v1");
+
+        let metadata = provider.provider_metadata();
+        assert_eq!(metadata.provider, "moonshot");
+        assert_eq!(metadata.model, "kimi-k2.5");
+        assert_eq!(metadata.endpoint.as_deref(), Some("autodl.art"));
+        assert_eq!(metadata.display_label(), "moonshot/kimi-k2.5 @ autodl.art");
     }
 
     /// Real API test: NVIDIA NIM with Llama 3.3 70B.

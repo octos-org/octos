@@ -186,10 +186,12 @@ impl SessionTaskQueryStore {
     pub fn query_json(&self, session_key: &str) -> serde_json::Value {
         let upgraded = {
             let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-            match guard
-                .get(session_key)
-                .and_then(|entry| entry.supervisor.upgrade().map(|supervisor| (supervisor, entry.data_dir.clone())))
-            {
+            match guard.get(session_key).and_then(|entry| {
+                entry
+                    .supervisor
+                    .upgrade()
+                    .map(|supervisor| (supervisor, entry.data_dir.clone()))
+            }) {
                 Some(entry) => Some(entry),
                 None => {
                     guard.remove(session_key);
@@ -2641,9 +2643,19 @@ impl SessionActor {
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
+                let provider_metadata = cr.provider_metadata.clone();
+                let model_label = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    });
                 serde_json::json!({
                     "_completion": true,
-                    "model": format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                    "model": model_label,
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
@@ -3375,7 +3387,12 @@ impl SessionActor {
         // Capture annotation data before match moves result
         let annotation_data: Option<(String, u32, u32, u64)> = if let Ok(Ok(ref cr)) = result {
             Some((
-                format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                cr.provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    }),
                 cr.token_usage.input_tokens,
                 cr.token_usage.output_tokens,
                 llm_latency.as_secs(),
@@ -3710,7 +3727,10 @@ mod tests {
     fn session_task_query_store_hides_absolute_output_paths() {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().join("profile-data");
-        let workspace = data_dir.join("users").join("api%3Asession").join("workspace");
+        let workspace = data_dir
+            .join("users")
+            .join("api%3Asession")
+            .join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let output = workspace.join("voice.mp3");
         std::fs::write(&output, b"audio").unwrap();

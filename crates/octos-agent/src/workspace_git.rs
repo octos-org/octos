@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{eyre, Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 
 use crate::workspace_policy::{
-    read_workspace_policy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceVersionControlProvider,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceVersionControlProvider,
+    read_workspace_policy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,7 +404,7 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_policy::{write_workspace_policy, WorkspacePolicy};
+    use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
 
     #[test]
     fn detects_slides_repo_from_changed_path() {
@@ -502,8 +502,10 @@ mod tests {
         assert!(report.committed.is_empty());
         assert_eq!(report.enforced_failures.len(), 1);
         assert_eq!(report.enforced_failures[0].repo_label, "slides/deck-a");
-        assert!(report.enforced_failures[0]
-            .error
-            .contains("parse workspace policy failed"));
+        assert!(
+            report.enforced_failures[0]
+                .error
+                .contains("parse workspace policy failed")
+        );
     }
 }

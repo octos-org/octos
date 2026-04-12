@@ -190,6 +190,7 @@ mod tests {
         let resp = ConversationResponse {
             content: "test".into(),
             reasoning_content: None,
+            provider_metadata: None,
             token_usage: octos_core::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,

@@ -164,6 +164,7 @@ impl Agent {
                         return Ok(ConversationResponse {
                             content: stop.message(),
                             reasoning_content: None,
+                            provider_metadata: None,
                             token_usage: total_usage,
                             files_modified,
                             streamed: false,
@@ -276,6 +277,9 @@ impl Agent {
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
@@ -294,6 +298,7 @@ impl Agent {
                                     return Ok(ConversationResponse {
                                         content: warning,
                                         reasoning_content: None,
+                                        provider_metadata: None,
                                         token_usage: total_usage,
                                         files_modified,
                                         streamed,
@@ -316,6 +321,9 @@ impl Agent {
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
@@ -335,6 +343,9 @@ impl Agent {
                                         .to_string()
                                 }),
                                 reasoning_content: None,
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,

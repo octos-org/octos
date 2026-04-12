@@ -57,6 +57,7 @@ impl Agent {
         let mut tool_calls: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
         let mut usage = octos_llm::TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
+        let mut provider_index = None;
 
         // Adaptive stream timeout:
         // - TTFT (first token): generous — models need time to process large
@@ -97,6 +98,9 @@ impl Agent {
             tracing::debug!(?event, "stream event received");
 
             match event {
+                StreamEvent::ProviderIndex(index) => {
+                    provider_index = Some(index);
+                }
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
                     reasoning.push_str(&delta);
@@ -233,7 +237,7 @@ impl Agent {
                 tool_calls,
                 stop_reason,
                 usage,
-                provider_index: None,
+                provider_index,
             },
             streamed,
         ))

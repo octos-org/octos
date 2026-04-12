@@ -56,7 +56,9 @@ impl StreamAccumulator {
             // Only the last Usage event is retained (providers emit final totals at stream end).
             StreamEvent::Usage(u) => self.usage = u.clone(),
             StreamEvent::Done(reason) => self.stop_reason = Some(*reason),
-            StreamEvent::ToolCallMetadata { .. } | StreamEvent::Error(_) => {}
+            StreamEvent::ProviderIndex(_)
+            | StreamEvent::ToolCallMetadata { .. }
+            | StreamEvent::Error(_) => {}
         }
     }
 

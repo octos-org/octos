@@ -1003,9 +1003,13 @@ pub async fn my_content(
         .entries
         .into_iter()
         .filter_map(|mut entry| {
-            let handle = response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
+            let handle =
+                response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
             entry.path = handle;
-            entry.thumbnail_path = entry.thumbnail_path.as_ref().map(|_| "available".to_string());
+            entry.thumbnail_path = entry
+                .thumbnail_path
+                .as_ref()
+                .map(|_| "available".to_string());
             Some(entry)
         })
         .collect();

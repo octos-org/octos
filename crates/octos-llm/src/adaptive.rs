@@ -10,13 +10,14 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::StreamExt;
 use octos_core::Message;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -1294,7 +1295,10 @@ impl AdaptiveRouter {
             }
         }
 
-        result
+        result.map(|mut response| {
+            response.provider_index = Some(idx);
+            response
+        })
     }
 
     /// Try a stream request on a specific provider.
@@ -1324,7 +1328,13 @@ impl AdaptiveRouter {
             }
         }
 
-        result
+        result.map(|stream| self.stream_with_provider_index(idx, stream))
+    }
+
+    fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
+        Box::pin(
+            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
+        )
     }
 }
 
@@ -1472,6 +1482,19 @@ impl LlmProvider for AdaptiveRouter {
         self.slots[idx].provider.provider_name()
     }
 
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].provider.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
+        let idx = provider_index.unwrap_or_else(|| self.select_provider().0);
+        self.slots
+            .get(idx)
+            .map(|slot| slot.provider.provider_metadata())
+            .unwrap_or_else(|| self.provider_metadata())
+    }
+
     fn export_metrics(&self) -> Option<serde_json::Value> {
         serde_json::to_value(self.export_model_catalog()).ok()
     }
@@ -1581,6 +1604,80 @@ mod tests {
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.unwrap(), "from-primary");
+    }
+
+    #[tokio::test]
+    async fn test_chat_returns_exact_provider_index_after_failover() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+        assert_eq!(resp.provider_index, Some(1));
+
+        let metadata = router.provider_metadata_for_index(resp.provider_index);
+        assert_eq!(metadata.provider, "fallback");
+        assert_eq!(metadata.model, "m2");
+        assert_eq!(metadata.display_label(), "fallback/m2");
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_emits_exact_provider_index_after_failover() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let mut stream = router
+            .chat_stream(&[], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("provider index event");
+        assert!(matches!(first, StreamEvent::ProviderIndex(1)));
+
+        let second = stream.next().await.expect("text event");
+        assert!(matches!(second, StreamEvent::TextDelta(ref text) if text == "from-fallback"));
     }
 
     #[tokio::test]

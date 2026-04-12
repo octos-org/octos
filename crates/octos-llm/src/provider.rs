@@ -6,7 +6,7 @@ use octos_core::Message;
 
 use crate::config::ChatConfig;
 use crate::context;
-use crate::types::{ChatResponse, ChatStream, StreamEvent, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 /// Trait for LLM providers.
 ///
@@ -64,6 +64,17 @@ pub trait LlmProvider: Send + Sync {
     /// Get the provider name (e.g., "anthropic", "openai").
     fn provider_name(&self) -> &str;
 
+    /// Get structured metadata for the active provider instance.
+    fn provider_metadata(&self) -> ProviderMetadata {
+        ProviderMetadata::new(self.provider_name(), self.model_id(), None)
+    }
+
+    /// Get structured metadata for a concrete provider slot, when the caller
+    /// knows which slot produced the response.
+    fn provider_metadata_for_index(&self, _provider_index: Option<usize>) -> ProviderMetadata {
+        self.provider_metadata()
+    }
+
     /// Export provider QoS metrics as JSON (for adaptive routers).
     /// Returns `None` for simple providers; overridden by `AdaptiveRouter`.
     fn export_metrics(&self) -> Option<serde_json::Value> {
@@ -78,6 +89,19 @@ pub trait LlmProvider: Send + Sync {
     /// Report streaming throughput metrics after a stream is fully consumed.
     /// Used by the adaptive router to update throughput scoring.
     fn report_stream_metrics(&self, _output_tokens: u32, _stream_duration_us: u64) {}
+}
+
+pub(crate) fn endpoint_label_from_base_url(url: &str) -> Option<String> {
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()?
+        .trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.trim_start_matches("www.").to_string())
 }
 
 /// Truncate an API error body to avoid leaking verbose internal details.

@@ -3,6 +3,36 @@
 use octos_core::ToolCall;
 use serde::{Deserialize, Serialize};
 
+/// Structured provenance for the provider instance that produced a response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMetadata {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+impl ProviderMetadata {
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            endpoint,
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        match self.endpoint.as_deref().filter(|value| !value.is_empty()) {
+            Some(endpoint) => format!("{}/{} @ {}", self.provider, self.model, endpoint),
+            None => format!("{}/{}", self.provider, self.model),
+        }
+    }
+}
+
 /// Response from a chat completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse {
@@ -74,6 +104,8 @@ pub struct ToolSpec {
 /// Events from a streaming LLM response.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Identifies which provider instance produced the stream.
+    ProviderIndex(usize),
     /// Incremental text chunk.
     TextDelta(String),
     /// Incremental reasoning/thinking content from thinking models.
