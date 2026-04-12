@@ -3,26 +3,25 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::Extension;
-use axum::Json;
-use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
+use axum::Json;
 use futures::stream::StreamExt;
 use octos_agent::Agent;
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
 use serde::{Deserialize, Serialize};
 
-use axum::http::HeaderMap;
-
-use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
-use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
+use super::AppState;
+use crate::project_templates::{read_site_project_metadata, SiteProjectMetadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -400,10 +399,51 @@ pub struct PaginationParams {
     pub offset: usize,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub since_seq: Option<usize>,
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 fn default_page_limit() -> usize {
     100
+}
+
+fn standalone_api_session_key_with_topic(
+    headers: &HeaderMap,
+    session_id: &str,
+    topic: Option<&str>,
+) -> SessionKey {
+    SessionKey::with_profile_topic(
+        api_profile_id_from_headers(headers),
+        "api",
+        session_id,
+        topic.unwrap_or_default(),
+    )
+}
+
+fn session_messages_proxy_path(
+    id: &str,
+    limit: usize,
+    offset: usize,
+    source: Option<&str>,
+    since_seq: Option<usize>,
+    topic: Option<&str>,
+) -> String {
+    let mut path = format!("/sessions/{id}/messages?limit={limit}&offset={offset}");
+    if let Some(source) = source {
+        path.push_str("&source=");
+        path.push_str(source);
+    }
+    if let Some(since_seq) = since_seq {
+        path.push_str("&since_seq=");
+        path.push_str(&since_seq.to_string());
+    }
+    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
+        path.push_str("&topic=");
+        path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
+    path
 }
 
 pub async fn session_messages(
@@ -425,7 +465,7 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key(&headers, &id);
+            let key = standalone_api_session_key_with_topic(&headers, &id, params.topic.as_deref());
             let mut sess = sessions.lock().await;
             let session = sess.get_or_create(&key).await;
             let messages: Vec<MessageInfo> = session
@@ -448,9 +488,17 @@ pub async fn session_messages(
 
     // Proxy to gateway.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!(
-            "/sessions/{id}/messages?limit={}&offset={}&source=full",
-            limit, offset
+        let path = session_messages_proxy_path(
+            &id,
+            limit,
+            offset,
+            if use_full {
+                Some("full")
+            } else {
+                params.source.as_deref()
+            },
+            params.since_seq,
+            params.topic.as_deref(),
         );
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
@@ -1315,7 +1363,11 @@ fn resolve_preview_asset_path(
                 Some(nested_index)
             } else if !request_path.contains('.') {
                 let html = candidate.with_extension("html");
-                if html.exists() { Some(html) } else { None }
+                if html.exists() {
+                    Some(html)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1657,14 +1709,14 @@ pub async fn list_content_files(
         if lower.starts_with('_') {
             return false;
         } // _report.md, _search_results.md, _sources.json
-        // Skip intermediates
+          // Skip intermediates
         if lower.starts_with("panel-") {
             return false;
         }
         if lower.contains("-ref.") {
             return false;
         } // mofa reference images
-        // Only keep meaningful output extensions
+          // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
             "md" | "markdown"
@@ -2388,14 +2440,35 @@ mod tests {
         let params: PaginationParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.limit, 100);
         assert_eq!(params.offset, 0);
+        assert_eq!(params.since_seq, None);
+        assert_eq!(params.topic, None);
     }
 
     #[test]
     fn pagination_custom_values() {
-        let json = r#"{"limit": 50, "offset": 10}"#;
+        let json = r#"{"limit": 50, "offset": 10, "since_seq": 3, "topic": "slides demo"}"#;
         let params: PaginationParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.limit, 50);
         assert_eq!(params.offset, 10);
+        assert_eq!(params.since_seq, Some(3));
+        assert_eq!(params.topic.as_deref(), Some("slides demo"));
+    }
+
+    #[test]
+    fn session_messages_proxy_path_includes_topic_and_since_seq() {
+        let path = session_messages_proxy_path(
+            "slides-123",
+            100,
+            5,
+            Some("full"),
+            Some(8),
+            Some("slides untitled-deck"),
+        );
+
+        assert_eq!(
+            path,
+            "/sessions/slides-123/messages?limit=100&offset=5&source=full&since_seq=8&topic=slides%20untitled-deck"
+        );
     }
 
     #[test]

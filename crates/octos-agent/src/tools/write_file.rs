@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
+use tracing::warn;
 
 use super::{Tool, ToolResult};
 
@@ -86,6 +87,16 @@ impl Tool for WriteFileTool {
         // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
         if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
             return Ok(super::file_io_error(e, &input.path));
+        }
+
+        if let Err(error) =
+            crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "write_file")
+        {
+            warn!(
+                path = %input.path,
+                error = %error,
+                "workspace git snapshot failed after write_file"
+            );
         }
 
         let line_count = input.content.lines().count();

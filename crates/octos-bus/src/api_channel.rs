@@ -6,26 +6,28 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::Json;
-use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use axum::Json;
+use axum::Router;
 use chrono::Utc;
 use eyre::Result;
-use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
+use octos_core::{
+    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use crate::SessionManager;
 use crate::channel::Channel;
+use crate::SessionManager;
 
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
@@ -36,7 +38,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
-    profile_id: String,
+    profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
 }
@@ -61,7 +63,7 @@ struct ChatRequest {
 pub struct ApiChannel {
     port: u16,
     auth_token: Option<String>,
-    profile_id: String,
+    profile_id: Option<String>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Track last sent content per chat_id for delta computation.
@@ -77,7 +79,7 @@ impl ApiChannel {
         auth_token: Option<String>,
         shutdown: Arc<AtomicBool>,
         sessions: Arc<Mutex<SessionManager>>,
-        profile_id: String,
+        profile_id: Option<String>,
     ) -> Self {
         Self {
             port,
@@ -340,7 +342,7 @@ impl Channel for ApiChannel {
 impl ApiChannel {
     /// Persist a message to the session JSONL for the given chat_id.
     async fn persist_to_session(&self, chat_id: &str, message: Message) {
-        let key = SessionKey::with_profile(&self.profile_id, "api", chat_id);
+        let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
         let mut sess = self.sessions.lock().await;
         if let Err(e) = sess.add_message(&key, message.clone()).await {
             tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
@@ -509,10 +511,80 @@ struct PaginationParams {
     /// "full" to read from disk (complete history), default reads from memory (compacted for LLM).
     #[serde(default)]
     source: Option<String>,
+    /// Return only messages strictly newer than this sequence number.
+    #[serde(default)]
+    since_seq: Option<usize>,
+    /// Explicit topic override for multi-topic sessions.
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 fn default_limit() -> usize {
     100
+}
+
+fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
+    SessionKey::with_profile(
+        profile_id
+            .filter(|value| !value.is_empty())
+            .unwrap_or(MAIN_PROFILE_ID),
+        "api",
+        chat_id,
+    )
+}
+
+fn api_session_key_candidates(
+    profile_id: Option<&str>,
+    id: &str,
+    topic: Option<&str>,
+) -> Vec<SessionKey> {
+    let mut keys = Vec::with_capacity(3);
+
+    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
+        if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+            keys.push(SessionKey::with_profile_topic(profile_id, "api", id, topic));
+        }
+        keys.push(SessionKey::with_profile_topic(
+            MAIN_PROFILE_ID,
+            "api",
+            id,
+            topic,
+        ));
+        keys.push(SessionKey::with_topic("api", id, topic));
+    } else {
+        if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+            keys.push(SessionKey::with_profile(profile_id, "api", id));
+        }
+        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", id));
+        keys.push(SessionKey::new("api", id));
+    }
+
+    keys.dedup_by(|left, right| left.0 == right.0);
+    keys
+}
+
+fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
+    id.strip_prefix("api:")
+        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
+}
+
+fn message_info_from_history_message(message: &Message) -> MessageInfo {
+    MessageInfo {
+        role: message.role.to_string(),
+        content: message.content.clone(),
+        timestamp: message.timestamp.to_rfc3339(),
+        media: message.media.clone(),
+        tool_calls: message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| serde_json::to_value(call).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// GET /sessions/:id/status — check if a session has an active task.
@@ -536,7 +608,7 @@ async fn handle_session_tasks(
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = SessionKey::with_profile(&state.profile_id, "api", &id);
+    let session_key = current_profile_api_session_key(state.profile_id.as_deref(), &id);
     let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
@@ -544,12 +616,11 @@ async fn handle_session_tasks(
 /// GET /sessions — list all API sessions.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
-    let prefix = format!("{}:api:", state.profile_id);
     let list: Vec<SessionInfo> = sess
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            let chat_id = id.strip_prefix(&prefix)?;
+            let chat_id = api_chat_id_from_session_key(&id)?;
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -571,126 +642,48 @@ async fn handle_session_messages(
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
-    let key = SessionKey::with_profile(&state.profile_id, "api", &id);
+    let candidates =
+        api_session_key_candidates(state.profile_id.as_deref(), &id, params.topic.as_deref());
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
-        let flat_path = sess.session_path(&key);
-        let data_dir = sess.data_dir();
-        drop(sess);
-
-        // Per-user session dir: data/users/{base_key}/sessions/
-        // Contains default.jsonl + topic files like 123.jsonl
-        // Read ALL jsonl files to merge messages across topics.
-        let per_user_dir = {
-            let base_key = key.base_key();
-            let encoded = crate::session::encode_path_component(base_key);
-            data_dir.join("users").join(encoded).join("sessions")
-        };
-
-        // Read from ALL per-user JSONL files + flat path and merge.
-        let mut all_lines = Vec::new();
-
-        // Primary: all per-user JSONL files (user messages + assistant responses)
-        if let Ok(entries) = std::fs::read_dir(&per_user_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|x| x == "jsonl") {
-                    if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                        all_lines.extend(content.lines().map(|l| l.to_string()));
-                    }
-                }
+        for candidate in &candidates {
+            if let Some(session) = sess.load(candidate).await {
+                let messages: Vec<MessageInfo> = session
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(_, message)| message_info_from_history_message(message))
+                    .collect();
+                return Json(messages).into_response();
             }
-        }
-        // Secondary: flat path (has file deliveries that may not be in per-user)
-        if let Ok(content) = tokio::fs::read_to_string(&flat_path).await {
-            // Only add lines from flat that have media (file deliveries) or bg notifications
-            // and aren't already in per-user
-            for line in content.lines() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let has_media = v
-                        .get("media")
-                        .and_then(|m| m.as_array())
-                        .is_some_and(|a| !a.is_empty());
-                    let is_bg = v
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.starts_with('✓') || c.starts_with('✗'));
-                    if has_media || is_bg {
-                        // Check for duplicate by content
-                        let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if !all_lines.iter().any(|existing| {
-                            existing.contains(content_str) && !content_str.is_empty()
-                        }) {
-                            all_lines.push(line.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        let messages: Vec<MessageInfo> = all_lines
-            .iter()
-            .filter_map(|line| {
-                let v: serde_json::Value = serde_json::from_str(line).ok()?;
-                let role = v.get("role")?.as_str()?;
-                let content = v.get("content")?.as_str().unwrap_or("");
-                let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-                let media: Vec<String> = v
-                    .get("media")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let tool_calls: Vec<serde_json::Value> = v
-                    .get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .map(|arr| arr.to_vec())
-                    .unwrap_or_default();
-                Some(MessageInfo {
-                    role: role.to_string(),
-                    content: content.to_string(),
-                    timestamp: timestamp.to_string(),
-                    media,
-                    tool_calls,
-                })
-            })
-            .skip(offset)
-            .take(limit)
-            .collect();
-        if !messages.is_empty() {
-            return Json(messages).into_response();
         }
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let mut sess = state.sessions.lock().await;
-    let session = sess.get_or_create(&key).await;
-    let history = session.get_history(fetch_count).to_vec();
-    let messages: Vec<MessageInfo> = history
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|m| MessageInfo {
-            role: m.role.to_string(),
-            content: m.content.clone(),
-            timestamp: m.timestamp.to_rfc3339(),
-            media: m.media.clone(),
-            tool_calls: m
-                .tool_calls
-                .as_ref()
-                .map(|tcs| {
-                    tcs.iter()
-                        .filter_map(|tc| serde_json::to_value(tc).ok())
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
-        .collect();
-    Json(messages).into_response()
+    let sess = state.sessions.lock().await;
+    for candidate in &candidates {
+        if let Some(session) = sess.load(candidate).await {
+            let history = session.get_history(fetch_count).to_vec();
+            let messages: Vec<MessageInfo> = history
+                .iter()
+                .enumerate()
+                .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                .skip(offset)
+                .take(limit)
+                .map(|(_, message)| message_info_from_history_message(message))
+                .collect();
+            if !messages.is_empty() {
+                return Json(messages).into_response();
+            }
+        }
+    }
+    Json(Vec::<MessageInfo>::new()).into_response()
 }
 
 /// DELETE /sessions/:id — delete a session.
@@ -698,11 +691,17 @@ async fn handle_delete_session(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let key = SessionKey::with_profile(&state.profile_id, "api", &id);
     let mut sess = state.sessions.lock().await;
-    match sess.clear(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let mut last_error: Option<String> = None;
+    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+        match sess.clear(&candidate).await {
+            Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    match last_error {
+        Some(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
@@ -838,13 +837,35 @@ mod tests {
     }
 
     #[test]
+    fn api_session_key_candidates_prefer_current_profile() {
+        let keys = api_session_key_candidates(Some("dspfac--newsbot"), "web-123", None);
+
+        assert_eq!(keys[0].0, "dspfac--newsbot:api:web-123");
+        assert_eq!(keys[1].0, "_main:api:web-123");
+        assert_eq!(keys[2].0, "api:web-123");
+    }
+
+    #[test]
+    fn api_chat_id_from_profiled_session_key_strips_prefix() {
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac--newsbot:api:web-123"),
+            Some("web-123")
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("_main:api:web-123"),
+            Some("web-123")
+        );
+        assert_eq!(api_chat_id_from_session_key("api:web-123"), Some("web-123"));
+    }
+
+    #[test]
     fn api_channel_name() {
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.name(), "api");
     }
@@ -856,7 +877,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
@@ -868,7 +889,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -899,7 +920,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -934,7 +955,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -978,11 +999,9 @@ mod tests {
         let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
-        assert!(
-            history
-                .iter()
-                .any(|m| m.media.contains(&"/tmp/test.mp3".to_string()))
-        );
+        assert!(history
+            .iter()
+            .any(|m| m.media.contains(&"/tmp/test.mp3".to_string())));
     }
 
     #[tokio::test]
@@ -993,7 +1012,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
 
         // Send a file message (no active SSE needed — goes straight to session)
@@ -1026,7 +1045,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
 
         // Send background task notification (checkmark)
@@ -1056,7 +1075,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
-            TEST_PROFILE_ID.to_string(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let msg = OutboundMessage {
             channel: "api".into(),

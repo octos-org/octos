@@ -9,15 +9,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
+use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
-    ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
+    create_bus, ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager,
 };
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
@@ -29,12 +29,12 @@ use tracing::{info, warn};
 
 use super::build_system_prompt;
 use super::message_preprocessing;
-use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
+use super::profile_factory::{build_plugin_env, ProfileActorFactoryBuilder};
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
 use crate::commands::{load_prompt, resolve_data_dir};
-use crate::config::{Config, detect_provider};
+use crate::config::{detect_provider, Config};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
@@ -491,52 +491,8 @@ impl GatewayRuntime {
         };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // Collect extra skills dirs: parent profile (for sub-accounts) + global
-        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
-        if data_dir != project_dir {
-            // Sub-account: also add parent profile's skills dir
-            if let Some(ref parent_path) = cmd.parent_profile {
-                if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
-                    if let Ok(parent) =
-                        serde_json::from_str::<crate::profiles::UserProfile>(&parent_content)
-                    {
-                        if let Some(ref store) = profile_store {
-                            extra_skills_dirs.push(store.resolve_data_dir(&parent));
-                        }
-                    }
-                }
-            }
-            extra_skills_dirs.push(project_dir.clone());
-        }
-
-        // Skills priority (highest first):
-        //   1. Profile skills (data_dir/skills or sub-account/skills)
-        //   2. Parent profile skills (if sub-account)
-        //   3. Global profile skills (project_dir/skills)
-        //   4. Bundled app-skills (project_dir/bundled-app-skills)
-        // Note: platform skills (voice, etc.) are admin-only — loaded in serve.rs
-        let skills_loader = if data_dir != project_dir {
-            let mut loader = SkillsLoader::new(&data_dir);
-            for dir in &extra_skills_dirs {
-                loader.add_skills_dir(dir);
-            }
-            loader
-        } else {
-            SkillsLoader::new(&project_dir)
-        };
-        // Add shared layered dirs (lower priority than profile skills)
-        let mut skills_loader = skills_loader;
-        skills_loader
-            .add_skills_path(project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR));
-        // Extra skills dirs from OCTOS_SKILLS_PATH env var
-        if let Ok(extra) = std::env::var("OCTOS_SKILLS_PATH") {
-            for p in extra.split(':') {
-                let p = p.trim();
-                if !p.is_empty() {
-                    skills_loader.add_skills_path(p);
-                }
-            }
-        }
+        // Customer-installed skills are strictly account-scoped.
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
 
         // Create message bus (before publisher is consumed by channel manager)
         let (agent_handle, publisher) = create_bus();
@@ -639,19 +595,7 @@ impl GatewayRuntime {
 
             // Load plugins with a dedicated work directory for output files
             let plugin_work_dir = data_dir.join("skill-output");
-            let mut plugin_dirs = crate::config::Config::plugin_dirs_from_project(&project_dir);
-            // Prepend per-profile skills dir (highest priority)
-            let profile_skills = data_dir.join("skills");
-            if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
-                plugin_dirs.insert(0, profile_skills);
-            }
-            // Sub-account: also add parent profile's skills dir
-            for dir in &extra_skills_dirs {
-                let parent_skills = dir.join("skills");
-                if parent_skills.exists() && !plugin_dirs.contains(&parent_skills) {
-                    plugin_dirs.push(parent_skills);
-                }
-            }
+            let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
@@ -811,7 +755,11 @@ impl GatewayRuntime {
                     }
                 }
 
-                if registered > 0 { Some(router) } else { None }
+                if registered > 0 {
+                    Some(router)
+                } else {
+                    None
+                }
             };
 
             // Capture config for per-session SpawnTool and PipelineTool creation
@@ -1042,11 +990,6 @@ impl GatewayRuntime {
         if tools.has_deferred() {
             tools.register(octos_agent::ActivateToolsTool::new());
         }
-
-        // Extract supervisor before consuming tools into the factory snapshot.
-        // Used by the API channel's task query callback (gated behind api feature).
-        #[cfg(feature = "api")]
-        let supervisor = tools.supervisor();
 
         // Create the base tool registry snapshot (excludes session-specific tools)
         let tool_registry_factory = Arc::new(SnapshotToolRegistryFactory::new(tools));
@@ -1285,7 +1228,6 @@ impl GatewayRuntime {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
-            let extra_dirs_p = extra_skills_dirs.clone();
             let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
@@ -1295,15 +1237,11 @@ impl GatewayRuntime {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
-                    let eds = extra_dirs_p.clone();
                     let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
-                        let mut sl = SkillsLoader::new(&dd);
-                        for dir in &eds {
-                            sl.add_skills_dir(dir);
-                        }
+                        let sl = crate::skills_scope::build_account_skills_loader(&dd);
                         let new_prompt =
                             build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;

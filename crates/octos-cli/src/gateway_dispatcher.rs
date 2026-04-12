@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
-use octos_core::{InboundMessage, MAIN_PROFILE_ID, OutboundMessage, SessionKey};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use octos_bus::{validate_topic_name, ActiveSessionStore, SessionManager};
+use octos_core::{InboundMessage, OutboundMessage, SessionKey, MAIN_PROFILE_ID};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::commands::gateway::{build_profiled_session_key, session_ui};
@@ -159,11 +159,18 @@ impl GatewayDispatcher {
                             } else {
                                 project_name
                             };
-                            crate::project_templates::scaffold_slides_project(
+                            match crate::project_templates::scaffold_slides_project(
                                 &workspace_root,
                                 project_name,
-                            );
-                            template_reply
+                            ) {
+                                Ok(_) => template_reply,
+                                Err(error) => {
+                                    warn!(topic = name, "slides scaffold failed: {error}");
+                                    format!(
+                                        "{template_reply}\n\nSlides git/bootstrap failed: {error}"
+                                    )
+                                }
+                            }
                         }
                         None => format!("Switched to session: {name}"),
                     }

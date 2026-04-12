@@ -24,6 +24,7 @@ pub mod process_manager;
 pub mod profiles;
 pub mod project_templates;
 pub mod session_actor;
+pub mod skills_scope;
 pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;
@@ -69,7 +70,7 @@ fn main() -> Result<()> {
 fn init_tracing(
     log_dir: Option<&std::path::Path>,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))

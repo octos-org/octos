@@ -1,8 +1,7 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use octos_bus::{ChannelManager, SessionManager};
-use octos_core::MAIN_PROFILE_ID;
 use tokio::sync::Mutex;
 
 use crate::config::ChannelEntry;
@@ -32,7 +31,7 @@ pub fn register(
         auth_token,
         shutdown.clone(),
         session_mgr.clone(),
-        gateway_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string(),
+        gateway_profile_id.map(str::to_string),
     );
     channel_mgr.register(Arc::new(channel));
     Ok(())

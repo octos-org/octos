@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
+use tracing::warn;
 
 use super::{Tool, ToolResult};
 
@@ -113,6 +114,16 @@ impl Tool for DiffEditTool {
 
         if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
             return Ok(super::file_io_error(e, &input.path));
+        }
+
+        if let Err(error) =
+            crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "diff_edit")
+        {
+            warn!(
+                path = %input.path,
+                error = %error,
+                "workspace git snapshot failed after diff_edit"
+            );
         }
 
         Ok(ToolResult {
