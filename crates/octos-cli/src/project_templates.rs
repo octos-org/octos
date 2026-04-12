@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use octos_agent::{WorkspaceProjectKind, initialize_and_commit};
+use octos_agent::{initialize_and_commit, WorkspaceProjectKind};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::Mutex;

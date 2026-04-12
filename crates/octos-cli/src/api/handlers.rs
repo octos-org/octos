@@ -3,26 +3,25 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::Extension;
-use axum::Json;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
+use axum::Json;
 use futures::stream::StreamExt;
 use octos_agent::Agent;
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
 use serde::{Deserialize, Serialize};
 
-use axum::http::HeaderMap;
-
-use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
-use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
+use super::AppState;
+use crate::project_templates::{read_site_project_metadata, SiteProjectMetadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -1364,7 +1363,11 @@ fn resolve_preview_asset_path(
                 Some(nested_index)
             } else if !request_path.contains('.') {
                 let html = candidate.with_extension("html");
-                if html.exists() { Some(html) } else { None }
+                if html.exists() {
+                    Some(html)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1706,14 +1709,14 @@ pub async fn list_content_files(
         if lower.starts_with('_') {
             return false;
         } // _report.md, _search_results.md, _sources.json
-        // Skip intermediates
+          // Skip intermediates
         if lower.starts_with("panel-") {
             return false;
         }
         if lower.contains("-ref.") {
             return false;
         } // mofa reference images
-        // Only keep meaningful output extensions
+          // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
             "md" | "markdown"

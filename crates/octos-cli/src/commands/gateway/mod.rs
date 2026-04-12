@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Result, WrapErr};
-use octos_core::{MAIN_PROFILE_ID, SessionKey};
+use octos_core::{SessionKey, MAIN_PROFILE_ID};
 use tracing::warn;
 
 use super::Executable;
@@ -178,7 +178,7 @@ mod tests {
     use octos_memory::{EpisodeStore, MemoryStore};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tokio::sync::{Mutex, RwLock, mpsc};
+    use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {

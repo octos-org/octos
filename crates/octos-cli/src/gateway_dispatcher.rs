@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
-use octos_core::{InboundMessage, MAIN_PROFILE_ID, OutboundMessage, SessionKey};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use octos_bus::{validate_topic_name, ActiveSessionStore, SessionManager};
+use octos_core::{InboundMessage, OutboundMessage, SessionKey, MAIN_PROFILE_ID};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::commands::gateway::{build_profiled_session_key, session_ui};
