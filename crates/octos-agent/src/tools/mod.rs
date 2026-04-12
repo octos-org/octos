@@ -198,6 +198,7 @@ pub mod write_file;
 pub mod activate_tools;
 pub mod admin;
 pub mod browser;
+pub mod check_background_tasks;
 pub mod tool_config;
 
 #[cfg(feature = "git")]
@@ -228,6 +229,7 @@ pub use write_file::WriteFileTool;
 
 pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
+pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 
 #[cfg(feature = "git")]

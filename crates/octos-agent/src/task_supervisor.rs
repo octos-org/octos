@@ -21,6 +21,21 @@ pub enum TaskStatus {
     Failed,
 }
 
+impl TaskStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Spawned | Self::Running)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// A tracked background task spawned by a spawn_only tool.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackgroundTask {
@@ -29,6 +44,7 @@ pub struct BackgroundTask {
     pub tool_call_id: String,
     pub status: TaskStatus,
     pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub output_files: Vec<String>,
     pub error: Option<String>,
@@ -93,6 +109,7 @@ impl TaskSupervisor {
             tool_call_id: tool_call_id.to_string(),
             status: TaskStatus::Spawned,
             started_at: Utc::now(),
+            updated_at: Utc::now(),
             completed_at: None,
             output_files: Vec::new(),
             error: None,
@@ -109,6 +126,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Running;
+                task.updated_at = Utc::now();
                 Some(task.clone())
             } else {
                 None
@@ -125,6 +143,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Completed;
+                task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.output_files = output_files;
                 Some(task.clone())
@@ -143,6 +162,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
+                task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error);
                 Some(task.clone())
@@ -168,7 +188,7 @@ impl TaskSupervisor {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks
             .values()
-            .filter(|t| t.status != TaskStatus::Completed && t.status != TaskStatus::Failed)
+            .filter(|t| t.status.is_active())
             .cloned()
             .collect()
     }
@@ -192,10 +212,7 @@ impl TaskSupervisor {
     /// Number of active (non-completed, non-failed) tasks.
     pub fn task_count(&self) -> usize {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        tasks
-            .values()
-            .filter(|t| t.status != TaskStatus::Completed && t.status != TaskStatus::Failed)
-            .count()
+        tasks.values().filter(|t| t.status.is_active()).count()
     }
 }
 
@@ -215,6 +232,7 @@ mod tests {
         assert_eq!(tasks[0].tool_call_id, "call-123");
         assert_eq!(tasks[0].status, TaskStatus::Spawned);
         assert!(tasks[0].completed_at.is_none());
+        assert!(tasks[0].updated_at >= tasks[0].started_at);
     }
 
     #[test]

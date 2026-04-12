@@ -5,24 +5,26 @@
 //! to the wrong chat.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
+use octos_agent::tools::{
+    CheckBackgroundTasksTool, MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
+};
 use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
 use octos_core::{
-    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
-    METADATA_SENDER_USER_ID,
+    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
+    OutboundMessage, SessionKey,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -686,6 +688,10 @@ impl ActorFactory {
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
+        tools.register(CheckBackgroundTasksTool::new(
+            tools.supervisor(),
+            session_key.to_string(),
+        ));
         tools.register(message_tool);
         tools.register(send_file_tool);
 
