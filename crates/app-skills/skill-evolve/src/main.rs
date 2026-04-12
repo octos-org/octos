@@ -682,11 +682,7 @@ fn split_learned_notes(content: &str) -> (&str, Vec<String>) {
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                Some(trimmed[2..].to_string())
-            } else {
-                None
-            }
+            trimmed.strip_prefix("- ").map(|stripped| stripped.to_string())
         })
         .collect();
     (body, notes)
