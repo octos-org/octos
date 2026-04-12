@@ -31,6 +31,7 @@ pub mod steering;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
+pub mod workspace_git;
 
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -59,6 +60,11 @@ pub use tools::{
     admin::{AdminApiContext, register_admin_api_tools},
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
+pub use workspace_git::{
+    WorkspaceProjectKind, commit_all_if_dirty, detect_workspace_repo, init_workspace_repo,
+    initialize_and_commit, list_workspace_repos, snapshot_workspace_change,
+    snapshot_workspace_turn,
+};
 
 #[cfg(test)]
 mod tests {
