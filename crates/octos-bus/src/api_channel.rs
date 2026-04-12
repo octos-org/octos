@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,7 +23,7 @@ use eyre::Result;
 use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::SessionManager;
 use crate::channel::Channel;
@@ -96,6 +97,103 @@ impl ApiChannel {
         self.task_query = Some(f);
         self
     }
+
+    fn session_workspace_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        let encoded = crate::session::encode_path_component(key.base_key());
+        data_dir.join("users").join(encoded).join("workspace")
+    }
+
+    fn session_artifact_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        Self::session_workspace_dir(data_dir, key).join(".artifacts")
+    }
+
+    fn sanitize_artifact_name(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "artifact".to_string());
+        name.replace(['/', '\\', '\0'], "_")
+    }
+
+    fn copy_media_into_session_artifacts(artifact_dir: &Path, media: &[String]) -> Vec<String> {
+        if let Err(error) = std::fs::create_dir_all(artifact_dir) {
+            warn!(
+                path = %artifact_dir.display(),
+                %error,
+                "failed to create session artifact directory"
+            );
+            return media.to_vec();
+        }
+
+        let canonical_artifact_dir =
+            std::fs::canonicalize(artifact_dir).unwrap_or_else(|_| artifact_dir.to_path_buf());
+
+        media
+            .iter()
+            .map(|raw| {
+                let source_path = PathBuf::from(raw);
+                if source_path.starts_with(&canonical_artifact_dir) {
+                    return raw.clone();
+                }
+
+                let canonical_source = match std::fs::canonicalize(&source_path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        warn!(path = %raw, %error, "failed to canonicalize media source");
+                        return raw.clone();
+                    }
+                };
+
+                if canonical_source.starts_with(&canonical_artifact_dir) {
+                    return canonical_source.to_string_lossy().to_string();
+                }
+
+                let safe_name = Self::sanitize_artifact_name(&canonical_source);
+                let dest =
+                    canonical_artifact_dir.join(format!("{}-{safe_name}", uuid::Uuid::now_v7()));
+
+                if canonical_source == dest {
+                    return canonical_source.to_string_lossy().to_string();
+                }
+
+                match std::fs::copy(&canonical_source, &dest) {
+                    Ok(_) => dest.to_string_lossy().to_string(),
+                    Err(error) => {
+                        warn!(
+                            source = %canonical_source.display(),
+                            dest = %dest.display(),
+                            %error,
+                            "failed to materialize media into session artifacts"
+                        );
+                        raw.clone()
+                    }
+                }
+            })
+            .collect()
+    }
+
+    async fn materialize_media_for_session(&self, chat_id: &str, media: &[String]) -> Vec<String> {
+        let key = SessionKey::with_profile(&self.profile_id, "api", chat_id);
+        let data_dir = {
+            let sess = self.sessions.lock().await;
+            sess.data_dir()
+        };
+        let artifact_dir = Self::session_artifact_dir(&data_dir, &key);
+        let media = media.to_vec();
+        let media_for_copy = media.clone();
+        match tokio::task::spawn_blocking(move || {
+            Self::copy_media_into_session_artifacts(&artifact_dir, &media_for_copy)
+        })
+        .await
+        {
+            Ok(paths) => paths,
+            Err(error) => {
+                warn!(chat_id = %chat_id, %error, "failed to join media materialization task");
+                media
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -144,19 +242,25 @@ impl Channel for ApiChannel {
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
         if !msg.media.is_empty() {
+            let persisted_media = self
+                .materialize_media_for_session(&msg.chat_id, &msg.media)
+                .await;
+
             // File message — persist to session history AND send SSE event.
             let file_desc = msg
                 .media
                 .iter()
+                .zip(persisted_media.iter())
                 .map(|p| {
-                    let name = std::path::Path::new(p)
+                    let (original_path, persisted_path) = p;
+                    let name = std::path::Path::new(original_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if msg.content.is_empty() {
-                        format!("[file:{p}] {name}")
+                        format!("[file:{persisted_path}] {name}")
                     } else {
-                        format!("[file:{p}] {name} — {}", msg.content)
+                        format!("[file:{persisted_path}] {name} — {}", msg.content)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -164,7 +268,7 @@ impl Channel for ApiChannel {
             let session_msg = Message {
                 role: MessageRole::Assistant,
                 content: file_desc,
-                media: msg.media.clone(),
+                media: persisted_media.clone(),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -175,8 +279,9 @@ impl Channel for ApiChannel {
             // Send SSE file event so the web client receives it in real-time
             let pending = self.pending.lock().await;
             if let Some(tx) = pending.get(&msg.chat_id) {
-                for path in &msg.media {
-                    let filename = std::path::Path::new(path)
+                for (original_path, persisted_path) in msg.media.iter().zip(persisted_media.iter())
+                {
+                    let filename = std::path::Path::new(original_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
@@ -187,7 +292,7 @@ impl Channel for ApiChannel {
                         .unwrap_or("");
                     let event = serde_json::json!({
                         "type": "file",
-                        "path": path,
+                        "path": persisted_path,
                         "filename": filename,
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
@@ -817,9 +922,13 @@ mod tests {
 
     const TEST_PROFILE_ID: &str = "dspfac";
 
+    fn test_sessions_in(data_dir: &Path) -> Arc<Mutex<SessionManager>> {
+        Arc::new(Mutex::new(SessionManager::open(data_dir).unwrap()))
+    }
+
     fn test_sessions() -> Arc<Mutex<SessionManager>> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()))
+        test_sessions_in(dir.path())
     }
 
     #[test]
@@ -928,7 +1037,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_completion_with_bg_tasks_closes_and_client_polls() {
-        let sessions = test_sessions();
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
         let ch = ApiChannel::new(
             8091,
             None,
@@ -936,6 +1046,10 @@ mod tests {
             sessions.clone(),
             TEST_PROFILE_ID.to_string(),
         );
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("test.mp3");
+        std::fs::write(&source, b"bg-audio").unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -968,7 +1082,7 @@ mod tests {
             chat_id: "test-bg".into(),
             content: String::new(),
             reply_to: None,
-            media: vec!["/tmp/test.mp3".into()],
+            media: vec![source.to_string_lossy().to_string()],
             metadata: serde_json::json!({}),
         };
         ch.send(&file_msg).await.unwrap();
@@ -978,16 +1092,20 @@ mod tests {
         let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
-        assert!(
-            history
-                .iter()
-                .any(|m| m.media.contains(&"/tmp/test.mp3".to_string()))
-        );
+        let stored = history
+            .iter()
+            .flat_map(|m| m.media.iter())
+            .find(|path| path.ends_with("test.mp3"))
+            .cloned()
+            .expect("expected persisted artifact path");
+        assert_ne!(stored, source.to_string_lossy().to_string());
+        assert!(Path::new(&stored).exists());
     }
 
     #[tokio::test]
     async fn send_file_message_persists_to_session() {
-        let sessions = test_sessions();
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
         let ch = ApiChannel::new(
             8091,
             None,
@@ -995,6 +1113,10 @@ mod tests {
             sessions.clone(),
             TEST_PROFILE_ID.to_string(),
         );
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("test.mp3");
+        std::fs::write(&source, b"audio").unwrap();
 
         // Send a file message (no active SSE needed — goes straight to session)
         let msg = OutboundMessage {
@@ -1002,7 +1124,7 @@ mod tests {
             chat_id: "test-file".into(),
             content: "Audio file".into(),
             reply_to: None,
-            media: vec!["/tmp/test.mp3".into()],
+            media: vec![source.to_string_lossy().to_string()],
             metadata: serde_json::json!({}),
         };
         ch.send(&msg).await.unwrap();
@@ -1013,9 +1135,92 @@ mod tests {
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert_eq!(history.len(), 1);
-        assert!(history[0].content.contains("/tmp/test.mp3"));
         assert!(history[0].content.contains("Audio file"));
-        assert_eq!(history[0].media, vec!["/tmp/test.mp3".to_string()]);
+        assert_eq!(history[0].media.len(), 1);
+        let persisted = &history[0].media[0];
+        assert_ne!(persisted, &source.to_string_lossy().to_string());
+        assert!(history[0].content.contains(persisted));
+        assert!(Path::new(persisted).exists());
+        assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_keeps_distinct_artifacts_for_same_basename() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            TEST_PROFILE_ID.to_string(),
+        );
+        let source_a_dir = data_dir.path().join("source-a");
+        let source_b_dir = data_dir.path().join("source-b");
+        std::fs::create_dir_all(&source_a_dir).unwrap();
+        std::fs::create_dir_all(&source_b_dir).unwrap();
+        let source_a = source_a_dir.join("report.pdf");
+        let source_b = source_b_dir.join("report.pdf");
+        std::fs::write(&source_a, b"alpha").unwrap();
+        std::fs::write(&source_b, b"beta").unwrap();
+
+        for source in [&source_a, &source_b] {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "collision-chat".into(),
+                content: "report".into(),
+                reply_to: None,
+                media: vec![source.to_string_lossy().to_string()],
+                metadata: serde_json::json!({}),
+            };
+            ch.send(&msg).await.unwrap();
+        }
+
+        let mut sess = sessions.lock().await;
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "collision-chat");
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        assert_eq!(history.len(), 2);
+        let first = history[0].media[0].clone();
+        let second = history[1].media[0].clone();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(Path::new(&first)).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(Path::new(&second)).unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_reuses_existing_session_artifact() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            TEST_PROFILE_ID.to_string(),
+        );
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "artifact-chat");
+        let artifact_dir = ApiChannel::session_artifact_dir(data_dir.path(), &key);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let existing = artifact_dir.join("existing.wav");
+        std::fs::write(&existing, b"persisted").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "artifact-chat".into(),
+            content: "existing".into(),
+            reply_to: None,
+            media: vec![existing.to_string_lossy().to_string()],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        let persisted = std::fs::canonicalize(&history[0].media[0]).unwrap();
+        let existing = std::fs::canonicalize(&existing).unwrap();
+        assert_eq!(persisted, existing);
     }
 
     #[tokio::test]
