@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use axum::extract::State;
@@ -249,14 +249,14 @@ impl Channel for ApiChannel {
                 .await;
 
             // File message — persist to session history AND send SSE event.
-            let file_desc = msg
-                .media
-                .iter()
-                .zip(persisted_media.iter())
-                .map(|(original_path, persisted_path)| {
-                    let name = std::path::Path::new(original_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
+        let file_desc = msg
+            .media
+            .iter()
+            .zip(persisted_media.iter())
+            .map(|(original_path, persisted_path)| {
+                let name = std::path::Path::new(original_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if msg.content.is_empty() {
                         format!("[file:{persisted_path}] {name}")
@@ -1200,15 +1200,48 @@ mod tests {
         let mut sess = sessions.lock().await;
         let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "collision-chat");
         let session = sess.get_or_create(&key).await;
-        let stored: Vec<String> = session
-            .get_history(10)
-            .iter()
-            .flat_map(|m| m.media.iter().cloned())
-            .collect();
-        assert_eq!(stored.len(), 2);
-        assert_ne!(stored[0], stored[1]);
-        assert_eq!(std::fs::read(Path::new(&stored[0])).unwrap().len(), 5);
-        assert_eq!(std::fs::read(Path::new(&stored[1])).unwrap().len(), 4);
+        let history = session.get_history(10);
+        assert_eq!(history.len(), 2);
+        let first = history[0].media[0].clone();
+        let second = history[1].media[0].clone();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(Path::new(&first)).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(Path::new(&second)).unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_reuses_existing_session_artifact() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "artifact-chat");
+        let artifact_dir = ApiChannel::session_artifact_dir(data_dir.path(), &key);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let existing = artifact_dir.join("existing.wav");
+        std::fs::write(&existing, b"persisted").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "artifact-chat".into(),
+            content: "existing".into(),
+            reply_to: None,
+            media: vec![existing.to_string_lossy().to_string()],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let session = sess.get_or_create(&key).await;
+        let history = session.get_history(10);
+        let persisted = std::fs::canonicalize(&history[0].media[0]).unwrap();
+        let existing = std::fs::canonicalize(&existing).unwrap();
+        assert_eq!(persisted, existing);
     }
 
     #[tokio::test]
