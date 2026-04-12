@@ -23,6 +23,7 @@ pub mod persona_service;
 pub mod process_manager;
 pub mod profiles;
 pub mod project_templates;
+mod qos_catalog;
 pub mod session_actor;
 pub mod skills_scope;
 pub mod soul_service;
