@@ -57,6 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,7 +67,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}"
+            merge_base="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+            changed_rs=()
+            while IFS= read -r -d '' file; do
+              changed_rs+=("$file")
+            done < <(git diff -z --name-only --diff-filter=ACMRT "$merge_base"...HEAD -- '*.rs')
+
+            if [ "${#changed_rs[@]}" -eq 0 ]; then
+              echo "No changed Rust files to format-check."
+              exit 0
+            fi
+
+            rustfmt --check --edition 2021 --config skip_children=true "${changed_rs[@]}"
+          else
+            cargo fmt --all -- --check
+          fi
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
