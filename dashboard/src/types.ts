@@ -83,6 +83,7 @@ export interface UserProfile {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -94,6 +95,7 @@ export interface ProfileResponse {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string

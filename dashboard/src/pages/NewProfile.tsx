@@ -9,13 +9,19 @@ export default function NewProfile() {
   const [loading, setLoading] = useState(false)
   const [id, setId] = useState('')
   const [name, setName] = useState('')
+  const [publicSubdomain, setPublicSubdomain] = useState('')
   const [enabled, setEnabled] = useState(true)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     try {
       setLoading(true)
-      await api.createProfile({ id, name, enabled })
+      await api.createProfile({
+        id,
+        name,
+        public_subdomain: publicSubdomain.trim() || null,
+        enabled,
+      })
       toast('Profile created')
       navigate(`/profile/${id}`)
     } catch (e: any) {
@@ -64,6 +70,16 @@ export default function NewProfile() {
               placeholder="Alice's Bot"
               className="input"
               required
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1.5">Public Subdomain</label>
+            <p className="text-xs text-gray-500 mb-1.5">Public URL slug. You can change this later without changing the internal profile ID.</p>
+            <input
+              value={publicSubdomain}
+              onChange={(e) => setPublicSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+              placeholder={id || 'alice-bot'}
+              className="input"
             />
           </div>
           <div>
