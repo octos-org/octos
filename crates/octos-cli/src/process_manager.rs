@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use eyre::{Result, bail};
+use eyre::{bail, Result};
 use octos_agent::sandbox::BLOCKED_ENV_VARS;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 #[cfg(feature = "api")]
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use crate::profiles::{ChannelCredentials, ProfileStore, UserProfile};
 
@@ -506,8 +506,8 @@ impl ProcessManager {
             if !procs.contains_key(&profile.id) {
                 // Process already exited and was removed by the monitor task.
                 drop(procs); // release read lock
-                // Give reader tasks time to flush remaining pipe data to the
-                // broadcast channel before we drain it.
+                             // Give reader tasks time to flush remaining pipe data to the
+                             // broadcast channel before we drain it.
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 // Drain log lines captured by our early subscriber.
                 let mut lines = Vec::new();

@@ -38,9 +38,9 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry, MetricsSnapshot,
-    ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy, SharedProviderMetrics,
-    StatusCallback, derive_cold_start_catalog,
+    derive_cold_start_catalog, AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus,
+    BaselineEntry, MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics,
+    SharedPolicy, SharedProviderMetrics, StatusCallback,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
@@ -53,8 +53,8 @@ pub use high_level::LlmClient;
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{
-    DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS, DEFAULT_EMBEDDING_TIMEOUT_SECS,
-    DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LlmProvider, build_http_client,
+    build_http_client, LlmProvider, DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS,
+    DEFAULT_EMBEDDING_TIMEOUT_SECS, DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS,
 };
 pub use responsiveness::ResponsivenessObserver;
 pub use retry::{RetryConfig, RetryProvider};
@@ -62,5 +62,5 @@ pub use router::{ProviderRouter, SubProviderMeta};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use types::{
-    ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec, strip_think_tags,
+    strip_think_tags, ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec,
 };
