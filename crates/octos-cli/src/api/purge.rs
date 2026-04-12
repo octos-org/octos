@@ -337,4 +337,22 @@ mod tests {
         assert!(report.port_released.is_none());
         assert!(state.profile_store.as_ref().unwrap().get(pid).unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn should_be_idempotent_when_run_twice() {
+        let (_temp, state) = build_test_state();
+        let pid = "double";
+
+        state.profile_store.as_ref().unwrap().save(&make_profile(pid)).unwrap();
+        state.user_store.as_ref().unwrap().save(&make_user(pid, "double@example.com")).unwrap();
+        state.tenant_store.as_ref().unwrap().save(&make_tenant("t-2", pid, "double-mac", 6043)).unwrap();
+
+        // First run: succeeds and returns Some(report)
+        let first = purge_by_profile_id(&state, pid).await.expect("first purge");
+        assert!(first.is_some());
+
+        // Second run: returns Ok(None) because the profile is gone
+        let second = purge_by_profile_id(&state, pid).await.expect("second purge");
+        assert!(second.is_none());
+    }
 }
