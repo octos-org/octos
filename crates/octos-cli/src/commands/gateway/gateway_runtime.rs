@@ -24,7 +24,7 @@ use octos_llm::{
     QosCatalog, RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
@@ -81,6 +81,7 @@ pub(super) struct GatewayRuntime {
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 
     // Status
     status_indicators: Arc<HashMap<String, Arc<StatusComposer>>>,
@@ -515,6 +516,8 @@ impl GatewayRuntime {
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
         #[cfg(feature = "matrix")]
         let mut matrix_channel: Option<Arc<octos_bus::MatrixChannel>> = None;
 
@@ -1140,6 +1143,7 @@ impl GatewayRuntime {
                 println!();
                 println!("{}", "Shutting down gateway...".yellow());
                 shutdown_clone.store(true, Ordering::Release);
+                shutdown_notify_clone.notify_waiters();
             }
         });
 
@@ -1258,6 +1262,7 @@ impl GatewayRuntime {
             config_rx,
             tool_config,
             shutdown,
+            shutdown_notify,
             status_indicators,
             persona_service,
             heartbeat_service,
@@ -1270,9 +1275,25 @@ impl GatewayRuntime {
 
     pub(super) async fn run(mut self) -> Result<()> {
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
+        let shutdown_notify = self.shutdown_notify.clone();
 
         // Main loop: dispatch inbound messages to concurrent tasks
-        while let Some(mut inbound) = self.agent_handle.recv_inbound().await {
+        loop {
+            let mut inbound = tokio::select! {
+                _ = shutdown_notify.notified() => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                inbound = self.agent_handle.recv_inbound() => {
+                    match inbound {
+                        Some(inbound) => inbound,
+                        None => break,
+                    }
+                }
+            };
+
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
