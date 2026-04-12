@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::Json;
 use serde::Serialize;
 
 use crate::api::AppState;
@@ -140,6 +143,27 @@ pub async fn purge_by_profile_id(
     );
 
     Ok(Some(report))
+}
+
+/// POST /api/admin/profiles/{id}/purge — full cascade removal.
+///
+/// Maps the cascade result to HTTP status:
+/// - `Ok(Some(report))` -> 200 with the report JSON
+/// - `Ok(None)` -> 404 (profile not found, or admin stores not configured)
+/// - `Err(_)` -> 500 (storage error)
+pub async fn purge_profile_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<PurgeReport>, (StatusCode, String)> {
+    if state.profile_store.is_none() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()));
+    }
+
+    match purge_by_profile_id(&state, &id).await {
+        Ok(Some(report)) => Ok(Json(report)),
+        Ok(None) => Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found"))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 /// Compute the recursive size of a directory in bytes. Returns 0 on any error.
