@@ -99,7 +99,7 @@ impl AuthManager {
                 c.session_expiry_hours,
                 c.allow_self_registration,
             ),
-            None => (None, 24, true), // dev mode: allow self-registration
+            None => (None, 24, false), // default to known-account login only
         };
         Self {
             pending_otps: RwLock::new(HashMap::new()),
@@ -145,11 +145,79 @@ impl AuthManager {
         self.sent_emails.read().await.clone()
     }
 
+    #[cfg(test)]
+    pub async fn test_pending_code(&self, email: &str, user_id: Option<&str>) -> Option<String> {
+        let key = Self::otp_key(&email.to_lowercase(), user_id);
+        self.pending_otps
+            .read()
+            .await
+            .get(&key)
+            .map(|otp| otp.code.clone())
+    }
+
     /// Persist current sessions to disk (best-effort).
     fn persist_sessions_blocking(sessions: &HashMap<String, ActiveSession>, path: &PathBuf) {
         if let Ok(data) = serde_json::to_string(sessions) {
             let _ = std::fs::write(path, data);
         }
+    }
+
+    fn otp_key(email: &str, user_id: Option<&str>) -> String {
+        match user_id {
+            Some(user_id) => format!("{email}::{user_id}"),
+            None => email.to_string(),
+        }
+    }
+
+    async fn store_pending_otp(&self, otp_key: &str) -> Result<bool> {
+        let now = Utc::now();
+        let code = generate_otp_code();
+        let mut otps = self.pending_otps.write().await;
+        if let Some(existing) = otps.get(otp_key) {
+            let elapsed = now.signed_duration_since(existing.created_at);
+            if elapsed < Duration::seconds(60) {
+                return Ok(false);
+            }
+        }
+        otps.insert(
+            otp_key.to_string(),
+            PendingOtp {
+                code,
+                created_at: now,
+                attempts: 0,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn verify_pending_otp(&self, otp_key: &str, code: &str) -> Result<bool> {
+        let now = Utc::now();
+        let valid = {
+            let mut otps = self.pending_otps.write().await;
+            let otp = match otps.get_mut(otp_key) {
+                Some(otp) => otp,
+                None => return Ok(false),
+            };
+
+            if now.signed_duration_since(otp.created_at) > Duration::minutes(5) {
+                otps.remove(otp_key);
+                return Ok(false);
+            }
+
+            otp.attempts += 1;
+            if otp.attempts > 3 {
+                otps.remove(otp_key);
+                return Ok(false);
+            }
+
+            let code_matches = constant_time_eq(code.as_bytes(), otp.code.as_bytes());
+            if code_matches {
+                otps.remove(otp_key);
+            }
+            code_matches
+        };
+
+        Ok(valid)
     }
 
     /// Send an arbitrary HTML email through the configured SMTP transport.
@@ -168,51 +236,54 @@ impl AuthManager {
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
     pub async fn send_otp(&self, email: &str) -> Result<bool> {
-        let email_lower = email.to_lowercase();
-        let now = Utc::now();
+        self.send_otp_with_registration(email, self.allow_self_registration)
+            .await
+    }
 
-        // When self-registration is off, only send OTP if user exists
-        if !self.allow_self_registration {
+    pub async fn send_otp_with_registration(
+        &self,
+        email: &str,
+        allow_registration: bool,
+    ) -> Result<bool> {
+        let email_lower = email.to_lowercase();
+
+        if !allow_registration {
             let user = self.user_store.get_by_email(&email_lower)?;
             if user.is_none() {
-                // Return Ok(true) to avoid email enumeration — caller shows same message
                 tracing::warn!(email = %email_lower, "OTP skipped — user not found and self-registration is disabled");
                 return Ok(true);
             }
         }
 
-        // Generate 6-digit code
-        let code = generate_otp_code();
-
-        // Atomic rate-limit check + insert under a single write lock
-        {
-            let mut otps = self.pending_otps.write().await;
-            if let Some(existing) = otps.get(&email_lower) {
-                let elapsed = now.signed_duration_since(existing.created_at);
-                if elapsed < Duration::seconds(60) {
-                    return Ok(false);
-                }
-            }
-            // Insert pending OTP only after rate-limit passes
-            otps.insert(
-                email_lower.clone(),
-                PendingOtp {
-                    code: code.clone(),
-                    created_at: now,
-                    attempts: 0,
-                },
-            );
+        let otp_key = Self::otp_key(&email_lower, None);
+        let should_send = self.store_pending_otp(&otp_key).await?;
+        if !should_send {
+            return Ok(false);
         }
 
-        // Send email — if it fails, remove the OTP so user isn't stuck rate-limited
         if let Some(ref smtp) = self.smtp_config {
-            if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key).map(|otp| otp.code.clone())
+            };
+            if let Some(code) = code {
+                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                    let mut otps = self.pending_otps.write().await;
+                    otps.remove(&otp_key);
+                    return Err(e);
+                }
+            } else {
                 let mut otps = self.pending_otps.write().await;
-                otps.remove(&email_lower);
-                return Err(e);
+                otps.remove(&otp_key);
+                bail!("pending OTP missing before email send");
             }
         } else {
-            // Dev mode: log to console — email will NOT be delivered
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key)
+                    .map(|otp| otp.code.clone())
+                    .unwrap_or_default()
+            };
             tracing::debug!(email = %email_lower, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
             tracing::warn!(email = %email_lower, "OTP generated (code redacted, enable debug logging to see) — configure dashboard_auth.smtp to send emails");
         }
@@ -220,54 +291,82 @@ impl AuthManager {
         Ok(true)
     }
 
+    pub async fn send_otp_for_user(&self, email: &str, user_id: &str) -> Result<bool> {
+        let email_lower = email.to_lowercase();
+        let user = self
+            .user_store
+            .get(user_id)?
+            .ok_or_else(|| eyre::eyre!("user '{user_id}' not found"))?;
+        if user.email.to_lowercase() != email_lower {
+            bail!("email '{email_lower}' is not registered to user '{user_id}'");
+        }
+
+        let otp_key = Self::otp_key(&email_lower, Some(user_id));
+        let should_send = self.store_pending_otp(&otp_key).await?;
+        if !should_send {
+            return Ok(false);
+        }
+
+        if let Some(ref smtp) = self.smtp_config {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key).map(|otp| otp.code.clone())
+            };
+            if let Some(code) = code {
+                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                    let mut otps = self.pending_otps.write().await;
+                    otps.remove(&otp_key);
+                    return Err(e);
+                }
+            } else {
+                let mut otps = self.pending_otps.write().await;
+                otps.remove(&otp_key);
+                bail!("pending OTP missing before email send");
+            }
+        } else {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key)
+                    .map(|otp| otp.code.clone())
+                    .unwrap_or_default()
+            };
+            tracing::debug!(email = %email_lower, user_id = %user_id, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
+            tracing::warn!(email = %email_lower, user_id = %user_id, "OTP generated (code redacted, enable debug logging to see) — configure dashboard_auth.smtp to send emails");
+        }
+
+        Ok(true)
+    }
+
     /// Verify OTP code. Returns session token on success.
     pub async fn verify_otp(&self, email: &str, code: &str) -> Result<Option<String>> {
+        self.verify_otp_with_registration(email, code, self.allow_self_registration)
+            .await
+    }
+
+    pub async fn verify_otp_with_registration(
+        &self,
+        email: &str,
+        code: &str,
+        allow_registration: bool,
+    ) -> Result<Option<String>> {
         let email_lower = email.to_lowercase();
         let now = Utc::now();
 
-        let valid = {
-            let mut otps = self.pending_otps.write().await;
-            let otp = match otps.get_mut(&email_lower) {
-                Some(otp) => otp,
-                None => return Ok(None),
-            };
-
-            // Check expiry (5 minutes)
-            if now.signed_duration_since(otp.created_at) > Duration::minutes(5) {
-                otps.remove(&email_lower);
-                return Ok(None);
-            }
-
-            // Check max attempts
-            otp.attempts += 1;
-            if otp.attempts > 3 {
-                otps.remove(&email_lower);
-                return Ok(None);
-            }
-
-            // Verify code (constant-time comparison)
-            let code_matches = constant_time_eq(code.as_bytes(), otp.code.as_bytes());
-            if code_matches {
-                otps.remove(&email_lower);
-            }
-            code_matches
-        };
-
-        if !valid {
+        if !self
+            .verify_pending_otp(&Self::otp_key(&email_lower, None), code)
+            .await?
+        {
             return Ok(None);
         }
 
-        // Check if user exists (or create if self-registration enabled)
         let user = self.user_store.get_by_email(&email_lower)?;
         let user = match user {
             Some(u) => u,
             None => {
-                if !self.allow_self_registration {
+                if !allow_registration {
                     bail!("no account found for this email");
                 }
-                // Auto-create user
                 let id = crate::user_store::email_to_user_id(&email_lower);
-                // Ensure unique ID
                 let mut final_id = id.clone();
                 let mut suffix = 1u32;
                 while self.user_store.get(&final_id)?.is_some() {
@@ -287,12 +386,54 @@ impl AuthManager {
             }
         };
 
-        // Update last_login_at
         let mut updated_user = user.clone();
         updated_user.last_login_at = Some(now);
         self.user_store.save(&updated_user)?;
 
-        // Generate session token
+        let token = generate_session_token();
+        let session = ActiveSession {
+            user_id: user.id.clone(),
+            role: user.role.clone(),
+            created_at: now,
+            expires_at: now + Duration::hours(self.session_expiry_hours as i64),
+        };
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(token.clone(), session);
+            if let Some(ref path) = self.sessions_path {
+                Self::persist_sessions_blocking(&sessions, path);
+            }
+        }
+
+        Ok(Some(token))
+    }
+
+    pub async fn verify_otp_for_user(
+        &self,
+        email: &str,
+        code: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let email_lower = email.to_lowercase();
+        let otp_key = Self::otp_key(&email_lower, Some(user_id));
+        if !self.verify_pending_otp(&otp_key, code).await? {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let user = self
+            .user_store
+            .get(user_id)?
+            .ok_or_else(|| eyre::eyre!("user '{user_id}' not found"))?;
+        if user.email.to_lowercase() != email_lower {
+            bail!("email '{email_lower}' is not registered to user '{user_id}'");
+        }
+
+        let mut updated_user = user.clone();
+        updated_user.last_login_at = Some(now);
+        self.user_store.save(&updated_user)?;
+
         let token = generate_session_token();
         let session = ActiveSession {
             user_id: user.id.clone(),

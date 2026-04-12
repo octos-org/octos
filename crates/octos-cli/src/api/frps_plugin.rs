@@ -341,6 +341,7 @@ mod tests {
             profile_store: None,
             process_manager: None,
             user_store: None,
+            allowlist_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,

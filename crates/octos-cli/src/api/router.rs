@@ -240,8 +240,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
-        .route("/api/admin/users", post(user_admin::create_user))
         .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        .route(
+            "/api/admin/allowed-emails",
+            get(user_admin::list_allowed_emails),
+        )
+        .route(
+            "/api/admin/allowed-emails",
+            post(user_admin::add_allowed_email),
+        )
+        .route(
+            "/api/admin/allowed-emails/{email}",
+            delete(user_admin::delete_allowed_email),
+        )
         // Session & cron diagnostics
         .route(
             "/api/admin/profiles/{id}/sessions",
@@ -755,6 +766,7 @@ mod tests {
             profile_store: None,
             process_manager: None,
             user_store: None,
+            allowlist_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,

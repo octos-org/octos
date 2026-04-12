@@ -157,6 +157,10 @@ impl ServeCommand {
         let user_store = Arc::new(
             crate::user_store::UserStore::open(&data_dir).wrap_err("failed to open user store")?,
         );
+        let allowlist_store = Arc::new(
+            crate::login_allowlist::LoginAllowlistStore::open(&data_dir)
+                .wrap_err("failed to open login allowlist store")?,
+        );
         let auth_manager = {
             let auth_config = config.dashboard_auth.clone();
             if auth_config.is_none() {
@@ -238,6 +242,7 @@ impl ServeCommand {
             profile_store: Some(profile_store.clone()),
             process_manager: Some(process_manager.clone()),
             user_store: Some(user_store),
+            allowlist_store: Some(allowlist_store),
             auth_manager,
             http_client: reqwest::Client::new(),
             config_path: resolved_config_path,

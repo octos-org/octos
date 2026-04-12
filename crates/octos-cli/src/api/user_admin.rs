@@ -9,28 +9,43 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::user_store::{User, UserRole, email_to_user_id};
-
-#[derive(Deserialize)]
-pub struct CreateUserRequest {
-    pub email: String,
-    pub name: String,
-    #[serde(default = "default_role")]
-    pub role: UserRole,
-}
-
-fn default_role() -> UserRole {
-    UserRole::User
-}
-
-#[derive(Serialize)]
-pub struct UserResponse {
-    pub user: User,
-}
+use crate::login_allowlist::AllowedLogin;
+use crate::user_store::User;
 
 #[derive(Serialize)]
 pub struct UsersListResponse {
     pub users: Vec<User>,
+}
+
+#[derive(Deserialize)]
+pub struct AllowlistRequest {
+    pub email: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AllowlistEntryResponse {
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<chrono::DateTime<Utc>>,
+    pub registered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_login_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+pub struct AllowlistResponse {
+    pub entries: Vec<AllowlistEntryResponse>,
 }
 
 #[derive(Serialize)]
@@ -52,65 +67,121 @@ pub async fn list_users(
     Ok(Json(UsersListResponse { users }))
 }
 
-/// POST /api/admin/users
-pub async fn create_user(
+/// GET /api/admin/allowed-emails
+pub async fn list_allowed_emails(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<(StatusCode, Json<UserResponse>), StatusCode> {
-    let us = state
-        .user_store
+) -> Result<Json<AllowlistResponse>, StatusCode> {
+    let allowlist = state
+        .allowlist_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let entries = allowlist
+        .list()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let user_store = state.user_store.as_ref();
+    let mapped = entries
+        .into_iter()
+        .map(|entry| {
+            let registered_user =
+                user_store.and_then(|store| store.get_by_email(&entry.email).ok().flatten());
+            AllowlistEntryResponse {
+                email: entry.email,
+                note: entry.note,
+                created_at: entry.created_at,
+                claimed_user_id: entry.claimed_user_id,
+                claimed_at: entry.claimed_at,
+                registered: registered_user.is_some(),
+                registered_user_id: registered_user.as_ref().map(|user| user.id.clone()),
+                registered_name: registered_user.as_ref().map(|user| user.name.clone()),
+                last_login_at: registered_user.and_then(|user| user.last_login_at),
+            }
+        })
+        .collect();
+    Ok(Json(AllowlistResponse { entries: mapped }))
+}
 
-    // Check if email already registered
-    if let Ok(Some(_)) = us.get_by_email(&req.email) {
-        tracing::warn!(email = %req.email, "create_user: email already registered");
+/// POST /api/admin/allowed-emails
+pub async fn add_allowed_email(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AllowlistRequest>,
+) -> Result<(StatusCode, Json<AllowlistEntryResponse>), StatusCode> {
+    let allowlist = state
+        .allowlist_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let email = crate::login_allowlist::normalize_email(&req.email);
+    super::admin::validate_email(&email).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if allowlist
+        .contains(&email)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         return Err(StatusCode::CONFLICT);
     }
 
-    // Generate unique ID from email
-    let base_id = email_to_user_id(&req.email);
-    let mut id = base_id.clone();
-    let mut suffix = 1u32;
-    while us.get(&id).unwrap_or(None).is_some() {
-        id = format!("{base_id}-{suffix}");
-        suffix += 1;
-    }
-
-    let user = User {
-        id,
-        email: req.email.to_lowercase(),
-        name: req.name,
-        role: req.role,
-        created_at: Utc::now(),
-        last_login_at: None,
-    };
-
-    us.save(&user).map_err(|e| {
-        tracing::error!(email = %user.email, error = %e, "create_user: failed to save user");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    tracing::info!(user_id = %user.id, email = %user.email, role = ?user.role, "create_user: user created");
-
-    // Also create a default profile for the user
-    if let Some(ref ps) = state.profile_store {
-        let profile = crate::profiles::UserProfile {
-            id: user.id.clone(),
-            name: user.name.clone(),
-            enabled: false,
-            data_dir: None,
-            parent_id: None,
-            config: crate::profiles::ProfileConfig::default(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        if let Err(e) = ps.save(&profile) {
-            tracing::warn!(user_id = %user.id, error = %e, "failed to create profile for new user");
+    if let Some(user_store) = state.user_store.as_ref() {
+        if user_store
+            .get_by_email(&email)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .is_some()
+        {
+            return Err(StatusCode::CONFLICT);
         }
     }
 
-    Ok((StatusCode::CREATED, Json(UserResponse { user })))
+    let entry = AllowedLogin {
+        email: email.clone(),
+        note: req.note.and_then(|note| {
+            let trimmed = note.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }),
+        created_at: Utc::now(),
+        claimed_user_id: None,
+        claimed_at: None,
+    };
+    allowlist
+        .save(&entry)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AllowlistEntryResponse {
+            email,
+            note: entry.note,
+            created_at: entry.created_at,
+            claimed_user_id: None,
+            claimed_at: None,
+            registered: false,
+            registered_user_id: None,
+            registered_name: None,
+            last_login_at: None,
+        }),
+    ))
+}
+
+/// DELETE /api/admin/allowed-emails/{email}
+pub async fn delete_allowed_email(
+    State(state): State<Arc<AppState>>,
+    Path(email): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let allowlist = state
+        .allowlist_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    match allowlist
+        .delete(&email)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        true => Ok(Json(ActionResponse {
+            ok: true,
+            message: None,
+        })),
+        false => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 /// DELETE /api/admin/users/{id}
@@ -123,17 +194,14 @@ pub async fn delete_user(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    // Stop gateway if running
     if let Some(ref pm) = state.process_manager {
         let _ = pm.stop(&id).await;
     }
 
-    // Delete profile
     if let Some(ref ps) = state.profile_store {
         let _ = ps.delete(&id);
     }
 
-    // Delete user
     match us.delete(&id) {
         Ok(true) => {
             tracing::info!(user_id = %id, "delete_user: user deleted");
@@ -156,45 +224,6 @@ pub async fn delete_user(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn create_user_request_deserialize_defaults() {
-        let json = r#"{"email": "alice@example.com", "name": "Alice"}"#;
-        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.email, "alice@example.com");
-        assert_eq!(req.name, "Alice");
-        assert!(matches!(req.role, UserRole::User));
-    }
-
-    #[test]
-    fn create_user_request_deserialize_admin_role() {
-        let json = r#"{"email": "admin@co.com", "name": "Admin", "role": "admin"}"#;
-        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.role, UserRole::Admin));
-    }
-
-    #[test]
-    fn default_role_is_user() {
-        assert!(matches!(default_role(), UserRole::User));
-    }
-
-    #[test]
-    fn user_response_serialize() {
-        let resp = UserResponse {
-            user: User {
-                id: "u1".into(),
-                email: "a@b.com".into(),
-                name: "Test".into(),
-                role: UserRole::User,
-                created_at: chrono::Utc::now(),
-                last_login_at: None,
-            },
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["user"]["id"], "u1");
-        assert_eq!(json["user"]["email"], "a@b.com");
-        assert_eq!(json["user"]["name"], "Test");
-    }
 
     #[test]
     fn users_list_response_serialize() {

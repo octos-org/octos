@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig};
 
+pub const MAX_SUB_ACCOUNTS_PER_PARENT: usize = 10;
+
 /// A user profile with all configuration needed to run a gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -567,6 +569,13 @@ impl ProfileStore {
         let _parent = self
             .get(parent_id)?
             .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?;
+
+        let existing_subs = self.list_sub_accounts(parent_id)?;
+        if existing_subs.len() >= MAX_SUB_ACCOUNTS_PER_PARENT {
+            bail!(
+                "profile '{parent_id}' already has the maximum of {MAX_SUB_ACCOUNTS_PER_PARENT} sub-accounts"
+            );
+        }
 
         let sub_id = format!("{parent_id}--{}", slugify(sub_name));
         validate_profile_id(&sub_id)?;

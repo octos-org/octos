@@ -23,6 +23,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::content_catalog::ContentCatalogManager;
+use crate::login_allowlist::LoginAllowlistStore;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
@@ -94,6 +95,8 @@ pub struct AppState {
     pub process_manager: Option<Arc<ProcessManager>>,
     /// User store for multi-user management.
     pub user_store: Option<Arc<UserStore>>,
+    /// Allowlist for pre-authorized email-based signup.
+    pub allowlist_store: Option<Arc<LoginAllowlistStore>>,
     /// Auth manager for email OTP and sessions.
     pub auth_manager: Option<Arc<AuthManager>>,
     /// Shared HTTP client for webhook proxying.

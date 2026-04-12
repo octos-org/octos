@@ -14,7 +14,7 @@ use super::AppState;
 use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
 
 /// Basic email format validation.
-fn validate_email(email: &str) -> Result<(), String> {
+pub(crate) fn validate_email(email: &str) -> Result<(), String> {
     if email.len() > 254 {
         return Err("Email address too long (max 254 chars)".into());
     }
@@ -3537,6 +3537,7 @@ mod register_tenant_email_tests {
             profile_store: None,
             process_manager: None,
             user_store: Some(user_store),
+            allowlist_store: None,
             auth_manager,
             http_client: reqwest::Client::new(),
             config_path: None,
@@ -3687,6 +3688,7 @@ mod register_flow_tests {
             profile_store: None,
             process_manager: None,
             user_store: Some(user_store.clone()),
+            allowlist_store: None,
             auth_manager: None,
             http_client: reqwest::Client::new(),
             config_path: None,
