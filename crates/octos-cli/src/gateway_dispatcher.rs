@@ -159,11 +159,18 @@ impl GatewayDispatcher {
                             } else {
                                 project_name
                             };
-                            crate::project_templates::scaffold_slides_project(
+                            match crate::project_templates::scaffold_slides_project(
                                 &workspace_root,
                                 project_name,
-                            );
-                            template_reply
+                            ) {
+                                Ok(_) => template_reply,
+                                Err(error) => {
+                                    warn!(topic = name, "slides scaffold failed: {error}");
+                                    format!(
+                                        "{template_reply}\n\nSlides git/bootstrap failed: {error}"
+                                    )
+                                }
+                            }
                         }
                         None => format!("Switched to session: {name}"),
                     }

@@ -128,6 +128,53 @@ fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+fn git_turn_summary(content: &str) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "agent turn update".to_string()
+    } else {
+        compact
+    }
+}
+
+async fn snapshot_workspace_turn_for_path(
+    session_key: &SessionKey,
+    workspace_root: std::path::PathBuf,
+    turn_summary: &str,
+) {
+    let turn_summary = git_turn_summary(turn_summary);
+
+    match tokio::task::spawn_blocking(move || {
+        octos_agent::snapshot_workspace_turn(&workspace_root, &turn_summary)
+    })
+    .await
+    {
+        Ok(Ok(committed)) => {
+            if !committed.is_empty() {
+                info!(
+                    session = %session_key,
+                    repos = ?committed,
+                    "workspace git turn snapshot committed"
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace git turn snapshot failed"
+            );
+        }
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace git turn snapshot task failed"
+            );
+        }
+    }
+}
+
 // ── Messages ────────────────────────────────────────────────────────────────
 
 /// Messages dispatched to a session actor.
@@ -697,7 +744,11 @@ impl ActorFactory {
             } else {
                 project_name
             };
-            crate::project_templates::scaffold_slides_project(&user_workspace, project_name);
+            if let Err(error) =
+                crate::project_templates::scaffold_slides_project(&user_workspace, project_name)
+            {
+                warn!(session = %session_key, "slides scaffold failed in workspace: {error}");
+            }
 
             // Copy built-in style templates into workspace/styles/ so the
             // agent's glob("styles/*.toml") can discover them.
@@ -999,6 +1050,15 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn snapshot_workspace_turn_if_needed(&self, turn_summary: &str) {
+        snapshot_workspace_turn_for_path(
+            &self.session_key,
+            self.user_workspace.clone(),
+            turn_summary,
+        )
+        .await;
+    }
+
     /// Check if this session is currently the active session for its chat.
     /// When inactive, streaming edits bypass the pending buffer, so we must
     /// skip streaming and let the reply go through the proxy path.
@@ -2512,6 +2572,9 @@ impl SessionActor {
             }
         }
 
+        self.snapshot_workspace_turn_if_needed(&inbound.content)
+            .await;
+
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
         // observe the shutdown signal during its iteration loop.
@@ -2592,6 +2655,7 @@ impl SessionActor {
         let history = pre_primary_history.to_vec();
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
+        let user_workspace = self.user_workspace.clone();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -2687,6 +2751,8 @@ impl SessionActor {
                     session = %session_key,
                     "overflow task cancelled by command, suppressing response"
                 );
+                snapshot_workspace_turn_for_path(&session_key, user_workspace.clone(), &content)
+                    .await;
                 // Still decrement and return — skip sending any reply.
                 overflow_counter.fetch_sub(1, Ordering::Release);
                 return;
@@ -2777,6 +2843,8 @@ impl SessionActor {
                         .await;
                 }
             }
+
+            snapshot_workspace_turn_for_path(&session_key, user_workspace, &content).await;
             // Decrement active overflow counter
             overflow_counter.fetch_sub(1, Ordering::Release);
         });
@@ -3126,6 +3194,9 @@ impl SessionActor {
                     .await;
             }
         }
+
+        self.snapshot_workspace_turn_if_needed(&inbound.content)
+            .await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);

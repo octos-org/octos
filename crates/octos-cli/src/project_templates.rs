@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use octos_agent::{WorkspaceProjectKind, initialize_and_commit};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -27,19 +28,22 @@ const SESSION_PROMPTS_DIR: &str = "session_prompts";
 /// Creates the following structure:
 /// ```text
 /// slides/<slug>/
-///   history/       — versioned script snapshots
+///   history/       — optional manual exports (git is the primary history)
 ///   output/        — generated PPTX files
 ///   assets/        — images, logos, branding
 ///   memory.md      — project-level memory
 ///   changelog.md   — edit history
 ///   script.js      — slide generation script template
 /// ```
-pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
+pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
     let slug = slugify(project_name);
     let project_dir = data_dir.join("slides").join(&slug);
-    std::fs::create_dir_all(project_dir.join("history")).ok();
-    std::fs::create_dir_all(project_dir.join("output")).ok();
-    std::fs::create_dir_all(project_dir.join("assets")).ok();
+    std::fs::create_dir_all(project_dir.join("history"))
+        .map_err(|e| format!("create slides history dir failed: {e}"))?;
+    std::fs::create_dir_all(project_dir.join("output"))
+        .map_err(|e| format!("create slides output dir failed: {e}"))?;
+    std::fs::create_dir_all(project_dir.join("assets"))
+        .map_err(|e| format!("create slides assets dir failed: {e}"))?;
 
     // Only write template files if they don't exist yet — avoid
     // overwriting LLM-written content on session actor restart.
@@ -50,11 +54,13 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
             "# {} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {}\n- Slides: 0\n",
             project_name, today
         );
-        std::fs::write(&memory_path, &memory).ok();
+        std::fs::write(&memory_path, &memory)
+            .map_err(|e| format!("write slides memory.md failed: {e}"))?;
     }
 
     if !project_dir.join("changelog.md").exists() {
-        std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n").ok();
+        std::fs::write(project_dir.join("changelog.md"), "# Changelog\n\n")
+            .map_err(|e| format!("write slides changelog.md failed: {e}"))?;
     }
 
     // Empty script.js — LLM MUST write real content before mofa_slides can run.
@@ -62,6 +68,9 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
     if !script_path.exists() {
         let template = format!(
             r#"// {} -- Slides Generation Script
+// version: v001_initial
+// updated_at: {}
+// change_summary: Initial scaffold created by /new slides
 // EMPTY: The agent must write slide content here before generating.
 // Use mofa_slides with input pointing to this file after writing content.
 //
@@ -73,13 +82,22 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> PathBuf {
 
 module.exports = [];
 "#,
-            project_name
+            project_name,
+            chrono::Utc::now().format("%Y-%m-%d")
         );
-        std::fs::write(&script_path, &template).ok();
+        std::fs::write(&script_path, &template)
+            .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
+    initialize_and_commit(
+        &project_dir,
+        WorkspaceProjectKind::Slides,
+        "Initialize slides workspace",
+    )
+    .map_err(|e| format!("initialize slides git repo failed: {e}"))?;
+
     info!(project = %project_name, slug = %slug, "scaffolded slides project");
-    project_dir
+    Ok(project_dir)
 }
 
 /// Build the user-facing reply after scaffolding a slides project.
@@ -90,6 +108,7 @@ pub fn slides_creation_reply(project_name: &str) -> String {
          Project directory: slides/{slug}/\n\
          Script: slides/{slug}/script.js\n\
          Memory: slides/{slug}/memory.md\n\n\
+         Local git history is enabled in slides/{slug}/.\n\n\
          Let me help you design your slides. I'll check available style templates first,\n\
          then we'll design the content together."
     )
@@ -118,7 +137,15 @@ RULES:
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
 - Read slides/{slug}/memory.md before each response for context.
-- After edits: update memory.md. Before edits: copy script.js to history/v{{NNN}}_{{desc}}.js.
+- Maintain a version header at the top of slides/{slug}/script.js:
+  // version: v{{NNN}}_{{desc}}
+  // updated_at: YYYY-MM-DD
+  // change_summary: <one line>
+- Local git is already initialized in slides/{slug}/ and is the primary revision history.
+- Do NOT create ad hoc versioned JS filenames as the main history mechanism.
+- On every meaningful edit: increment NNN, update the script.js version header, append the same version tag to changelog.md, and rely on git auto-commits for revision history.
+- After edits: update memory.md.
+- If the user asks for change history, inspect it with shell("git -C slides/{slug} log --oneline -- script.js changelog.md memory.md").
 
 STYLE TOML — create at styles/{{name}}.toml when user wants a custom style:
 ```toml
@@ -485,6 +512,7 @@ WORKFLOW:
 2. Preserve the selected framework: {template}
 3. Maintain the extracted structure while removing private/source-specific branding
 4. After source edits, rebuild the site so the iframe preview stays current
+5. Local git is already initialized in sites/{site_slug}/; rely on git auto-commits for revision history instead of ad hoc backup files
 
 BUILD RULES:
 - {template}: build output dir is sites/{site_slug}/{build_output_dir}/
@@ -500,6 +528,7 @@ EXPECTATIONS:
 - Keep the preview working under a session-scoped subpath
 - Prefer editing existing scaffold files over recreating the project
 - When adding pages, keep navigation and internal links aligned with the build path
+- If the user asks for change history, inspect it with shell("git -C sites/{site_slug} log --oneline -- .")
 
 Tools: read_file, write_file, edit_file, shell, glob
 "#,
@@ -759,6 +788,12 @@ pub fn scaffold_site_project(
         .ok_or_else(|| "mofa-site skill directory not found".to_string())?;
     run_site_bootstrap(&skill_dir, &project_dir, &metadata)?;
     write_site_support_files(&project_dir, &metadata)?;
+    initialize_and_commit(
+        &project_dir,
+        WorkspaceProjectKind::Sites,
+        "Initialize site workspace",
+    )
+    .map_err(|e| format!("initialize site git repo failed: {e}"))?;
 
     info!(
         session_id = %session_id,
@@ -778,6 +813,7 @@ pub fn site_creation_reply(metadata: &SiteProjectMetadata) -> String {
          Template: {template}\n\
          Preview route: {preview_url}\n\
          Session metadata: {project_dir}/{session_file}\n\n\
+         Local git history is enabled in {project_dir}/.\n\n\
          The scaffold is ready. Edit the source files and refresh the iframe preview to see the built site.",
         site_name = metadata.site_name,
         project_dir = metadata.project_dir,
@@ -814,7 +850,7 @@ mod tests {
     #[test]
     fn should_scaffold_slides_project_directories() {
         let tmp = tempfile::tempdir().unwrap();
-        let project_dir = scaffold_slides_project(tmp.path(), "test-deck");
+        let project_dir = scaffold_slides_project(tmp.path(), "test-deck").unwrap();
 
         assert!(project_dir.join("history").is_dir());
         assert!(project_dir.join("output").is_dir());
@@ -822,6 +858,8 @@ mod tests {
         assert!(project_dir.join("memory.md").is_file());
         assert!(project_dir.join("changelog.md").is_file());
         assert!(project_dir.join("script.js").is_file());
+        assert!(project_dir.join(".git").is_dir());
+        assert!(project_dir.join(".gitignore").is_file());
 
         let memory = std::fs::read_to_string(project_dir.join("memory.md")).unwrap();
         assert!(memory.contains("test-deck"));
@@ -835,13 +873,13 @@ mod tests {
     #[test]
     fn should_scaffold_idempotently() {
         let tmp = tempfile::tempdir().unwrap();
-        scaffold_slides_project(tmp.path(), "deck");
+        scaffold_slides_project(tmp.path(), "deck").unwrap();
         // Modify a file and ensure re-scaffold preserves user edits.
         let memory_path = tmp.path().join("slides/deck/memory.md");
         std::fs::write(&memory_path, "custom content").unwrap();
 
         // Re-scaffold keeps existing files intact.
-        scaffold_slides_project(tmp.path(), "deck");
+        scaffold_slides_project(tmp.path(), "deck").unwrap();
         let content = std::fs::read_to_string(&memory_path).unwrap();
         assert_eq!(content, "custom content");
     }
@@ -895,6 +933,7 @@ mod tests {
         assert!(reply.contains("Q4 Report"));
         assert!(reply.contains("slides/q4-report/"));
         assert!(reply.contains("Let me help you design your slides"));
+        assert!(reply.contains("Local git history is enabled"));
     }
 
     #[test]
