@@ -204,6 +204,19 @@ mod tests {
         }
     }
 
+    fn make_sub_profile(id: &str, parent_id: &str) -> UserProfile {
+        UserProfile {
+            id: id.to_string(),
+            name: format!("Sub {id}"),
+            enabled: true,
+            data_dir: None,
+            parent_id: Some(parent_id.to_string()),
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
     fn make_user(id: &str, email: &str) -> User {
         User {
             id: id.to_string(),
@@ -354,5 +367,36 @@ mod tests {
         // Second run: returns Ok(None) because the profile is gone
         let second = purge_by_profile_id(&state, pid).await.expect("second purge");
         assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_cascade_purge_to_sub_accounts() {
+        let (_temp, state) = build_test_state();
+        let parent_id = "parent";
+        let sub1 = "sub1";
+        let sub2 = "sub2";
+
+        let ps = state.profile_store.as_ref().unwrap();
+        ps.save(&make_profile(parent_id)).unwrap();
+        ps.save(&make_sub_profile(sub1, parent_id)).unwrap();
+        ps.save(&make_sub_profile(sub2, parent_id)).unwrap();
+
+        // Drop fake data in each sub-account's data dir
+        for sub_id in [sub1, sub2] {
+            let sub = ps.get(sub_id).unwrap().unwrap();
+            let dir = ps.resolve_data_dir(&sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("data.bin"), b"x").unwrap();
+        }
+
+        purge_by_profile_id(&state, parent_id)
+            .await
+            .expect("purge")
+            .expect("Some(report)");
+
+        // All three profiles gone
+        assert!(ps.get(parent_id).unwrap().is_none());
+        assert!(ps.get(sub1).unwrap().is_none());
+        assert!(ps.get(sub2).unwrap().is_none());
     }
 }
