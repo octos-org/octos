@@ -3,6 +3,11 @@ use std::process::Command;
 
 use eyre::{eyre, Result, WrapErr};
 
+use crate::workspace_policy::{
+    read_workspace_policy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    WorkspaceVersionControlProvider,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceProjectKind {
     Slides,
@@ -39,6 +44,27 @@ pub struct WorkspaceRepo {
     pub kind: WorkspaceProjectKind,
     pub root: PathBuf,
     pub slug: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct WorkspaceTurnSnapshotReport {
+    pub committed: Vec<String>,
+    pub enforced_failures: Vec<WorkspaceTurnSnapshotFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceTurnSnapshotFailure {
+    pub repo_label: String,
+    pub error: String,
+}
+
+enum WorkspaceTurnSnapshotPlan {
+    LegacyGit,
+    PolicyGit {
+        auto_init: bool,
+        fail_on_error: bool,
+    },
+    Skip,
 }
 
 pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<WorkspaceRepo> {
@@ -78,23 +104,12 @@ pub fn init_workspace_repo(project_root: &Path, kind: WorkspaceProjectKind) -> R
 }
 
 pub fn commit_all_if_dirty(project_root: &Path, message: &str) -> Result<bool> {
-    init_workspace_repo(project_root, infer_kind_from_root(project_root)?)
-        .wrap_err("ensure git repo failed")?;
-    run_git(project_root, &["add", "-A", "--", "."])?;
-
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["diff", "--cached", "--quiet", "--", "."])
-        .status()
-        .wrap_err("git diff --cached failed")?;
-
-    if status.success() {
-        return Ok(false);
-    }
-
-    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-    Ok(true)
+    commit_all_if_dirty_with_options(
+        project_root,
+        infer_kind_from_root(project_root)?,
+        message,
+        true,
+    )
 }
 
 pub fn initialize_and_commit(
@@ -195,20 +210,111 @@ pub fn list_workspace_repos(base_dir: &Path) -> Result<Vec<WorkspaceRepo>> {
     Ok(repos)
 }
 
-pub fn snapshot_workspace_turn(base_dir: &Path, summary: &str) -> Result<Vec<String>> {
+pub fn snapshot_workspace_turn(
+    base_dir: &Path,
+    summary: &str,
+) -> Result<WorkspaceTurnSnapshotReport> {
     let repos = list_workspace_repos(base_dir)?;
-    let mut committed = Vec::new();
+    let mut report = WorkspaceTurnSnapshotReport::default();
     let summary = normalize_turn_summary(summary);
 
     for repo in repos {
         let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
         let message = format!("Turn snapshot for {repo_label}: {summary}");
-        if commit_all_if_dirty(&repo.root, &message)? {
-            committed.push(repo_label);
+        match snapshot_plan_for_repo(&repo) {
+            Ok(WorkspaceTurnSnapshotPlan::Skip) => {}
+            Ok(WorkspaceTurnSnapshotPlan::LegacyGit) => {
+                if commit_all_if_dirty(&repo.root, &message)? {
+                    report.committed.push(repo_label);
+                }
+            }
+            Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
+                auto_init,
+                fail_on_error,
+            }) => {
+                match commit_all_if_dirty_with_options(&repo.root, repo.kind, &message, auto_init) {
+                    Ok(true) => report.committed.push(repo_label),
+                    Ok(false) => {}
+                    Err(error) => {
+                        if fail_on_error {
+                            report.enforced_failures.push(WorkspaceTurnSnapshotFailure {
+                                repo_label,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                report.enforced_failures.push(WorkspaceTurnSnapshotFailure {
+                    repo_label,
+                    error: error.to_string(),
+                });
+            }
         }
     }
 
-    Ok(committed)
+    Ok(report)
+}
+
+fn commit_all_if_dirty_with_options(
+    project_root: &Path,
+    kind: WorkspaceProjectKind,
+    message: &str,
+    auto_init: bool,
+) -> Result<bool> {
+    if auto_init {
+        init_workspace_repo(project_root, kind).wrap_err("ensure git repo failed")?;
+    } else if !project_root.join(".git").exists() {
+        return Err(eyre!(
+            "workspace policy requires git repo at {}, but auto_init is disabled",
+            project_root.display()
+        ));
+    }
+
+    run_git(project_root, &["add", "-A", "--", "."])?;
+
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["diff", "--cached", "--quiet", "--", "."])
+        .status()
+        .wrap_err("git diff --cached failed")?;
+
+    if status.success() {
+        return Ok(false);
+    }
+
+    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
+    Ok(true)
+}
+
+fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotPlan> {
+    let Some(policy) = read_workspace_policy(&repo.root)? else {
+        return Ok(WorkspaceTurnSnapshotPlan::LegacyGit);
+    };
+
+    if !policy.workspace.kind.matches_project_kind(repo.kind) {
+        return Err(eyre!(
+            "workspace policy kind mismatch for {}: expected {}, found {}",
+            repo.root.display(),
+            WorkspacePolicyKind::from(repo.kind).as_str(),
+            policy.workspace.kind.as_str(),
+        ));
+    }
+
+    if policy.version_control.provider != WorkspaceVersionControlProvider::Git {
+        return Ok(WorkspaceTurnSnapshotPlan::Skip);
+    }
+
+    if policy.version_control.trigger != WorkspaceSnapshotTrigger::TurnEnd {
+        return Ok(WorkspaceTurnSnapshotPlan::Skip);
+    }
+
+    Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
+        auto_init: policy.version_control.auto_init,
+        fail_on_error: policy.version_control.fail_on_error,
+    })
 }
 
 fn infer_kind_from_root(project_root: &Path) -> Result<WorkspaceProjectKind> {
@@ -298,6 +404,7 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_policy::{write_workspace_policy, WorkspacePolicy};
 
     #[test]
     fn detects_slides_repo_from_changed_path() {
@@ -359,11 +466,44 @@ mod tests {
         std::fs::create_dir_all(&sites_root).unwrap();
         std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
         std::fs::write(sites_root.join("index.html"), "<h1>hello</h1>\n").unwrap();
+        write_workspace_policy(
+            &slides_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        write_workspace_policy(
+            &sites_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites),
+        )
+        .unwrap();
 
-        let committed = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
 
-        assert_eq!(committed, vec!["sites/newsbot", "slides/deck-a"]);
+        assert_eq!(report.committed, vec!["sites/newsbot", "slides/deck-a"]);
+        assert!(report.enforced_failures.is_empty());
         assert!(slides_root.join(".git").exists());
         assert!(sites_root.join(".git").exists());
+    }
+
+    #[test]
+    fn reports_malformed_policy_as_enforced_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-a");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(
+            slides_root.join(".octos-workspace.toml"),
+            "[workspace]\nkind = \"slides\"\n[version_control]\nprovider = ",
+        )
+        .unwrap();
+
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+
+        assert!(report.committed.is_empty());
+        assert_eq!(report.enforced_failures.len(), 1);
+        assert_eq!(report.enforced_failures[0].repo_label, "slides/deck-a");
+        assert!(report.enforced_failures[0]
+            .error
+            .contains("parse workspace policy failed"));
     }
 }

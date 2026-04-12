@@ -141,7 +141,7 @@ async fn snapshot_workspace_turn_for_path(
     session_key: &SessionKey,
     workspace_root: std::path::PathBuf,
     turn_summary: &str,
-) {
+) -> Option<String> {
     let turn_summary = git_turn_summary(turn_summary);
 
     match tokio::task::spawn_blocking(move || {
@@ -149,30 +149,79 @@ async fn snapshot_workspace_turn_for_path(
     })
     .await
     {
-        Ok(Ok(committed)) => {
-            if !committed.is_empty() {
+        Ok(Ok(report)) => {
+            if !report.committed.is_empty() {
                 info!(
                     session = %session_key,
-                    repos = ?committed,
-                    "workspace git turn snapshot committed"
+                    repos = ?report.committed,
+                    "workspace turn snapshot committed"
                 );
             }
+            if report.enforced_failures.is_empty() {
+                return None;
+            }
+
+            let repo_labels = report
+                .enforced_failures
+                .iter()
+                .map(|failure| failure.repo_label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let first_error = report
+                .enforced_failures
+                .first()
+                .map(|failure| failure.error.as_str())
+                .unwrap_or("unknown error");
+            warn!(
+                session = %session_key,
+                failures = ?report.enforced_failures,
+                "workspace turn snapshot enforcement failed"
+            );
+            Some(format!(
+                "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
+            ))
         }
         Ok(Err(error)) => {
             warn!(
                 session = %session_key,
                 error = %error,
-                "workspace git turn snapshot failed"
+                "workspace turn snapshot failed"
             );
+            Some(format!(
+                "Workspace versioning failed. Turn snapshot was not recorded.\nError: {error}"
+            ))
         }
         Err(error) => {
             warn!(
                 session = %session_key,
                 error = %error,
-                "workspace git turn snapshot task failed"
+                "workspace turn snapshot task failed"
             );
+            Some(format!(
+                "Workspace versioning task failed. Turn snapshot was not recorded.\nError: {error}"
+            ))
         }
     }
+}
+
+async fn emit_workspace_snapshot_notice(
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    channel: &str,
+    chat_id: &str,
+    reply_to: Option<String>,
+    sender_user_id: Option<&str>,
+    content: String,
+) {
+    let _ = out_tx
+        .send(OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content,
+            reply_to,
+            media: vec![],
+            metadata: system_notice_metadata(sender_user_id),
+        })
+        .await;
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -1050,13 +1099,28 @@ struct SessionActor {
 }
 
 impl SessionActor {
-    async fn snapshot_workspace_turn_if_needed(&self, turn_summary: &str) {
-        snapshot_workspace_turn_for_path(
+    async fn snapshot_workspace_turn_if_needed(
+        &self,
+        turn_summary: &str,
+        reply_to: Option<String>,
+    ) {
+        if let Some(notice) = snapshot_workspace_turn_for_path(
             &self.session_key,
             self.user_workspace.clone(),
             turn_summary,
         )
-        .await;
+        .await
+        {
+            emit_workspace_snapshot_notice(
+                &self.out_tx,
+                &self.channel,
+                &self.chat_id,
+                reply_to,
+                self.sender_user_id.as_deref(),
+                notice,
+            )
+            .await;
+        }
     }
 
     /// Check if this session is currently the active session for its chat.
@@ -2572,7 +2636,7 @@ impl SessionActor {
             }
         }
 
-        self.snapshot_workspace_turn_if_needed(&inbound.content)
+        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
@@ -2751,8 +2815,20 @@ impl SessionActor {
                     session = %session_key,
                     "overflow task cancelled by command, suppressing response"
                 );
-                snapshot_workspace_turn_for_path(&session_key, user_workspace.clone(), &content)
+                if let Some(notice) =
+                    snapshot_workspace_turn_for_path(&session_key, user_workspace.clone(), &content)
+                        .await
+                {
+                    emit_workspace_snapshot_notice(
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        sender_user_id.as_deref(),
+                        notice,
+                    )
                     .await;
+                }
                 // Still decrement and return — skip sending any reply.
                 overflow_counter.fetch_sub(1, Ordering::Release);
                 return;
@@ -2807,10 +2883,10 @@ impl SessionActor {
                     if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx
                             .send(OutboundMessage {
-                                channel,
-                                chat_id,
+                                channel: channel.clone(),
+                                chat_id: chat_id.clone(),
                                 content: reply,
-                                reply_to: overflow_reply_to,
+                                reply_to: overflow_reply_to.clone(),
                                 media: vec![],
                                 metadata: serde_json::json!({}),
                             })
@@ -2821,10 +2897,10 @@ impl SessionActor {
                     tracing::error!(session = %session_key, error = %e, "overflow agent task failed");
                     let _ = out_tx
                         .send(OutboundMessage {
-                            channel,
-                            chat_id,
+                            channel: channel.clone(),
+                            chat_id: chat_id.clone(),
                             content: format!("Error: {e}"),
-                            reply_to: overflow_reply_to,
+                            reply_to: overflow_reply_to.clone(),
                             media: vec![],
                             metadata: serde_json::json!({}),
                         })
@@ -2833,10 +2909,10 @@ impl SessionActor {
                 Err(_) => {
                     let _ = out_tx
                         .send(OutboundMessage {
-                            channel,
-                            chat_id,
+                            channel: channel.clone(),
+                            chat_id: chat_id.clone(),
                             content: "Processing timed out.".to_string(),
-                            reply_to: overflow_reply_to,
+                            reply_to: overflow_reply_to.clone(),
                             media: vec![],
                             metadata: serde_json::json!({}),
                         })
@@ -2844,7 +2920,19 @@ impl SessionActor {
                 }
             }
 
-            snapshot_workspace_turn_for_path(&session_key, user_workspace, &content).await;
+            if let Some(notice) =
+                snapshot_workspace_turn_for_path(&session_key, user_workspace, &content).await
+            {
+                emit_workspace_snapshot_notice(
+                    &out_tx,
+                    &channel,
+                    &chat_id,
+                    overflow_reply_to.clone(),
+                    sender_user_id.as_deref(),
+                    notice,
+                )
+                .await;
+            }
             // Decrement active overflow counter
             overflow_counter.fetch_sub(1, Ordering::Release);
         });
@@ -3195,7 +3283,7 @@ impl SessionActor {
             }
         }
 
-        self.snapshot_workspace_turn_if_needed(&inbound.content)
+        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
 
         // Reset per-session cancellation flag so the next message starts fresh.

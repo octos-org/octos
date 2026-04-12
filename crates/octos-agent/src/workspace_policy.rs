@@ -26,6 +26,28 @@ pub enum WorkspacePolicyKind {
     Sites,
 }
 
+impl WorkspacePolicyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slides => "slides",
+            Self::Sites => "sites",
+        }
+    }
+
+    pub fn matches_project_kind(self, kind: WorkspaceProjectKind) -> bool {
+        self == Self::from(kind)
+    }
+}
+
+impl From<WorkspaceProjectKind> for WorkspacePolicyKind {
+    fn from(value: WorkspaceProjectKind) -> Self {
+        match value {
+            WorkspaceProjectKind::Slides => Self::Slides,
+            WorkspaceProjectKind::Sites => Self::Sites,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceVersionControlPolicy {
     pub provider: WorkspaceVersionControlProvider,
