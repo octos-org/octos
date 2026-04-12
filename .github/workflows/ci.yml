@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -81,6 +84,7 @@ jobs:
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   check-arm:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
@@ -105,6 +109,7 @@ jobs:
         run: cargo test --workspace
 
   check-riscv:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"
@@ -129,6 +134,7 @@ jobs:
         run: cargo test --workspace
 
   check-windows:
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
