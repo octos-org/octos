@@ -38,7 +38,7 @@ impl Tool for ManageSkillsTool {
         "admin_manage_skills"
     }
     fn description(&self) -> &str {
-        "Manage skills for a profile: list installed skills, install from GitHub (user/repo), or remove by name. Sub-accounts share their parent profile's skills."
+        "Manage customer-installed skills for exactly one profile or sub-account: list installed skills, install from GitHub (user/repo), or remove by name."
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({

@@ -24,6 +24,7 @@ pub mod process_manager;
 pub mod profiles;
 pub mod project_templates;
 pub mod session_actor;
+pub mod skills_scope;
 pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;
