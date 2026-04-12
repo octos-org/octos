@@ -6,28 +6,28 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::Json;
-use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use axum::Json;
+use axum::Router;
 use chrono::Utc;
 use eyre::Result;
 use octos_core::{
-    InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
+    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use crate::SessionManager;
 use crate::channel::Channel;
+use crate::SessionManager;
 
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
@@ -999,11 +999,9 @@ mod tests {
         let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
-        assert!(
-            history
-                .iter()
-                .any(|m| m.media.contains(&"/tmp/test.mp3".to_string()))
-        );
+        assert!(history
+            .iter()
+            .any(|m| m.media.contains(&"/tmp/test.mp3".to_string())));
     }
 
     #[tokio::test]

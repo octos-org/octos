@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{Result, WrapErr, eyre};
+use eyre::{eyre, Result, WrapErr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceProjectKind {

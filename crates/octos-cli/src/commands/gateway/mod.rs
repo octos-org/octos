@@ -32,8 +32,8 @@ use {
     octos_agent::{AgentConfig, ToolRegistry},
     octos_bus::{ActiveSessionStore, ChannelManager, CronService, SessionManager},
     profile_factory::ProfileActorFactoryBuilder,
-    std::sync::Arc,
     std::sync::atomic::{AtomicBool, AtomicUsize},
+    std::sync::Arc,
 };
 
 /// Run as a persistent gateway daemon.
