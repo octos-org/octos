@@ -95,6 +95,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
+        .route("/api/sessions/{id}/files", get(handlers::session_files))
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 

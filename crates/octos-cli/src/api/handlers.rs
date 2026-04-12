@@ -1,6 +1,6 @@
 //! API request handlers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -548,6 +548,83 @@ pub async fn session_tasks(
     Json(serde_json::json!([])).into_response()
 }
 
+#[derive(Serialize)]
+pub struct SessionFileInfo {
+    pub filename: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_at: String,
+}
+
+fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+
+        if metadata.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            collect_session_files(&path, out);
+            continue;
+        }
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        out.push(SessionFileInfo {
+            filename,
+            path: path.to_string_lossy().to_string(),
+            size_bytes: metadata.len(),
+            modified_at: modified_rfc3339(&metadata),
+        });
+    }
+}
+
+pub async fn session_files(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let data_dir = if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        sess.data_dir()
+    } else {
+        let identity = identity.as_ref().map(|ext| &ext.0);
+        match resolve_profile_data_dir(&state, &headers, identity).await {
+            Ok(data_dir) => data_dir,
+            Err(response) => return response,
+        }
+    };
+
+    let mut files = Vec::new();
+    for workspace in api_session_workspace_dirs(&data_dir, &id) {
+        if workspace.exists() {
+            collect_session_files(&workspace, &mut files);
+        }
+    }
+
+    files.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    files.dedup_by(|left, right| left.path == right.path);
+    Json(files).into_response()
+}
+
 /// DELETE /api/sessions/:id -- delete a session.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
@@ -916,9 +993,22 @@ fn api_session_workspace_dirs(
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let profile_id = infer_profile_id_from_data_dir(data_dir);
-    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
-    let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
-    vec![data_dir.join("users").join(encoded_base).join("workspace")]
+    let mut dirs = Vec::with_capacity(3);
+    let mut seen = HashSet::new();
+
+    for key in [
+        SessionKey::with_profile(&profile_id, "api", session_id),
+        SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id),
+        SessionKey::new("api", session_id),
+    ] {
+        let encoded_base = octos_bus::session::encode_path_component(key.base_key());
+        let path = data_dir.join("users").join(encoded_base).join("workspace");
+        if seen.insert(path.clone()) {
+            dirs.push(path);
+        }
+    }
+
+    dirs
 }
 
 #[cfg(test)]
@@ -2366,11 +2456,23 @@ mod tests {
         let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
         let dirs = api_session_workspace_dirs(base, "slides-123");
 
-        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs.len(), 3);
         assert_eq!(
             dirs[0],
             base.join("users")
                 .join("dspfac%3Aapi%3Aslides-123")
+                .join("workspace")
+        );
+        assert_eq!(
+            dirs[1],
+            base.join("users")
+                .join("_main%3Aapi%3Aslides-123")
+                .join("workspace")
+        );
+        assert_eq!(
+            dirs[2],
+            base.join("users")
+                .join("api%3Aslides-123")
                 .join("workspace")
         );
     }
