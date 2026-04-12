@@ -61,6 +61,7 @@ serde_yml = "0.0.12"
 base64 = "0.22"
 
 # Crypto
+md-5 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }

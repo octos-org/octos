@@ -2440,31 +2440,33 @@ pub async fn read_session(
 
     let max_lines = query.lines.min(200);
     let messages = session.get_history(max_lines);
-    let msg_json: Vec<serde_json::Value> =
-        messages
-            .iter()
-            .map(|m| {
-                let mut obj = serde_json::json!({
-                    "role": m.role.as_str(),
-                    "content": truncate_str(&m.content, 500),
-                });
-                if let Some(ref tc) = m.tool_calls {
-                    if !tc.is_empty() {
-                        obj["tool_calls"] =
-                            serde_json::json!(tc.iter().map(|t| {
-                        serde_json::json!({
-                            "name": t.name,
-                            "arguments": truncate_str(&t.arguments.to_string(), 200),
-                        })
-                    }).collect::<Vec<_>>());
-                    }
+    let msg_json: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            let mut obj = serde_json::json!({
+                "role": m.role.as_str(),
+                "content": truncate_str(&m.content, 500),
+            });
+            if let Some(ref tc) = m.tool_calls {
+                if !tc.is_empty() {
+                    obj["tool_calls"] = serde_json::json!(
+                        tc.iter()
+                            .map(|t| {
+                                serde_json::json!({
+                                    "name": t.name,
+                                    "arguments": truncate_str(&t.arguments.to_string(), 200),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    );
                 }
-                if let Some(ref name) = m.tool_call_id {
-                    obj["tool_call_id"] = serde_json::json!(name);
-                }
-                obj
-            })
-            .collect();
+            }
+            if let Some(ref name) = m.tool_call_id {
+                obj["tool_call_id"] = serde_json::json!(name);
+            }
+            obj
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "profile_id": id,
@@ -2958,7 +2960,7 @@ pub async fn create_tenant(
         id: req.name.clone(),
         name: req.name.clone(),
         subdomain: req.name.clone(),
-        tunnel_token: String::new(),
+        tunnel_token: uuid::Uuid::new_v4().to_string(),
         ssh_port,
         local_port: req.local_port,
         auth_token: format!(
@@ -3017,95 +3019,40 @@ pub async fn tenant_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script =
-        build_admin_tenant_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
+    let script = build_admin_tenant_setup_script(&tenant, domain, server);
 
     Ok(script)
-}
-
-fn shared_frps_token() -> Option<String> {
-    std::env::var("FRPS_TOKEN").ok().filter(|v| !v.is_empty())
 }
 
 fn build_admin_tenant_setup_script(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
-    frps_token: Option<&str>,
 ) -> String {
     let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
-    match frps_token {
-        Some(frps_token) => format!(
-            r#"#!/usr/bin/env bash
+    format!(
+        r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh with your tenant configuration pre-filled.
-# The shared FRPS token is injected server-side by the host.
+# Per-tenant tunnel token is embedded — no shared FRPS token needed.
 set -euo pipefail
 
 curl -fsSL "{install_url}" | bash -s -- \
     --tenant-name "{subdomain}" \
-    --frps-token "{frps_token}" \
+    --frps-token "{tunnel_token}" \
     --ssh-port {ssh_port} \
     --domain "{domain}" \
     --frps-server "{server}" \
     --auth-token "{auth_token}"
 "#,
-            subdomain = tenant.subdomain,
-            domain = domain,
-            server = server,
-            ssh_port = tenant.ssh_port,
-            install_url = install_url,
-            frps_token = frps_token,
-            auth_token = tenant.auth_token,
-        ),
-        None => format!(
-            r#"#!/usr/bin/env bash
-# Setup script for {subdomain}.{domain}
-# Downloads and runs install.sh with your tenant configuration pre-filled.
-#
-# Usage:
-#   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | FRPS_TOKEN=<token> bash
-#   curl -fsSL https://{domain}/api/admin/tenants/{id}/setup-script | bash -s -- --frps-token <token>
-set -euo pipefail
-
-# shared FRPS auth token — must be provided as env var, flag, or positional argument
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
-        *)            FRPS_TOKEN="${{FRPS_TOKEN:-$1}}"; shift ;;
-    esac
-done
-FRPS_TOKEN="${{FRPS_TOKEN:-}}"
-if [ -z "$FRPS_TOKEN" ]; then
-    echo ""
-    echo "ERROR: shared FRPS token required."
-    echo ""
-    echo "Usage:"
-    echo "  curl ... | FRPS_TOKEN=<token> bash"
-    echo "  curl ... | bash -s -- --frps-token <token>"
-    echo "  curl ... | bash -s -- <token>"
-    echo ""
-    echo "Your operator should provide the shared FRPS token during onboarding."
-    exit 1
-fi
-
-curl -fsSL "{install_url}" | bash -s -- \
-    --tenant-name "{subdomain}" \
-    --frps-token "$FRPS_TOKEN" \
-    --ssh-port {ssh_port} \
-    --domain "{domain}" \
-    --frps-server "{server}" \
-    --auth-token "{auth_token}"
-"#,
-            subdomain = tenant.subdomain,
-            domain = domain,
-            server = server,
-            ssh_port = tenant.ssh_port,
-            id = tenant.id,
-            install_url = install_url,
-            auth_token = tenant.auth_token,
-        ),
-    }
+        subdomain = tenant.subdomain,
+        domain = domain,
+        server = server,
+        ssh_port = tenant.ssh_port,
+        install_url = install_url,
+        tunnel_token = tenant.tunnel_token,
+        auth_token = tenant.auth_token,
+    )
 }
 
 // ── Self-service tenant registration (user-auth level) ──────────────
@@ -3200,7 +3147,7 @@ pub async fn register_tenant(
         id: req.name.clone(),
         name: req.name.clone(),
         subdomain: req.name.clone(),
-        tunnel_token: String::new(),
+        tunnel_token: uuid::Uuid::new_v4().to_string(),
         ssh_port,
         local_port: req.local_port,
         auth_token: format!(
@@ -3225,8 +3172,7 @@ pub async fn register_tenant(
     let mut email_sent = false;
     if !user_email.is_empty() {
         if let Some(auth_manager) = state.auth_manager.as_ref() {
-            let (subject, html) =
-                build_register_setup_email(&tenant, domain, server, shared_frps_token().as_deref());
+            let (subject, html) = build_register_setup_email(&tenant, domain, server);
             match auth_manager
                 .send_html_email(&user_email, &subject, &html)
                 .await
@@ -3247,14 +3193,8 @@ pub async fn register_tenant(
         }
     }
 
-    let unix_cmd =
-        build_register_setup_command_unix(&tenant, domain, shared_frps_token().as_deref());
-    let win_cmd = build_register_setup_command_windows(
-        &tenant,
-        domain,
-        server,
-        shared_frps_token().as_deref(),
-    );
+    let unix_cmd = build_register_setup_command_unix(&tenant, domain);
+    let win_cmd = build_register_setup_command_windows(&tenant, domain, server);
 
     Ok(Json(RegisterResponse {
         id: tenant.id.clone(),
@@ -3336,8 +3276,7 @@ pub async fn register_setup_script(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script =
-        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
+    let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
 }
@@ -3368,40 +3307,26 @@ pub async fn register_setup_script_public(
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
     let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
-    let script =
-        build_register_setup_script(&tenant, domain, server, shared_frps_token().as_deref());
+    let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
 }
 
-fn build_register_setup_command_unix(
-    tenant: &crate::tenant::TenantConfig,
-    domain: &str,
-    frps_token: Option<&str>,
-) -> String {
+fn build_register_setup_command_unix(tenant: &crate::tenant::TenantConfig, domain: &str) -> String {
     let setup_url = format!(
         "https://{domain}/api/register/setup-script/{id}/{auth_token}",
         domain = domain,
         id = tenant.id,
         auth_token = tenant.auth_token,
     );
-
-    match frps_token {
-        Some(_) => format!(r#"curl -fsSL "{setup_url}" | bash"#, setup_url = setup_url),
-        None => format!(
-            r#"curl -fsSL "{setup_url}" | FRPS_TOKEN=<shared-frps-token> bash"#,
-            setup_url = setup_url,
-        ),
-    }
+    format!(r#"curl -fsSL "{setup_url}" | bash"#, setup_url = setup_url)
 }
 
 fn build_register_setup_command_windows(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
-    frps_token: Option<&str>,
 ) -> String {
-    let frps_token = frps_token.unwrap_or("<shared-frps-token>");
     format!(
         r#"irm "https://github.com/octos-org/octos/releases/latest/download/install.ps1" -OutFile install.ps1; .\install.ps1 -Tunnel -AuthToken "{auth_token}" -Port {local_port} -TenantName "{subdomain}" -FrpsToken "{frps_token}" -SshPort {ssh_port} -TunnelDomain "{domain}" -FrpsServer "{server}""#,
         subdomain = tenant.subdomain,
@@ -3409,7 +3334,7 @@ fn build_register_setup_command_windows(
         server = server,
         ssh_port = tenant.ssh_port,
         auth_token = tenant.auth_token,
-        frps_token = frps_token,
+        frps_token = tenant.tunnel_token,
         local_port = tenant.local_port,
     )
 }
@@ -3418,16 +3343,13 @@ fn build_register_setup_script(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
-    frps_token: Option<&str>,
 ) -> String {
     let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
-    match frps_token {
-        Some(frps_token) => format!(
-            r#"#!/usr/bin/env bash
+    format!(
+        r#"#!/usr/bin/env bash
 # Setup script for {subdomain}.{domain}
 # Downloads and runs install.sh as a managed tenant bootstrap.
-# Tunnel is required for this registered machine. The shared FRPS token
-# is injected server-side by the host.
+# Per-tenant tunnel token is embedded — no shared FRPS token needed.
 set -euo pipefail
 
 curl -fsSL "{install_url}" | bash -s -- \
@@ -3435,67 +3357,20 @@ curl -fsSL "{install_url}" | bash -s -- \
     --auth-token "{auth_token}" \
     --port {local_port} \
     --tenant-name "{subdomain}" \
-    --frps-token "{frps_token}" \
+    --frps-token "{tunnel_token}" \
     --ssh-port {ssh_port} \
     --domain "{domain}" \
     --frps-server "{server}"
 "#,
-            subdomain = tenant.subdomain,
-            domain = domain,
-            install_url = install_url,
-            auth_token = tenant.auth_token,
-            local_port = tenant.local_port,
-            frps_token = frps_token,
-            ssh_port = tenant.ssh_port,
-            server = server,
-        ),
-        None => format!(
-            r#"#!/usr/bin/env bash
-# Setup script for {subdomain}.{domain}
-# Downloads and runs install.sh as a managed tenant bootstrap.
-# Tunnel is required for this registered machine and the shared FRPS token
-# must be provided by your operator.
-set -euo pipefail
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --frps-token) FRPS_TOKEN="${{2:-}}"; shift 2 ;;
-        *)            FRPS_TOKEN="${{FRPS_TOKEN:-$1}}"; shift ;;
-    esac
-done
-FRPS_TOKEN="${{FRPS_TOKEN:-}}"
-if [ -z "$FRPS_TOKEN" ]; then
-    echo ""
-    echo "ERROR: shared FRPS token required."
-    echo ""
-    echo "Usage:"
-    echo "  curl ... | FRPS_TOKEN=<token> bash"
-    echo "  curl ... | bash -s -- --frps-token <token>"
-    echo "  curl ... | bash -s -- <token>"
-    echo ""
-    echo "Your operator should provide the shared FRPS token."
-    exit 1
-fi
-
-curl -fsSL "{install_url}" | bash -s -- \
-    --tunnel \
-    --auth-token "{auth_token}" \
-    --port {local_port} \
-    --tenant-name "{subdomain}" \
-    --frps-token "$FRPS_TOKEN" \
-    --ssh-port {ssh_port} \
-    --domain "{domain}" \
-    --frps-server "{server}"
-"#,
-            subdomain = tenant.subdomain,
-            domain = domain,
-            install_url = install_url,
-            auth_token = tenant.auth_token,
-            local_port = tenant.local_port,
-            ssh_port = tenant.ssh_port,
-            server = server,
-        ),
-    }
+        subdomain = tenant.subdomain,
+        domain = domain,
+        install_url = install_url,
+        auth_token = tenant.auth_token,
+        local_port = tenant.local_port,
+        tunnel_token = tenant.tunnel_token,
+        ssh_port = tenant.ssh_port,
+        server = server,
+    )
 }
 
 /// Minimal HTML escaping for values interpolated into email HTML.
@@ -3510,24 +3385,16 @@ fn build_register_setup_email(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
     server: &str,
-    frps_token: Option<&str>,
 ) -> (String, String) {
-    let unix_command = html_escape(&build_register_setup_command_unix(
-        tenant, domain, frps_token,
-    ));
+    let unix_command = html_escape(&build_register_setup_command_unix(tenant, domain));
     let windows_command = html_escape(&build_register_setup_command_windows(
-        tenant, domain, server, frps_token,
+        tenant, domain, server,
     ));
     let public_url = format!(
         "https://{}.{}",
         html_escape(&tenant.subdomain),
         html_escape(domain)
     );
-    let frps_note_html = if frps_token.is_some() {
-        String::new()
-    } else {
-        r#"<p style="margin: 0;"><strong>Shared FRPS token:</strong> replace <code>&lt;shared-frps-token&gt;</code> with the token from your operator.</p>"#.to_string()
-    };
     let subject = format!("octos setup for {}", tenant.subdomain);
     let html = format!(
         r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px;">
@@ -3539,7 +3406,6 @@ fn build_register_setup_email(
         <p style="margin: 0 0 8px 0;"><strong>SSH port:</strong> {ssh_port}</p>
         <p style="margin: 0 0 8px 0;"><strong>Auth token:</strong> {auth_token}</p>
     </div>
-    {frps_note_html}
     <p style="color: #444; margin-bottom: 8px;">macOS / Linux install command:</p>
     <pre style="background: #111827; color: #f9fafb; border-radius: 10px; padding: 16px; overflow-x: auto; white-space: pre-wrap;">{unix_command}</pre>
     <p style="color: #444; margin: 16px 0 8px 0;">Windows install command:</p>
@@ -3550,7 +3416,6 @@ fn build_register_setup_email(
         public_url = public_url,
         ssh_port = tenant.ssh_port,
         auth_token = html_escape(&tenant.auth_token),
-        frps_note_html = frps_note_html,
         unix_command = unix_command,
         windows_command = windows_command,
     );
@@ -3563,12 +3428,12 @@ mod register_setup_script_tests {
     use chrono::Utc;
 
     #[test]
-    fn register_setup_script_is_managed_tunnel_bootstrap() {
+    fn should_embed_per_tenant_tunnel_token_in_setup_script() {
         let tenant = crate::tenant::TenantConfig {
             id: "alice".into(),
             name: "alice".into(),
             subdomain: "alice".into(),
-            tunnel_token: "secret".into(),
+            tunnel_token: "per-tenant-uuid".into(),
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "auth-token".into(),
@@ -3578,28 +3443,26 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32", None);
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
 
         assert!(script.contains("managed tenant bootstrap"));
-        assert!(script.contains("Tunnel is required for this registered machine"));
         assert!(script.contains("--tunnel"));
         assert!(script.contains("--auth-token \"auth-token\""));
         assert!(script.contains("--tenant-name \"alice\""));
-        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
-        assert!(!script.contains("--frps-token \"secret\""));
+        assert!(script.contains("--frps-token \"per-tenant-uuid\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
         assert!(script.contains("--frps-server \"163.192.33.32\""));
-        assert!(!script.contains("local tenant setup"));
+        assert!(!script.contains("$FRPS_TOKEN"));
     }
 
     #[test]
-    fn register_setup_email_contains_unix_and_windows_reinstall_commands() {
+    fn should_include_per_tenant_token_in_email_commands() {
         let tenant = crate::tenant::TenantConfig {
             id: "alice".into(),
             name: "alice".into(),
             subdomain: "alice".into(),
-            tunnel_token: "secret".into(),
+            tunnel_token: "per-tenant-uuid".into(),
             ssh_port: 6001,
             local_port: 9090,
             auth_token: "auth-token".into(),
@@ -3610,25 +3473,23 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32", None);
+            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
 
         assert!(html.contains("/api/register/setup-script/alice/"));
-        assert!(html.contains("FRPS_TOKEN=&lt;shared-frps-token&gt; bash"));
         assert!(html.contains("install.ps1"));
         assert!(html.contains("-Tunnel"));
         assert!(html.contains("-Port 9090"));
-        assert!(html.contains("-FrpsToken &quot;&lt;shared-frps-token&gt;&quot;"));
-        assert!(html.contains("<strong>Shared FRPS token:</strong>"));
-        assert!(!html.contains("<strong>FRP token:</strong> secret"));
+        assert!(html.contains("-FrpsToken &quot;per-tenant-uuid&quot;"));
+        assert!(!html.contains("Shared FRPS token:"));
     }
 
     #[test]
-    fn register_setup_script_embeds_real_shared_frps_token_when_available() {
+    fn should_generate_setup_commands_with_tenant_token() {
         let tenant = crate::tenant::TenantConfig {
             id: "alice".into(),
             name: "alice".into(),
             subdomain: "alice".into(),
-            tunnel_token: String::new(),
+            tunnel_token: "per-tenant-uuid".into(),
             ssh_port: 6001,
             local_port: 8080,
             auth_token: "auth-token".into(),
@@ -3638,35 +3499,16 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(
-            &tenant,
-            "octos-cloud.org",
-            "163.192.33.32",
-            Some("shared-token"),
-        );
-        let unix_command =
-            build_register_setup_command_unix(&tenant, "octos-cloud.org", Some("shared-token"));
-        let windows_command = build_register_setup_command_windows(
-            &tenant,
-            "octos-cloud.org",
-            "163.192.33.32",
-            Some("shared-token"),
-        );
-        let (_subject, html) = build_register_setup_email(
-            &tenant,
-            "octos-cloud.org",
-            "163.192.33.32",
-            Some("shared-token"),
-        );
+        let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
+        let windows_command =
+            build_register_setup_command_windows(&tenant, "octos-cloud.org", "163.192.33.32");
 
-        assert!(script.contains("--frps-token \"shared-token\""));
-        assert!(!script.contains("FRPS_TOKEN=\"${FRPS_TOKEN:-}\""));
         assert_eq!(
             unix_command,
             r#"curl -fsSL "https://octos-cloud.org/api/register/setup-script/alice/auth-token" | bash"#
         );
-        assert!(windows_command.contains("-FrpsToken \"shared-token\""));
-        assert!(!html.contains("Shared FRPS token:"));
+        assert!(windows_command.contains("-FrpsToken \"per-tenant-uuid\""));
+        assert!(!windows_command.contains("shared-frps-token"));
     }
 }
 
@@ -3704,6 +3546,7 @@ mod register_tenant_email_tests {
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
@@ -3771,7 +3614,7 @@ mod register_tenant_email_tests {
         assert!(email.subject.contains("macmini"));
         assert!(email.html.contains("https://macmini.octos-cloud.org"));
         assert!(email.html.contains("/api/register/setup-script/macmini/"));
-        assert!(email.html.contains("&lt;shared-frps-token&gt;"));
+        assert!(!email.html.contains("shared-frps-token"));
         assert!(email.html.contains("-Tunnel"));
         assert!(email.html.contains("-Port 9090"));
         assert!(email.html.contains(&response.0.dashboard_url));
@@ -3781,17 +3624,13 @@ mod register_tenant_email_tests {
                 .setup_command_unix
                 .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
         );
+        assert!(!response.0.setup_command_unix.contains("shared-frps-token"));
+        assert!(response.0.setup_command_windows.contains("-FrpsToken"));
         assert!(
-            response
-                .0
-                .setup_command_unix
-                .contains("FRPS_TOKEN=<shared-frps-token> bash")
-        );
-        assert!(
-            response
+            !response
                 .0
                 .setup_command_windows
-                .contains("-FrpsToken \"<shared-frps-token>\"")
+                .contains("shared-frps-token")
         );
         assert!(response.0.setup_command_windows.contains("-Tunnel"));
         assert!(response.0.setup_command_windows.contains("-Port 9090"));
@@ -3857,6 +3696,7 @@ mod register_flow_tests {
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
@@ -3915,18 +3755,11 @@ mod register_flow_tests {
                 .setup_command_unix
                 .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
         );
-        assert!(
-            resp.0
-                .setup_command_unix
-                .contains("FRPS_TOKEN=<shared-frps-token> bash")
-        );
+        assert!(!resp.0.setup_command_unix.contains("FRPS_TOKEN=<shared"));
         assert!(resp.0.setup_command_windows.contains("-TenantName"));
         assert!(resp.0.setup_command_windows.contains("macmini"));
-        assert!(
-            resp.0
-                .setup_command_windows
-                .contains("-FrpsToken \"<shared-frps-token>\"")
-        );
+        assert!(resp.0.setup_command_windows.contains("-FrpsToken"));
+        assert!(!resp.0.setup_command_windows.contains("shared-frps-token"));
     }
 
     // ── Duplicate tenant name ───────────────────────────────────────
@@ -4153,8 +3986,14 @@ mod register_flow_tests {
         assert!(script.contains("--domain \"octos-cloud.org\""));
         assert!(script.contains("--frps-server \"163.192.33.32\""));
         assert!(script.contains("--ssh-port"));
-        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
-        assert!(saved_tunnel_token.is_empty());
+        assert!(
+            script.contains(&format!("--frps-token \"{saved_tunnel_token}\"")),
+            "script should embed the per-tenant tunnel_token"
+        );
+        assert!(
+            !saved_tunnel_token.is_empty(),
+            "tunnel_token should be generated"
+        );
     }
 
     #[tokio::test]
@@ -4181,8 +4020,15 @@ mod register_flow_tests {
         .await
         .unwrap();
 
+        let saved_tenant = state
+            .tenant_store
+            .as_ref()
+            .unwrap()
+            .get("macmini")
+            .unwrap()
+            .unwrap();
         assert!(script.contains("--tenant-name \"macmini\""));
-        assert!(script.contains("--frps-token \"$FRPS_TOKEN\""));
+        assert!(script.contains(&format!("--frps-token \"{}\"", saved_tenant.tunnel_token)));
     }
 
     #[tokio::test]

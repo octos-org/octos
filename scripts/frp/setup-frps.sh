@@ -8,7 +8,6 @@
 #
 # Environment:
 #   FRPS_DASHBOARD_PASSWORD  (optional) Dashboard password (default: random)
-#   FRPS_TOKEN               (optional) Shared FRPS auth token (default: random)
 #   FRPS_VERSION             (optional) frp version to install (default: 0.65.0)
 #   OCTOS_SERVE_PORT         (optional) octos serve port for auth plugin (default: 8080)
 
@@ -17,7 +16,6 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────
 FRPS_VERSION="${FRPS_VERSION:-0.65.0}"
 FRPS_DASHBOARD_PASSWORD="${FRPS_DASHBOARD_PASSWORD:-$(openssl rand -hex 16)}"
-FRPS_TOKEN="${FRPS_TOKEN:-$(openssl rand -hex 32)}"
 OCTOS_SERVE_PORT="${OCTOS_SERVE_PORT:-8080}"
 FRPS_BIND_PORT="${FRPS_BIND_PORT:-7000}"
 FRPS_VHOST_HTTP_PORT="${FRPS_VHOST_HTTP_PORT:-8081}"
@@ -94,15 +92,16 @@ log.to = "/var/log/frps.log"
 log.level = "info"
 log.maxDays = 7
 
-# Shared FRPS token auth plus tenant-specific NewProxy authorization via octos
+# Per-tenant token auth — plugin verifies md5(token+timestamp) on Login,
+# then cross-checks tenant ownership on NewProxy.
 auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
+auth.token = ""
 
 [[httpPlugins]]
 name = "octos-auth"
 addr = "127.0.0.1:${OCTOS_SERVE_PORT}"
 path = "/api/internal/frps-auth"
-ops = ["NewProxy"]
+ops = ["Login", "NewProxy"]
 EOF
 
 # Install custom 404 page
@@ -185,7 +184,6 @@ esac
 
 echo "==> frps is running"
 echo "    Control port: ${FRPS_BIND_PORT}"
-echo "    Shared token: ${FRPS_TOKEN}"
 echo "    vHost HTTP:   ${FRPS_VHOST_HTTP_PORT}"
 echo "    vHost HTTPS:  ${FRPS_VHOST_HTTPS_PORT}"
 echo "    Dashboard:    http://localhost:${FRPS_DASHBOARD_PORT}"
