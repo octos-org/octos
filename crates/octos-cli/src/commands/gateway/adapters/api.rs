@@ -11,6 +11,7 @@ pub fn register(
     entry: &ChannelEntry,
     shutdown: &Arc<AtomicBool>,
     session_mgr: &Arc<Mutex<SessionManager>>,
+    task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
     gateway_profile_id: Option<&str>,
     api_port_override: Option<u16>,
 ) -> eyre::Result<()> {
@@ -33,6 +34,11 @@ pub fn register(
         session_mgr.clone(),
         gateway_profile_id.map(str::to_string),
     );
+    let channel = if let Some(task_query) = task_query {
+        channel.with_task_query(task_query)
+    } else {
+        channel
+    };
     channel_mgr.register(Arc::new(channel));
     Ok(())
 }

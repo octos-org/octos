@@ -24,7 +24,8 @@ use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{detect_provider, Config};
 use crate::session_actor::{
-    ActorFactory, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
+    ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
+    SnapshotToolRegistryFactory,
     ToolRegistryFactory,
 };
 
@@ -294,6 +295,7 @@ pub(super) struct ProfileActorFactoryBuilder {
     pub(super) no_retry: bool,
     /// Sandbox config for child bot tool registries.
     pub(super) sandbox_config: octos_agent::SandboxConfig,
+    pub(super) task_query_store: SessionTaskQueryStore,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -637,6 +639,7 @@ impl ProfileActorFactoryBuilder {
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
             llm_strong,
+            task_query_store: self.task_query_store.clone(),
         })
     }
 }

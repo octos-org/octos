@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use octos_agent::tools::{
@@ -14,7 +15,8 @@ use octos_agent::tools::{
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, HookContext, HookExecutor, TokenTracker, TurnAttachmentContext,
+    Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
+    TurnAttachmentContext,
 };
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
@@ -128,6 +130,38 @@ fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::
 /// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
+
+/// Shared lookup table for session-scoped background task supervisors.
+#[derive(Default, Clone)]
+pub struct SessionTaskQueryStore {
+    supervisors: Arc<StdMutex<HashMap<String, Weak<TaskSupervisor>>>>,
+}
+
+impl SessionTaskQueryStore {
+    pub fn register(&self, session_key: &SessionKey, supervisor: &Arc<TaskSupervisor>) {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(session_key.to_string(), Arc::downgrade(supervisor));
+    }
+
+    pub fn query_json(&self, session_key: &str) -> serde_json::Value {
+        let upgraded = {
+            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get(session_key).and_then(Weak::upgrade) {
+                Some(supervisor) => Some(supervisor),
+                None => {
+                    guard.remove(session_key);
+                    None
+                }
+            }
+        };
+
+        match upgraded {
+            Some(supervisor) => serde_json::to_value(supervisor.get_tasks_for_session(session_key))
+                .unwrap_or_else(|_| serde_json::json!([])),
+            None => serde_json::json!([]),
+        }
+    }
+}
 
 fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
     sender_user_id
@@ -611,6 +645,8 @@ pub struct ActorFactory {
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Extra environment variables for plugin processes in subagents.
     pub plugin_extra_env: Vec<(String, String)>,
+    /// Session-scoped background task lookup for API inspection.
+    pub task_query_store: SessionTaskQueryStore,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -719,10 +755,12 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
+        let supervisor = tools.supervisor();
+        self.task_query_store.register(&session_key, &supervisor);
         tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
         tools.register(CheckBackgroundTasksTool::new(
-            tools.supervisor(),
+            supervisor.clone(),
             session_key.to_string(),
         ));
         tools.register(message_tool);
@@ -786,7 +824,7 @@ impl ActorFactory {
         // Wire supervisor on_change callback to push task status via SSE.
         // Uses try_send to avoid blocking the sync Mutex context.
         let status_tx = tx.clone();
-        tools.supervisor().set_on_change(move |task| {
+        supervisor.set_on_change(move |task| {
             if let Ok(json) = serde_json::to_string(task) {
                 let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
             }
@@ -4763,6 +4801,7 @@ mod tests {
             memory_store: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            task_query_store: SessionTaskQueryStore::default(),
         };
 
         let registry = ActorRegistry::new(
