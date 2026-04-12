@@ -1142,20 +1142,13 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
             let registry_ver = entries
                 .iter()
                 .find(|e| {
-                    e.repo == source.repo
-                        || e.skills.contains(&name.to_string())
-                        || e.name == name
+                    e.repo == source.repo || e.skills.contains(&name.to_string()) || e.name == name
                 })
                 .and_then(|e| e.version.as_ref());
 
             if let Some(rv) = registry_ver {
                 if !version_newer(rv, lv) {
-                    println!(
-                        "  {} '{}' is up to date (v{})",
-                        "OK".green(),
-                        name,
-                        lv
-                    );
+                    println!("  {} '{}' is up to date (v{})", "OK".green(), name, lv);
                     return Ok(());
                 }
                 println!(

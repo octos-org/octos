@@ -4,7 +4,7 @@
 //! per-provider latency (EMA + p95), error rates, and circuit breaker state.
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -815,29 +815,17 @@ impl AdaptiveRouter {
                     cost_in: {
                         let runtime = f64::from_bits(s.cost_in.load(Ordering::Relaxed));
                         let seeded = f64::from_bits(s.seeded_cost_in.load(Ordering::Relaxed));
-                        if runtime > 0.0 {
-                            runtime
-                        } else {
-                            seeded
-                        }
+                        if runtime > 0.0 { runtime } else { seeded }
                     },
                     cost_out: {
                         let runtime = s.cost_per_m;
                         let seeded = f64::from_bits(s.seeded_cost_out.load(Ordering::Relaxed));
-                        if runtime > 0.0 {
-                            runtime
-                        } else {
-                            seeded
-                        }
+                        if runtime > 0.0 { runtime } else { seeded }
                     },
                     ds_output: {
                         let runtime = s.ds_output.load(Ordering::Relaxed);
                         let seeded = s.seeded_ds_output.load(Ordering::Relaxed);
-                        if runtime > 0 {
-                            runtime
-                        } else {
-                            seeded
-                        }
+                        if runtime > 0 { runtime } else { seeded }
                     },
                     context_window: {
                         let v = s.context_window.load(Ordering::Relaxed);

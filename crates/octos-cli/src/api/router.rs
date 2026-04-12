@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{delete, get, post, put};
-use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use super::AppState;
 use super::admin;
 use super::auth_handlers;
 use super::frps_plugin;
@@ -18,7 +19,6 @@ use super::metrics;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
-use super::AppState;
 use crate::user_store::UserRole;
 
 /// Authentication identity extracted by the auth middleware.

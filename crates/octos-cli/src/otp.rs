@@ -429,8 +429,14 @@ impl AuthManager {
             })?;
 
         let email_msg = Message::builder()
-            .from(smtp.from_address.parse().map_err(|e| eyre::eyre!("invalid from address: {e}"))?)
-            .to(email.parse().map_err(|e| eyre::eyre!("invalid to address: {e}"))?)
+            .from(
+                smtp.from_address
+                    .parse()
+                    .map_err(|e| eyre::eyre!("invalid from address: {e}"))?,
+            )
+            .to(email
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid to address: {e}"))?)
             .subject(subject)
             .header(ContentType::TEXT_HTML)
             .body(html.to_string())

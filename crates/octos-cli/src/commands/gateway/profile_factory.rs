@@ -30,7 +30,12 @@ use crate::session_actor::{
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 /// (full LLM, provider name, adaptive router, strong-only LLM for slides)
-pub(crate) type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>, Arc<dyn LlmProvider>);
+pub(crate) type LlmStack = (
+    Arc<dyn LlmProvider>,
+    String,
+    Option<Arc<AdaptiveRouter>>,
+    Arc<dyn LlmProvider>,
+);
 
 pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
     let model = config.model.clone();
@@ -133,8 +138,7 @@ pub(crate) fn build_strong_chain(
     if strong_fallbacks.is_empty() || no_retry {
         return Ok(Arc::new(RetryProvider::new(primary)));
     }
-    let mut providers: Vec<Arc<dyn LlmProvider>> =
-        vec![Arc::new(RetryProvider::new(primary))];
+    let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
         let fallback_config = if fallback.api_key_env.is_some() {
             let mut cloned = config.clone();
