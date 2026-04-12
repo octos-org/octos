@@ -317,4 +317,24 @@ mod tests {
         let result = purge_by_profile_id(&state, "ghost").await.expect("no error");
         assert!(result.is_none());
     }
+
+    #[tokio::test]
+    async fn should_purge_orphan_profile_with_no_user_or_tenant() {
+        let (_temp, state) = build_test_state();
+        let pid = "orphan";
+
+        // Only the profile exists — no user, no tenant
+        state.profile_store.as_ref().unwrap().save(&make_profile(pid)).unwrap();
+
+        let report = purge_by_profile_id(&state, pid)
+            .await
+            .expect("purge")
+            .expect("Some(report)");
+
+        assert_eq!(report.profile_id, pid);
+        assert!(report.user_email.is_none());
+        assert!(report.tenant_id.is_none());
+        assert!(report.port_released.is_none());
+        assert!(state.profile_store.as_ref().unwrap().get(pid).unwrap().is_none());
+    }
 }
