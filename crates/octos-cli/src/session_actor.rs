@@ -1256,25 +1256,7 @@ impl SessionActor {
                                     metadata: serde_json::json!({}),
                                 }).await;
                             } else {
-                                // Full background result (from spawn subagent) — inject + rewrite
-                                self.inject_background_result(&task_label, &content, false).await;
-                                let rewrite_msg = octos_core::InboundMessage {
-                                    channel: self.channel.clone(),
-                                    sender_id: "system".to_string(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: format!(
-                                        "[REWRITE] The background task \"{task_label}\" has completed. \
-                                         Rewrite the raw report above into a clean, well-structured, \
-                                         readable message for the user. Keep all key findings, data, \
-                                         and citations. Use proper Markdown formatting. \
-                                         Match the language of the original research request."
-                                    ),
-                                    timestamp: chrono::Utc::now(),
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                    message_id: None,
-                                };
-                                self.process_inbound(rewrite_msg, vec![], vec![]).await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -1863,8 +1845,7 @@ impl SessionActor {
                                     })
                                     .await;
                             } else {
-                                self.inject_background_result(&task_label, &content, true)
-                                    .await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
@@ -1925,8 +1906,7 @@ impl SessionActor {
                                     })
                                     .await;
                             } else {
-                                self.inject_background_result(&task_label, &content, true)
-                                    .await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
@@ -1951,10 +1931,9 @@ impl SessionActor {
     /// retrieve the full report via `recall_memory("<slug>")`.
     /// Inject a background task result into the conversation context.
     ///
-    /// When `notify` is true, sends a preview notification directly to the user.
-    /// When false, the caller is responsible for triggering an LLM rewrite turn
-    /// that will produce a clean user-facing message.
-    async fn inject_background_result(&self, task_label: &str, content: &str, notify: bool) {
+    /// Sends a preview notification directly to the user and injects the result
+    /// into session history for subsequent turns.
+    async fn inject_background_result(&self, task_label: &str, content: &str) {
         const SUMMARY_THRESHOLD: usize = 1000;
         const SUMMARY_CHARS: usize = 800;
 
@@ -2016,21 +1995,19 @@ impl SessionActor {
             }
         }
 
-        if notify {
-            // Send raw preview directly (used when agent is busy and will see
-            // the injected context on its next turn).
-            let _ = self
-                .out_tx
-                .send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: notification,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                })
-                .await;
-        }
+        // Send raw preview directly; the injected context is available on the
+        // next turn without forcing a synthetic rewrite prompt.
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: notification,
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await;
     }
 
     /// Copy media files from their original location (e.g. profile media_dir)
@@ -2361,7 +2338,7 @@ impl SessionActor {
                                     metadata: serde_json::json!({}),
                                 }).await;
                             } else {
-                                self.inject_background_result(&task_label, &content, true).await;
+                                self.inject_background_result(&task_label, &content).await;
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -4108,6 +4085,73 @@ mod tests {
                 .any(|m| m.content.contains("Background task") && m.content.contains("research"));
             assert!(has_bg_msg, "background result not found in session history");
         }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_followup_background_result_notifies_without_rewrite_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_secs(4), make_response("primary done"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("long task")).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.contains("research") && r.contains("completed")),
+            "background notification not found in: {:?}",
+            responses
+        );
+        assert!(
+            responses.iter().any(|r| r.contains("primary done")),
+            "primary response not found in: {:?}",
+            responses
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Background task") && m.content.contains("research")),
+            "background result not found in session history"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("[REWRITE]")),
+            "rewrite prompt leaked into session history: {:?}",
+            session.messages
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
