@@ -836,14 +836,14 @@ mod tests {
     fn should_scaffold_idempotently() {
         let tmp = tempfile::tempdir().unwrap();
         scaffold_slides_project(tmp.path(), "deck");
-        // Modify a file
+        // Modify a file and ensure re-scaffold preserves user edits.
         let memory_path = tmp.path().join("slides/deck/memory.md");
         std::fs::write(&memory_path, "custom content").unwrap();
 
-        // Re-scaffold overwrites
+        // Re-scaffold keeps existing files intact.
         scaffold_slides_project(tmp.path(), "deck");
         let content = std::fs::read_to_string(&memory_path).unwrap();
-        assert!(content.contains("Slides Project"));
+        assert_eq!(content, "custom content");
     }
 
     #[test]
@@ -894,7 +894,7 @@ mod tests {
         let reply = slides_creation_reply("Q4 Report");
         assert!(reply.contains("Q4 Report"));
         assert!(reply.contains("slides/q4-report/"));
-        assert!(reply.contains("What is this presentation about"));
+        assert!(reply.contains("Let me help you design your slides"));
     }
 
     #[test]

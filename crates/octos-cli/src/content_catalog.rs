@@ -93,7 +93,7 @@ pub struct ContentEntry {
 
 // ── Query types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ContentQuery {
     pub category: Option<String>,
     pub search: Option<String>,
@@ -105,6 +105,20 @@ pub struct ContentQuery {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+}
+
+impl Default for ContentQuery {
+    fn default() -> Self {
+        Self {
+            category: None,
+            search: None,
+            from: None,
+            to: None,
+            sort: default_sort(),
+            limit: default_limit(),
+            offset: 0,
+        }
+    }
 }
 
 fn default_sort() -> String {
@@ -293,6 +307,14 @@ impl ContentCatalog {
                 }
                 Self::walk_dir(&path, known, cb)?;
             } else if path.is_file() {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name == CATALOG_FILENAME {
+                    continue;
+                }
                 let path_str = path.to_string_lossy().to_string();
                 if !known.contains(&path_str) {
                     cb(&path);

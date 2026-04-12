@@ -1193,6 +1193,12 @@ mod tests {
         let (disp, _, tmp) = setup_dispatcher(tx);
         let disp = disp.with_data_dir(tmp.path().to_path_buf());
         let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
 
         let result = disp
             .handle_new_command(
@@ -1209,12 +1215,12 @@ mod tests {
         // Should get the slides creation reply, not the generic switch message
         assert!(msg.content.contains("my-deck"));
         assert!(msg.content.contains("slides/my-deck/"));
-        assert!(msg.content.contains("What is this presentation about"));
+        assert!(msg.content.contains("Let me help you design your slides"));
 
-        // Project directory should be scaffolded
-        assert!(tmp.path().join("slides/my-deck/script.js").is_file());
-        assert!(tmp.path().join("slides/my-deck/memory.md").is_file());
-        assert!(tmp.path().join("slides/my-deck/history").is_dir());
+        // Project directory should be scaffolded under the per-user workspace.
+        assert!(workspace_root.join("slides/my-deck/script.js").is_file());
+        assert!(workspace_root.join("slides/my-deck/memory.md").is_file());
+        assert!(workspace_root.join("slides/my-deck/history").is_dir());
 
         // Session prompt should be written
         let prompt = crate::project_templates::read_session_prompt(tmp.path(), "slides my-deck");
@@ -1228,6 +1234,12 @@ mod tests {
         let (disp, _, tmp) = setup_dispatcher(tx);
         let disp = disp.with_data_dir(tmp.path().to_path_buf());
         let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
 
         let result = disp
             .handle_new_command(
@@ -1242,7 +1254,7 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let msg = rx.try_recv().unwrap();
         assert!(msg.content.contains("untitled"));
-        assert!(tmp.path().join("slides/untitled/script.js").is_file());
+        assert!(workspace_root.join("slides/untitled/script.js").is_file());
     }
 
     #[tokio::test]
