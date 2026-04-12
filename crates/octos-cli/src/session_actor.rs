@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use octos_agent::tools::{
-    CheckBackgroundTasksTool, MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
+    BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
+    SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
@@ -242,6 +243,8 @@ pub enum ActorMessage {
         task_label: String,
         /// The subagent's final output.
         content: String,
+        /// Delivery semantics for this result.
+        kind: BackgroundResultKind,
     },
     /// Background task status changed — push to SSE.
     TaskStatusChanged {
@@ -719,12 +722,13 @@ impl ActorFactory {
         // Wire direct background result injection (bypasses InboundMessage relay)
         let bg_tx = tx.clone();
         spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
-            move |task_label: String, content: String| {
+            move |payload: BackgroundResultPayload| {
                 let tx = bg_tx.clone();
                 Box::pin(async move {
                     tx.send(ActorMessage::BackgroundResult {
-                        task_label,
-                        content,
+                        task_label: payload.task_label,
+                        content: payload.content,
+                        kind: payload.kind,
                     })
                     .await
                     .is_ok()
@@ -736,12 +740,13 @@ impl ActorFactory {
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
-        tools.set_background_result_sender(Arc::new(move |task_label: String, content: String| {
+        tools.set_background_result_sender(Arc::new(move |payload: BackgroundResultPayload| {
             let tx = bg_tx2.clone();
             Box::pin(async move {
                 tx.send(ActorMessage::BackgroundResult {
-                    task_label,
-                    content,
+                    task_label: payload.task_label,
+                    content: payload.content,
+                    kind: payload.kind,
                 })
                 .await
                 .is_ok()
@@ -1212,10 +1217,14 @@ impl SessionActor {
                                 self.process_inbound(final_message, final_media).await;
                             }
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                        }) => {
                             // Lightweight notification for spawn_only tool completions
                             // (e.g. fm_tts success/failure) — send directly, no LLM turn.
-                            if content.starts_with('✓') || content.starts_with('✗') {
+                            if kind == BackgroundResultKind::Notification {
                                 tracing::info!(task = %task_label, "spawn_only notification: {}", content);
                                 let _ = self.out_tx.send(octos_core::OutboundMessage {
                                     channel: self.channel.clone(),
@@ -1812,9 +1821,24 @@ impl SessionActor {
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
-                                .await;
+                            if kind == BackgroundResultKind::Notification {
+                                let _ = self
+                                    .out_tx
+                                    .send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content,
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({}),
+                                    })
+                                    .await;
+                            } else {
+                                self.inject_background_result(&task_label, &content, true)
+                                    .await;
+                            }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
@@ -1856,9 +1880,24 @@ impl SessionActor {
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
-                                .await;
+                            if kind == BackgroundResultKind::Notification {
+                                let _ = self
+                                    .out_tx
+                                    .send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content,
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({}),
+                                    })
+                                    .await;
+                            } else {
+                                self.inject_background_result(&task_label, &content, true)
+                                    .await;
+                            }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
@@ -2248,8 +2287,12 @@ impl SessionActor {
                             self.serve_overflow(&message, &overflow_history);
                             overflow_served = true;
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            if content.starts_with('✓') || content.starts_with('✗') {
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                        }) => {
+                            if kind == BackgroundResultKind::Notification {
                                 let _ = self.out_tx.send(octos_core::OutboundMessage {
                                     channel: self.channel.clone(),
                                     chat_id: self.chat_id.clone(),
@@ -3957,6 +4000,7 @@ mod tests {
         tx.send(ActorMessage::BackgroundResult {
             task_label: "research".to_string(),
             content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
         })
         .await
         .unwrap();

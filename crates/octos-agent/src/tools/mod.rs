@@ -220,7 +220,7 @@ pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
-pub use spawn::SpawnTool;
+pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
 pub use synthesize_research::SynthesizeResearchTool;
 pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;

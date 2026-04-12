@@ -19,7 +19,20 @@ use crate::Agent;
 /// Returns `true` if the result was delivered, `false` if the actor is dead
 /// (caller should fall back to the InboundMessage relay path).
 pub type BackgroundResultSender =
-    Arc<dyn Fn(String, String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+    Arc<dyn Fn(BackgroundResultPayload) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundResultKind {
+    Notification,
+    Report,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundResultPayload {
+    pub task_label: String,
+    pub content: String,
+    pub kind: BackgroundResultKind,
+}
 
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
@@ -473,7 +486,13 @@ impl Tool for SpawnTool {
                 // If the actor has exited (idle timeout), the send fails and we
                 // fall through to the legacy InboundMessage relay path.
                 if let Some(sender) = bg_sender {
-                    if sender(task_label, content.clone()).await {
+                    if sender(BackgroundResultPayload {
+                        task_label,
+                        content: content.clone(),
+                        kind: BackgroundResultKind::Report,
+                    })
+                    .await
+                    {
                         return;
                     }
                     warn!("background result sender failed (actor dead?), falling back to relay");

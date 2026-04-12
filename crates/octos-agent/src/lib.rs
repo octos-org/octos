@@ -53,11 +53,12 @@ pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use task_supervisor::{BackgroundTask, TaskStatus, TaskSupervisor};
 pub use tools::{
-    ActivateToolsTool, BrowserTool, CheckBackgroundTasksTool, ConfigureToolTool, DeepSearchTool,
-    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    ReadFileTool, RecallMemoryTool, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool,
-    SynthesizeResearchTool, TakePhotoTool, Tool, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, WebFetchTool, WebSearchTool, WriteFileTool,
+    ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
+    CheckBackgroundTasksTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
+    GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool,
+    SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool,
+    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
+    WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
