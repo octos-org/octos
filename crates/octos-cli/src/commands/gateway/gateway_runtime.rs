@@ -1316,6 +1316,7 @@ impl GatewayRuntime {
             .await;
             let image_media = media_result.image_media;
             let attachment_media = media_result.attachment_media;
+            let attachment_prompt = media_result.attachment_prompt;
 
             // Route cron-triggered messages to their target channel
             let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
@@ -1589,6 +1590,7 @@ impl GatewayRuntime {
                     message: inbound,
                     image_media,
                     attachment_media,
+                    attachment_prompt,
                     session_key,
                     reply_channel: &reply_channel,
                     reply_chat_id: &reply_chat_id,

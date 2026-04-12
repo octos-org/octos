@@ -121,10 +121,23 @@ impl Agent {
 
                 messages.extend_from_slice(history);
 
-                let content = if user_content.is_empty() && !media.is_empty() {
+                let base_content = if user_content.is_empty() && !media.is_empty() {
                     "[User sent an image]".to_string()
                 } else {
                     user_content.to_string()
+                };
+                let content = if let Some(summary) = TURN_ATTACHMENT_CTX
+                    .try_with(|ctx| ctx.prompt_summary.clone())
+                    .ok()
+                    .flatten()
+                {
+                    if base_content.trim().is_empty() {
+                        summary
+                    } else {
+                        format!("{base_content}\n\n{summary}")
+                    }
+                } else {
+                    base_content
                 };
 
                 messages.push(Message {

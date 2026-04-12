@@ -32,6 +32,7 @@ pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
+    pub prompt_summary: Option<String>,
 }
 
 tokio::task_local! {

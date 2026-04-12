@@ -40,6 +40,7 @@ pub struct DispatchParams<'a> {
     pub message: InboundMessage,
     pub image_media: Vec<String>,
     pub attachment_media: Vec<String>,
+    pub attachment_prompt: Option<String>,
     pub session_key: SessionKey,
     pub reply_channel: &'a str,
     pub reply_chat_id: &'a str,
@@ -143,6 +144,26 @@ fn git_turn_summary(content: &str) -> String {
     }
 }
 
+fn merge_attachment_prompt_summaries(
+    existing: Option<String>,
+    incoming: Option<String>,
+) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
 async fn snapshot_workspace_turn_for_path(
     session_key: &SessionKey,
     workspace_root: std::path::PathBuf,
@@ -239,6 +260,7 @@ pub enum ActorMessage {
         message: InboundMessage,
         image_media: Vec<String>,
         attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     },
     /// Result from a background subagent task — injected as a system message
     /// into the conversation without triggering an extra LLM call.
@@ -346,6 +368,7 @@ impl ActorRegistry {
             message,
             image_media,
             attachment_media,
+            attachment_prompt,
             session_key,
             reply_channel,
             reply_chat_id,
@@ -393,6 +416,7 @@ impl ActorRegistry {
             message,
             image_media,
             attachment_media,
+            attachment_prompt,
         };
 
         match handle.tx.try_send(actor_msg) {
@@ -1164,6 +1188,7 @@ impl SessionActor {
                             message,
                             image_media,
                             attachment_media,
+                            attachment_prompt,
                         }) => {
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
@@ -1210,8 +1235,19 @@ impl SessionActor {
                             }
 
                             // Drain any queued messages according to queue mode
-                            let (final_message, final_media, final_attachment_media) =
-                                self.drain_queue(message, image_media, attachment_media).await;
+                            let (
+                                final_message,
+                                final_media,
+                                final_attachment_media,
+                                final_attachment_prompt,
+                            ) = self
+                                .drain_queue(
+                                    message,
+                                    image_media,
+                                    attachment_media,
+                                    attachment_prompt,
+                                )
+                                .await;
 
                             // Copy non-image attachments into the agent workspace so
                             // tools can resolve them by filename without path hints.
@@ -1227,6 +1263,7 @@ impl SessionActor {
                                     final_message,
                                     final_media,
                                     final_attachment_media,
+                                    final_attachment_prompt,
                                 )
                                 .await;
                             } else {
@@ -1234,6 +1271,7 @@ impl SessionActor {
                                     final_message,
                                     final_media,
                                     final_attachment_media,
+                                    final_attachment_prompt,
                                 )
                                 .await;
                             }
@@ -1797,15 +1835,17 @@ impl SessionActor {
         message: InboundMessage,
         image_media: Vec<String>,
         attachment_media: Vec<String>,
-    ) -> (InboundMessage, Vec<String>, Vec<String>) {
+        attachment_prompt: Option<String>,
+    ) -> (InboundMessage, Vec<String>, Vec<String>, Option<String>) {
         match self.queue_mode {
             QueueMode::Followup | QueueMode::Speculative => {
-                (message, image_media, attachment_media)
+                (message, image_media, attachment_media, attachment_prompt)
             }
             QueueMode::Collect => {
                 let mut combined_content = message.content.clone();
                 let mut combined_media = image_media;
                 let mut combined_attachment_media = attachment_media;
+                let mut combined_attachment_prompt = attachment_prompt;
                 let mut count = 0u32;
 
                 // Non-blocking drain of queued inbound messages
@@ -1815,6 +1855,7 @@ impl SessionActor {
                             message: queued,
                             image_media: queued_media,
                             attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling batch");
@@ -1826,6 +1867,10 @@ impl SessionActor {
                                 .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
                             combined_media.extend(queued_media);
                             combined_attachment_media.extend(queued_attachment_media);
+                            combined_attachment_prompt = merge_attachment_prompt_summaries(
+                                combined_attachment_prompt,
+                                queued_attachment_prompt,
+                            );
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
@@ -1860,7 +1905,12 @@ impl SessionActor {
                 }
                 let mut msg = message;
                 msg.content = combined_content;
-                (msg, combined_media, combined_attachment_media)
+                (
+                    msg,
+                    combined_media,
+                    combined_attachment_media,
+                    combined_attachment_prompt,
+                )
             }
             QueueMode::Steer | QueueMode::Interrupt => {
                 // Coalescing delay: give rapid follow-up messages time to arrive
@@ -1869,6 +1919,7 @@ impl SessionActor {
                 let mut latest_message = message;
                 let mut latest_media = image_media;
                 let mut latest_attachment_media = attachment_media;
+                let mut latest_attachment_prompt = attachment_prompt;
 
                 // Non-blocking drain: keep only the newest inbound message
                 loop {
@@ -1877,6 +1928,7 @@ impl SessionActor {
                             message: queued,
                             image_media: queued_media,
                             attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling");
@@ -1887,6 +1939,7 @@ impl SessionActor {
                             latest_message = queued;
                             latest_media = queued_media;
                             latest_attachment_media = queued_attachment_media;
+                            latest_attachment_prompt = queued_attachment_prompt;
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
@@ -1919,7 +1972,12 @@ impl SessionActor {
                         Err(_) => break,
                     }
                 }
-                (latest_message, latest_media, latest_attachment_media)
+                (
+                    latest_message,
+                    latest_media,
+                    latest_attachment_media,
+                    latest_attachment_prompt,
+                )
             }
         }
     }
@@ -2052,6 +2110,7 @@ impl SessionActor {
     fn build_turn_attachment_context(
         &self,
         attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     ) -> TurnAttachmentContext {
         let mut audio_attachment_paths = Vec::new();
         let mut file_attachment_paths = Vec::new();
@@ -2067,6 +2126,21 @@ impl SessionActor {
             attachment_paths: attachment_media,
             audio_attachment_paths,
             file_attachment_paths,
+            prompt_summary: attachment_prompt,
+        }
+    }
+
+    fn persisted_user_content(
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> String {
+        if inbound.content.is_empty() && !image_media.is_empty() {
+            "[User sent an image]".to_string()
+        } else if inbound.content.is_empty() && !attachment_media.is_empty() {
+            "[User sent attachments]".to_string()
+        } else {
+            inbound.content.clone()
         }
     }
 
@@ -2080,6 +2154,7 @@ impl SessionActor {
         inbound: InboundMessage,
         image_media: Vec<String>,
         attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     ) {
         // Reset overflow cancellation from any prior command handling (#21).
         self.overflow_cancelled.store(false, Ordering::Release);
@@ -2100,6 +2175,9 @@ impl SessionActor {
             "speculative: entering concurrent processing"
         );
 
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
         let _permit = match self.semaphore.acquire().await {
@@ -2113,11 +2191,7 @@ impl SessionActor {
         // so overflow reads see it in context (chronological ordering).
         let user_msg = Message {
             role: MessageRole::User,
-            content: if inbound.content.is_empty() && !image_media.is_empty() {
-                "[User sent an image]".to_string()
-            } else {
-                inbound.content.clone()
-            },
+            content: persisted_user_content,
             media: image_media.clone(),
             tool_calls: None,
             tool_call_id: None,
@@ -2222,7 +2296,7 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
-        let attachments = self.build_turn_attachment_context(attachment_media);
+        let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
 
@@ -2299,7 +2373,12 @@ impl SessionActor {
                 // New message arrived in inbox
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media: _, attachment_media: _ }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media: _,
+                            attachment_media: _,
+                            attachment_prompt: _,
+                        }) => {
                             if octos_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
                                 self.send_reply(octos_core::abort_response(&message.content)).await;
@@ -3028,6 +3107,7 @@ impl SessionActor {
         inbound: InboundMessage,
         image_media: Vec<String>,
         attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     ) {
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
@@ -3037,6 +3117,9 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return, // semaphore closed
         };
+
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
 
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
@@ -3131,7 +3214,7 @@ impl SessionActor {
                 &inbound.content,
                 &history,
                 image_media,
-                self.build_turn_attachment_context(attachment_media),
+                self.build_turn_attachment_context(attachment_media, attachment_prompt),
                 &token_tracker,
             ),
         )
@@ -3225,8 +3308,18 @@ impl SessionActor {
                         }
                     }
 
+                    let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
-                        if let Err(e) = handle.add_message(msg.clone()).await {
+                        let message_to_save =
+                            if !persisted_user_message && msg.role == MessageRole::User {
+                                persisted_user_message = true;
+                                let mut sanitized = msg.clone();
+                                sanitized.content = persisted_user_content.clone();
+                                sanitized
+                            } else {
+                                msg.clone()
+                            };
+                        if let Err(e) = handle.add_message(message_to_save).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
@@ -3610,6 +3703,25 @@ mod tests {
             },
             image_media: vec![],
             attachment_media: vec![],
+            attachment_prompt: None,
+        }
+    }
+
+    fn make_attachment_inbound(summary: &str, attachment_path: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: None,
+            },
+            image_media: vec![],
+            attachment_media: vec![attachment_path.to_string()],
+            attachment_prompt: Some(summary.to_string()),
         }
     }
 
@@ -4157,6 +4269,67 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    #[tokio::test]
+    async fn test_attachment_hints_do_not_persist_in_session_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("attachment processed"),
+            )],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_attachment_inbound(
+            "[Attached files]\n- report.pdf",
+            "/tmp/uploads/report.pdf",
+        ))
+        .await
+        .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response timeout")
+            .expect("channel closed");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let contents = session
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| *content == "[User sent attachments]"),
+            "generic attachment placeholder missing from history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("[Attached files]")),
+            "transient attachment prompt leaked into history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("report.pdf")),
+            "attachment filename leaked into history: {:?}",
+            contents
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     // ── Queue mode tests ─────────────────────────────────────────────────
 
     /// Collect mode batches queued messages into one combined prompt.
@@ -4621,6 +4794,7 @@ mod tests {
                 message: msg,
                 image_media: vec![],
                 attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4662,6 +4836,7 @@ mod tests {
                 message: msg,
                 image_media: vec![],
                 attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4703,6 +4878,7 @@ mod tests {
                 message: msg1,
                 image_media: vec![],
                 attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4728,6 +4904,7 @@ mod tests {
                 message: msg2,
                 image_media: vec![],
                 attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4776,6 +4953,7 @@ mod tests {
                 message: msg,
                 image_media: vec![],
                 attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",

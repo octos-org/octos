@@ -16,6 +16,8 @@ pub struct MediaResult {
     pub image_media: Vec<String>,
     /// Non-image attachments copied into the workspace for tool access.
     pub attachment_media: Vec<String>,
+    /// Transient attachment summary for the current turn only.
+    pub attachment_prompt: Option<String>,
     /// Whether any audio attachment was detected (for auto-TTS downstream).
     #[allow(dead_code)]
     pub is_voice_message: bool,
@@ -90,16 +92,14 @@ pub async fn process_media(
         }
     }
 
-    append_attachment_summary(
-        &mut inbound.content,
-        "Attached audio files",
-        &audio_filenames,
-    );
-    append_attachment_summary(
-        &mut inbound.content,
-        "Attached files",
-        &attachment_filenames,
-    );
+    let attachment_prompt = build_attachment_summary("Attached audio files", &audio_filenames)
+        .into_iter()
+        .chain(build_attachment_summary(
+            "Attached files",
+            &attachment_filenames,
+        ))
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     // Tag voice messages in metadata for auto-TTS downstream
     if is_voice_message {
@@ -111,6 +111,11 @@ pub async fn process_media(
     MediaResult {
         image_media,
         attachment_media,
+        attachment_prompt: if attachment_prompt.is_empty() {
+            None
+        } else {
+            Some(attachment_prompt)
+        },
         is_voice_message,
     }
 }
@@ -145,26 +150,19 @@ fn attachment_display_name(path: &str) -> String {
         .to_string()
 }
 
-fn append_attachment_summary(content: &mut String, heading: &str, filenames: &[String]) {
+fn build_attachment_summary(heading: &str, filenames: &[String]) -> Option<String> {
     if filenames.is_empty() {
-        return;
+        return None;
     }
 
-    let section = format!(
+    Some(format!(
         "[{heading}]\n{}",
         filenames
             .iter()
             .map(|name| format!("- {name}"))
             .collect::<Vec<_>>()
             .join("\n")
-    );
-
-    if content.trim().is_empty() {
-        *content = section;
-    } else {
-        content.push_str("\n\n");
-        content.push_str(&section);
-    }
+    ))
 }
 
 /// Resolve the reply channel and chat_id for an inbound message.
@@ -312,9 +310,13 @@ mod tests {
         assert!(result.image_media.is_empty());
         assert_eq!(result.attachment_media, vec!["/tmp/uploads/voice-note.ogg"]);
         assert!(result.is_voice_message);
-        assert!(inbound.content.contains("voice-note.ogg"));
+        assert_eq!(
+            result.attachment_prompt.as_deref(),
+            Some("[Attached audio files]\n- voice-note.ogg")
+        );
         assert!(!inbound.content.contains("[Audio file:"));
         assert!(!inbound.content.contains("/tmp/uploads/voice-note.ogg"));
+        assert!(!inbound.content.contains("voice-note.ogg"));
     }
 
     #[tokio::test]
@@ -327,9 +329,13 @@ mod tests {
 
         assert!(result.image_media.is_empty());
         assert_eq!(result.attachment_media, vec!["/tmp/uploads/report.pdf"]);
-        assert!(inbound.content.contains("[Attached files]"));
-        assert!(inbound.content.contains("report.pdf"));
+        assert_eq!(
+            result.attachment_prompt.as_deref(),
+            Some("[Attached files]\n- report.pdf")
+        );
         assert!(!inbound.content.contains("/tmp/uploads/report.pdf"));
+        assert!(!inbound.content.contains("[Attached files]"));
+        assert!(!inbound.content.contains("report.pdf"));
     }
 
     #[test]
