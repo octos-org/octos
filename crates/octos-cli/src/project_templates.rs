@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use octos_agent::{initialize_and_commit, WorkspaceProjectKind};
+use octos_agent::{
+    initialize_and_commit, write_workspace_policy, WorkspacePolicy, WorkspaceProjectKind,
+};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -89,6 +91,12 @@ module.exports = [];
             .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
+    write_workspace_policy(
+        &project_dir,
+        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+    )
+    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+
     initialize_and_commit(
         &project_dir,
         WorkspaceProjectKind::Slides,
@@ -108,6 +116,7 @@ pub fn slides_creation_reply(project_name: &str) -> String {
          Project directory: slides/{slug}/\n\
          Script: slides/{slug}/script.js\n\
          Memory: slides/{slug}/memory.md\n\n\
+         Workspace policy: slides/{slug}/.octos-workspace.toml\n\
          Local git history is enabled in slides/{slug}/.\n\n\
          Let me help you design your slides. I'll check available style templates first,\n\
          then we'll design the content together."
@@ -137,6 +146,7 @@ RULES:
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
 - Read slides/{slug}/memory.md before each response for context.
+- Workspace policy lives at slides/{slug}/.octos-workspace.toml.
 - Maintain a version header at the top of slides/{slug}/script.js:
   // version: v{{NNN}}_{{desc}}
   // updated_at: YYYY-MM-DD
@@ -517,6 +527,7 @@ WORKFLOW:
 BUILD RULES:
 - {template}: build output dir is sites/{site_slug}/{build_output_dir}/
 - Preview route shape: /api/preview/<profile-id>/<session-id>/{site_slug}/
+- Workspace policy lives at sites/{site_slug}/.octos-workspace.toml.
 - If template is quarto-lesson, run shell(\"quarto render\") from sites/{site_slug}/ when Quarto is available
 - If template is astro-site, nextjs-app, or react-vite:
   - run shell(\"test -d node_modules || npm install\") from sites/{site_slug}/
@@ -788,6 +799,11 @@ pub fn scaffold_site_project(
         .ok_or_else(|| "mofa-site skill directory not found".to_string())?;
     run_site_bootstrap(&skill_dir, &project_dir, &metadata)?;
     write_site_support_files(&project_dir, &metadata)?;
+    write_workspace_policy(
+        &project_dir,
+        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites),
+    )
+    .map_err(|e| format!("write site workspace policy failed: {e}"))?;
     initialize_and_commit(
         &project_dir,
         WorkspaceProjectKind::Sites,
@@ -813,6 +829,7 @@ pub fn site_creation_reply(metadata: &SiteProjectMetadata) -> String {
          Template: {template}\n\
          Preview route: {preview_url}\n\
          Session metadata: {project_dir}/{session_file}\n\n\
+         Workspace policy: {project_dir}/.octos-workspace.toml\n\
          Local git history is enabled in {project_dir}/.\n\n\
          The scaffold is ready. Edit the source files and refresh the iframe preview to see the built site.",
         site_name = metadata.site_name,
@@ -860,6 +877,7 @@ mod tests {
         assert!(project_dir.join("script.js").is_file());
         assert!(project_dir.join(".git").is_dir());
         assert!(project_dir.join(".gitignore").is_file());
+        assert!(project_dir.join(".octos-workspace.toml").is_file());
 
         let memory = std::fs::read_to_string(project_dir.join("memory.md")).unwrap();
         assert!(memory.contains("test-deck"));
@@ -933,6 +951,7 @@ mod tests {
         assert!(reply.contains("Q4 Report"));
         assert!(reply.contains("slides/q4-report/"));
         assert!(reply.contains("Let me help you design your slides"));
+        assert!(reply.contains(".octos-workspace.toml"));
         assert!(reply.contains("Local git history is enabled"));
     }
 
