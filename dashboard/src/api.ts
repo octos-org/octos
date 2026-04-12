@@ -12,6 +12,7 @@ import type {
   SharedMetrics,
   MonitorStatus,
   SystemMetrics,
+  PurgeReport,
 } from './types'
 
 const BASE = '/api/admin'
@@ -99,6 +100,9 @@ export const api = {
 
   deleteProfile: (id: string) =>
     request<ActionResponse>(`/profiles/${id}`, { method: 'DELETE' }),
+
+  purgeProfile: (id: string) =>
+    request<PurgeReport>(`/profiles/${id}/purge`, { method: 'POST' }),
 
   startGateway: (id: string) =>
     request<ActionResponse>(`/profiles/${id}/start`, { method: 'POST' }),
