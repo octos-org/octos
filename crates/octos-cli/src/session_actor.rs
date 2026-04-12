@@ -5,8 +5,8 @@
 //! to the wrong chat.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
@@ -14,15 +14,15 @@ use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
 use octos_core::{
-    InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
-    OutboundMessage, SessionKey,
+    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+    METADATA_SENDER_USER_ID,
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -78,6 +78,46 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
 
+fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let current_profile_id = data_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let family_root_profile = current_profile_id
+        .as_deref()
+        .and_then(|value| value.split("--").next())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let octos_home = data_dir
+        .ancestors()
+        .nth(3)
+        .map(std::path::Path::to_path_buf);
+
+    let mut candidates = Vec::new();
+    candidates.push(data_dir.join("skills").join("mofa-slides").join("styles"));
+
+    if let Some(ref home) = octos_home {
+        candidates.push(home.join("skills").join("mofa-slides").join("styles"));
+
+        if let Some(ref root_profile) = family_root_profile {
+            candidates.push(
+                home.join("profiles")
+                    .join(root_profile)
+                    .join("data")
+                    .join("skills")
+                    .join("mofa-slides")
+                    .join("styles"),
+            );
+        }
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_dir())
+}
+
 /// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
@@ -86,6 +126,53 @@ fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
     sender_user_id
         .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
         .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn git_turn_summary(content: &str) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "agent turn update".to_string()
+    } else {
+        compact
+    }
+}
+
+async fn snapshot_workspace_turn_for_path(
+    session_key: &SessionKey,
+    workspace_root: std::path::PathBuf,
+    turn_summary: &str,
+) {
+    let turn_summary = git_turn_summary(turn_summary);
+
+    match tokio::task::spawn_blocking(move || {
+        octos_agent::snapshot_workspace_turn(&workspace_root, &turn_summary)
+    })
+    .await
+    {
+        Ok(Ok(committed)) => {
+            if !committed.is_empty() {
+                info!(
+                    session = %session_key,
+                    repos = ?committed,
+                    "workspace git turn snapshot committed"
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace git turn snapshot failed"
+            );
+        }
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace git turn snapshot task failed"
+            );
+        }
+    }
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -640,6 +727,9 @@ impl ActorFactory {
         // For slides sessions, auto-activate media tools and use primary model
         // (bypasses adaptive router which may pick a weak model).
         let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
+        let is_site = session_key
+            .topic()
+            .is_some_and(|t| t == "site" || t.starts_with("site "));
         if is_slides {
             tools.activate("group:media");
 
@@ -649,14 +739,22 @@ impl ActorFactory {
             // which is unreachable from the sandboxed workspace.
             let topic = session_key.topic().unwrap_or("slides");
             let project_name = topic.strip_prefix("slides").unwrap_or("").trim();
-            let project_name = if project_name.is_empty() { "untitled" } else { project_name };
-            crate::project_templates::scaffold_slides_project(&user_workspace, project_name);
+            let project_name = if project_name.is_empty() {
+                "untitled"
+            } else {
+                project_name
+            };
+            if let Err(error) =
+                crate::project_templates::scaffold_slides_project(&user_workspace, project_name)
+            {
+                warn!(session = %session_key, "slides scaffold failed in workspace: {error}");
+            }
 
             // Copy built-in style templates into workspace/styles/ so the
             // agent's glob("styles/*.toml") can discover them.
-            let builtin_styles = self.data_dir.join("skills/mofa-slides/styles");
+            let builtin_styles = resolve_builtin_slides_styles_dir(&self.data_dir);
             let ws_styles = user_workspace.join("styles");
-            if builtin_styles.exists() {
+            if let Some(builtin_styles) = builtin_styles {
                 std::fs::create_dir_all(&ws_styles).ok();
                 if let Ok(entries) = std::fs::read_dir(&builtin_styles) {
                     for entry in entries.flatten() {
@@ -670,6 +768,26 @@ impl ActorFactory {
                         }
                     }
                 }
+            } else {
+                warn!(
+                    session = %session_key,
+                    data_dir = %self.data_dir.display(),
+                    "builtin mofa-slides styles directory not found"
+                );
+            }
+        }
+
+        if is_site {
+            let topic = session_key.topic().unwrap_or("site");
+            let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
+            if let Err(error) = crate::project_templates::scaffold_site_project(
+                &user_workspace,
+                profile_id,
+                session_key.chat_id(),
+                topic,
+                &self.data_dir,
+            ) {
+                warn!(session = %session_key, "site scaffold failed in workspace: {error}");
             }
         }
 
@@ -932,6 +1050,15 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn snapshot_workspace_turn_if_needed(&self, turn_summary: &str) {
+        snapshot_workspace_turn_for_path(
+            &self.session_key,
+            self.user_workspace.clone(),
+            turn_summary,
+        )
+        .await;
+    }
+
     /// Check if this session is currently the active session for its chat.
     /// When inactive, streaming edits bypass the pending buffer, so we must
     /// skip streaming and let the reply go through the proxy path.
@@ -1132,8 +1259,9 @@ impl SessionActor {
                      /status — show agent status\n\
                      /adaptive — view adaptive routing\n\
                      /reset — reset session state\n\
-                     /help — show this help"
-                ).await;
+                     /help — show this help",
+                )
+                .await;
                 true
             }
         }
@@ -2444,6 +2572,9 @@ impl SessionActor {
             }
         }
 
+        self.snapshot_workspace_turn_if_needed(&inbound.content)
+            .await;
+
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
         // observe the shutdown signal during its iteration loop.
@@ -2524,6 +2655,7 @@ impl SessionActor {
         let history = pre_primary_history.to_vec();
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
+        let user_workspace = self.user_workspace.clone();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -2619,6 +2751,8 @@ impl SessionActor {
                     session = %session_key,
                     "overflow task cancelled by command, suppressing response"
                 );
+                snapshot_workspace_turn_for_path(&session_key, user_workspace.clone(), &content)
+                    .await;
                 // Still decrement and return — skip sending any reply.
                 overflow_counter.fetch_sub(1, Ordering::Release);
                 return;
@@ -2709,6 +2843,8 @@ impl SessionActor {
                         .await;
                 }
             }
+
+            snapshot_workspace_turn_for_path(&session_key, user_workspace, &content).await;
             // Decrement active overflow counter
             overflow_counter.fetch_sub(1, Ordering::Release);
         });
@@ -3059,6 +3195,9 @@ impl SessionActor {
             }
         }
 
+        self.snapshot_workspace_turn_if_needed(&inbound.content)
+            .await;
+
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);
 
@@ -3151,6 +3290,56 @@ mod tests {
             "beforeafter"
         );
         assert_eq!(strip_think_tags("<think>unclosed"), "");
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_falls_back_to_root_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let root_styles = octos_home
+            .join("profiles")
+            .join("dspfac")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&root_styles).unwrap();
+        std::fs::write(root_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data).unwrap();
+
+        assert_eq!(resolved, root_styles);
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_does_not_use_unrelated_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let unrelated_styles = octos_home
+            .join("profiles")
+            .join("someone-else")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&unrelated_styles).unwrap();
+        std::fs::write(unrelated_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data);
+
+        assert!(resolved.is_none());
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────

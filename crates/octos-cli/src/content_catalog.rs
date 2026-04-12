@@ -24,7 +24,7 @@ const SKIP_DIRS: &[&str] = &[
     "memory",
     "skills",
     "history",
-    "users",       // per-user dirs scanned separately via workspace/ path
+    "users", // per-user dirs scanned separately via workspace/ path
     "logs",
     ".thumbnails",
     "whatsapp-auth",
@@ -93,7 +93,7 @@ pub struct ContentEntry {
 
 // ── Query types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ContentQuery {
     pub category: Option<String>,
     pub search: Option<String>,
@@ -105,6 +105,20 @@ pub struct ContentQuery {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+}
+
+impl Default for ContentQuery {
+    fn default() -> Self {
+        Self {
+            category: None,
+            search: None,
+            from: None,
+            to: None,
+            sort: default_sort(),
+            limit: default_limit(),
+            offset: 0,
+        }
+    }
 }
 
 fn default_sort() -> String {
@@ -275,11 +289,7 @@ impl ContentCatalog {
     }
 
     /// Recursive directory walker that skips internal dirs.
-    fn walk_dir(
-        dir: &Path,
-        known: &HashSet<String>,
-        cb: &mut impl FnMut(&Path),
-    ) -> io::Result<()> {
+    fn walk_dir(dir: &Path, known: &HashSet<String>, cb: &mut impl FnMut(&Path)) -> io::Result<()> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return Ok(()),
@@ -297,6 +307,14 @@ impl ContentCatalog {
                 }
                 Self::walk_dir(&path, known, cb)?;
             } else if path.is_file() {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name == CATALOG_FILENAME {
+                    continue;
+                }
                 let path_str = path.to_string_lossy().to_string();
                 if !known.contains(&path_str) {
                     cb(&path);
@@ -340,7 +358,9 @@ impl ContentCatalog {
         // Sort.
         match q.sort.as_str() {
             "oldest" => filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
-            "name" => filtered.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase())),
+            "name" => {
+                filtered.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()))
+            }
             "size" => filtered.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes)),
             _ => filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at)), // newest
         }
@@ -423,9 +443,9 @@ impl ContentCatalog {
         let img = image::open(path)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("image open: {e}")))?;
         let thumb = img.thumbnail(THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_WIDTH);
-        thumb.save(&thumb_path).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("thumbnail save: {e}"))
-        })?;
+        thumb
+            .save(&thumb_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("thumbnail save: {e}")))?;
 
         Ok(thumb_path.to_string_lossy().to_string())
     }
@@ -457,10 +477,7 @@ impl ContentCatalogManager {
     }
 
     /// Get or create a catalog for a profile, identified by profile ID.
-    pub async fn get_catalog(
-        &self,
-        profile_id: &str,
-    ) -> io::Result<Arc<RwLock<ContentCatalog>>> {
+    pub async fn get_catalog(&self, profile_id: &str) -> io::Result<Arc<RwLock<ContentCatalog>>> {
         let mut map = self.catalogs.lock().await;
         if let Some(cat) = map.get(profile_id) {
             return Ok(Arc::clone(cat));
@@ -509,12 +526,30 @@ mod tests {
 
     #[test]
     fn should_categorize_extensions() {
-        assert_eq!(ContentCategory::from_extension("md"), ContentCategory::Report);
-        assert_eq!(ContentCategory::from_extension("MP3"), ContentCategory::Audio);
-        assert_eq!(ContentCategory::from_extension("pptx"), ContentCategory::Slides);
-        assert_eq!(ContentCategory::from_extension("png"), ContentCategory::Image);
-        assert_eq!(ContentCategory::from_extension("mp4"), ContentCategory::Video);
-        assert_eq!(ContentCategory::from_extension("xyz"), ContentCategory::Other);
+        assert_eq!(
+            ContentCategory::from_extension("md"),
+            ContentCategory::Report
+        );
+        assert_eq!(
+            ContentCategory::from_extension("MP3"),
+            ContentCategory::Audio
+        );
+        assert_eq!(
+            ContentCategory::from_extension("pptx"),
+            ContentCategory::Slides
+        );
+        assert_eq!(
+            ContentCategory::from_extension("png"),
+            ContentCategory::Image
+        );
+        assert_eq!(
+            ContentCategory::from_extension("mp4"),
+            ContentCategory::Video
+        );
+        assert_eq!(
+            ContentCategory::from_extension("xyz"),
+            ContentCategory::Other
+        );
     }
 
     #[test]
@@ -532,7 +567,12 @@ mod tests {
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
         let id = cat
-            .index_file(&test_file, Some("session-1"), Some("write_file"), Some("A test report"))
+            .index_file(
+                &test_file,
+                Some("session-1"),
+                Some("write_file"),
+                Some("A test report"),
+            )
             .unwrap()
             .unwrap();
 
@@ -552,8 +592,16 @@ mod tests {
         std::fs::write(&test_file, "hello").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        assert!(cat.index_file(&test_file, None, None, None).unwrap().is_some());
-        assert!(cat.index_file(&test_file, None, None, None).unwrap().is_none());
+        assert!(
+            cat.index_file(&test_file, None, None, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cat.index_file(&test_file, None, None, None)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(cat.len(), 1);
     }
 
@@ -564,8 +612,10 @@ mod tests {
         std::fs::write(tmp.path().join("b.png"), "image").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        cat.index_file(&tmp.path().join("a.md"), None, None, None).unwrap();
-        cat.index_file(&tmp.path().join("b.png"), None, None, None).unwrap();
+        cat.index_file(&tmp.path().join("a.md"), None, None, None)
+            .unwrap();
+        cat.index_file(&tmp.path().join("b.png"), None, None, None)
+            .unwrap();
 
         let result = cat.query(&ContentQuery {
             category: Some("report".into()),
@@ -582,8 +632,10 @@ mod tests {
         std::fs::write(tmp.path().join("daily-log.md"), "d").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        cat.index_file(&tmp.path().join("weekly-report.md"), None, None, None).unwrap();
-        cat.index_file(&tmp.path().join("daily-log.md"), None, None, None).unwrap();
+        cat.index_file(&tmp.path().join("weekly-report.md"), None, None, None)
+            .unwrap();
+        cat.index_file(&tmp.path().join("daily-log.md"), None, None, None)
+            .unwrap();
 
         let result = cat.query(&ContentQuery {
             search: Some("weekly".into()),
@@ -600,7 +652,10 @@ mod tests {
         std::fs::write(&test_file, "bye").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        let id = cat.index_file(&test_file, None, None, None).unwrap().unwrap();
+        let id = cat
+            .index_file(&test_file, None, None, None)
+            .unwrap()
+            .unwrap();
 
         assert!(test_file.exists());
         assert!(cat.delete(&id).unwrap());
@@ -616,9 +671,18 @@ mod tests {
         std::fs::write(tmp.path().join("c.txt"), "c").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        let id_a = cat.index_file(&tmp.path().join("a.txt"), None, None, None).unwrap().unwrap();
-        let _id_b = cat.index_file(&tmp.path().join("b.txt"), None, None, None).unwrap().unwrap();
-        let id_c = cat.index_file(&tmp.path().join("c.txt"), None, None, None).unwrap().unwrap();
+        let id_a = cat
+            .index_file(&tmp.path().join("a.txt"), None, None, None)
+            .unwrap()
+            .unwrap();
+        let _id_b = cat
+            .index_file(&tmp.path().join("b.txt"), None, None, None)
+            .unwrap()
+            .unwrap();
+        let id_c = cat
+            .index_file(&tmp.path().join("c.txt"), None, None, None)
+            .unwrap()
+            .unwrap();
 
         let deleted = cat.bulk_delete(&[id_a, id_c]).unwrap();
         assert_eq!(deleted, 2);
@@ -666,8 +730,10 @@ mod tests {
         std::fs::write(tmp.path().join("alpha.txt"), "a").unwrap();
 
         let mut cat = ContentCatalog::open(tmp.path()).unwrap();
-        cat.index_file(&tmp.path().join("zebra.txt"), None, None, None).unwrap();
-        cat.index_file(&tmp.path().join("alpha.txt"), None, None, None).unwrap();
+        cat.index_file(&tmp.path().join("zebra.txt"), None, None, None)
+            .unwrap();
+        cat.index_file(&tmp.path().join("alpha.txt"), None, None, None)
+            .unwrap();
 
         let result = cat.query(&ContentQuery {
             sort: "name".into(),

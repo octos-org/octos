@@ -582,12 +582,13 @@ fn registry_version_for(repo: &str, skill_name: Option<&str>) -> Option<String> 
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
 
-        let matches = e_repo == repo
-            || e_name == repo
-            || skill_name.map_or(false, |sn| e_skills.contains(&sn));
+        let matches =
+            e_repo == repo || e_name == repo || skill_name.is_some_and(|sn| e_skills.contains(&sn));
 
         if matches {
-            e.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
+            e.get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         } else {
             None
         }

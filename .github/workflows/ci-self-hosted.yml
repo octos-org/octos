@@ -1,0 +1,98 @@
+name: CI (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to test"
+        required: false
+        default: "main"
+      include_arm:
+        description: "Run ARM64 self-hosted validation"
+        required: false
+        type: boolean
+        default: false
+      include_windows:
+        description: "Run Windows self-hosted validation"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+
+jobs:
+  fast-linux:
+    name: fast-linux
+    runs-on: [self-hosted, linux, x64, octos-fast]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: QoS adaptive/runtime catalog regressions
+        run: |
+          cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
+          cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
+          cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
+          cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+
+  linux-arm:
+    name: linux-arm
+    if: ${{ inputs.include_arm }}
+    runs-on: [self-hosted, linux, arm64, octos-arm]
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: self-hosted-arm64
+
+      - name: Build and test
+        run: |
+          cargo build --workspace
+          cargo build -p octos-cli --features ${{ env.FEATURES }}
+          cargo test --workspace --no-run
+          cargo test --workspace
+
+  windows:
+    name: windows
+    if: ${{ inputs.include_windows }}
+    runs-on: [self-hosted, windows, x64, octos-windows]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: self-hosted-windows
+
+      - name: Build and test
+        run: |
+          cargo build --workspace
+          cargo build -p octos-cli --features ${{ env.FEATURES }}
+          cargo test --workspace

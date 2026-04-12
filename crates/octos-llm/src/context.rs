@@ -91,9 +91,7 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
         65_535
     } else if m.contains("glm") || m.contains("minimax") {
         128_000
-    } else if m.contains("gpt-4") || m.contains("gpt-5") {
-        32_768
-    } else if m.contains("claude") {
+    } else if m.contains("gpt-4") || m.contains("gpt-5") || m.contains("claude") {
         32_768
     } else if m.contains("deepseek") {
         8_000

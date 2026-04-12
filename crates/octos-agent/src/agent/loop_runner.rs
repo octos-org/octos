@@ -232,11 +232,9 @@ impl Agent {
                 }
                 StopReason::ToolUse => {
                     // Check for loop detection before executing
-                    let mut loop_detected = false;
                     for tc in &response.tool_calls {
                         if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments) {
                             warn!("loop detected — breaking agent loop");
-                            loop_detected = true;
                             // Don't execute the tools — break out with a message
                             self.emit_cost_update(&total_usage, &response.usage);
                             let new_start = (1 + history.len()).min(messages.len());
@@ -250,16 +248,14 @@ impl Agent {
                             });
                         }
                     }
-                    if !loop_detected {
-                        self.handle_tool_use(
-                            &response,
-                            &mut messages,
-                            &mut files_modified,
-                            &mut total_usage,
-                            tracker,
-                        )
-                        .await?;
-                    }
+                    self.handle_tool_use(
+                        &response,
+                        &mut messages,
+                        &mut files_modified,
+                        &mut total_usage,
+                        tracker,
+                    )
+                    .await?;
                 }
                 StopReason::MaxTokens => {
                     self.emit_cost_update(&total_usage, &response.usage);

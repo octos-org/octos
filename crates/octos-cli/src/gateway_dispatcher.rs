@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
-use octos_core::{InboundMessage, OutboundMessage, SessionKey};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use octos_bus::{validate_topic_name, ActiveSessionStore, SessionManager};
+use octos_core::{InboundMessage, OutboundMessage, SessionKey, MAIN_PROFILE_ID};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::commands::gateway::{build_profiled_session_key, session_ui};
@@ -145,9 +145,62 @@ impl GatewayDispatcher {
             // Check for project templates (e.g. "/new slides <project>")
             let reply = if name == "slides" || name.starts_with("slides ") {
                 if let Some(data_dir) = &self.data_dir {
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+
                     match crate::project_templates::try_activate_slides_template(data_dir, name) {
-                        Some(template_reply) => template_reply,
+                        Some(template_reply) => {
+                            let project_name = name.strip_prefix("slides").unwrap_or("").trim();
+                            let project_name = if project_name.is_empty() {
+                                "untitled"
+                            } else {
+                                project_name
+                            };
+                            match crate::project_templates::scaffold_slides_project(
+                                &workspace_root,
+                                project_name,
+                            ) {
+                                Ok(_) => template_reply,
+                                Err(error) => {
+                                    warn!(topic = name, "slides scaffold failed: {error}");
+                                    format!(
+                                        "{template_reply}\n\nSlides git/bootstrap failed: {error}"
+                                    )
+                                }
+                            }
+                        }
                         None => format!("Switched to session: {name}"),
+                    }
+                } else {
+                    format!("Switched to session: {name}")
+                }
+            } else if name == "site" || name.starts_with("site ") {
+                if let Some(data_dir) = &self.data_dir {
+                    let _ = crate::project_templates::try_activate_site_template(data_dir, name);
+                    let profile_id = self
+                        .dispatch_profile_id
+                        .clone()
+                        .unwrap_or_else(|| MAIN_PROFILE_ID.to_string());
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+                    match crate::project_templates::scaffold_site_project(
+                        &workspace_root,
+                        &profile_id,
+                        session_key.chat_id(),
+                        name,
+                        data_dir,
+                    ) {
+                        Ok(metadata) => crate::project_templates::site_creation_reply(&metadata),
+                        Err(error) => {
+                            warn!(topic = name, "site scaffold failed: {error}");
+                            format!("Switched to session: {name}\n\nSite scaffold failed: {error}")
+                        }
                     }
                 } else {
                     format!("Switched to session: {name}")
@@ -1147,6 +1200,12 @@ mod tests {
         let (disp, _, tmp) = setup_dispatcher(tx);
         let disp = disp.with_data_dir(tmp.path().to_path_buf());
         let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
 
         let result = disp
             .handle_new_command(
@@ -1163,12 +1222,12 @@ mod tests {
         // Should get the slides creation reply, not the generic switch message
         assert!(msg.content.contains("my-deck"));
         assert!(msg.content.contains("slides/my-deck/"));
-        assert!(msg.content.contains("What is this presentation about"));
+        assert!(msg.content.contains("Let me help you design your slides"));
 
-        // Project directory should be scaffolded
-        assert!(tmp.path().join("slides/my-deck/script.js").is_file());
-        assert!(tmp.path().join("slides/my-deck/memory.md").is_file());
-        assert!(tmp.path().join("slides/my-deck/history").is_dir());
+        // Project directory should be scaffolded under the per-user workspace.
+        assert!(workspace_root.join("slides/my-deck/script.js").is_file());
+        assert!(workspace_root.join("slides/my-deck/memory.md").is_file());
+        assert!(workspace_root.join("slides/my-deck/history").is_dir());
 
         // Session prompt should be written
         let prompt = crate::project_templates::read_session_prompt(tmp.path(), "slides my-deck");
@@ -1182,6 +1241,12 @@ mod tests {
         let (disp, _, tmp) = setup_dispatcher(tx);
         let disp = disp.with_data_dir(tmp.path().to_path_buf());
         let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
 
         let result = disp
             .handle_new_command(
@@ -1196,7 +1261,7 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let msg = rx.try_recv().unwrap();
         assert!(msg.content.contains("untitled"));
-        assert!(tmp.path().join("slides/untitled/script.js").is_file());
+        assert!(workspace_root.join("slides/untitled/script.js").is_file());
     }
 
     #[tokio::test]

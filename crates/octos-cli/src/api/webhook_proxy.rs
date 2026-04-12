@@ -152,6 +152,7 @@ async fn proxy_to_gateway_with_bytes(
 pub async fn api_chat_proxy(
     state: &AppState,
     port: u16,
+    profile_id: Option<&str>,
     message: &str,
     session_id: Option<&str>,
     media: &[String],
@@ -161,6 +162,7 @@ pub async fn api_chat_proxy(
         "message": message,
         "session_id": session_id,
         "media": media,
+        "target_profile_id": profile_id,
     });
 
     let resp = match state

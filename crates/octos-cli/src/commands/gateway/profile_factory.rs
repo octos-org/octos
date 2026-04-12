@@ -5,24 +5,24 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Result;
-use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
+use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{ActiveSessionStore, CronService, SessionManager};
 use octos_core::OutboundMessage;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, ProviderRouter, RetryProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
-use crate::config::{Config, detect_provider};
+use crate::config::{detect_provider, Config};
 use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
     ToolRegistryFactory,
@@ -30,7 +30,12 @@ use crate::session_actor::{
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 /// (full LLM, provider name, adaptive router, strong-only LLM for slides)
-pub(crate) type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>, Arc<dyn LlmProvider>);
+pub(crate) type LlmStack = (
+    Arc<dyn LlmProvider>,
+    String,
+    Option<Arc<AdaptiveRouter>>,
+    Arc<dyn LlmProvider>,
+);
 
 pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
     let model = config.model.clone();
@@ -133,8 +138,7 @@ pub(crate) fn build_strong_chain(
     if strong_fallbacks.is_empty() || no_retry {
         return Ok(Arc::new(RetryProvider::new(primary)));
     }
-    let mut providers: Vec<Arc<dyn LlmProvider>> =
-        vec![Arc::new(RetryProvider::new(primary))];
+    let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
     for fallback in strong_fallbacks {
         let fallback_config = if fallback.api_key_env.is_some() {
             let mut cloned = config.clone();
@@ -307,29 +311,7 @@ impl ProfileActorFactoryBuilder {
         let model_id = llm.model_id().to_string();
 
         let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
-        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
-        if profile_data_dir != self.project_dir {
-            if let Some(parent_id) = effective_profile.parent_id.as_deref() {
-                if let Some(parent) = self.profile_store.get(parent_id)? {
-                    extra_skills_dirs.push(self.profile_store.resolve_data_dir(&parent));
-                }
-            }
-            extra_skills_dirs.push(self.project_dir.clone());
-        }
-
-        let mut skills_loader = if profile_data_dir != self.project_dir {
-            let mut loader = SkillsLoader::new(&profile_data_dir);
-            for dir in &extra_skills_dirs {
-                loader.add_skills_dir(dir);
-            }
-            loader
-        } else {
-            SkillsLoader::new(&self.project_dir)
-        };
-        skills_loader.add_skills_path(
-            self.project_dir
-                .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR),
-        );
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir);
 
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
@@ -401,19 +383,7 @@ impl ProfileActorFactoryBuilder {
                     .to_string_lossy()
                     .to_string(),
             ));
-            let mut plugin_dirs =
-                crate::config::Config::plugin_dirs_from_project(&self.project_dir);
-            let profile_skills = profile_data_dir.join("skills");
-            if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
-                plugin_dirs.insert(0, profile_skills);
-            }
-            // Include parent profile skills dir so child bots can use parent's skills
-            for dir in &extra_skills_dirs {
-                let skills = dir.join("skills");
-                if skills.exists() && !plugin_dirs.contains(&skills) {
-                    plugin_dirs.push(skills);
-                }
-            }
+            let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
                     &mut tools,
@@ -530,7 +500,11 @@ impl ProfileActorFactoryBuilder {
                         ),
                     }
                 }
-                if registered > 1 { Some(router) } else { None }
+                if registered > 1 {
+                    Some(router)
+                } else {
+                    None
+                }
             };
             provider_router = child_router.clone();
 

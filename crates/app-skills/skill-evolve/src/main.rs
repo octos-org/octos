@@ -135,11 +135,11 @@ fn run_hook() {
     }
 
     // Call LLM.
-    let suggestion = match generate_suggestion(&skill_name, &tool_name, &error_output, &skill_content)
-    {
-        Some(s) => s,
-        None => return,
-    };
+    let suggestion =
+        match generate_suggestion(&skill_name, &tool_name, &error_output, &skill_content) {
+            Some(s) => s,
+            None => return,
+        };
 
     // Persist patch.
     let patch = EvolutionPatch {
@@ -154,7 +154,10 @@ fn run_hook() {
     if store.patches.len() > MAX_PATCHES {
         store.patches.drain(0..store.patches.len() - MAX_PATCHES);
     }
-    let _ = fs::write(&store_path, serde_json::to_string_pretty(&store).unwrap_or_default());
+    let _ = fs::write(
+        &store_path,
+        serde_json::to_string_pretty(&store).unwrap_or_default(),
+    );
 }
 
 fn is_on_cooldown(store: &EvolutionStore) -> bool {
@@ -214,7 +217,11 @@ fn cmd_list(skills_dirs: &[PathBuf]) {
                 continue;
             }
             let skill_name = entry.file_name().to_string_lossy().to_string();
-            output.push_str(&format!("## {} ({} pending)\n", skill_name, store.patches.len()));
+            output.push_str(&format!(
+                "## {} ({} pending)\n",
+                skill_name,
+                store.patches.len()
+            ));
             for patch in &store.patches {
                 output.push_str(&format!(
                     "- [{}] tool `{}`: {}\n  Error: {}\n",
@@ -302,7 +309,10 @@ fn cmd_apply(skills_dirs: &[PathBuf], skill: &str) {
         &store_path,
         serde_json::to_string_pretty(&EvolutionStore::default()).unwrap_or_default(),
     );
-    print_result(true, &format!("Applied {count} patches to {skill}/SKILL.md"));
+    print_result(
+        true,
+        &format!("Applied {count} patches to {skill}/SKILL.md"),
+    );
 }
 
 fn cmd_discard(skills_dirs: &[PathBuf], skill: &str) {
@@ -542,21 +552,13 @@ fn resolve_llm_config() -> Option<(String, String, String)> {
             "https://api.deepseek.com/v1",
             "deepseek-chat",
         ),
-        (
-            "KIMI_API_KEY",
-            "https://api.moonshot.ai/v1",
-            "kimi-2.5",
-        ),
+        ("KIMI_API_KEY", "https://api.moonshot.ai/v1", "kimi-2.5"),
         (
             "DASHSCOPE_API_KEY",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "qwen-plus",
         ),
-        (
-            "OPENAI_API_KEY",
-            "https://api.openai.com/v1",
-            "gpt-4o-mini",
-        ),
+        ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-4o-mini"),
         (
             "GEMINI_API_KEY",
             "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -636,10 +638,7 @@ fn find_skill_for_tool(skills_dirs: &[PathBuf], tool_name: &str) -> Option<(Stri
             if let Some(tools) = manifest["tools"].as_array() {
                 for tool in tools {
                     if tool["name"].as_str() == Some(tool_name) {
-                        let name = manifest["name"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let name = manifest["name"].as_str().unwrap_or("unknown").to_string();
                         return Some((name, entry.path()));
                     }
                 }
@@ -682,11 +681,9 @@ fn split_learned_notes(content: &str) -> (&str, Vec<String>) {
         .lines()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                Some(trimmed[2..].to_string())
-            } else {
-                None
-            }
+            trimmed
+                .strip_prefix("- ")
+                .map(|stripped| stripped.to_string())
         })
         .collect();
     (body, notes)
@@ -880,7 +877,10 @@ mod tests {
         ).unwrap();
 
         let result = find_skill_for_tool(&[dir.path().to_path_buf()], "skill_evolve");
-        assert!(result.is_none(), "should skip self to avoid evolution loops");
+        assert!(
+            result.is_none(),
+            "should skip self to avoid evolution loops"
+        );
     }
 
     #[test]

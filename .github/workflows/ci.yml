@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -54,6 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,7 +67,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}"
+            merge_base="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+            changed_rs=()
+            while IFS= read -r -d '' file; do
+              changed_rs+=("$file")
+            done < <(git diff -z --name-only --diff-filter=ACMRT "$merge_base"...HEAD -- '*.rs')
+
+            if [ "${#changed_rs[@]}" -eq 0 ]; then
+              echo "No changed Rust files to format-check."
+              exit 0
+            fi
+
+            rustfmt --check --edition 2021 --config skip_children=true "${changed_rs[@]}"
+          else
+            cargo fmt --all -- --check
+          fi
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
@@ -70,10 +92,18 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: QoS adaptive/runtime catalog regressions
+        run: |
+          cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
+          cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
+          cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
+          cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+
       - name: activate_tools regression tests
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   check-arm:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
@@ -98,6 +128,7 @@ jobs:
         run: cargo test --workspace
 
   check-riscv:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"
@@ -122,6 +153,7 @@ jobs:
         run: cargo test --workspace
 
   check-windows:
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6

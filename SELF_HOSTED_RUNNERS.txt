@@ -1,0 +1,128 @@
+Self-Hosted Runners
+===================
+
+This repo now separates PR CI from slow platform matrix jobs:
+
+- PR fast lane:
+  - dashboard
+  - typos
+  - check
+- Slow platform matrix:
+  - check-arm
+  - check-riscv
+  - check-windows
+  - release artifact builds
+  - these run on push, schedule, or workflow_dispatch
+
+There is also a manual workflow:
+
+- .github/workflows/ci-self-hosted.yml
+
+It is meant for repo-owned machines such as Mini 3, ARM boxes, or Windows builders.
+
+Runner Labels
+-------------
+
+Use these labels exactly so the workflow can target the right machines:
+
+- Fast Linux x64 runner:
+  - self-hosted,linux,x64,octos-fast
+- Linux ARM64 runner:
+  - self-hosted,linux,arm64,octos-arm
+- Windows x64 runner:
+  - self-hosted,windows,x64,octos-windows
+
+Prerequisites
+-------------
+
+1. Install gh and authenticate with a token that can create runner registration tokens.
+2. Install build dependencies on the runner host:
+   - Rust toolchain
+   - git
+   - curl
+   - platform-native compiler toolchain
+3. For Linux/macOS, use:
+   - scripts/setup-github-runner.sh
+
+Fast Linux Runner Example
+-------------------------
+
+    cd /Users/yuechen/home/crew-rs-port
+
+    scripts/setup-github-runner.sh \
+      --name mini3-octos-fast \
+      --labels self-hosted,linux,x64,octos-fast
+
+Then launch it:
+
+    cd ~/.github-runners/mini3-octos-fast && ./run.sh
+
+If you want it as a Linux service:
+
+    cd /Users/yuechen/home/crew-rs-port
+
+    scripts/setup-github-runner.sh \
+      --name mini3-octos-fast \
+      --labels self-hosted,linux,x64,octos-fast \
+      --service
+
+ARM64 Runner Example
+--------------------
+
+    cd /Users/yuechen/home/crew-rs-port
+
+    scripts/setup-github-runner.sh \
+      --name arm-builder \
+      --labels self-hosted,linux,arm64,octos-arm \
+      --service
+
+Windows Runner Example
+----------------------
+
+Use a standard GitHub Actions runner installation on the Windows machine and register it with:
+
+- name:
+  - windows-builder
+- labels:
+  - self-hosted,windows,x64,octos-windows
+
+Typical manual flow in PowerShell:
+
+    $repo = "octos-org/octos"
+    $url = "https://github.com/$repo"
+    $token = gh api -X POST "repos/$repo/actions/runners/registration-token" --jq .token
+
+    mkdir C:\actions-runner
+    cd C:\actions-runner
+    curl.exe -L -o actions-runner-win-x64-2.328.0.zip https://github.com/actions/runner/releases/download/v2.328.0/actions-runner-win-x64-2.328.0.zip
+    tar -xf .\actions-runner-win-x64-2.328.0.zip
+    .\config.cmd --unattended --url $url --token $token --name windows-builder --labels self-hosted,windows,x64,octos-windows --replace
+    .\run.cmd
+
+Triggering The Workflow
+-----------------------
+
+From GitHub Actions UI:
+
+- workflow: CI (self-hosted)
+- inputs:
+  - ref
+  - include_arm
+  - include_windows
+
+From CLI:
+
+    gh workflow run "CI (self-hosted)" \
+      --repo octos-org/octos \
+      -f ref=main \
+      -f include_arm=true \
+      -f include_windows=false
+
+Recommended Rollout
+-------------------
+
+1. Register one Linux x64 runner first with octos-fast.
+2. Confirm CI (self-hosted) succeeds on the fast lane.
+3. Add ARM64 runner with octos-arm.
+4. Add Windows runner with octos-windows.
+5. Only after that, decide whether any self-hosted jobs should become required checks.

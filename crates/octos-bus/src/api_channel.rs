@@ -6,26 +6,29 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::Json;
-use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use axum::Json;
+use axum::Router;
 use chrono::Utc;
 use eyre::Result;
-use octos_core::{InboundMessage, Message, MessageRole, OutboundMessage, SessionKey};
+use octos_core::{
+    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
-use tracing::info;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{info, warn};
 
-use crate::SessionManager;
 use crate::channel::Channel;
+use crate::SessionManager;
 
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
@@ -36,6 +39,7 @@ struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     auth_token: Option<String>,
+    profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
 }
@@ -49,6 +53,8 @@ struct ChatRequest {
     /// File paths from prior upload.
     #[serde(default)]
     media: Vec<String>,
+    #[serde(default)]
+    target_profile_id: Option<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -58,6 +64,7 @@ struct ChatRequest {
 pub struct ApiChannel {
     port: u16,
     auth_token: Option<String>,
+    profile_id: Option<String>,
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Track last sent content per chat_id for delta computation.
@@ -73,10 +80,12 @@ impl ApiChannel {
         auth_token: Option<String>,
         shutdown: Arc<AtomicBool>,
         sessions: Arc<Mutex<SessionManager>>,
+        profile_id: Option<String>,
     ) -> Self {
         Self {
             port,
             auth_token,
+            profile_id,
             shutdown,
             pending: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
@@ -89,6 +98,103 @@ impl ApiChannel {
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
         self
+    }
+
+    fn session_workspace_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        let encoded = crate::session::encode_path_component(key.base_key());
+        data_dir.join("users").join(encoded).join("workspace")
+    }
+
+    fn session_artifact_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        Self::session_workspace_dir(data_dir, key).join(".artifacts")
+    }
+
+    fn sanitize_artifact_name(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "artifact".to_string());
+        name.replace(['/', '\\', '\0'], "_")
+    }
+
+    fn copy_media_into_session_artifacts(artifact_dir: &Path, media: &[String]) -> Vec<String> {
+        if let Err(error) = std::fs::create_dir_all(artifact_dir) {
+            warn!(
+                path = %artifact_dir.display(),
+                %error,
+                "failed to create session artifact directory"
+            );
+            return media.to_vec();
+        }
+
+        let canonical_artifact_dir =
+            std::fs::canonicalize(artifact_dir).unwrap_or_else(|_| artifact_dir.to_path_buf());
+
+        media
+            .iter()
+            .map(|raw| {
+                let source_path = PathBuf::from(raw);
+                if source_path.starts_with(&canonical_artifact_dir) {
+                    return raw.clone();
+                }
+
+                let canonical_source = match std::fs::canonicalize(&source_path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        warn!(path = %raw, %error, "failed to canonicalize media source");
+                        return raw.clone();
+                    }
+                };
+
+                if canonical_source.starts_with(&canonical_artifact_dir) {
+                    return canonical_source.to_string_lossy().to_string();
+                }
+
+                let safe_name = Self::sanitize_artifact_name(&canonical_source);
+                let dest =
+                    canonical_artifact_dir.join(format!("{}-{safe_name}", uuid::Uuid::now_v7()));
+
+                if canonical_source == dest {
+                    return canonical_source.to_string_lossy().to_string();
+                }
+
+                match std::fs::copy(&canonical_source, &dest) {
+                    Ok(_) => dest.to_string_lossy().to_string(),
+                    Err(error) => {
+                        warn!(
+                            source = %canonical_source.display(),
+                            dest = %dest.display(),
+                            %error,
+                            "failed to materialize media into session artifacts"
+                        );
+                        raw.clone()
+                    }
+                }
+            })
+            .collect()
+    }
+
+    async fn materialize_media_for_session(&self, chat_id: &str, media: &[String]) -> Vec<String> {
+        let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
+        let data_dir = {
+            let sess = self.sessions.lock().await;
+            sess.data_dir()
+        };
+        let artifact_dir = Self::session_artifact_dir(&data_dir, &key);
+        let media = media.to_vec();
+        let media_for_copy = media.clone();
+        match tokio::task::spawn_blocking(move || {
+            Self::copy_media_into_session_artifacts(&artifact_dir, &media_for_copy)
+        })
+        .await
+        {
+            Ok(paths) => paths,
+            Err(error) => {
+                warn!(chat_id = %chat_id, %error, "failed to join media materialization task");
+                media
+            }
+        }
     }
 }
 
@@ -103,6 +209,7 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             auth_token: self.auth_token.clone(),
+            profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
         };
@@ -137,19 +244,24 @@ impl Channel for ApiChannel {
 
     async fn send(&self, msg: &OutboundMessage) -> Result<()> {
         if !msg.media.is_empty() {
+            let persisted_media = self
+                .materialize_media_for_session(&msg.chat_id, &msg.media)
+                .await;
+
             // File message — persist to session history AND send SSE event.
             let file_desc = msg
                 .media
                 .iter()
-                .map(|p| {
-                    let name = std::path::Path::new(p)
+                .zip(persisted_media.iter())
+                .map(|(original_path, persisted_path)| {
+                    let name = std::path::Path::new(original_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if msg.content.is_empty() {
-                        format!("[file:{p}] {name}")
+                        format!("[file:{persisted_path}] {name}")
                     } else {
-                        format!("[file:{p}] {name} — {}", msg.content)
+                        format!("[file:{persisted_path}] {name} — {}", msg.content)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -157,7 +269,7 @@ impl Channel for ApiChannel {
             let session_msg = Message {
                 role: MessageRole::Assistant,
                 content: file_desc,
-                media: msg.media.clone(),
+                media: persisted_media.clone(),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -168,16 +280,20 @@ impl Channel for ApiChannel {
             // Send SSE file event so the web client receives it in real-time
             let pending = self.pending.lock().await;
             if let Some(tx) = pending.get(&msg.chat_id) {
-                for path in &msg.media {
-                    let filename = std::path::Path::new(path)
+                for (original_path, persisted_path) in msg.media.iter().zip(persisted_media.iter())
+                {
+                    let filename = std::path::Path::new(original_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let tool_call_id = msg.metadata.get("tool_call_id")
-                        .and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_call_id = msg
+                        .metadata
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let event = serde_json::json!({
                         "type": "file",
-                        "path": path,
+                        "path": persisted_path,
                         "filename": filename,
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
@@ -329,33 +445,20 @@ impl Channel for ApiChannel {
 
 impl ApiChannel {
     /// Persist a message to the session JSONL for the given chat_id.
-    ///
-    /// Tries the `_main:api:{chat_id}` key first (gateway layout), then falls
-    /// back to `api:{chat_id}` (legacy layout).
     async fn persist_to_session(&self, chat_id: &str, message: Message) {
-        let key = SessionKey(format!("_main:api:{chat_id}"));
-        let alt_key = SessionKey::new("api", chat_id);
+        let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
         let mut sess = self.sessions.lock().await;
-        // Try the gateway-style key first; if it has no prior session on disk,
-        // try the legacy key.  If neither exists yet, use the gateway key.
-        let target_key = if sess.session_path(&key).exists() {
-            key
-        } else if sess.session_path(&alt_key).exists() {
-            alt_key
-        } else {
-            key
-        };
-        if let Err(e) = sess.add_message(&target_key, message.clone()).await {
+        if let Err(e) = sess.add_message(&key, message.clone()).await {
             tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
         } else {
-            info!(chat_id = %chat_id, key = %target_key.0, "persisted file/notification to session");
+            info!(chat_id = %chat_id, key = %key.0, "persisted file/notification to session");
         }
 
         // Also write to the per-user SessionHandle path so the web client
         // (which reads from per-user JSONL via source=full) can see file deliveries.
         let data_dir = sess.data_dir();
         drop(sess);
-        let base_key = target_key.base_key();
+        let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
         let per_user_path = per_user_dir.join("default.jsonl");
@@ -364,13 +467,21 @@ impl ApiChannel {
                 let path_clone = per_user_path.clone();
                 match tokio::task::spawn_blocking(move || {
                     use std::io::Write;
-                    let mut f = std::fs::OpenOptions::new().append(true).open(&per_user_path)?;
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&per_user_path)?;
                     writeln!(f, "{}", msg_json)?;
                     Ok::<_, std::io::Error>(())
-                }).await {
+                })
+                .await
+                {
                     Ok(Ok(())) => info!(chat_id = %chat_id, "persisted to per-user session"),
-                    Ok(Err(e)) => tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed"),
-                    Err(e) => tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed"),
+                    Ok(Err(e)) => {
+                        tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed")
+                    }
+                    Err(e) => {
+                        tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed")
+                    }
                 }
             }
         } else {
@@ -434,7 +545,10 @@ async fn handle_chat(
         content: req.message,
         timestamp: Utc::now(),
         media: req.media,
-        metadata: serde_json::json!({}),
+        metadata: match req.target_profile_id.filter(|value| !value.is_empty()) {
+            Some(profile_id) => serde_json::json!({ "target_profile_id": profile_id }),
+            None => serde_json::json!({}),
+        },
         message_id: None,
     };
 
@@ -501,10 +615,80 @@ struct PaginationParams {
     /// "full" to read from disk (complete history), default reads from memory (compacted for LLM).
     #[serde(default)]
     source: Option<String>,
+    /// Return only messages strictly newer than this sequence number.
+    #[serde(default)]
+    since_seq: Option<usize>,
+    /// Explicit topic override for multi-topic sessions.
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 fn default_limit() -> usize {
     100
+}
+
+fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
+    SessionKey::with_profile(
+        profile_id
+            .filter(|value| !value.is_empty())
+            .unwrap_or(MAIN_PROFILE_ID),
+        "api",
+        chat_id,
+    )
+}
+
+fn api_session_key_candidates(
+    profile_id: Option<&str>,
+    id: &str,
+    topic: Option<&str>,
+) -> Vec<SessionKey> {
+    let mut keys = Vec::with_capacity(3);
+
+    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
+        if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+            keys.push(SessionKey::with_profile_topic(profile_id, "api", id, topic));
+        }
+        keys.push(SessionKey::with_profile_topic(
+            MAIN_PROFILE_ID,
+            "api",
+            id,
+            topic,
+        ));
+        keys.push(SessionKey::with_topic("api", id, topic));
+    } else {
+        if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+            keys.push(SessionKey::with_profile(profile_id, "api", id));
+        }
+        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", id));
+        keys.push(SessionKey::new("api", id));
+    }
+
+    keys.dedup_by(|left, right| left.0 == right.0);
+    keys
+}
+
+fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
+    id.strip_prefix("api:")
+        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
+}
+
+fn message_info_from_history_message(message: &Message) -> MessageInfo {
+    MessageInfo {
+        role: message.role.to_string(),
+        content: message.content.clone(),
+        timestamp: message.timestamp.to_rfc3339(),
+        media: message.media.clone(),
+        tool_calls: message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| serde_json::to_value(call).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// GET /sessions/:id/status — check if a session has an active task.
@@ -528,8 +712,8 @@ async fn handle_session_tasks(
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = format!("_main:api:{id}");
-    let tasks = query_fn(&session_key);
+    let session_key = current_profile_api_session_key(state.profile_id.as_deref(), &id);
+    let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
 
@@ -540,10 +724,7 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            // Session keys may be "api:{id}" (legacy) or "_main:api:{id}" (per-user layout)
-            let chat_id = id
-                .strip_prefix("api:")
-                .or_else(|| id.strip_prefix("_main:api:"))?;
+            let chat_id = api_chat_id_from_session_key(&id)?;
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -565,131 +746,48 @@ async fn handle_session_messages(
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
     };
-    let key = SessionKey::new("api", &id);
-    // Sessions created through the gateway use "_main:api:{id}" as the key
-    let alt_key = SessionKey(format!("_main:api:{id}"));
+    let candidates =
+        api_session_key_candidates(state.profile_id.as_deref(), &id, params.topic.as_deref());
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
-        let flat_path = sess.session_path(&key);
-        let alt_flat_path = sess.session_path(&alt_key);
-        let data_dir = sess.data_dir();
-        drop(sess);
-
-        // Per-user session dir: data/users/{base_key}/sessions/
-        // Contains default.jsonl + topic files like 123.jsonl
-        // Read ALL jsonl files to merge messages across topics.
-        let per_user_dir = {
-            let base_key = alt_key.base_key();
-            let encoded = crate::session::encode_path_component(base_key);
-            data_dir.join("users").join(encoded).join("sessions")
-        };
-
-        // Read from ALL per-user JSONL files + flat path and merge.
-        let mut all_lines = Vec::new();
-
-        // Primary: all per-user JSONL files (user messages + assistant responses)
-        if let Ok(entries) = std::fs::read_dir(&per_user_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|x| x == "jsonl") {
-                    if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                        all_lines.extend(content.lines().map(|l| l.to_string()));
-                    }
-                }
+        for candidate in &candidates {
+            if let Some(session) = sess.load(candidate).await {
+                let messages: Vec<MessageInfo> = session
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(_, message)| message_info_from_history_message(message))
+                    .collect();
+                return Json(messages).into_response();
             }
-        }
-        // Secondary: flat path (has file deliveries that may not be in per-user)
-        let flat_read = if tokio::fs::metadata(&flat_path).await.is_ok() {
-            flat_path
-        } else {
-            alt_flat_path
-        };
-        if let Ok(content) = tokio::fs::read_to_string(&flat_read).await {
-            // Only add lines from flat that have media (file deliveries) or bg notifications
-            // and aren't already in per-user
-            for line in content.lines() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let has_media = v.get("media").and_then(|m| m.as_array()).is_some_and(|a| !a.is_empty());
-                    let is_bg = v.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with('✓') || c.starts_with('✗'));
-                    if has_media || is_bg {
-                        // Check for duplicate by content
-                        let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if !all_lines.iter().any(|existing| existing.contains(content_str) && !content_str.is_empty()) {
-                            all_lines.push(line.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        let messages: Vec<MessageInfo> = all_lines
-            .iter()
-            .filter_map(|line| {
-                let v: serde_json::Value = serde_json::from_str(line).ok()?;
-                let role = v.get("role")?.as_str()?;
-                let content = v.get("content")?.as_str().unwrap_or("");
-                let timestamp =
-                    v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-                let media: Vec<String> = v
-                    .get("media")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let tool_calls: Vec<serde_json::Value> = v
-                    .get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .map(|arr| arr.to_vec())
-                    .unwrap_or_default();
-                Some(MessageInfo {
-                    role: role.to_string(),
-                    content: content.to_string(),
-                    timestamp: timestamp.to_string(),
-                    media,
-                    tool_calls,
-                })
-            })
-            .skip(offset)
-            .take(limit)
-            .collect();
-        if !messages.is_empty() {
-            return Json(messages).into_response();
         }
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let mut sess = state.sessions.lock().await;
-    // Try primary key first, fall back to _main: prefixed key
-    let session = sess.get_or_create(&key).await;
-    let history = session.get_history(fetch_count);
-    let use_alt = history.is_empty();
-    let history = if use_alt {
-        sess.get_or_create(&alt_key)
-            .await
-            .get_history(fetch_count)
-            .to_vec()
-    } else {
-        history.to_vec()
-    };
-    let messages: Vec<MessageInfo> = history
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|m| MessageInfo {
-            role: m.role.to_string(),
-            content: m.content.clone(),
-            timestamp: m.timestamp.to_rfc3339(),
-            media: m.media.clone(),
-            tool_calls: m.tool_calls.as_ref()
-                .map(|tcs| tcs.iter().filter_map(|tc| serde_json::to_value(tc).ok()).collect())
-                .unwrap_or_default(),
-        })
-        .collect();
-    Json(messages).into_response()
+    let sess = state.sessions.lock().await;
+    for candidate in &candidates {
+        if let Some(session) = sess.load(candidate).await {
+            let history = session.get_history(fetch_count).to_vec();
+            let messages: Vec<MessageInfo> = history
+                .iter()
+                .enumerate()
+                .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                .skip(offset)
+                .take(limit)
+                .map(|(_, message)| message_info_from_history_message(message))
+                .collect();
+            if !messages.is_empty() {
+                return Json(messages).into_response();
+            }
+        }
+    }
+    Json(Vec::<MessageInfo>::new()).into_response()
 }
 
 /// DELETE /sessions/:id — delete a session.
@@ -697,15 +795,17 @@ async fn handle_delete_session(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let key = SessionKey::new("api", &id);
-    let alt_key = SessionKey(format!("_main:api:{id}"));
     let mut sess = state.sessions.lock().await;
-    // Try both key formats (legacy api:{id} and per-user _main:api:{id})
-    let r1 = sess.clear(&key).await;
-    let r2 = sess.clear(&alt_key).await;
-    match r1.or(r2) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let mut last_error: Option<String> = None;
+    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+        match sess.clear(&candidate).await {
+            Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    match last_error {
+        Some(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
@@ -817,10 +917,17 @@ async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    const TEST_PROFILE_ID: &str = "dspfac";
+
+    fn test_sessions_in(data_dir: &Path) -> Arc<Mutex<SessionManager>> {
+        Arc::new(Mutex::new(SessionManager::open(data_dir).unwrap()))
+    }
 
     fn test_sessions() -> Arc<Mutex<SessionManager>> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()))
+        test_sessions_in(dir.path())
     }
 
     #[test]
@@ -839,12 +946,35 @@ mod tests {
     }
 
     #[test]
+    fn api_session_key_candidates_prefer_current_profile() {
+        let keys = api_session_key_candidates(Some("dspfac--newsbot"), "web-123", None);
+
+        assert_eq!(keys[0].0, "dspfac--newsbot:api:web-123");
+        assert_eq!(keys[1].0, "_main:api:web-123");
+        assert_eq!(keys[2].0, "api:web-123");
+    }
+
+    #[test]
+    fn api_chat_id_from_profiled_session_key_strips_prefix() {
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac--newsbot:api:web-123"),
+            Some("web-123")
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("_main:api:web-123"),
+            Some("web-123")
+        );
+        assert_eq!(api_chat_id_from_session_key("api:web-123"), Some("web-123"));
+    }
+
+    #[test]
     fn api_channel_name() {
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.name(), "api");
     }
@@ -856,6 +986,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         assert_eq!(ch.max_message_length(), 1_000_000);
     }
@@ -867,6 +998,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -897,6 +1029,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
@@ -925,13 +1058,19 @@ mod tests {
 
     #[tokio::test]
     async fn send_completion_with_bg_tasks_closes_and_client_polls() {
-        let sessions = test_sessions();
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("test.mp3");
+        std::fs::write(&source, b"bg-audio").unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
@@ -964,32 +1103,41 @@ mod tests {
             chat_id: "test-bg".into(),
             content: String::new(),
             reply_to: None,
-            media: vec!["/tmp/test.mp3".into()],
+            media: vec![source.to_string_lossy().to_string()],
             metadata: serde_json::json!({}),
         };
         ch.send(&file_msg).await.unwrap();
 
         // Client polling session history would find it
         let mut sess = sessions.lock().await;
-        let key = SessionKey("_main:api:test-bg".into());
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
-        assert!(
-            history
-                .iter()
-                .any(|m| m.media.contains(&"/tmp/test.mp3".to_string()))
-        );
+        let stored = history
+            .iter()
+            .flat_map(|m| m.media.iter())
+            .find(|path| path.ends_with("test.mp3"))
+            .cloned()
+            .expect("expected persisted artifact path");
+        assert_ne!(stored, source.to_string_lossy().to_string());
+        assert!(Path::new(&stored).exists());
     }
 
     #[tokio::test]
     async fn send_file_message_persists_to_session() {
-        let sessions = test_sessions();
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("test.mp3");
+        std::fs::write(&source, b"audio").unwrap();
 
         // Send a file message (no active SSE needed — goes straight to session)
         let msg = OutboundMessage {
@@ -997,20 +1145,70 @@ mod tests {
             chat_id: "test-file".into(),
             content: "Audio file".into(),
             reply_to: None,
-            media: vec!["/tmp/test.mp3".into()],
+            media: vec![source.to_string_lossy().to_string()],
             metadata: serde_json::json!({}),
         };
         ch.send(&msg).await.unwrap();
 
         // Verify it was persisted to the session
         let mut sess = sessions.lock().await;
-        let key = SessionKey(format!("_main:api:test-file"));
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-file");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert_eq!(history.len(), 1);
-        assert!(history[0].content.contains("/tmp/test.mp3"));
         assert!(history[0].content.contains("Audio file"));
-        assert_eq!(history[0].media, vec!["/tmp/test.mp3".to_string()]);
+        assert_eq!(history[0].media.len(), 1);
+        let persisted = &history[0].media[0];
+        assert_ne!(persisted, &source.to_string_lossy().to_string());
+        assert!(history[0].content.contains(persisted));
+        assert!(Path::new(persisted).exists());
+        assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_keeps_distinct_artifacts_for_same_basename() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let source_a_dir = data_dir.path().join("source-a");
+        let source_b_dir = data_dir.path().join("source-b");
+        std::fs::create_dir_all(&source_a_dir).unwrap();
+        std::fs::create_dir_all(&source_b_dir).unwrap();
+        let source_a = source_a_dir.join("report.pdf");
+        let source_b = source_b_dir.join("report.pdf");
+        std::fs::write(&source_a, b"alpha").unwrap();
+        std::fs::write(&source_b, b"beta").unwrap();
+
+        for source in [&source_a, &source_b] {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "collision-chat".into(),
+                content: "report".into(),
+                reply_to: None,
+                media: vec![source.to_string_lossy().to_string()],
+                metadata: serde_json::json!({}),
+            };
+            ch.send(&msg).await.unwrap();
+        }
+
+        let mut sess = sessions.lock().await;
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "collision-chat");
+        let session = sess.get_or_create(&key).await;
+        let stored: Vec<String> = session
+            .get_history(10)
+            .iter()
+            .flat_map(|m| m.media.iter().cloned())
+            .collect();
+        assert_eq!(stored.len(), 2);
+        assert_ne!(stored[0], stored[1]);
+        assert_eq!(std::fs::read(Path::new(&stored[0])).unwrap().len(), 5);
+        assert_eq!(std::fs::read(Path::new(&stored[1])).unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -1021,6 +1219,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
 
         // Send background task notification (checkmark)
@@ -1036,7 +1235,7 @@ mod tests {
 
         // Verify it was persisted to the session (not sent via SSE)
         let mut sess = sessions.lock().await;
-        let key = SessionKey(format!("_main:api:test-bg2"));
+        let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "test-bg2");
         let session = sess.get_or_create(&key).await;
         let history = session.get_history(10);
         assert_eq!(history.len(), 1);
@@ -1050,6 +1249,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
         );
         let msg = OutboundMessage {
             channel: "api".into(),

@@ -198,25 +198,12 @@ impl Executable for SkillsCommand {
 
 // ── Public API for programmatic access ───────────────────────────────
 
-/// Resolve the skills directory for a profile.
-/// Sub-accounts resolve to their parent profile's skills dir.
+/// Resolve the installed customer skills directory for exactly the requested account.
 pub fn resolve_profile_skills_dir(
     store: &crate::profiles::ProfileStore,
     profile_id: &str,
 ) -> Result<PathBuf> {
-    let profile = store
-        .get(profile_id)?
-        .ok_or_else(|| eyre::eyre!("profile '{profile_id}' not found"))?;
-    let target = if let Some(ref parent_id) = profile.parent_id {
-        store
-            .get(parent_id)?
-            .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?
-    } else {
-        profile
-    };
-    let data_dir = store.resolve_data_dir(&target);
-    std::fs::create_dir_all(data_dir.join("skills")).ok();
-    Ok(data_dir.join("skills"))
+    crate::skills_scope::resolve_account_skills_dir(store, profile_id)
 }
 
 /// List installed skills in a directory (returns structured data).
@@ -1142,20 +1129,13 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
             let registry_ver = entries
                 .iter()
                 .find(|e| {
-                    e.repo == source.repo
-                        || e.skills.contains(&name.to_string())
-                        || e.name == name
+                    e.repo == source.repo || e.skills.contains(&name.to_string()) || e.name == name
                 })
                 .and_then(|e| e.version.as_ref());
 
             if let Some(rv) = registry_ver {
                 if !version_newer(rv, lv) {
-                    println!(
-                        "  {} '{}' is up to date (v{})",
-                        "OK".green(),
-                        name,
-                        lv
-                    );
+                    println!("  {} '{}' is up to date (v{})", "OK".green(), name, lv);
                     return Ok(());
                 }
                 println!(

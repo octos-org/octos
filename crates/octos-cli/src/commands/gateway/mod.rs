@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Result, WrapErr};
-use octos_core::{MAIN_PROFILE_ID, SessionKey};
+use octos_core::{SessionKey, MAIN_PROFILE_ID};
 use tracing::warn;
 
 use super::Executable;
@@ -32,8 +32,8 @@ use {
     octos_agent::{AgentConfig, ToolRegistry},
     octos_bus::{ActiveSessionStore, ChannelManager, CronService, SessionManager},
     profile_factory::ProfileActorFactoryBuilder,
-    std::sync::Arc,
     std::sync::atomic::{AtomicBool, AtomicUsize},
+    std::sync::Arc,
 };
 
 /// Run as a persistent gateway daemon.
@@ -101,12 +101,17 @@ pub struct GatewayCommand {
 }
 
 fn resolve_dispatch_profile_id(
+    current_gateway_profile_id: Option<&str>,
     target_profile_id: Option<&str>,
     profile_store: Option<&crate::profiles::ProfileStore>,
 ) -> Result<Option<String>> {
     let Some(profile_id) = target_profile_id.filter(|value| !value.is_empty()) else {
-        return Ok(None);
+        return Ok(current_gateway_profile_id.map(str::to_string));
     };
+
+    if current_gateway_profile_id.is_some_and(|current| current == profile_id) {
+        return Ok(Some(profile_id.to_string()));
+    }
 
     let Some(store) = profile_store else {
         warn!(
@@ -173,7 +178,7 @@ mod tests {
     use octos_memory::{EpisodeStore, MemoryStore};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use tokio::sync::{Mutex, RwLock, mpsc};
+    use tokio::sync::{mpsc, Mutex, RwLock};
 
     fn make_profile(id: &str, system_prompt: Option<&str>) -> crate::profiles::UserProfile {
         crate::profiles::UserProfile {
@@ -407,7 +412,9 @@ mod tests {
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
 
-        let resolved = resolve_dispatch_profile_id(Some("missing-profile"), Some(&store)).unwrap();
+        let resolved =
+            resolve_dispatch_profile_id(Some("weather"), Some("missing-profile"), Some(&store))
+                .unwrap();
 
         assert_eq!(resolved, None);
     }
@@ -420,9 +427,33 @@ mod tests {
             .save(&make_profile("weather", Some("weather prompt")))
             .unwrap();
 
-        let resolved = resolve_dispatch_profile_id(Some("weather"), Some(&store)).unwrap();
+        let resolved =
+            resolve_dispatch_profile_id(Some("botfather"), Some("weather"), Some(&store)).unwrap();
 
         assert_eq!(resolved.as_deref(), Some("weather"));
+    }
+
+    #[test]
+    fn test_dispatch_current_gateway_profile_keeps_target_without_lookup() {
+        let resolved =
+            resolve_dispatch_profile_id(Some("dspfac--newsbot"), Some("dspfac--newsbot"), None)
+                .unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("dspfac--newsbot"));
+    }
+
+    #[test]
+    fn test_dispatch_without_target_uses_current_gateway_profile() {
+        let resolved = resolve_dispatch_profile_id(Some("dspfac--newsbot"), None, None).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("dspfac--newsbot"));
+    }
+
+    #[test]
+    fn test_dispatch_without_target_keeps_main_when_gateway_unscoped() {
+        let resolved = resolve_dispatch_profile_id(None, None, None).unwrap();
+
+        assert_eq!(resolved, None);
     }
 
     #[cfg(unix)]

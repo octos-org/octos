@@ -66,6 +66,7 @@ pub struct ChannelRegistrationCtx<'a> {
     pub media_dir: &'a Path,
     pub data_dir: &'a Path,
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
+    pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
     #[cfg(feature = "matrix")]
@@ -103,6 +104,7 @@ pub fn register_all(
                 entry,
                 ctx.shutdown,
                 ctx.session_mgr,
+                ctx.gateway_profile_id,
                 ctx.api_port_override,
             )?,
             #[cfg(feature = "wecom-bot")]

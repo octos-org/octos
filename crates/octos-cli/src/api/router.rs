@@ -56,6 +56,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Public auth endpoints (no auth required)
     let auth_api = Router::new()
+        .route("/api/auth/status", get(auth_handlers::auth_status))
         .route("/api/auth/send-code", post(auth_handlers::send_code))
         .route("/api/auth/verify", post(auth_handlers::verify))
         .route("/api/auth/logout", post(auth_handlers::logout));
@@ -69,6 +70,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/upload",
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
+        .route(
+            "/api/site-files/upload",
+            post(handlers::upload_site_files).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}",
+            get(handlers::serve_site_preview_root),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}/",
+            get(handlers::serve_site_preview_root),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_site_preview_path),
+        )
         .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
@@ -79,6 +96,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
+        .route("/api/sessions/{id}/files", get(handlers::session_files))
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 
@@ -396,6 +414,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}",
+            get(handlers::serve_public_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
+            get(handlers::serve_public_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_public_site_preview_path),
+        )
         .route(
             "/api/register/setup-script/{id}/{auth_token}",
             get(admin::register_setup_script_public),
@@ -753,7 +783,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service()).await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
         });
         tokio::task::yield_now().await;
 
