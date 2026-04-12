@@ -5,6 +5,7 @@
 //! to the wrong chat.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, Weak};
@@ -134,20 +135,62 @@ pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
 /// Shared lookup table for session-scoped background task supervisors.
 #[derive(Default, Clone)]
 pub struct SessionTaskQueryStore {
-    supervisors: Arc<StdMutex<HashMap<String, Weak<TaskSupervisor>>>>,
+    supervisors: Arc<StdMutex<HashMap<String, SessionTaskQueryEntry>>>,
+}
+
+struct SessionTaskQueryEntry {
+    supervisor: Weak<TaskSupervisor>,
+    data_dir: PathBuf,
+}
+
+fn task_response_path(data_dir: &Path, path: &str) -> String {
+    octos_bus::file_handle::encode_profile_file_handle(data_dir, Path::new(path))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn sanitize_task_for_response(
+    data_dir: &Path,
+    task: &octos_agent::BackgroundTask,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id,
+        "tool_name": task.tool_name,
+        "tool_call_id": task.tool_call_id,
+        "status": task.status,
+        "started_at": task.started_at,
+        "updated_at": task.updated_at,
+        "completed_at": task.completed_at,
+        "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
+        "error": task.error,
+        "session_key": task.session_key,
+    })
 }
 
 impl SessionTaskQueryStore {
-    pub fn register(&self, session_key: &SessionKey, supervisor: &Arc<TaskSupervisor>) {
+    pub fn register(
+        &self,
+        session_key: &SessionKey,
+        supervisor: &Arc<TaskSupervisor>,
+        data_dir: &Path,
+    ) {
         let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(session_key.to_string(), Arc::downgrade(supervisor));
+        guard.insert(
+            session_key.to_string(),
+            SessionTaskQueryEntry {
+                supervisor: Arc::downgrade(supervisor),
+                data_dir: data_dir.to_path_buf(),
+            },
+        );
     }
 
     pub fn query_json(&self, session_key: &str) -> serde_json::Value {
         let upgraded = {
             let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.get(session_key).and_then(Weak::upgrade) {
-                Some(supervisor) => Some(supervisor),
+            match guard
+                .get(session_key)
+                .and_then(|entry| entry.supervisor.upgrade().map(|supervisor| (supervisor, entry.data_dir.clone())))
+            {
+                Some(entry) => Some(entry),
                 None => {
                     guard.remove(session_key);
                     None
@@ -156,8 +199,13 @@ impl SessionTaskQueryStore {
         };
 
         match upgraded {
-            Some(supervisor) => serde_json::to_value(supervisor.get_tasks_for_session(session_key))
-                .unwrap_or_else(|_| serde_json::json!([])),
+            Some((supervisor, data_dir)) => serde_json::Value::Array(
+                supervisor
+                    .get_tasks_for_session(session_key)
+                    .iter()
+                    .map(|task| sanitize_task_for_response(&data_dir, task))
+                    .collect(),
+            ),
             None => serde_json::json!([]),
         }
     }
@@ -756,7 +804,8 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
-        self.task_query_store.register(&session_key, &supervisor);
+        self.task_query_store
+            .register(&session_key, &supervisor, &self.data_dir);
         tools.rebind_plugin_work_dirs(&user_workspace);
         tools.set_session_key(session_key.to_string());
         tools.register(CheckBackgroundTasksTool::new(
@@ -824,8 +873,10 @@ impl ActorFactory {
         // Wire supervisor on_change callback to push task status via SSE.
         // Uses try_send to avoid blocking the sync Mutex context.
         let status_tx = tx.clone();
+        let task_data_dir = self.data_dir.clone();
         supervisor.set_on_change(move |task| {
-            if let Ok(json) = serde_json::to_string(task) {
+            let task_json = sanitize_task_for_response(&task_data_dir, task);
+            if let Ok(json) = serde_json::to_string(&task_json) {
                 let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
             }
         });
@@ -3653,6 +3704,34 @@ mod tests {
         let resolved = resolve_builtin_slides_styles_dir(&current_data);
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn session_task_query_store_hides_absolute_output_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        let workspace = data_dir.join("users").join("api%3Asession").join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let output = workspace.join("voice.mp3");
+        std::fs::write(&output, b"audio").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("fm_tts", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![output.to_string_lossy().to_string()]);
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let files = tasks[0]["output_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let handle = files[0].as_str().unwrap();
+        assert!(handle.starts_with("pf/"));
+        assert!(!handle.starts_with("/"));
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
