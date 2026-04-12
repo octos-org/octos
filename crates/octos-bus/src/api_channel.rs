@@ -28,6 +28,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::channel::Channel;
+use crate::file_handle::{
+    encode_profile_file_handle, resolve_legacy_file_request, resolve_scoped_file_handle,
+};
 use crate::SessionManager;
 
 /// Callback that returns serialized task list for a session key.
@@ -268,21 +271,27 @@ impl Channel for ApiChannel {
             let persisted_media = self
                 .materialize_media_for_session(&msg.chat_id, &msg.media)
                 .await;
+            let data_dir = {
+                let sess = self.sessions.lock().await;
+                sess.data_dir()
+            };
 
             // File message — persist to session history AND send SSE event.
-        let file_desc = msg
-            .media
-            .iter()
-            .zip(persisted_media.iter())
-            .map(|(original_path, persisted_path)| {
-                let name = std::path::Path::new(original_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
+            let file_desc = msg
+                .media
+                .iter()
+                .zip(persisted_media.iter())
+                .map(|(original_path, persisted_path)| {
+                    let name = std::path::Path::new(original_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    let handle = response_path_for_session_file(&data_dir, Path::new(persisted_path))
+                        .unwrap_or_else(|| persisted_path.clone());
                     if msg.content.is_empty() {
-                        format!("[file:{persisted_path}] {name}")
+                        format!("[file:{handle}] {name}")
                     } else {
-                        format!("[file:{persisted_path}] {name} — {}", msg.content)
+                        format!("[file:{handle}] {name} — {}", msg.content)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -314,7 +323,8 @@ impl Channel for ApiChannel {
                         .unwrap_or("");
                     let event = serde_json::json!({
                         "type": "file",
-                        "path": persisted_path,
+                        "path": response_path_for_session_file(&data_dir, Path::new(persisted_path))
+                            .unwrap_or_else(|| persisted_path.clone()),
                         "filename": filename,
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
@@ -696,12 +706,49 @@ fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
         .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
 }
 
-fn message_info_from_history_message(message: &Message) -> MessageInfo {
+fn response_path_for_session_file(data_dir: &Path, path: &Path) -> Option<String> {
+    encode_profile_file_handle(data_dir, path)
+}
+
+fn sanitize_message_file_markers(content: &str, data_dir: &Path) -> String {
+    let mut remaining = content;
+    let mut sanitized = String::with_capacity(content.len());
+
+    while let Some(start) = remaining.find("[file:") {
+        let (before, rest) = remaining.split_at(start);
+        sanitized.push_str(before);
+
+        let Some(end) = rest.find(']') else {
+            sanitized.push_str(rest);
+            return sanitized;
+        };
+
+        let raw_path = &rest[6..end];
+        let replacement = Path::new(raw_path)
+            .is_absolute()
+            .then(|| response_path_for_session_file(data_dir, Path::new(raw_path)))
+            .flatten()
+            .unwrap_or_else(|| raw_path.to_string());
+        sanitized.push_str("[file:");
+        sanitized.push_str(&replacement);
+        sanitized.push(']');
+        remaining = &rest[end + 1..];
+    }
+
+    sanitized.push_str(remaining);
+    sanitized
+}
+
+fn message_info_from_history_message(message: &Message, data_dir: &Path) -> MessageInfo {
     MessageInfo {
         role: message.role.to_string(),
-        content: message.content.clone(),
+        content: sanitize_message_file_markers(&message.content, data_dir),
         timestamp: message.timestamp.to_rfc3339(),
-        media: message.media.clone(),
+        media: message
+            .media
+            .iter()
+            .filter_map(|path| response_path_for_session_file(data_dir, Path::new(path)))
+            .collect(),
         tool_calls: message
             .tool_calls
             .as_ref()
@@ -777,6 +824,7 @@ async fn handle_session_messages(
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
         let sess = state.sessions.lock().await;
+        let data_dir = sess.data_dir();
         for candidate in &candidates {
             if let Some(session) = sess.load(candidate).await {
                 let messages: Vec<MessageInfo> = session
@@ -786,7 +834,7 @@ async fn handle_session_messages(
                     .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
                     .skip(offset)
                     .take(limit)
-                    .map(|(_, message)| message_info_from_history_message(message))
+                    .map(|(_, message)| message_info_from_history_message(message, &data_dir))
                     .collect();
                 return Json(messages).into_response();
             }
@@ -795,6 +843,7 @@ async fn handle_session_messages(
     }
 
     let sess = state.sessions.lock().await;
+    let data_dir = sess.data_dir();
     for candidate in &candidates {
         if let Some(session) = sess.load(candidate).await {
             let history = session.get_history(fetch_count).to_vec();
@@ -804,7 +853,7 @@ async fn handle_session_messages(
                 .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
                 .skip(offset)
                 .take(limit)
-                .map(|(_, message)| message_info_from_history_message(message))
+                .map(|(_, message)| message_info_from_history_message(message, &data_dir))
                 .collect();
             if !messages.is_empty() {
                 return Json(messages).into_response();
@@ -834,25 +883,19 @@ async fn handle_delete_session(
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
-async fn handle_file_download(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    let file_path = std::path::Path::new(&path);
-
-    // Security: only serve files from known safe directories
-    let canonical = match std::fs::canonicalize(file_path) {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
+async fn handle_file_download(
+    State(state): State<ApiState>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    let data_dir = {
+        let sess = state.sessions.lock().await;
+        sess.data_dir()
     };
-
-    // Must be under $HOME/.octos or /tmp (NOT the entire $HOME)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
-        .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
-    let tmp_dir =
-        std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
-    if !allowed {
+    let canonical = resolve_scoped_file_handle(&data_dir, &path)
+        .or_else(|| resolve_legacy_file_request(&data_dir, &path));
+    let Some(canonical) = canonical else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
-    }
+    };
 
     match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
@@ -932,7 +975,15 @@ async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
             )
                 .into_response();
         }
-        paths.push(dest.to_string_lossy().to_string());
+        let Some(handle) = crate::file_handle::encode_tmp_upload_handle(&dest, Some(&safe_name))
+        else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode upload handle",
+            )
+                .into_response();
+        };
+        paths.push(handle);
     }
 
     Json(paths).into_response()
@@ -967,6 +1018,36 @@ mod tests {
         let json = r#"{"message": "hi", "session_id": "web-123"}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("web-123"));
+    }
+
+    #[test]
+    fn message_info_from_history_message_hides_absolute_paths() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let artifact = data_dir
+            .path()
+            .join("users")
+            .join("dspfac%3Aapi%3Aweb-1")
+            .join("workspace")
+            .join(".artifacts")
+            .join("deck.pptx");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"pptx").unwrap();
+
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: format!("[file:{}] deck.pptx", artifact.to_string_lossy()),
+            media: vec![artifact.to_string_lossy().to_string()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        };
+
+        let info = message_info_from_history_message(&message, data_dir.path());
+        assert_eq!(info.media.len(), 1);
+        assert_ne!(info.media[0], artifact.to_string_lossy());
+        assert!(!info.content.contains(&artifact.to_string_lossy().to_string()));
+        assert!(info.content.contains("[file:pf/"));
     }
 
     #[test]
@@ -1206,7 +1287,8 @@ mod tests {
         assert_eq!(history[0].media.len(), 1);
         let persisted = &history[0].media[0];
         assert_ne!(persisted, &source.to_string_lossy().to_string());
-        assert!(history[0].content.contains(persisted));
+        assert!(!history[0].content.contains(persisted));
+        assert!(history[0].content.contains("[file:pf/"));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
     }

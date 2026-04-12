@@ -14,6 +14,10 @@ use axum::Json;
 use futures::stream::StreamExt;
 use octos_agent::Agent;
 use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
+use octos_bus::file_handle::{
+    encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
+    resolve_scoped_file_handle,
+};
 use serde::{Deserialize, Serialize};
 
 use super::auth_handlers::ADMIN_PROFILE_ID;
@@ -53,6 +57,19 @@ pub(crate) struct ContentFileEntry {
     category: String,
     /// Parent directory name for grouping in the UI.
     group: String,
+}
+
+pub(crate) fn response_path_for_profile_file(
+    base_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<String> {
+    encode_profile_file_handle(base_dir, path)
+        .or_else(|| encode_tmp_upload_handle(path, path.file_name().and_then(|name| name.to_str())))
+}
+
+fn resolve_scoped_download_path(base_dir: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+    resolve_scoped_file_handle(base_dir, request_path)
+        .or_else(|| resolve_legacy_file_request(base_dir, request_path))
 }
 
 /// Maximum message length (1MB).
@@ -556,7 +573,11 @@ pub struct SessionFileInfo {
     pub modified_at: String,
 }
 
-fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>) {
+fn collect_session_files(
+    root: &std::path::Path,
+    data_dir: &std::path::Path,
+    out: &mut Vec<SessionFileInfo>,
+) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -571,7 +592,7 @@ fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>)
             if entry.file_name() == ".git" {
                 continue;
             }
-            collect_session_files(&path, out);
+            collect_session_files(&path, data_dir, out);
             continue;
         }
 
@@ -583,9 +604,12 @@ fn collect_session_files(root: &std::path::Path, out: &mut Vec<SessionFileInfo>)
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let Some(handle) = response_path_for_profile_file(data_dir, &path) else {
+            continue;
+        };
         out.push(SessionFileInfo {
             filename,
-            path: path.to_string_lossy().to_string(),
+            path: handle,
             size_bytes: metadata.len(),
             modified_at: modified_rfc3339(&metadata),
         });
@@ -612,7 +636,7 @@ pub async fn session_files(
     let mut files = Vec::new();
     for workspace in api_session_workspace_dirs(&data_dir, &id) {
         if workspace.exists() {
-            collect_session_files(&workspace, &mut files);
+            collect_session_files(&workspace, &data_dir, &mut files);
         }
     }
 
@@ -623,6 +647,19 @@ pub async fn session_files(
     });
     files.dedup_by(|left, right| left.path == right.path);
     Json(files).into_response()
+}
+
+async fn resolve_file_access_data_dir(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<std::path::PathBuf, Response> {
+    if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        return Ok(sess.data_dir());
+    }
+
+    resolve_profile_data_dir(state, headers, identity).await
 }
 
 /// DELETE /api/sessions/:id -- delete a session.
@@ -655,7 +692,7 @@ pub async fn delete_session(
 /// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
 ///
 /// Accepts multipart/form-data with one or more `file` fields.
-/// Returns JSON array of server-side file paths.
+/// Returns JSON array of server-side upload handles.
 pub async fn upload(
     State(_state): State<Arc<AppState>>,
     mut multipart: axum::extract::Multipart,
@@ -725,7 +762,11 @@ pub async fn upload(
         })?;
 
         tracing::info!(path = %dest.display(), size = data.len(), "file uploaded");
-        paths.push(dest.to_string_lossy().to_string());
+        let handle = encode_tmp_upload_handle(&dest, Some(&safe_name)).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to encode upload handle".into(),
+        ))?;
+        paths.push(handle);
     }
 
     if paths.is_empty() {
@@ -886,10 +927,16 @@ pub async fn upload_site_files(
             .and_then(|value| value.to_str())
             .unwrap_or(&safe_name)
             .to_string();
+        let Some(handle) = response_path_for_profile_file(&data_dir, &destination) else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode uploaded file handle".into(),
+            ));
+        };
 
         saved.push(ContentFileEntry {
             filename: saved_name.clone(),
-            path: destination.to_string_lossy().to_string(),
+            path: handle,
             size: meta.len(),
             modified: modified_rfc3339(&meta),
             category: categorize(&saved_name),
@@ -902,48 +949,40 @@ pub async fn upload_site_files(
 
 /// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
 pub async fn serve_file_by_query(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(filename) = params.get("path") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    serve_file_impl(filename).await
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_file_impl(&data_dir, filename).await
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
-pub async fn serve_file(axum::extract::Path(filename): axum::extract::Path<String>) -> Response {
-    serve_file_impl(&filename).await
+pub async fn serve_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(data_dir) => data_dir,
+        Err(response) => return response,
+    };
+    serve_file_impl(&data_dir, &filename).await
 }
 
-async fn serve_file_impl(filename: &str) -> Response {
-    // Try as an absolute path first (for pipeline-generated files)
-    let file_path = std::path::Path::new(&filename);
-    let path = if file_path.is_absolute() {
-        // Security: only serve files under $HOME/.octos or /tmp
-        // (NOT the entire $HOME — prevent reading arbitrary user files)
-        let canonical = match std::fs::canonicalize(file_path) {
-            Ok(p) => p,
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        };
-        let home = std::env::var("HOME").unwrap_or_default();
-        let octos_dir = std::fs::canonicalize(format!("{home}/.octos"))
-            .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/.octos")));
-        let tmp_dir =
-            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let allowed = canonical.starts_with(&octos_dir) || canonical.starts_with(&tmp_dir);
-        if !allowed {
-            return (StatusCode::FORBIDDEN, "access denied").into_response();
-        }
-        canonical
-    } else {
-        // Relative path — serve from uploads dir
-        let safe_name = filename.replace(['/', '\\', '\0', '~'], "_");
-        let upload_dir = std::env::temp_dir().join("octos-uploads");
-        let path = upload_dir.join(&safe_name);
-        if !path.exists() || !path.starts_with(&upload_dir) {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        path
+async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response {
+    let Some(path) = resolve_scoped_download_path(data_dir, filename) else {
+        return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
 
     let data = match tokio::fs::read(&path).await {
@@ -1843,6 +1882,7 @@ pub async fn list_content_files(
     }
 
     fn collect_files_recursive(
+        data_dir: &std::path::Path,
         current_dir: &std::path::Path,
         display_root: &str,
         relative_dir: &std::path::Path,
@@ -1866,6 +1906,7 @@ pub async fn list_content_files(
                 let mut next_relative = relative_dir.to_path_buf();
                 next_relative.push(&name);
                 collect_files_recursive(
+                    data_dir,
                     &path,
                     display_root,
                     &next_relative,
@@ -1893,11 +1934,14 @@ pub async fn list_content_files(
                     relative_dir.to_string_lossy().replace('\\', "/")
                 )
             };
+            let Some(handle) = response_path_for_profile_file(data_dir, &path) else {
+                continue;
+            };
 
             files.push(ContentFile {
                 category: categorize(&name),
                 filename: name,
-                path: path.to_string_lossy().to_string(),
+                path: handle,
                 size: meta.len(),
                 modified: modified_rfc3339(&meta),
                 group,
@@ -1918,6 +1962,7 @@ pub async fn list_content_files(
         let display_dir = display_dir_for_scan(dir_name);
         let allow_nested_dirs = display_dir != "research";
         collect_files_recursive(
+            &data_dir,
             &dir_path,
             &display_dir,
             std::path::Path::new(""),
@@ -2475,6 +2520,29 @@ mod tests {
                 .join("api%3Aslides-123")
                 .join("workspace")
         );
+    }
+
+    #[test]
+    fn response_path_for_profile_file_hides_absolute_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("slides/demo/output/deck.pptx");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"pptx").unwrap();
+
+        let handle = response_path_for_profile_file(base.path(), &file).expect("handle");
+
+        assert_ne!(handle, file.to_string_lossy());
+        assert!(handle.ends_with("/deck.pptx"));
+    }
+
+    #[test]
+    fn resolve_scoped_download_path_denies_other_profile_absolute_path() {
+        let current = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_file = other.path().join("secret.txt");
+        std::fs::write(&other_file, b"secret").unwrap();
+
+        assert!(resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none());
     }
 
     #[test]

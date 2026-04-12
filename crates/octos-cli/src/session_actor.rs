@@ -2075,12 +2075,15 @@ impl SessionActor {
         media
             .into_iter()
             .map(|path| {
-                let src = std::path::Path::new(&path);
+                let resolved = octos_bus::file_handle::resolve_upload_reference(&path)
+                    .map(|candidate| candidate.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let src = std::path::Path::new(&resolved);
                 if !src.exists() {
-                    return path;
+                    return resolved;
                 }
                 let Some(filename) = src.file_name() else {
-                    return path;
+                    return resolved;
                 };
                 let dest = self.user_workspace.join(filename);
                 match std::fs::copy(src, &dest) {
@@ -2100,7 +2103,7 @@ impl SessionActor {
                             error = %e,
                             "failed to copy media to workspace, using original path"
                         );
-                        path
+                        resolved
                     }
                 }
             })

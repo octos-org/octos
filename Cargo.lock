@@ -3587,6 +3587,7 @@ dependencies = [
  "async-imap",
  "async-trait",
  "axum",
+ "base64",
  "cbc",
  "chrono",
  "chrono-tz",

@@ -41,15 +41,16 @@ pub async fn process_media(
 
     if let Some(asr_bin) = asr_binary {
         for path in &inbound.media {
+            let resolved_path = resolve_media_reference(path);
             if octos_bus::media::is_audio(path) {
                 is_voice_message = true;
-                attachment_media.push(path.clone());
+                attachment_media.push(resolved_path.clone());
                 audio_filenames.push(attachment_display_name(path));
                 // Show "listening" indicator while transcribing voice
                 if let Some(ch) = channel_mgr.get_channel(&inbound.channel) {
                     let _ = ch.send_listening(&inbound.chat_id).await;
                 }
-                let mut input = serde_json::json!({"audio_path": path});
+                let mut input = serde_json::json!({"audio_path": resolved_path});
                 if let Some(lang) = asr_language {
                     input["language"] = serde_json::Value::String(lang.to_string());
                 }
@@ -67,6 +68,7 @@ pub async fn process_media(
                 }
             } else {
                 route_non_audio_attachment(
+                    &resolved_path,
                     path,
                     &mut image_media,
                     &mut attachment_media,
@@ -77,12 +79,14 @@ pub async fn process_media(
     } else {
         // Check for audio even without transcriber (for voice_message flag)
         for path in &inbound.media {
+            let resolved_path = resolve_media_reference(path);
             if octos_bus::media::is_audio(path) {
                 is_voice_message = true;
-                attachment_media.push(path.clone());
+                attachment_media.push(resolved_path.clone());
                 audio_filenames.push(attachment_display_name(path));
             } else {
                 route_non_audio_attachment(
+                    &resolved_path,
                     path,
                     &mut image_media,
                     &mut attachment_media,
@@ -121,17 +125,24 @@ pub async fn process_media(
 }
 
 fn route_non_audio_attachment(
-    path: &str,
+    resolved_path: &str,
+    display_source: &str,
     image_media: &mut Vec<String>,
     attachment_media: &mut Vec<String>,
     attachment_filenames: &mut Vec<String>,
 ) {
-    if octos_bus::media::is_image(path) {
-        image_media.push(path.to_string());
+    if octos_bus::media::is_image(display_source) {
+        image_media.push(resolved_path.to_string());
     } else {
-        attachment_media.push(path.to_string());
-        attachment_filenames.push(attachment_display_name(path));
+        attachment_media.push(resolved_path.to_string());
+        attachment_filenames.push(attachment_display_name(display_source));
     }
+}
+
+fn resolve_media_reference(path: &str) -> String {
+    octos_bus::file_handle::resolve_upload_reference(path)
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn merge_transcript_into_content(existing: &str, transcript: &str) -> String {
@@ -336,6 +347,27 @@ mod tests {
         assert!(!inbound.content.contains("/tmp/uploads/report.pdf"));
         assert!(!inbound.content.contains("[Attached files]"));
         assert!(!inbound.content.contains("report.pdf"));
+    }
+
+    #[tokio::test]
+    async fn process_media_resolves_upload_handles_to_real_paths() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let saved = upload_root.join(format!("{}-report.pdf", uuid::Uuid::now_v7()));
+        std::fs::write(&saved, b"pdf").unwrap();
+        let handle = octos_bus::file_handle::encode_tmp_upload_handle(&saved, Some("report.pdf"))
+            .expect("handle");
+        let mut inbound = inbound_with_media("Please summarize this", vec![handle.as_str()]);
+        let channels = ChannelManager::new();
+
+        let result = process_media(&mut inbound, None, None, &channels).await;
+        let expected = std::fs::canonicalize(&saved)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(result.attachment_media, vec![expected]);
+        let _ = std::fs::remove_file(saved);
     }
 
     #[test]

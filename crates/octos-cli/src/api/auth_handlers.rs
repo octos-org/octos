@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::admin::ProfileResponse;
+use super::handlers::response_path_for_profile_file;
 use crate::profiles::mask_secrets;
 use crate::user_store::{User, UserRole};
 
@@ -990,13 +991,28 @@ pub async fn my_content(
     } else {
         resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?
     };
+    let data_dir = ps.resolve_data_dir(&profile);
 
     let catalog = mgr
         .get_catalog_with_scan(&profile.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let cat = catalog.read().await;
-    Ok(Json(cat.query(&query)))
+    let result = cat.query(&query);
+    let entries = result
+        .entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            let handle = response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
+            entry.path = handle;
+            entry.thumbnail_path = entry.thumbnail_path.as_ref().map(|_| "available".to_string());
+            Some(entry)
+        })
+        .collect();
+    Ok(Json(crate::content_catalog::ContentQueryResult {
+        entries,
+        total: result.total,
+    }))
 }
 
 /// GET /api/my/content/:id/thumbnail
