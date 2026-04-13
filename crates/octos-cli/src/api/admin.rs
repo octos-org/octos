@@ -3586,6 +3586,7 @@ mod register_tenant_email_tests {
                     },
                     session_expiry_hours: 24,
                     allow_self_registration: true,
+                    static_tokens: Vec::new(),
                 }),
                 user_store.clone(),
             )

@@ -155,12 +155,14 @@ pub async fn api_chat_proxy(
     profile_id: Option<&str>,
     message: &str,
     session_id: Option<&str>,
+    topic: Option<&str>,
     media: &[String],
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
         "message": message,
         "session_id": session_id,
+        "topic": topic,
         "media": media,
         "target_profile_id": profile_id,
     });

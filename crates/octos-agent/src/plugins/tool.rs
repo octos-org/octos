@@ -97,15 +97,62 @@ impl PluginTool {
 
         let mut rewritten = serde_json::Map::with_capacity(obj.len());
         for (key, value) in obj {
-            if matches!(key.as_str(), "audio_path" | "file_path") {
+            if matches!(key.as_str(), "audio_path" | "file_path" | "input") {
                 if let Some(path) = value.as_str() {
                     rewritten.insert(
                         key.clone(),
                         serde_json::Value::String(
                             resolve_path_in_work_dir(path, work_dir)
-                                .unwrap_or_else(|| path.to_string()),
+                                .unwrap_or_else(|| absolutize_path_in_work_dir(path, work_dir)),
                         ),
                     );
+                    continue;
+                }
+            }
+            if matches!(key.as_str(), "out" | "slide_dir") {
+                if let Some(path) = value.as_str() {
+                    rewritten.insert(
+                        key.clone(),
+                        serde_json::Value::String(absolutize_path_in_work_dir(path, work_dir)),
+                    );
+                    continue;
+                }
+            }
+            if key == "style" {
+                if let Some(style) = value.as_str()
+                    && let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir)
+                {
+                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                    continue;
+                }
+            }
+            if key == "slides" {
+                if let Some(slides) = value.as_array() {
+                    let rewritten_slides = slides
+                        .iter()
+                        .map(|slide| {
+                            let Some(slide_obj) = slide.as_object() else {
+                                return slide.clone();
+                            };
+                            let mut rewritten_slide = slide_obj.clone();
+                            if let Some(source_image) = slide_obj
+                                .get("source_image")
+                                .and_then(|value| value.as_str())
+                            {
+                                rewritten_slide.insert(
+                                    "source_image".into(),
+                                    serde_json::Value::String(
+                                        resolve_path_in_work_dir(source_image, work_dir)
+                                            .unwrap_or_else(|| {
+                                                absolutize_path_in_work_dir(source_image, work_dir)
+                                            }),
+                                    ),
+                                );
+                            }
+                            serde_json::Value::Object(rewritten_slide)
+                        })
+                        .collect::<Vec<_>>();
+                    rewritten.insert(key.clone(), serde_json::Value::Array(rewritten_slides));
                     continue;
                 }
             }
@@ -183,6 +230,15 @@ fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool
 
 fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
     let candidate = std::path::Path::new(raw_path);
+    if candidate.is_absolute() && candidate.exists() {
+        return Some(raw_path.to_string());
+    }
+
+    let nested = work_dir.join(candidate);
+    if nested.exists() {
+        return Some(nested.to_string_lossy().into_owned());
+    }
+
     if candidate.exists() {
         return Some(raw_path.to_string());
     }
@@ -204,6 +260,37 @@ fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Optio
     }
 
     None
+}
+
+fn absolutize_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> String {
+    let candidate = std::path::Path::new(raw_path);
+    if candidate.is_absolute() {
+        raw_path.to_string()
+    } else {
+        work_dir.join(candidate).to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_slides_style_in_work_dir(style: &str, work_dir: &std::path::Path) -> Option<String> {
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = std::path::Path::new(trimmed);
+    if candidate.is_absolute() || trimmed.contains('/') || trimmed.contains('\\') {
+        return Some(absolutize_path_in_work_dir(trimmed, work_dir));
+    }
+
+    let filename = if trimmed.ends_with(".toml") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.toml")
+    };
+    let resolved = work_dir.join("styles").join(filename);
+    resolved
+        .exists()
+        .then(|| resolved.to_string_lossy().into_owned())
 }
 
 #[async_trait]
@@ -627,6 +714,84 @@ mod tests {
 
         assert_eq!(rewritten["audio_path"], wav.to_string_lossy().to_string());
         assert_eq!(rewritten["file_path"], pdf.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_preserves_nested_workspace_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("slides").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+        let script = nested.join("script.js");
+        std::fs::write(&script, b"export default [];").unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string"},
+                    "out": {"type": "string"},
+                    "slide_dir": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "input": "slides/demo/script.js",
+            "out": "slides/demo/output/deck.pptx",
+            "slide_dir": "slides/demo/output/imgs"
+        }));
+
+        assert_eq!(rewritten["input"], script.to_string_lossy().to_string());
+        assert_eq!(
+            rewritten["out"],
+            dir.path()
+                .join("slides/demo/output/deck.pptx")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(
+            rewritten["slide_dir"],
+            dir.path()
+                .join("slides/demo/output/imgs")
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_resolves_workspace_style_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let styles = dir.path().join("styles");
+        std::fs::create_dir_all(&styles).unwrap();
+        let style = styles.join("cyberpunk-neon.toml");
+        std::fs::write(&style, b"[meta]\nname='Cyberpunk'\n").unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "style": "cyberpunk-neon"
+        }));
+
+        assert_eq!(rewritten["style"], style.to_string_lossy().to_string());
     }
 
     #[test]

@@ -963,6 +963,11 @@ impl ActorFactory {
                         }
                     }
                 }
+                let cyberpunk_alias = ws_styles.join("cyberpunk-neon.toml");
+                let blade_runner = ws_styles.join("nb-br.toml");
+                if !cyberpunk_alias.exists() && blade_runner.is_file() {
+                    std::fs::copy(&blade_runner, &cyberpunk_alias).ok();
+                }
             } else {
                 warn!(
                     session = %session_key,

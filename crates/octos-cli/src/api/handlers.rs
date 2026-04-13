@@ -35,6 +35,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
     pub stream: bool,
     /// File paths from prior `/api/upload` call.
     #[serde(default)]
@@ -127,6 +129,7 @@ pub async fn chat(
             Some(&profile_id),
             &req.message,
             req.session_id.as_deref(),
+            req.topic.as_deref(),
             &req.media,
         )
         .await;
@@ -189,8 +192,11 @@ async fn chat_sync(
         "chat: processing message"
     );
 
-    let session_key =
-        standalone_api_session_key(&headers, req.session_id.as_deref().unwrap_or("default"));
+    let session_key = standalone_api_session_key_with_topic(
+        &headers,
+        req.session_id.as_deref().unwrap_or("default"),
+        req.topic.as_deref(),
+    );
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -244,7 +250,8 @@ async fn chat_streaming(
         "chat: streaming message"
     );
 
-    let session_key = standalone_api_session_key(&headers, &session_id);
+    let session_key =
+        standalone_api_session_key_with_topic(&headers, &session_id, req.topic.as_deref());
 
     // Load history before spawning
     let history: Vec<Message> = {
@@ -430,6 +437,12 @@ pub struct PaginationParams {
     pub topic: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct TopicQueryParams {
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 fn default_page_limit() -> usize {
     100
 }
@@ -445,6 +458,17 @@ fn standalone_api_session_key_with_topic(
         session_id,
         topic.unwrap_or_default(),
     )
+}
+
+fn append_topic_query(path: &mut String, topic: Option<&str>) {
+    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
+        path.push_str(if path.contains('?') {
+            "&topic="
+        } else {
+            "?topic="
+        });
+        path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
 }
 
 fn session_messages_proxy_path(
@@ -464,10 +488,7 @@ fn session_messages_proxy_path(
         path.push_str("&since_seq=");
         path.push_str(&since_seq.to_string());
     }
-    if let Some(topic) = topic.filter(|value| !value.is_empty()) {
-        path.push_str("&topic=");
-        path.push_str(&octos_bus::session::encode_path_component(topic));
-    }
+    append_topic_query(&mut path, topic);
     path
 }
 
@@ -543,10 +564,12 @@ pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
     // Proxy to gateway (session actors live there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}/status");
+        let mut path = format!("/sessions/{id}/status");
+        append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -562,10 +585,12 @@ pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
     // Proxy to gateway (task supervisor lives there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}/tasks");
+        let mut path = format!("/sessions/{id}/tasks");
+        append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
 
@@ -2190,6 +2215,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                     &ChatRequest {
                         message: content.clone(),
                         session_id: Some(session_id.clone()),
+                        topic: None,
                         stream: true,
                         media: media.clone(),
                     },
@@ -2649,6 +2675,26 @@ mod tests {
         assert_eq!(
             path,
             "/sessions/slides-123/messages?limit=100&offset=5&source=full&since_seq=8&topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_topic_query_uses_question_mark_for_clean_path() {
+        let mut path = "/sessions/slides-123/tasks".to_string();
+        append_topic_query(&mut path, Some("slides untitled-deck"));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/tasks?topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_topic_query_uses_ampersand_when_query_exists() {
+        let mut path = "/sessions/slides-123/messages?limit=100".to_string();
+        append_topic_query(&mut path, Some("slides untitled-deck"));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/messages?limit=100&topic=slides%20untitled-deck"
         );
     }
 
