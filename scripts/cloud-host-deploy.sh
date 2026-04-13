@@ -783,7 +783,7 @@ validate "frps-ssh-port-end" "$FRPS_SSH_PORT_END" '[0-9]+'
 if [ "$ENABLE_SMTP" = true ]; then
     validate "smtp-host" "$SMTP_HOST" '[a-zA-Z0-9.-]+'
     validate "smtp-port" "$SMTP_PORT" '[0-9]+'
-    validate "smtp-from" "$SMTP_FROM" '([^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+|.+ <[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+>)'
+    validate "smtp-from" "$SMTP_FROM" '([^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+|[^"\\<>[:space:]][^"\\<>]*[^"\\<>[:space:]] <[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+>)'
 fi
 case "$ENABLE_HTTPS" in
     true|false) ;;
