@@ -477,7 +477,7 @@ ENABLE_SMTP=$ENABLE_SMTP
 SMTP_HOST=$SMTP_HOST
 SMTP_PORT=$SMTP_PORT
 SMTP_USERNAME=$SMTP_USERNAME
-SMTP_FROM=$SMTP_FROM
+SMTP_FROM='$SMTP_FROM'
 ALLOW_SELF_REGISTRATION=$ALLOW_SELF_REGISTRATION
 FRPS_BIND_PORT=$FRPS_BIND_PORT
 FRPS_VHOST_HTTP_PORT=$FRPS_VHOST_HTTP_PORT
@@ -508,7 +508,7 @@ ENABLE_SMTP=$ENABLE_SMTP
 SMTP_HOST=$SMTP_HOST
 SMTP_PORT=$SMTP_PORT
 SMTP_USERNAME=$SMTP_USERNAME
-SMTP_FROM=$SMTP_FROM
+SMTP_FROM='$SMTP_FROM'
 ALLOW_SELF_REGISTRATION=$ALLOW_SELF_REGISTRATION
 FRPS_BIND_PORT=$FRPS_BIND_PORT
 FRPS_VHOST_HTTP_PORT=$FRPS_VHOST_HTTP_PORT
@@ -734,7 +734,7 @@ fi
 
 section "Collecting configuration"
 prompt_value TUNNEL_DOMAIN "Base domain for signup and tenant subdomains"
-prompt_value FRPS_SERVER "Address tenants use to reach frps" "$TUNNEL_DOMAIN"
+prompt_value FRPS_SERVER "Address tenants use to reach frps" "frps.${TUNNEL_DOMAIN}"
 if [ -z "$FRPS_TOKEN" ]; then
     FRPS_TOKEN="$(openssl rand -hex 32)"
 fi
@@ -783,7 +783,7 @@ validate "frps-ssh-port-end" "$FRPS_SSH_PORT_END" '[0-9]+'
 if [ "$ENABLE_SMTP" = true ]; then
     validate "smtp-host" "$SMTP_HOST" '[a-zA-Z0-9.-]+'
     validate "smtp-port" "$SMTP_PORT" '[0-9]+'
-    validate "smtp-from" "$SMTP_FROM" '[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+'
+    validate "smtp-from" "$SMTP_FROM" '([^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+|[^"\\<>[:space:]][^"\\<>]*[^"\\<>[:space:]] <[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+>)'
 fi
 case "$ENABLE_HTTPS" in
     true|false) ;;

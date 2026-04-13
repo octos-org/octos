@@ -63,12 +63,23 @@ struct LoginContent {
     /// MD5(auth.token + timestamp) computed by the frpc client.
     #[serde(default)]
     privilege_key: String,
-    /// Unix timestamp string sent by frpc.
-    #[serde(default)]
+    /// Unix timestamp sent by frpc (integer or string depending on frp version).
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     timestamp: String,
     /// Unique identifier for this frpc session.
     #[serde(default)]
     run_id: String,
+}
+
+fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    match v {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Err(<D::Error as serde::de::Error>::custom(
+            "timestamp must be a string or number",
+        )),
+    }
 }
 
 /// NewProxy content from frps — contains the proxy configuration being registered.
