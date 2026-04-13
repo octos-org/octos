@@ -560,7 +560,16 @@ impl GatewayRuntime {
 
             // Load plugins with a dedicated work directory for output files
             let plugin_work_dir = data_dir.join("skill-output");
-            let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+            let mut plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+            // Include bundled app-skills and platform skills (bootstrapped into project_dir)
+            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+            if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
+                plugin_dirs.push(bundled_dir);
+            }
+            let platform_dir = project_dir.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
+            if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+                plugin_dirs.push(platform_dir);
+            }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(

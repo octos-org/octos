@@ -249,6 +249,7 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
+            .route("/admin/shell", post(handle_admin_shell))
             .with_state(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -993,6 +994,138 @@ async fn handle_upload(mut multipart: axum::extract::Multipart) -> Response {
     }
 
     Json(paths).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Admin shell (diagnostics)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShellRequest {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ShellResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+}
+
+/// POST /admin/shell — execute a shell command (admin auth required).
+async fn handle_admin_shell(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ShellRequest>,
+) -> Response {
+    // Verify admin token
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("x-auth-token")
+                .and_then(|v| v.to_str().ok())
+        })
+        .unwrap_or("");
+
+    // Check channel-level token, env var, then config.json auth_token.
+    let expected_token: Option<String> = state
+        .auth_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok().filter(|t| !t.is_empty()))
+        .or_else(|| {
+            // Try OCTOS_DATA_DIR, then ~/.octos, then cwd/.octos
+            let home = std::env::var("HOME").unwrap_or_default();
+            let candidates = [
+                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
+                format!("{home}/.octos"),
+            ];
+            for dir in &candidates {
+                if dir.is_empty() { continue; }
+                if let Ok(s) = std::fs::read_to_string(format!("{dir}/config.json")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if let Some(t) = v.get("auth_token").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                return Some(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+    let is_admin = match &expected_token {
+        Some(expected) if !expected.is_empty() => {
+            token.len() == expected.len()
+                && token
+                    .as_bytes()
+                    .iter()
+                    .zip(expected.as_bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        }
+        _ => false,
+    };
+
+    if !is_admin {
+        // Debug: return what we tried to match against
+        let debug = format!(
+            "token_len={} expected_len={} data_dir={} home={}",
+            token.len(),
+            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
+            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
+            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
+        );
+        return (StatusCode::UNAUTHORIZED, debug).into_response();
+    }
+
+    if req.command.is_empty() {
+        return (StatusCode::BAD_REQUEST, "command is required").into_response();
+    }
+
+    let timeout = std::time::Duration::from_secs(req.timeout_secs.unwrap_or(30).min(300));
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(&req.command);
+    if let Some(ref cwd) = req.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}"))
+                .into_response();
+        }
+    };
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Json(ShellResponse {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            timed_out: false,
+        })
+        .into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}"))
+            .into_response(),
+        Err(_) => Json(ShellResponse {
+            stdout: String::new(),
+            stderr: "command timed out".to_string(),
+            exit_code: -1,
+            timed_out: true,
+        })
+        .into_response(),
+    }
 }
 
 #[cfg(test)]
