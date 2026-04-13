@@ -16,12 +16,14 @@ export default function HomePage() {
     profileId, parentId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
     profileName, setProfileName, profileEmail, setProfileEmail, publicSubdomain, setPublicSubdomain, enabled, setEnabled,
-    save, saving, deleteProfile,
+    save, saving, deleteProfile, purgeProfile,
   } = useProfile()
   const navigate = useNavigate()
   const { toast } = useToast()
   const [actionLoading, setActionLoading] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [purgeOpen, setPurgeOpen] = useState(false)
+  const [purgeConfirmText, setPurgeConfirmText] = useState('')
 
   // Sub-accounts state
   const [subAccounts, setSubAccounts] = useState<ProfileResponse[]>([])
@@ -99,6 +101,12 @@ export default function HomePage() {
   const handleDelete = async () => {
     await deleteProfile()
     setDeleteOpen(false)
+    navigate('/')
+  }
+  const handlePurge = async () => {
+    await purgeProfile()
+    setPurgeOpen(false)
+    setPurgeConfirmText('')
     navigate('/')
   }
 
@@ -288,12 +296,21 @@ export default function HomePage() {
               {saving ? 'Saving...' : 'Save'}
             </button>
             {isAdmin && !isOwn && (
-              <button
-                onClick={() => setDeleteOpen(true)}
-                className="px-4 py-2 text-sm font-medium rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/20 transition"
-              >
-                Delete Profile
-              </button>
+              <>
+                <button
+                  onClick={() => setDeleteOpen(true)}
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/20 transition"
+                >
+                  Delete Profile
+                </button>
+                <button
+                  onClick={() => setPurgeOpen(true)}
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-600/40 transition ml-2"
+                  title="Full removal — profile, user, node, and all data"
+                >
+                  Purge (Full Removal)
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -463,6 +480,50 @@ export default function HomePage() {
         onConfirm={handleDelete}
         onCancel={() => setDeleteOpen(false)}
       />
+
+      {purgeOpen && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setPurgeOpen(false)}>
+          <div className="bg-gray-900 border border-red-500/30 rounded-lg p-6 max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-red-400 mb-3">Purge &quot;{profileName}&quot;?</h2>
+            <div className="text-sm text-gray-300 mb-4 space-y-2">
+              <p>This will <strong>permanently</strong> remove:</p>
+              <ul className="list-disc list-inside text-gray-400 ml-2">
+                <li>The profile and all its data (memories, episodes, sessions)</li>
+                <li>The user account ({profileEmail})</li>
+                <li>The registered node and any sub-accounts</li>
+              </ul>
+              <p className="text-amber-400 text-xs mt-3">
+                The same email and node name can be used to register again after this. <strong>This cannot be undone.</strong>
+              </p>
+            </div>
+            <label className="block text-xs text-gray-400 mb-1">
+              Type the profile name <code className="text-red-300">{profileName}</code> to confirm:
+            </label>
+            <input
+              type="text"
+              value={purgeConfirmText}
+              onChange={(e) => setPurgeConfirmText(e.target.value)}
+              className="input w-full mb-4"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => { setPurgeOpen(false); setPurgeConfirmText('') }}
+                className="px-4 py-2 text-sm rounded-lg bg-gray-700 hover:bg-gray-600 transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handlePurge}
+                disabled={purgeConfirmText !== profileName}
+                className="px-4 py-2 text-sm rounded-lg bg-red-600 hover:bg-red-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                Purge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

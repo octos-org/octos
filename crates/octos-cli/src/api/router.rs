@@ -16,6 +16,7 @@ use super::auth_handlers;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::purge;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
@@ -186,6 +187,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/profiles/{id}", get(admin::get_profile))
         .route("/api/admin/profiles/{id}", put(admin::update_profile))
         .route("/api/admin/profiles/{id}", delete(admin::delete_profile))
+        .route(
+            "/api/admin/profiles/{id}/purge",
+            post(purge::purge_profile_handler),
+        )
+        .route(
+            "/api/admin/profiles/by-node/{node_name}/purge",
+            post(purge::purge_by_node_handler),
+        )
         .route("/api/admin/profiles/{id}/start", post(admin::start_gateway))
         .route("/api/admin/profiles/{id}/stop", post(admin::stop_gateway))
         .route(

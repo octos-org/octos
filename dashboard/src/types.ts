@@ -115,6 +115,16 @@ export interface ActionResponse {
   message?: string
 }
 
+export interface PurgeReport {
+  profile_id: string
+  user_email: string | null
+  tenant_id: string | null
+  node_name: string | null
+  port_released: number | null
+  files_removed: string[]
+  bytes_freed: number
+}
+
 export interface BulkActionResponse {
   ok: boolean
   count: number

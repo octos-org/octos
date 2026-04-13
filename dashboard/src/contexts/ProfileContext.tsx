@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useAuth } from './AuthContext'
 import { useToast } from '../components/Toast'
 import { api, myApi, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
-import type { ProfileConfig, ProcessStatus } from '../types'
+import type { ProfileConfig, ProcessStatus, PurgeReport } from '../types'
 
 const defaultConfig: ProfileConfig = {
   provider: 'anthropic',
@@ -39,6 +39,7 @@ interface ProfileContextValue {
   setEnabled: (enabled: boolean) => void
   logStreamUrl: string
   deleteProfile: () => Promise<void>
+  purgeProfile: () => Promise<PurgeReport | null>
 }
 
 const ProfileContext = createContext<ProfileContextValue | null>(null)
@@ -191,6 +192,19 @@ export function ProfileProvider({ children }: Props) {
     }
   }, [isOwn, profileId, toast])
 
+  const purgeProfile = useCallback(async (): Promise<PurgeReport | null> => {
+    if (isOwn) return null
+    try {
+      const report = await api.purgeProfile(profileId)
+      const mb = (report.bytes_freed / 1024 / 1024).toFixed(1)
+      toast(`Purged: freed ${mb} MB${report.port_released != null ? `, released port ${report.port_released}` : ''}`)
+      return report
+    } catch (e: any) {
+      toast(e.message, 'error')
+      return null
+    }
+  }, [isOwn, profileId, toast])
+
   const value: ProfileContextValue = {
     profileId,
     parentId,
@@ -215,6 +229,7 @@ export function ProfileProvider({ children }: Props) {
     setEnabled,
     logStreamUrl,
     deleteProfile,
+    purgeProfile,
   }
 
   return <ProfileContext.Provider value={value}>{children}</ProfileContext.Provider>

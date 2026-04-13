@@ -7,6 +7,7 @@ pub mod auth_handlers;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
+pub mod purge;
 mod router;
 mod sse;
 mod static_files;
@@ -125,4 +126,46 @@ pub struct AppState {
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
     pub content_catalog_mgr: Option<Arc<ContentCatalogManager>>,
+}
+
+#[cfg(test)]
+impl AppState {
+    /// Empty `AppState` for unit tests — every store/service is `None`.
+    ///
+    /// Override individual fields with struct-update syntax:
+    ///
+    /// ```ignore
+    /// let state = AppState {
+    ///     profile_store: Some(profile_store),
+    ///     ..AppState::empty_for_tests()
+    /// };
+    /// ```
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            started_at: chrono::Utc::now(),
+            auth_token: None,
+            metrics_handle: None,
+            profile_store: None,
+            process_manager: None,
+            user_store: None,
+            allowlist_store: None,
+            auth_manager: None,
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            tenant_store: None,
+            run_id_cache: Arc::new(RunIdCache::new()),
+            tunnel_domain: None,
+            frps_server: None,
+            frps_port: None,
+            deployment_mode: crate::config::DeploymentMode::Local,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        }
+    }
 }
