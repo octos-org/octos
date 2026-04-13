@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::StreamExt;
 use octos_core::Message;
 use tracing::{info, warn};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::retry::RetryProvider;
-use crate::types::{ChatResponse, ChatStream, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 /// Circuit breaker state for a single provider.
 struct ProviderSlot {
@@ -167,6 +168,12 @@ impl ProviderChain {
             );
         }
     }
+
+    fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
+        Box::pin(
+            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
+        )
+    }
 }
 
 #[async_trait]
@@ -209,7 +216,7 @@ impl LlmProvider for ProviderChain {
             match slot.provider.chat_stream(messages, tools, config).await {
                 Ok(stream) => {
                     self.record_success(idx);
-                    return Ok(stream);
+                    return Ok(self.stream_with_provider_index(idx, stream));
                 }
                 Err(e) => {
                     let retryable = RetryProvider::should_failover(&e);
@@ -240,6 +247,19 @@ impl LlmProvider for ProviderChain {
     fn provider_name(&self) -> &str {
         let idx = self.pick_start();
         self.slots[idx].provider.provider_name()
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let idx = self.pick_start();
+        self.slots[idx].provider.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
+        let idx = provider_index.unwrap_or_else(|| self.pick_start());
+        self.slots
+            .get(idx)
+            .map(|slot| slot.provider.provider_metadata())
+            .unwrap_or_else(|| self.provider_metadata())
     }
 
     fn report_late_failure(&self) {

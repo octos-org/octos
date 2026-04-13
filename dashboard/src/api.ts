@@ -9,6 +9,7 @@ import type {
   OtpVerifyResponse,
   MeResponse,
   User,
+  AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
   SystemMetrics,
@@ -75,6 +76,7 @@ export const api = {
   createProfile: (data: {
     id: string
     name: string
+    public_subdomain?: string | null
     enabled?: boolean
     data_dir?: string | null
     config?: ProfileConfig
@@ -88,6 +90,7 @@ export const api = {
     id: string,
     data: {
       name?: string
+      public_subdomain?: string | null
       enabled?: boolean
       data_dir?: string | null
       config?: ProfileConfig
@@ -127,7 +130,7 @@ export const api = {
   listSubAccounts: (parentId: string) =>
     request<ProfileResponse[]>(`/profiles/${parentId}/accounts`),
 
-  createSubAccount: (parentId: string, data: { name: string; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
+  createSubAccount: (parentId: string, data: { sub_account_id?: string; name: string; public_subdomain?: string | null; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
     request<ProfileResponse>(`/profiles/${parentId}/accounts`, {
       method: 'POST',
       body: JSON.stringify(data),
@@ -136,10 +139,17 @@ export const api = {
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
 
-  createUser: (data: { email: string; name: string; role?: string }) =>
-    request<{ user: User }>('/users', {
+  listAllowedEmails: () => request<{ entries: AllowlistEntry[] }>('/allowed-emails'),
+
+  addAllowedEmail: (data: { email: string; note?: string }) =>
+    request<AllowlistEntry>('/allowed-emails', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+
+  deleteAllowedEmail: (email: string) =>
+    request<ActionResponse>(`/allowed-emails/${encodeURIComponent(email)}`, {
+      method: 'DELETE',
     }),
 
   deleteUser: (id: string) =>
@@ -210,6 +220,8 @@ export const myApi = {
 
   updateProfile: (data: {
     name?: string
+    email?: string
+    public_subdomain?: string | null
     enabled?: boolean
     config?: ProfileConfig
   }) =>
@@ -256,6 +268,30 @@ export const myApi = {
 
   listSubAccounts: () =>
     authedRequest<ProfileResponse[]>('/my/profile/accounts'),
+
+  getSubAccount: (id: string) =>
+    authedRequest<ProfileResponse>(`/my/profile/accounts/${id}`),
+
+  createSubAccount: (data: { sub_account_id?: string; name: string; public_subdomain?: string | null; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
+    authedRequest<ProfileResponse>('/my/profile/accounts', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  updateSubAccount: (
+    id: string,
+    data: {
+      name?: string
+      public_subdomain?: string | null
+      enabled?: boolean
+      config?: ProfileConfig
+      email?: string
+    },
+  ) =>
+    authedRequest<ProfileResponse>(`/my/profile/accounts/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
 
   startSubGateway: (id: string) =>
     authedRequest<ActionResponse>(`/my/profile/accounts/${id}/start`, { method: 'POST' }),

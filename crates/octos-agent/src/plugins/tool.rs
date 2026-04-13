@@ -86,6 +86,124 @@ impl PluginTool {
             timeout: self.timeout,
         }
     }
+
+    fn rewrite_workspace_file_args(&self, args: &serde_json::Value) -> serde_json::Value {
+        let Some(work_dir) = self.work_dir.as_ref() else {
+            return args.clone();
+        };
+        let Some(obj) = args.as_object() else {
+            return args.clone();
+        };
+
+        let mut rewritten = serde_json::Map::with_capacity(obj.len());
+        for (key, value) in obj {
+            if matches!(key.as_str(), "audio_path" | "file_path") {
+                if let Some(path) = value.as_str() {
+                    rewritten.insert(
+                        key.clone(),
+                        serde_json::Value::String(
+                            resolve_path_in_work_dir(path, work_dir)
+                                .unwrap_or_else(|| path.to_string()),
+                        ),
+                    );
+                    continue;
+                }
+            }
+            rewritten.insert(key.clone(), value.clone());
+        }
+        serde_json::Value::Object(rewritten)
+    }
+
+    fn prepare_effective_args(
+        &self,
+        args: &serde_json::Value,
+        ctx: Option<&ToolContext>,
+    ) -> serde_json::Value {
+        let mut effective_args = args.clone();
+        if let Some(obj) = effective_args.as_object_mut() {
+            let has_audio_path = obj
+                .get("audio_path")
+                .and_then(|value| value.as_str())
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if !has_audio_path
+                && input_schema_has_property(&self.tool_def.input_schema, "audio_path")
+                && let Some(ctx) = ctx
+                && ctx.audio_attachment_paths.len() == 1
+            {
+                obj.insert(
+                    "audio_path".into(),
+                    serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
+                );
+            }
+
+            let has_file_path = obj
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if !has_file_path
+                && input_schema_has_property(&self.tool_def.input_schema, "file_path")
+                && let Some(ctx) = ctx
+                && ctx.file_attachment_paths.len() == 1
+            {
+                obj.insert(
+                    "file_path".into(),
+                    serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
+                );
+            }
+        }
+
+        let mut effective_args = self.rewrite_workspace_file_args(&effective_args);
+        if self.tool_def.name == "mofa_slides" {
+            if let Some(obj) = effective_args.as_object_mut() {
+                if !obj.contains_key("out")
+                    || obj["out"].as_str().map(|s| s.is_empty()).unwrap_or(true)
+                {
+                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    obj.insert(
+                        "out".into(),
+                        serde_json::Value::String(format!("slides_{ts}.pptx")),
+                    );
+                    tracing::info!("injected default 'out' for mofa_slides");
+                }
+            }
+        }
+
+        effective_args
+    }
+}
+
+fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.as_object())
+        .is_some_and(|properties| properties.contains_key(property))
+}
+
+fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
+    let candidate = std::path::Path::new(raw_path);
+    if candidate.exists() {
+        return Some(raw_path.to_string());
+    }
+
+    let filename = candidate.file_name()?;
+    let resolved = work_dir.join(filename);
+    if resolved.exists() {
+        return Some(resolved.to_string_lossy().into_owned());
+    }
+
+    let filename_str = filename.to_str()?;
+    for entry in std::fs::read_dir(work_dir).ok()? {
+        let entry = entry.ok()?;
+        let entry_path = entry.path();
+        let entry_name = entry_path.file_name()?.to_str()?;
+        if entry_name == filename_str || entry_name.ends_with(&format!("_{filename_str}")) {
+            return Some(entry_path.to_string_lossy().into_owned());
+        }
+    }
+
+    None
 }
 
 #[async_trait]
@@ -163,6 +281,9 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
+        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
+        let effective_args = self.prepare_effective_args(args, ctx.as_ref());
+
         let mut child = cmd.spawn().wrap_err_with(|| {
             format!(
                 "failed to spawn plugin '{}' executable: {}",
@@ -179,23 +300,6 @@ impl Tool for PluginTool {
             "plugin process spawned"
         );
 
-        // Inject defaults for known plugins
-        let mut effective_args = args.clone();
-        if self.tool_def.name == "mofa_slides" {
-            if let Some(obj) = effective_args.as_object_mut() {
-                if !obj.contains_key("out")
-                    || obj["out"].as_str().map(|s| s.is_empty()).unwrap_or(true)
-                {
-                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                    obj.insert(
-                        "out".into(),
-                        serde_json::Value::String(format!("slides_{ts}.pptx")),
-                    );
-                    tracing::info!("injected default 'out' for mofa_slides");
-                }
-            }
-        }
-
         // Write args to stdin
         if let Some(mut stdin) = child.stdin.take() {
             let data = serde_json::to_vec(&effective_args)?;
@@ -206,9 +310,6 @@ impl Tool for PluginTool {
         // Take stdout and stderr handles for separate streaming
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
-
-        // Read tool context from task-local (set by agent.rs)
-        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
 
         // Spawn stderr reader: streams lines as ToolProgress events
         let tool_name = self.tool_def.name.clone();
@@ -423,7 +524,9 @@ impl Tool for PluginTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SilentReporter;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn make_tool_def(name: &str, desc: &str) -> PluginToolDef {
         PluginToolDef {
@@ -491,6 +594,72 @@ mod tests {
         let schema = tool.input_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["msg"].is_object());
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_updates_audio_and_file_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("mark.wav");
+        let pdf = dir.path().join("deck.pdf");
+        std::fs::write(&wav, b"wav").unwrap();
+        std::fs::write(&pdf, b"pdf").unwrap();
+
+        let def = PluginToolDef {
+            name: "voice_tool".to_string(),
+            description: "Voice tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "audio_path": {"type": "string"},
+                    "file_path": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "audio_path": "/home/user/uploads/mark.wav",
+            "file_path": "deck.pdf",
+        }));
+
+        assert_eq!(rewritten["audio_path"], wav.to_string_lossy().to_string());
+        assert_eq!(rewritten["file_path"], pdf.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn prepare_effective_args_injects_attachment_defaults() {
+        let def = PluginToolDef {
+            name: "voice_tool".to_string(),
+            description: "Voice tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "audio_path": {"type": "string"},
+                    "file_path": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+        let ctx = ToolContext {
+            tool_id: "tool-1".to_string(),
+            reporter: Arc::new(SilentReporter),
+            attachment_paths: vec![
+                "/workspace/voice.ogg".to_string(),
+                "/workspace/report.pdf".to_string(),
+            ],
+            audio_attachment_paths: vec!["/workspace/voice.ogg".to_string()],
+            file_attachment_paths: vec!["/workspace/report.pdf".to_string()],
+        };
+
+        let prepared = tool.prepare_effective_args(&json!({}), Some(&ctx));
+
+        assert_eq!(prepared["audio_path"], "/workspace/voice.ogg");
+        assert_eq!(prepared["file_path"], "/workspace/report.pdf");
     }
 
     /// Write a script to a file and make it executable, with fsync to avoid ETXTBSY

@@ -34,7 +34,9 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rustyline = { workspace = true }
 reqwest = { workspace = true }
+md-5 = { workspace = true, optional = true }
 sha2 = { workspace = true }
+subtle = { workspace = true, optional = true }
 open = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
@@ -65,7 +67,7 @@ keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 default = []
-api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "octos-bus/api"]
+api = ["dep:axum", "dep:tower-http", "dep:futures", "dep:rust-embed", "dep:metrics", "dep:metrics-exporter-prometheus", "dep:lettre", "dep:rand", "dep:sysinfo", "dep:md-5", "dep:subtle", "octos-bus/api"]
 admin-bot = ["dep:teloxide", "dep:futures", "api"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]

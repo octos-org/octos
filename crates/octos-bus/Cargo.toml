@@ -42,6 +42,7 @@ subtle = { workspace = true }
 sha2 = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }
+base64 = { workspace = true }
 
 # Optional: channel integrations
 teloxide = { workspace = true, optional = true }

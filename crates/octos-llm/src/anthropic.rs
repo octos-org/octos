@@ -13,8 +13,10 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+use crate::types::{
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+};
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
@@ -242,6 +244,15 @@ impl LlmProvider for AnthropicProvider {
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let endpoint = if self.base_url != "https://api.anthropic.com" {
+            endpoint_label_from_base_url(&self.base_url)
+        } else {
+            None
+        };
+        ProviderMetadata::new(self.provider_label.clone(), self.model.clone(), endpoint)
     }
 }
 

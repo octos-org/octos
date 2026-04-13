@@ -32,10 +32,12 @@ pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
 pub mod workspace_git;
+pub mod workspace_policy;
 
 pub use agent::{
-    Agent, AgentConfig, ConversationResponse, TokenTracker, DEFAULT_SESSION_TIMEOUT_SECS,
+    Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
     DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, TASK_REPORTER,
+    TokenTracker,
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
@@ -45,23 +47,30 @@ pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
-pub use sandbox::{create_sandbox, Sandbox, SandboxConfig, SandboxMode};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use task_supervisor::{BackgroundTask, TaskStatus, TaskSupervisor};
 pub use tools::{
-    admin::{register_admin_api_tools, AdminApiContext},
-    ActivateToolsTool, BrowserTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
+    ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
+    CheckBackgroundTasksTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
     GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool, ReadFileTool, RecallMemoryTool,
     SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool,
-    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext,
+    WebFetchTool, WebSearchTool, WriteFileTool,
+    admin::{AdminApiContext, register_admin_api_tools},
 };
-pub use turn::{turns_to_messages, Turn, TurnKind};
+pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use workspace_git::{
-    commit_all_if_dirty, detect_workspace_repo, init_workspace_repo, initialize_and_commit,
-    list_workspace_repos, snapshot_workspace_change, snapshot_workspace_turn, WorkspaceProjectKind,
+    WorkspaceProjectKind, commit_all_if_dirty, detect_workspace_repo, init_workspace_repo,
+    initialize_and_commit, list_workspace_repos, snapshot_workspace_change,
+    snapshot_workspace_turn,
+};
+pub use workspace_policy::{
+    WORKSPACE_POLICY_FILE, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
+    read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 
 #[cfg(test)]

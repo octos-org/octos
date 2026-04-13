@@ -14,8 +14,8 @@ use crate::vision;
 
 use crate::config::ChatConfig;
 use crate::openai::parse_openai_sse_events;
-use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, StopReason, TokenUsage, ToolSpec};
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StopReason, TokenUsage, ToolSpec};
 
 /// OpenRouter provider (routes to many LLM providers).
 pub struct OpenRouterProvider {
@@ -247,6 +247,15 @@ impl LlmProvider for OpenRouterProvider {
 
     fn provider_name(&self) -> &str {
         "openrouter"
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let endpoint = if self.base_url != "https://openrouter.ai/api/v1" {
+            endpoint_label_from_base_url(&self.base_url)
+        } else {
+            None
+        };
+        ProviderMetadata::new("openrouter", self.model.clone(), endpoint)
     }
 }
 

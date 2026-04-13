@@ -15,7 +15,8 @@ use serde::Deserialize;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+use crate::types::ProviderMetadata;
 use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
 
 /// OpenAI provider using the Responses API.
@@ -186,6 +187,15 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     fn provider_name(&self) -> &str {
         "openai"
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let endpoint = if self.base_url != "https://api.openai.com/v1" {
+            endpoint_label_from_base_url(&self.base_url)
+        } else {
+            None
+        };
+        ProviderMetadata::new("openai", self.model.clone(), endpoint)
     }
 }
 

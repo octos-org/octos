@@ -5,8 +5,8 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use eyre::Result;
@@ -17,15 +17,15 @@ use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, ProviderRouter, RetryProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
-use crate::config::{detect_provider, Config};
+use crate::config::{Config, detect_provider};
 use crate::session_actor::{
-    ActorFactory, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
-    ToolRegistryFactory,
+    ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
+    SnapshotToolRegistryFactory, ToolRegistryFactory,
 };
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
@@ -294,6 +294,7 @@ pub(super) struct ProfileActorFactoryBuilder {
     pub(super) no_retry: bool,
     /// Sandbox config for child bot tool registries.
     pub(super) sandbox_config: octos_agent::SandboxConfig,
+    pub(super) task_query_store: SessionTaskQueryStore,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -500,11 +501,7 @@ impl ProfileActorFactoryBuilder {
                         ),
                     }
                 }
-                if registered > 1 {
-                    Some(router)
-                } else {
-                    None
-                }
+                if registered > 1 { Some(router) } else { None }
             };
             provider_router = child_router.clone();
 
@@ -637,6 +634,7 @@ impl ProfileActorFactoryBuilder {
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
             llm_strong,
+            task_query_store: self.task_query_store.clone(),
         })
     }
 }

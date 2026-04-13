@@ -13,8 +13,10 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+use crate::types::{
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+};
 
 /// Google Gemini provider.
 pub struct GeminiProvider {
@@ -283,6 +285,15 @@ impl LlmProvider for GeminiProvider {
 
     fn provider_name(&self) -> &str {
         "gemini"
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let endpoint = if self.base_url != "https://generativelanguage.googleapis.com/v1beta" {
+            endpoint_label_from_base_url(&self.base_url)
+        } else {
+            None
+        };
+        ProviderMetadata::new("gemini", self.model.clone(), endpoint)
     }
 }
 

@@ -17,6 +17,7 @@ use super::message_repair::{
 use super::{Agent, ConversationResponse, TokenTracker};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
+use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 impl Agent {
     /// Build a `ChatConfig` with optional `chat_max_tokens` override from `AgentConfig`.
@@ -36,7 +37,24 @@ impl Agent {
         history: &[Message],
         media: Vec<String>,
     ) -> Result<ConversationResponse> {
-        self.process_message_inner(user_content, history, media, None)
+        self.process_message_inner(
+            user_content,
+            history,
+            media,
+            TurnAttachmentContext::default(),
+            None,
+        )
+        .await
+    }
+
+    pub async fn process_message_with_attachments(
+        &self,
+        user_content: &str,
+        history: &[Message],
+        media: Vec<String>,
+        attachments: TurnAttachmentContext,
+    ) -> Result<ConversationResponse> {
+        self.process_message_inner(user_content, history, media, attachments, None)
             .await
     }
 
@@ -49,7 +67,25 @@ impl Agent {
         media: Vec<String>,
         tracker: &TokenTracker,
     ) -> Result<ConversationResponse> {
-        self.process_message_inner(user_content, history, media, Some(tracker))
+        self.process_message_inner(
+            user_content,
+            history,
+            media,
+            TurnAttachmentContext::default(),
+            Some(tracker),
+        )
+        .await
+    }
+
+    pub async fn process_message_tracked_with_attachments(
+        &self,
+        user_content: &str,
+        history: &[Message],
+        media: Vec<String>,
+        attachments: TurnAttachmentContext,
+        tracker: &TokenTracker,
+    ) -> Result<ConversationResponse> {
+        self.process_message_inner(user_content, history, media, attachments, Some(tracker))
             .await
     }
 
@@ -58,189 +94,258 @@ impl Agent {
         user_content: &str,
         history: &[Message],
         media: Vec<String>,
+        attachments: TurnAttachmentContext,
         tracker: Option<&TokenTracker>,
     ) -> Result<ConversationResponse> {
-        // Reset per-run flags
-        self.tools.reset_spawn_only_invoked();
+        TURN_ATTACHMENT_CTX
+            .scope(attachments, async {
+                // Reset per-run flags
+                self.tools.reset_spawn_only_invoked();
 
-        let mut messages = vec![Message {
-            role: MessageRole::System,
-            content: self
-                .system_prompt
-                .read()
-                .unwrap_or_else(|e| {
-                    tracing::warn!("system prompt lock was poisoned, recovering");
-                    e.into_inner()
-                })
-                .clone(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            timestamp: chrono::Utc::now(),
-        }];
-
-        messages.extend_from_slice(history);
-
-        let content = if user_content.is_empty() && !media.is_empty() {
-            "[User sent an image]".to_string()
-        } else {
-            user_content.to_string()
-        };
-
-        messages.push(Message {
-            role: MessageRole::User,
-            content,
-            media,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            timestamp: chrono::Utc::now(),
-        });
-
-        let config = self.chat_config();
-        let mut total_usage = TokenUsage::default();
-        let mut files_modified = Vec::new();
-        let mut iteration = 0u32;
-        let start = Instant::now();
-        let mut loop_detector = LoopDetector::new(12);
-
-        loop {
-            if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
-                // Skip system prompt + history; return only new messages
-                let new_start = (1 + history.len()).min(messages.len());
-                return Ok(ConversationResponse {
-                    content: stop.message(),
+                let mut messages = vec![Message {
+                    role: MessageRole::System,
+                    content: self
+                        .system_prompt
+                        .read()
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("system prompt lock was poisoned, recovering");
+                            e.into_inner()
+                        })
+                        .clone(),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
                     reasoning_content: None,
-                    token_usage: total_usage,
-                    files_modified,
-                    streamed: false,
-                    messages: messages[new_start..].to_vec(),
+                    timestamp: chrono::Utc::now(),
+                }];
+
+                messages.extend_from_slice(history);
+
+                let base_content = if user_content.is_empty() && !media.is_empty() {
+                    "[User sent an image]".to_string()
+                } else {
+                    user_content.to_string()
+                };
+                let content = if let Some(summary) = TURN_ATTACHMENT_CTX
+                    .try_with(|ctx| ctx.prompt_summary.clone())
+                    .ok()
+                    .flatten()
+                {
+                    if base_content.trim().is_empty() {
+                        summary
+                    } else {
+                        format!("{base_content}\n\n{summary}")
+                    }
+                } else {
+                    base_content
+                };
+
+                messages.push(Message {
+                    role: MessageRole::User,
+                    content,
+                    media,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    timestamp: chrono::Utc::now(),
                 });
-            }
 
-            iteration += 1;
-            self.reporter()
-                .report(ProgressEvent::Thinking { iteration });
+                let config = self.chat_config();
+                let mut total_usage = TokenUsage::default();
+                let mut files_modified = Vec::new();
+                let mut iteration = 0u32;
+                let start = Instant::now();
+                let mut loop_detector = LoopDetector::new(12);
 
-            // LRU tool management: tick iteration counter and auto-evict idle tools
-            self.tools.tick();
-            let evicted = self.tools.auto_evict();
-            if !evicted.is_empty() {
-                tracing::info!(
-                    evicted = %evicted.join(", "),
-                    count = evicted.len(),
-                    "auto-evicted idle tools"
-                );
-            }
+                loop {
+                    if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
+                        // Skip system prompt + history; return only new messages
+                        let new_start = (1 + history.len()).min(messages.len());
+                        return Ok(ConversationResponse {
+                            content: stop.message(),
+                            reasoning_content: None,
+                            provider_metadata: None,
+                            token_usage: total_usage,
+                            files_modified,
+                            streamed: false,
+                            messages: messages[new_start..].to_vec(),
+                        });
+                    }
 
-            let tools_spec = self.tools.specs();
-            self.trim_to_context_window(&mut messages);
-            normalize_system_messages(&mut messages);
-            repair_message_order(&mut messages);
-            repair_tool_pairs(&mut messages);
-            synthesize_missing_tool_results(&mut messages);
-            truncate_old_tool_results(&mut messages);
-            normalize_tool_call_ids(&mut messages);
+                    iteration += 1;
+                    self.reporter()
+                        .report(ProgressEvent::Thinking { iteration });
 
-            if iteration == 1 && tools_spec.len() > 25 {
-                tracing::warn!(
-                    tools = tools_spec.len(),
-                    "high tool count may cause empty responses with some models; \
-                     consider reducing skills (always: false) or adding a tool_policy deny list"
-                );
-            }
-            tracing::info!(
-                iteration,
-                messages = messages.len(),
-                tools = tools_spec.len(),
-                message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
-                "calling LLM"
-            );
-            let (response, streamed) = match self
-                .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) if e.to_string().contains("empty response after") => {
-                    // Empty response after retries -- try once more (adaptive router
-                    // may select a different provider on this second attempt).
-                    warn!(error = %e, "retrying LLM call for adaptive failover");
-                    self.reporter().report(ProgressEvent::LlmStatus {
-                        message: "Switching provider...".to_string(),
+                    // LRU tool management: tick iteration counter and auto-evict idle tools
+                    self.tools.tick();
+                    let evicted = self.tools.auto_evict();
+                    if !evicted.is_empty() {
+                        tracing::info!(
+                            evicted = %evicted.join(", "),
+                            count = evicted.len(),
+                            "auto-evicted idle tools"
+                        );
+                    }
+
+                    let tools_spec = self.tools.specs();
+                    self.trim_to_context_window(&mut messages);
+                    normalize_system_messages(&mut messages);
+                    repair_message_order(&mut messages);
+                    repair_tool_pairs(&mut messages);
+                    synthesize_missing_tool_results(&mut messages);
+                    truncate_old_tool_results(&mut messages);
+                    normalize_tool_call_ids(&mut messages);
+
+                    if iteration == 1 && tools_spec.len() > 25 {
+                        tracing::warn!(
+                            tools = tools_spec.len(),
+                            "high tool count may cause empty responses with some models; \
+                             consider reducing skills (always: false) or adding a tool_policy deny list"
+                        );
+                    }
+                    tracing::info!(
+                        iteration,
+                        messages = messages.len(),
+                        tools = tools_spec.len(),
+                        message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
+                        "calling LLM"
+                    );
+                    let (response, streamed) = match self
+                        .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) if e.to_string().contains("empty response after") => {
+                            // Empty response after retries -- try once more (adaptive router
+                            // may select a different provider on this second attempt).
+                            warn!(error = %e, "retrying LLM call for adaptive failover");
+                            self.reporter().report(ProgressEvent::LlmStatus {
+                                message: "Switching provider...".to_string(),
+                                iteration,
+                            });
+                            self.call_llm_with_hooks(
+                                &messages,
+                                &tools_spec,
+                                &config,
+                                iteration,
+                                &total_usage,
+                            )
+                            .await?
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    self.reporter().report(ProgressEvent::Response {
+                        content: response.content.clone().unwrap_or_default(),
                         iteration,
                     });
-                    self.call_llm_with_hooks(
-                        &messages,
-                        &tools_spec,
-                        &config,
-                        iteration,
-                        &total_usage,
-                    )
-                    .await?
-                }
-                Err(e) => return Err(e),
-            };
-            self.reporter().report(ProgressEvent::Response {
-                content: response.content.clone().unwrap_or_default(),
-                iteration,
-            });
-            {
-                let tool_names: Vec<&str> = response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| tc.name.as_str())
-                    .collect();
-                let tool_ids: Vec<&str> = response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| tc.id.as_str())
-                    .collect();
-                tracing::info!(
-                    iteration,
-                    stop_reason = ?response.stop_reason,
-                    tool_calls = response.tool_calls.len(),
-                    tool_names = %tool_names.join(", "),
-                    tool_ids = %tool_ids.join(", "),
-                    response_content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
-                    input_tokens = response.usage.input_tokens,
-                    output_tokens = response.usage.output_tokens,
-                    "LLM response received"
-                );
-            }
-            total_usage.input_tokens += response.usage.input_tokens;
-            total_usage.output_tokens += response.usage.output_tokens;
-            if let Some(t) = tracker {
-                t.input_tokens
-                    .store(total_usage.input_tokens, Ordering::Relaxed);
-                t.output_tokens
-                    .store(total_usage.output_tokens, Ordering::Relaxed);
-            }
+                    {
+                        let tool_names: Vec<&str> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| tc.name.as_str())
+                            .collect();
+                        let tool_ids: Vec<&str> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| tc.id.as_str())
+                            .collect();
+                        tracing::info!(
+                            iteration,
+                            stop_reason = ?response.stop_reason,
+                            tool_calls = response.tool_calls.len(),
+                            tool_names = %tool_names.join(", "),
+                            tool_ids = %tool_ids.join(", "),
+                            response_content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
+                            input_tokens = response.usage.input_tokens,
+                            output_tokens = response.usage.output_tokens,
+                            "LLM response received"
+                        );
+                    }
+                    total_usage.input_tokens += response.usage.input_tokens;
+                    total_usage.output_tokens += response.usage.output_tokens;
+                    if let Some(t) = tracker {
+                        t.input_tokens
+                            .store(total_usage.input_tokens, Ordering::Relaxed);
+                        t.output_tokens
+                            .store(total_usage.output_tokens, Ordering::Relaxed);
+                    }
 
-            match response.stop_reason {
-                StopReason::EndTurn | StopReason::StopSequence => {
-                    self.emit_cost_update(&total_usage, &response.usage);
-                    let new_start = (1 + history.len()).min(messages.len());
-                    return Ok(ConversationResponse {
-                        content: response.content.unwrap_or_default(),
-                        reasoning_content: response.reasoning_content.clone(),
-                        token_usage: total_usage,
-                        files_modified,
-                        streamed,
-                        messages: messages[new_start..].to_vec(),
-                    });
-                }
-                StopReason::ToolUse => {
-                    // Check for loop detection before executing
-                    for tc in &response.tool_calls {
-                        if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments) {
-                            warn!("loop detected — breaking agent loop");
-                            // Don't execute the tools — break out with a message
+                    match response.stop_reason {
+                        StopReason::EndTurn | StopReason::StopSequence => {
                             self.emit_cost_update(&total_usage, &response.usage);
                             let new_start = (1 + history.len()).min(messages.len());
                             return Ok(ConversationResponse {
-                                content: warning,
+                                content: response.content.unwrap_or_default(),
+                                reasoning_content: response.reasoning_content.clone(),
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
+                                token_usage: total_usage,
+                                files_modified,
+                                streamed,
+                                messages: messages[new_start..].to_vec(),
+                            });
+                        }
+                        StopReason::ToolUse => {
+                            // Check for loop detection before executing
+                            for tc in &response.tool_calls {
+                                if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
+                                {
+                                    warn!("loop detected — breaking agent loop");
+                                    // Don't execute the tools — break out with a message
+                                    self.emit_cost_update(&total_usage, &response.usage);
+                                    let new_start = (1 + history.len()).min(messages.len());
+                                    return Ok(ConversationResponse {
+                                        content: warning,
+                                        reasoning_content: None,
+                                        provider_metadata: None,
+                                        token_usage: total_usage,
+                                        files_modified,
+                                        streamed,
+                                        messages: messages[new_start..].to_vec(),
+                                    });
+                                }
+                            }
+                            self.handle_tool_use(
+                                &response,
+                                &mut messages,
+                                &mut files_modified,
+                                &mut total_usage,
+                                tracker,
+                            )
+                            .await?;
+                        }
+                        StopReason::MaxTokens => {
+                            self.emit_cost_update(&total_usage, &response.usage);
+                            let new_start = (1 + history.len()).min(messages.len());
+                            return Ok(ConversationResponse {
+                                content: response.content.unwrap_or_default(),
+                                reasoning_content: response.reasoning_content.clone(),
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
+                                token_usage: total_usage,
+                                files_modified,
+                                streamed,
+                                messages: messages[new_start..].to_vec(),
+                            });
+                        }
+                        StopReason::ContentFiltered => {
+                            // After retries in call_llm_with_hooks, content is still filtered.
+                            // Return a user-visible message instead of empty content.
+                            self.emit_cost_update(&total_usage, &response.usage);
+                            warn!("content filtered by provider safety/moderation after retries");
+                            let new_start = (1 + history.len()).min(messages.len());
+                            return Ok(ConversationResponse {
+                                content: response.content.unwrap_or_else(|| {
+                                    "[Content was blocked by the model's safety filter. \
+                                     Please rephrase your request.]"
+                                        .to_string()
+                                }),
                                 reasoning_content: None,
+                                provider_metadata: Some(
+                                    self.llm.provider_metadata_for_index(response.provider_index),
+                                ),
                                 token_usage: total_usage,
                                 files_modified,
                                 streamed,
@@ -248,50 +353,10 @@ impl Agent {
                             });
                         }
                     }
-                    self.handle_tool_use(
-                        &response,
-                        &mut messages,
-                        &mut files_modified,
-                        &mut total_usage,
-                        tracker,
-                    )
-                    .await?;
                 }
-                StopReason::MaxTokens => {
-                    self.emit_cost_update(&total_usage, &response.usage);
-                    let new_start = (1 + history.len()).min(messages.len());
-                    return Ok(ConversationResponse {
-                        content: response.content.unwrap_or_default(),
-                        reasoning_content: response.reasoning_content.clone(),
-                        token_usage: total_usage,
-                        files_modified,
-                        streamed,
-                        messages: messages[new_start..].to_vec(),
-                    });
-                }
-                StopReason::ContentFiltered => {
-                    // After retries in call_llm_with_hooks, content is still filtered.
-                    // Return a user-visible message instead of empty content.
-                    self.emit_cost_update(&total_usage, &response.usage);
-                    warn!("content filtered by provider safety/moderation after retries");
-                    let new_start = (1 + history.len()).min(messages.len());
-                    return Ok(ConversationResponse {
-                        content: response.content.unwrap_or_else(|| {
-                            "[Content was blocked by the model's safety filter. \
-                             Please rephrase your request.]"
-                                .to_string()
-                        }),
-                        reasoning_content: None,
-                        token_usage: total_usage,
-                        files_modified,
-                        streamed,
-                        messages: messages[new_start..].to_vec(),
-                    });
-                }
-            }
-        }
+            })
+            .await
     }
-
     /// Run a task to completion (used by spawn tool).
     pub async fn run_task(&self, task: &Task) -> Result<TaskResult> {
         let task_start = Instant::now();

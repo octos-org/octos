@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
-use crate::tools::{TOOL_CTX, ToolContext};
+use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
+use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 
 impl Agent {
     pub(super) async fn execute_tools(
@@ -123,9 +124,16 @@ impl Agent {
                             bg_supervisor.mark_running(&task_id);
 
                             // Helper to create TOOL_CTX for plugin stderr progress streaming
+                            let attachment_ctx =
+                                TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
+                                attachment_paths: attachment_ctx.attachment_paths.clone(),
+                                audio_attachment_paths: attachment_ctx
+                                    .audio_attachment_paths
+                                    .clone(),
+                                file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
                             };
 
                             let mut result = TOOL_CTX
@@ -184,7 +192,15 @@ impl Agent {
                                         tracing::warn!(tool = %bg_name, "spawn_only tool produced no files");
                                         bg_supervisor.mark_failed(&task_id, err_msg.clone());
                                         if let Some(ref sender) = bg_sender {
-                                            let _ = sender(bg_name.clone(), format!("✗ {} failed: no output files produced", bg_name)).await;
+                                            let _ = sender(BackgroundResultPayload {
+                                                task_label: bg_name.clone(),
+                                                content: format!(
+                                                    "✗ {} failed: no output files produced",
+                                                    bg_name
+                                                ),
+                                                kind: BackgroundResultKind::Notification,
+                                            })
+                                            .await;
                                         }
                                     } else {
                                         bg_supervisor.mark_completed(&task_id, sent_files.clone());
@@ -194,7 +210,15 @@ impl Agent {
                                             format!(" ({})", sent_files.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect::<Vec<_>>().join(", "))
                                         };
                                         if let Some(ref sender) = bg_sender {
-                                            let _ = sender(bg_name.clone(), format!("✓ {} completed{}", bg_name, file_info)).await;
+                                            let _ = sender(BackgroundResultPayload {
+                                                task_label: bg_name.clone(),
+                                                content: format!(
+                                                    "✓ {} completed{}",
+                                                    bg_name, file_info
+                                                ),
+                                                kind: BackgroundResultKind::Notification,
+                                            })
+                                            .await;
                                         }
                                     }
                                 }
@@ -207,7 +231,12 @@ impl Agent {
                                     bg_supervisor.mark_failed(&task_id, r.output.clone());
                                     // Notify session of failure
                                     if let Some(ref sender) = bg_sender {
-                                        let _ = sender(bg_name.clone(), format!("✗ {} failed: {}", bg_name, r.output)).await;
+                                        let _ = sender(BackgroundResultPayload {
+                                            task_label: bg_name.clone(),
+                                            content: format!("✗ {} failed: {}", bg_name, r.output),
+                                            kind: BackgroundResultKind::Notification,
+                                        })
+                                        .await;
                                     }
                                 }
                                 Err(e) => {
@@ -218,7 +247,12 @@ impl Agent {
                                     );
                                     bg_supervisor.mark_failed(&task_id, e.to_string());
                                     if let Some(ref sender) = bg_sender {
-                                        let _ = sender(bg_name.clone(), format!("✗ {} error: {}", bg_name, e)).await;
+                                        let _ = sender(BackgroundResultPayload {
+                                            task_label: bg_name.clone(),
+                                            content: format!("✗ {} error: {}", bg_name, e),
+                                            kind: BackgroundResultKind::Notification,
+                                        })
+                                        .await;
                                     }
                                 }
                             }
@@ -245,9 +279,14 @@ impl Agent {
                         );
                     }
 
+                    let attachment_ctx =
+                        TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        attachment_paths: attachment_ctx.attachment_paths.clone(),
+                        audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
+                        file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
                     };
                     let result = TOOL_CTX
                         .scope(ctx, tools.execute(&tc_name, &effective_args))

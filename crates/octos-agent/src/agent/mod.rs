@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, RwLock};
 
 use octos_core::{AgentId, Message, TokenUsage};
-use octos_llm::{EmbeddingProvider, LlmProvider};
+use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
 use crate::hooks::{HookContext, HookExecutor};
@@ -81,6 +81,8 @@ pub struct ConversationResponse {
     pub content: String,
     /// Reasoning/thinking content from thinking models (o1, DeepSeek, kimi, etc.).
     pub reasoning_content: Option<String>,
+    /// Exact provider instance provenance for the final assistant reply.
+    pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,

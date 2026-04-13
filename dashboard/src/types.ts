@@ -83,6 +83,7 @@ export interface UserProfile {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -94,6 +95,7 @@ export interface ProfileResponse {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -179,6 +181,18 @@ export interface OtpVerifyResponse {
   token?: string
   user?: User
   message?: string
+}
+
+export interface AllowlistEntry {
+  email: string
+  note?: string | null
+  created_at: string
+  claimed_user_id?: string | null
+  claimed_at?: string | null
+  registered: boolean
+  registered_user_id?: string | null
+  registered_name?: string | null
+  last_login_at?: string | null
 }
 
 export interface MeResponse {

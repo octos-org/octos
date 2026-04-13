@@ -17,11 +17,27 @@ use crate::progress::ProgressReporter;
 pub struct ToolContext {
     pub tool_id: String,
     pub reporter: Arc<dyn ProgressReporter>,
+    pub attachment_paths: Vec<String>,
+    pub audio_attachment_paths: Vec<String>,
+    pub file_attachment_paths: Vec<String>,
 }
 
 tokio::task_local! {
     /// Task-local tool context, scoped per tool invocation in agent.rs.
     pub static TOOL_CTX: ToolContext;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TurnAttachmentContext {
+    pub attachment_paths: Vec<String>,
+    pub audio_attachment_paths: Vec<String>,
+    pub file_attachment_paths: Vec<String>,
+    pub prompt_summary: Option<String>,
+}
+
+tokio::task_local! {
+    /// Task-local per-turn attachment context, scoped to the current agent run.
+    pub static TURN_ATTACHMENT_CTX: TurnAttachmentContext;
 }
 
 /// Progress update from a long-running tool execution.
@@ -198,6 +214,7 @@ pub mod write_file;
 pub mod activate_tools;
 pub mod admin;
 pub mod browser;
+pub mod check_background_tasks;
 pub mod tool_config;
 
 #[cfg(feature = "git")]
@@ -219,7 +236,7 @@ pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
-pub use spawn::SpawnTool;
+pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
 pub use synthesize_research::SynthesizeResearchTool;
 pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;
@@ -228,6 +245,7 @@ pub use write_file::WriteFileTool;
 
 pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
+pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 
 #[cfg(feature = "git")]

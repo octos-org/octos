@@ -7,6 +7,7 @@ pub mod coalesce;
 pub mod cron_service;
 pub mod cron_types;
 pub mod dedup;
+pub mod file_handle;
 pub mod heartbeat;
 pub mod markdown_html;
 pub mod media;
