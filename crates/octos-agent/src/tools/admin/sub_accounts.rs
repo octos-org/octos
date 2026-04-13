@@ -140,7 +140,9 @@ impl CreateSubAccountTool {
 #[derive(Deserialize)]
 struct CreateSubAccountInput {
     profile_id: String,
+    sub_account_id: String,
     name: String,
+    public_subdomain: String,
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
@@ -164,7 +166,9 @@ impl Tool for CreateSubAccountTool {
             "type": "object",
             "properties": {
                 "profile_id": { "type": "string", "description": "Parent profile ID" },
+                "sub_account_id": { "type": "string", "description": "One-time child user ID slug. Final internal profile ID becomes <parent>--<sub_account_id>." },
                 "name": { "type": "string", "description": "Name for the sub-account (e.g. 'work bot', 'support')" },
+                "public_subdomain": { "type": "string", "description": "Editable public URL slug for the sub-account, e.g. 'newsbot' for https://newsbot.crew.ominix.io" },
                 "email": { "type": "string", "description": "Email address for web client OTP login (optional)" },
                 "channels": {
                     "type": "array",
@@ -178,7 +182,7 @@ impl Tool for CreateSubAccountTool {
                     "additionalProperties": { "type": "string" }
                 }
             },
-            "required": ["profile_id", "name"]
+            "required": ["profile_id", "sub_account_id", "name", "public_subdomain"]
         })
     }
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -186,7 +190,9 @@ impl Tool for CreateSubAccountTool {
             serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
 
         let mut body = serde_json::json!({
+            "sub_account_id": input.sub_account_id,
             "name": input.name,
+            "public_subdomain": input.public_subdomain,
             "channels": input.channels,
             "env_vars": input.env_vars,
         });
@@ -275,7 +281,9 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(required.contains(&"profile_id"));
+        assert!(required.contains(&"sub_account_id"));
         assert!(required.contains(&"name"));
+        assert!(required.contains(&"public_subdomain"));
     }
 
     #[test]
@@ -287,10 +295,17 @@ mod tests {
 
     #[test]
     fn create_sub_account_input_minimal() {
-        let v = serde_json::json!({"profile_id": "p1", "name": "test bot"});
+        let v = serde_json::json!({
+            "profile_id": "p1",
+            "sub_account_id": "newsbot",
+            "name": "test bot",
+            "public_subdomain": "newsbot"
+        });
         let input: CreateSubAccountInput = serde_json::from_value(v).unwrap();
         assert_eq!(input.profile_id, "p1");
+        assert_eq!(input.sub_account_id, "newsbot");
         assert_eq!(input.name, "test bot");
+        assert_eq!(input.public_subdomain, "newsbot");
         assert!(input.channels.is_empty());
         assert!(input.system_prompt.is_none());
         assert!(input.env_vars.is_empty());
@@ -300,12 +315,16 @@ mod tests {
     fn create_sub_account_input_full() {
         let v = serde_json::json!({
             "profile_id": "p1",
+            "sub_account_id": "work-bot",
             "name": "work",
+            "public_subdomain": "work-bot",
             "channels": [{"Telegram": {"token_env": "TG_TOKEN"}}],
             "system_prompt": "You are helpful.",
             "env_vars": {"API_KEY": "secret"}
         });
         let input: CreateSubAccountInput = serde_json::from_value(v).unwrap();
+        assert_eq!(input.sub_account_id, "work-bot");
+        assert_eq!(input.public_subdomain, "work-bot");
         assert_eq!(input.channels.len(), 1);
         assert_eq!(input.system_prompt.as_deref(), Some("You are helpful."));
         assert_eq!(input.env_vars.get("API_KEY").unwrap(), "secret");

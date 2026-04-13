@@ -21,7 +21,11 @@
           },
           "sub_account_id": {
             "type": "string",
-            "description": "ID of the sub-account (required for 'update', 'delete', 'info', 'start', 'stop', 'restart'). Format: parent-id--slug, e.g. 'dspfac--work-bot'."
+            "description": "For 'create': one-time child user ID slug. Final internal profile ID becomes parent-id--slug. For update/delete/info/start/stop/restart: full existing sub-account ID, e.g. 'dspfac--work-bot'."
+          },
+          "public_subdomain": {
+            "type": "string",
+            "description": "Public URL slug for the sub-account, required for 'create'. Example: 'newsbot' for https://newsbot.crew.ominix.io."
           },
           "system_prompt": {
             "type": "string",

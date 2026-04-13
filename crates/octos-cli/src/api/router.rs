@@ -163,6 +163,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_sub_accounts),
         )
         .route(
+            "/api/my/profile/accounts",
+            post(auth_handlers::create_my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            get(auth_handlers::my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            put(auth_handlers::update_my_sub_account),
+        )
+        .route(
             "/api/my/profile/accounts/{id}/start",
             post(auth_handlers::start_my_sub_gateway),
         )
@@ -531,7 +543,7 @@ async fn user_auth_middleware(
     let token = extract_token(&req);
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let profile_id = req
+    let profile_selector = req
         .headers()
         .get("x-profile-id")
         .and_then(|v| v.to_str().ok())
@@ -555,14 +567,18 @@ async fn user_auth_middleware(
         .map(|ci| ci.0.ip().is_loopback())
         .unwrap_or(false);
 
-    if !profile_id.is_empty() && is_loopback {
-        // Validate that the profile actually exists to prevent spoofing.
-        if let Some(ref store) = state.profile_store {
-            if store.get(&profile_id).ok().flatten().is_none() {
-                tracing::warn!(profile_id = %profile_id, "X-Profile-Id references non-existent profile");
+    if !profile_selector.is_empty() && is_loopback {
+        let resolved_profile_id = match state
+            .profile_store
+            .as_ref()
+            .and_then(|store| store.resolve_profile_id(&profile_selector).ok().flatten())
+        {
+            Some(profile_id) => profile_id,
+            None => {
+                tracing::warn!(profile = %profile_selector, "X-Profile-Id references unknown profile or public subdomain");
                 return Err(StatusCode::UNAUTHORIZED);
             }
-        }
+        };
 
         let uri_str = uri.path();
         // Only allow proxy auth for chat-related endpoints, not admin
@@ -574,16 +590,16 @@ async fn user_auth_middleware(
             || uri_str.starts_with("/api/status")
         {
             req.extensions_mut().insert(AuthIdentity::User {
-                id: profile_id,
+                id: resolved_profile_id,
                 role: UserRole::User,
             });
             return Ok(next.run(req).await);
         }
     }
 
-    if !profile_id.is_empty() && !is_loopback {
+    if !profile_selector.is_empty() && !is_loopback {
         tracing::warn!(
-            profile_id = %profile_id,
+            profile_id = %profile_selector,
             "X-Profile-Id header rejected: request not from loopback address"
         );
     }

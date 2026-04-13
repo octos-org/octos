@@ -12,6 +12,9 @@ use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
+use crate::workspace_contract::{
+    SpawnTaskContractResult, enforce_spawn_task_contract, requires_workspace_contract,
+};
 
 impl Agent {
     pub(super) async fn execute_tools(
@@ -122,6 +125,7 @@ impl Agent {
                         let bg_reporter = reporter.clone();
                         tokio::spawn(async move {
                             bg_supervisor.mark_running(&task_id);
+                            let bg_started_at = std::time::SystemTime::now();
 
                             // Helper to create TOOL_CTX for plugin stderr progress streaming
                             let attachment_ctx =
@@ -156,69 +160,212 @@ impl Agent {
                                         success = true,
                                         "spawn_only background tool completed"
                                     );
-                                    let mut sent_files = Vec::new();
-                                    // Auto-send files from the background task (with retry)
-                                    for file_path in &r.files_to_send {
-                                        let path_str = file_path.to_string_lossy().to_string();
-                                        tracing::info!(tool = %bg_name, file = %path_str, "background auto-sending file");
-                                        let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": bg_tc_id});
-                                        let mut delivered = false;
-                                        for attempt in 0..3 {
-                                            match bg_tools.execute("send_file", &send_args).await {
-                                                Ok(sr) if sr.success => {
-                                                    tracing::info!(tool = %bg_name, file = %path_str, "background file sent");
-                                                    sent_files.push(path_str.clone());
-                                                    delivered = true;
-                                                    break;
-                                                }
-                                                Ok(sr) => {
-                                                    tracing::warn!(tool = %bg_name, file = %path_str, attempt, error = %sr.output, "background file send failed");
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(tool = %bg_name, file = %path_str, attempt, error = %e, "background file send failed");
-                                                }
-                                            }
-                                            if attempt < 2 {
-                                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    match enforce_spawn_task_contract(
+                                        &bg_tools,
+                                        &bg_name,
+                                        &bg_tc_id,
+                                        &r.files_to_send,
+                                        bg_started_at,
+                                    )
+                                    .await
+                                    {
+                                        SpawnTaskContractResult::Satisfied { delivered_files } => {
+                                            bg_supervisor
+                                                .mark_completed(&task_id, delivered_files.clone());
+                                            let file_info = if delivered_files.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(
+                                                    " ({})",
+                                                    delivered_files
+                                                        .iter()
+                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                )
+                                            };
+                                            if let Some(ref sender) = bg_sender {
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: format!(
+                                                        "✓ {} completed{}",
+                                                        bg_name, file_info
+                                                    ),
+                                                    kind: BackgroundResultKind::Notification,
+                                                })
+                                                .await;
                                             }
                                         }
-                                        if !delivered {
-                                            tracing::error!(tool = %bg_name, file = %path_str, "file delivery failed after 3 attempts");
+                                        SpawnTaskContractResult::Failed {
+                                            error,
+                                            notify_user,
+                                        } => {
+                                            tracing::warn!(
+                                                tool = %bg_name,
+                                                error = %error,
+                                                "workspace contract rejected spawn_only result"
+                                            );
+                                            bg_supervisor.mark_failed(&task_id, error.clone());
+                                            if let Some(ref sender) = bg_sender {
+                                                let content = notify_user.unwrap_or_else(|| {
+                                                    format!("✗ {} failed: {}", bg_name, error)
+                                                });
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content,
+                                                    kind: BackgroundResultKind::Notification,
+                                                })
+                                                .await;
+                                            }
                                         }
-                                    }
-                                    if sent_files.is_empty() && r.files_to_send.is_empty() {
-                                        // Tool returned success but produced no output files
-                                        let err_msg = format!("completed with no output (stdout: {})", r.output.chars().take(200).collect::<String>());
-                                        tracing::warn!(tool = %bg_name, "spawn_only tool produced no files");
-                                        bg_supervisor.mark_failed(&task_id, err_msg.clone());
-                                        if let Some(ref sender) = bg_sender {
-                                            let _ = sender(BackgroundResultPayload {
-                                                task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✗ {} failed: no output files produced",
+                                        SpawnTaskContractResult::NotConfigured => {
+                                            if requires_workspace_contract(&bg_name) {
+                                                let err_msg = format!(
+                                                    "workspace contract is required for {} but not configured",
                                                     bg_name
-                                                ),
-                                                kind: BackgroundResultKind::Notification,
-                                            })
-                                            .await;
-                                        }
-                                    } else {
-                                        bg_supervisor.mark_completed(&task_id, sent_files.clone());
-                                        let file_info = if sent_files.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" ({})", sent_files.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect::<Vec<_>>().join(", "))
-                                        };
-                                        if let Some(ref sender) = bg_sender {
-                                            let _ = sender(BackgroundResultPayload {
-                                                task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✓ {} completed{}",
-                                                    bg_name, file_info
-                                                ),
-                                                kind: BackgroundResultKind::Notification,
-                                            })
-                                            .await;
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg.clone());
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, err_msg
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                    })
+                                                    .await;
+                                                }
+                                                return;
+                                            }
+
+                                            let mut sent_files = Vec::new();
+                                            let mut delivery_failed = false;
+                                            for file_path in &r.files_to_send {
+                                                let path_str =
+                                                    file_path.to_string_lossy().to_string();
+                                                tracing::info!(
+                                                    tool = %bg_name,
+                                                    file = %path_str,
+                                                    "background auto-sending file"
+                                                );
+                                                let send_args = serde_json::json!({
+                                                    "file_path": path_str,
+                                                    "tool_call_id": bg_tc_id
+                                                });
+                                                let mut delivered = false;
+                                                for attempt in 0..3 {
+                                                    match bg_tools.execute("send_file", &send_args).await {
+                                                        Ok(sr) if sr.success => {
+                                                            tracing::info!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                "background file sent"
+                                                            );
+                                                            sent_files.push(path_str.clone());
+                                                            delivered = true;
+                                                            break;
+                                                        }
+                                                        Ok(sr) => {
+                                                            tracing::warn!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                attempt,
+                                                                error = %sr.output,
+                                                                "background file send failed"
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                attempt,
+                                                                error = %e,
+                                                                "background file send failed"
+                                                            );
+                                                        }
+                                                    }
+                                                    if attempt < 2 {
+                                                        tokio::time::sleep(
+                                                            std::time::Duration::from_secs(3),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                if !delivered {
+                                                    delivery_failed = true;
+                                                    tracing::error!(
+                                                        tool = %bg_name,
+                                                        file = %path_str,
+                                                        "file delivery failed after 3 attempts"
+                                                    );
+                                                }
+                                            }
+
+                                            if r.files_to_send.is_empty() {
+                                                let err_msg = format!(
+                                                    "completed with no output (stdout: {})",
+                                                    r.output.chars().take(200).collect::<String>()
+                                                );
+                                                tracing::warn!(
+                                                    tool = %bg_name,
+                                                    "spawn_only tool produced no files"
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg);
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: no output files produced",
+                                                            bg_name
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                    })
+                                                    .await;
+                                                }
+                                            } else if delivery_failed
+                                                || sent_files.len() != r.files_to_send.len()
+                                            {
+                                                let err_msg = format!(
+                                                    "completed but file delivery failed ({}/{})",
+                                                    sent_files.len(),
+                                                    r.files_to_send.len()
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg.clone());
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, err_msg
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                    })
+                                                    .await;
+                                                }
+                                            } else {
+                                                bg_supervisor
+                                                    .mark_completed(&task_id, sent_files.clone());
+                                                let file_info = format!(
+                                                    " ({})",
+                                                    sent_files
+                                                        .iter()
+                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                );
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✓ {} completed{}",
+                                                            bg_name, file_info
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                    })
+                                                    .await;
+                                                }
+                                            }
                                         }
                                     }
                                 }

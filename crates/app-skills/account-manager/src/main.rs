@@ -23,6 +23,8 @@ struct UserProfile {
     data_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_subdomain: Option<String>,
     config: ProfileConfig,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -78,6 +80,8 @@ struct Input {
     name: Option<String>,
     #[serde(default)]
     sub_account_id: Option<String>,
+    #[serde(default)]
+    public_subdomain: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
@@ -180,7 +184,9 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
     };
 
     if subs.is_empty() {
-        output_ok("No sub-accounts found. You can create one by asking me to create a sub-account with a name.");
+        output_ok(
+            "No sub-accounts found. Create one with an explicit user ID, public subdomain, and name.",
+        );
         return;
     }
 
@@ -217,15 +223,30 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
             })
             .unwrap_or("");
         lines.push(format!(
-            "  - {id} ({name}, {status}) [{channels}]{prompt_preview}{sandbox_status}",
+            "  - {id} ({name}, {status}, url: {public_subdomain}) [{channels}]{prompt_preview}{sandbox_status}",
             id = s.id,
             name = s.name,
+            public_subdomain = s.public_subdomain.as_deref().unwrap_or(&s.id),
         ));
     }
     output_ok(&lines.join("\n"));
 }
 
 fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
+    let child_slug = match &input.sub_account_id {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            output_error("'sub_account_id' is required for the 'create' action.");
+            return;
+        }
+    };
+    let public_subdomain = match &input.public_subdomain {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            output_error("'public_subdomain' is required for the 'create' action.");
+            return;
+        }
+    };
     let name = match &input.name {
         Some(n) if !n.trim().is_empty() => n.trim(),
         _ => {
@@ -241,7 +262,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         return;
     }
 
-    let sub_id = format!("{parent_id}--{}", slugify(name));
+    let sub_id = format!("{parent_id}--{child_slug}");
 
     // Check for existing
     let sub_path = profiles_dir.join(format!("{sub_id}.json"));
@@ -304,6 +325,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         enabled: input.enable.unwrap_or(false),
         data_dir: None,
         parent_id: Some(parent_id.to_string()),
+        public_subdomain: Some(public_subdomain.to_string()),
         config: ProfileConfig {
             channels,
             gateway: GatewaySettings {
@@ -320,7 +342,9 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
 
     match save_profile(profiles_dir, &profile) {
         Ok(()) => {
-            let mut msg = format!("Created sub-account '{sub_id}' (name: {name}).");
+            let mut msg = format!(
+                "Created sub-account '{sub_id}' (name: {name}).\nPublic URL: https://{public_subdomain}.crew.ominix.io"
+            );
             if profile.enabled {
                 msg.push_str("\nThe account is enabled and will start on next gateway restart.");
             } else {

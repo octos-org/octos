@@ -11,27 +11,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Json;
-use axum::Router;
 use chrono::Utc;
 use eyre::Result;
 use octos_core::{
-    InboundMessage, Message, MessageRole, OutboundMessage, SessionKey, MAIN_PROFILE_ID,
+    InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
+use crate::SessionManager;
 use crate::channel::Channel;
 use crate::file_handle::{
     encode_profile_file_handle, resolve_legacy_file_request, resolve_scoped_file_handle,
 };
-use crate::SessionManager;
 
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
@@ -202,11 +202,13 @@ impl ApiChannel {
 }
 
 fn initial_sse_events(has_media: bool) -> Vec<String> {
-    let mut events = vec![serde_json::json!({
-        "type": "thinking",
-        "iteration": 0,
-    })
-    .to_string()];
+    let mut events = vec![
+        serde_json::json!({
+            "type": "thinking",
+            "iteration": 0,
+        })
+        .to_string(),
+    ];
 
     if has_media {
         events.push(
@@ -286,8 +288,9 @@ impl Channel for ApiChannel {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let handle = response_path_for_session_file(&data_dir, Path::new(persisted_path))
-                        .unwrap_or_else(|| persisted_path.clone());
+                    let handle =
+                        response_path_for_session_file(&data_dir, Path::new(persisted_path))
+                            .unwrap_or_else(|| persisted_path.clone());
                     if msg.content.is_empty() {
                         format!("[file:{handle}] {name}")
                     } else {
@@ -1046,7 +1049,11 @@ mod tests {
         let info = message_info_from_history_message(&message, data_dir.path());
         assert_eq!(info.media.len(), 1);
         assert_ne!(info.media[0], artifact.to_string_lossy());
-        assert!(!info.content.contains(&artifact.to_string_lossy().to_string()));
+        assert!(
+            !info
+                .content
+                .contains(&artifact.to_string_lossy().to_string())
+        );
         assert!(info.content.contains("[file:pf/"));
     }
 

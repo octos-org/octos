@@ -15,7 +15,7 @@ export default function HomePage() {
   const {
     profileId, parentId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
-    profileName, setProfileName, profileEmail, setProfileEmail, enabled, setEnabled,
+    profileName, setProfileName, profileEmail, setProfileEmail, publicSubdomain, setPublicSubdomain, enabled, setEnabled,
     save, saving, deleteProfile,
   } = useProfile()
   const navigate = useNavigate()
@@ -27,7 +27,9 @@ export default function HomePage() {
   const [subAccounts, setSubAccounts] = useState<ProfileResponse[]>([])
   const [subsLoading, setSubsLoading] = useState(false)
   const [showCreateSub, setShowCreateSub] = useState(false)
+  const [newSubId, setNewSubId] = useState('')
   const [newSubName, setNewSubName] = useState('')
+  const [newSubdomain, setNewSubdomain] = useState('')
   const [newSubEmail, setNewSubEmail] = useState('')
   const [createSubLoading, setCreateSubLoading] = useState(false)
 
@@ -54,12 +56,21 @@ export default function HomePage() {
     if (!profileId || !newSubName.trim()) return
     setCreateSubLoading(true)
     try {
-      await api.createSubAccount(profileId, {
+      const payload = {
+        sub_account_id: newSubId.trim() || undefined,
         name: newSubName.trim(),
+        public_subdomain: newSubdomain.trim() || undefined,
         email: newSubEmail.trim() || undefined,
-      })
+      }
+      if (isAdmin) {
+        await api.createSubAccount(profileId, payload)
+      } else {
+        await myApi.createSubAccount(payload)
+      }
       toast('Sub-account created', 'success')
+      setNewSubId('')
       setNewSubName('')
+      setNewSubdomain('')
       setNewSubEmail('')
       setShowCreateSub(false)
       loadSubAccounts()
@@ -164,6 +175,7 @@ export default function HomePage() {
           <h3 className="text-sm font-semibold text-white mb-4">Profile Info</h3>
           <dl className="space-y-3 text-xs">
             <InfoRow label="ID" value={profileId} />
+            <InfoRow label="Public URL ID" value={publicSubdomain || profileId} />
             {parentId && (
               <div className="flex justify-between">
                 <dt className="text-gray-500">Parent</dt>
@@ -215,6 +227,22 @@ export default function HomePage() {
               onChange={(e) => setProfileName(e.target.value)}
               className="input max-w-md"
             />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1.5">Public Subdomain</label>
+            <input
+              value={publicSubdomain}
+              onChange={(e) => setPublicSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+              placeholder={profileId}
+              className="input max-w-md"
+              disabled={!!parentId && isOwn}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Public URL preview: <span className="font-mono text-gray-400">https://{(publicSubdomain || profileId) || 'your-subdomain'}.crew.ominix.io</span>
+            </p>
+            {!!parentId && isOwn && (
+              <p className="text-xs text-gray-500 mt-1">Sub-account users cannot change their own public subdomain. The parent account controls it.</p>
+            )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-1.5">Login Email</label>
@@ -281,7 +309,7 @@ export default function HomePage() {
                 <span className="ml-2 text-gray-500 font-normal">({subAccounts.length})</span>
               )}
             </h3>
-            {isAdmin && (
+            {(
               <button
                 onClick={() => setShowCreateSub(!showCreateSub)}
                 className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition"
@@ -294,6 +322,16 @@ export default function HomePage() {
           {showCreateSub && (
             <div className="mb-4 p-3 rounded-lg bg-white/[0.03] border border-gray-700/50 space-y-3">
               <div>
+                <label className="block text-xs text-gray-400 mb-1">User ID</label>
+                <input
+                  value={newSubId}
+                  onChange={e => setNewSubId(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                  placeholder="newsbot"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-gray-500 mt-1">One-time internal child ID. Final internal profile ID becomes <span className="font-mono">{profileId || 'parent'}--{newSubId || 'child-id'}</span>.</p>
+              </div>
+              <div>
                 <label className="block text-xs text-gray-400 mb-1">Name</label>
                 <input
                   value={newSubName}
@@ -301,6 +339,16 @@ export default function HomePage() {
                   placeholder="e.g. work-bot"
                   className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
                 />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Public Subdomain</label>
+                <input
+                  value={newSubdomain}
+                  onChange={e => setNewSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                  placeholder="newsbot"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">https://{newSubdomain || 'newsbot'}.crew.ominix.io</span></p>
               </div>
               <div>
                 <label className="block text-xs text-gray-400 mb-1">Email (for web client login)</label>
@@ -314,7 +362,12 @@ export default function HomePage() {
               </div>
               <button
                 onClick={handleCreateSubAccount}
-                disabled={createSubLoading || !newSubName.trim()}
+                disabled={
+                  createSubLoading
+                    || !newSubName.trim()
+                    || !newSubId.trim()
+                    || !newSubdomain.trim()
+                }
                 className="px-4 py-2 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent/80 transition disabled:opacity-50"
               >
                 {createSubLoading ? 'Creating...' : 'Create Sub-Account'}

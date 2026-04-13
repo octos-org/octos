@@ -3,29 +3,29 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::Extension;
+use axum::Json;
 use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
-use axum::Json;
 use futures::stream::StreamExt;
 use octos_agent::Agent;
-use octos_core::{AgentId, Message, SessionKey, MAIN_PROFILE_ID};
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
 use serde::{Deserialize, Serialize};
 
+use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::sse::ChannelReporter;
-use super::AppState;
-use crate::project_templates::{read_site_project_metadata, SiteProjectMetadata};
+use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
 /// POST /api/chat -- send a message, get a response.
 /// When `stream: true`, returns SSE events. Otherwise returns JSON.
@@ -67,7 +67,10 @@ pub(crate) fn response_path_for_profile_file(
         .or_else(|| encode_tmp_upload_handle(path, path.file_name().and_then(|name| name.to_str())))
 }
 
-fn resolve_scoped_download_path(base_dir: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+fn resolve_scoped_download_path(
+    base_dir: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
     resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
 }
@@ -75,19 +78,28 @@ fn resolve_scoped_download_path(base_dir: &std::path::Path, request_path: &str) 
 /// Maximum message length (1MB).
 const MAX_MESSAGE_LEN: usize = 1_048_576;
 
+fn resolve_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .and_then(|selector| {
+            state
+                .profile_store
+                .as_ref()
+                .and_then(|store| store.resolve_profile_id(selector).ok().flatten())
+        })
+}
+
 /// Resolve API port for a specific profile, or fall back to first available.
-/// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
+/// X-Profile-Id may be either the internal profile id or a public subdomain.
 async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
     let pm = state.process_manager.as_ref()?;
 
     // Check X-Profile-Id header first (set by reverse proxy from subdomain)
-    if let Some(profile_id) = headers
-        .get("x-profile-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(port) = pm.api_port(profile_id).await {
-            return Some((profile_id.to_string(), port));
+    if let Some(profile_id) = resolve_profile_id_from_headers(state, headers) {
+        if let Some(port) = pm.api_port(&profile_id).await {
+            return Some((profile_id, port));
         }
         tracing::warn!(profile = profile_id, "no API port for requested profile");
     }
@@ -96,16 +108,17 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
-fn api_profile_id_from_headers(headers: &HeaderMap) -> &str {
-    headers
-        .get("x-profile-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MAIN_PROFILE_ID)
+fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
+    resolve_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(headers: &HeaderMap, session_id: &str) -> SessionKey {
-    SessionKey::with_profile(api_profile_id_from_headers(headers), "api", session_id)
+fn standalone_api_session_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> SessionKey {
+    let profile_id = api_profile_id_from_headers(state, headers);
+    SessionKey::with_profile(&profile_id, "api", session_id)
 }
 
 pub async fn chat(
@@ -186,8 +199,11 @@ async fn chat_sync(
         "chat: processing message"
     );
 
-    let session_key =
-        standalone_api_session_key(&headers, req.session_id.as_deref().unwrap_or("default"));
+    let session_key = standalone_api_session_key(
+        &state,
+        &headers,
+        req.session_id.as_deref().unwrap_or("default"),
+    );
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -241,7 +257,7 @@ async fn chat_streaming(
         "chat: streaming message"
     );
 
-    let session_key = standalone_api_session_key(&headers, &session_id);
+    let session_key = standalone_api_session_key(&state, &headers, &session_id);
 
     // Load history before spawning
     let history: Vec<Message> = {
@@ -365,7 +381,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{}:api:", api_profile_id_from_headers(&headers));
+        let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
         all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
             let chat_id = id.strip_prefix(&prefix)?;
             Some(SessionInfo {
@@ -427,16 +443,13 @@ fn default_page_limit() -> usize {
 }
 
 fn standalone_api_session_key_with_topic(
+    state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
     topic: Option<&str>,
 ) -> SessionKey {
-    SessionKey::with_profile_topic(
-        api_profile_id_from_headers(headers),
-        "api",
-        session_id,
-        topic.unwrap_or_default(),
-    )
+    let profile_id = api_profile_id_from_headers(state, headers);
+    SessionKey::with_profile_topic(&profile_id, "api", session_id, topic.unwrap_or_default())
 }
 
 fn session_messages_proxy_path(
@@ -482,7 +495,12 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(&headers, &id, params.topic.as_deref());
+            let key = standalone_api_session_key_with_topic(
+                &state,
+                &headers,
+                &id,
+                params.topic.as_deref(),
+            );
             let mut sess = sessions.lock().await;
             let session = sess.get_or_create(&key).await;
             let messages: Vec<MessageInfo> = session
@@ -669,7 +687,7 @@ pub async fn delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if let Some(sessions) = &state.sessions {
-        let key = standalone_api_session_key(&headers, &id);
+        let key = standalone_api_session_key(&state, &headers, &id);
         let mut sess = sessions.lock().await;
         return match sess.clear(&key).await {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1492,11 +1510,7 @@ fn resolve_preview_asset_path(
                 Some(nested_index)
             } else if !request_path.contains('.') {
                 let html = candidate.with_extension("html");
-                if html.exists() {
-                    Some(html)
-                } else {
-                    None
-                }
+                if html.exists() { Some(html) } else { None }
             } else {
                 None
             }
@@ -1838,14 +1852,14 @@ pub async fn list_content_files(
         if lower.starts_with('_') {
             return false;
         } // _report.md, _search_results.md, _sources.json
-          // Skip intermediates
+        // Skip intermediates
         if lower.starts_with("panel-") {
             return false;
         }
         if lower.contains("-ref.") {
             return false;
         } // mofa reference images
-          // Only keep meaningful output extensions
+        // Only keep meaningful output extensions
         matches!(
             lower.rsplit('.').next().unwrap_or(""),
             "md" | "markdown"
@@ -2542,7 +2556,9 @@ mod tests {
         let other_file = other.path().join("secret.txt");
         std::fs::write(&other_file, b"secret").unwrap();
 
-        assert!(resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none());
+        assert!(
+            resolve_scoped_download_path(current.path(), &other_file.to_string_lossy()).is_none()
+        );
     }
 
     #[test]

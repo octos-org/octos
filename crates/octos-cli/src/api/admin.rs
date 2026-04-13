@@ -32,6 +32,8 @@ pub struct CreateProfileRequest {
     pub id: String,
     pub name: String,
     #[serde(default)]
+    pub public_subdomain: Option<String>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub data_dir: Option<String>,
@@ -52,6 +54,9 @@ pub struct UpdateProfileRequest {
     /// Set or update the email address for OTP login.
     #[serde(default)]
     pub email: Option<String>,
+    /// Mutable public hostname slug. `null` clears back to legacy `id`.
+    #[serde(default)]
+    pub public_subdomain: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -254,6 +259,10 @@ pub async fn create_profile(
         enabled: req.enabled,
         data_dir: req.data_dir,
         parent_id: None,
+        public_subdomain: req
+            .public_subdomain
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty()),
         config: req.config,
         created_at: now,
         updated_at: now,
@@ -308,6 +317,11 @@ pub async fn update_profile(
     }
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        profile.public_subdomain = public_subdomain
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
     }
     // Merge config: parse the raw JSON "config" object and overlay only the
     // keys that are explicitly present, preserving all other existing fields.
@@ -1153,7 +1167,11 @@ pub async fn stop_all(
 
 #[derive(Deserialize)]
 pub struct CreateSubAccountRequest {
+    #[serde(default)]
+    pub sub_account_id: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub public_subdomain: Option<String>,
     /// Optional email address for OTP login to the web client.
     #[serde(default)]
     pub email: Option<String>,
@@ -1163,6 +1181,17 @@ pub struct CreateSubAccountRequest {
     pub gateway: Option<crate::profiles::GatewaySettings>,
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
+}
+
+pub(crate) fn required_sub_account_slug(
+    value: Option<&str>,
+    field_name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("{field_name} is required")))?;
+    Ok(value.to_string())
 }
 
 /// GET /api/admin/profiles/:id/accounts — List sub-accounts for a profile.
@@ -1197,7 +1226,7 @@ pub async fn list_sub_accounts(
 
 /// Validate that channel credentials have the required fields populated.
 /// Returns an error message if any channel is missing required fields.
-fn validate_channel_credentials(
+pub(crate) fn validate_channel_credentials(
     channels: &[crate::profiles::ChannelCredentials],
 ) -> Result<(), String> {
     use crate::profiles::ChannelCredentials;
@@ -1239,6 +1268,15 @@ pub async fn create_sub_account(
         "admin not configured".into(),
     ))?;
 
+    if req.name.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+
+    let sub_account_id =
+        required_sub_account_slug(req.sub_account_id.as_deref(), "sub_account_id")?;
+    let public_subdomain =
+        required_sub_account_slug(req.public_subdomain.as_deref(), "public_subdomain")?;
+
     // Validate channel credentials if any are provided
     if !req.channels.is_empty() {
         validate_channel_credentials(&req.channels).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -1247,7 +1285,9 @@ pub async fn create_sub_account(
     let mut sub = store
         .create_sub_account(
             &parent_id,
+            sub_account_id.as_str(),
             &req.name,
+            public_subdomain.as_str(),
             req.channels,
             req.gateway.unwrap_or_default(),
         )

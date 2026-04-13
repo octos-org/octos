@@ -83,6 +83,7 @@ export interface UserProfile {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -94,6 +95,7 @@ export interface ProfileResponse {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -186,6 +188,27 @@ export interface AllowlistEntry {
 export interface MeResponse {
   user: User
   profile: ProfileResponse | null
+  portal: PortalState
+}
+
+export interface AccessibleProfileSummary {
+  id: string
+  name: string
+  parent_id?: string | null
+  relationship: string
+  api_scope: string
+  route_base: string
+  can_manage_sub_accounts: boolean
+}
+
+export interface PortalState {
+  kind: string
+  home_profile_id: string
+  home_route: string
+  can_access_admin_portal: boolean
+  can_manage_users: boolean
+  sub_account_limit: number
+  accessible_profiles: AccessibleProfileSummary[]
 }
 
 export interface BridgeQrInfo {

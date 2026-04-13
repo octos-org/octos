@@ -38,7 +38,7 @@ pub async fn handle_account_command(
     match parts.first().copied().unwrap_or("list") {
         "" | "list" => match store.list_sub_accounts(parent_id) {
             Ok(subs) if subs.is_empty() => {
-                "No sub-accounts.\nCreate one with: /account create <name>".to_string()
+                "No sub-accounts.\nCreate one with: /account create <user-id> <public-subdomain> <name>".to_string()
             }
             Ok(subs) => {
                 let mut lines = vec!["Sub-accounts:".to_string()];
@@ -82,19 +82,25 @@ pub async fn handle_account_command(
         },
 
         "create" => {
-            let name = parts.get(1).copied().unwrap_or("").trim();
-            if name.is_empty() {
-                return "Usage: /account create <name>".to_string();
+            let rest = parts.get(1).copied().unwrap_or("").trim();
+            let mut tokens = rest.splitn(3, ' ');
+            let child_id = tokens.next().unwrap_or("").trim();
+            let public_subdomain = tokens.next().unwrap_or("").trim();
+            let name = tokens.next().unwrap_or("").trim();
+            if child_id.is_empty() || public_subdomain.is_empty() || name.is_empty() {
+                return "Usage: /account create <user-id> <public-subdomain> <name>".to_string();
             }
             match store.create_sub_account(
                 parent_id,
+                child_id,
                 name,
+                public_subdomain,
                 vec![],
                 crate::profiles::GatewaySettings::default(),
             ) {
                 Ok(sub) => format!(
-                    "Created sub-account: {}\nAdd channels via dashboard or CLI:\n  octos account create --profile {} {} --telegram-token <token>",
-                    sub.id, parent_id, name
+                    "Created sub-account: {}\nPublic URL: https://{}.crew.ominix.io\nAdd channels via dashboard or CLI:\n  octos account create --profile {} --id {} --subdomain {} {} --telegram-token <token>",
+                    sub.id, public_subdomain, parent_id, child_id, public_subdomain, name
                 ),
                 Err(e) => format!("Error: {e}"),
             }
@@ -182,7 +188,7 @@ pub async fn handle_account_command(
         }
 
         other => format!(
-            "Unknown sub-command: {other}\nUsage: /account [list|create|update|delete|start|stop|restart]\n  /account list — list sub-accounts\n  /account create <name> — create sub-account\n  /account update <sub-id> key=value ... — update config\n  /account start <sub-id> — enable & start gateway\n  /account stop <sub-id> — disable & stop gateway\n  /account restart <sub-id> — restart gateway\n  /account delete <sub-id> — delete sub-account"
+            "Unknown sub-command: {other}\nUsage: /account [list|create|update|delete|start|stop|restart]\n  /account list — list sub-accounts\n  /account create <user-id> <public-subdomain> <name> — create sub-account\n  /account update <sub-id> key=value ... — update config\n  /account start <sub-id> — enable & start gateway\n  /account stop <sub-id> — disable & stop gateway\n  /account restart <sub-id> — restart gateway\n  /account delete <sub-id> — delete sub-account"
         ),
     }
 }

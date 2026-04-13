@@ -1177,6 +1177,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 channels,
                 ..Default::default()

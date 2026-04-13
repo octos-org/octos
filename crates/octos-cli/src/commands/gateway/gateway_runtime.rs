@@ -40,7 +40,9 @@ use crate::persona_service::PersonaService;
 use crate::qos_catalog::{
     load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
 };
-use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
+use crate::session_actor::{
+    ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
+};
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
@@ -970,6 +972,7 @@ impl GatewayRuntime {
         // Pending message buffer for inactive sessions
         let pending_messages: crate::session_actor::PendingMessages =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let task_query_store = SessionTaskQueryStore::default();
 
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
@@ -1013,6 +1016,7 @@ impl GatewayRuntime {
                 false,
             )
             .unwrap_or_else(|_| llm_for_compaction.clone()),
+            task_query_store: task_query_store.clone(),
         };
         let profile_factory_builder =
             profile_store
@@ -1043,6 +1047,7 @@ impl GatewayRuntime {
                     plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
                     no_retry: cmd.no_retry,
                     sandbox_config: sandbox_config.clone(),
+                    task_query_store: task_query_store.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1087,6 +1092,10 @@ impl GatewayRuntime {
                 media_dir: &media_dir,
                 data_dir: &data_dir,
                 session_mgr: &session_mgr,
+                task_query: Some(Arc::new({
+                    let store = task_query_store.clone();
+                    move |session_key: &str| store.query_json(session_key)
+                })),
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),

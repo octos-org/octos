@@ -36,14 +36,19 @@ Use this tool when the user asks to:
 ```json
 {
   "action": "create",
+  "sub_account_id": "work-bot",
   "name": "work bot",
+  "public_subdomain": "work-bot",
   "system_prompt": "You are a professional work assistant.",
   "telegram_token": "123456:ABC-DEF...",
   "enable": true
 }
 ```
 
-Only `name` is required. Other fields are optional.
+Required: `sub_account_id`, `name`, `public_subdomain`.
+
+- `sub_account_id` is the one-time child user ID slug. Final internal profile ID becomes `parent-id--sub_account_id`.
+- `public_subdomain` is the editable URL slug used for `https://<public_subdomain>.crew.ominix.io`.
 
 ### Update a sub-account
 

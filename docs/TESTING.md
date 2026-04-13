@@ -18,6 +18,177 @@
 
 ---
 
+## Live Playwright On Mini 1
+
+Use this for real deployed-server validation, not for local dev loops.
+
+Reference host:
+
+- web: `https://dspfac.crew.ominix.io`
+- api: `https://dspfac.crew.ominix.io`
+
+There are two separate Playwright surfaces:
+
+1. `octos-web/tests`
+   - real Chromium browser against the deployed UI
+   - covers chat UX, uploads, slides, TTS, sessions, content panel, task widgets
+2. `octos/e2e/tests`
+   - request/API tests against the deployed backend
+   - covers SSE integrity, UTF-8/CJK streaming, session persistence, file events, session APIs
+
+### Browser Commands
+
+Run from [/Users/yuechen/home/octos-web](/Users/yuechen/home/octos-web):
+
+```bash
+BASE_URL=https://dspfac.crew.ominix.io npx playwright test
+```
+
+Recommended split:
+
+```bash
+BASE_URL=https://dspfac.crew.ominix.io npx playwright test \
+  tests/chat-fixes.spec.ts \
+  tests/tts-file-delivery.spec.ts
+
+BASE_URL=https://dspfac.crew.ominix.io npx playwright test \
+  tests/adaptive-routing.spec.ts \
+  tests/audio-autoplay.spec.ts \
+  tests/audio-autoplay-history.spec.ts \
+  tests/command-hints.spec.ts \
+  tests/content-panel.spec.ts \
+  tests/deep-research.spec.ts \
+  tests/error-recovery.spec.ts \
+  tests/file-upload.spec.ts \
+  tests/queue-mode.spec.ts \
+  tests/session-switching.spec.ts \
+  tests/streaming-fidelity.spec.ts
+
+BASE_URL=https://dspfac.crew.ominix.io \
+API_BASE=https://dspfac.crew.ominix.io \
+npx playwright test \
+  tests/slides-api.spec.ts \
+  tests/slides-stress.spec.ts
+
+BASE_URL=https://dspfac.crew.ominix.io \
+npx playwright test tests/slides-workflow.spec.ts
+```
+
+Critical note:
+
+- `tests/slides-api.spec.ts` and `tests/slides-stress.spec.ts` default to `:3000` if `API_BASE` is not set
+- if they fail with `ECONNREFUSED ... :3000`, that is a harness misconfiguration, not a product regression
+
+### Backend/API Commands
+
+Run from [/Users/yuechen/home/octos/e2e](/Users/yuechen/home/octos/e2e):
+
+```bash
+OCTOS_TEST_URL=https://dspfac.crew.ominix.io npx playwright test
+```
+
+To include privileged admin/tool regression checks:
+
+```bash
+OCTOS_TEST_URL=https://dspfac.crew.ominix.io \
+OCTOS_AUTH_TOKEN=<real-admin-token> \
+npx playwright test
+```
+
+Without `OCTOS_AUTH_TOKEN`, the admin shell / ffmpeg / privileged tool-chain checks are expected to skip.
+
+### Auth Assumptions
+
+Most browser tests already use the built-in e2e auth path from
+[helpers.ts](/Users/yuechen/home/octos-web/tests/helpers.ts):
+
+- token: `e2e-test-2026`
+- profile: `dspfac`
+
+### Failure Classification
+
+Treat failures in these buckets:
+
+- real regression
+  - browser-facing file paths expose raw absolute server paths instead of `pf/...` or `up/...`
+  - background task widgets stop reflecting real task state
+  - SSE UTF-8/CJK corruption appears
+  - session/file/task APIs fail consistently on the deployed host
+- flaky/model-tool instability
+  - upload/file-read fails once but rerun passes
+  - long generation flow fails once and succeeds immediately on rerun
+- harness/selector bug
+  - `ECONNREFUSED ... :3000` in slides API/stress tests
+  - `/help` failing because the test only waits for `assistant-message`
+  - collect mode failing because the test expects multiple assistant bubbles instead of one merged response
+  - `/new slides ...` failing only because no assistant bubble appears even though the session switched
+
+On failure, inspect:
+
+- `test-results/.../error-context.md`
+- `test-results/.../test-failed-1.png`
+
+### Current Known Weak Tests
+
+As of April 12, 2026:
+
+- `tests/slides-workflow.spec.ts`
+  - `/help` currently renders via `cmd-feedback`, not `assistant-message`
+  - `/new slides ...` currently creates/switches the session without an assistant bubble
+- `tests/queue-mode.spec.ts`
+  - the collect-mode assertion expects `>= 2` assistant bubbles, which conflicts with merged-response behavior
+- `tests/file-upload.spec.ts`
+  - CSV upload can still be intermittently flaky on rare runs
+
+### CI Recommendation
+
+Yes, this should be part of release validation, but not as a strict per-PR gate.
+
+Recommended split:
+
+- normal CI:
+  - `cargo fmt`
+  - `cargo clippy`
+  - unit/integration tests
+  - deterministic local browser tests
+- post-deploy / release-candidate CI on the test server:
+  - backend `octos/e2e` Playwright against Mini 1
+  - stable browser `octos-web/tests` subset against Mini 1
+  - quarantine or separately report known-flaky specs
+
+Good release-gate subset:
+
+```bash
+cd /Users/yuechen/home/octos/e2e
+OCTOS_TEST_URL=https://dspfac.crew.ominix.io npx playwright test
+
+cd /Users/yuechen/home/octos-web
+BASE_URL=https://dspfac.crew.ominix.io npx playwright test \
+  tests/chat-fixes.spec.ts \
+  tests/tts-file-delivery.spec.ts \
+  tests/adaptive-routing.spec.ts \
+  tests/audio-autoplay.spec.ts \
+  tests/audio-autoplay-history.spec.ts \
+  tests/command-hints.spec.ts \
+  tests/content-panel.spec.ts \
+  tests/deep-research.spec.ts \
+  tests/error-recovery.spec.ts \
+  tests/session-switching.spec.ts \
+  tests/streaming-fidelity.spec.ts
+
+BASE_URL=https://dspfac.crew.ominix.io \
+API_BASE=https://dspfac.crew.ominix.io \
+npx playwright test \
+  tests/slides-api.spec.ts \
+  tests/slides-stress.spec.ts
+```
+
+Do not block releases on these until fixed:
+
+- `tests/slides-workflow.spec.ts`
+- `tests/queue-mode.spec.ts`
+- `tests/file-upload.spec.ts` if it remains intermittent
+
 ## CI Pipeline
 
 `scripts/ci.sh` runs the same checks as `.github/workflows/ci.yml` plus focused subsystem tests.

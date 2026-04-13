@@ -756,7 +756,10 @@ User: Create a new sub-account called "coding assistant" with the system prompt
       Connect it to Telegram with token 123:ABC...
 
 Bot: [uses manage_account tool with action="create"]
+     Creates sub-account with sub_account_id="coding-assistant",
+     public_subdomain="coding-assistant"
      Created sub-account "coding assistant" (dspfac--coding-assistant).
+     Public URL: https://coding-assistant.crew.ominix.io
      Telegram channel configured. Starting...
 ```
 
@@ -1316,6 +1319,8 @@ Manages sub-accounts under the current profile. See [Section 9](#9-sub-account-m
 User: Create a sub-account for my work team with a Telegram bot
 
 Bot: [uses manage_account with action="create", name="work team",
+      sub_account_id="work-team",
+      public_subdomain="work-team",
       system_prompt="You are a work assistant for the engineering team.",
       telegram_token="123:ABC...", enable=true]
      Created sub-account "work team" (mybot--work-team) and started it.

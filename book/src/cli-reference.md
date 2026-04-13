@@ -219,7 +219,7 @@ Manage sub-accounts under profiles. Sub-accounts inherit LLM provider config but
 
 ```bash
 octos account list --profile <id>                         # List sub-accounts
-octos account create --profile <id> <name> [OPTIONS]      # Create sub-account
+octos account create --profile <id> --id <child-id> --subdomain <public-subdomain> <name> [OPTIONS]  # Create sub-account
 octos account update <id> [OPTIONS]                       # Update sub-account
 ```
 

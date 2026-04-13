@@ -219,7 +219,7 @@ octos office clean <dir>                  # 清理解包后 PPTX 中的孤立文
 
 ```bash
 octos account list --profile <id>                         # 列出子账户
-octos account create --profile <id> <name> [OPTIONS]      # 创建子账户
+octos account create --profile <id> --id <子账户ID> --subdomain <公网域名标识> <name> [OPTIONS]  # 创建子账户
 octos account update <id> [OPTIONS]                       # 更新子账户
 ```
 

@@ -33,6 +33,8 @@ interface ProfileContextValue {
   setProfileName: (name: string) => void
   profileEmail: string
   setProfileEmail: (email: string) => void
+  publicSubdomain: string
+  setPublicSubdomain: (subdomain: string) => void
   enabled: boolean
   setEnabled: (enabled: boolean) => void
   logStreamUrl: string
@@ -58,6 +60,7 @@ export function ProfileProvider({ children }: Props) {
   const [status, setStatus] = useState<ProcessStatus | null>(null)
   const [profileName, setProfileName] = useState('')
   const [profileEmail, setProfileEmail] = useState('')
+  const [publicSubdomain, setPublicSubdomain] = useState('')
   const [enabled, setEnabled] = useState(true)
   const [parentId, setParentId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -74,6 +77,18 @@ export function ProfileProvider({ children }: Props) {
         restartGateway: () => myApi.restartGateway(),
       }
     }
+    if (!isAdmin) {
+      return {
+        getProfile: () => myApi.getSubAccount(profileId),
+        updateProfile: (data: any) => myApi.updateSubAccount(profileId, data),
+        startGateway: () => myApi.startSubGateway(profileId),
+        stopGateway: () => myApi.stopSubGateway(profileId),
+        restartGateway: async () => {
+          await myApi.stopSubGateway(profileId)
+          await myApi.startSubGateway(profileId)
+        },
+      }
+    }
     return {
       getProfile: () => api.getProfile(profileId),
       updateProfile: (data: any) => api.updateProfile(profileId, data),
@@ -81,7 +96,7 @@ export function ProfileProvider({ children }: Props) {
       stopGateway: () => api.stopGateway(profileId),
       restartGateway: () => api.restartGateway(profileId),
     }
-  }, [isOwn, profileId])
+  }, [isAdmin, isOwn, profileId])
 
   const logStreamUrl = useMemo(
     () => (isOwn ? getLogStreamUrl() : getAdminLogStreamUrl(profileId)),
@@ -96,6 +111,7 @@ export function ProfileProvider({ children }: Props) {
       setStatus(profile.status)
       setProfileName(profile.name)
       setProfileEmail(profile.email || '')
+      setPublicSubdomain(profile.public_subdomain || profile.id)
       setEnabled(profile.enabled)
       setParentId(profile.parent_id || null)
     } catch (e: any) {
@@ -115,12 +131,17 @@ export function ProfileProvider({ children }: Props) {
       const profile = await adapter.updateProfile({
         name: profileName,
         email: profileEmail || undefined,
+        public_subdomain:
+          publicSubdomain.trim() && publicSubdomain.trim() !== profileId
+            ? publicSubdomain.trim()
+            : null,
         enabled,
         config,
       })
       setConfig(profile.config)
       setStatus(profile.status)
       setProfileName(profile.name)
+      setPublicSubdomain(profile.public_subdomain || profile.id)
       setEnabled(profile.enabled)
       toast('Configuration saved')
     } catch (e: any) {
@@ -128,7 +149,7 @@ export function ProfileProvider({ children }: Props) {
     } finally {
       setSaving(false)
     }
-  }, [adapter, config, profileName, enabled, toast])
+  }, [adapter, config, profileEmail, profileId, profileName, publicSubdomain, enabled, toast])
 
   const startGateway = useCallback(async () => {
     try {
@@ -188,6 +209,8 @@ export function ProfileProvider({ children }: Props) {
     setProfileName,
     profileEmail,
     setProfileEmail,
+    publicSubdomain,
+    setPublicSubdomain,
     enabled,
     setEnabled,
     logStreamUrl,

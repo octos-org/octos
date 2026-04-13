@@ -719,7 +719,10 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
      连接 Telegram，令牌是 123:ABC...
 
 机器人：[使用 manage_account 工具，action="create"]
+       使用 sub_account_id="coding-assistant"、
+       public_subdomain="coding-assistant" 创建子账户
        已创建子账户"编程助手"(dspfac--coding-assistant)。
+       公网地址：https://coding-assistant.crew.ominix.io
        Telegram 通道已配置。正在启动...
 ```
 
@@ -1271,6 +1274,8 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 用户：为我的工作团队创建一个子账户，配置 Telegram 机器人
 
 机器人：[使用 manage_account，action="create"，name="work team"，
+        sub_account_id="work-team"，
+        public_subdomain="work-team"，
         system_prompt="你是工程团队的工作助手。"，
         telegram_token="123:ABC..."，enable=true]
        已创建子账户"work team"(mybot--work-team)并启动。
