@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{eyre, Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
+
+use tracing::warn;
 
 use crate::workspace_policy::{
-    read_workspace_policy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceVersionControlProvider,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceVersionControlProvider,
+    read_workspace_policy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +52,14 @@ pub struct WorkspaceRepo {
 pub struct WorkspaceTurnSnapshotReport {
     pub committed: Vec<String>,
     pub enforced_failures: Vec<WorkspaceTurnSnapshotFailure>,
+    pub validation_failures: Vec<WorkspaceValidationFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceValidationFailure {
+    pub repo_label: String,
+    pub check: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +73,7 @@ enum WorkspaceTurnSnapshotPlan {
     PolicyGit {
         auto_init: bool,
         fail_on_error: bool,
+        turn_end_validators: Vec<String>,
     },
     Skip,
 }
@@ -218,10 +229,14 @@ pub fn snapshot_workspace_turn(
     let mut report = WorkspaceTurnSnapshotReport::default();
     let summary = normalize_turn_summary(summary);
 
-    for repo in repos {
+    // Collect (repo_root, validators) from the plan phase so we don't re-read
+    // the workspace policy during validation.
+    let mut pending_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+
+    for repo in &repos {
         let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
         let message = format!("Turn snapshot for {repo_label}: {summary}");
-        match snapshot_plan_for_repo(&repo) {
+        match snapshot_plan_for_repo(repo) {
             Ok(WorkspaceTurnSnapshotPlan::Skip) => {}
             Ok(WorkspaceTurnSnapshotPlan::LegacyGit) => {
                 if commit_all_if_dirty(&repo.root, &message)? {
@@ -231,18 +246,22 @@ pub fn snapshot_workspace_turn(
             Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
                 auto_init,
                 fail_on_error,
+                turn_end_validators,
             }) => {
                 match commit_all_if_dirty_with_options(&repo.root, repo.kind, &message, auto_init) {
-                    Ok(true) => report.committed.push(repo_label),
+                    Ok(true) => report.committed.push(repo_label.clone()),
                     Ok(false) => {}
                     Err(error) => {
                         if fail_on_error {
                             report.enforced_failures.push(WorkspaceTurnSnapshotFailure {
-                                repo_label,
+                                repo_label: repo_label.clone(),
                                 error: error.to_string(),
                             });
                         }
                     }
+                }
+                if !turn_end_validators.is_empty() {
+                    pending_validations.push((repo.root.clone(), repo_label, turn_end_validators));
                 }
             }
             Err(error) => {
@@ -254,7 +273,49 @@ pub fn snapshot_workspace_turn(
         }
     }
 
+    // Run turn-end validators using the already-parsed policy data.
+    run_turn_end_validators(&pending_validations, &mut report);
+
     Ok(report)
+}
+
+/// Run tier 1 turn-end validators using pre-parsed policy data.
+///
+/// Each entry is `(repo_root, repo_label, validator_specs)` collected during
+/// the snapshot plan phase, avoiding a second policy read from disk.
+fn run_turn_end_validators(
+    validations: &[(PathBuf, String, Vec<String>)],
+    report: &mut WorkspaceTurnSnapshotReport,
+) {
+    use crate::behaviour::{ActionResult, run_action};
+
+    for (repo_root, repo_label, specs) in validations {
+        for spec in specs {
+            match run_action(repo_root, spec) {
+                Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
+                Ok(ActionResult::Fail { reason }) => {
+                    report.validation_failures.push(WorkspaceValidationFailure {
+                        repo_label: repo_label.clone(),
+                        check: spec.clone(),
+                        reason,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        repo = %repo_label,
+                        check = %spec,
+                        error = %e,
+                        "turn-end validator failed to execute"
+                    );
+                    report.validation_failures.push(WorkspaceValidationFailure {
+                        repo_label: repo_label.clone(),
+                        check: spec.clone(),
+                        reason: format!("validator error: {e}"),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn commit_all_if_dirty_with_options(
@@ -314,6 +375,7 @@ fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotP
     Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
         auto_init: policy.version_control.auto_init,
         fail_on_error: policy.version_control.fail_on_error,
+        turn_end_validators: policy.validation.on_turn_end,
     })
 }
 
@@ -404,7 +466,7 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_policy::{write_workspace_policy, WorkspacePolicy};
+    use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
 
     #[test]
     fn detects_slides_repo_from_changed_path() {
@@ -502,8 +564,73 @@ mod tests {
         assert!(report.committed.is_empty());
         assert_eq!(report.enforced_failures.len(), 1);
         assert_eq!(report.enforced_failures[0].repo_label, "slides/deck-a");
-        assert!(report.enforced_failures[0]
-            .error
-            .contains("parse workspace policy failed"));
+        assert!(
+            report.enforced_failures[0]
+                .error
+                .contains("parse workspace policy failed")
+        );
+    }
+
+    #[test]
+    fn should_report_validation_failures_at_turn_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-a");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+
+        // Write policy with a turn-end validator that will fail
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_exists:output/*.pptx".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+
+        // Git snapshot should succeed
+        assert_eq!(report.committed, vec!["slides/deck-a"]);
+        // But validation should fail (no .pptx file)
+        assert_eq!(report.validation_failures.len(), 1);
+        assert_eq!(report.validation_failures[0].repo_label, "slides/deck-a");
+        assert_eq!(
+            report.validation_failures[0].check,
+            "file_exists:output/*.pptx"
+        );
+        assert!(
+            report.validation_failures[0]
+                .reason
+                .contains("no files match")
+        );
+    }
+
+    #[test]
+    fn should_pass_validation_when_artifact_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-b");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+
+        // Create the expected output
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_exists:output/*.pptx".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+
+        assert_eq!(report.committed, vec!["slides/deck-b"]);
+        assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn should_skip_validation_when_no_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-c");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+
+        // No policy file — no validation
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+        assert!(report.validation_failures.is_empty());
     }
 }

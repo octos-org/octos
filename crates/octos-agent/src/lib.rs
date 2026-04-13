@@ -8,6 +8,7 @@
 //! - Integration with codex sandboxing (when enabled)
 
 mod agent;
+pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
@@ -31,6 +32,7 @@ pub mod steering;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
+pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
 
@@ -63,14 +65,15 @@ pub use tools::{
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use workspace_git::{
-    WorkspaceProjectKind, commit_all_if_dirty, detect_workspace_repo, init_workspace_repo,
-    initialize_and_commit, list_workspace_repos, snapshot_workspace_change,
+    WorkspaceProjectKind, WorkspaceValidationFailure, commit_all_if_dirty, detect_workspace_repo,
+    init_workspace_repo, initialize_and_commit, list_workspace_repos, snapshot_workspace_change,
     snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    WORKSPACE_POLICY_FILE, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
-    read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    SpawnTaskPolicy, ValidationPolicy, WORKSPACE_POLICY_FILE, WorkspacePolicy, WorkspacePolicyKind,
+    WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+    WorkspaceVersionControlProvider, read_workspace_policy, workspace_policy_path,
+    write_workspace_policy,
 };
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use super::policy::{self, ToolPolicy};
 use super::{
     BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
     ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -82,6 +82,8 @@ pub struct ToolRegistry {
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
     /// Session key for tagging background tasks (set per-session).
     session_key: Option<String>,
+    /// Workspace root for contract enforcement on spawn_only tasks.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ToolRegistry {
@@ -107,7 +109,18 @@ impl ToolRegistry {
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_key: None,
+            workspace_root: None,
         }
+    }
+
+    /// Set the workspace root for contract enforcement.
+    pub fn set_workspace_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        self.workspace_root = Some(root.into());
+    }
+
+    /// Get the workspace root (if set).
+    pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.workspace_root.clone()
     }
 
     /// Mark a tool name as coming from a plugin binary.
@@ -353,6 +366,7 @@ impl ToolRegistry {
             supervisor: self.supervisor.clone(),
             spawn_only_invoked: self.spawn_only_invoked.clone(),
             session_key: self.session_key.clone(),
+            workspace_root: self.workspace_root.clone(),
         }
     }
 
@@ -617,6 +631,9 @@ impl ToolRegistry {
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -635,6 +652,9 @@ impl ToolRegistry {
         "glob",
         "grep",
         "list_dir",
+        "workspace_log",
+        "workspace_show",
+        "workspace_diff",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -657,6 +677,9 @@ impl ToolRegistry {
         registry.register(GlobTool::new(cwd));
         registry.register(GrepTool::new(cwd));
         registry.register(ListDirTool::new(cwd));
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]

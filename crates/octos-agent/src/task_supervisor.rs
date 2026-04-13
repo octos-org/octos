@@ -1,8 +1,12 @@
 //! Background task lifecycle management for spawn_only tools.
 //!
-//! The `TaskSupervisor` tracks background tasks from spawn to completion,
-//! replacing the bare `AtomicU32` counter with rich task state. This enables
-//! API endpoints to report per-task status, output files, and errors.
+//! The `TaskSupervisor` is a status store that tracks background tasks from
+//! spawn to completion. It does NOT enforce workspace contracts — that
+//! responsibility belongs to `workspace_contract::enforce()`, which runs
+//! inline in `execution.rs` BEFORE the supervisor status is updated.
+//!
+//! The supervisor only sees truth-checked states: `Completed` means the
+//! workspace contract was satisfied, `Failed` means it was not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -215,7 +219,6 @@ impl TaskSupervisor {
         tasks.values().filter(|t| t.status.is_active()).count()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

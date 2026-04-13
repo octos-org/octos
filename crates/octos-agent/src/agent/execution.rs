@@ -156,6 +156,41 @@ impl Agent {
                                         success = true,
                                         "spawn_only background tool completed"
                                     );
+
+                                    // Enforce workspace contract BEFORE marking completed.
+                                    // If a contract is defined for this tool and verification
+                                    // fails, mark_failed instead of mark_completed.
+                                    if let Some(workspace_root) = bg_tools.workspace_root() {
+                                        use crate::workspace_contract::{self, ContractVerdict};
+                                        match workspace_contract::enforce(&workspace_root, &bg_name) {
+                                            ContractVerdict::Satisfied { .. } => {
+                                                tracing::info!(
+                                                    tool = %bg_name,
+                                                    "workspace contract satisfied"
+                                                );
+                                            }
+                                            ContractVerdict::Failed { reasons, .. } => {
+                                                let err = format!(
+                                                    "workspace contract failed: {}",
+                                                    reasons.join("; ")
+                                                );
+                                                tracing::warn!(tool = %bg_name, error = %err);
+                                                bg_supervisor.mark_failed(&task_id, err.clone());
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!("✗ {} contract failed: {}", bg_name, err),
+                                                        kind: BackgroundResultKind::Notification,
+                                                    }).await;
+                                                }
+                                                return;
+                                            }
+                                            ContractVerdict::NoContract => {
+                                                // No contract — proceed with existing behaviour
+                                            }
+                                        }
+                                    }
+
                                     let mut sent_files = Vec::new();
                                     // Auto-send files from the background task (with retry)
                                     for file_path in &r.files_to_send {
