@@ -355,7 +355,14 @@ mod tests {
         );
         assert!(config.contains("serverAddr = \"163.192.33.32\""));
         assert!(config.contains("serverPort = 7000"));
-        assert!(config.contains("auth.token = \"shared-frps-token-123\""));
+        assert!(
+            config.contains("auth.token = \"\""),
+            "auth.token must be empty — plugin authenticates via metadatas.token"
+        );
+        assert!(
+            config.contains("token = \"shared-frps-token-123\""),
+            "per-tenant token must land in [metadatas] token, not auth.token"
+        );
         assert!(config.contains("\"alice.octos-cloud.org\""));
         assert!(config.contains("localPort = 8080"));
         assert!(config.contains("remotePort = 6001"));

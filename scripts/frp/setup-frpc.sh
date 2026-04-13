@@ -100,7 +100,8 @@ serverAddr = "${FRPS_SERVER}"
 serverPort = ${FRPS_PORT}
 
 auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
+auth.token = ""
+metadatas.token = "${FRPS_TOKEN}"
 
 log.to = "/var/log/frpc.log"
 log.level = "info"

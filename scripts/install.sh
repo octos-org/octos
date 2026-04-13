@@ -322,8 +322,13 @@ write_frpc_config() {
     cat > "$tmp" << EOF
 serverAddr = "${FRPS_SERVER}"
 serverPort = 7000
+
+# Both sides use empty auth.token so frps's built-in VerifyLogin passes;
+# the octos plugin authenticates the tenant via metadatas.token.
 auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
+auth.token = ""
+metadatas.token = "${FRPS_TOKEN}"
+
 log.to = "/var/log/frpc.log"
 log.level = "info"
 log.maxDays = 7

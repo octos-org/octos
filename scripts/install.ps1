@@ -217,7 +217,8 @@ function Write-FrpcConfig {
 serverAddr = "$FrpsServer"
 serverPort = 7000
 auth.method = "token"
-auth.token = "$FrpsToken"
+auth.token = ""
+metadatas.token = "$FrpsToken"
 log.to = "$($FrpcLog -replace '\\', '/')"
 log.level = "info"
 log.maxDays = 7
