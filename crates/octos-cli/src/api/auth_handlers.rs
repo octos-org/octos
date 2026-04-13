@@ -401,11 +401,14 @@ pub async fn send_code(
             }));
         }
     } else if root_login_target.is_none() {
-        tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
-        return Ok(Json(SendCodeResponse {
-            ok: false,
-            message: Some("This email is not registered for login".into()),
-        }));
+        if !auth_mgr.allow_self_registration {
+            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
+            return Ok(Json(SendCodeResponse {
+                ok: false,
+                message: Some("This email is not registered for login".into()),
+            }));
+        }
+        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
     }
 
     // Rate-limit OTP sends: max 3 per email per 5-minute window.
@@ -504,7 +507,11 @@ pub async fn auth_status(
         bootstrap_mode: is_bootstrap_mode(&state),
         email_login_enabled,
         admin_token_login_enabled: state.auth_token.is_some(),
-        allow_self_registration: false,
+        allow_self_registration: state
+            .auth_manager
+            .as_ref()
+            .map(|m| m.allow_self_registration)
+            .unwrap_or(false),
         scoped_profile,
     }))
 }
@@ -539,7 +546,7 @@ pub async fn verify(
                 message: Some("Invalid or expired code".into()),
             }));
         }
-    } else if root_login_target.is_none() {
+    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration {
         return Ok(Json(VerifyResponse {
             ok: false,
             token: None,
