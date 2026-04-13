@@ -45,8 +45,9 @@ fi
 #   1. project-local <cwd>/.octos/config.json
 #   2. <data-dir>/config.json
 CONFIG_FILE=""
-if [[ -f "$(pwd)/.octos/config.json" ]]; then
-  CONFIG_FILE="$(pwd)/.octos/config.json"
+CWD="$(pwd)"
+if [[ -f "$CWD/.octos/config.json" ]]; then
+  CONFIG_FILE="$CWD/.octos/config.json"
 elif [[ -f "$DATA_DIR/config.json" ]]; then
   CONFIG_FILE="$DATA_DIR/config.json"
 fi
