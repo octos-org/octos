@@ -34,8 +34,12 @@ if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
 fi
 API_BASE="http://${API_HOST}:${API_PORT}"
 
-# Auth token: env var, then config.json, then auth.json
-AUTH_TOKEN="${OCTOS_ADMIN_TOKEN:-}"
+# Auth token priority, matching `octos serve` itself (commands/serve.rs:109-114):
+#   1. $OCTOS_AUTH_TOKEN    — the server's own env var (CLI flag equivalent)
+#   2. $OCTOS_ADMIN_TOKEN   — injected into child gateway processes (fallback)
+#   3. config.json .auth_token
+#   4. ~/.octos/auth.json .admin_token
+AUTH_TOKEN="${OCTOS_AUTH_TOKEN:-${OCTOS_ADMIN_TOKEN:-}}"
 if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$CONFIG_FILE" ]]; then
   if command -v jq >/dev/null 2>&1; then
     AUTH_TOKEN=$(jq -r '.auth_token // empty' "$CONFIG_FILE" 2>/dev/null || true)
