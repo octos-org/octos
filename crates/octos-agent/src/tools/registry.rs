@@ -16,7 +16,7 @@ use super::policy::{self, ToolPolicy};
 use super::{
     BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
     ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -626,6 +626,9 @@ impl ToolRegistry {
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -644,6 +647,9 @@ impl ToolRegistry {
         "glob",
         "grep",
         "list_dir",
+        "workspace_log",
+        "workspace_show",
+        "workspace_diff",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -667,6 +673,9 @@ impl ToolRegistry {
         registry.register(GlobTool::new(cwd));
         registry.register(GrepTool::new(cwd));
         registry.register(ListDirTool::new(cwd));
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]

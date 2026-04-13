@@ -14,9 +14,25 @@ pub struct WorkspacePolicy {
     pub version_control: WorkspaceVersionControlPolicy,
     pub tracking: WorkspaceTrackingPolicy,
     #[serde(default)]
+    pub validation: ValidationPolicy,
+    #[serde(default)]
     pub artifacts: WorkspaceArtifactsPolicy,
     #[serde(default)]
     pub spawn_tasks: BTreeMap<String, WorkspaceSpawnTaskPolicy>,
+}
+
+/// Tiered validation checks run at different points in the turn lifecycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationPolicy {
+    /// Tier 1: cheap checks run every turn (< 100ms). e.g. file_exists, build exit code.
+    #[serde(default)]
+    pub on_turn_end: Vec<String>,
+    /// Tier 2: medium checks run when source files change (1-5s). e.g. preview render.
+    #[serde(default)]
+    pub on_source_change: Vec<String>,
+    /// Tier 3: expensive checks run on completion/publish only (10-30s). e.g. Playwright.
+    #[serde(default)]
+    pub on_completion: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +137,7 @@ impl WorkspacePolicy {
                         ".DS_Store".into(),
                     ],
                 },
+                validation: ValidationPolicy::default(),
                 artifacts: WorkspaceArtifactsPolicy::default(),
                 spawn_tasks: BTreeMap::new(),
             },
@@ -148,6 +165,7 @@ impl WorkspacePolicy {
                         ".DS_Store".into(),
                     ],
                 },
+                validation: ValidationPolicy::default(),
                 artifacts: WorkspaceArtifactsPolicy::default(),
                 spawn_tasks: BTreeMap::new(),
             },
@@ -185,6 +203,7 @@ impl WorkspacePolicy {
             tracking: WorkspaceTrackingPolicy {
                 ignore: vec!["tmp/**".into(), ".DS_Store".into()],
             },
+            validation: ValidationPolicy::default(),
             artifacts: WorkspaceArtifactsPolicy { entries: artifacts },
             spawn_tasks,
         }
