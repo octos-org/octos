@@ -1,7 +1,7 @@
 //! Tool registry: stores, filters, and executes registered tools.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -56,6 +56,7 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    workspace_root: Option<PathBuf>,
     /// Provider-specific policy that filters specs() output without removing tools.
     provider_policy: Option<ToolPolicy>,
     /// Context-based tag filter: only tools with matching tags appear in specs().
@@ -95,6 +96,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            workspace_root: None,
             provider_policy: None,
             context_filter: None,
             cached_specs: std::sync::Mutex::new(None),
@@ -169,6 +171,11 @@ impl ToolRegistry {
     /// Get a shared handle to the task supervisor.
     pub fn supervisor(&self) -> Arc<TaskSupervisor> {
         self.supervisor.clone()
+    }
+
+    /// Root workspace path associated with this registry, if any.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
     }
 
     /// Register a background task and return its ID.
@@ -341,6 +348,7 @@ impl ToolRegistry {
 
         Self {
             tools,
+            workspace_root: self.workspace_root.clone(),
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             cached_specs: std::sync::Mutex::new(None),
@@ -606,6 +614,7 @@ impl ToolRegistry {
     pub fn with_builtins_and_sandbox(cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
+        registry.workspace_root = Some(cwd.to_path_buf());
         registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
         registry.register(ReadFileTool::new(cwd));
         registry.register(DiffEditTool::new(cwd));
@@ -648,6 +657,7 @@ impl ToolRegistry {
         let cwd = cwd.as_ref();
         // Clone everything except cwd-bound tools
         let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        registry.workspace_root = Some(cwd.to_path_buf());
         // Re-register cwd-bound tools with the new workspace
         registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
         registry.register(ReadFileTool::new(cwd));
