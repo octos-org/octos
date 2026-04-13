@@ -76,7 +76,9 @@ fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Strin
     match v {
         serde_json::Value::String(s) => Ok(s),
         serde_json::Value::Number(n) => Ok(n.to_string()),
-        _ => Ok(String::new()),
+        _ => Err(<D::Error as serde::de::Error>::custom(
+            "timestamp must be a string or number",
+        )),
     }
 }
 
