@@ -197,7 +197,7 @@ export function ProfileProvider({ children }: Props) {
     try {
       const report = await api.purgeProfile(profileId)
       const mb = (report.bytes_freed / 1024 / 1024).toFixed(1)
-      toast(`Purged: freed ${mb} MB${report.port_released ? `, released port ${report.port_released}` : ''}`)
+      toast(`Purged: freed ${mb} MB${report.port_released != null ? `, released port ${report.port_released}` : ''}`)
       return report
     } catch (e: any) {
       toast(e.message, 'error')
