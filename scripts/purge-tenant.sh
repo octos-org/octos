@@ -2,17 +2,24 @@
 # purge-tenant.sh — full removal of a registered tenant (profile + user + node + data).
 #
 # Usage:
-#   purge-tenant.sh <node-name> [--force]
+#   purge-tenant.sh <node-name> [--force] [--data-dir <path>]
 #
 # Calls POST /api/admin/profiles/by-node/<node-name>/purge on the local octos serve.
 # By default prompts for type-to-confirm. Use --force to skip the prompt.
+#
+# Config resolution mirrors the CLI:
+#   1. <cwd>/.octos/config.json  (project-local)
+#   2. <--data-dir>/config.json  (explicit override)
+#   3. $OCTOS_HOME/config.json   (env var)
+#   4. ~/.octos/config.json      (default)
 set -euo pipefail
 
 NODE_NAME="${1:-}"
 FORCE=false
+DATA_DIR_OVERRIDE=""
 
 if [[ -z "$NODE_NAME" ]]; then
-  echo "Usage: $0 <node-name> [--force]" >&2
+  echo "Usage: $0 <node-name> [--force] [--data-dir <path>]" >&2
   exit 2
 fi
 
@@ -20,31 +27,44 @@ shift
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --force) FORCE=true; shift;;
+    --data-dir) DATA_DIR_OVERRIDE="$2"; shift 2;;
     *) echo "Unknown flag: $1" >&2; exit 2;;
   esac
 done
 
-# Resolve API base URL from config (fall back to default)
-CONFIG_FILE="${OCTOS_CONFIG:-$HOME/.octos/config.json}"
+# Resolve data directory: --data-dir flag > OCTOS_HOME env var > ~/.octos
+if [[ -n "$DATA_DIR_OVERRIDE" ]]; then
+  DATA_DIR="$DATA_DIR_OVERRIDE"
+elif [[ -n "${OCTOS_HOME:-}" ]]; then
+  DATA_DIR="$OCTOS_HOME"
+else
+  DATA_DIR="$HOME/.octos"
+fi
+
+# Resolve config file following the same priority as the CLI:
+#   1. project-local <cwd>/.octos/config.json
+#   2. <data-dir>/config.json
+CONFIG_FILE=""
+if [[ -f "$(pwd)/.octos/config.json" ]]; then
+  CONFIG_FILE="$(pwd)/.octos/config.json"
+elif [[ -f "$DATA_DIR/config.json" ]]; then
+  CONFIG_FILE="$DATA_DIR/config.json"
+fi
+
+# Resolve API base URL — default 127.0.0.1:8080 (serve host/port are CLI args, not in config)
 API_HOST="127.0.0.1"
 API_PORT="8080"
-if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
-  API_HOST=$(jq -r '.serve.host // "127.0.0.1"' "$CONFIG_FILE" 2>/dev/null || echo "127.0.0.1")
-  API_PORT=$(jq -r '.serve.port // 8080' "$CONFIG_FILE" 2>/dev/null || echo 8080)
-fi
 API_BASE="http://${API_HOST}:${API_PORT}"
 
-# Auth token: env var, then config.json, then auth.json
-AUTH_TOKEN="${OCTOS_ADMIN_TOKEN:-}"
-if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$CONFIG_FILE" ]]; then
+# Auth token: OCTOS_AUTH_TOKEN env var (matches octos serve --auth-token / OCTOS_AUTH_TOKEN),
+# then auth_token field from config.json
+AUTH_TOKEN="${OCTOS_AUTH_TOKEN:-}"
+if [[ -z "$AUTH_TOKEN" ]] && [[ -n "$CONFIG_FILE" ]]; then
   if command -v jq >/dev/null 2>&1; then
     AUTH_TOKEN=$(jq -r '.auth_token // empty' "$CONFIG_FILE" 2>/dev/null || true)
   elif command -v python3 >/dev/null 2>&1; then
     AUTH_TOKEN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('auth_token',''))" 2>/dev/null || true)
   fi
-fi
-if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$HOME/.octos/auth.json" ]] && command -v jq >/dev/null 2>&1; then
-  AUTH_TOKEN=$(jq -r '.admin_token // empty' "$HOME/.octos/auth.json" 2>/dev/null || true)
 fi
 
 AUTH_HEADER=()
