@@ -17,7 +17,7 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
-    TurnAttachmentContext,
+    TurnAttachmentContext, WorkspacePolicy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
@@ -160,6 +160,8 @@ fn sanitize_task_for_response(
         "started_at": task.started_at,
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
+        "runtime_state": task.runtime_state,
+        "runtime_detail": task.runtime_detail,
         "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
         "error": task.error,
         "session_key": task.session_key,
@@ -789,6 +791,18 @@ impl ActorFactory {
                 path = %user_workspace.display(),
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
+        }
+        let session_policy_path = workspace_policy_path(&user_workspace);
+        if !session_policy_path.exists() {
+            if let Err(error) =
+                write_workspace_policy(&user_workspace, &WorkspacePolicy::for_session())
+            {
+                warn!(
+                    session = %session_key,
+                    path = %session_policy_path.display(),
+                    "failed to write session workspace policy: {error}"
+                );
+            }
         }
 
         // send_file resolves relative paths against user_workspace (same as
@@ -3738,6 +3752,11 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new());
         let task_id = supervisor.register("fm_tts", "call-1", Some("api:session"));
         supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
         supervisor.mark_completed(&task_id, vec![output.to_string_lossy().to_string()]);
 
         let store = SessionTaskQueryStore::default();
@@ -3747,6 +3766,8 @@ mod tests {
         let payload = store.query_json(&session_key.to_string());
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["runtime_state"], "completed");
+        assert!(tasks[0]["runtime_detail"].is_null());
         let files = tasks[0]["output_files"].as_array().unwrap();
         assert_eq!(files.len(), 1);
         let handle = files[0].as_str().unwrap();

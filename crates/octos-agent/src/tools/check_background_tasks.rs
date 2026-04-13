@@ -112,6 +112,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["tool_name"], "fm_tts");
         assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["runtime_state"], "executing_tool");
     }
 
     #[tokio::test]
@@ -132,5 +133,6 @@ mod tests {
         let tasks = payload["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["status"], TaskStatus::Running.as_str());
+        assert_eq!(tasks[0]["runtime_state"], "executing_tool");
     }
 }

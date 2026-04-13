@@ -31,6 +31,7 @@ pub mod steering;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
+pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
 
@@ -51,7 +52,7 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
-pub use task_supervisor::{BackgroundTask, TaskStatus, TaskSupervisor};
+pub use task_supervisor::{BackgroundTask, TaskRuntimeState, TaskStatus, TaskSupervisor};
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, ConfigureToolTool, DeepSearchTool, DiffEditTool, EditFileTool,
@@ -68,9 +69,10 @@ pub use workspace_git::{
     snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    WORKSPACE_POLICY_FILE, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
-    read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
+    WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy,
+    WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider, read_workspace_policy,
+    workspace_policy_path, write_workspace_policy,
 };
 
 #[cfg(test)]
