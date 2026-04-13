@@ -34,21 +34,17 @@ if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
 fi
 API_BASE="http://${API_HOST}:${API_PORT}"
 
-# Auth token priority, matching `octos serve` itself (commands/serve.rs:109-114):
-#   1. $OCTOS_AUTH_TOKEN    — the server's own env var (CLI flag equivalent)
-#   2. $OCTOS_ADMIN_TOKEN   — injected into child gateway processes (fallback)
-#   3. config.json .auth_token
-#   4. ~/.octos/auth.json .admin_token
-AUTH_TOKEN="${OCTOS_AUTH_TOKEN:-${OCTOS_ADMIN_TOKEN:-}}"
+# Auth token — mirrors `octos serve`'s own resolution (commands/serve.rs:109-114):
+#   1. $OCTOS_AUTH_TOKEN         — the env var the server itself reads
+#   2. config.json .auth_token   — the persisted fallback the server uses
+# (Not auth.json — that's a provider OAuth credential store, not an admin token.)
+AUTH_TOKEN="${OCTOS_AUTH_TOKEN:-}"
 if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$CONFIG_FILE" ]]; then
   if command -v jq >/dev/null 2>&1; then
     AUTH_TOKEN=$(jq -r '.auth_token // empty' "$CONFIG_FILE" 2>/dev/null || true)
   elif command -v python3 >/dev/null 2>&1; then
     AUTH_TOKEN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('auth_token',''))" 2>/dev/null || true)
   fi
-fi
-if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$HOME/.octos/auth.json" ]] && command -v jq >/dev/null 2>&1; then
-  AUTH_TOKEN=$(jq -r '.admin_token // empty' "$HOME/.octos/auth.json" 2>/dev/null || true)
 fi
 
 AUTH_HEADER=()
