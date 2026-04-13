@@ -46,6 +46,11 @@ pub struct DashboardAuthConfig {
     /// Whether to allow self-registration (unknown emails auto-create users).
     #[serde(default)]
     pub allow_self_registration: bool,
+    /// Static tokens that bypass OTP verification (for E2E testing).
+    /// When a verify request's code matches a static token, authentication
+    /// succeeds immediately without sending or checking an OTP.
+    #[serde(default)]
+    pub static_tokens: Vec<String>,
 }
 
 fn default_session_hours() -> u64 {
@@ -84,6 +89,8 @@ pub struct AuthManager {
     smtp_password: Option<String>,
     session_expiry_hours: u64,
     pub allow_self_registration: bool,
+    /// Static tokens that bypass OTP (for E2E testing).
+    pub static_tokens: Vec<String>,
     user_store: Arc<UserStore>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
@@ -93,14 +100,16 @@ pub struct AuthManager {
 
 impl AuthManager {
     pub fn new(config: Option<DashboardAuthConfig>, user_store: Arc<UserStore>) -> Self {
-        let (smtp_config, session_expiry_hours, allow_self_registration) = match config {
-            Some(c) => (
-                Some(c.smtp),
-                c.session_expiry_hours,
-                c.allow_self_registration,
-            ),
-            None => (None, 24, false), // default to known-account login only
-        };
+        let (smtp_config, session_expiry_hours, allow_self_registration, static_tokens) =
+            match config {
+                Some(c) => (
+                    Some(c.smtp),
+                    c.session_expiry_hours,
+                    c.allow_self_registration,
+                    c.static_tokens,
+                ),
+                None => (None, 24, false, Vec::new()),
+            };
         Self {
             pending_otps: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
@@ -108,6 +117,7 @@ impl AuthManager {
             smtp_password: None,
             session_expiry_hours,
             allow_self_registration,
+            static_tokens,
             user_store,
             sessions_path: None,
             #[cfg(test)]
@@ -338,6 +348,13 @@ impl AuthManager {
     }
 
     /// Verify OTP code. Returns session token on success.
+    /// Check if a code is a static token (bypasses OTP for E2E testing).
+    pub fn is_static_token(&self, code: &str) -> bool {
+        self.static_tokens
+            .iter()
+            .any(|t| !t.is_empty() && t == code)
+    }
+
     pub async fn verify_otp(&self, email: &str, code: &str) -> Result<Option<String>> {
         self.verify_otp_with_registration(email, code, self.allow_self_registration)
             .await
@@ -352,9 +369,13 @@ impl AuthManager {
         let email_lower = email.to_lowercase();
         let now = Utc::now();
 
-        if !self
-            .verify_pending_otp(&Self::otp_key(&email_lower, None), code)
-            .await?
+        // Static tokens bypass OTP verification entirely (E2E testing).
+        let is_static = self.is_static_token(code);
+
+        if !is_static
+            && !self
+                .verify_pending_otp(&Self::otp_key(&email_lower, None), code)
+                .await?
         {
             return Ok(None);
         }
@@ -416,8 +437,9 @@ impl AuthManager {
         user_id: &str,
     ) -> Result<Option<String>> {
         let email_lower = email.to_lowercase();
+        let is_static = self.is_static_token(code);
         let otp_key = Self::otp_key(&email_lower, Some(user_id));
-        if !self.verify_pending_otp(&otp_key, code).await? {
+        if !is_static && !self.verify_pending_otp(&otp_key, code).await? {
             return Ok(None);
         }
 
