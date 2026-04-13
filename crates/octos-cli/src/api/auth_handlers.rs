@@ -575,6 +575,11 @@ pub async fn verify(
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
             }
+            None if auth_mgr.allow_self_registration => {
+                auth_mgr
+                    .verify_otp_with_registration(&requested_email, &req.code, true)
+                    .await
+            }
             None => Ok(None),
         }
     };
