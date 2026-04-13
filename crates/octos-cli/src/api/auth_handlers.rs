@@ -383,7 +383,11 @@ pub async fn send_code(
         .as_deref()
         .and_then(|profile_id| resolve_scoped_login_user(&state, profile_id, &requested_email));
     let root_login_target = if scoped_profile_id.is_none() {
-        resolve_root_login_target(&state, &requested_email)
+        match resolve_root_login_target(&state, &requested_email) {
+            Some(target) => Some(target),
+            None if auth_mgr.allow_self_registration => Some(RootLoginTarget::Allowlisted),
+            None => None,
+        }
     } else {
         None
     };
