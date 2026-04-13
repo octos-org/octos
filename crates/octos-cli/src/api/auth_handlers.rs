@@ -312,11 +312,14 @@ pub async fn send_code(
             }));
         }
     } else if login_target.is_none() {
-        tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a root profile");
-        return Ok(Json(SendCodeResponse {
-            ok: false,
-            message: Some("This email is not registered for this account".into()),
-        }));
+        if !auth_mgr.allow_self_registration {
+            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a root profile");
+            return Ok(Json(SendCodeResponse {
+                ok: false,
+                message: Some("This email is not registered for this account".into()),
+            }));
+        }
+        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
     }
 
     // Rate-limit OTP sends: max 3 per email per 5-minute window.
@@ -409,7 +412,7 @@ pub async fn verify(
         resolve_root_login_user(&state, &requested_email)
     };
 
-    if login_target.is_none() {
+    if login_target.is_none() && !auth_mgr.allow_self_registration {
         return Ok(Json(VerifyResponse {
             ok: false,
             token: None,

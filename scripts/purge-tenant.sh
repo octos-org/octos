@@ -34,8 +34,15 @@ if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
 fi
 API_BASE="http://${API_HOST}:${API_PORT}"
 
-# Auth token: env var or auth.json
+# Auth token: env var, then config.json, then auth.json
 AUTH_TOKEN="${OCTOS_ADMIN_TOKEN:-}"
+if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$CONFIG_FILE" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    AUTH_TOKEN=$(jq -r '.auth_token // empty' "$CONFIG_FILE" 2>/dev/null || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    AUTH_TOKEN=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('auth_token',''))" 2>/dev/null || true)
+  fi
+fi
 if [[ -z "$AUTH_TOKEN" ]] && [[ -f "$HOME/.octos/auth.json" ]] && command -v jq >/dev/null 2>&1; then
   AUTH_TOKEN=$(jq -r '.admin_token // empty' "$HOME/.octos/auth.json" 2>/dev/null || true)
 fi
