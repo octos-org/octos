@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Serialize;
 
 use crate::api::AppState;
@@ -88,11 +88,15 @@ pub async fn purge_by_profile_id(
                     );
                 } else {
                     report.bytes_freed += bytes;
-                    report.files_removed.push(sub_data_dir.display().to_string());
+                    report
+                        .files_removed
+                        .push(sub_data_dir.display().to_string());
                 }
             }
             let _ = profile_store.delete(&sub.id);
-            report.files_removed.push(format!("profiles/{}.json", sub.id));
+            report
+                .files_removed
+                .push(format!("profiles/{}.json", sub.id));
         }
     }
 
@@ -108,7 +112,9 @@ pub async fn purge_by_profile_id(
         }
     }
     let _ = profile_store.delete(profile_id);
-    report.files_removed.push(format!("profiles/{profile_id}.json"));
+    report
+        .files_removed
+        .push(format!("profiles/{profile_id}.json"));
 
     // 4. Delete user record (capture email first for the report)
     if let Some(us) = state.user_store.as_ref() {
@@ -116,7 +122,9 @@ pub async fn purge_by_profile_id(
             report.user_email = Some(user.email);
         }
         if let Ok(true) = us.delete(profile_id) {
-            report.files_removed.push(format!("users/{profile_id}.json"));
+            report
+                .files_removed
+                .push(format!("users/{profile_id}.json"));
         }
     }
 
@@ -129,7 +137,9 @@ pub async fn purge_by_profile_id(
                 report.node_name = Some(tenant.subdomain.clone());
                 report.port_released = Some(tenant.ssh_port);
                 if let Ok(true) = ts.delete(&tenant.id) {
-                    report.files_removed.push(format!("tenants/{}.json", tenant.id));
+                    report
+                        .files_removed
+                        .push(format!("tenants/{}.json", tenant.id));
                 }
             }
         }
@@ -156,7 +166,10 @@ pub async fn purge_profile_handler(
     Path(id): Path<String>,
 ) -> Result<Json<PurgeReport>, (StatusCode, String)> {
     if state.profile_store.is_none() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin not configured".into(),
+        ));
     }
 
     match purge_by_profile_id(&state, &id).await {
@@ -241,6 +254,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -254,6 +268,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: Some(parent_id.to_string()),
+            public_subdomain: None,
             config: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -352,7 +367,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(state.user_store.as_ref().unwrap().get(pid).unwrap().is_none());
+        assert!(
+            state
+                .user_store
+                .as_ref()
+                .unwrap()
+                .get(pid)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             state
                 .tenant_store
@@ -370,7 +393,9 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_profile_does_not_exist() {
         let (_temp, state) = build_test_state();
-        let result = purge_by_profile_id(&state, "ghost").await.expect("no error");
+        let result = purge_by_profile_id(&state, "ghost")
+            .await
+            .expect("no error");
         assert!(result.is_none());
     }
 
@@ -380,7 +405,12 @@ mod tests {
         let pid = "orphan";
 
         // Only the profile exists — no user, no tenant
-        state.profile_store.as_ref().unwrap().save(&make_profile(pid)).unwrap();
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&make_profile(pid))
+            .unwrap();
 
         let report = purge_by_profile_id(&state, pid)
             .await
@@ -391,7 +421,15 @@ mod tests {
         assert!(report.user_email.is_none());
         assert!(report.tenant_id.is_none());
         assert!(report.port_released.is_none());
-        assert!(state.profile_store.as_ref().unwrap().get(pid).unwrap().is_none());
+        assert!(
+            state
+                .profile_store
+                .as_ref()
+                .unwrap()
+                .get(pid)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -399,16 +437,33 @@ mod tests {
         let (_temp, state) = build_test_state();
         let pid = "double";
 
-        state.profile_store.as_ref().unwrap().save(&make_profile(pid)).unwrap();
-        state.user_store.as_ref().unwrap().save(&make_user(pid, "double@example.com")).unwrap();
-        state.tenant_store.as_ref().unwrap().save(&make_tenant("t-2", pid, "double-mac", 6043)).unwrap();
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .save(&make_profile(pid))
+            .unwrap();
+        state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .save(&make_user(pid, "double@example.com"))
+            .unwrap();
+        state
+            .tenant_store
+            .as_ref()
+            .unwrap()
+            .save(&make_tenant("t-2", pid, "double-mac", 6043))
+            .unwrap();
 
         // First run: succeeds and returns Some(report)
         let first = purge_by_profile_id(&state, pid).await.expect("first purge");
         assert!(first.is_some());
 
         // Second run: returns Ok(None) because the profile is gone
-        let second = purge_by_profile_id(&state, pid).await.expect("second purge");
+        let second = purge_by_profile_id(&state, pid)
+            .await
+            .expect("second purge");
         assert!(second.is_none());
     }
 

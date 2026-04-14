@@ -73,13 +73,11 @@ fn is_local_request_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let host = request_host(headers)?;
-    if is_local_request_host(&host) {
-        return None;
-    }
-
-    let candidate = host.split('.').next()?.trim();
+fn resolve_routed_profile_id_candidate(
+    state: &AppState,
+    candidate: &str,
+) -> Option<String> {
+    let candidate = candidate.trim();
     if candidate.is_empty()
         || matches!(
             candidate,
@@ -92,8 +90,17 @@ fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<Strin
     state
         .profile_store
         .as_ref()
-        .and_then(|store| store.get(candidate).ok().flatten())
-        .map(|_| candidate.to_string())
+        .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
+}
+
+fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let host = request_host(headers)?;
+    if is_local_request_host(&host) {
+        return None;
+    }
+
+    let candidate = host.split('.').next()?;
+    resolve_routed_profile_id_candidate(state, candidate)
 }
 
 fn trusted_auth_scope_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
@@ -111,7 +118,7 @@ fn trusted_auth_scope_profile_id(state: &AppState, headers: &HeaderMap) -> Optio
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(|candidate| resolve_routed_profile_id_candidate(state, candidate))
 }
 
 fn resolve_scoped_login_user(
@@ -617,6 +624,7 @@ pub async fn verify(
                         let profile = crate::profiles::UserProfile {
                             id: user.id.clone(),
                             name: user.name.clone(),
+                            public_subdomain: None,
                             enabled: false,
                             data_dir: None,
                             parent_id: None,
@@ -864,6 +872,19 @@ pub async fn update_my_profile(
     // Apply updates (same logic as admin::update_profile but scoped)
     if let Some(name) = req.name {
         profile.name = name;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        if profile.parent_id.is_some() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "sub-accounts cannot change their own public subdomain".into(),
+            ));
+        }
+        profile.public_subdomain = public_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
     }
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
@@ -1432,6 +1453,221 @@ pub async fn my_sub_accounts(
     Ok(Json(items))
 }
 
+fn resolve_my_managed_parent_profile(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+) -> Result<crate::profiles::UserProfile, StatusCode> {
+    let profile = resolve_my_profile(identity, ps)?;
+    if profile.parent_id.is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(profile)
+}
+
+/// GET /api/my/profile/accounts/:id — Return a sub-account managed by the current user.
+pub async fn my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+) -> Result<Json<crate::api::admin::ProfileResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
+    let status = pm.status(&sub.id).await;
+    Ok(Json(crate::api::admin::ProfileResponse {
+        email: None,
+        profile: crate::profiles::mask_secrets(&sub),
+        status,
+    }))
+}
+
+/// POST /api/my/profile/accounts — Create a sub-account owned by the current user.
+pub async fn create_my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<crate::api::admin::CreateSubAccountRequest>,
+) -> Result<(StatusCode, Json<crate::api::admin::ProfileResponse>), (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let parent = resolve_my_managed_parent_profile(&identity, ps)
+        .map_err(|status| (status, "sub-accounts cannot create sub-accounts".into()))?;
+
+    if !req.channels.is_empty() {
+        super::admin::validate_channel_credentials(&req.channels)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+
+    let mut sub = ps
+        .create_sub_account(
+            &parent.id,
+            &req.sub_account_id,
+            &req.public_subdomain,
+            &req.name,
+            req.channels,
+            req.gateway.unwrap_or_default(),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if !req.env_vars.is_empty() {
+        sub.config.env_vars = req.env_vars;
+        sub.updated_at = chrono::Utc::now();
+        ps.save(&sub)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            super::admin::validate_email(&email)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("Email '{email}' is already registered to another account"),
+                    ));
+                }
+                let user = crate::user_store::User {
+                    id: sub.id.clone(),
+                    email,
+                    name: sub.name.clone(),
+                    role: crate::user_store::UserRole::User,
+                    created_at: chrono::Utc::now(),
+                    last_login_at: None,
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
+    }
+
+    let status = pm.status(&sub.id).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::api::admin::ProfileResponse {
+            email: None,
+            profile: crate::profiles::mask_secrets(&sub),
+            status,
+        }),
+    ))
+}
+
+/// PUT /api/my/profile/accounts/:id — Update a managed sub-account.
+pub async fn update_my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+    body: String,
+) -> Result<Json<crate::api::admin::ProfileResponse>, (StatusCode, String)> {
+    let req: crate::api::admin::UpdateProfileRequest =
+        serde_json::from_str(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {e}"),
+            )
+        })?;
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let _parent = resolve_my_managed_parent_profile(&identity, ps)
+        .map_err(|status| (status, "sub-accounts cannot manage sub-accounts".into()))?;
+    let mut sub = resolve_my_sub_account(&identity, ps, &sub_id)
+        .map_err(|status| (status, "sub-account not found".into()))?;
+
+    if let Some(name) = req.name {
+        sub.name = name;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        match public_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(slug) => sub.public_subdomain = Some(slug.to_string()),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "sub-accounts must keep a public subdomain".into(),
+                ));
+            }
+        }
+    }
+    if let Some(enabled) = req.enabled {
+        sub.enabled = enabled;
+    }
+    if let Some(config) = req.config {
+        sub.config = config;
+    }
+    sub.updated_at = chrono::Utc::now();
+
+    ps.save_with_merge(&mut sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            super::admin::validate_email(&email)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                if let Ok(Some(existing)) = user_store.get_by_email(&email) {
+                    if existing.id != sub_id {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!("Email '{email}' is already registered to another account"),
+                        ));
+                    }
+                }
+                let user = match user_store.get(&sub_id) {
+                    Ok(Some(mut u)) => {
+                        u.email = email;
+                        u.name = sub.name.clone();
+                        u
+                    }
+                    _ => crate::user_store::User {
+                        id: sub.id.clone(),
+                        email,
+                        name: sub.name.clone(),
+                        role: crate::user_store::UserRole::User,
+                        created_at: chrono::Utc::now(),
+                        last_login_at: None,
+                    },
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
+    }
+
+    let status = pm.status(&sub.id).await;
+    Ok(Json(crate::api::admin::ProfileResponse {
+        email: None,
+        profile: crate::profiles::mask_secrets(&sub),
+        status,
+    }))
+}
+
 /// Helper: resolve a sub-account owned by the current user.
 fn resolve_my_sub_account(
     identity: &AuthIdentity,
@@ -1558,6 +1794,7 @@ fn ensure_admin_profile(ps: &crate::profiles::ProfileStore) -> Result<(), Status
     let profile = crate::profiles::UserProfile {
         id: ADMIN_PROFILE_ID.into(),
         name: "Admin".into(),
+        public_subdomain: None,
         enabled: false,
         data_dir: None,
         parent_id: None,
@@ -1804,6 +2041,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: crate::profiles::ProfileConfig::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1962,6 +2200,81 @@ mod tests {
         let scoped =
             trusted_auth_scope_profile_id(&state, &localhost_scoped_headers("tenant--assistant"));
         assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
+    }
+
+    #[test]
+    fn trusted_auth_scope_resolves_child_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        profile_store.save(&child).unwrap();
+
+        let scoped = trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
+        assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
+    }
+
+    #[tokio::test]
+    async fn top_level_user_can_change_own_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "public_subdomain": "tenant-host"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resp.profile.public_subdomain.as_deref(),
+            Some("tenant-host")
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_account_cannot_change_own_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        profile_store.save(&child).unwrap();
+
+        let err = update_my_profile(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant--assistant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "public_subdomain": "new-assistant"
+            })
+            .to_string(),
+        )
+        .await;
+
+        let err = match err {
+            Ok(_) => panic!("sub-account self-update unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "sub-accounts cannot change their own public subdomain");
     }
 
     #[tokio::test]

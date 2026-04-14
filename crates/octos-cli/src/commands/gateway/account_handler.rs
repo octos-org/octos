@@ -38,7 +38,7 @@ pub async fn handle_account_command(
     match parts.first().copied().unwrap_or("list") {
         "" | "list" => match store.list_sub_accounts(parent_id) {
             Ok(subs) if subs.is_empty() => {
-                "No sub-accounts.\nCreate one with: /account create <name>".to_string()
+                "No sub-accounts.\nCreate one with: /account create <sub-account-id> <public-subdomain> <display name>".to_string()
             }
             Ok(subs) => {
                 let mut lines = vec!["Sub-accounts:".to_string()];
@@ -82,19 +82,25 @@ pub async fn handle_account_command(
         },
 
         "create" => {
-            let name = parts.get(1).copied().unwrap_or("").trim();
-            if name.is_empty() {
-                return "Usage: /account create <name>".to_string();
+            let raw = parts.get(1).copied().unwrap_or("").trim();
+            let mut fields = raw.splitn(3, ' ');
+            let sub_account_id = fields.next().unwrap_or("").trim();
+            let public_subdomain = fields.next().unwrap_or("").trim();
+            let name = fields.next().unwrap_or("").trim();
+            if sub_account_id.is_empty() || public_subdomain.is_empty() || name.is_empty() {
+                return "Usage: /account create <sub-account-id> <public-subdomain> <display name>".to_string();
             }
             match store.create_sub_account(
                 parent_id,
+                sub_account_id,
+                public_subdomain,
                 name,
                 vec![],
                 crate::profiles::GatewaySettings::default(),
             ) {
                 Ok(sub) => format!(
-                    "Created sub-account: {}\nAdd channels via dashboard or CLI:\n  octos account create --profile {} {} --telegram-token <token>",
-                    sub.id, parent_id, name
+                    "Created sub-account: {}\nAdd channels via dashboard or CLI:\n  octos account create --profile {} --sub-account-id {} --public-subdomain {} {} --telegram-token <token>",
+                    sub.id, parent_id, sub_account_id, public_subdomain, name
                 ),
                 Err(e) => format!("Error: {e}"),
             }

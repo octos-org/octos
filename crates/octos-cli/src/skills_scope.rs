@@ -50,6 +50,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 gateway: GatewaySettings::default(),
                 ..Default::default()
@@ -63,6 +64,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: Some("dspfac".into()),
+            public_subdomain: Some("newsbot".into()),
             config: ProfileConfig {
                 gateway: GatewaySettings::default(),
                 ..Default::default()

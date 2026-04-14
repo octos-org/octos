@@ -22,6 +22,14 @@ pub struct UserProfile {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// Public host slug used for inbound routing.
+    ///
+    /// When present, external host routing resolves this slug to the internal
+    /// immutable profile ID. Top-level profiles may leave it unset to fall back
+    /// to their internal ID. Sub-accounts are expected to set it explicitly at
+    /// creation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_subdomain: Option<String>,
     /// Whether this profile's gateway should auto-start with the server.
     #[serde(default)]
     pub enabled: bool,
@@ -452,6 +460,10 @@ impl ProfileStore {
     /// Save a profile (create or update). Also initializes the data directory.
     pub fn save(&self, profile: &UserProfile) -> Result<()> {
         validate_profile_id(&profile.id)?;
+        if let Some(slug) = profile.public_subdomain.as_deref() {
+            validate_public_subdomain(slug)?;
+            self.ensure_public_subdomain_available(slug, Some(&profile.id))?;
+        }
 
         // Initialize data directory structure
         let data_dir = self.resolve_data_dir(profile);
@@ -554,6 +566,60 @@ impl ProfileStore {
             .collect())
     }
 
+    /// Resolve a public host slug to an internal profile ID.
+    ///
+    /// Host routing is authoritative on `public_subdomain`. For top-level
+    /// profiles only, we allow falling back to the immutable internal ID when
+    /// no explicit public slug has been configured.
+    pub fn resolve_routable_profile_id(&self, candidate: &str) -> Result<Option<String>> {
+        if let Some(profile) = self.get_by_public_subdomain(candidate)? {
+            return Ok(Some(profile.id));
+        }
+
+        let Some(profile) = self.get(candidate)? else {
+            return Ok(None);
+        };
+
+        if profile.parent_id.is_none() && profile.public_subdomain.is_none() {
+            return Ok(Some(profile.id));
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_by_public_subdomain(&self, slug: &str) -> Result<Option<UserProfile>> {
+        let normalized = slug.trim();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|profile| profile.public_subdomain.as_deref() == Some(normalized)))
+    }
+
+    pub fn ensure_public_subdomain_available(
+        &self,
+        slug: &str,
+        except_profile_id: Option<&str>,
+    ) -> Result<()> {
+        let normalized = slug.trim();
+        validate_public_subdomain(normalized)?;
+
+        for profile in self.list()? {
+            if except_profile_id == Some(profile.id.as_str()) {
+                continue;
+            }
+            if profile.id == normalized
+                || profile.public_subdomain.as_deref() == Some(normalized)
+            {
+                bail!("public subdomain '{normalized}' is already in use");
+            }
+        }
+        Ok(())
+    }
+
     /// Create a sub-account under a parent profile.
     ///
     /// The sub-account inherits LLM provider config from the parent at runtime.
@@ -561,14 +627,19 @@ impl ProfileStore {
     pub fn create_sub_account(
         &self,
         parent_id: &str,
+        sub_account_id: &str,
+        public_subdomain: &str,
         sub_name: &str,
         channels: Vec<ChannelCredentials>,
         gateway: GatewaySettings,
     ) -> Result<UserProfile> {
         // Verify parent exists
-        let _parent = self
+        let parent = self
             .get(parent_id)?
             .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?;
+        if parent.parent_id.is_some() {
+            bail!("sub-account '{parent_id}' cannot own sub-accounts");
+        }
 
         let existing_subs = self.list_sub_accounts(parent_id)?;
         if existing_subs.len() >= MAX_SUB_ACCOUNTS_PER_PARENT {
@@ -577,8 +648,9 @@ impl ProfileStore {
             );
         }
 
-        let sub_id = format!("{parent_id}--{}", slugify(sub_name));
+        let sub_id = format!("{parent_id}--{}", sub_account_id.trim());
         validate_profile_id(&sub_id)?;
+        self.ensure_public_subdomain_available(public_subdomain, None)?;
 
         if self.get(&sub_id)?.is_some() {
             bail!("sub-account '{sub_id}' already exists");
@@ -588,6 +660,7 @@ impl ProfileStore {
         let profile = UserProfile {
             id: sub_id,
             name: sub_name.to_string(),
+            public_subdomain: Some(public_subdomain.trim().to_string()),
             enabled: false,
             data_dir: None,
             parent_id: Some(parent_id.to_string()),
@@ -652,14 +725,12 @@ pub fn resolve_effective_profile(
     Ok(effective)
 }
 
-/// Convert a name to a slug (lowercase, non-alphanumeric chars replaced with hyphens).
-fn slugify(s: &str) -> String {
-    let slug: String = s
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    slug.trim_matches('-').to_string()
+fn validate_public_subdomain(slug: &str) -> Result<()> {
+    validate_profile_id(slug)?;
+    if matches!(slug, "www" | "app" | "admin" | "api" | "crew" | "octos") {
+        bail!("public subdomain '{slug}' is reserved");
+    }
+    Ok(())
 }
 
 /// Return a copy of the profile with secret values in `env_vars` masked.
@@ -1112,6 +1183,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
@@ -1151,6 +1223,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -1192,6 +1265,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("moonshot".into()),
                 model: Some("kimi-k2.5".into()),
@@ -1216,6 +1290,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
@@ -1250,6 +1325,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1278,6 +1354,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-1234567890abcdef".into()),
@@ -1305,6 +1382,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1331,6 +1409,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-real-secret-key".into()),
@@ -1351,6 +1430,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "sk-r***key".into()), // masked — should keep original
@@ -1379,6 +1459,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -1406,6 +1487,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 gateway: GatewaySettings {
@@ -1435,6 +1517,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1462,6 +1545,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -1478,6 +1562,8 @@ mod tests {
         let sub = store
             .create_sub_account(
                 "parent",
+                "work-bot",
+                "work-bot",
                 "work bot",
                 vec![ChannelCredentials::Telegram {
                     token_env: "WORK_TG_TOKEN".into(),
@@ -1504,8 +1590,95 @@ mod tests {
         // Duplicate should fail
         assert!(
             store
-                .create_sub_account("parent", "work bot", vec![], GatewaySettings::default())
+                .create_sub_account(
+                    "parent",
+                    "work-bot",
+                    "work-bot",
+                    "work bot",
+                    vec![],
+                    GatewaySettings::default(),
+                )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_public_subdomain_must_be_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let first = UserProfile {
+            id: "top-level".into(),
+            name: "Top".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: Some("shared-host".into()),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let second = UserProfile {
+            id: "top-level-2".into(),
+            name: "Top 2".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: Some("shared-host".into()),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&first).unwrap();
+        assert!(store.save(&second).is_err());
+    }
+
+    #[test]
+    fn test_resolve_routable_profile_id_prefers_public_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let parent = UserProfile {
+            id: "tenant".into(),
+            name: "Tenant".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let child = UserProfile {
+            id: "tenant--newsbot".into(),
+            name: "Newsbot".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: Some("tenant".into()),
+            public_subdomain: Some("newsbot".into()),
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&parent).unwrap();
+        store.save(&child).unwrap();
+
+        assert_eq!(
+            store.resolve_routable_profile_id("newsbot").unwrap().as_deref(),
+            Some("tenant--newsbot")
+        );
+        assert_eq!(
+            store.resolve_routable_profile_id("tenant").unwrap().as_deref(),
+            Some("tenant")
+        );
+        assert!(
+            store
+                .resolve_routable_profile_id("tenant--newsbot")
+                .unwrap()
+                .is_none(),
+            "child internal IDs must not be routable once public_subdomain is authoritative"
         );
     }
 
@@ -1521,6 +1694,7 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
@@ -1550,6 +1724,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: Some("parent".into()),
+            public_subdomain: Some("work".into()),
             config: ProfileConfig {
                 channels: vec![ChannelCredentials::Telegram {
                     token_env: "WORK_TG".into(),
@@ -1608,6 +1783,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: Some("parent-a".into()),
+            public_subdomain: Some("sub".into()),
             config: ProfileConfig::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1675,6 +1851,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [
                     ("KC_KEY".into(), "keychain:".into()),
@@ -1711,6 +1888,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [
                     ("API_KEY".into(), "keychain:".into()),
@@ -1759,6 +1937,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [("API_KEY".into(), "sk-real-secret".into())].into(),
                 ..Default::default()
@@ -1794,6 +1973,7 @@ mod tests {
             enabled: false,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: ProfileConfig {
                 env_vars: [("API_KEY".into(), "keychain:".into())].into(),
                 ..Default::default()

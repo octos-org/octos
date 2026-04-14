@@ -164,6 +164,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_sub_accounts),
         )
         .route(
+            "/api/my/profile/accounts",
+            post(auth_handlers::create_my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            get(auth_handlers::my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            put(auth_handlers::update_my_sub_account),
+        )
+        .route(
             "/api/my/profile/accounts/{id}/start",
             post(auth_handlers::start_my_sub_gateway),
         )

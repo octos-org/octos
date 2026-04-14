@@ -80,19 +80,72 @@ fn resolve_scoped_download_path(
 /// Maximum message length (1MB).
 const MAX_MESSAGE_LEN: usize = 1_048_576;
 
+fn request_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(strip_port_from_host(&raw).to_string())
+}
+
+fn strip_port_from_host(host: &str) -> &str {
+    if let Some(stripped) = host.strip_prefix('[') {
+        return stripped.split(']').next().unwrap_or(host);
+    }
+
+    if host.matches(':').count() == 1 {
+        return host.split(':').next().unwrap_or(host);
+    }
+
+    host
+}
+
+fn is_local_request_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn resolve_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
+    state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
+}
+
+fn routed_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if let Some(host) = request_host(headers) {
+        if !is_local_request_host(&host) {
+            if let Some(candidate) = host.split('.').next() {
+                if let Some(profile_id) = resolve_profile_id_candidate(state, candidate) {
+                    return Some(profile_id);
+                }
+            }
+        }
+    }
+
+    headers
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|candidate| resolve_profile_id_candidate(state, candidate))
+}
+
 /// Resolve API port for a specific profile, or fall back to first available.
 /// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
 async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
     let pm = state.process_manager.as_ref()?;
 
-    // Check X-Profile-Id header first (set by reverse proxy from subdomain)
-    if let Some(profile_id) = headers
-        .get("x-profile-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(port) = pm.api_port(profile_id).await {
-            return Some((profile_id.to_string(), port));
+    if let Some(profile_id) = routed_profile_id_from_headers(state, headers) {
+        if let Some(port) = pm.api_port(&profile_id).await {
+            return Some((profile_id, port));
         }
         tracing::warn!(profile = profile_id, "no API port for requested profile");
     }
@@ -101,16 +154,13 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
-fn api_profile_id_from_headers(headers: &HeaderMap) -> &str {
-    headers
-        .get("x-profile-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(MAIN_PROFILE_ID)
+fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
+    routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(headers: &HeaderMap, session_id: &str) -> SessionKey {
-    SessionKey::with_profile(api_profile_id_from_headers(headers), "api", session_id)
+fn standalone_api_session_key(state: &AppState, headers: &HeaderMap, session_id: &str) -> SessionKey {
+    let profile_id = api_profile_id_from_headers(state, headers);
+    SessionKey::with_profile(&profile_id, "api", session_id)
 }
 
 pub async fn chat(
@@ -193,6 +243,7 @@ async fn chat_sync(
     );
 
     let session_key = standalone_api_session_key_with_topic(
+        &state,
         &headers,
         req.session_id.as_deref().unwrap_or("default"),
         req.topic.as_deref(),
@@ -251,7 +302,7 @@ async fn chat_streaming(
     );
 
     let session_key =
-        standalone_api_session_key_with_topic(&headers, &session_id, req.topic.as_deref());
+        standalone_api_session_key_with_topic(&state, &headers, &session_id, req.topic.as_deref());
 
     // Load history before spawning
     let history: Vec<Message> = {
@@ -380,7 +431,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{}:api:", api_profile_id_from_headers(&headers));
+        let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
         all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
             let chat_id = id.strip_prefix(&prefix)?;
             Some(SessionInfo {
@@ -448,12 +499,14 @@ fn default_page_limit() -> usize {
 }
 
 fn standalone_api_session_key_with_topic(
+    state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
     topic: Option<&str>,
 ) -> SessionKey {
+    let profile_id = api_profile_id_from_headers(state, headers);
     SessionKey::with_profile_topic(
-        api_profile_id_from_headers(headers),
+        &profile_id,
         "api",
         session_id,
         topic.unwrap_or_default(),
@@ -511,7 +564,7 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(&headers, &id, params.topic.as_deref());
+            let key = standalone_api_session_key_with_topic(&state, &headers, &id, params.topic.as_deref());
             let mut sess = sessions.lock().await;
             let session = sess.get_or_create(&key).await;
             let messages: Vec<MessageInfo> = session
@@ -703,7 +756,7 @@ pub async fn delete_session(
 ) -> Response {
     // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
-        let key = standalone_api_session_key(&headers, &id);
+        let key = standalone_api_session_key(&state, &headers, &id);
         let mut sess = sessions.lock().await;
         if let Err(e) = sess.clear(&key).await {
             tracing::error!(error = %e, "delete session from standalone store failed");
@@ -1108,14 +1161,14 @@ async fn resolve_profile_data_dir(
 ) -> Result<std::path::PathBuf, Response> {
     if let Some((_profile_id, _port)) = resolve_api_port(state, headers).await {
         if let Some(ref ps) = state.profile_store {
-            let header_profile_id = headers.get("x-profile-id").and_then(|v| v.to_str().ok());
+            let header_profile_id = routed_profile_id_from_headers(state, headers);
             let identity_profile_id = match identity {
                 Some(AuthIdentity::User { id, .. }) => Some(id.as_str()),
                 Some(AuthIdentity::Admin) => Some(ADMIN_PROFILE_ID),
                 None => None,
             };
 
-            if let Some(pid) = header_profile_id.or(identity_profile_id) {
+            if let Some(pid) = header_profile_id.as_deref().or(identity_profile_id) {
                 match ps.get(pid) {
                     Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
                     Ok(None) => {

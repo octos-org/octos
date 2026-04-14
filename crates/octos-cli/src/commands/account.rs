@@ -29,6 +29,12 @@ pub enum AccountAction {
         /// Parent profile ID.
         #[arg(long)]
         profile: String,
+        /// Immutable child ID suffix.
+        #[arg(long)]
+        sub_account_id: String,
+        /// Public host slug for this sub-account.
+        #[arg(long)]
+        public_subdomain: String,
         /// Sub-account display name.
         name: String,
         /// Telegram bot token (creates a Telegram channel).
@@ -112,7 +118,9 @@ impl Executable for AccountCommand {
                 let subs = store.list_sub_accounts(&profile)?;
                 if subs.is_empty() {
                     println!("No sub-accounts for profile '{profile}'.");
-                    println!("Create one with: octos account create --profile {profile} <name>");
+                    println!(
+                        "Create one with: octos account create --profile {profile} --sub-account-id <id> --public-subdomain <slug> <name>"
+                    );
                     return Ok(());
                 }
 
@@ -133,6 +141,8 @@ impl Executable for AccountCommand {
 
             AccountAction::Create {
                 profile,
+                sub_account_id,
+                public_subdomain,
                 name,
                 telegram_token,
                 whatsapp,
@@ -165,7 +175,14 @@ impl Executable for AccountCommand {
                     ..Default::default()
                 };
 
-                let mut sub = store.create_sub_account(&profile, &name, channels, gateway)?;
+                let mut sub = store.create_sub_account(
+                    &profile,
+                    &sub_account_id,
+                    &public_subdomain,
+                    &name,
+                    channels,
+                    gateway,
+                )?;
 
                 // Save env vars
                 if !env_vars.is_empty() {
@@ -191,7 +208,7 @@ impl Executable for AccountCommand {
                     println!();
                     println!("No channels configured. Add via dashboard or:");
                     println!(
-                        "  octos account create --profile {profile} <name> --telegram-token <token>"
+                        "  octos account create --profile {profile} --sub-account-id <id> --public-subdomain <slug> <name> --telegram-token <token>"
                     );
                 }
             }

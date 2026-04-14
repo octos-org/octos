@@ -32,6 +32,8 @@ pub struct CreateProfileRequest {
     pub id: String,
     pub name: String,
     #[serde(default)]
+    pub public_subdomain: Option<String>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub data_dir: Option<String>,
@@ -43,6 +45,8 @@ pub struct CreateProfileRequest {
 pub struct UpdateProfileRequest {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub public_subdomain: Option<Option<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -251,6 +255,10 @@ pub async fn create_profile(
     let profile = UserProfile {
         id: req.id,
         name: req.name,
+        public_subdomain: req
+            .public_subdomain
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         enabled: req.enabled,
         data_dir: req.data_dir,
         parent_id: None,
@@ -302,6 +310,24 @@ pub async fn update_profile(
 
     if let Some(name) = req.name {
         profile.name = name;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        match public_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(slug) => profile.public_subdomain = Some(slug.to_string()),
+            None => {
+                if profile.parent_id.is_some() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "sub-accounts must keep a public subdomain".into(),
+                    ));
+                }
+                profile.public_subdomain = None;
+            }
+        }
     }
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
@@ -1153,7 +1179,9 @@ pub async fn stop_all(
 
 #[derive(Deserialize)]
 pub struct CreateSubAccountRequest {
+    pub sub_account_id: String,
     pub name: String,
+    pub public_subdomain: String,
     /// Optional email address for OTP login to the web client.
     #[serde(default)]
     pub email: Option<String>,
@@ -1197,7 +1225,7 @@ pub async fn list_sub_accounts(
 
 /// Validate that channel credentials have the required fields populated.
 /// Returns an error message if any channel is missing required fields.
-fn validate_channel_credentials(
+pub(crate) fn validate_channel_credentials(
     channels: &[crate::profiles::ChannelCredentials],
 ) -> Result<(), String> {
     use crate::profiles::ChannelCredentials;
@@ -1247,6 +1275,8 @@ pub async fn create_sub_account(
     let mut sub = store
         .create_sub_account(
             &parent_id,
+            &req.sub_account_id,
+            &req.public_subdomain,
             &req.name,
             req.channels,
             req.gateway.unwrap_or_default(),

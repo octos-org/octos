@@ -211,7 +211,14 @@ impl octos_bus::BotManager for GatewayBotManager {
         };
         let mut sub =
             self.store
-                .create_sub_account(&self.parent_profile_id, username, vec![], gateway)?;
+                .create_sub_account(
+                    &self.parent_profile_id,
+                    username,
+                    username,
+                    name,
+                    vec![],
+                    gateway,
+                )?;
         sub.name = name.to_string();
         sub.config.env_vars.insert(
             MATRIX_BOT_USER_ID_ENV_KEY.to_string(),

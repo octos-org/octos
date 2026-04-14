@@ -23,6 +23,8 @@ struct UserProfile {
     data_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_subdomain: Option<String>,
     config: ProfileConfig,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -78,6 +80,8 @@ struct Input {
     name: Option<String>,
     #[serde(default)]
     sub_account_id: Option<String>,
+    #[serde(default)]
+    public_subdomain: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
@@ -216,8 +220,13 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
                 }
             })
             .unwrap_or("");
+        let public_host = s
+            .public_subdomain
+            .as_deref()
+            .map(|slug| format!(" | host: {slug}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  - {id} ({name}, {status}) [{channels}]{prompt_preview}{sandbox_status}",
+            "  - {id} ({name}, {status}) [{channels}]{public_host}{prompt_preview}{sandbox_status}",
             id = s.id,
             name = s.name,
         ));
@@ -226,6 +235,20 @@ fn action_list(profiles_dir: &Path, parent_id: &str) {
 }
 
 fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
+    let sub_account_id = match &input.sub_account_id {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            output_error("'sub_account_id' is required for the 'create' action.");
+            return;
+        }
+    };
+    let public_subdomain = match &input.public_subdomain {
+        Some(slug) if !slug.trim().is_empty() => slug.trim(),
+        _ => {
+            output_error("'public_subdomain' is required for the 'create' action.");
+            return;
+        }
+    };
     let name = match &input.name {
         Some(n) if !n.trim().is_empty() => n.trim(),
         _ => {
@@ -241,7 +264,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         return;
     }
 
-    let sub_id = format!("{parent_id}--{}", slugify(name));
+    let sub_id = format!("{parent_id}--{sub_account_id}");
 
     // Check for existing
     let sub_path = profiles_dir.join(format!("{sub_id}.json"));
@@ -257,7 +280,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
     if let Some(ref token) = input.telegram_token {
         let env_name = format!(
             "TELEGRAM_BOT_TOKEN_{}",
-            slugify(name).to_uppercase().replace('-', "_")
+            sub_account_id.to_uppercase().replace('-', "_")
         );
         channels.push(json!({
             "type": "telegram",
@@ -304,6 +327,7 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
         enabled: input.enable.unwrap_or(false),
         data_dir: None,
         parent_id: Some(parent_id.to_string()),
+        public_subdomain: Some(public_subdomain.to_string()),
         config: ProfileConfig {
             channels,
             gateway: GatewaySettings {
@@ -320,7 +344,9 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
 
     match save_profile(profiles_dir, &profile) {
         Ok(()) => {
-            let mut msg = format!("Created sub-account '{sub_id}' (name: {name}).");
+            let mut msg = format!(
+                "Created sub-account '{sub_id}' (name: {name}, host: {public_subdomain})."
+            );
             if profile.enabled {
                 msg.push_str("\nThe account is enabled and will start on next gateway restart.");
             } else {
@@ -379,7 +405,6 @@ fn action_delete(profiles_dir: &Path, parent_id: &str, input: &Input) {
 }
 
 fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
-    // Resolve sub_account_id: use explicit ID, or guess from name
     let sub_id: String = if let Some(ref id) = input.sub_account_id {
         let trimmed = id.trim();
         if trimmed.is_empty() {
@@ -387,21 +412,6 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
             return;
         }
         trimmed.to_string()
-    } else if let Some(ref name) = input.name {
-        let guessed = format!("{parent_id}--{}", slugify(name));
-        if load_profile(profiles_dir, &guessed)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            guessed
-        } else {
-            output_error(
-                "'sub_account_id' is required for the 'info' action. \
-                 You can get the ID from the 'list' action.",
-            );
-            return;
-        }
     } else {
         output_error("'sub_account_id' is required for the 'info' action.");
         return;
@@ -474,6 +484,7 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
 
     let msg = format!(
         "Sub-account: {id}\n\
+         Public subdomain: {public_subdomain}\n\
          Name: {name}\n\
          Parent: {parent_id}\n\
          Status: {status}\n\
@@ -481,6 +492,7 @@ fn action_info(profiles_dir: &Path, parent_id: &str, input: &Input) {
          System prompt: {prompt}\n\
          Created: {created}{sandbox_info}{parent_info}",
         id = profile.id,
+        public_subdomain = profile.public_subdomain.as_deref().unwrap_or("(unset)"),
         name = profile.name,
         created = profile.created_at.format("%Y-%m-%d %H:%M UTC"),
     );
@@ -491,17 +503,6 @@ fn action_update(profiles_dir: &Path, parent_id: &str, input: &Input) {
     let sub_id = match &input.sub_account_id {
         Some(id) if !id.trim().is_empty() => id.trim(),
         _ => {
-            // Try to guess from name
-            if let Some(ref name) = input.name {
-                let guessed = format!("{parent_id}--{}", slugify(name));
-                if load_profile(profiles_dir, &guessed)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    return action_update_by_id(profiles_dir, parent_id, &guessed, input);
-                }
-            }
             output_error("'sub_account_id' is required for the 'update' action.");
             return;
         }
@@ -634,6 +635,16 @@ fn action_update_by_id(profiles_dir: &Path, parent_id: &str, sub_id: &str, input
             Some(prompt.clone())
         };
         changed.push("system prompt");
+    }
+
+    if let Some(ref public_subdomain) = input.public_subdomain {
+        let trimmed = public_subdomain.trim();
+        if trimmed.is_empty() {
+            output_error("'public_subdomain' cannot be empty for the 'update' action.");
+            return;
+        }
+        profile.public_subdomain = Some(trimmed.to_string());
+        changed.push("public subdomain");
     }
 
     // Update enabled state
@@ -777,21 +788,11 @@ fn action_restart(profiles_dir: &Path, parent_id: &str, input: &Input) {
     }
 }
 
-fn resolve_sub_id(profiles_dir: &Path, parent_id: &str, input: &Input) -> Option<String> {
+fn resolve_sub_id(_profiles_dir: &Path, _parent_id: &str, input: &Input) -> Option<String> {
     if let Some(ref id) = input.sub_account_id {
         let trimmed = id.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
-        }
-    }
-    if let Some(ref name) = input.name {
-        let guessed = format!("{parent_id}--{}", slugify(name));
-        if load_profile(profiles_dir, &guessed)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return Some(guessed);
         }
     }
     output_error("'sub_account_id' is required. You can get the ID from the 'list' action.");

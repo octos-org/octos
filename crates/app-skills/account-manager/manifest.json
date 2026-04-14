@@ -17,11 +17,15 @@
           },
           "name": {
             "type": "string",
-            "description": "Display name for the sub-account (required for 'create', optional for 'update'/'info' to resolve ID)."
+            "description": "Display name for the sub-account (required for 'create', optional for 'update')."
           },
           "sub_account_id": {
             "type": "string",
-            "description": "ID of the sub-account (required for 'update', 'delete', 'info', 'start', 'stop', 'restart'). Format: parent-id--slug, e.g. 'dspfac--work-bot'."
+            "description": "Immutable sub-account ID suffix chosen at creation time. Required for 'create', 'update', 'delete', 'info', 'start', 'stop', and 'restart'. For existing accounts, use the full internal ID returned by 'list', e.g. 'dspfac--work-bot'."
+          },
+          "public_subdomain": {
+            "type": "string",
+            "description": "Public host slug for the sub-account. Required for 'create'. Optional for 'update' to change the public domain name while keeping the internal ID unchanged."
           },
           "system_prompt": {
             "type": "string",
