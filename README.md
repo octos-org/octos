@@ -108,9 +108,36 @@ The tenant device connects outbound to the VPS using `frpc`. The VPS runs the pu
 
 For production use, the VPS also needs wildcard HTTPS. The current setup uses Caddy plus Cloudflare DNS challenge, or another supported DNS provider, to issue and manage certificates for the main domain and tenant subdomains.
 
+Requirements for this option:
+
+1. **Your own hosted domain name**
+   Example: `octos.example.com`
+2. **A DNS provider / authoritative DNS API**
+   Its role here is specifically the ACME `DNS-01` solver used by Caddy's internal ACME client to mint the wildcard certificate for `*.octos.example.com`, which is what tenant subdomains use. If you stay HTTP-only with `--http-only`, or if you only need the apex domain, this wildcard-DNS flow is not required.
+3. **An SMTP service**
+   This is needed so the cloud host can send OTP emails to tenants during portal signup and login.
+
 #### 1. Bootstrap the VPS
 
-On a Linux VPS with DNS already pointed at it:
+On a Linux VPS with DNS already pointed at it, you can either:
+
+- run the script with full flags for a mostly non-interactive flow, or
+- run `bash scripts/cloud-host-deploy.sh` with no flags and let it prompt you interactively
+
+Before running it, export the environment variables needed by your chosen providers. For example:
+
+```bash
+export CF_API_TOKEN=xxx
+export SMTP_PASSWORD=xxx
+```
+
+Notes:
+
+- For Cloudflare, the script expects `CF_API_TOKEN` for the DNS provider token.
+- For SMTP, you can pre-export `SMTP_PASSWORD` so the bootstrap does not need that secret entered later.
+- If you enable SMTP, the script will also prompt for or use the rest of the SMTP settings such as host, port, username, and from-address.
+
+Example using explicit flags:
 
 ```bash
 git clone https://github.com/octos-org/octos.git
@@ -118,6 +145,14 @@ cd octos
 bash scripts/cloud-host-deploy.sh \
     --domain octos.example.com \
     --https --dns-provider cloudflare
+```
+
+Interactive mode:
+
+```bash
+git clone https://github.com/octos-org/octos.git
+cd octos
+bash scripts/cloud-host-deploy.sh
 ```
 
 This wraps three host-side steps:
