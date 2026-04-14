@@ -65,8 +65,10 @@ pub use tools::{
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use workspace_git::{
-    WorkspaceProjectKind, WorkspaceValidationFailure, commit_all_if_dirty, detect_workspace_repo,
-    init_workspace_repo, initialize_and_commit, list_workspace_repos, snapshot_workspace_change,
+    WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,
+    WorkspaceValidationFailure, WorkspaceValidationPhase, commit_all_if_dirty,
+    detect_workspace_repo, init_workspace_repo, initialize_and_commit, inspect_workspace_contract,
+    inspect_workspace_contracts, list_workspace_repos, snapshot_workspace_change,
     snapshot_workspace_turn,
 };
 pub use workspace_policy::{

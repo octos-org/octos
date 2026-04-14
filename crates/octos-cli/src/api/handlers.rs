@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use octos_agent::Agent;
+use octos_agent::{Agent, inspect_workspace_contract};
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
@@ -158,7 +158,11 @@ fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String 
     routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(state: &AppState, headers: &HeaderMap, session_id: &str) -> SessionKey {
+fn standalone_api_session_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> SessionKey {
     let profile_id = api_profile_id_from_headers(state, headers);
     SessionKey::with_profile(&profile_id, "api", session_id)
 }
@@ -505,12 +509,7 @@ fn standalone_api_session_key_with_topic(
     topic: Option<&str>,
 ) -> SessionKey {
     let profile_id = api_profile_id_from_headers(state, headers);
-    SessionKey::with_profile_topic(
-        &profile_id,
-        "api",
-        session_id,
-        topic.unwrap_or_default(),
-    )
+    SessionKey::with_profile_topic(&profile_id, "api", session_id, topic.unwrap_or_default())
 }
 
 fn append_topic_query(path: &mut String, topic: Option<&str>) {
@@ -564,7 +563,12 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(&state, &headers, &id, params.topic.as_deref());
+            let key = standalone_api_session_key_with_topic(
+                &state,
+                &headers,
+                &id,
+                params.topic.as_deref(),
+            );
             let mut sess = sessions.lock().await;
             let session = sess.get_or_create(&key).await;
             let messages: Vec<MessageInfo> = session
@@ -733,6 +737,39 @@ pub async fn session_files(
     });
     files.dedup_by(|left, right| left.path == right.path);
     Json(files).into_response()
+}
+
+pub async fn session_workspace_contract(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let data_dir = if let Some(sessions) = &state.sessions {
+        let sess = sessions.lock().await;
+        sess.data_dir()
+    } else {
+        let identity = identity.as_ref().map(|ext| &ext.0);
+        match resolve_profile_data_dir(&state, &headers, identity).await {
+            Ok(data_dir) => data_dir,
+            Err(response) => return response,
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for workspace in api_session_workspace_dirs(&data_dir, &id) {
+        if !workspace.exists() {
+            continue;
+        }
+        let Ok(repos) = octos_agent::list_workspace_repos(&workspace) else {
+            continue;
+        };
+        statuses.extend(repos.iter().map(inspect_workspace_contract));
+    }
+
+    statuses.sort_by(|left, right| left.repo_label.cmp(&right.repo_label));
+    statuses.dedup_by(|left, right| left.repo_label == right.repo_label);
+    Json(statuses).into_response()
 }
 
 async fn resolve_file_access_data_dir(

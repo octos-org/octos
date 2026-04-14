@@ -137,8 +137,26 @@ impl WorkspacePolicy {
                         ".DS_Store".into(),
                     ],
                 },
-                validation: ValidationPolicy::default(),
-                artifacts: WorkspaceArtifactsPolicy::default(),
+                validation: ValidationPolicy {
+                    on_turn_end: vec![
+                        "file_exists:script.js".into(),
+                        "file_exists:memory.md".into(),
+                        "file_exists:changelog.md".into(),
+                    ],
+                    on_source_change: Vec::new(),
+                    on_completion: vec![
+                        "file_exists:output/*.pptx".into(),
+                        "file_exists:output/**/manifest.json".into(),
+                        "file_exists:output/**/slide-*.png".into(),
+                    ],
+                },
+                artifacts: WorkspaceArtifactsPolicy {
+                    entries: BTreeMap::from([
+                        ("deck".into(), "output/*.pptx".into()),
+                        ("manifest".into(), "output/**/manifest.json".into()),
+                        ("previews".into(), "output/**/slide-*.png".into()),
+                    ]),
+                },
                 spawn_tasks: BTreeMap::new(),
             },
             WorkspaceProjectKind::Sites => Self {
@@ -260,6 +278,40 @@ mod tests {
 
         let roundtrip = read_workspace_policy(temp.path()).unwrap().unwrap();
         assert_eq!(roundtrip, policy);
+    }
+
+    #[test]
+    fn slides_policy_has_default_contract() {
+        let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+
+        assert_eq!(
+            policy.validation.on_turn_end,
+            vec![
+                "file_exists:script.js",
+                "file_exists:memory.md",
+                "file_exists:changelog.md",
+            ]
+        );
+        assert_eq!(
+            policy.validation.on_completion,
+            vec![
+                "file_exists:output/*.pptx",
+                "file_exists:output/**/manifest.json",
+                "file_exists:output/**/slide-*.png",
+            ]
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("deck").map(String::as_str),
+            Some("output/*.pptx")
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("manifest").map(String::as_str),
+            Some("output/**/manifest.json")
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("previews").map(String::as_str),
+            Some("output/**/slide-*.png")
+        );
     }
 
     #[test]

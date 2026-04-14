@@ -2,11 +2,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eyre::{Result, WrapErr, eyre};
+use glob::glob;
+use serde::Serialize;
 use tracing::warn;
 
+use crate::behaviour::{ActionResult, run_action};
 use crate::workspace_policy::{
-    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceVersionControlProvider,
-    read_workspace_policy,
+    WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    WorkspaceVersionControlProvider, read_workspace_policy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,8 +60,16 @@ pub struct WorkspaceTurnSnapshotReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceValidationFailure {
     pub repo_label: String,
+    pub phase: WorkspaceValidationPhase,
     pub check: String,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceValidationPhase {
+    TurnEnd,
+    Completion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,8 +84,40 @@ enum WorkspaceTurnSnapshotPlan {
         auto_init: bool,
         fail_on_error: bool,
         turn_end_validators: Vec<String>,
+        completion_validators: Vec<String>,
+        artifact_patterns: Vec<String>,
     },
     Skip,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceContractStatus {
+    pub repo_label: String,
+    pub kind: String,
+    pub slug: String,
+    pub policy_managed: bool,
+    pub revision: Option<String>,
+    pub dirty: bool,
+    pub ready: bool,
+    pub error: Option<String>,
+    pub turn_end_checks: Vec<WorkspaceCheckStatus>,
+    pub completion_checks: Vec<WorkspaceCheckStatus>,
+    pub artifacts: Vec<WorkspaceArtifactStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceCheckStatus {
+    pub spec: String,
+    pub passed: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceArtifactStatus {
+    pub name: String,
+    pub pattern: String,
+    pub present: bool,
+    pub matches: Vec<String>,
 }
 
 pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<WorkspaceRepo> {
@@ -230,7 +273,8 @@ pub fn snapshot_workspace_turn(
 
     // Collect (repo_root, validators) from the plan phase so we don't re-read
     // the workspace policy during validation.
-    let mut pending_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    let mut pending_turn_end_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    let mut pending_completion_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
 
     for repo in &repos {
         let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
@@ -246,6 +290,8 @@ pub fn snapshot_workspace_turn(
                 auto_init,
                 fail_on_error,
                 turn_end_validators,
+                completion_validators,
+                artifact_patterns,
             }) => {
                 match commit_all_if_dirty_with_options(&repo.root, repo.kind, &message, auto_init) {
                     Ok(true) => report.committed.push(repo_label.clone()),
@@ -260,7 +306,20 @@ pub fn snapshot_workspace_turn(
                     }
                 }
                 if !turn_end_validators.is_empty() {
-                    pending_validations.push((repo.root.clone(), repo_label, turn_end_validators));
+                    pending_turn_end_validations.push((
+                        repo.root.clone(),
+                        repo_label.clone(),
+                        turn_end_validators,
+                    ));
+                }
+                if !completion_validators.is_empty()
+                    && repo_has_declared_artifacts(&repo.root, &artifact_patterns)
+                {
+                    pending_completion_validations.push((
+                        repo.root.clone(),
+                        repo_label,
+                        completion_validators,
+                    ));
                 }
             }
             Err(error) => {
@@ -273,21 +332,29 @@ pub fn snapshot_workspace_turn(
     }
 
     // Run turn-end validators using the already-parsed policy data.
-    run_turn_end_validators(&pending_validations, &mut report);
+    run_validators(
+        WorkspaceValidationPhase::TurnEnd,
+        &pending_turn_end_validations,
+        &mut report,
+    );
+    run_validators(
+        WorkspaceValidationPhase::Completion,
+        &pending_completion_validations,
+        &mut report,
+    );
 
     Ok(report)
 }
 
-/// Run tier 1 turn-end validators using pre-parsed policy data.
+/// Run validators using pre-parsed policy data.
 ///
 /// Each entry is `(repo_root, repo_label, validator_specs)` collected during
 /// the snapshot plan phase, avoiding a second policy read from disk.
-fn run_turn_end_validators(
+fn run_validators(
+    phase: WorkspaceValidationPhase,
     validations: &[(PathBuf, String, Vec<String>)],
     report: &mut WorkspaceTurnSnapshotReport,
 ) {
-    use crate::behaviour::{ActionResult, run_action};
-
     for (repo_root, repo_label, specs) in validations {
         for spec in specs {
             match run_action(repo_root, spec) {
@@ -295,6 +362,7 @@ fn run_turn_end_validators(
                 Ok(ActionResult::Fail { reason }) => {
                     report.validation_failures.push(WorkspaceValidationFailure {
                         repo_label: repo_label.clone(),
+                        phase,
                         check: spec.clone(),
                         reason,
                     });
@@ -308,6 +376,7 @@ fn run_turn_end_validators(
                     );
                     report.validation_failures.push(WorkspaceValidationFailure {
                         repo_label: repo_label.clone(),
+                        phase,
                         check: spec.clone(),
                         reason: format!("validator error: {e}"),
                     });
@@ -315,6 +384,12 @@ fn run_turn_end_validators(
             }
         }
     }
+}
+
+fn repo_has_declared_artifacts(repo_root: &Path, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| !resolve_artifact_matches(repo_root, pattern).is_empty())
 }
 
 fn commit_all_if_dirty_with_options(
@@ -375,7 +450,213 @@ fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotP
         auto_init: policy.version_control.auto_init,
         fail_on_error: policy.version_control.fail_on_error,
         turn_end_validators: policy.validation.on_turn_end,
+        completion_validators: policy.validation.on_completion,
+        artifact_patterns: policy.artifacts.entries.into_values().collect(),
     })
+}
+
+pub fn inspect_workspace_contracts(base_dir: &Path) -> Result<Vec<WorkspaceContractStatus>> {
+    let repos = list_workspace_repos(base_dir)?;
+    Ok(repos.iter().map(inspect_workspace_contract).collect())
+}
+
+pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
+    let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+    let revision = git_head_revision(&repo.root);
+    let dirty = git_is_dirty(&repo.root);
+
+    let policy = match read_workspace_policy(&repo.root) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => {
+            return WorkspaceContractStatus {
+                repo_label,
+                kind: repo.kind.display_name().to_string(),
+                slug: repo.slug.clone(),
+                policy_managed: false,
+                revision,
+                dirty,
+                ready: false,
+                error: None,
+                turn_end_checks: Vec::new(),
+                completion_checks: Vec::new(),
+                artifacts: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return WorkspaceContractStatus {
+                repo_label,
+                kind: repo.kind.display_name().to_string(),
+                slug: repo.slug.clone(),
+                policy_managed: true,
+                revision,
+                dirty,
+                ready: false,
+                error: Some(error.to_string()),
+                turn_end_checks: Vec::new(),
+                completion_checks: Vec::new(),
+                artifacts: Vec::new(),
+            };
+        }
+    };
+
+    if !policy.workspace.kind.matches_project_kind(repo.kind) {
+        return WorkspaceContractStatus {
+            repo_label,
+            kind: repo.kind.display_name().to_string(),
+            slug: repo.slug.clone(),
+            policy_managed: true,
+            revision,
+            dirty,
+            ready: false,
+            error: Some(format!(
+                "workspace policy kind mismatch: expected {}, found {}",
+                WorkspacePolicyKind::from(repo.kind).as_str(),
+                policy.workspace.kind.as_str()
+            )),
+            turn_end_checks: Vec::new(),
+            completion_checks: Vec::new(),
+            artifacts: Vec::new(),
+        };
+    }
+
+    inspect_managed_workspace_contract(repo, revision, dirty, &policy)
+}
+
+fn inspect_managed_workspace_contract(
+    repo: &WorkspaceRepo,
+    revision: Option<String>,
+    dirty: bool,
+    policy: &WorkspacePolicy,
+) -> WorkspaceContractStatus {
+    let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+    let artifacts = policy
+        .artifacts
+        .entries
+        .iter()
+        .map(|(name, pattern)| {
+            let matches = resolve_artifact_matches(&repo.root, pattern);
+            WorkspaceArtifactStatus {
+                name: name.clone(),
+                pattern: pattern.clone(),
+                present: !matches.is_empty(),
+                matches,
+            }
+        })
+        .collect::<Vec<_>>();
+    let turn_end_checks = evaluate_check_specs(&repo.root, &policy.validation.on_turn_end);
+    let completion_checks = evaluate_check_specs(&repo.root, &policy.validation.on_completion);
+    let ready = check_list_passed(&turn_end_checks)
+        && check_list_passed(&completion_checks)
+        && artifacts.iter().all(|artifact| artifact.present);
+
+    WorkspaceContractStatus {
+        repo_label,
+        kind: repo.kind.display_name().to_string(),
+        slug: repo.slug.clone(),
+        policy_managed: true,
+        revision,
+        dirty,
+        ready,
+        error: None,
+        turn_end_checks,
+        completion_checks,
+        artifacts,
+    }
+}
+
+fn evaluate_check_specs(repo_root: &Path, specs: &[String]) -> Vec<WorkspaceCheckStatus> {
+    specs
+        .iter()
+        .map(|spec| match run_action(repo_root, spec) {
+            Ok(ActionResult::Pass | ActionResult::Notify { .. }) => WorkspaceCheckStatus {
+                spec: spec.clone(),
+                passed: true,
+                reason: None,
+            },
+            Ok(ActionResult::Fail { reason }) => WorkspaceCheckStatus {
+                spec: spec.clone(),
+                passed: false,
+                reason: Some(reason),
+            },
+            Err(error) => WorkspaceCheckStatus {
+                spec: spec.clone(),
+                passed: false,
+                reason: Some(format!("validator error: {error}")),
+            },
+        })
+        .collect()
+}
+
+fn check_list_passed(checks: &[WorkspaceCheckStatus]) -> bool {
+    checks.iter().all(|check| check.passed)
+}
+
+fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
+    let full_pattern = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        repo_root.join(pattern)
+    };
+    let canonical_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut matches = Vec::new();
+
+    let Ok(entries) = glob(&full_pattern.to_string_lossy()) else {
+        return matches;
+    };
+
+    for entry in entries.flatten() {
+        if !entry.is_file() {
+            continue;
+        }
+        let canonical = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        if !canonical.starts_with(&canonical_root) {
+            continue;
+        }
+        let relative = entry
+            .strip_prefix(repo_root)
+            .unwrap_or(&entry)
+            .to_string_lossy()
+            .replace('\\', "/");
+        matches.push(relative);
+    }
+
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn git_head_revision(project_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!revision.is_empty()).then_some(revision)
+}
+
+fn git_is_dirty(project_root: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--",
+            ".",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
 }
 
 fn infer_kind_from_root(project_root: &Path) -> Result<WorkspaceProjectKind> {
@@ -587,6 +868,10 @@ mod tests {
         assert_eq!(report.validation_failures.len(), 1);
         assert_eq!(report.validation_failures[0].repo_label, "slides/deck-a");
         assert_eq!(
+            report.validation_failures[0].phase,
+            WorkspaceValidationPhase::TurnEnd
+        );
+        assert_eq!(
             report.validation_failures[0].check,
             "file_exists:output/*.pptx"
         );
@@ -609,6 +894,7 @@ mod tests {
 
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
         policy.validation.on_turn_end = vec!["file_exists:output/*.pptx".into()];
+        policy.validation.on_completion = Vec::new();
         write_workspace_policy(&slides_root, &policy).unwrap();
 
         let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
@@ -626,5 +912,76 @@ mod tests {
 
         let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
         assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn should_run_completion_validation_when_artifacts_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-d");
+        std::fs::create_dir_all(slides_root.join("output").join("imgs")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
+        std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_completion = vec![
+            "file_exists:output/*.pptx".into(),
+            "file_exists:output/**/manifest.json".into(),
+        ];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+
+        let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
+
+        assert_eq!(report.validation_failures.len(), 1);
+        assert_eq!(
+            report.validation_failures[0].phase,
+            WorkspaceValidationPhase::Completion
+        );
+        assert_eq!(
+            report.validation_failures[0].check,
+            "file_exists:output/**/manifest.json"
+        );
+    }
+
+    #[test]
+    fn inspects_workspace_contract_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-e");
+        std::fs::create_dir_all(slides_root.join("output").join("imgs")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
+        std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(
+            slides_root.join("output/imgs/manifest.json"),
+            "{\"slides\":[]}\n",
+        )
+        .unwrap();
+        std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
+        write_workspace_policy(
+            &slides_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        initialize_and_commit(
+            &slides_root,
+            WorkspaceProjectKind::Slides,
+            "Initialize slides workspace",
+        )
+        .unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        assert_eq!(statuses.len(), 1);
+        let status = &statuses[0];
+        assert_eq!(status.repo_label, "slides/deck-e");
+        assert!(status.policy_managed);
+        assert!(status.ready);
+        assert!(status.revision.is_some());
+        assert!(!status.dirty);
+        assert_eq!(status.artifacts.len(), 3);
+        assert!(status.artifacts.iter().all(|artifact| artifact.present));
+        assert!(status.turn_end_checks.iter().all(|check| check.passed));
+        assert!(status.completion_checks.iter().all(|check| check.passed));
     }
 }

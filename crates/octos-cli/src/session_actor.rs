@@ -250,6 +250,23 @@ fn merge_attachment_prompt_summaries(
     }
 }
 
+fn merge_optional_text(existing: Option<String>, incoming: Option<String>) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
 async fn snapshot_workspace_turn_for_path(
     session_key: &SessionKey,
     workspace_root: std::path::PathBuf,
@@ -270,29 +287,66 @@ async fn snapshot_workspace_turn_for_path(
                     "workspace turn snapshot committed"
                 );
             }
-            if report.enforced_failures.is_empty() {
+            if report.enforced_failures.is_empty() && report.validation_failures.is_empty() {
                 return None;
             }
 
-            let repo_labels = report
-                .enforced_failures
-                .iter()
-                .map(|failure| failure.repo_label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let first_error = report
-                .enforced_failures
-                .first()
-                .map(|failure| failure.error.as_str())
-                .unwrap_or("unknown error");
-            warn!(
-                session = %session_key,
-                failures = ?report.enforced_failures,
-                "workspace turn snapshot enforcement failed"
-            );
-            Some(format!(
-                "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
-            ))
+            if !report.validation_failures.is_empty() {
+                warn!(
+                    session = %session_key,
+                    failures = ?report.validation_failures,
+                    "workspace contract validation failed"
+                );
+            }
+
+            let enforcement_notice = if report.enforced_failures.is_empty() {
+                None
+            } else {
+                let repo_labels = report
+                    .enforced_failures
+                    .iter()
+                    .map(|failure| failure.repo_label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let first_error = report
+                    .enforced_failures
+                    .first()
+                    .map(|failure| failure.error.as_str())
+                    .unwrap_or("unknown error");
+                warn!(
+                    session = %session_key,
+                    failures = ?report.enforced_failures,
+                    "workspace turn snapshot enforcement failed"
+                );
+                Some(format!(
+                    "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
+                ))
+            };
+
+            let validation_notice = if report.validation_failures.is_empty() {
+                None
+            } else {
+                let failures = report
+                    .validation_failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{} [{}] {}: {}",
+                            failure.repo_label,
+                            match failure.phase {
+                                octos_agent::WorkspaceValidationPhase::TurnEnd => "turn_end",
+                                octos_agent::WorkspaceValidationPhase::Completion => "completion",
+                            },
+                            failure.check,
+                            failure.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!("Workspace contract validation failed:\n{failures}"))
+            };
+
+            merge_optional_text(enforcement_notice, validation_notice)
         }
         Ok(Err(error)) => {
             warn!(

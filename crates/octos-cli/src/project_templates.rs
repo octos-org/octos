@@ -157,6 +157,7 @@ RULES:
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
 - Read slides/{slug}/memory.md before each response for context.
 - Workspace policy lives at slides/{slug}/.octos-workspace.toml.
+- Treat the workspace contract as authoritative. A "finished" deck means the contract is satisfied: required source files exist and the declared artifacts for deck/manifest/previews are present.
 - Maintain a version header at the top of slides/{slug}/script.js:
   // version: v{{NNN}}_{{desc}}
   // updated_at: YYYY-MM-DD
@@ -214,6 +215,7 @@ INCREMENTAL UPDATES:
 
 TASK STATUS CHECK:
 When user asks about progress ("做完了吗", "done?", "status"):
+  use the workspace contract as the definition of ready/not-ready
   glob("slides/{slug}/output/imgs/slide-*.png") to count generated slides
   glob("slides/{slug}/output/*.pptx") to check if PPTX exists
   check_background_tasks({{"include_completed": true}}) to inspect the current session's background task state
