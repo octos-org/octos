@@ -825,13 +825,17 @@ async fn handle_session_tasks(
 /// GET /sessions — list all API sessions.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
+    let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
         .list_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
-            let chat_id = api_chat_id_from_session_key(&id)?;
+            let chat_id = api_chat_id_from_session_key(&id)?.to_string();
+            if !seen.insert(chat_id.clone()) {
+                return None;
+            }
             Some(SessionInfo {
-                id: chat_id.to_string(),
+                id: chat_id,
                 message_count: count,
             })
         })
@@ -1166,7 +1170,10 @@ async fn handle_admin_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
     use std::path::Path;
+    use tower::util::ServiceExt;
 
     const TEST_PROFILE_ID: &str = "dspfac";
 
@@ -1625,5 +1632,56 @@ mod tests {
         };
         // Should not error
         ch.send(&msg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_dedups_profile_scoped_duplicates_by_chat_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let mut sess = sessions.lock().await;
+        sess.add_message(
+            &SessionKey::with_profile("dspfac", "api", "slides-123"),
+            Message::user("one"),
+        )
+        .await
+        .unwrap();
+        sess.add_message(
+            &SessionKey::with_profile(MAIN_PROFILE_ID, "api", "slides-123"),
+            Message::user("two"),
+        )
+        .await
+        .unwrap();
+        drop(sess);
+
+        let app = Router::new()
+            .route("/sessions", get(handle_list_sessions))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some("dspfac".into()),
+                task_query: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let matching: Vec<&serde_json::Value> = sessions
+            .iter()
+            .filter(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("slides-123"))
+            .collect();
+        assert_eq!(matching.len(), 1);
     }
 }

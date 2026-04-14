@@ -345,82 +345,128 @@ impl SessionManager {
     /// Checks the legacy flat layout first, then the per-user directory layout.
     /// Uses spawn_blocking to avoid blocking the async runtime.
     async fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
-        let path = self.session_path(key);
+        let flat_path = self.session_path(key);
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        let per_user_path = users_dir
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
 
-        // If not found in flat layout, try per-user layout
-        let path = if path.exists() {
-            path
-        } else {
-            let base_key = key.base_key();
-            let encoded_base = encode_path_component(base_key);
-            let topic = key.topic().unwrap_or("default");
-            let encoded_topic = encode_path_component(topic);
-            let users_dir = self
-                .sessions_dir
-                .parent()
-                .unwrap_or(&self.sessions_dir)
-                .join("users");
-            let per_user_path = users_dir
-                .join(&encoded_base)
-                .join("sessions")
-                .join(format!("{encoded_topic}.jsonl"));
-            if per_user_path.exists() {
-                per_user_path
-            } else {
-                return None;
-            }
-        };
+        if !flat_path.exists() && !per_user_path.exists() {
+            return None;
+        }
 
         let key_clone = key.clone();
         tokio::task::spawn_blocking(move || {
-            // Guard against oversized files to prevent OOM
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() > MAX_SESSION_FILE_SIZE {
+            fn load_session_file(path: &Path, key: &SessionKey) -> Option<Session> {
+                // Guard against oversized files to prevent OOM
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.len() > MAX_SESSION_FILE_SIZE {
+                        warn!(
+                            key = %key,
+                            path = %path.display(),
+                            size = meta.len(),
+                            limit = MAX_SESSION_FILE_SIZE,
+                            "session file too large, skipping"
+                        );
+                        return None;
+                    }
+                }
+
+                let content = std::fs::read_to_string(path).ok()?;
+                let mut lines = content.lines();
+
+                let meta_line = lines.next()?;
+                let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
+
+                if meta.schema_version > CURRENT_SESSION_SCHEMA {
                     warn!(
-                        key = %key_clone,
-                        size = meta.len(),
-                        limit = MAX_SESSION_FILE_SIZE,
-                        "session file too large, skipping"
+                        key = %key,
+                        path = %path.display(),
+                        file_version = meta.schema_version,
+                        current_version = CURRENT_SESSION_SCHEMA,
+                        "session file has newer schema version, skipping"
                     );
                     return None;
                 }
+
+                let messages: Vec<Message> = lines
+                    .filter(|line| !line.trim().is_empty())
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+
+                Some(Session {
+                    key: key.clone(),
+                    parent_key: meta.parent_key.map(SessionKey),
+                    topic: meta.topic,
+                    summary: meta.summary,
+                    messages,
+                    created_at: meta.created_at,
+                    updated_at: meta.updated_at,
+                })
             }
 
-            let content = std::fs::read_to_string(&path).ok()?;
-            let mut lines = content.lines();
+            let flat = flat_path
+                .exists()
+                .then(|| load_session_file(&flat_path, &key_clone))
+                .flatten();
+            let per_user = per_user_path
+                .exists()
+                .then(|| load_session_file(&per_user_path, &key_clone))
+                .flatten();
 
-            // First line is metadata
-            let meta_line = lines.next()?;
-            let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
+            let merged = match (flat, per_user) {
+                (Some(flat), Some(per_user)) => {
+                    let mut merged_messages = Vec::with_capacity(
+                        flat.messages.len().saturating_add(per_user.messages.len()),
+                    );
+                    let mut seen = std::collections::HashSet::new();
 
-            // Reject files from a newer schema we don't understand
-            if meta.schema_version > CURRENT_SESSION_SCHEMA {
-                warn!(
-                    key = %key_clone,
-                    file_version = meta.schema_version,
-                    current_version = CURRENT_SESSION_SCHEMA,
-                    "session file has newer schema version, skipping"
-                );
-                return None;
-            }
+                    for message in flat
+                        .messages
+                        .into_iter()
+                        .chain(per_user.messages.into_iter())
+                    {
+                        let Ok(fingerprint) = serde_json::to_string(&message) else {
+                            continue;
+                        };
+                        if seen.insert(fingerprint) {
+                            merged_messages.push(message);
+                        }
+                    }
+                    merged_messages.sort_by_key(|message| message.timestamp);
 
-            // Remaining lines are messages
-            let messages: Vec<Message> = lines
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
+                    Session {
+                        key: key_clone.clone(),
+                        parent_key: per_user.parent_key.or(flat.parent_key),
+                        topic: per_user.topic.or(flat.topic),
+                        summary: per_user.summary.or(flat.summary),
+                        messages: merged_messages,
+                        created_at: flat.created_at.min(per_user.created_at),
+                        updated_at: flat.updated_at.max(per_user.updated_at),
+                    }
+                }
+                (Some(session), None) | (None, Some(session)) => session,
+                (None, None) => return None,
+            };
 
-            debug!(key = %key_clone, messages = messages.len(), "Loaded session from disk");
+            debug!(
+                key = %key_clone,
+                messages = merged.messages.len(),
+                flat_exists = flat_path.exists(),
+                per_user_exists = per_user_path.exists(),
+                "Loaded session from disk"
+            );
 
-            Some(Session {
-                key: key_clone,
-                parent_key: meta.parent_key.map(SessionKey),
-                topic: meta.topic,
-                summary: meta.summary,
-                messages,
-                created_at: meta.created_at,
-                updated_at: meta.updated_at,
-            })
+            Some(merged)
         })
         .await
         .ok()
@@ -1866,6 +1912,79 @@ mod tests {
 
         // Should refuse to load
         assert!(mgr.load_from_disk(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_from_disk_merges_flat_and_per_user_histories() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::with_profile("dspfac", "api", "slides-123");
+
+        let older = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let newer = older + chrono::Duration::minutes(1);
+
+        let flat_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "created_at": older,
+            "updated_at": newer
+        });
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(
+            mgr.session_path(&key),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&flat_meta).unwrap(),
+                serde_json::to_string(&Message {
+                    role: MessageRole::Assistant,
+                    content: "artifact".into(),
+                    media: vec!["/tmp/file.png".into()],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    timestamp: newer,
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let encoded_base = encode_path_component(key.base_key());
+        let per_user_dir = tmp.path().join("users").join(encoded_base).join("sessions");
+        std::fs::create_dir_all(&per_user_dir).unwrap();
+        let per_user_meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "created_at": older,
+            "updated_at": older
+        });
+        std::fs::write(
+            per_user_dir.join("default.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&per_user_meta).unwrap(),
+                serde_json::to_string(&Message {
+                    role: MessageRole::User,
+                    content: "make slides".into(),
+                    media: vec![],
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    timestamp: older,
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let session = mgr
+            .load_from_disk(&key)
+            .await
+            .expect("expected merged session");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "make slides");
+        assert_eq!(session.messages[1].content, "artifact");
+        assert_eq!(session.updated_at, newer);
     }
 
     #[tokio::test]
