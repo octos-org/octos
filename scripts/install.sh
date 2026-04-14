@@ -1683,6 +1683,11 @@ if [ -n "$CADDY_DOMAIN" ]; then
     respond /check 200
 }
 
+http:// {
+    @octos host ${CADDY_DOMAIN} *.${CADDY_DOMAIN}
+    redir @octos https://{host}{uri} 308
+}
+
 ${CADDY_DOMAIN} {
     handle /api/* {
         reverse_proxy ${CADDY_UPSTREAM}
@@ -1701,32 +1706,30 @@ ${CADDY_DOMAIN} {
     }
 }
 
-*.${CADDY_DOMAIN} {
+https:// {
     tls {
         on_demand
     }
 
-    @api path /api/*
-    @admin path /admin*
-    @auth path /auth/*
+    @sub host *.${CADDY_DOMAIN}
 
-    handle @api {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+    handle @sub {
+        @api path /api/*
+        @admin path /admin*
+        @auth path /auth/*
+
+        handle @api {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle @admin {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+        handle @admin {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle @auth {
-        reverse_proxy ${CADDY_UPSTREAM} {
-            header_up X-Profile-Id {labels.2}
+        handle @auth {
+            reverse_proxy ${CADDY_UPSTREAM}
         }
-    }
-    handle {
-        reverse_proxy ${CADDY_UPSTREAM}
+        handle {
+            reverse_proxy ${CADDY_UPSTREAM}
+        }
     }
 }
 CADDYEOF
