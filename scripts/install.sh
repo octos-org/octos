@@ -21,8 +21,8 @@
 #                            Requires: wildcard DNS A record pointing to this server
 #   --tunnel                 Enable optional frpc tunnel setup
 #     --tenant-name NAME     Tenant subdomain (e.g. "alice") for public access
-#     --frps-token TOKEN     shared frps auth token
-#     --frps-token-file FILE Read shared frps auth token from FILE
+#     --frps-token TOKEN     per-tenant tunnel token (goes in metadatas.token)
+#     --frps-token-file FILE Read per-tenant tunnel token from FILE
 #     --frps-server ADDR     frps server address (default: 163.192.33.32)
 #     --ssh-port PORT        SSH tunnel remote port (default: 6001)
 #     --domain DOMAIN        Tunnel domain (default: octos-cloud.org)
@@ -98,8 +98,8 @@ Optional features:
 Optional tunnel (frpc):
   --tunnel                 Enable optional frpc tunnel setup
   --tenant-name NAME       Tenant subdomain (e.g. "alice") for public access
-  --frps-token TOKEN       shared frps auth token
-  --frps-token-file FILE   Read shared frps auth token from FILE
+  --frps-token TOKEN       per-tenant tunnel token (goes in metadatas.token)
+  --frps-token-file FILE   Read per-tenant tunnel token from FILE
   --frps-server ADDR       frps server address (default: 163.192.33.32)
   --ssh-port PORT          SSH tunnel remote port (default: 6001)
   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
@@ -322,8 +322,13 @@ write_frpc_config() {
     cat > "$tmp" << EOF
 serverAddr = "${FRPS_SERVER}"
 serverPort = 7000
+
+# Both sides use empty auth.token so frps's built-in VerifyLogin passes;
+# the octos plugin authenticates the tenant via metadatas.token.
 auth.method = "token"
-auth.token = "${FRPS_TOKEN}"
+auth.token = ""
+metadatas.token = "${FRPS_TOKEN}"
+
 log.to = "/var/log/frpc.log"
 log.level = "info"
 log.maxDays = 7
@@ -1091,9 +1096,11 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
             fi
         fi
         if [ -z "$FRPS_TOKEN" ]; then
-            FRPS_TOKEN=$(grep 'auth.token' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            # Per-tenant tunnel token lives in metadatas.token (auth.token is
+            # intentionally empty — see tenant-frpc.toml.template).
+            FRPS_TOKEN=$(grep 'metadatas.token' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
             if [ -n "$FRPS_TOKEN" ]; then
-                ok "shared frps token from existing config: ${FRPS_TOKEN:0:8}..."
+                ok "per-tenant tunnel token from existing config: ${FRPS_TOKEN:0:8}..."
             fi
         fi
         if [ "$FRPS_SERVER" = "163.192.33.32" ]; then
@@ -1120,10 +1127,10 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
         [ -z "$TENANT_NAME" ] && err "Tenant name is required"
     fi
     if [ -z "$FRPS_TOKEN" ]; then
-        echo "    Enter the shared frps auth token:"
+        echo "    Enter the per-tenant tunnel token (from 'octos admin create-tenant'):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
-        [ -z "$FRPS_TOKEN" ] && err "shared frps token is required"
+        [ -z "$FRPS_TOKEN" ] && err "per-tenant tunnel token is required"
     fi
 
     validate_inputs
@@ -1139,7 +1146,7 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
     echo "    Tunnel configuration:"
     echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "      frps server:  ${FRPS_SERVER}:7000"
-    echo "      shared frps token: ${FRPS_TOKEN:0:8}..."
+    echo "      tunnel token: ${FRPS_TOKEN:0:8}..."
     echo "      SSH port:     ${SSH_PORT}"
 
     # Install frpc if missing
@@ -1529,7 +1536,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
 
     if [ -z "$TENANT_NAME" ] || [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Tunnel setup requires a tenant name, shared frps token, and SSH port."
+        echo "    Tunnel setup requires a tenant name, per-tenant tunnel token, and SSH port."
         echo "    If you don't have these yet, register at:"
         echo "      https://${TUNNEL_DOMAIN}"
         echo "    You'll receive your setup command with all values pre-filled."
@@ -1561,7 +1568,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
     if [ -z "$FRPS_TOKEN" ] && [ -n "$FRPS_TOKEN_FILE" ]; then
         if [ -f "$FRPS_TOKEN_FILE" ]; then
             FRPS_TOKEN=$(cat "$FRPS_TOKEN_FILE")
-            echo "    shared frps token loaded from $FRPS_TOKEN_FILE"
+            echo "    tunnel token loaded from $FRPS_TOKEN_FILE"
         else
             err "token file not found: $FRPS_TOKEN_FILE"
         fi
@@ -1569,7 +1576,7 @@ if [ "$ENABLE_TUNNEL" = true ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the shared frps auth token (press Enter to use placeholder):"
+        echo "    Enter the per-tenant tunnel token (press Enter to use placeholder):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
         if [ -z "$FRPS_TOKEN" ]; then
@@ -1587,9 +1594,9 @@ if [ "$ENABLE_TUNNEL" = true ]; then
     echo "      Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "      frps server:  ${FRPS_SERVER}:7000"
     if [ "$TOKEN_PLACEHOLDER" = true ]; then
-        echo "      shared frps token: CHANGE_ME (placeholder)"
+        echo "      tunnel token: CHANGE_ME (placeholder)"
     else
-        echo "      shared frps token: ${FRPS_TOKEN:0:8}..."
+        echo "      tunnel token: ${FRPS_TOKEN:0:8}..."
     fi
     echo "      SSH port:     ${SSH_PORT}"
     echo "      Local port:   ${PORT}"

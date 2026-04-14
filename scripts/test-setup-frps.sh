@@ -11,20 +11,17 @@ fail() {
 }
 
 main() {
-    grep -Fq 'FRPS_TOKEN="${FRPS_TOKEN:-$(openssl rand -hex 32)}"' "$SCRIPT" \
-        || fail "setup-frps.sh should define a shared FRPS token default"
-
     grep -Fq 'auth.method = "token"' "$SCRIPT" \
-        || fail "setup-frps.sh should enable native FRPS token auth"
+        || fail "setup-frps.sh should keep auth.method = token (plugin rewrites privilege_key)"
 
-    grep -Fq 'auth.token = "${FRPS_TOKEN}"' "$SCRIPT" \
-        || fail "setup-frps.sh should write the shared FRPS token into frps.toml"
+    grep -Fq 'auth.token = ""' "$SCRIPT" \
+        || fail "setup-frps.sh must leave auth.token empty so the plugin can rewrite privilege_key to md5(\"\" + ts)"
 
-    grep -Fq 'ops = ["NewProxy"]' "$SCRIPT" \
-        || fail "setup-frps.sh should only use the Octos plugin for NewProxy authorization"
+    grep -Fq 'ops = ["Login", "NewProxy"]' "$SCRIPT" \
+        || fail "setup-frps.sh must route Login AND NewProxy through the Octos plugin"
 
-    if grep -Fq 'ops = ["Login", "NewProxy"]' "$SCRIPT"; then
-        fail "setup-frps.sh should not route Login through the Octos plugin anymore"
+    if grep -Eq 'FRPS_TOKEN=.*openssl rand' "$SCRIPT"; then
+        fail "setup-frps.sh should not generate a shared FRPS token (per-tenant tokens only)"
     fi
 
     echo "setup-frps tests passed"

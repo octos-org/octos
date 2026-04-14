@@ -93,8 +93,8 @@ OPTIONAL FEATURES
 OPTIONAL TUNNEL (frpc)
   -Tunnel                Enable optional frpc tunnel
   -TenantName <name>     Tenant subdomain (e.g. "alice") for public access
-  -FrpsToken <token>     shared frps auth token
-  -FrpsTokenFile <file>  Read shared frps auth token from file
+  -FrpsToken <token>     per-tenant tunnel token (goes in metadatas.token)
+  -FrpsTokenFile <file>  Read per-tenant tunnel token from file
   -FrpsServer <addr>     frps server address (default: 163.192.33.32)
   -SshPort <port>        SSH tunnel remote port (default: 6001)
   -TunnelDomain <domain> Tunnel domain (default: octos-cloud.org)
@@ -217,7 +217,8 @@ function Write-FrpcConfig {
 serverAddr = "$FrpsServer"
 serverPort = 7000
 auth.method = "token"
-auth.token = "$FrpsToken"
+auth.token = ""
+metadatas.token = "$FrpsToken"
 log.to = "$($FrpcLog -replace '\\', '/')"
 log.level = "info"
 log.maxDays = 7
@@ -303,7 +304,7 @@ function Invoke-TunnelPrompts {
 
     if (-not $script:TenantName -or -not $script:FrpsToken) {
         Write-Host ""
-        Write-Host "    Tunnel setup requires a tenant name, shared frps token, and SSH port."
+        Write-Host "    Tunnel setup requires a tenant name, per-tenant tunnel token, and SSH port."
         Write-Host "    If you don't have these yet, register at:"
         Write-Host "      https://$TunnelDomain"
         Write-Host "    You'll receive your setup command with all values pre-filled."
@@ -333,7 +334,7 @@ function Invoke-TunnelPrompts {
 
     if (-not $script:FrpsToken) {
         Write-Host ""
-        Write-Host "    Enter the shared frps auth token (press Enter to use placeholder):"
+        Write-Host "    Enter the per-tenant tunnel token (press Enter to use placeholder):"
         $userInput = Read-Host "    > "
         if ($userInput) {
             $script:FrpsToken = $userInput
@@ -352,9 +353,9 @@ function Invoke-TunnelPrompts {
     Write-Host "      Tenant:       $($script:TenantName).$TunnelDomain"
     Write-Host "      frps server:  ${FrpsServer}:7000"
     if ($script:TokenPlaceholder) {
-        Write-Host "      shared frps token: CHANGE_ME (placeholder)"
+        Write-Host "      tunnel token: CHANGE_ME (placeholder)"
     } else {
-        Write-Host "      shared frps token: $($script:FrpsToken.Substring(0, [Math]::Min(8, $script:FrpsToken.Length)))..."
+        Write-Host "      tunnel token: $($script:FrpsToken.Substring(0, [Math]::Min(8, $script:FrpsToken.Length)))..."
     }
     Write-Host "      SSH port:     $SshPort"
     Write-Host "      Local port:   $Port"
@@ -400,9 +401,11 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
                 Ok "tunnel domain from existing config: $TunnelDomain"
             }
         }
-        if (-not $FrpsToken -and $existingConfig -match 'auth\.token\s*=\s*"([^"]+)"') {
+        # Per-tenant tunnel token lives in metadatas.token (auth.token is
+        # intentionally empty — see tenant-frpc.toml.template).
+        if (-not $FrpsToken -and $existingConfig -match 'metadatas\.token\s*=\s*"([^"]+)"') {
             $FrpsToken = $Matches[1]
-            Ok "shared frps token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
+            Ok "per-tenant tunnel token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
         }
         if ($FrpsServer -eq "163.192.33.32" -and $existingConfig -match 'serverAddr\s*=\s*"([^"]+)"') {
             $existingFrpsServer = $Matches[1]

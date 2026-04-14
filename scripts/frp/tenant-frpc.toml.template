@@ -3,7 +3,7 @@
 # Placeholders (replaced by setup-frpc.sh or octos admin):
 #   {{FRPS_SERVER}}    — VPS hostname or IP
 #   {{FRPS_PORT}}      — frps control port (default: 7000)
-#   {{FRPS_TOKEN}}     — Shared FRPS auth token from the cloud host
+#   {{FRPS_TOKEN}}     — Per-tenant tunnel token (goes in metadatas.token)
 #   {{SUBDOMAIN}}      — Tenant subdomain (e.g. "alice")
 #   {{LOCAL_PORT}}     — Local octos serve port (default: 8080)
 #   {{SSH_REMOTE_PORT}} — Allocated SSH tunnel port (e.g. 6001)
@@ -12,8 +12,12 @@
 serverAddr = "{{FRPS_SERVER}}"
 serverPort = {{FRPS_PORT}}
 
+# Both sides use empty auth.token so frps's built-in VerifyLogin passes
+# without any content rewriting. The octos plugin authenticates the tenant
+# via metadatas.token below.
 auth.method = "token"
-auth.token = "{{FRPS_TOKEN}}"
+auth.token = ""
+metadatas.token = "{{FRPS_TOKEN}}"
 
 # Logging
 log.to = "/var/log/frpc.log"

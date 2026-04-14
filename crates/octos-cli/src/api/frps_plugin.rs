@@ -1,9 +1,16 @@
 //! frps server plugin handler for per-tenant tunnel authorization.
 //!
 //! frps sends HTTP requests to this endpoint for Login and NewProxy operations.
-//! Login verifies the client's `privilege_key` (MD5 of tenant token + timestamp)
-//! against all registered tenants, caching the `run_id → tenant_id` mapping.
-//! NewProxy cross-checks the cached tenant against the requested resource.
+//! Login authenticates the tenant via `metadatas.token` (set in frpc.toml),
+//! then caches the `run_id → tenant_id` mapping. NewProxy cross-checks the
+//! cached tenant against the requested subdomain or SSH port.
+//!
+//! Both frps and frpc set `auth.token = ""` so frps's built-in VerifyLogin is
+//! a trivial no-op md5("" + ts) match — it cannot carry the per-tenant secret,
+//! which is why the token rides in metadatas instead. Returning `unchange:true`
+//! and not rewriting the Login content is the same pattern used by production
+//! plugins like frp-auth-plugin; rewriting content (`unchange:false`) passes
+//! VerifyLogin but breaks the control session post-login.
 //!
 //! Protocol: <https://github.com/fatedier/frp/blob/dev/doc/server_plugin.md>
 
@@ -14,7 +21,6 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -60,15 +66,16 @@ impl PluginResponse {
 /// Login content from frps — sent when a client connects.
 #[derive(Debug, Deserialize)]
 struct LoginContent {
-    /// MD5(auth.token + timestamp) computed by the frpc client.
-    #[serde(default)]
-    privilege_key: String,
     /// Unix timestamp sent by frpc (integer or string depending on frp version).
     #[serde(default, deserialize_with = "deserialize_timestamp")]
     timestamp: String,
     /// Unique identifier for this frpc session.
     #[serde(default)]
     run_id: String,
+    /// Tenant metadata from `metadatas` in frpc.toml (wire field: `metas`).
+    /// We expect `metas.token = <per-tenant-uuid>`.
+    #[serde(default)]
+    metas: std::collections::HashMap<String, String>,
 }
 
 fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -131,6 +138,10 @@ pub async fn frps_auth(
 
     match req.op.as_str() {
         "Login" => {
+            // Per-tenant auth via metadatas.token — both frps and frpc set
+            // `auth.token = ""`, so the built-in token check is a trivial
+            // md5("" + ts) == md5("" + ts) match and we never need to modify
+            // the Login content. Tenant identity rides in `metas.token`.
             let content: LoginContent = serde_json::from_value(req.content).map_err(|e| {
                 tracing::warn!(error = %e, "frps Login: invalid request content");
                 (
@@ -152,6 +163,21 @@ pub async fn frps_auth(
                 ));
             }
 
+            let Some(client_token) = content.metas.get("token") else {
+                tracing::warn!("frps Login: missing metadatas.token");
+                return Err((
+                    StatusCode::OK,
+                    Json(PluginResponse::deny("authentication failed")),
+                ));
+            };
+            if client_token.is_empty() {
+                tracing::warn!("frps Login: empty metadatas.token");
+                return Err((
+                    StatusCode::OK,
+                    Json(PluginResponse::deny("authentication failed")),
+                ));
+            }
+
             let tenants = store.list().map_err(|e| {
                 tracing::error!(error = %e, "frps Login: failed to list tenants");
                 (
@@ -160,28 +186,32 @@ pub async fn frps_auth(
                 )
             })?;
 
-            let client_key_bytes = content.privilege_key.as_bytes();
+            let client_token_bytes = client_token.as_bytes();
             for tenant in &tenants {
                 if tenant.tunnel_token.is_empty() {
                     continue;
                 }
-                let mut hasher = Md5::new();
-                hasher.update(format!("{}{}", tenant.tunnel_token, content.timestamp));
-                let expected = format!("{:x}", hasher.finalize());
-                if expected.as_bytes().ct_eq(client_key_bytes).into() {
+                if tenant
+                    .tunnel_token
+                    .as_bytes()
+                    .ct_eq(client_token_bytes)
+                    .into()
+                {
                     tracing::info!(
                         tenant = %tenant.id,
                         run_id = %content.run_id,
                         "frps Login: authenticated"
                     );
-                    state
-                        .run_id_cache
-                        .insert(content.run_id, tenant.id.clone(), RUN_ID_CACHE_TTL);
+                    state.run_id_cache.insert(
+                        content.run_id.clone(),
+                        tenant.id.clone(),
+                        RUN_ID_CACHE_TTL,
+                    );
                     return Ok(Json(PluginResponse::allow()));
                 }
             }
 
-            tracing::warn!("frps Login: no tenant matched privilege_key");
+            tracing::warn!("frps Login: no tenant matched metadatas.token");
             Err((
                 StatusCode::OK,
                 Json(PluginResponse::deny("authentication failed")),
@@ -330,15 +360,21 @@ mod tests {
     use axum::extract::State;
     use axum::http::StatusCode;
     use chrono::Utc;
-    use md5::{Digest, Md5};
     use serde_json::{Value, json};
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    fn compute_privilege_key(token: &str, timestamp: i64) -> String {
-        let mut hasher = Md5::new();
-        hasher.update(format!("{token}{timestamp}"));
-        format!("{:x}", hasher.finalize())
+    /// Build a Login content payload in the shape frps sends. The per-tenant
+    /// secret rides in `metas.token`; `privilege_key` and `auth.token` are
+    /// empty on both sides, so frps's built-in VerifyLogin is a trivial match.
+    fn login_content(tenant_token: &str, run_id: &str, timestamp: i64) -> Value {
+        json!({
+            "version": "0.65.0",
+            "privilege_key": "",
+            "timestamp": timestamp,
+            "run_id": run_id,
+            "metas": { "token": tenant_token },
+        })
     }
 
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
@@ -418,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_reject_login_with_arbitrary_shared_token() {
+    async fn should_reject_login_missing_metadatas_token() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -431,7 +467,9 @@ mod tests {
             json!({
                 "op": "Login",
                 "content": {
-                    "privilege_key": "shared-host-token"
+                    "timestamp": Utc::now().timestamp(),
+                    "run_id": "run-no-metas",
+                    "version": "0.65.0"
                 }
             }),
         )
@@ -569,18 +607,12 @@ mod tests {
         let (base_url, server) = spawn_test_server(state).await;
 
         let timestamp = Utc::now().timestamp();
-        let privilege_key = compute_privilege_key(&saved.tunnel_token, timestamp);
 
         let (login_status, login_body) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": timestamp.to_string(),
-                    "run_id": "run-created-alice",
-                    "version": "0.65.0"
-                }
+                "content": login_content(&saved.tunnel_token, "run-created-alice", timestamp),
             }),
         )
         .await;
@@ -623,7 +655,7 @@ mod tests {
     // ── Per-tenant token (v2) tests ─────────────────────────────────
 
     #[tokio::test]
-    async fn should_allow_login_when_privilege_key_matches_tenant_token() {
+    async fn should_allow_login_when_metadatas_token_matches_tenant() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -632,29 +664,26 @@ mod tests {
         let (base_url, server) = spawn_test_server(state).await;
 
         let timestamp = Utc::now().timestamp();
-        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
-
         let (status, body) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": timestamp.to_string(),
-                    "run_id": "run-alice-001",
-                    "version": "0.65.0"
-                }
+                "content": login_content("per-tenant-secret-alice", "run-alice-001", timestamp),
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        // Plugin must return unchange=true so frps uses the original Login
+        // content — this is the pattern used by production frp auth plugins
+        // (frp-auth-plugin). Attempting to rewrite content (unchange=false)
+        // works for VerifyLogin but breaks the control session post-login.
         assert_eq!(body, json!({"reject": false, "unchange": true}));
 
         server.abort();
     }
 
     #[tokio::test]
-    async fn should_deny_login_when_privilege_key_matches_no_tenant() {
+    async fn should_deny_login_when_metadatas_token_matches_no_tenant() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(&dir);
         let store = state.tenant_store.as_ref().unwrap().clone();
@@ -663,25 +692,18 @@ mod tests {
         let (base_url, server) = spawn_test_server(state).await;
 
         let timestamp = Utc::now().timestamp();
-        let privilege_key = compute_privilege_key("wrong-token", timestamp);
-
         let (status, body) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": timestamp.to_string(),
-                    "run_id": "run-mallory-001",
-                    "version": "0.65.0"
-                }
+                "content": login_content("wrong-token", "run-mallory-001", timestamp),
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             body["reject"].as_bool().unwrap(),
-            "should reject unknown token"
+            "should reject unknown metadatas.token"
         );
 
         server.abort();
@@ -696,19 +718,16 @@ mod tests {
 
         let (base_url, server) = spawn_test_server(state).await;
 
-        let stale_timestamp = Utc::now().timestamp() - 16 * 60; // 16 minutes ago
-        let privilege_key = compute_privilege_key("per-tenant-secret-alice", stale_timestamp);
-
+        let stale_timestamp = Utc::now().timestamp() - 16 * 60;
         let (status, body) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": stale_timestamp.to_string(),
-                    "run_id": "run-replay-001",
-                    "version": "0.65.0"
-                }
+                "content": login_content(
+                    "per-tenant-secret-alice",
+                    "run-replay-001",
+                    stale_timestamp,
+                ),
             }),
         )
         .await;
@@ -731,19 +750,13 @@ mod tests {
         let (base_url, server) = spawn_test_server(state).await;
 
         let timestamp = Utc::now().timestamp();
-        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
 
         // Login first — should cache run_id → alice
         let (login_status, _) = post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": timestamp.to_string(),
-                    "run_id": "run-alice-002",
-                    "version": "0.65.0"
-                }
+                "content": login_content("per-tenant-secret-alice", "run-alice-002", timestamp),
             }),
         )
         .await;
@@ -779,19 +792,13 @@ mod tests {
         let (base_url, server) = spawn_test_server(state).await;
 
         let timestamp = Utc::now().timestamp();
-        let privilege_key = compute_privilege_key("per-tenant-secret-alice", timestamp);
 
         // Login as alice
         post_plugin(
             &base_url,
             json!({
                 "op": "Login",
-                "content": {
-                    "privilege_key": privilege_key,
-                    "timestamp": timestamp.to_string(),
-                    "run_id": "run-alice-003",
-                    "version": "0.65.0"
-                }
+                "content": login_content("per-tenant-secret-alice", "run-alice-003", timestamp),
             }),
         )
         .await;
