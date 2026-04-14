@@ -701,25 +701,23 @@ pub async fn delete_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
         let key = standalone_api_session_key(&headers, &id);
         let mut sess = sessions.lock().await;
-        return match sess.clear(&key).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "delete session failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-        };
+        if let Err(e) = sess.clear(&key).await {
+            tracing::error!(error = %e, "delete session from standalone store failed");
+        }
     }
 
-    // Proxy to gateway
+    // Also proxy delete to gateway — sessions may live in the gateway's
+    // SessionManager (per-profile data dir), not just the serve process's store.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let path = format!("/sessions/{id}");
-        return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+        let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
 
-    (StatusCode::SERVICE_UNAVAILABLE, "Sessions not available").into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
