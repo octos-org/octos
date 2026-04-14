@@ -37,25 +37,15 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 
 All three paths are valid. The easiest is Octos Cloud signup, but the self-hosted modes are first-class as well.
 
-```mermaid
-flowchart TD
-    A[Choose how to run Octos]
-    A --> B[1. Octos Cloud signup]
-    A --> C[2. Self-hosted local]
-    A --> D[3. Self-hosted cloud + tenant pair]
+| Option | Machines involved | Public internet access | Who manages the infrastructure | Best fit |
+| --- | --- | --- | --- | --- |
+| **1. Octos Cloud signup** | Your device + Octos Cloud | Yes | Octos Cloud + you | Fastest path |
+| **2. Self-hosted local-only** | One machine | No | You | Local/private use |
+| **3. Self-hosted cloud + tenant pair** | Your VPS + your device | Yes | You | Full self-hosting with remote access |
 
-    B --> B1[Hosted portal]
-    B --> B2[Your device runs Octos]
-    B --> B3[Public access from anywhere]
+Visual overview:
 
-    C --> C1[One machine]
-    C --> C2[Local network only]
-    C --> C3[Can upgrade later]
-
-    D --> D1[VPS runs cloud host]
-    D --> D2[Your device runs tenant]
-    D --> D3[Cloudflare or equivalent provides public HTTPS]
-```
+<img src="images/octos-options.jpg" alt="Three ways to run Octos: Octos Cloud signup, self-hosted local-only, and self-hosted cloud plus tenant pair" width="100%" />
 
 ### Option 1: Sign up on Octos Cloud
 
@@ -72,7 +62,7 @@ When you click `Send Code` on the portal, check your Spam folder if the email do
 
 After signup, the portal shows your node details, public URL, and the setup command to run on your device:
 
-![Octos Cloud signup response](images/octos-reg-ss.png)
+<img src="images/octos-reg-ss.png" alt="Octos Cloud signup response" width="50%" />
 
 This path is the best choice if you want:
 
