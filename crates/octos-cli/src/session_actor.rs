@@ -976,6 +976,7 @@ impl ActorFactory {
                 );
             }
         }
+        let slides_generation_available = !is_slides || tools.get("mofa_slides").is_some();
 
         if is_site {
             let topic = session_key.topic().unwrap_or("site");
@@ -1007,6 +1008,14 @@ impl ActorFactory {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        if is_slides && !slides_generation_available {
+            system_prompt.push_str(
+                "\n\n## Slides Generation Availability\n\n\
+                 `mofa_slides` is not available on this host. You may still design and edit slide projects, \
+                 but you must tell the user that PPTX/image generation is unavailable here. \
+                 Do NOT retry generation via shell, run_pipeline, or alternative binaries.",
+            );
+        }
         if has_deferred {
             let groups = tools.deferred_groups();
             let mut tool_names = Vec::new();

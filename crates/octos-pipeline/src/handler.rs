@@ -301,6 +301,18 @@ impl Handler for CodergenHandler {
             );
         }
 
+        #[cfg(windows)]
+        {
+            system_prompt.push_str(
+                "\n\nWINDOWS RUNTIME RULES:\n\
+                 - You are running on Windows.\n\
+                 - If you use shell, write cmd.exe-compatible commands only.\n\
+                 - Do NOT use Unix-only commands like `ps`, `grep`, `head`, `rm`, `ls`, `cat`, `which`, or `bash`.\n\
+                 - Prefer built-in tools over shell whenever possible.\n\
+                 - If a required tool or binary is unavailable on this host, state that explicitly and stop instead of retrying via shell.",
+            );
+        }
+
         // Create and run the agent.
         // When max_output_tokens is not set in the DOT graph, use the
         // provider's actual max output capability instead of the global

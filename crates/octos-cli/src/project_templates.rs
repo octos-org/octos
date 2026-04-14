@@ -126,6 +126,15 @@ pub fn slides_creation_reply(project_name: &str) -> String {
 /// Generate the slides-specific system prompt for a session.
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
+    let delete_cached_png_instruction = if cfg!(windows) {
+        format!(
+            "  shell(\"if exist slides/{slug}/output/imgs/slide-NN.png del /q slides\\\\{slug}\\\\output\\\\imgs\\\\slide-NN.png\") for each changed slide N"
+        )
+    } else {
+        format!(
+            "  shell(\"rm -f slides/{slug}/output/imgs/slide-NN.png\") for each changed slide N"
+        )
+    };
     format!(
         r#"You are a slides designer for the "{project_name}" project.
 Project dir: slides/{slug}/
@@ -145,6 +154,7 @@ RULES:
 - ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
+- If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
 - Read slides/{slug}/memory.md before each response for context.
 - Workspace policy lives at slides/{slug}/.octos-workspace.toml.
 - Maintain a version header at the top of slides/{slug}/script.js:
@@ -197,7 +207,7 @@ Custom styles persist in styles/ and appear as templates for future projects.
 INCREMENTAL UPDATES:
 - script.js is the SINGLE SOURCE OF TRUTH — never recreate, always edit
 - To update slides: read → edit changed slides only → delete their cached PNGs → regenerate
-  shell("rm -f slides/{slug}/output/imgs/slide-NN.png") for each changed slide N
+{delete_cached_png_instruction}
   (slide-01.png = slides[0], slide-02.png = slides[1], etc.)
 - Skipping PNG deletion causes mofa to reuse stale images
 - New slides need no PNG deletion (no cache yet)
@@ -206,10 +216,10 @@ TASK STATUS CHECK:
 When user asks about progress ("做完了吗", "done?", "status"):
   glob("slides/{slug}/output/imgs/slide-*.png") to count generated slides
   glob("slides/{slug}/output/*.pptx") to check if PPTX exists
-  shell("ps aux | grep mofa_slides | grep -v grep") to check if still generating
-Report: X/N slides done, PPTX ready/not ready, generation running/finished.
+  check_background_tasks({{"include_completed": true}}) to inspect the current session's background task state
+Report: X/N slides done, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state.
 
-Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file
+Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks
 "#
     )
 }
@@ -943,6 +953,14 @@ mod tests {
         assert!(reply.unwrap().contains("untitled"));
         // Scaffolding happens in session_actor, not here
         assert!(!tmp.path().join("slides/untitled/script.js").is_file());
+    }
+
+    #[test]
+    fn slides_prompt_uses_supervisor_for_status_checks() {
+        let prompt = slides_system_prompt("Deck");
+        assert!(prompt.contains("check_background_tasks"));
+        assert!(prompt.contains("If `mofa_slides` is not available"));
+        assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));
     }
 
     #[test]
