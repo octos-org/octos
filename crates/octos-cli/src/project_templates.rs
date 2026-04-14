@@ -217,13 +217,15 @@ INCREMENTAL UPDATES:
 
 TASK STATUS CHECK:
 When user asks about progress ("做完了吗", "done?", "status"):
-  use the workspace contract as the definition of ready/not-ready
-  glob("slides/{slug}/output/imgs/slide-*.png") to count generated slides
-  glob("slides/{slug}/output/*.pptx") to check if PPTX exists
-  check_background_tasks({{"include_completed": true}}) to inspect the current session's background task state
-Report: X/N slides done, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state.
+  use check_background_tasks({{"include_completed": true}}) to inspect the current session's execution state
+  use check_workspace_contract({{"project": "slides/{slug}"}}) to inspect deliverable truth
+  task state tells you what happened in execution
+  workspace state tells you what is true about the deliverable
+  treat the workspace contract as the definition of ready/not-ready
+  count generated slides from the contract's preview artifact matches
+Report: X previews present, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state, and list any failed contract checks or missing artifacts.
 
-Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks
+Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks, check_workspace_contract
 "#
     )
 }
@@ -960,12 +962,16 @@ mod tests {
     }
 
     #[test]
-    fn slides_prompt_uses_supervisor_for_status_checks() {
+    fn slides_prompt_uses_task_and_workspace_state_for_status_checks() {
         let prompt = slides_system_prompt("Deck");
         assert!(prompt.contains("check_background_tasks"));
+        assert!(prompt.contains("check_workspace_contract"));
+        assert!(prompt.contains("task state tells you what happened in execution"));
+        assert!(prompt.contains("workspace state tells you what is true about the deliverable"));
         assert!(prompt.contains("If `mofa_slides` is not available"));
         assert!(prompt.contains("Runtime owns workspace contract enforcement"));
         assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
+        assert!(!prompt.contains("glob(\"slides/{slug}/output/*.pptx\")"));
         assert!(!prompt.contains("On every meaningful edit: increment NNN"));
         assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));
     }

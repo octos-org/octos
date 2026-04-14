@@ -215,6 +215,7 @@ pub mod activate_tools;
 pub mod admin;
 pub mod browser;
 pub mod check_background_tasks;
+pub mod check_workspace_contract;
 pub mod tool_config;
 pub mod workspace_history;
 
@@ -247,6 +248,7 @@ pub use write_file::WriteFileTool;
 pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
+pub use check_workspace_contract::CheckWorkspaceContractTool;
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use workspace_history::{WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool};
 

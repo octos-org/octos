@@ -14,9 +14,10 @@ use crate::task_supervisor::TaskSupervisor;
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
-    ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
+    BrowserTool, CheckWorkspaceContractTool, ConfigureToolTool, DiffEditTool, EditFileTool,
+    GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle,
+    ToolResult, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -626,6 +627,7 @@ impl ToolRegistry {
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
+        registry.register(CheckWorkspaceContractTool::new(cwd));
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
@@ -647,6 +649,7 @@ impl ToolRegistry {
         "glob",
         "grep",
         "list_dir",
+        "check_workspace_contract",
         "workspace_log",
         "workspace_show",
         "workspace_diff",
@@ -673,6 +676,7 @@ impl ToolRegistry {
         registry.register(GlobTool::new(cwd));
         registry.register(GrepTool::new(cwd));
         registry.register(ListDirTool::new(cwd));
+        registry.register(CheckWorkspaceContractTool::new(cwd));
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
         registry.register(WorkspaceDiffTool::new(cwd));
