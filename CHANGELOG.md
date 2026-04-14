@@ -3,6 +3,11 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
+### Changed
+
+- Per-tenant frps tunnel authentication via `metadatas.token`. Each tenant now has its own `tunnel_token` (UUID generated at registration) validated by the octos frps server plugin; the previous shared FRPS auth token is no longer needed and `auth.token` is set to `""` on both frps and frpc. `scripts/install.sh` and `scripts/install.ps1` recover the per-tenant token from an existing `/etc/frp/frpc.toml` on rerun and have updated prompt wording to reflect the per-tenant model.
+- README "Quick Start" restructured into a three-step cloud-deployment walkthrough (VPS bootstrap → portal registration → tenant install) with explicit uninstall instructions for both cloud and tenant machines. The developer build flow moved under a new "Build from source" heading.
+
 ## [0.1.1] - 2026-04-07
 
 ### Highlights
