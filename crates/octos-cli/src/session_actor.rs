@@ -963,6 +963,11 @@ impl ActorFactory {
                         }
                     }
                 }
+                let cyberpunk_alias = ws_styles.join("cyberpunk-neon.toml");
+                let blade_runner = ws_styles.join("nb-br.toml");
+                if !cyberpunk_alias.exists() && blade_runner.is_file() {
+                    std::fs::copy(&blade_runner, &cyberpunk_alias).ok();
+                }
             } else {
                 warn!(
                     session = %session_key,
@@ -2499,6 +2504,25 @@ impl SessionActor {
                                 continue;
                             }
                             let elapsed = started.elapsed();
+
+                            if self.queue_mode == QueueMode::Interrupt {
+                                // Interrupt mode: abort the primary agent task
+                                // so the new message can be processed immediately.
+                                info!(
+                                    session = %self.session_key,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    "interrupt: aborting primary task for new message"
+                                );
+                                agent_task.abort();
+                                self.cancelled.store(true, Ordering::Release);
+
+                                // Process the interrupting message as overflow
+                                // (same as speculative, but the primary is now dead)
+                                self.serve_overflow(&message, &overflow_history);
+                                overflow_served = true;
+                                continue;
+                            }
+
                             info!(
                                 session = %self.session_key,
                                 elapsed_ms = elapsed.as_millis(),

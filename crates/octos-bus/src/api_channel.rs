@@ -53,6 +53,8 @@ struct ChatRequest {
     message: String,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
     /// File paths from prior upload.
     #[serde(default)]
     media: Vec<String>,
@@ -586,9 +588,18 @@ async fn handle_chat(
         content: req.message,
         timestamp: Utc::now(),
         media: req.media,
-        metadata: match req.target_profile_id.filter(|value| !value.is_empty()) {
-            Some(profile_id) => serde_json::json!({ "target_profile_id": profile_id }),
-            None => serde_json::json!({}),
+        metadata: {
+            let mut metadata = serde_json::Map::new();
+            if let Some(profile_id) = req.target_profile_id.filter(|value| !value.is_empty()) {
+                metadata.insert(
+                    "target_profile_id".to_string(),
+                    serde_json::Value::String(profile_id),
+                );
+            }
+            if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
+                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
+            }
+            serde_json::Value::Object(metadata)
         },
         message_id: None,
     };
@@ -669,12 +680,21 @@ fn default_limit() -> usize {
 }
 
 fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
-    SessionKey::with_profile(
+    current_profile_api_session_key_with_topic(profile_id, chat_id, None)
+}
+
+fn current_profile_api_session_key_with_topic(
+    profile_id: Option<&str>,
+    chat_id: &str,
+    topic: Option<&str>,
+) -> SessionKey {
+    SessionKey::with_profile_topic(
         profile_id
             .filter(|value| !value.is_empty())
             .unwrap_or(MAIN_PROFILE_ID),
         "api",
         chat_id,
+        topic.unwrap_or_default(),
     )
 }
 
@@ -773,11 +793,13 @@ fn message_info_from_history_message(message: &Message, data_dir: &Path) -> Mess
 async fn handle_session_status(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     let pending = state.pending.lock().await;
     let active = pending.contains_key(&id);
     Json(serde_json::json!({
         "active": active,
+        "topic": params.topic,
     }))
     .into_response()
 }
@@ -786,11 +808,16 @@ async fn handle_session_status(
 async fn handle_session_tasks(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = current_profile_api_session_key(state.profile_id.as_deref(), &id);
+    let session_key = current_profile_api_session_key_with_topic(
+        state.profile_id.as_deref(),
+        &id,
+        params.topic.as_deref(),
+    );
     let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
@@ -1028,11 +1055,7 @@ async fn handle_admin_shell(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("x-auth-token")
-                .and_then(|v| v.to_str().ok())
-        })
+        .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
 
     // Check channel-level token, env var, then config.json auth_token.
@@ -1040,7 +1063,11 @@ async fn handle_admin_shell(
         .auth_token
         .clone()
         .filter(|t| !t.is_empty())
-        .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok().filter(|t| !t.is_empty()))
+        .or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
         .or_else(|| {
             // Try OCTOS_DATA_DIR, then ~/.octos, then cwd/.octos
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1049,7 +1076,9 @@ async fn handle_admin_shell(
                 format!("{home}/.octos"),
             ];
             for dir in &candidates {
-                if dir.is_empty() { continue; }
+                if dir.is_empty() {
+                    continue;
+                }
                 if let Ok(s) = std::fs::read_to_string(format!("{dir}/config.json")) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                         if let Some(t) = v.get("auth_token").and_then(|t| t.as_str()) {
@@ -1103,7 +1132,10 @@ async fn handle_admin_shell(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn failed: {e}"),
+            )
                 .into_response();
         }
     };
@@ -1116,7 +1148,10 @@ async fn handle_admin_shell(
             timed_out: false,
         })
         .into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("exec failed: {e}"))
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("exec failed: {e}"),
+        )
             .into_response(),
         Err(_) => Json(ShellResponse {
             stdout: String::new(),
@@ -1150,6 +1185,17 @@ mod tests {
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.message, "hello");
         assert!(req.session_id.is_none());
+        assert!(req.topic.is_none());
+    }
+
+    #[test]
+    fn chat_request_deserialize_with_topic() {
+        let json =
+            r#"{"message": "hello", "session_id": "slides-123", "topic": "slides untitled"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "hello");
+        assert_eq!(req.session_id.as_deref(), Some("slides-123"));
+        assert_eq!(req.topic.as_deref(), Some("slides untitled"));
     }
 
     #[test]

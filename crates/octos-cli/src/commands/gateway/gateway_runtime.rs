@@ -1407,7 +1407,19 @@ impl GatewayRuntime {
                 "",
             );
             let base_key_str = base_session_key.base_key().to_string();
-            let session_key = {
+            let explicit_topic = inbound
+                .metadata
+                .get("topic")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let session_key = if let Some(topic) = explicit_topic {
+                build_profiled_session_key(
+                    dispatch_profile_id.as_deref(),
+                    &inbound.channel,
+                    &inbound.chat_id,
+                    topic,
+                )
+            } else {
                 let store = self.active_sessions.read().await;
                 store.resolve_session_key(&base_key_str)
             };
