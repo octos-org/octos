@@ -284,9 +284,9 @@ impl Tool for RunPipelineTool {
             .join("\n");
 
         // Find the report file from this pipeline run's actual files_modified.
-        // The session actor auto-delivers .md files via file_modified on ToolResult,
-        // so no LLM instruction needed.
-        // Ensure absolute path so session actor can find and deliver the file.
+        // Delivery is driven by files_to_send on ToolResult, so no LLM instruction
+        // or session-level markdown heuristics are needed.
+        // Ensure absolute path so the execution loop can find and deliver the file.
         let report_file = result
             .files_modified
             .iter()
