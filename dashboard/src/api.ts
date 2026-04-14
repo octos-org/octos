@@ -130,7 +130,7 @@ export const api = {
   listSubAccounts: (parentId: string) =>
     request<ProfileResponse[]>(`/profiles/${parentId}/accounts`),
 
-  createSubAccount: (parentId: string, data: { sub_account_id?: string; name: string; public_subdomain?: string | null; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
+  createSubAccount: (parentId: string, data: { sub_account_id: string; name: string; public_subdomain: string; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
     request<ProfileResponse>(`/profiles/${parentId}/accounts`, {
       method: 'POST',
       body: JSON.stringify(data),
@@ -272,7 +272,7 @@ export const myApi = {
   getSubAccount: (id: string) =>
     authedRequest<ProfileResponse>(`/my/profile/accounts/${id}`),
 
-  createSubAccount: (data: { sub_account_id?: string; name: string; public_subdomain?: string | null; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
+  createSubAccount: (data: { sub_account_id: string; name: string; public_subdomain: string; email?: string; channels?: any[]; system_prompt?: string; env_vars?: Record<string, string> }) =>
     authedRequest<ProfileResponse>('/my/profile/accounts', {
       method: 'POST',
       body: JSON.stringify(data),

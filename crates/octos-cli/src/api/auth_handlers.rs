@@ -73,10 +73,7 @@ fn is_local_request_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn resolve_routed_profile_id_candidate(
-    state: &AppState,
-    candidate: &str,
-) -> Option<String> {
+fn resolve_routed_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
     let candidate = candidate.trim();
     if candidate.is_empty()
         || matches!(
@@ -1444,11 +1441,14 @@ pub async fn my_sub_accounts(
     let mut items = Vec::with_capacity(subs.len());
     for s in subs {
         let status = pm.status(&s.id).await;
-        items.push(crate::api::admin::ProfileResponse {
-            email: None,
-            profile: crate::profiles::mask_secrets(&s),
-            status,
-        });
+        items.push(
+            crate::api::admin::ProfileResponse {
+                email: None,
+                profile: crate::profiles::mask_secrets(&s),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        );
     }
     Ok(Json(items))
 }
@@ -1481,11 +1481,14 @@ pub async fn my_sub_account(
 
     let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
     let status = pm.status(&sub.id).await;
-    Ok(Json(crate::api::admin::ProfileResponse {
-        email: None,
-        profile: crate::profiles::mask_secrets(&sub),
-        status,
-    }))
+    Ok(Json(
+        crate::api::admin::ProfileResponse {
+            email: None,
+            profile: crate::profiles::mask_secrets(&sub),
+            status,
+        }
+        .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 /// POST /api/my/profile/accounts — Create a sub-account owned by the current user.
@@ -1532,8 +1535,7 @@ pub async fn create_my_sub_account(
     if let Some(email) = &req.email {
         let email = email.trim().to_lowercase();
         if !email.is_empty() {
-            super::admin::validate_email(&email)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             if let Some(user_store) = state.user_store.as_ref() {
                 if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
                     return Err((
@@ -1559,11 +1561,14 @@ pub async fn create_my_sub_account(
     let status = pm.status(&sub.id).await;
     Ok((
         StatusCode::CREATED,
-        Json(crate::api::admin::ProfileResponse {
-            email: None,
-            profile: crate::profiles::mask_secrets(&sub),
-            status,
-        }),
+        Json(
+            crate::api::admin::ProfileResponse {
+                email: None,
+                profile: crate::profiles::mask_secrets(&sub),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        ),
     ))
 }
 
@@ -1627,8 +1632,7 @@ pub async fn update_my_sub_account(
     if let Some(email) = &req.email {
         let email = email.trim().to_lowercase();
         if !email.is_empty() {
-            super::admin::validate_email(&email)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             if let Some(user_store) = state.user_store.as_ref() {
                 if let Ok(Some(existing)) = user_store.get_by_email(&email) {
                     if existing.id != sub_id {
@@ -1661,11 +1665,14 @@ pub async fn update_my_sub_account(
     }
 
     let status = pm.status(&sub.id).await;
-    Ok(Json(crate::api::admin::ProfileResponse {
-        email: None,
-        profile: crate::profiles::mask_secrets(&sub),
-        status,
-    }))
+    Ok(Json(
+        crate::api::admin::ProfileResponse {
+            email: None,
+            profile: crate::profiles::mask_secrets(&sub),
+            status,
+        }
+        .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 /// Helper: resolve a sub-account owned by the current user.
@@ -2213,7 +2220,8 @@ mod tests {
         child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
 
-        let scoped = trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
+        let scoped =
+            trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
         assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
     }
 
@@ -2274,7 +2282,10 @@ mod tests {
         };
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert_eq!(err.1, "sub-accounts cannot change their own public subdomain");
+        assert_eq!(
+            err.1,
+            "sub-accounts cannot change their own public subdomain"
+        );
     }
 
     #[tokio::test]

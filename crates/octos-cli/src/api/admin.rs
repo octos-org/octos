@@ -186,11 +186,14 @@ pub async fn list_profiles(
     let mut items = Vec::with_capacity(page.len());
     for p in page {
         let status = pm.status(&p.id).await;
-        items.push(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&p),
-            status,
-        });
+        items.push(
+            ProfileResponse {
+                email: None,
+                profile: mask_secrets(&p),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        );
     }
     Ok(Json(items))
 }
@@ -276,11 +279,14 @@ pub async fn create_profile(
     let status = pm.status(&profile.id).await;
     Ok((
         StatusCode::CREATED,
-        Json(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&profile),
-            status,
-        }),
+        Json(
+            ProfileResponse {
+                email: None,
+                profile: mask_secrets(&profile),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        ),
     ))
 }
 
@@ -398,11 +404,14 @@ pub async fn update_profile(
 
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
-    Ok(Json(ProfileResponse {
-        email: None,
-        profile: mask_secrets(&profile),
-        status,
-    }))
+    Ok(Json(
+        ProfileResponse {
+            email: None,
+            profile: mask_secrets(&profile),
+            status,
+        }
+        .with_email_lookup(state.user_store.as_deref()),
+    ))
 }
 
 /// DELETE /api/admin/profiles/:id
@@ -1214,11 +1223,14 @@ pub async fn list_sub_accounts(
     let mut items = Vec::with_capacity(subs.len());
     for s in subs {
         let status = pm.status(&s.id).await;
-        items.push(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&s),
-            status,
-        });
+        items.push(
+            ProfileResponse {
+                email: None,
+                profile: mask_secrets(&s),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        );
     }
     Ok(Json(items))
 }
@@ -1323,11 +1335,14 @@ pub async fn create_sub_account(
     let status = pm.status(&sub.id).await;
     Ok((
         StatusCode::CREATED,
-        Json(ProfileResponse {
-            email: None,
-            profile: mask_secrets(&sub),
-            status,
-        }),
+        Json(
+            ProfileResponse {
+                email: None,
+                profile: mask_secrets(&sub),
+                status,
+            }
+            .with_email_lookup(state.user_store.as_deref()),
+        ),
     ))
 }
 

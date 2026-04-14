@@ -20,8 +20,7 @@ Thumbs.db
 # Node
 node_modules/
 
-# Dashboard build output
-crates/octos-cli/static/admin/
+# Dashboard build output is embedded by octos-cli and committed.
 
 # Environment
 .env

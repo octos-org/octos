@@ -10,6 +10,28 @@ import type { ProfileResponse } from '../../types'
 import { api, myApi } from '../../api'
 import { useToast } from '../../components/Toast'
 
+function publicHostBase(hostname: string): string {
+  const normalized = hostname.trim().toLowerCase().replace(/:\d+$/, '')
+  if (!normalized) return 'crew.ominix.io'
+
+  const labels = normalized.split('.').filter(Boolean)
+  if (labels.length >= 4 && labels.slice(-2).join('.') === 'ominix.io') {
+    return labels.slice(-3).join('.')
+  }
+
+  return normalized
+}
+
+function publicUrlPreview(slug: string, fallback: string): string {
+  const resolvedSlug = slug.trim() || fallback.trim() || 'your-subdomain'
+  if (typeof window === 'undefined') {
+    return `https://${resolvedSlug}.crew.ominix.io`
+  }
+
+  const protocol = window.location.protocol === 'http:' ? 'http' : 'https'
+  return `${protocol}://${resolvedSlug}.${publicHostBase(window.location.hostname)}`
+}
+
 export default function HomePage() {
   const { isAdmin } = useAuth()
   const {
@@ -55,13 +77,13 @@ export default function HomePage() {
   }, [loadSubAccounts])
 
   const handleCreateSubAccount = async () => {
-    if (!profileId || !newSubName.trim()) return
+    if (!profileId || !newSubId.trim() || !newSubName.trim() || !newSubdomain.trim()) return
     setCreateSubLoading(true)
     try {
       const payload = {
-        sub_account_id: newSubId.trim() || undefined,
+        sub_account_id: newSubId.trim(),
         name: newSubName.trim(),
-        public_subdomain: newSubdomain.trim() || undefined,
+        public_subdomain: newSubdomain.trim(),
         email: newSubEmail.trim() || undefined,
       }
       if (isAdmin) {
@@ -246,7 +268,7 @@ export default function HomePage() {
               disabled={!!parentId && isOwn}
             />
             <p className="text-xs text-gray-500 mt-1">
-              Public URL preview: <span className="font-mono text-gray-400">https://{(publicSubdomain || profileId) || 'your-subdomain'}.crew.ominix.io</span>
+              Public URL preview: <span className="font-mono text-gray-400">{publicUrlPreview(publicSubdomain, profileId)}</span>
             </p>
             {!!parentId && isOwn && (
               <p className="text-xs text-gray-500 mt-1">Sub-account users cannot change their own public subdomain. The parent account controls it.</p>
@@ -365,7 +387,7 @@ export default function HomePage() {
                   placeholder="newsbot"
                   className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
                 />
-                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">https://{newSubdomain || 'newsbot'}.crew.ominix.io</span></p>
+                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">{publicUrlPreview(newSubdomain, 'newsbot')}</span></p>
               </div>
               <div>
                 <label className="block text-xs text-gray-400 mb-1">Email (for web client login)</label>
