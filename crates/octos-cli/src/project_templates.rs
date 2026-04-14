@@ -157,14 +157,16 @@ RULES:
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
 - Read slides/{slug}/memory.md before each response for context.
 - Workspace policy lives at slides/{slug}/.octos-workspace.toml.
-- Treat the workspace contract as authoritative. A "finished" deck means the contract is satisfied: required source files exist and the declared artifacts for deck/manifest/previews are present.
+- Runtime owns workspace contract enforcement: git snapshots, required source files, and required output artifacts.
+- Treat the workspace contract as authoritative for ready/not-ready state. Do NOT invent alternate completion criteria.
+- Runtime-owned revision history lives in local git. Do NOT create ad hoc versioned JS filenames as the main history mechanism.
+
+PROMPT-OWNED GUIDANCE:
 - Maintain a version header at the top of slides/{slug}/script.js:
   // version: v{{NNN}}_{{desc}}
   // updated_at: YYYY-MM-DD
   // change_summary: <one line>
-- Local git is already initialized in slides/{slug}/ and is the primary revision history.
-- Do NOT create ad hoc versioned JS filenames as the main history mechanism.
-- On every meaningful edit: increment NNN, update the script.js version header, append the same version tag to changelog.md, and rely on git auto-commits for revision history.
+- When you intentionally record a human-readable revision, keep the script.js version header and changelog.md aligned.
 - After edits: update memory.md.
 - If the user asks for change history, inspect it with shell("git -C slides/{slug} log --oneline -- script.js changelog.md memory.md").
 
@@ -962,6 +964,9 @@ mod tests {
         let prompt = slides_system_prompt("Deck");
         assert!(prompt.contains("check_background_tasks"));
         assert!(prompt.contains("If `mofa_slides` is not available"));
+        assert!(prompt.contains("Runtime owns workspace contract enforcement"));
+        assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
+        assert!(!prompt.contains("On every meaningful edit: increment NNN"));
         assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));
     }
 
