@@ -63,41 +63,6 @@ The install script saves itself locally, so you can re-run without downloading a
 & "$HOME\.octos\bin\install.ps1" -Doctor    # Diagnose issues
 ```
 
-### Cloud signup
-
-Register at [octos-cloud.org](https://octos-cloud.org) to get a personalized install command with your machine name, auth token, and SSH port pre-filled — for both macOS/Linux and Windows. In the normal hosted flow, the macOS/Linux setup command is a single `curl ... | bash` one-liner; the shared FRPS token is injected server-side by the host and does not need to be typed manually. If SMTP is configured on the server, the setup details are also emailed as backup.
-
-### Cloud host bootstrap
-
-To bootstrap the relay/host server itself, run the new host bootstrap script on a Linux VPS:
-
-```bash
-bash scripts/cloud-host-deploy.sh
-```
-
-It wraps the three host-side steps in order:
-
-- `scripts/install.sh` for `octos serve`
-- `scripts/frp/setup-frps.sh` for the relay
-- `scripts/frp/setup-caddy.sh` for apex and wildcard routing
-
-For silent reruns, it supports `--config <env-file>` and persists the chosen settings to `./cloud-bootstrap.env` in the current working directory by default.
-
-For production DNS, use two hostnames:
-
-- `octos.example.com` and `*.octos.example.com` proxied through Cloudflare for the portal and tenant sites
-- `frps.octos.example.com` as `DNS only` for the raw FRP control connection on port `7000`
-
-### Deployment modes
-
-octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
-
-- **`local`** (default) — Standalone machine. Dashboard at `/admin/`.
-- **`tenant`** — End-user machine with optional tunnel to a cloud relay.
-- **`cloud`** — VPS relay server with tenant management and public signup page.
-
-`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. Direct installers such as `scripts/install.sh` and `scripts/install.ps1` create it for local or tenant machines; `scripts/cloud-host-deploy.sh` now creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
-
 ### Optional features
 
 ```bash
@@ -108,7 +73,99 @@ curl ... | bash -s -- --install-deps
 curl ... | bash -s -- --caddy-domain crew.example.com
 ```
 
-## Quick Start
+## Quick Start — Cloud deployment
+
+Run octos as a **cloud relay** with a public signup portal so users can register and connect their own machines (Mac, Linux, Windows) via an frpc tunnel. Three steps: bootstrap the VPS, register on the portal, run the generated setup command on the tenant machine.
+
+### 1. Bootstrap the VPS (operator)
+
+On a Linux VPS with your domain's DNS already pointed at it:
+
+```bash
+# On the VPS
+git clone https://github.com/octos-org/octos.git
+cd octos
+bash scripts/cloud-host-deploy.sh \
+    --domain octos.example.com \
+    --https --dns-provider cloudflare
+```
+
+The script wraps three host-side steps:
+
+- `scripts/install.sh` — installs `octos serve` and sets `mode = "cloud"`
+- `scripts/frp/setup-frps.sh` — installs and configures `frps` as a systemd service
+- `scripts/frp/setup-caddy.sh` — Caddy with on-demand TLS for apex + wildcard subdomains
+
+It persists the chosen settings to `./cloud-bootstrap.env` for silent reruns (`--config ./cloud-bootstrap.env --non-interactive`). Tenant authentication is **per-tenant**: each tenant registration generates its own tunnel token (stored in the frpc client's `metadatas.token`) — there is no shared FRPS secret to distribute.
+
+**DNS prerequisites** (two hostnames):
+
+- `octos.example.com` and `*.octos.example.com` — proxied through Cloudflare for the portal and tenant dashboards (HTTPS)
+- `frps.octos.example.com` — `DNS only` (no proxy) so tenants can reach the raw FRP control connection on port `7000`
+
+### 2. Register on the portal
+
+Once the VPS is up, visit `https://octos.example.com` and complete the self-service signup form. The portal returns a **personalized setup command** for macOS/Linux and Windows with your subdomain, per-tenant tunnel token, SSH port, and dashboard auth token all pre-filled. If SMTP was configured during bootstrap, the same details are also emailed as backup.
+
+### 3. Connect the tenant machine
+
+Paste the command the portal gave you into a terminal on the machine you want to expose:
+
+```bash
+# macOS / Linux — example (use the exact one from the portal)
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
+    --tunnel \
+    --tenant-name alice \
+    --frps-token <per-tenant-uuid> \
+    --ssh-port 6001 \
+    --domain octos.example.com \
+    --frps-server frps.octos.example.com \
+    --auth-token <dashboard-token>
+```
+
+```powershell
+# Windows PowerShell — equivalent command is emitted by the portal
+```
+
+The installer downloads the release binary, writes `/etc/frp/frpc.toml` with the per-tenant token under `metadatas.token`, installs `octos serve` as a launchd/systemd service, and brings the tunnel up. Your dashboard is then reachable at `https://<tenant-name>.octos.example.com/admin/`.
+
+**Reruns.** The installer saves itself locally, so re-running `~/.octos/bin/install.sh --tunnel` (or `install.ps1 -Tunnel`) will recover the per-tenant tunnel token from the existing `/etc/frp/frpc.toml` without prompting. Pass `--doctor` to diagnose tunnel or dashboard issues.
+
+### Uninstall
+
+Use the matching uninstall flag on whichever machine you want to wipe:
+
+```bash
+# Tenant machine (macOS / Linux)
+~/.octos/bin/install.sh --uninstall
+
+# Tenant machine (Windows PowerShell)
+& "$HOME\.octos\bin\install.ps1" -Uninstall
+
+# Cloud VPS — removes octos serve, frps, and Caddy
+bash scripts/cloud-host-deploy.sh --uninstall
+
+# Cloud VPS + wipe data directory (~/.octos) as well
+bash scripts/cloud-host-deploy.sh --uninstall --purge
+```
+
+On a tenant, `install.sh --uninstall` tears down both `io.octos.serve`/`octos-serve.service` and `io.octos.frpc`/`frpc.service`, removes `/etc/frp` and `/usr/local/bin/frpc`, and stops Caddy if it was installed. The data directory (`~/.octos`) is preserved unless you remove it manually.
+
+On the VPS, `cloud-host-deploy.sh --uninstall` calls `install.sh --uninstall` internally and additionally stops and removes `frps.service` and the Caddy host config. Use it — not plain `install.sh --uninstall` — to avoid leaving `frps` running against deleted config.
+
+### Deployment modes
+
+octos supports three deployment modes via `"mode"` in `~/.octos/config.json`:
+
+- **`local`** (default) — Standalone machine. Dashboard at `/admin/`.
+- **`tenant`** — End-user machine with optional frpc tunnel to a cloud relay.
+- **`cloud`** — VPS relay with tenant management, public signup page, and per-tenant frps authentication.
+
+`~/.octos/config.json` is the runtime config that `octos serve` loads on startup. `scripts/install.sh` and `scripts/install.ps1` create it for local/tenant machines; `scripts/cloud-host-deploy.sh` creates or updates it for host machines with `mode = "cloud"` plus `tunnel_domain` and `frps_server`.
+
+## Build from source
+
+For development against an unreleased checkout:
 
 ```bash
 # Build and install
@@ -129,6 +186,8 @@ octos gateway
 # Web dashboard + REST API
 octos serve
 ```
+
+For a repo-local tenant deploy (builds from source, sets up the same service + tunnel as `install.sh`), use `scripts/local-tenant-deploy.sh --full`.
 
 ## Documentation
 
