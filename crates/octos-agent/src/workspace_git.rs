@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use eyre::{Result, WrapErr, eyre};
 use glob::glob;
@@ -139,6 +143,10 @@ pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<Wor
 }
 
 pub fn init_workspace_repo(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
+    with_repo_git_lock(project_root, || init_workspace_repo_unlocked(project_root, kind))
+}
+
+fn init_workspace_repo_unlocked(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
     std::fs::create_dir_all(project_root)
         .wrap_err_with(|| format!("create project dir failed: {}", project_root.display()))?;
 
@@ -170,22 +178,24 @@ pub fn initialize_and_commit(
     kind: WorkspaceProjectKind,
     message: &str,
 ) -> Result<bool> {
-    init_workspace_repo(project_root, kind)?;
-    run_git(project_root, &["add", "-A", "--", "."])?;
+    with_repo_git_lock(project_root, || {
+        init_workspace_repo_unlocked(project_root, kind)?;
+        run_git(project_root, &["add", "-A", "--", "."])?;
 
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["diff", "--cached", "--quiet", "--", "."])
-        .status()
-        .wrap_err("git diff --cached failed")?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["diff", "--cached", "--quiet", "--", "."])
+            .status()
+            .wrap_err("git diff --cached failed")?;
 
-    if status.success() {
-        return Ok(false);
-    }
+        if status.success() {
+            return Ok(false);
+        }
 
-    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-    Ok(true)
+        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
+        Ok(true)
+    })
 }
 
 pub fn snapshot_workspace_change(
@@ -197,8 +207,6 @@ pub fn snapshot_workspace_change(
         Some(repo) => repo,
         None => return Ok(None),
     };
-
-    init_workspace_repo(&repo.root, repo.kind)?;
 
     let relative_path = changed_path
         .strip_prefix(&repo.root)
@@ -398,30 +406,32 @@ fn commit_all_if_dirty_with_options(
     message: &str,
     auto_init: bool,
 ) -> Result<bool> {
-    if auto_init {
-        init_workspace_repo(project_root, kind).wrap_err("ensure git repo failed")?;
-    } else if !project_root.join(".git").exists() {
-        return Err(eyre!(
-            "workspace policy requires git repo at {}, but auto_init is disabled",
-            project_root.display()
-        ));
-    }
+    with_repo_git_lock(project_root, || {
+        if auto_init {
+            init_workspace_repo_unlocked(project_root, kind).wrap_err("ensure git repo failed")?;
+        } else if !project_root.join(".git").exists() {
+            return Err(eyre!(
+                "workspace policy requires git repo at {}, but auto_init is disabled",
+                project_root.display()
+            ));
+        }
 
-    run_git(project_root, &["add", "-A", "--", "."])?;
+        run_git(project_root, &["add", "-A", "--", "."])?;
 
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["diff", "--cached", "--quiet", "--", "."])
-        .status()
-        .wrap_err("git diff --cached failed")?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["diff", "--cached", "--quiet", "--", "."])
+            .status()
+            .wrap_err("git diff --cached failed")?;
 
-    if status.success() {
-        return Ok(false);
-    }
+        if status.success() {
+            return Ok(false);
+        }
 
-    run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-    Ok(true)
+        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
+        Ok(true)
+    })
 }
 
 fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotPlan> {
@@ -717,30 +727,64 @@ fn truncate_utf8_boundary(s: &str, max_len: usize) -> String {
 }
 
 fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(args)
-        .output()
-        .wrap_err_with(|| format!("failed to spawn git {:?}", args))?;
+    let mut attempt = 0_u32;
+    loop {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(args)
+            .output()
+            .wrap_err_with(|| format!("failed to spawn git {:?}", args))?;
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(eyre!(
-        "git {:?} failed in {}: {}{}",
-        args,
-        project_root.display(),
-        stderr.trim(),
-        if stdout.trim().is_empty() {
-            String::new()
-        } else {
-            format!(" | stdout: {}", stdout.trim())
+        if output.status.success() {
+            return Ok(());
         }
-    ))
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let lock_error = is_git_index_lock_error(&stderr) || is_git_index_lock_error(&stdout);
+        if lock_error && attempt < 5 {
+            attempt += 1;
+            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+            continue;
+        }
+
+        return Err(eyre!(
+            "git {:?} failed in {}: {}{}",
+            args,
+            project_root.display(),
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | stdout: {}", stdout.trim())
+            }
+        ));
+    }
+}
+
+fn with_repo_git_lock<T>(project_root: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = repo_git_lock(project_root);
+    let _guard = lock
+        .lock()
+        .map_err(|_| eyre!("workspace git lock poisoned for {}", project_root.display()))?;
+    op()
+}
+
+fn repo_git_lock(project_root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().expect("workspace git lock map poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn is_git_index_lock_error(output: &str) -> bool {
+    output.contains(".git/index.lock")
+        || (output.contains("index.lock") && output.contains("Unable to create"))
 }
 
 #[cfg(test)]
@@ -983,5 +1027,13 @@ mod tests {
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn detects_git_index_lock_errors() {
+        assert!(is_git_index_lock_error(
+            "fatal: Unable to create 'C:/tmp/.git/index.lock': File exists."
+        ));
+        assert!(!is_git_index_lock_error("fatal: not a git repository"));
     }
 }
