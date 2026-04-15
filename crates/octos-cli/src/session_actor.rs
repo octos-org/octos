@@ -219,6 +219,41 @@ async fn persist_assistant_message(
     }
 }
 
+async fn persist_terminal_reply_and_fanout(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    session_key: &SessionKey,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    channel: &str,
+    chat_id: &str,
+    reply_to: Option<String>,
+    content: String,
+    media: Vec<String>,
+) -> bool {
+    let Some(_persisted) =
+        persist_assistant_message(session_handle, session_key, content.clone(), media.clone())
+            .await
+    else {
+        warn!(
+            session = %session_key,
+            "skipping live fanout because terminal reply was not persisted"
+        );
+        return false;
+    };
+
+    let _ = out_tx
+        .send(OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content,
+            reply_to,
+            media,
+            metadata: serde_json::json!({}),
+        })
+        .await;
+
+    true
+}
+
 fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let current_profile_id = data_dir
         .parent()
@@ -3354,46 +3389,32 @@ impl SessionActor {
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
                 let content = format!("Error: {e}");
-                let _ = persist_assistant_message(
+                let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
-                    content.clone(),
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
                     vec![],
                 )
                 .await;
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content,
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
             }
             Err(_) => {
                 tracing::error!(session = %self.session_key, "session processing timed out");
                 let content = "Processing timed out. Please try again.".to_string();
-                let _ = persist_assistant_message(
+                let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
-                    content.clone(),
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
                     vec![],
                 )
                 .await;
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content,
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
             }
         }
 
@@ -3657,43 +3678,31 @@ impl SessionActor {
                 Ok(Err(e)) => {
                     tracing::error!(session = %session_key, error = %e, "overflow agent task failed");
                     let content = format!("Error: {e}");
-                    let _ = persist_assistant_message(
+                    let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
-                        content.clone(),
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        content,
                         vec![],
                     )
                     .await;
-                    let _ = out_tx
-                        .send(OutboundMessage {
-                            channel: channel.clone(),
-                            chat_id: chat_id.clone(),
-                            content,
-                            reply_to: overflow_reply_to.clone(),
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
                 }
                 Err(_) => {
                     let content = "Processing timed out.".to_string();
-                    let _ = persist_assistant_message(
+                    let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
-                        content.clone(),
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        content,
                         vec![],
                     )
                     .await;
-                    let _ = out_tx
-                        .send(OutboundMessage {
-                            channel: channel.clone(),
-                            chat_id: chat_id.clone(),
-                            content,
-                            reply_to: overflow_reply_to.clone(),
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
                 }
             }
 
@@ -4073,46 +4082,32 @@ impl SessionActor {
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
                 let content = format!("Error: {e}");
-                let _ = persist_assistant_message(
+                let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
-                    content.clone(),
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
                     vec![],
                 )
                 .await;
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content,
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
             }
             Err(_) => {
                 tracing::error!(session = %self.session_key, "session processing timed out");
                 let content = "Processing timed out. Please try again.".to_string();
-                let _ = persist_assistant_message(
+                let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
-                    content.clone(),
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
                     vec![],
                 )
                 .await;
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content,
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
             }
         }
 
@@ -4346,6 +4341,44 @@ mod tests {
             };
             tokio::time::sleep(delay).await;
             Ok(response)
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct ErrorMockProvider {
+        name: String,
+        error: String,
+    }
+
+    impl ErrorMockProvider {
+        fn new(name: &str, error: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                error: error.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ErrorMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            Err(eyre::eyre!(self.error.clone()))
         }
 
         fn context_window(&self) -> u32 {
@@ -5104,6 +5137,42 @@ mod tests {
                 .any(|message| message.role == MessageRole::Assistant
                     && message.content == "Processing timed out. Please try again."),
             "timeout message not found in session history: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_error_persists_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(ErrorMockProvider::new("agent", "scripted failure"));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("cause failure")).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("error response")
+            .expect("outbound error message");
+        assert_eq!(outbound.content, "Error: scripted failure");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content == "Error: scripted failure"),
+            "error message not found in session history: {:?}",
             session
                 .messages
                 .iter()
