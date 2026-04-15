@@ -9,6 +9,7 @@ mod loop_runner;
 mod memory;
 mod message_repair;
 mod streaming;
+mod turn_state;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
