@@ -9,14 +9,19 @@
 //! workspace contract was satisfied, `Failed` means it was not.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use octos_core::TaskId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
 
 /// Lifecycle status of a background task.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Spawned,
@@ -46,7 +51,7 @@ impl TaskStatus {
 /// `runtime_state` tracks where the task is inside the workspace/runtime
 /// lifecycle. This lets the agent and UI distinguish "tool is still running"
 /// from "tool finished but outputs are still being verified/delivered".
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRuntimeState {
     Spawned,
@@ -60,7 +65,7 @@ pub enum TaskRuntimeState {
 }
 
 /// A tracked background task spawned by a spawn_only tool.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundTask {
     pub id: String,
     pub tool_name: String,
@@ -82,11 +87,31 @@ pub struct BackgroundTask {
 /// Callback invoked when a task's status changes.
 type OnChangeCallback = Box<dyn Fn(&BackgroundTask) + Send + Sync>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedTaskRecord {
+    #[serde(default = "default_task_ledger_schema")]
+    schema_version: u32,
+    task: BackgroundTask,
+}
+
+fn default_task_ledger_schema() -> u32 {
+    CURRENT_TASK_LEDGER_SCHEMA
+}
+
 impl std::fmt::Debug for TaskSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskSupervisor")
             .field("tasks", &self.tasks)
             .field("on_change", &"<callback>")
+            .field(
+                "persistence_path",
+                &self
+                    .persistence_path
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            )
             .finish()
     }
 }
@@ -98,6 +123,7 @@ impl std::fmt::Debug for TaskSupervisor {
 pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
+    persistence_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -112,7 +138,36 @@ impl TaskSupervisor {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             on_change: Arc::new(Mutex::new(None)),
+            persistence_path: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Enable append-only persistence for task snapshots and restore existing state.
+    pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let restored = Self::load_persisted_tasks(&path)?;
+        {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            for (task_id, task) in restored {
+                match tasks.get(&task_id) {
+                    Some(existing) if existing.updated_at >= task.updated_at => {}
+                    _ => {
+                        tasks.insert(task_id, task);
+                    }
+                }
+            }
+        }
+
+        let mut guard = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(path);
+        Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
     }
 
     /// Set a callback that fires whenever a task's status changes.
@@ -145,6 +200,8 @@ impl TaskSupervisor {
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(id.clone(), task);
+        drop(tasks);
+        self.persist_snapshot_by_id(&id);
         id
     }
 
@@ -163,6 +220,7 @@ impl TaskSupervisor {
             }
         };
         if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
             self.notify_change(task);
         }
     }
@@ -186,6 +244,7 @@ impl TaskSupervisor {
             }
         };
         if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
             self.notify_change(task);
         }
     }
@@ -207,6 +266,7 @@ impl TaskSupervisor {
             }
         };
         if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
             self.notify_change(task);
         }
     }
@@ -228,8 +288,81 @@ impl TaskSupervisor {
             }
         };
         if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
             self.notify_change(task);
         }
+    }
+
+    fn persist_snapshot_by_id(&self, task_id: &str) {
+        let snapshot = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.get(task_id).cloned()
+        };
+        if let Some(task) = snapshot {
+            self.persist_snapshot(&task);
+        }
+    }
+
+    fn persist_snapshot(&self, task: &BackgroundTask) {
+        let Some(path) = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+
+        let record = PersistedTaskRecord {
+            schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+            task: task.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&record) else {
+            return;
+        };
+
+        if let Err(error) = Self::append_persisted_task(&path, &json) {
+            tracing::warn!(
+                task_id = %task.id,
+                path = %path.display(),
+                error = %error,
+                "failed to persist background task snapshot"
+            );
+        }
+    }
+
+    fn append_persisted_task(path: &PathBuf, json: &str) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{json}")?;
+        Ok(())
+    }
+
+    fn load_persisted_tasks(path: &PathBuf) -> std::io::Result<HashMap<String, BackgroundTask>> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut restored = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<PersistedTaskRecord>(&line) else {
+                continue;
+            };
+            if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
+                continue;
+            }
+            restored.insert(record.task.id.clone(), record.task);
+        }
+        Ok(restored)
     }
 
     /// Fire the on_change callback (if set) with a task snapshot.
@@ -380,5 +513,82 @@ mod tests {
         supervisor.mark_completed("nonexistent", vec![]);
         supervisor.mark_failed("nonexistent", "err".to_string());
         assert_eq!(supervisor.task_count(), 0);
+    }
+
+    #[test]
+    fn should_restore_running_task_state_after_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+
+        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            TaskRuntimeState::ResolvingOutputs,
+            Some("collecting evidence".to_string()),
+        );
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let tasks = restored.get_all_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, task_id);
+        assert_eq!(tasks[0].status, TaskStatus::Running);
+        assert_eq!(tasks[0].runtime_state, TaskRuntimeState::ResolvingOutputs);
+        assert_eq!(
+            tasks[0].runtime_detail.as_deref(),
+            Some("collecting evidence")
+        );
+    }
+
+    #[test]
+    fn should_restore_completed_and_failed_truth_after_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+
+        let completed = supervisor.register("fm_tts", "call-2", Some("api:session"));
+        supervisor.mark_running(&completed);
+        supervisor.mark_runtime_state(
+            &completed,
+            TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+        supervisor.mark_completed(&completed, vec!["/tmp/output.mp3".to_string()]);
+
+        let failed = supervisor.register("podcast_generate", "call-3", Some("api:session"));
+        supervisor.mark_running(&failed);
+        supervisor.mark_failed(&failed, "No dialogue lines found in script".to_string());
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let tasks = restored.get_all_tasks();
+        assert_eq!(tasks.len(), 2);
+
+        let completed_task = tasks
+            .iter()
+            .find(|task| task.id == completed)
+            .expect("completed task missing");
+        assert_eq!(completed_task.status, TaskStatus::Completed);
+        assert_eq!(completed_task.runtime_state, TaskRuntimeState::Completed);
+        assert_eq!(completed_task.output_files, vec!["/tmp/output.mp3"]);
+
+        let failed_task = tasks
+            .iter()
+            .find(|task| task.id == failed)
+            .expect("failed task missing");
+        assert_eq!(failed_task.status, TaskStatus::Failed);
+        assert_eq!(failed_task.runtime_state, TaskRuntimeState::Failed);
+        assert_eq!(
+            failed_task.error.as_deref(),
+            Some("No dialogue lines found in script")
+        );
     }
 }
