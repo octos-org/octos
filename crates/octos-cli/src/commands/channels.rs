@@ -125,6 +125,8 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "wecom-bot" => true,
         #[cfg(feature = "qq-bot")]
         "qq-bot" => true,
+        #[cfg(feature = "matrix")]
+        "matrix" => true,
         _ => false,
     }
 }
