@@ -1,7 +1,6 @@
 //! Main agent loop: process_message and run_task orchestration.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use eyre::Result;
@@ -14,6 +13,7 @@ use super::message_repair::{
     normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,
     sanitize_tool_call_id, synthesize_missing_tool_results, truncate_old_tool_results,
 };
+use super::turn_state::LoopTurnState;
 use super::{Agent, ConversationResponse, TokenTracker};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
@@ -151,28 +151,26 @@ impl Agent {
                 });
 
                 let config = self.chat_config();
-                let mut total_usage = TokenUsage::default();
                 let mut files_modified = Vec::new();
-                let mut iteration = 0u32;
-                let start = Instant::now();
+                let mut turn = LoopTurnState::new(Instant::now());
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
-                    if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
+                    if let Some(stop) = turn.check_budget(self) {
+                        turn.record_budget_stop(&stop);
                         // Skip system prompt + history; return only new messages
-                        let new_start = (1 + history.len()).min(messages.len());
                         return Ok(ConversationResponse {
                             content: stop.message(),
                             reasoning_content: None,
                             provider_metadata: None,
-                            token_usage: total_usage,
+                            token_usage: turn.total_usage().clone(),
                             files_modified,
                             streamed: false,
-                            messages: messages[new_start..].to_vec(),
+                            messages: LoopTurnState::new_messages(&messages, history.len()),
                         });
                     }
 
-                    iteration += 1;
+                    let iteration = turn.advance_iteration();
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -211,7 +209,13 @@ impl Agent {
                         "calling LLM"
                     );
                     let (response, streamed) = match self
-                        .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
+                        .call_llm_with_hooks(
+                            &messages,
+                            &tools_spec,
+                            &config,
+                            iteration,
+                            turn.total_usage(),
+                        )
                         .await
                     {
                         Ok(r) => r,
@@ -228,7 +232,7 @@ impl Agent {
                                 &tools_spec,
                                 &config,
                                 iteration,
-                                &total_usage,
+                                turn.total_usage(),
                             )
                             .await?
                         }
@@ -261,29 +265,25 @@ impl Agent {
                             "LLM response received"
                         );
                     }
-                    total_usage.input_tokens += response.usage.input_tokens;
-                    total_usage.output_tokens += response.usage.output_tokens;
-                    if let Some(t) = tracker {
-                        t.input_tokens
-                            .store(total_usage.input_tokens, Ordering::Relaxed);
-                        t.output_tokens
-                            .store(total_usage.output_tokens, Ordering::Relaxed);
-                    }
+                    turn.record_usage(
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        tracker,
+                    );
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
-                            self.emit_cost_update(&total_usage, &response.usage);
-                            let new_start = (1 + history.len()).min(messages.len());
+                            self.emit_cost_update(turn.total_usage(), &response.usage);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
-                                token_usage: total_usage,
+                                token_usage: turn.total_usage().clone(),
                                 files_modified,
                                 streamed,
-                                messages: messages[new_start..].to_vec(),
+                                messages: LoopTurnState::new_messages(&messages, history.len()),
                             });
                         }
                         StopReason::ToolUse => {
@@ -293,16 +293,18 @@ impl Agent {
                                 {
                                     warn!("loop detected — breaking agent loop");
                                     // Don't execute the tools — break out with a message
-                                    self.emit_cost_update(&total_usage, &response.usage);
-                                    let new_start = (1 + history.len()).min(messages.len());
+                                    self.emit_cost_update(turn.total_usage(), &response.usage);
                                     return Ok(ConversationResponse {
                                         content: warning,
                                         reasoning_content: None,
                                         provider_metadata: None,
-                                        token_usage: total_usage,
+                                        token_usage: turn.total_usage().clone(),
                                         files_modified,
                                         streamed,
-                                        messages: messages[new_start..].to_vec(),
+                                        messages: LoopTurnState::new_messages(
+                                            &messages,
+                                            history.len(),
+                                        ),
                                     });
                                 }
                             }
@@ -311,14 +313,13 @@ impl Agent {
                                 &mut messages,
                                 &mut files_modified,
                                 None,
-                                &mut total_usage,
+                                &mut turn,
                                 tracker,
                             )
                             .await?;
 
                             if self.tools.spawn_only_was_invoked() {
-                                self.emit_cost_update(&total_usage, &response.usage);
-                                let new_start = (1 + history.len()).min(messages.len());
+                                self.emit_cost_update(turn.total_usage(), &response.usage);
                                 let background_tools = response
                                     .tool_calls
                                     .iter()
@@ -345,34 +346,32 @@ impl Agent {
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(response.provider_index),
                                     ),
-                                    token_usage: total_usage,
+                                    token_usage: turn.total_usage().clone(),
                                     files_modified,
                                     streamed,
-                                    messages: messages[new_start..].to_vec(),
+                                    messages: LoopTurnState::new_messages(&messages, history.len()),
                                 });
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(&total_usage, &response.usage);
-                            let new_start = (1 + history.len()).min(messages.len());
+                            self.emit_cost_update(turn.total_usage(), &response.usage);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
-                                token_usage: total_usage,
+                                token_usage: turn.total_usage().clone(),
                                 files_modified,
                                 streamed,
-                                messages: messages[new_start..].to_vec(),
+                                messages: LoopTurnState::new_messages(&messages, history.len()),
                             });
                         }
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(&total_usage, &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response.usage);
                             warn!("content filtered by provider safety/moderation after retries");
-                            let new_start = (1 + history.len()).min(messages.len());
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
                                     "[Content was blocked by the model's safety filter. \
@@ -383,10 +382,10 @@ impl Agent {
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
                                 ),
-                                token_usage: total_usage,
+                                token_usage: turn.total_usage().clone(),
                                 files_modified,
                                 streamed,
-                                messages: messages[new_start..].to_vec(),
+                                messages: LoopTurnState::new_messages(&messages, history.len()),
                             });
                         }
                     }
@@ -409,27 +408,27 @@ impl Agent {
                 task_id: task.id.to_string(),
             });
 
-            let mut iteration = 0u32;
             let mut messages = self.build_initial_messages(task).await;
-            let mut total_usage = TokenUsage::default();
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
+            let mut turn = LoopTurnState::new(task_start);
             let config = self.chat_config();
 
             loop {
-                if let Some(stop) = self.check_budget(iteration, task_start, &total_usage) {
-                    self.report_budget_stop(&stop, iteration);
+                if let Some(stop) = turn.check_budget(self) {
+                    turn.record_budget_stop(&stop);
+                    self.report_budget_stop(&stop, turn.iteration());
                     return Ok(TaskResult {
                         success: false,
                         output: stop.message(),
                         files_modified,
                         files_to_send,
                         subtasks: Vec::new(),
-                        token_usage: total_usage,
+                        token_usage: turn.total_usage().clone(),
                     });
                 }
 
-                iteration += 1;
+                let iteration = turn.advance_iteration();
                 let iter_start = Instant::now();
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
@@ -449,10 +448,15 @@ impl Agent {
                 normalize_tool_call_ids(&mut messages);
 
                 let (response, _streamed) = self
-                    .call_llm_with_hooks(&messages, &tools_spec, &config, iteration, &total_usage)
+                    .call_llm_with_hooks(
+                        &messages,
+                        &tools_spec,
+                        &config,
+                        iteration,
+                        turn.total_usage(),
+                    )
                     .await?;
-                total_usage.input_tokens += response.usage.input_tokens;
-                total_usage.output_tokens += response.usage.output_tokens;
+                turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
                 let tool_names: Vec<&str> = response
                     .tool_calls
@@ -521,7 +525,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(&total_usage, &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response.usage);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: true,
                             iterations: iteration,
@@ -529,8 +533,8 @@ impl Agent {
                         });
 
                         info!(
-                            total_input_tokens = total_usage.input_tokens,
-                            total_output_tokens = total_usage.output_tokens,
+                            total_input_tokens = turn.total_usage().input_tokens,
+                            total_output_tokens = turn.total_usage().output_tokens,
                             iterations = iteration,
                             files_modified = files_modified.len(),
                             duration_ms = task_start.elapsed().as_millis() as u64,
@@ -538,7 +542,7 @@ impl Agent {
                         );
                         return Ok(self.build_result(
                             &response,
-                            total_usage,
+                            turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
                         ));
@@ -549,13 +553,13 @@ impl Agent {
                             &mut messages,
                             &mut files_modified,
                             Some(&mut files_to_send),
-                            &mut total_usage,
+                            &mut turn,
                             None,
                         )
                         .await?;
                     }
                     StopReason::MaxTokens => {
-                        self.emit_cost_update(&total_usage, &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response.usage);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -563,14 +567,14 @@ impl Agent {
                         });
                         return Ok(self.build_result(
                             &response,
-                            total_usage,
+                            turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
                         ));
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(&total_usage, &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response.usage);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -578,7 +582,7 @@ impl Agent {
                         });
                         let mut result = self.build_result(
                             &response,
-                            total_usage,
+                            turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
                         );
@@ -624,7 +628,7 @@ impl Agent {
         messages: &mut Vec<Message>,
         files_modified: &mut Vec<PathBuf>,
         files_to_send: Option<&mut Vec<PathBuf>>,
-        total_usage: &mut TokenUsage,
+        turn: &mut LoopTurnState,
         tracker: Option<&TokenTracker>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
@@ -679,14 +683,7 @@ impl Agent {
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
         }
-        total_usage.input_tokens += tool_tokens.input_tokens;
-        total_usage.output_tokens += tool_tokens.output_tokens;
-        if let Some(t) = tracker {
-            t.input_tokens
-                .store(total_usage.input_tokens, Ordering::Relaxed);
-            t.output_tokens
-                .store(total_usage.output_tokens, Ordering::Relaxed);
-        }
+        turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
         Ok(())
     }
 }
@@ -699,7 +696,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
-    use octos_core::{AgentId, TaskContext, TaskKind, ToolCall};
+    use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
     use octos_llm::{ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
     use octos_memory::EpisodeStore;
 
@@ -785,6 +782,106 @@ mod tests {
         }
     }
 
+    struct NamedEchoTool {
+        name: &'static str,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for NamedEchoTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Echo a fixed tool response"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                output: self.output.to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct MultiToolThenEndProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MultiToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let response = match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_alpha".to_string(),
+                            name: "alpha".to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            id: "call_beta".to_string(),
+                            name: "beta".to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_gamma".to_string(),
+                        name: "gamma".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            };
+            Ok(response)
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
     #[tokio::test]
     async fn run_task_collects_files_to_send_without_file_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -816,5 +913,58 @@ mod tests {
         assert!(result.success);
         assert!(result.files_modified.is_empty());
         assert_eq!(result.files_to_send, vec![file_path]);
+    }
+
+    #[tokio::test]
+    async fn process_message_preserves_tool_pair_order_across_iterations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        tools.register(NamedEchoTool {
+            name: "beta",
+            output: "beta ok",
+        });
+        tools.register(NamedEchoTool {
+            name: "gamma",
+            output: "gamma ok",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MultiToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Tool,
+                MessageRole::Tool,
+                MessageRole::Assistant,
+                MessageRole::Tool,
+            ]
+        );
+        assert_eq!(result.content, "done");
+        assert_eq!(result.messages[1].tool_calls.as_ref().unwrap().len(), 2);
+        assert_eq!(result.messages[4].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            result.messages[2].tool_call_id.as_deref(),
+            Some("call_alpha")
+        );
+        assert_eq!(
+            result.messages[3].tool_call_id.as_deref(),
+            Some("call_beta")
+        );
+        assert_eq!(
+            result.messages[5].tool_call_id.as_deref(),
+            Some("call_gamma")
+        );
     }
 }
