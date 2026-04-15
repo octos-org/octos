@@ -322,6 +322,8 @@ fn sanitize_task_for_response(
         "id": task.id,
         "tool_name": task.tool_name,
         "tool_call_id": task.tool_call_id,
+        "parent_session_key": task.parent_session_key,
+        "child_session_key": task.child_session_key,
         "status": task.status,
         "started_at": task.started_at,
         "updated_at": task.updated_at,
@@ -1087,7 +1089,7 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
-        if let Err(error) = supervisor.enable_persistence(task_state_path) {
+        if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
                 session = %session_key,
                 error = %error,
@@ -1116,7 +1118,11 @@ impl ActorFactory {
         )
         .with_provider_policy(self.provider_policy.clone())
         .with_agent_config(self.agent_config.clone())
-        .with_task_supervisor(supervisor.clone(), session_key.to_string());
+        .with_task_supervisor(
+            supervisor.clone(),
+            session_key.to_string(),
+            task_state_path.clone(),
+        );
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
@@ -4271,7 +4277,14 @@ mod tests {
         std::fs::write(&output, b"audio").unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new());
-        let task_id = supervisor.register("fm_tts", "call-1", Some("api:session"));
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "fm_tts",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
         supervisor.mark_running(&task_id);
         supervisor.mark_runtime_state(
             &task_id,
@@ -4294,6 +4307,14 @@ mod tests {
         let handle = files[0].as_str().unwrap();
         assert!(handle.starts_with("pf/"));
         assert!(!handle.starts_with("/"));
+        assert_eq!(tasks[0]["parent_session_key"], "api:session");
+        assert!(
+            tasks[0]["child_session_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("api:session#child-")
+        );
+        assert!(tasks[0]["task_ledger_path"].is_null());
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
