@@ -45,6 +45,7 @@ scripts/deploy.sh
 !docs/TESTING.md
 !docs/ARCHITECTURE.md
 !docs/OCTOS_RUNTIME_REFACTOR_RFC.md
+!docs/OCTOS_RUNTIME_EXECUTION_PLAN.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 

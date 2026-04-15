@@ -4,6 +4,8 @@
 
 Refactor Octos into a hybrid runtime that keeps free-form chat flexibility while making long-running, deliverable-heavy work reliable.
 
+See [OCTOS_RUNTIME_EXECUTION_PLAN.md](OCTOS_RUNTIME_EXECUTION_PLAN.md) for lane ownership, branch names, merge order, and required tests.
+
 The target system combines:
 
 - Claude Code style loop governance for long free-form work

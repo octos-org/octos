@@ -5,6 +5,7 @@
 octos is an 18-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 For the background-task delivery model used by web chat, see [SESSION_EVENT_ARCHITECTURE.md](SESSION_EVENT_ARCHITECTURE.md).
+For the runtime refactor execution map, see [OCTOS_RUNTIME_EXECUTION_PLAN.md](OCTOS_RUNTIME_EXECUTION_PLAN.md).
 For a comparison of how Octos, OpenClaw, Claude Code, and Hermes Agent constrain long free-form workflows, see [HARNESSING_FREEFORM_WORKFLOWS.md](HARNESSING_FREEFORM_WORKFLOWS.md).
 For the staged runtime refactor plan that combines loop governance, subagent runtime, workflow runtime, and durable delivery, see [OCTOS_RUNTIME_REFACTOR_RFC.md](OCTOS_RUNTIME_REFACTOR_RFC.md).
 
