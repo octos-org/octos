@@ -344,9 +344,8 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
 
     match save_profile(profiles_dir, &profile) {
         Ok(()) => {
-            let mut msg = format!(
-                "Created sub-account '{sub_id}' (name: {name}, host: {public_subdomain})."
-            );
+            let mut msg =
+                format!("Created sub-account '{sub_id}' (name: {name}, host: {public_subdomain}).");
             if profile.enabled {
                 msg.push_str("\nThe account is enabled and will start on next gateway restart.");
             } else {

@@ -509,16 +509,34 @@ impl ProfileStore {
     pub fn save_with_merge(&self, profile: &mut UserProfile) -> Result<()> {
         if let Some(existing) = self.get(&profile.id)? {
             for (key, new_val) in profile.config.env_vars.iter_mut() {
-                let is_masked = new_val.contains("***")
-                    || new_val.contains(KEYCHAIN_DISPLAY)
-                    || new_val.is_empty();
                 // Never overwrite the real stored value with a display artifact,
                 // but DO allow explicit "keychain:" marker (it's the real value).
-                if is_masked && new_val != crate::auth::KEYCHAIN_MARKER {
+                if should_preserve_display_secret(new_val)
+                    && new_val != crate::auth::KEYCHAIN_MARKER
+                {
                     if let Some(old_val) = existing.config.env_vars.get(key) {
                         *new_val = old_val.clone();
                     }
                 }
+            }
+
+            if let (Some(existing_email), Some(email)) = (
+                existing.config.email.as_ref(),
+                profile.config.email.as_mut(),
+            ) {
+                preserve_secret_field(&mut email.password, existing_email.password.as_ref());
+                preserve_secret_field(
+                    &mut email.password_env,
+                    existing_email.password_env.as_ref(),
+                );
+                preserve_secret_field(
+                    &mut email.feishu_app_secret,
+                    existing_email.feishu_app_secret.as_ref(),
+                );
+                preserve_secret_field(
+                    &mut email.feishu_app_secret_env,
+                    existing_email.feishu_app_secret_env.as_ref(),
+                );
             }
         }
         self.save(profile)
@@ -611,9 +629,7 @@ impl ProfileStore {
             if except_profile_id == Some(profile.id.as_str()) {
                 continue;
             }
-            if profile.id == normalized
-                || profile.public_subdomain.as_deref() == Some(normalized)
-            {
+            if profile.id == normalized || profile.public_subdomain.as_deref() == Some(normalized) {
                 bail!("public subdomain '{normalized}' is already in use");
             }
         }
@@ -746,11 +762,66 @@ pub fn mask_secrets(profile: &UserProfile) -> UserProfile {
             *value = mask_value(value);
         }
     }
+    if let Some(email) = masked.config.email.as_mut() {
+        mask_secret_field(&mut email.password);
+        mask_env_reference_field(&mut email.password_env);
+        mask_secret_field(&mut email.feishu_app_secret);
+        mask_env_reference_field(&mut email.feishu_app_secret_env);
+    }
     masked
 }
 
 /// Display string for keychain-backed values in API responses.
 const KEYCHAIN_DISPLAY: &str = "\u{1f511} (keychain)";
+
+fn should_preserve_display_secret(value: &str) -> bool {
+    value.contains("***") || value.contains(KEYCHAIN_DISPLAY) || value.is_empty()
+}
+
+fn preserve_secret_field(new_value: &mut Option<String>, old_value: Option<&String>) {
+    let Some(new_value) = new_value.as_mut() else {
+        return;
+    };
+    if should_preserve_display_secret(new_value) && new_value != crate::auth::KEYCHAIN_MARKER {
+        if let Some(old_value) = old_value {
+            *new_value = old_value.clone();
+        }
+    }
+}
+
+fn mask_secret_field(value: &mut Option<String>) {
+    if let Some(value) = value.as_mut() {
+        if value == crate::auth::KEYCHAIN_MARKER {
+            *value = KEYCHAIN_DISPLAY.to_string();
+        } else {
+            *value = mask_value(value);
+        }
+    }
+}
+
+fn mask_env_reference_field(value: &mut Option<String>) {
+    if let Some(value) = value.as_mut() {
+        if value == crate::auth::KEYCHAIN_MARKER {
+            *value = KEYCHAIN_DISPLAY.to_string();
+        } else if !looks_like_env_var_name(value) {
+            *value = mask_value(value);
+        }
+    }
+}
+
+fn looks_like_env_var_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return false;
+    }
+    value.contains('_') || value.chars().any(|ch| ch.is_ascii_uppercase())
+}
 
 fn mask_value(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -1373,6 +1444,47 @@ mod tests {
     }
 
     #[test]
+    fn test_mask_secrets_masks_nested_email_secrets() {
+        let profile = UserProfile {
+            id: "mail".into(),
+            name: "Mail".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                email: Some(EmailSettings {
+                    provider: "smtp".into(),
+                    smtp_host: Some("smtp.gmail.com".into()),
+                    smtp_port: Some(465),
+                    username: Some("dspfac@gmail.com".into()),
+                    password_env: Some("eqepkfbyfymwfhnv".into()),
+                    password: Some("eqepkfbyfymwfhnv".into()),
+                    from_address: Some("dspfac@gmail.com".into()),
+                    feishu_app_id: None,
+                    feishu_app_secret_env: Some("LARK_APP_SECRET".into()),
+                    feishu_app_secret: Some("super-secret-lark-token".into()),
+                    feishu_from_address: None,
+                    feishu_region: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let masked = mask_secrets(&profile);
+        let email = masked.config.email.as_ref().expect("email config");
+        assert_eq!(email.password.as_deref(), Some("eqep***hnv"));
+        assert_eq!(email.password_env.as_deref(), Some("eqep***hnv"));
+        assert_eq!(email.feishu_app_secret.as_deref(), Some("supe***ken"));
+        assert_eq!(
+            email.feishu_app_secret_env.as_deref(),
+            Some("LARK_APP_SECRET")
+        );
+    }
+
+    #[test]
     fn test_file_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let store = ProfileStore::open(dir.path()).unwrap();
@@ -1449,6 +1561,73 @@ mod tests {
         assert_eq!(loaded.config.env_vars["API_KEY"], "sk-real-secret-key");
         assert_eq!(loaded.config.env_vars["OTHER"], "new-value");
         assert_eq!(loaded.config.env_vars["NEW_KEY"], "brand-new");
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_email_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        let original = UserProfile {
+            id: "email-merge".into(),
+            name: "Email Merge".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                email: Some(EmailSettings {
+                    provider: "smtp".into(),
+                    smtp_host: Some("smtp.gmail.com".into()),
+                    smtp_port: Some(465),
+                    username: Some("dspfac@gmail.com".into()),
+                    password_env: Some("eqepkfbyfymwfhnv".into()),
+                    password: Some("eqepkfbyfymwfhnv".into()),
+                    from_address: Some("dspfac@gmail.com".into()),
+                    feishu_app_id: None,
+                    feishu_app_secret_env: Some("LARK_APP_SECRET".into()),
+                    feishu_app_secret: Some("super-secret-lark-token".into()),
+                    feishu_from_address: None,
+                    feishu_region: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        let mut updated = original.clone();
+        updated.config.email = Some(EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp.gmail.com".into()),
+            smtp_port: Some(587),
+            username: Some("dspfac@gmail.com".into()),
+            password_env: Some("eqep***hnv".into()),
+            password: Some("eqep***hnv".into()),
+            from_address: Some("dspfac@gmail.com".into()),
+            feishu_app_id: None,
+            feishu_app_secret_env: Some("LARK_APP_SECRET".into()),
+            feishu_app_secret: Some("supe***ken".into()),
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("email-merge").unwrap().unwrap();
+        let email = loaded.config.email.as_ref().expect("email config");
+        assert_eq!(email.smtp_port, Some(587));
+        assert_eq!(email.password.as_deref(), Some("eqepkfbyfymwfhnv"));
+        assert_eq!(email.password_env.as_deref(), Some("eqepkfbyfymwfhnv"));
+        assert_eq!(
+            email.feishu_app_secret.as_deref(),
+            Some("super-secret-lark-token")
+        );
+        assert_eq!(
+            email.feishu_app_secret_env.as_deref(),
+            Some("LARK_APP_SECRET")
+        );
     }
 
     #[test]
@@ -1666,11 +1845,17 @@ mod tests {
         store.save(&child).unwrap();
 
         assert_eq!(
-            store.resolve_routable_profile_id("newsbot").unwrap().as_deref(),
+            store
+                .resolve_routable_profile_id("newsbot")
+                .unwrap()
+                .as_deref(),
             Some("tenant--newsbot")
         );
         assert_eq!(
-            store.resolve_routable_profile_id("tenant").unwrap().as_deref(),
+            store
+                .resolve_routable_profile_id("tenant")
+                .unwrap()
+                .as_deref(),
             Some("tenant")
         );
         assert!(

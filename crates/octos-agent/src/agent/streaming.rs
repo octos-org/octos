@@ -169,26 +169,7 @@ impl Agent {
             .into_iter()
             .filter(|(_, name, _, _)| !name.is_empty())
             .map(|(id, name, args, metadata)| {
-                let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
-                    // For write_file with truncated content, recover what we can.
-                    // The raw string looks like: {"path":"./report.md","content":"# Report...
-                    // Extract path and content even from broken JSON.
-                    if name == "write_file" {
-                        if let Some(recovered) = recover_write_file_args(&args) {
-                            tracing::info!(
-                                tool = %name,
-                                "recovered truncated write_file content ({} chars)",
-                                recovered.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0)
-                            );
-                            return recovered;
-                        }
-                    }
-                    tracing::warn!(tool = %name, error = %e, "malformed tool call JSON");
-                    serde_json::Value::String(format!(
-                        "MALFORMED_JSON: {e}. Raw input: {}",
-                        octos_core::truncated_utf8(&args, 200, "...")
-                    ))
-                });
+                let arguments = parse_tool_call_arguments(&name, &args);
                 octos_core::ToolCall {
                     id,
                     name,
@@ -278,6 +259,29 @@ impl Agent {
     }
 }
 
+fn parse_tool_call_arguments(name: &str, raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|e| {
+        if let Some(recovered) = recover_tool_call_args(name, raw) {
+            tracing::info!(tool = %name, raw_len = raw.len(), "recovered malformed tool call JSON");
+            return recovered;
+        }
+        tracing::warn!(tool = %name, error = %e, "malformed tool call JSON");
+        serde_json::Value::String(format!(
+            "MALFORMED_JSON: {e}. Raw input: {}",
+            octos_core::truncated_utf8(raw, 200, "...")
+        ))
+    })
+}
+
+fn recover_tool_call_args(name: &str, raw: &str) -> Option<serde_json::Value> {
+    match name {
+        "write_file" => recover_write_file_args(raw),
+        "fm_tts" => recover_tts_args(raw, "voice"),
+        "voice_synthesize" => recover_tts_args(raw, "speaker"),
+        _ => None,
+    }
+}
+
 /// Recover write_file arguments from a truncated JSON string.
 ///
 /// When the LLM's streaming output is cut off, the JSON for write_file looks like:
@@ -310,6 +314,48 @@ fn recover_write_file_args(raw: &str) -> Option<serde_json::Value> {
         "path": path,
         "content": content,
     }))
+}
+
+fn recover_tts_args(raw: &str, voice_field: &str) -> Option<serde_json::Value> {
+    recover_json_object_args(
+        raw,
+        &["text"],
+        &[voice_field, "output_path", "language", "prompt"],
+        &["speed"],
+    )
+}
+
+fn recover_json_object_args(
+    raw: &str,
+    required_strings: &[&str],
+    optional_strings: &[&str],
+    optional_numbers: &[&str],
+) -> Option<serde_json::Value> {
+    let mut object = serde_json::Map::new();
+
+    for field in required_strings {
+        let value = extract_json_string_field(raw, field)?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        object.insert((*field).to_string(), serde_json::Value::String(value));
+    }
+
+    for field in optional_strings {
+        if let Some(value) = extract_json_string_field(raw, field) {
+            if !value.is_empty() {
+                object.insert((*field).to_string(), serde_json::Value::String(value));
+            }
+        }
+    }
+
+    for field in optional_numbers {
+        if let Some(value) = extract_json_number_field(raw, field) {
+            object.insert((*field).to_string(), value);
+        }
+    }
+
+    Some(serde_json::Value::Object(object))
 }
 
 /// Extract a string value for a given key from potentially malformed JSON.
@@ -353,4 +399,109 @@ fn extract_json_string_field(raw: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_json_number_field(raw: &str, key: &str) -> Option<serde_json::Value> {
+    let patterns = [format!("\"{key}\":"), format!("\"{key}\": ")];
+
+    for pattern in &patterns {
+        if let Some(start) = raw.find(pattern.as_str()) {
+            let mut value_start = start + pattern.len();
+            let bytes = raw.as_bytes();
+
+            while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+                value_start += 1;
+            }
+
+            let mut value_end = value_start;
+            while value_end < bytes.len()
+                && matches!(
+                    bytes[value_end],
+                    b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E'
+                )
+            {
+                value_end += 1;
+            }
+
+            if value_end == value_start {
+                continue;
+            }
+
+            if let Ok(value) =
+                serde_json::from_str::<serde_json::Value>(&raw[value_start..value_end])
+            {
+                if value.is_number() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tool_call_arguments_recovers_truncated_fm_tts_payload() {
+        let raw =
+            r#"{"text":"北京今日热点播客第一段","voice":"yangmi","prompt":"专业大方","speed":1.05"#;
+        let arguments = parse_tool_call_arguments("fm_tts", raw);
+
+        assert!(
+            arguments.is_object(),
+            "expected recovered object, got {arguments}"
+        );
+        assert_eq!(
+            arguments.get("text").and_then(|v| v.as_str()),
+            Some("北京今日热点播客第一段")
+        );
+        assert_eq!(
+            arguments.get("voice").and_then(|v| v.as_str()),
+            Some("yangmi")
+        );
+        assert_eq!(
+            arguments.get("prompt").and_then(|v| v.as_str()),
+            Some("专业大方")
+        );
+        assert_eq!(arguments.get("speed").and_then(|v| v.as_f64()), Some(1.05));
+    }
+
+    #[test]
+    fn parse_tool_call_arguments_recovers_text_only_truncated_tts_payload() {
+        let raw = r#"{"text":"这里是一个非常长的播客片段，"#;
+        let arguments = parse_tool_call_arguments("fm_tts", raw);
+
+        assert!(
+            arguments.is_object(),
+            "expected recovered object, got {arguments}"
+        );
+        assert_eq!(
+            arguments.get("text").and_then(|v| v.as_str()),
+            Some("这里是一个非常长的播客片段，")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_arguments_preserves_write_file_recovery() {
+        let raw = r##"{"path":"./report.md","content":"# Report"##;
+        let arguments = parse_tool_call_arguments("write_file", raw);
+
+        assert!(
+            arguments.is_object(),
+            "expected recovered object, got {arguments}"
+        );
+        assert_eq!(
+            arguments.get("path").and_then(|v| v.as_str()),
+            Some("./report.md")
+        );
+        assert!(
+            arguments
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|content| content.contains("# Report"))
+        );
+    }
 }

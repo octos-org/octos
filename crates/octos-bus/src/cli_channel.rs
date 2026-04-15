@@ -22,6 +22,10 @@ impl CliChannel {
     }
 }
 
+fn is_exit_command(trimmed: &str) -> bool {
+    matches!(trimmed, "/quit" | "/exit" | "quit" | "exit")
+}
+
 #[async_trait]
 impl Channel for CliChannel {
     fn name(&self) -> &str {
@@ -45,8 +49,20 @@ impl Channel for CliChannel {
                 continue;
             }
 
-            if trimmed == "/quit" || trimmed == "/exit" {
+            if is_exit_command(&trimmed) {
                 self.shutdown.store(true, Ordering::SeqCst);
+                // Wake the gateway main loop so it can observe the shutdown flag
+                // even though background services still hold inbound sender clones.
+                let _ = inbound_tx.try_send(InboundMessage {
+                    channel: "system".into(),
+                    sender_id: "shutdown".into(),
+                    chat_id: "shutdown".into(),
+                    content: String::new(),
+                    timestamp: Utc::now(),
+                    media: vec![],
+                    metadata: serde_json::json!({ "_shutdown": true }),
+                    message_id: None,
+                });
                 break;
             }
 
@@ -81,5 +97,20 @@ impl Channel for CliChannel {
     async fn stop(&self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_exit_command;
+
+    #[test]
+    fn recognizes_exit_commands() {
+        for cmd in ["/quit", "/exit", "quit", "exit"] {
+            assert!(is_exit_command(cmd), "{cmd} should exit");
+        }
+        for cmd in [" /quit", "hello", "quit now", "/q"] {
+            assert!(!is_exit_command(cmd), "{cmd} should not exit");
+        }
     }
 }

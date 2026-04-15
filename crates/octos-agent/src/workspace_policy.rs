@@ -193,6 +193,7 @@ impl WorkspacePolicy {
     pub fn for_session() -> Self {
         let mut artifacts = BTreeMap::new();
         artifacts.insert("primary_audio".into(), "*.mp3".into());
+        artifacts.insert("podcast_audio".into(), "**/podcast_full_*.*".into());
 
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
@@ -200,13 +201,24 @@ impl WorkspacePolicy {
                 "file_exists:$artifact".into(),
                 "file_size_min:$artifact:1024".into(),
             ],
-            on_complete: vec!["send_file:$artifact".into()],
+            on_complete: vec![],
             on_failure: vec!["notify_user:TTS generation failed".into()],
+        };
+
+        let podcast_contract = WorkspaceSpawnTaskPolicy {
+            artifact: Some("podcast_audio".into()),
+            on_verify: vec![
+                "file_exists:$artifact".into(),
+                "file_size_min:$artifact:4096".into(),
+            ],
+            on_complete: vec![],
+            on_failure: vec!["notify_user:Podcast generation failed".into()],
         };
 
         let mut spawn_tasks = BTreeMap::new();
         spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
         spawn_tasks.insert("voice_synthesize".into(), tts_contract);
+        spawn_tasks.insert("podcast_generate".into(), podcast_contract);
 
         Self {
             workspace: WorkspacePolicyWorkspace {
@@ -254,6 +266,26 @@ pub fn write_workspace_policy(project_root: &Path, policy: &WorkspacePolicy) -> 
     std::fs::write(&path, rendered)
         .wrap_err_with(|| format!("write workspace policy failed: {}", path.display()))?;
     Ok(())
+}
+
+pub fn upgrade_workspace_policy_if_legacy(
+    policy: &WorkspacePolicy,
+    kind: WorkspaceProjectKind,
+) -> Option<WorkspacePolicy> {
+    match kind {
+        WorkspaceProjectKind::Slides if *policy == legacy_slides_workspace_policy() => {
+            Some(WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides))
+        }
+        WorkspaceProjectKind::Slides | WorkspaceProjectKind::Sites => None,
+    }
+}
+
+fn legacy_slides_workspace_policy() -> WorkspacePolicy {
+    let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+    policy.validation = ValidationPolicy::default();
+    policy.artifacts = WorkspaceArtifactsPolicy::default();
+    policy.spawn_tasks.clear();
+    policy
 }
 
 #[cfg(test)]
@@ -335,10 +367,46 @@ mod tests {
         );
         let task = policy.spawn_tasks.get("fm_tts").expect("fm_tts contract");
         assert_eq!(task.artifact.as_deref(), Some("primary_audio"));
+        assert!(task.on_complete.is_empty());
+
+        assert_eq!(
+            policy
+                .artifacts
+                .entries
+                .get("podcast_audio")
+                .map(String::as_str),
+            Some("**/podcast_full_*.*")
+        );
+        let podcast_task = policy
+            .spawn_tasks
+            .get("podcast_generate")
+            .expect("podcast_generate contract");
+        assert_eq!(podcast_task.artifact.as_deref(), Some("podcast_audio"));
         assert!(
-            task.on_complete
+            podcast_task
+                .on_verify
                 .iter()
-                .any(|action| action == "send_file:$artifact")
+                .any(|action| action == "file_size_min:$artifact:4096")
+        );
+    }
+
+    #[test]
+    fn upgrades_legacy_slides_policy_to_default_contract() {
+        let legacy = legacy_slides_workspace_policy();
+        let upgraded = upgrade_workspace_policy_if_legacy(&legacy, WorkspaceProjectKind::Slides)
+            .expect("legacy slides policy should upgrade");
+
+        assert_eq!(
+            upgraded,
+            WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides)
+        );
+    }
+
+    #[test]
+    fn does_not_upgrade_non_legacy_slides_policy() {
+        let current = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        assert!(
+            upgrade_workspace_policy_if_legacy(&current, WorkspaceProjectKind::Slides).is_none()
         );
     }
 }

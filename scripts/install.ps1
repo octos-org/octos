@@ -1282,7 +1282,7 @@ $wrapperContent = @"
 set "OCTOS_HOME=$DataDir"
 set "OCTOS_DATA_DIR=$DataDir"
 set "OCTOS_AUTH_TOKEN=$AuthToken"
-"$octosBin" serve --port $Port --host 0.0.0.0 --auth-token $AuthToken >> "$serveLog" 2>&1
+"$octosBin" serve --port $Port --host 0.0.0.0 --auth-token $AuthToken
 "@
 [System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.UTF8Encoding]::new($false))
 

@@ -583,6 +583,7 @@ impl AuthManager {
 
         let password = std::env::var(&smtp.password_env)
             .ok()
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| self.smtp_password.clone())
             .ok_or_else(|| {
                 eyre::eyre!(

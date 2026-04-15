@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use octos_agent::{
-    WorkspacePolicy, WorkspaceProjectKind, initialize_and_commit, write_workspace_policy,
+    WorkspacePolicy, WorkspaceProjectKind, initialize_and_commit, read_workspace_policy,
+    upgrade_workspace_policy_if_legacy, write_workspace_policy,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -91,11 +92,25 @@ module.exports = [];
             .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
-    write_workspace_policy(
-        &project_dir,
-        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
-    )
-    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+    match read_workspace_policy(&project_dir)
+        .map_err(|e| format!("read slides workspace policy failed: {e}"))?
+    {
+        Some(existing_policy) => {
+            if let Some(upgraded_policy) =
+                upgrade_workspace_policy_if_legacy(&existing_policy, WorkspaceProjectKind::Slides)
+            {
+                write_workspace_policy(&project_dir, &upgraded_policy)
+                    .map_err(|e| format!("upgrade slides workspace policy failed: {e}"))?;
+            }
+        }
+        None => {
+            write_workspace_policy(
+                &project_dir,
+                &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+            )
+            .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+        }
+    }
 
     initialize_and_commit(
         &project_dir,
@@ -916,6 +931,41 @@ mod tests {
         scaffold_slides_project(tmp.path(), "deck").unwrap();
         let content = std::fs::read_to_string(&memory_path).unwrap();
         assert_eq!(content, "custom content");
+    }
+
+    #[test]
+    fn should_upgrade_legacy_slides_policy_on_rescaffold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = scaffold_slides_project(tmp.path(), "deck").unwrap();
+        let legacy_policy = WorkspacePolicy {
+            validation: octos_agent::ValidationPolicy::default(),
+            artifacts: octos_agent::WorkspaceArtifactsPolicy::default(),
+            spawn_tasks: Default::default(),
+            ..WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides)
+        };
+        write_workspace_policy(&project_dir, &legacy_policy).unwrap();
+
+        scaffold_slides_project(tmp.path(), "deck").unwrap();
+
+        let policy = read_workspace_policy(&project_dir).unwrap().unwrap();
+        assert_eq!(
+            policy,
+            WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides)
+        );
+    }
+
+    #[test]
+    fn should_preserve_custom_slides_policy_on_rescaffold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = scaffold_slides_project(tmp.path(), "deck").unwrap();
+        let mut custom_policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        custom_policy.validation.on_turn_end = vec!["file_exists:custom.js".into()];
+        write_workspace_policy(&project_dir, &custom_policy).unwrap();
+
+        scaffold_slides_project(tmp.path(), "deck").unwrap();
+
+        let policy = read_workspace_policy(&project_dir).unwrap().unwrap();
+        assert_eq!(policy, custom_policy);
     }
 
     #[test]

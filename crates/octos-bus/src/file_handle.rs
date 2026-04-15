@@ -17,9 +17,20 @@ pub fn temp_upload_root() -> PathBuf {
 }
 
 pub fn encode_profile_file_handle(base_dir: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(base_dir).ok()?;
+    let relative = path
+        .strip_prefix(base_dir)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let canonical_base = std::fs::canonicalize(base_dir).ok()?;
+            let canonical_path = std::fs::canonicalize(path).ok()?;
+            canonical_path
+                .strip_prefix(&canonical_base)
+                .ok()
+                .map(Path::to_path_buf)
+        })?;
     let display_name = path.file_name()?.to_str()?;
-    encode_scoped_handle(PROFILE_HANDLE_PREFIX, relative, display_name)
+    encode_scoped_handle(PROFILE_HANDLE_PREFIX, &relative, display_name)
 }
 
 pub fn encode_tmp_upload_handle(path: &Path, display_name: Option<&str>) -> Option<String> {

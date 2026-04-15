@@ -46,7 +46,6 @@ mod tests {
     use super::*;
     use crate::task::{Task, TaskContext, TaskKind, TaskResult, TokenUsage};
     use crate::types::AgentId;
-    use std::path::PathBuf;
 
     fn make_task() -> Task {
         Task::new(
@@ -63,6 +62,7 @@ mod tests {
             success: true,
             output: "done".into(),
             files_modified: vec![],
+            files_to_send: vec![],
             subtasks: vec![],
             token_usage: TokenUsage::default(),
         }

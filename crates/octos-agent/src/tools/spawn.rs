@@ -13,7 +13,8 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
-use crate::Agent;
+use crate::task_supervisor::TaskSupervisor;
+use crate::{Agent, AgentConfig};
 
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
@@ -32,6 +33,7 @@ pub struct BackgroundResultPayload {
     pub task_label: String,
     pub content: String,
     pub kind: BackgroundResultKind,
+    pub media: Vec<String>,
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -55,6 +57,12 @@ pub struct SpawnTool {
     plugin_dirs: Vec<PathBuf>,
     /// Extra environment variables for plugin processes.
     plugin_extra_env: Vec<(String, String)>,
+    /// Shared task supervisor so background subagents show up in task tracking.
+    task_supervisor: Option<Arc<TaskSupervisor>>,
+    /// Owning session key for tracked background subagents.
+    session_key: Option<String>,
+    /// Optional agent config inherited from the parent session.
+    worker_config: Option<AgentConfig>,
 }
 
 impl SpawnTool {
@@ -77,6 +85,9 @@ impl SpawnTool {
             background_result_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            task_supervisor: None,
+            session_key: None,
+            worker_config: None,
         }
     }
 
@@ -102,6 +113,9 @@ impl SpawnTool {
             background_result_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            task_supervisor: None,
+            session_key: None,
+            worker_config: None,
         }
     }
 
@@ -139,6 +153,23 @@ impl SpawnTool {
     ) -> Self {
         self.plugin_dirs = dirs;
         self.plugin_extra_env = extra_env;
+        self
+    }
+
+    /// Register spawned background workers in the shared task supervisor.
+    pub fn with_task_supervisor(
+        mut self,
+        supervisor: Arc<TaskSupervisor>,
+        session_key: impl Into<String>,
+    ) -> Self {
+        self.task_supervisor = Some(supervisor);
+        self.session_key = Some(session_key.into());
+        self
+    }
+
+    /// Inherit the parent agent configuration for spawned workers.
+    pub fn with_agent_config(mut self, config: AgentConfig) -> Self {
+        self.worker_config = Some(config);
         self
     }
 
@@ -216,6 +247,15 @@ struct Input {
 
 fn default_mode() -> String {
     "background".into()
+}
+
+fn should_deliver_output_files(files: &[PathBuf]) -> bool {
+    files.iter().any(|path| {
+        !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("md" | "txt" | "json" | "csv")
+        )
+    })
 }
 
 #[async_trait]
@@ -372,6 +412,9 @@ impl Tool for SpawnTool {
                 tools.set_provider_policy(pp.clone());
             }
             let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
+            if let Some(ref config) = self.worker_config {
+                worker = worker.with_config(config.clone());
+            }
             // Base prompt: configured worker prompt, or compiled-in default.
             // Additional instructions are appended, never replacing the base.
             let base_prompt = self
@@ -416,6 +459,13 @@ impl Tool for SpawnTool {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            let tracked_task_id = self.task_supervisor.as_ref().map(|supervisor| {
+                supervisor.register(
+                    &label,
+                    &format!("spawn-{worker_id}"),
+                    self.session_key.as_deref(),
+                )
+            });
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -428,8 +478,16 @@ impl Tool for SpawnTool {
             let task_label = label.clone();
             let plugin_dirs = self.plugin_dirs.clone();
             let plugin_extra_env = self.plugin_extra_env.clone();
+            let task_supervisor = self.task_supervisor.clone();
+            let worker_config = self.worker_config.clone();
 
             tokio::spawn(async move {
+                if let (Some(supervisor), Some(task_id)) =
+                    (task_supervisor.as_ref(), tracked_task_id.as_ref())
+                {
+                    supervisor.mark_running(task_id);
+                }
+
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.
                 if !plugin_dirs.is_empty() {
@@ -452,6 +510,9 @@ impl Tool for SpawnTool {
                     tools.set_provider_policy(pp);
                 }
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
+                if let Some(ref config) = worker_config {
+                    worker = worker.with_config(config.clone());
+                }
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
@@ -472,6 +533,31 @@ impl Tool for SpawnTool {
                 );
 
                 let result = worker.run_task(&subtask).await;
+                let tracked_output_files = match &result {
+                    Ok(task_result) => task_result
+                        .files_to_send
+                        .iter()
+                        .chain(task_result.files_modified.iter())
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+
+                if let (Some(supervisor), Some(task_id)) =
+                    (task_supervisor.as_ref(), tracked_task_id.as_ref())
+                {
+                    match &result {
+                        Ok(task_result) if task_result.success => {
+                            supervisor.mark_completed(task_id, tracked_output_files.clone());
+                        }
+                        Ok(task_result) => {
+                            supervisor.mark_failed(task_id, task_result.output.clone());
+                        }
+                        Err(error) => {
+                            supervisor.mark_failed(task_id, error.to_string());
+                        }
+                    }
+                }
 
                 let content = match &result {
                     Ok(r) => format!(
@@ -481,6 +567,16 @@ impl Tool for SpawnTool {
                     ),
                     Err(e) => format!("Status: FAILED\nError: {e}"),
                 };
+                let (result_kind, result_media) = match &result {
+                    Ok(r) if r.success && should_deliver_output_files(&r.files_to_send) => (
+                        BackgroundResultKind::Notification,
+                        r.files_to_send
+                            .iter()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => (BackgroundResultKind::Report, Vec::new()),
+                };
 
                 // Direct injection path: inject as system message, no extra LLM call.
                 // If the actor has exited (idle timeout), the send fails and we
@@ -489,7 +585,8 @@ impl Tool for SpawnTool {
                     if sender(BackgroundResultPayload {
                         task_label,
                         content: content.clone(),
-                        kind: BackgroundResultKind::Report,
+                        kind: result_kind,
+                        media: result_media.clone(),
                     })
                     .await
                     {
@@ -564,6 +661,9 @@ mod tests {
             background_result_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            task_supervisor: None,
+            session_key: None,
+            worker_config: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -574,6 +674,47 @@ mod tests {
 
         // Worker count should not increment on invalid input
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_background_spawn_tracks_supervisor_lifecycle() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session");
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Write a short answer",
+                "label": "Deep research",
+                "mode": "background",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    assert_eq!(task.tool_name, "Deep research");
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     // Minimal mock provider for testing

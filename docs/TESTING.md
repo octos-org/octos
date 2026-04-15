@@ -16,6 +16,10 @@
 ./scripts/ci.sh --serial
 ```
 
+For live browser smoke coverage of long-running workflows such as deep research,
+background TTS, and research-first podcast generation, see
+[LIVE_BROWSER_SMOKE_TESTS.md](LIVE_BROWSER_SMOKE_TESTS.md).
+
 ---
 
 ## CI Pipeline

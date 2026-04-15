@@ -259,11 +259,20 @@ impl SessionManager {
 
     /// Add a message to a session and persist it.
     pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
-        let session = self.get_or_create(key).await;
-        session.messages.push(message.clone());
-        session.updated_at = Utc::now();
+        self.add_message_with_seq(key, message).await.map(|_| ())
+    }
+
+    /// Add a message to a session, persist it, and return its committed sequence.
+    pub async fn add_message_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<usize> {
         self.append_to_disk(key, &message).await?;
-        Ok(())
+        let session = self.get_or_create(key).await;
+        session.messages.push(message);
+        session.updated_at = Utc::now();
+        Ok(session.messages.len().saturating_sub(1))
     }
 
     /// Get the JSONL file path for a session key.
@@ -828,10 +837,15 @@ impl SessionHandle {
 
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
+        self.add_message_with_seq(message).await.map(|_| ())
+    }
+
+    /// Add a message to the session, persist it, and return its committed sequence.
+    pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         self.append_to_disk(&message).await?;
-        Ok(())
+        Ok(self.session.messages.len().saturating_sub(1))
     }
 
     /// Sort messages by timestamp (for speculative overflow ordering).
@@ -2146,5 +2160,25 @@ mod tests {
         for e in &entries {
             assert_eq!(e.message_count, 1, "each session should have 1 message");
         }
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_add_message_with_seq_returns_committed_index() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-seq-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        let first = handle
+            .add_message_with_seq(make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+        let second = handle
+            .add_message_with_seq(make_message(MessageRole::Assistant, "world"))
+            .await
+            .unwrap();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(handle.get_history(10).len(), 2);
     }
 }

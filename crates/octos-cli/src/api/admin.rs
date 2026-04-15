@@ -2766,6 +2766,33 @@ const DEFAULT_SHELL_TIMEOUT: u64 = 30;
 /// Maximum shell timeout in seconds.
 const MAX_SHELL_TIMEOUT: u64 = 600;
 
+fn platform_shell_command(command: &str, cwd: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C");
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c");
+        cmd
+    };
+    cmd.arg(command).current_dir(cwd);
+    cmd
+}
+
+async fn kill_process_tree(pid: u32) {
+    let mut killer = if cfg!(windows) {
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("kill");
+        cmd.args(["-9", &pid.to_string()]);
+        cmd
+    };
+    let _ = killer.output().await;
+}
+
 #[derive(Deserialize)]
 pub struct ShellRequest {
     pub command: String,
@@ -2815,8 +2842,7 @@ pub async fn admin_shell(
         ));
     }
 
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(&req.command).current_dir(cwd_path);
+    let mut cmd = platform_shell_command(&req.command, cwd_path);
 
     // Sanitize environment — remove dangerous env vars
     for var in octos_agent::sandbox::BLOCKED_ENV_VARS {
@@ -2874,10 +2900,7 @@ pub async fn admin_shell(
         Err(_) => {
             // Kill the child process on timeout
             if let Some(pid) = child_pid {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output()
-                    .await;
+                kill_process_tree(pid).await;
             }
             tracing::warn!(
                 timeout = timeout_secs,
@@ -4200,11 +4223,39 @@ mod tests {
         assert_eq!(MAX_SHELL_TIMEOUT, 600);
     }
 
+    fn test_shell_cwd() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
+    fn missing_test_cwd() -> String {
+        std::env::temp_dir()
+            .join("octos-admin-shell-missing")
+            .join("nope")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn test_stderr_command() -> &'static str {
+        if cfg!(windows) {
+            "echo err 1>&2"
+        } else {
+            "echo err >&2"
+        }
+    }
+
+    fn test_timeout_command() -> &'static str {
+        if cfg!(windows) {
+            "ping 127.0.0.1 -n 10 > nul"
+        } else {
+            "sleep 10"
+        }
+    }
+
     #[tokio::test]
     async fn shell_echo_command() {
         let req = ShellRequest {
             command: "echo hello".into(),
-            cwd: Some("/tmp".into()),
+            cwd: Some(test_shell_cwd()),
             timeout_secs: Some(5),
         };
         let result = admin_shell(Json(req)).await.unwrap();
@@ -4228,7 +4279,7 @@ mod tests {
     async fn shell_bad_cwd_rejected() {
         let req = ShellRequest {
             command: "echo hi".into(),
-            cwd: Some("/nonexistent/path/xyz".into()),
+            cwd: Some(missing_test_cwd()),
             timeout_secs: None,
         };
         let err = admin_shell(Json(req)).await.unwrap_err();
@@ -4238,8 +4289,8 @@ mod tests {
     #[tokio::test]
     async fn shell_captures_stderr() {
         let req = ShellRequest {
-            command: "echo err >&2".into(),
-            cwd: Some("/tmp".into()),
+            command: test_stderr_command().into(),
+            cwd: Some(test_shell_cwd()),
             timeout_secs: Some(5),
         };
         let result = admin_shell(Json(req)).await.unwrap();
@@ -4251,7 +4302,7 @@ mod tests {
     async fn shell_nonzero_exit_code() {
         let req = ShellRequest {
             command: "exit 42".into(),
-            cwd: Some("/tmp".into()),
+            cwd: Some(test_shell_cwd()),
             timeout_secs: Some(5),
         };
         let result = admin_shell(Json(req)).await.unwrap();
@@ -4261,8 +4312,8 @@ mod tests {
     #[tokio::test]
     async fn shell_timeout() {
         let req = ShellRequest {
-            command: "sleep 10".into(),
-            cwd: Some("/tmp".into()),
+            command: test_timeout_command().into(),
+            cwd: Some(test_shell_cwd()),
             timeout_secs: Some(1),
         };
         let result = admin_shell(Json(req)).await.unwrap();

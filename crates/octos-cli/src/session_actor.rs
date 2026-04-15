@@ -17,7 +17,8 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
-    TurnAttachmentContext, WorkspacePolicy, workspace_policy_path, write_workspace_policy,
+    TurnAttachmentContext, WorkspacePolicy, read_workspace_policy, workspace_policy_path,
+    write_workspace_policy,
 };
 use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
 use octos_core::AgentId;
@@ -30,7 +31,7 @@ use octos_llm::{
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -76,6 +77,109 @@ struct ForwarderParams {
     sender_user_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForcedBackgroundWorkflow {
+    DeepResearch,
+    ResearchPodcast,
+}
+
+impl ForcedBackgroundWorkflow {
+    fn detect(content: &str) -> Option<Self> {
+        let lower = content.to_ascii_lowercase();
+        if Self::explicitly_foreground(&lower, content) {
+            return None;
+        }
+
+        let has_podcast = lower.contains("podcast")
+            || content.contains("播客")
+            || content.contains("语音播客");
+        let has_research_signal = lower.contains("deep research")
+            || lower.contains("research")
+            || lower.contains("latest")
+            || lower.contains("news")
+            || content.contains("研究")
+            || content.contains("深入")
+            || content.contains("深度")
+            || content.contains("最新")
+            || content.contains("今日")
+            || content.contains("热点")
+            || content.contains("新闻")
+            || content.contains("搜索")
+            || content.contains("资料");
+
+        if has_podcast && has_research_signal {
+            return Some(Self::ResearchPodcast);
+        }
+
+        let has_deep_research = lower.contains("deep research")
+            || content.contains("深度研究")
+            || content.contains("深入研究")
+            || content.contains("深度调查")
+            || content.contains("深度搜索")
+            || content.contains("深度调研");
+        if has_deep_research {
+            return Some(Self::DeepResearch);
+        }
+
+        None
+    }
+
+    fn explicitly_foreground(lower: &str, original: &str) -> bool {
+        lower.contains("wait synchronously")
+            || lower.contains("wait for completion")
+            || lower.contains("don't use background")
+            || lower.contains("do not use background")
+            || original.contains("不要后台")
+            || original.contains("别后台")
+            || original.contains("同步")
+            || original.contains("等待完成")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DeepResearch => "Deep research",
+            Self::ResearchPodcast => "Research podcast",
+        }
+    }
+
+    fn ack_message(self) -> &'static str {
+        match self {
+            Self::DeepResearch => {
+                "深度研究已在后台启动。完成后会把最终研究结果发回当前会话。"
+            }
+            Self::ResearchPodcast => {
+                "研究和播客生成已在后台启动。完成后只会发送最终音频结果到当前会话。"
+            }
+        }
+    }
+
+    fn allowed_tools(self) -> Vec<String> {
+        match self {
+            Self::DeepResearch => vec!["run_pipeline".into()],
+            Self::ResearchPodcast => vec![
+                "deep_search".into(),
+                "news_fetch".into(),
+                "write_file".into(),
+                "read_file".into(),
+                "list_dir".into(),
+                "glob".into(),
+                "podcast_generate".into(),
+            ],
+        }
+    }
+
+    fn additional_instructions(self) -> &'static str {
+        match self {
+            Self::DeepResearch => {
+                "You are a background research analyst. Use run_pipeline with an inline DOT graph to complete the research in the background. Deliver exactly one final user-facing report. Do not emit intermediate status chatter or send intermediate files."
+            }
+            Self::ResearchPodcast => {
+                "You are a background news podcast producer. Research inside this worker, write a single podcast script in the exact format `[Character - voice, emotion] text`, and then call podcast_generate exactly once after the script is ready. Use the exact clone voices `clone:yangmi` for 杨幂 and `clone:douwentao` for 窦文涛 on every dialogue line. Do not substitute preset voices like alloy, nova, or vivian. Keep the research focused: gather only enough fresh evidence to support the script, stop after roughly 4-6 search passes, and do not keep recursively expanding side topics. Target a substantive but bounded final audio runtime of about 10-15 minutes unless the user explicitly asks for a longer show. That usually means about 18-28 dialogue lines total and no sprawling 30-45 minute scripts. Do not use fm_tts, voice_synthesize, or send_file. Do not deliver intermediate reports or script files. Only the final podcast audio may be delivered to the user."
+            }
+        }
+    }
+}
+
 /// Default actor inbox capacity.
 const ACTOR_INBOX_SIZE: usize = 32;
 
@@ -87,6 +191,36 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PersistedSessionMessage {
+    seq: usize,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+async fn persist_assistant_message(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    session_key: &SessionKey,
+    content: String,
+    media: Vec<String>,
+) -> Option<PersistedSessionMessage> {
+    let mut assistant_msg = Message::assistant(content);
+    assistant_msg.media = media;
+    let timestamp = assistant_msg.timestamp;
+
+    let mut handle = session_handle.lock().await;
+    match handle.add_message_with_seq(assistant_msg).await {
+        Ok(seq) => Some(PersistedSessionMessage { seq, timestamp }),
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to persist assistant message"
+            );
+            None
+        }
+    }
+}
 
 fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let current_profile_id = data_dir
@@ -411,6 +545,10 @@ pub enum ActorMessage {
         content: String,
         /// Delivery semantics for this result.
         kind: BackgroundResultKind,
+        /// Media files attached to this terminal background result.
+        media: Vec<String>,
+        /// Completion acknowledgment for durable persistence.
+        ack: Option<oneshot::Sender<bool>>,
     },
     /// Background task status changed — push to SSE.
     TaskStatusChanged {
@@ -847,14 +985,52 @@ impl ActorFactory {
             );
         }
         let session_policy_path = workspace_policy_path(&user_workspace);
-        if !session_policy_path.exists() {
-            if let Err(error) =
-                write_workspace_policy(&user_workspace, &WorkspacePolicy::for_session())
-            {
+        let desired_session_policy = WorkspacePolicy::for_session();
+        match read_workspace_policy(&user_workspace) {
+            Ok(Some(mut existing_policy)) => {
+                let mut updated = false;
+                for (name, pattern) in &desired_session_policy.artifacts.entries {
+                    if !existing_policy.artifacts.entries.contains_key(name) {
+                        existing_policy
+                            .artifacts
+                            .entries
+                            .insert(name.clone(), pattern.clone());
+                        updated = true;
+                    }
+                }
+                for (name, task) in &desired_session_policy.spawn_tasks {
+                    if !existing_policy.spawn_tasks.contains_key(name) {
+                        existing_policy
+                            .spawn_tasks
+                            .insert(name.clone(), task.clone());
+                        updated = true;
+                    }
+                }
+                if updated {
+                    if let Err(error) = write_workspace_policy(&user_workspace, &existing_policy) {
+                        warn!(
+                            session = %session_key,
+                            path = %session_policy_path.display(),
+                            "failed to upgrade session workspace policy: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = write_workspace_policy(&user_workspace, &desired_session_policy)
+                {
+                    warn!(
+                        session = %session_key,
+                        path = %session_policy_path.display(),
+                        "failed to write session workspace policy: {error}"
+                    );
+                }
+            }
+            Err(error) => {
                 warn!(
                     session = %session_key,
                     path = %session_policy_path.display(),
-                    "failed to write session workspace policy: {error}"
+                    "failed to read session workspace policy: {error}"
                 );
             }
         }
@@ -894,7 +1070,9 @@ impl ActorFactory {
             channel,
             chat_id,
         )
-        .with_provider_policy(self.provider_policy.clone());
+        .with_provider_policy(self.provider_policy.clone())
+        .with_agent_config(self.agent_config.clone())
+        .with_task_supervisor(supervisor.clone(), session_key.to_string());
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
@@ -912,13 +1090,17 @@ impl ActorFactory {
             move |payload: BackgroundResultPayload| {
                 let tx = bg_tx.clone();
                 Box::pin(async move {
+                    let (ack_tx, ack_rx) = oneshot::channel();
                     tx.send(ActorMessage::BackgroundResult {
                         task_label: payload.task_label,
                         content: payload.content,
                         kind: payload.kind,
+                        media: payload.media,
+                        ack: Some(ack_tx),
                     })
                     .await
                     .is_ok()
+                        && ack_rx.await.unwrap_or(false)
                 })
             },
         ));
@@ -930,13 +1112,17 @@ impl ActorFactory {
         tools.set_background_result_sender(Arc::new(move |payload: BackgroundResultPayload| {
             let tx = bg_tx2.clone();
             Box::pin(async move {
+                let (ack_tx, ack_rx) = oneshot::channel();
                 tx.send(ActorMessage::BackgroundResult {
                     task_label: payload.task_label,
                     content: payload.content,
                     kind: payload.kind,
+                    media: payload.media,
+                    ack: Some(ack_tx),
                 })
                 .await
                 .is_ok()
+                    && ack_rx.await.unwrap_or(false)
             })
         }));
 
@@ -1453,21 +1639,14 @@ impl SessionActor {
                             task_label,
                             content,
                             kind,
+                            media,
+                            ack,
                         }) => {
-                            // Lightweight notification for spawn_only tool completions
-                            // (e.g. fm_tts success/failure) — send directly, no LLM turn.
-                            if kind == BackgroundResultKind::Notification {
-                                tracing::info!(task = %task_label, "spawn_only notification: {}", content);
-                                let _ = self.out_tx.send(octos_core::OutboundMessage {
-                                    channel: self.channel.clone(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: content.clone(),
-                                    reply_to: None,
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                }).await;
-                            } else {
-                                self.inject_background_result(&task_label, &content).await;
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -2049,21 +2228,14 @@ impl SessionActor {
                             task_label,
                             content,
                             kind,
+                            media,
+                            ack,
                         }) => {
-                            if kind == BackgroundResultKind::Notification {
-                                let _ = self
-                                    .out_tx
-                                    .send(OutboundMessage {
-                                        channel: self.channel.clone(),
-                                        chat_id: self.chat_id.clone(),
-                                        content,
-                                        reply_to: None,
-                                        media: vec![],
-                                        metadata: serde_json::json!({}),
-                                    })
-                                    .await;
-                            } else {
-                                self.inject_background_result(&task_label, &content).await;
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
@@ -2118,21 +2290,14 @@ impl SessionActor {
                             task_label,
                             content,
                             kind,
+                            media,
+                            ack,
                         }) => {
-                            if kind == BackgroundResultKind::Notification {
-                                let _ = self
-                                    .out_tx
-                                    .send(OutboundMessage {
-                                        channel: self.channel.clone(),
-                                        chat_id: self.chat_id.clone(),
-                                        content,
-                                        reply_to: None,
-                                        media: vec![],
-                                        metadata: serde_json::json!({}),
-                                    })
-                                    .await;
-                            } else {
-                                self.inject_background_result(&task_label, &content).await;
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
@@ -2164,7 +2329,60 @@ impl SessionActor {
     ///
     /// Sends a preview notification directly to the user and injects the result
     /// into session history for subsequent turns.
-    async fn inject_background_result(&self, task_label: &str, content: &str) {
+    async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
+        let persisted = persist_assistant_message(
+            &self.session_handle,
+            &self.session_key,
+            content.clone(),
+            media.clone(),
+        )
+        .await;
+
+        let metadata = match persisted.as_ref() {
+            Some(persisted_message) => serde_json::json!({
+                "_history_persisted": true,
+                "_session_result": {
+                    "seq": persisted_message.seq,
+                    "role": "assistant",
+                    "content": content.clone(),
+                    "timestamp": persisted_message.timestamp.to_rfc3339(),
+                    "media": media.clone(),
+                }
+            }),
+            None => serde_json::json!({ "_history_persisted": false }),
+        };
+
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content,
+                reply_to: None,
+                media,
+                metadata,
+            })
+            .await;
+
+        persisted.is_some()
+    }
+
+    async fn handle_background_result(
+        &self,
+        task_label: &str,
+        content: &str,
+        kind: BackgroundResultKind,
+        media: Vec<String>,
+    ) -> bool {
+        if kind == BackgroundResultKind::Notification {
+            self.deliver_background_notification(content.to_string(), media)
+                .await
+        } else {
+            self.inject_background_result(task_label, content).await
+        }
+    }
+
+    async fn inject_background_result(&self, task_label: &str, content: &str) -> bool {
         const SUMMARY_THRESHOLD: usize = 1000;
         const SUMMARY_CHARS: usize = 800;
 
@@ -2219,12 +2437,15 @@ impl SessionActor {
         };
 
         let system_msg = Message::system(context_content);
-        {
+        let persisted = {
             let mut handle = self.session_handle.lock().await;
             if let Err(e) = handle.add_message(system_msg).await {
                 warn!(session = %self.session_key, error = %e, "failed to inject background result");
+                false
+            } else {
+                true
             }
-        }
+        };
 
         // Send raw preview directly; the injected context is available on the
         // next turn without forcing a synthetic rewrite prompt.
@@ -2239,6 +2460,8 @@ impl SessionActor {
                 metadata: serde_json::json!({}),
             })
             .await;
+
+        persisted
     }
 
     /// Copy media files from their original location (e.g. profile media_dir)
@@ -2320,6 +2543,146 @@ impl SessionActor {
         }
     }
 
+    fn forced_background_workflow_for_turn(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> Option<ForcedBackgroundWorkflow> {
+        if !image_media.is_empty() || !attachment_media.is_empty() {
+            return None;
+        }
+        if self.channel == "system" {
+            return None;
+        }
+        ForcedBackgroundWorkflow::detect(&inbound.content)
+    }
+
+    async fn maybe_start_forced_background_workflow(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+        attachment_prompt: Option<&str>,
+        persisted_user_content: &str,
+        reply_to: Option<String>,
+    ) -> bool {
+        let Some(workflow) =
+            self.forced_background_workflow_for_turn(inbound, image_media, attachment_media)
+        else {
+            return false;
+        };
+
+        let mut task = inbound.content.clone();
+        if let Some(prompt) = attachment_prompt.filter(|value| !value.trim().is_empty()) {
+            task.push_str("\n\nAttachment context:\n");
+            task.push_str(prompt);
+        }
+
+        let args = serde_json::json!({
+            "task": task,
+            "label": workflow.label(),
+            "mode": "background",
+            "allowed_tools": workflow.allowed_tools(),
+            "additional_instructions": workflow.additional_instructions(),
+        });
+
+        let tool_registry = self.agent.tool_registry();
+        let spawn_result = match tool_registry.execute("spawn", &args).await {
+            Ok(result) if result.success => result,
+            Ok(result) => {
+                warn!(
+                    session = %self.session_key,
+                    workflow = workflow.label(),
+                    error = %result.output,
+                    "forced background spawn returned failure"
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    session = %self.session_key,
+                    workflow = workflow.label(),
+                    error = %error,
+                    "forced background spawn failed"
+                );
+                return false;
+            }
+        };
+
+        let user_msg = Message {
+            role: MessageRole::User,
+            content: persisted_user_content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        };
+        {
+            let mut handle = self.session_handle.lock().await;
+            let session = handle.get_or_create();
+            if session.summary.is_none() && !persisted_user_content.trim().is_empty() {
+                session.summary = Some(persisted_user_content.chars().take(100).collect());
+            }
+            if let Err(error) = handle.add_message(user_msg).await {
+                warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+            }
+        }
+
+        let ack_content = workflow.ack_message().to_string();
+        let persisted = persist_assistant_message(
+            &self.session_handle,
+            &self.session_key,
+            ack_content.clone(),
+            vec![],
+        )
+        .await;
+
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: ack_content,
+                reply_to,
+                media: vec![],
+                metadata: serde_json::json!({
+                    "_history_persisted": persisted,
+                    "spawn_output": spawn_result.output,
+                }),
+            })
+            .await;
+
+        if self.channel == "api" {
+            let bg_tasks = tool_registry
+                .supervisor()
+                .get_tasks_for_session(&self.session_key.to_string())
+                .into_iter()
+                .filter(|task| task.status.is_active())
+                .map(|task| sanitize_task_for_response(&self.data_dir, &task))
+                .collect::<Vec<_>>();
+
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({
+                        "_completion": true,
+                        "has_bg_tasks": !bg_tasks.is_empty(),
+                        "bg_tasks": bg_tasks,
+                    }),
+                })
+                .await;
+        }
+
+        true
+    }
+
     /// Speculative processing: runs the LLM call but monitors the inbox.
     /// If the call exceeds 2× responsiveness baseline and a new user message
     /// arrives, the new message gets a quick LLM response via the adaptive
@@ -2360,6 +2723,21 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return,
         };
+
+        if self
+            .maybe_start_forced_background_workflow(
+                &inbound,
+                &image_media,
+                &attachment_media,
+                attachment_prompt.as_deref(),
+                &persisted_user_content,
+                inbound_message_id.clone(),
+            )
+            .await
+        {
+            self.cancelled.store(false, Ordering::Release);
+            return;
+        }
 
         let max_history = self.max_history.load(Ordering::Acquire);
 
@@ -2601,18 +2979,14 @@ impl SessionActor {
                             task_label,
                             content,
                             kind,
+                            media,
+                            ack,
                         }) => {
-                            if kind == BackgroundResultKind::Notification {
-                                let _ = self.out_tx.send(octos_core::OutboundMessage {
-                                    channel: self.channel.clone(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: content.clone(),
-                                    reply_to: None,
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                }).await;
-                            } else {
-                                self.inject_background_result(&task_label, &content).await;
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
@@ -2977,12 +3351,20 @@ impl SessionActor {
             }
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
+                let content = format!("Error: {e}");
+                let _ = persist_assistant_message(
+                    &self.session_handle,
+                    &self.session_key,
+                    content.clone(),
+                    vec![],
+                )
+                .await;
                 let _ = self
                     .out_tx
                     .send(OutboundMessage {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
-                        content: format!("Error: {e}"),
+                        content,
                         reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
@@ -2991,12 +3373,20 @@ impl SessionActor {
             }
             Err(_) => {
                 tracing::error!(session = %self.session_key, "session processing timed out");
+                let content = "Processing timed out. Please try again.".to_string();
+                let _ = persist_assistant_message(
+                    &self.session_handle,
+                    &self.session_key,
+                    content.clone(),
+                    vec![],
+                )
+                .await;
                 let _ = self
                     .out_tx
                     .send(OutboundMessage {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
-                        content: "Processing timed out. Please try again.".to_string(),
+                        content,
                         reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
@@ -3264,11 +3654,19 @@ impl SessionActor {
                 }
                 Ok(Err(e)) => {
                     tracing::error!(session = %session_key, error = %e, "overflow agent task failed");
+                    let content = format!("Error: {e}");
+                    let _ = persist_assistant_message(
+                        &session_handle,
+                        &session_key,
+                        content.clone(),
+                        vec![],
+                    )
+                    .await;
                     let _ = out_tx
                         .send(OutboundMessage {
                             channel: channel.clone(),
                             chat_id: chat_id.clone(),
-                            content: format!("Error: {e}"),
+                            content,
                             reply_to: overflow_reply_to.clone(),
                             media: vec![],
                             metadata: serde_json::json!({}),
@@ -3276,11 +3674,19 @@ impl SessionActor {
                         .await;
                 }
                 Err(_) => {
+                    let content = "Processing timed out.".to_string();
+                    let _ = persist_assistant_message(
+                        &session_handle,
+                        &session_key,
+                        content.clone(),
+                        vec![],
+                    )
+                    .await;
                     let _ = out_tx
                         .send(OutboundMessage {
                             channel: channel.clone(),
                             chat_id: chat_id.clone(),
-                            content: "Processing timed out.".to_string(),
+                            content,
                             reply_to: overflow_reply_to.clone(),
                             media: vec![],
                             metadata: serde_json::json!({}),
@@ -3333,6 +3739,21 @@ impl SessionActor {
             let session = handle.get_or_create();
             session.get_history(max_history).to_vec()
         };
+
+        if self
+            .maybe_start_forced_background_workflow(
+                &inbound,
+                &image_media,
+                &attachment_media,
+                attachment_prompt.as_deref(),
+                &persisted_user_content,
+                inbound_message_id.clone(),
+            )
+            .await
+        {
+            self.cancelled.store(false, Ordering::Release);
+            return;
+        }
 
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
@@ -3649,12 +4070,20 @@ impl SessionActor {
             }
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
+                let content = format!("Error: {e}");
+                let _ = persist_assistant_message(
+                    &self.session_handle,
+                    &self.session_key,
+                    content.clone(),
+                    vec![],
+                )
+                .await;
                 let _ = self
                     .out_tx
                     .send(OutboundMessage {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
-                        content: format!("Error: {e}"),
+                        content,
                         reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
@@ -3663,12 +4092,20 @@ impl SessionActor {
             }
             Err(_) => {
                 tracing::error!(session = %self.session_key, "session processing timed out");
+                let content = "Processing timed out. Please try again.".to_string();
+                let _ = persist_assistant_message(
+                    &self.session_handle,
+                    &self.session_key,
+                    content.clone(),
+                    vec![],
+                )
+                .await;
                 let _ = self
                     .out_tx
                     .send(OutboundMessage {
                         channel: self.channel.clone(),
                         chat_id: self.chat_id.clone(),
-                        content: "Processing timed out. Please try again.".to_string(),
+                        content,
                         reply_to: inbound_message_id.clone(),
                         media: vec![],
                         metadata: serde_json::json!({}),
@@ -4053,6 +4490,72 @@ mod tests {
         (inbox_tx, out_rx, handle, session_mgr)
     }
 
+    async fn setup_actor_with_timeout(
+        agent_provider: Arc<dyn LlmProvider>,
+        session_timeout: Duration,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-timeout"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout,
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
     /// Build a minimal SessionActor with speculative mode + adaptive router.
     ///
     /// `agent_provider` is used by the Agent for primary calls.
@@ -4404,6 +4907,8 @@ mod tests {
             task_label: "research".to_string(),
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: None,
         })
         .await
         .unwrap();
@@ -4469,6 +4974,8 @@ mod tests {
             task_label: "research".to_string(),
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: None,
         })
         .await
         .unwrap();
@@ -4511,6 +5018,95 @@ mod tests {
                 .all(|m| !m.content.contains("[REWRITE]")),
             "rewrite prompt leaked into session history: {:?}",
             session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_notification_persists_media_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let media_path = dir.path().join("podcast_full_test.mp3");
+        std::fs::write(&media_path, vec![1u8; 4096]).unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "podcast_generate".to_string(),
+            content: String::new(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![media_path.to_string_lossy().to_string()],
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background notification was not persisted"
+        );
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+        assert_eq!(
+            outbound.media,
+            vec![media_path.to_string_lossy().to_string()]
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let persisted = session.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.media == vec![media_path.to_string_lossy().to_string()]
+        });
+        assert!(persisted, "media notification not found in session history");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_timeout_failure_persists_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(250), make_response("late reply"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_timeout(agent_llm, Duration::from_millis(50), &dir).await;
+
+        tx.send(make_inbound("slow request")).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout response")
+            .expect("outbound timeout message");
+        assert_eq!(outbound.content, "Processing timed out. Please try again.");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content == "Processing timed out. Please try again."),
+            "timeout message not found in session history: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
         );
 
         drop(tx);
@@ -5259,5 +5855,35 @@ mod tests {
         assert_eq!(news.get_history(10).len(), 1);
         assert_eq!(weather.get_history(10)[0].content, "weather message");
         assert_eq!(news.get_history(10)[0].content, "news message");
+    }
+
+    #[test]
+    fn forced_background_workflow_detects_deep_research() {
+        assert_eq!(
+            ForcedBackgroundWorkflow::detect(
+                "请对「全球AI代理竞争格局」做一次深度研究，并输出完整报告。"
+            ),
+            Some(ForcedBackgroundWorkflow::DeepResearch)
+        );
+    }
+
+    #[test]
+    fn forced_background_workflow_detects_research_podcast() {
+        assert_eq!(
+            ForcedBackgroundWorkflow::detect(
+                "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻，要求专业冷静。"
+            ),
+            Some(ForcedBackgroundWorkflow::ResearchPodcast)
+        );
+    }
+
+    #[test]
+    fn forced_background_workflow_respects_foreground_override() {
+        assert_eq!(
+            ForcedBackgroundWorkflow::detect(
+                "请同步等待完成，不要后台。对这个主题做深度研究并直接在这里输出。"
+            ),
+            None
+        );
     }
 }

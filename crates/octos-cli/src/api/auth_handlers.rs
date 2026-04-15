@@ -2350,6 +2350,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn me_masks_nested_email_secret_fields() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        user_store
+            .save(&User {
+                id: "tenant".into(),
+                email: "tenant@example.com".into(),
+                name: "Tenant Owner".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp.gmail.com".into()),
+            smtp_port: Some(465),
+            username: Some("tenant@example.com".into()),
+            password_env: Some("eqepkfbyfymwfhnv".into()),
+            password: Some("eqepkfbyfymwfhnv".into()),
+            from_address: Some("tenant@example.com".into()),
+            feishu_app_id: None,
+            feishu_app_secret_env: Some("LARK_APP_SECRET".into()),
+            feishu_app_secret: Some("super-secret-lark-token".into()),
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = me(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["user"]["email"], "tenant@example.com");
+        let email_config = &json["profile"]["config"]["email"];
+        assert_eq!(email_config["password"], "eqep***hnv");
+        assert_eq!(email_config["password_env"], "eqep***hnv");
+        assert_eq!(email_config["feishu_app_secret"], "supe***ken");
+        assert_eq!(email_config["feishu_app_secret_env"], "LARK_APP_SECRET");
+    }
+
+    #[tokio::test]
     async fn root_allowlisted_email_can_complete_login_and_provision_user() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let allowlist_store = state.allowlist_store.as_ref().unwrap().clone();

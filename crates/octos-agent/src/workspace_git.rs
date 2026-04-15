@@ -143,7 +143,9 @@ pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<Wor
 }
 
 pub fn init_workspace_repo(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
-    with_repo_git_lock(project_root, || init_workspace_repo_unlocked(project_root, kind))
+    with_repo_git_lock(project_root, || {
+        init_workspace_repo_unlocked(project_root, kind)
+    })
 }
 
 fn init_workspace_repo_unlocked(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {

@@ -12,6 +12,7 @@ pub(crate) mod session_ui;
 mod skills_handler;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Args;
 use eyre::{Result, WrapErr};
@@ -153,12 +154,16 @@ pub(crate) fn build_profiled_session_key(
 
 impl Executable for GatewayCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(8 * 1024 * 1024) // 8MB stack for deep agent futures
             .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+            .wrap_err("failed to create tokio runtime")?;
+        let result = runtime.block_on(self.run_async());
+        // The CLI channel reads stdin via Tokio's blocking stdin adapter, which can
+        // otherwise keep runtime teardown from returning promptly after shutdown.
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        result
     }
 }
 

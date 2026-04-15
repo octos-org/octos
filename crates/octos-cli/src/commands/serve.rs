@@ -175,7 +175,10 @@ impl ServeCommand {
             // (covers nohup startup where LaunchAgent env vars aren't available)
             if let Some(ref auth_cfg) = auth_config {
                 let pw_env = &auth_cfg.smtp.password_env;
-                if std::env::var(pw_env).is_err() {
+                if std::env::var(pw_env)
+                    .ok()
+                    .map_or(true, |value| value.trim().is_empty())
+                {
                     let profiles_for_smtp = profile_store.list().unwrap_or_default();
                     for p in &profiles_for_smtp {
                         if let Some(pw) = p.config.env_vars.get(pw_env) {
