@@ -9,10 +9,8 @@ use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
-use super::message_repair::{
-    normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,
-    sanitize_tool_call_id, synthesize_missing_tool_results, truncate_old_tool_results,
-};
+use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
+use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::LoopTurnState;
 use super::{Agent, ConversationResponse, TokenTracker};
 use crate::loop_detect::LoopDetector;
@@ -186,13 +184,7 @@ impl Agent {
                     }
 
                     let tools_spec = self.tools.specs();
-                    self.trim_to_context_window(&mut messages);
-                    normalize_system_messages(&mut messages);
-                    repair_message_order(&mut messages);
-                    repair_tool_pairs(&mut messages);
-                    synthesize_missing_tool_results(&mut messages);
-                    truncate_old_tool_results(&mut messages);
-                    normalize_tool_call_ids(&mut messages);
+                    prepare_conversation_messages(self, &mut messages);
 
                     if iteration == 1 && tools_spec.len() > 25 {
                         tracing::warn!(
@@ -444,8 +436,7 @@ impl Agent {
                 }
 
                 let tools_spec = self.tools.specs();
-                self.trim_to_context_window(&mut messages);
-                normalize_tool_call_ids(&mut messages);
+                prepare_task_messages(self, &mut messages);
 
                 let (response, _streamed) = self
                     .call_llm_with_hooks(

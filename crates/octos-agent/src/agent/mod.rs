@@ -5,6 +5,7 @@ mod compaction;
 mod detection;
 mod execution;
 mod llm_call;
+mod loop_compaction;
 mod loop_runner;
 mod memory;
 mod message_repair;
