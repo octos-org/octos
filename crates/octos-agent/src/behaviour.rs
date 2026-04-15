@@ -4,7 +4,8 @@
 //! an action kind + argument. They run without LLM involvement and are used for
 //! spawn_only task verification, turn-end validation, and cleanup.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use eyre::{Result, eyre};
 use glob::glob;
@@ -30,6 +31,38 @@ impl ActionResult {
     }
 }
 
+/// Optional named target resolution for actions that need runtime-bound paths.
+///
+/// This is used by spawn-task contracts so shared actions such as
+/// `file_exists:$artifact` and `file_size_min:$artifact:1024` resolve against
+/// the verified output candidates rather than a static glob.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ActionContext {
+    named_targets: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl ActionContext {
+    pub(crate) fn with_named_target(
+        mut self,
+        name: impl Into<String>,
+        targets: Vec<PathBuf>,
+    ) -> Self {
+        self.named_targets.insert(name.into(), targets);
+        self
+    }
+
+    pub(crate) fn resolve_targets(
+        &self,
+        workspace_root: &Path,
+        target: &str,
+    ) -> Result<Vec<PathBuf>> {
+        if target.starts_with('$') {
+            return Ok(self.named_targets.get(target).cloned().unwrap_or_default());
+        }
+        resolve_glob(workspace_root, target)
+    }
+}
+
 /// Extract notification messages from action results.
 pub fn notifications(results: &[(String, ActionResult)]) -> Vec<String> {
     results
@@ -52,12 +85,20 @@ pub fn notifications(results: &[(String, ActionResult)]) -> Vec<String> {
 /// - `notify_user:<message>` — log a notification (always passes, actual
 ///   delivery wired by caller)
 pub fn run_action(workspace_root: &Path, spec: &str) -> Result<ActionResult> {
+    run_action_with_context(workspace_root, &ActionContext::default(), spec)
+}
+
+pub(crate) fn run_action_with_context(
+    workspace_root: &Path,
+    context: &ActionContext,
+    spec: &str,
+) -> Result<ActionResult> {
     let (kind, arg) = parse_spec(spec)?;
 
     match kind {
-        "file_exists" => action_file_exists(workspace_root, arg),
-        "file_size_min" => action_file_size_min(workspace_root, arg),
-        "cleanup" => action_cleanup(workspace_root, arg),
+        "file_exists" => action_file_exists(workspace_root, context, arg),
+        "file_size_min" => action_file_size_min(workspace_root, context, arg),
+        "cleanup" => action_cleanup(workspace_root, context, arg),
         "notify_user" => action_notify_user(arg),
         _ => Err(eyre!("unknown behaviour action: {kind}")),
     }
@@ -66,9 +107,17 @@ pub fn run_action(workspace_root: &Path, spec: &str) -> Result<ActionResult> {
 /// Run a list of action specs. Returns all results. Stops early on error
 /// (action parse/execution failure), but NOT on `ActionResult::Fail`.
 pub fn run_actions(workspace_root: &Path, specs: &[String]) -> Result<Vec<(String, ActionResult)>> {
+    run_actions_with_context(workspace_root, &ActionContext::default(), specs)
+}
+
+pub(crate) fn run_actions_with_context(
+    workspace_root: &Path,
+    context: &ActionContext,
+    specs: &[String],
+) -> Result<Vec<(String, ActionResult)>> {
     let mut results = Vec::with_capacity(specs.len());
     for spec in specs {
-        let result = run_action(workspace_root, spec)?;
+        let result = run_action_with_context(workspace_root, context, spec)?;
         results.push((spec.clone(), result));
     }
     Ok(results)
@@ -97,8 +146,12 @@ fn parse_spec(spec: &str) -> Result<(&str, &str)> {
     Ok((kind, arg))
 }
 
-fn resolve_glob(workspace_root: &Path, pattern: &str) -> Result<Vec<std::path::PathBuf>> {
-    let full_pattern = workspace_root.join(pattern).to_string_lossy().to_string();
+fn resolve_glob(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let full_pattern = if Path::new(pattern).is_absolute() {
+        pattern.to_string()
+    } else {
+        workspace_root.join(pattern).to_string_lossy().to_string()
+    };
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -124,11 +177,19 @@ fn resolve_glob(workspace_root: &Path, pattern: &str) -> Result<Vec<std::path::P
     Ok(matches)
 }
 
-fn action_file_exists(workspace_root: &Path, pattern: &str) -> Result<ActionResult> {
-    let matches = resolve_glob(workspace_root, pattern)?;
+fn action_file_exists(
+    workspace_root: &Path,
+    context: &ActionContext,
+    pattern: &str,
+) -> Result<ActionResult> {
+    let matches = context.resolve_targets(workspace_root, pattern)?;
     if matches.is_empty() {
         Ok(ActionResult::Fail {
             reason: format!("no files match pattern: {pattern}"),
+        })
+    } else if matches.iter().any(|path| !path.exists()) {
+        Ok(ActionResult::Fail {
+            reason: format!("missing file for pattern: {pattern}"),
         })
     } else {
         info!(pattern, count = matches.len(), "file_exists check passed");
@@ -136,7 +197,11 @@ fn action_file_exists(workspace_root: &Path, pattern: &str) -> Result<ActionResu
     }
 }
 
-fn action_file_size_min(workspace_root: &Path, arg: &str) -> Result<ActionResult> {
+fn action_file_size_min(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
     // Format: glob_pattern:min_bytes
     let (pattern, min_str) = arg
         .rsplit_once(':')
@@ -146,7 +211,7 @@ fn action_file_size_min(workspace_root: &Path, arg: &str) -> Result<ActionResult
         .parse()
         .map_err(|_| eyre!("file_size_min: invalid byte count: {min_str}"))?;
 
-    let matches = resolve_glob(workspace_root, pattern)?;
+    let matches = context.resolve_targets(workspace_root, pattern)?;
     if matches.is_empty() {
         return Ok(ActionResult::Fail {
             reason: format!("no files match pattern: {pattern}"),
@@ -170,8 +235,12 @@ fn action_file_size_min(workspace_root: &Path, arg: &str) -> Result<ActionResult
     Ok(ActionResult::Pass)
 }
 
-fn action_cleanup(workspace_root: &Path, pattern: &str) -> Result<ActionResult> {
-    let matches = resolve_glob(workspace_root, pattern)?;
+fn action_cleanup(
+    workspace_root: &Path,
+    context: &ActionContext,
+    pattern: &str,
+) -> Result<ActionResult> {
+    let matches = context.resolve_targets(workspace_root, pattern)?;
     let mut removed = 0;
     for path in matches {
         if path.is_file() {
@@ -310,6 +379,31 @@ mod tests {
         ];
         let notifs = notifications(&results);
         assert_eq!(notifs, vec!["done", "ready"]);
+    }
+
+    #[test]
+    fn should_resolve_named_targets_for_file_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact.mp3");
+        std::fs::write(&artifact, vec![0u8; 2048]).unwrap();
+
+        let context = ActionContext::default().with_named_target("$artifact", vec![artifact]);
+        let result =
+            run_action_with_context(temp.path(), &context, "file_size_min:$artifact:1024").unwrap();
+
+        assert_eq!(result, ActionResult::Pass);
+    }
+
+    #[test]
+    fn should_support_absolute_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("absolute.mp3");
+        std::fs::write(&artifact, b"audio").unwrap();
+
+        let spec = format!("file_exists:{}", artifact.display());
+        let result = run_action(temp.path(), &spec).unwrap();
+
+        assert_eq!(result, ActionResult::Pass);
     }
 
     #[test]

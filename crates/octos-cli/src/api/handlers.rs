@@ -41,6 +41,8 @@ pub struct ChatRequest {
     /// File paths from prior `/api/upload` call.
     #[serde(default)]
     pub media: Vec<String>,
+    #[serde(default)]
+    pub attach_only: bool,
 }
 
 #[derive(Serialize)]
@@ -185,6 +187,7 @@ pub async fn chat(
             req.session_id.as_deref(),
             req.topic.as_deref(),
             &req.media,
+            req.attach_only,
         )
         .await;
     }
@@ -777,12 +780,37 @@ async fn resolve_file_access_data_dir(
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
 ) -> Result<std::path::PathBuf, Response> {
+    if should_resolve_file_access_from_profile(headers, identity) {
+        match resolve_profile_data_dir(state, headers, identity).await {
+            Ok(data_dir) => return Ok(data_dir),
+            Err(response) if response.status() != StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(response);
+            }
+            Err(_) => {}
+        }
+    }
+
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         return Ok(sess.data_dir());
     }
 
     resolve_profile_data_dir(state, headers, identity).await
+}
+
+fn should_resolve_file_access_from_profile(
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> bool {
+    // Hosted/profile-scoped requests must use the same root as /api/files/list so
+    // profile-encoded file handles round-trip through /api/files unchanged.
+    request_host(headers).is_some_and(|host| !is_local_request_host(&host))
+        || headers
+            .get("x-profile-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || identity.is_some()
 }
 
 /// DELETE /api/sessions/:id -- delete a session.
@@ -2306,6 +2334,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         topic: None,
                         stream: true,
                         media: media.clone(),
+                        attach_only: false,
                     },
                 ) {
                     // Standalone agent mode — run the agent directly.
@@ -2656,6 +2685,50 @@ mod tests {
 
         assert_ne!(handle, file.to_string_lossy());
         assert!(handle.ends_with("/deck.pptx"));
+    }
+
+    #[test]
+    fn should_resolve_file_access_from_profile_for_remote_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("windows.ominix.io"),
+        );
+
+        assert!(should_resolve_file_access_from_profile(&headers, None));
+    }
+
+    #[test]
+    fn should_resolve_file_access_from_profile_skips_local_host_without_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("localhost:8080"),
+        );
+
+        assert!(!should_resolve_file_access_from_profile(&headers, None));
+    }
+
+    #[tokio::test]
+    async fn resolve_file_access_data_dir_falls_back_to_session_store_when_gateway_missing() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("windows.ominix.io"),
+        );
+
+        let resolved = resolve_file_access_data_dir(&state, &headers, None)
+            .await
+            .expect("fallback data dir");
+
+        assert_eq!(resolved, data_dir.path());
     }
 
     #[test]

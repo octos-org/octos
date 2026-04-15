@@ -1658,7 +1658,9 @@ impl GatewayRuntime {
 
         // ── Shutdown ────────────────────────────────────────────────────
         // Timeout prevents hung actors from blocking the entire sequence.
-        let shutdown_timeout = Duration::from_secs(30);
+        // CLI shutdown should return control to the terminal promptly.
+        // Hung actors will be abandoned and then torn down by runtime shutdown.
+        let shutdown_timeout = Duration::from_secs(1);
         if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
             .await
             .is_err()

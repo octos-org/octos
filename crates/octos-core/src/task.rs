@@ -131,6 +131,9 @@ pub struct TaskResult {
     pub output: String,
     /// Files that were modified.
     pub files_modified: Vec<PathBuf>,
+    /// Files explicitly declared for delivery back to the user.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_to_send: Vec<PathBuf>,
     /// Subtasks created (for Plan tasks).
     pub subtasks: Vec<TaskId>,
     /// Token usage.
@@ -326,6 +329,7 @@ mod tests {
             success: true,
             output: "all tests pass".to_string(),
             files_modified: vec![PathBuf::from("src/main.rs")],
+            files_to_send: vec![PathBuf::from("output/report.md")],
             subtasks: vec![],
             token_usage: TokenUsage {
                 input_tokens: 100,
@@ -337,6 +341,7 @@ mod tests {
         let parsed: TaskResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.success);
         assert_eq!(parsed.output, "all tests pass");
+        assert_eq!(parsed.files_to_send, vec![PathBuf::from("output/report.md")]);
         assert_eq!(parsed.token_usage.input_tokens, 100);
     }
 

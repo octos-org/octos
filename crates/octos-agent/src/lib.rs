@@ -75,7 +75,8 @@ pub use workspace_policy::{
     ValidationPolicy, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
     WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
     WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
-    read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
+    write_workspace_policy,
 };
 
 #[cfg(test)]

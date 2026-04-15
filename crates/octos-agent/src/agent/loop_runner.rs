@@ -310,10 +310,47 @@ impl Agent {
                                 &response,
                                 &mut messages,
                                 &mut files_modified,
+                                None,
                                 &mut total_usage,
                                 tracker,
                             )
                             .await?;
+
+                            if self.tools.spawn_only_was_invoked() {
+                                self.emit_cost_update(&total_usage, &response.usage);
+                                let new_start = (1 + history.len()).min(messages.len());
+                                let background_tools = response
+                                    .tool_calls
+                                    .iter()
+                                    .filter(|tc| self.tools.is_spawn_only(&tc.name))
+                                    .map(|tc| tc.name.as_str())
+                                    .collect::<Vec<_>>();
+                                let content = if background_tools.is_empty() {
+                                    "Background work started. The final result will be delivered automatically when it is ready.".to_string()
+                                } else if background_tools.len() == 1 {
+                                    format!(
+                                        "Background work started for `{}`. The final result will be delivered automatically when it is ready.",
+                                        background_tools[0]
+                                    )
+                                } else {
+                                    format!(
+                                        "Background work started for {} tasks ({}). The final results will be delivered automatically when they are ready.",
+                                        background_tools.len(),
+                                        background_tools.join(", ")
+                                    )
+                                };
+                                return Ok(ConversationResponse {
+                                    content,
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(response.provider_index),
+                                    ),
+                                    token_usage: total_usage,
+                                    files_modified,
+                                    streamed,
+                                    messages: messages[new_start..].to_vec(),
+                                });
+                            }
                         }
                         StopReason::MaxTokens => {
                             self.emit_cost_update(&total_usage, &response.usage);
@@ -376,6 +413,7 @@ impl Agent {
             let mut messages = self.build_initial_messages(task).await;
             let mut total_usage = TokenUsage::default();
             let mut files_modified = Vec::new();
+            let mut files_to_send = Vec::new();
             let config = self.chat_config();
 
             loop {
@@ -385,6 +423,7 @@ impl Agent {
                         success: false,
                         output: stop.message(),
                         files_modified,
+                        files_to_send,
                         subtasks: Vec::new(),
                         token_usage: total_usage,
                     });
@@ -497,13 +536,19 @@ impl Agent {
                             duration_ms = task_start.elapsed().as_millis() as u64,
                             "task completed"
                         );
-                        return Ok(self.build_result(&response, total_usage, files_modified));
+                        return Ok(self.build_result(
+                            &response,
+                            total_usage,
+                            files_modified,
+                            files_to_send,
+                        ));
                     }
                     StopReason::ToolUse => {
                         self.handle_tool_use(
                             &response,
                             &mut messages,
                             &mut files_modified,
+                            Some(&mut files_to_send),
                             &mut total_usage,
                             None,
                         )
@@ -516,7 +561,12 @@ impl Agent {
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
-                        return Ok(self.build_result(&response, total_usage, files_modified));
+                        return Ok(self.build_result(
+                            &response,
+                            total_usage,
+                            files_modified,
+                            files_to_send,
+                        ));
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
@@ -526,7 +576,12 @@ impl Agent {
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
-                        let mut result = self.build_result(&response, total_usage, files_modified);
+                        let mut result = self.build_result(
+                            &response,
+                            total_usage,
+                            files_modified,
+                            files_to_send,
+                        );
                         if result.output.is_empty() {
                             result.output =
                                 "[Content was blocked by the model's safety filter.]".to_string();
@@ -545,12 +600,14 @@ impl Agent {
         response: &ChatResponse,
         usage: TokenUsage,
         files_modified: Vec<std::path::PathBuf>,
+        files_to_send: Vec<std::path::PathBuf>,
     ) -> TaskResult {
         let success = response.stop_reason != StopReason::MaxTokens;
         TaskResult {
             success,
             output: response.content.clone().unwrap_or_default(),
             files_modified,
+            files_to_send,
             subtasks: Vec::new(),
             token_usage: octos_core::TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -566,6 +623,7 @@ impl Agent {
         response: &ChatResponse,
         messages: &mut Vec<Message>,
         files_modified: &mut Vec<PathBuf>,
+        files_to_send: Option<&mut Vec<PathBuf>>,
         total_usage: &mut TokenUsage,
         tracker: Option<&TokenTracker>,
     ) -> Result<()> {
@@ -614,9 +672,13 @@ impl Agent {
             }
         }
         messages.push(self.response_to_message(&response));
-        let (tool_messages, tool_files, tool_tokens) = self.execute_tools(&response).await?;
+        let (tool_messages, tool_files, tool_send_files, tool_tokens) =
+            self.execute_tools(&response).await?;
         messages.extend(tool_messages);
         files_modified.extend(tool_files);
+        if let Some(files_to_send) = files_to_send {
+            files_to_send.extend(tool_send_files);
+        }
         total_usage.input_tokens += tool_tokens.input_tokens;
         total_usage.output_tokens += tool_tokens.output_tokens;
         if let Some(t) = tracker {
@@ -626,5 +688,133 @@ impl Agent {
                 .store(total_usage.output_tokens, Ordering::Relaxed);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use async_trait::async_trait;
+    use octos_core::{AgentId, TaskContext, TaskKind, ToolCall};
+    use octos_llm::{ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
+    use octos_memory::EpisodeStore;
+
+    use crate::tools::{Tool, ToolRegistry, ToolResult};
+
+    struct FilesToSendOnlyTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FilesToSendOnlyTool {
+        fn name(&self) -> &str {
+            "emit_audio"
+        }
+
+        fn description(&self) -> &str {
+            "Emit an audio file via files_to_send only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                output: "audio generated".to_string(),
+                success: true,
+                files_to_send: vec![self.file_path.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    struct ToolThenEndProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let response = if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_emit_audio".to_string(),
+                        name: "emit_audio".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            };
+            Ok(response)
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_collects_files_to_send_without_file_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("podcast.mp3");
+        std::fs::write(&file_path, b"fake mp3").unwrap();
+
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(FilesToSendOnlyTool {
+            file_path: file_path.clone(),
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Generate audio".to_string(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(result.success);
+        assert!(result.files_modified.is_empty());
+        assert_eq!(result.files_to_send, vec![file_path]);
     }
 }

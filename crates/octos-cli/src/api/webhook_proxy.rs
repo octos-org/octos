@@ -157,6 +157,7 @@ pub async fn api_chat_proxy(
     session_id: Option<&str>,
     topic: Option<&str>,
     media: &[String],
+    attach_only: bool,
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
@@ -165,6 +166,7 @@ pub async fn api_chat_proxy(
         "topic": topic,
         "media": media,
         "target_profile_id": profile_id,
+        "attach_only": attach_only,
     });
 
     let resp = match state
