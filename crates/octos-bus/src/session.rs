@@ -891,6 +891,11 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Path for the append-only background task ledger sidecar.
+    pub fn task_state_path(&self) -> PathBuf {
+        self.session_path().with_extension("tasks.jsonl")
+    }
+
     /// Clear the session (in-memory and on disk).
     pub async fn clear(&mut self) -> Result<()> {
         self.session = Session::new(self.session.key.clone());
@@ -2180,5 +2185,19 @@ mod tests {
         assert_eq!(first, 0);
         assert_eq!(second, 1);
         assert_eq!(handle.get_history(10).len(), 2);
+    }
+
+    #[test]
+    fn test_session_handle_task_state_path_uses_sidecar_file() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-task-ledger");
+        let handle = SessionHandle::open(tmp.path(), &key);
+
+        let path = handle.task_state_path();
+        assert!(path.ends_with("default.tasks.jsonl"));
+        assert_eq!(
+            path.parent().unwrap(),
+            handle.session_path().parent().unwrap()
+        );
     }
 }

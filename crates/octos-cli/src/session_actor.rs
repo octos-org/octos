@@ -90,9 +90,8 @@ impl ForcedBackgroundWorkflow {
             return None;
         }
 
-        let has_podcast = lower.contains("podcast")
-            || content.contains("播客")
-            || content.contains("语音播客");
+        let has_podcast =
+            lower.contains("podcast") || content.contains("播客") || content.contains("语音播客");
         let has_research_signal = lower.contains("deep research")
             || lower.contains("research")
             || lower.contains("latest")
@@ -144,9 +143,7 @@ impl ForcedBackgroundWorkflow {
 
     fn ack_message(self) -> &'static str {
         match self {
-            Self::DeepResearch => {
-                "深度研究已在后台启动。完成后会把最终研究结果发回当前会话。"
-            }
+            Self::DeepResearch => "深度研究已在后台启动。完成后会把最终研究结果发回当前会话。",
             Self::ResearchPodcast => {
                 "研究和播客生成已在后台启动。完成后只会发送最终音频结果到当前会话。"
             }
@@ -984,6 +981,11 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+        // Create the per-actor session handle early so we can derive the
+        // background task ledger path before any worker can mutate state.
+        let session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        let task_state_path = session_handle.task_state_path();
+        let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);
         let desired_session_policy = WorkspacePolicy::for_session();
         match read_workspace_policy(&user_workspace) {
@@ -1050,6 +1052,13 @@ impl ActorFactory {
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
         let supervisor = tools.supervisor();
+        if let Err(error) = supervisor.enable_persistence(task_state_path) {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to enable task supervisor persistence"
+            );
+        }
         self.task_query_store
             .register(&session_key, &supervisor, &self.data_dir);
         tools.rebind_plugin_work_dirs(&user_workspace);
@@ -1295,13 +1304,6 @@ impl ActorFactory {
 
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
-
-        // Create a per-actor SessionHandle — each actor owns its session data.
-        // No shared mutex, no cross-session contention.
-        let session_handle = Arc::new(Mutex::new(SessionHandle::open(
-            &self.data_dir,
-            &session_key,
-        )));
 
         // Load per-user status configuration
         let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());
