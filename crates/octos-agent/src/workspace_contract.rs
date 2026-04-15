@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use glob::glob;
 
 use crate::behaviour::{
-    ActionContext, ActionResult, failure_reasons, run_action_with_context, run_actions_with_context,
+    ActionContext, ActionResult, evaluate_actions_with_context, run_action_with_context,
 };
 use crate::task_supervisor::{TaskRuntimeState, TaskSupervisor};
 use crate::tools::ToolRegistry;
@@ -234,9 +234,14 @@ fn run_verify_actions(
     artifact_paths: &[PathBuf],
 ) -> Result<(), String> {
     let context = ActionContext::default().with_named_target("$artifact", artifact_paths.to_vec());
-    let results = run_actions_with_context(workspace_root, &context, actions)
-        .map_err(|error| format!("verify action error: {error}"))?;
-    let failures = failure_reasons(&results);
+    let mut failures = Vec::new();
+    for (spec, result) in evaluate_actions_with_context(workspace_root, &context, actions) {
+        match result {
+            Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
+            Ok(ActionResult::Fail { reason }) => failures.push(format!("{spec}: {reason}")),
+            Err(error) => failures.push(format!("{spec}: validator error: {error}")),
+        }
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -463,5 +468,22 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    #[test]
+    fn runtime_verification_uses_shared_validator_semantics_for_file_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("output.mp3");
+        std::fs::write(&artifact, b"x").unwrap();
+
+        let error = run_verify_actions(
+            temp.path(),
+            &["file_size_min:$artifact:1024".into()],
+            std::slice::from_ref(&artifact),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("file_size_min:$artifact:1024"));
+        assert!(error.contains("output.mp3 is 1 bytes, minimum is 1024"));
     }
 }

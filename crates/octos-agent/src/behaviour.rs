@@ -2,7 +2,8 @@
 //!
 //! Actions are simple string specs like `"file_exists:output/*.mp3"` parsed into
 //! an action kind + argument. They run without LLM involvement and are used for
-//! spawn_only task verification, turn-end validation, and cleanup.
+//! workspace inspection, spawn_only task verification, turn-end validation, and
+//! cleanup.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -110,15 +111,30 @@ pub fn run_actions(workspace_root: &Path, specs: &[String]) -> Result<Vec<(Strin
     run_actions_with_context(workspace_root, &ActionContext::default(), specs)
 }
 
+pub(crate) fn evaluate_actions_with_context(
+    workspace_root: &Path,
+    context: &ActionContext,
+    specs: &[String],
+) -> Vec<(String, Result<ActionResult>)> {
+    specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.clone(),
+                run_action_with_context(workspace_root, context, spec),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn run_actions_with_context(
     workspace_root: &Path,
     context: &ActionContext,
     specs: &[String],
 ) -> Result<Vec<(String, ActionResult)>> {
     let mut results = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let result = run_action_with_context(workspace_root, context, spec)?;
-        results.push((spec.clone(), result));
+    for (spec, result) in evaluate_actions_with_context(workspace_root, context, specs) {
+        results.push((spec, result?));
     }
     Ok(results)
 }
@@ -443,5 +459,25 @@ mod tests {
         let failures = failure_reasons(&results);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("missing.txt"));
+    }
+
+    #[test]
+    fn shared_validator_semantics_should_evaluate_actions_with_context_without_short_circuiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact.mp3");
+        std::fs::write(&artifact, vec![0u8; 2048]).unwrap();
+
+        let context = ActionContext::default().with_named_target("$artifact", vec![artifact]);
+        let specs = vec![
+            "file_exists:$artifact".to_string(),
+            "file_size_min:$artifact:1024".to_string(),
+            "file_exists:missing.txt".to_string(),
+        ];
+
+        let results = evaluate_actions_with_context(temp.path(), &context, &specs);
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].1, Ok(ActionResult::Pass)));
+        assert!(matches!(results[1].1, Ok(ActionResult::Pass)));
+        assert!(matches!(results[2].1, Ok(ActionResult::Fail { .. })));
     }
 }

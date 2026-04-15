@@ -10,7 +10,7 @@ use glob::glob;
 use serde::Serialize;
 use tracing::warn;
 
-use crate::behaviour::{ActionResult, run_action};
+use crate::behaviour::{ActionContext, ActionResult, evaluate_actions_with_context};
 use crate::workspace_policy::{
     WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
     WorkspaceVersionControlProvider, read_workspace_policy,
@@ -366,14 +366,16 @@ fn run_validators(
     report: &mut WorkspaceTurnSnapshotReport,
 ) {
     for (repo_root, repo_label, specs) in validations {
-        for spec in specs {
-            match run_action(repo_root, spec) {
+        for (spec, result) in
+            evaluate_actions_with_context(repo_root, &ActionContext::default(), specs)
+        {
+            match result {
                 Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
                 Ok(ActionResult::Fail { reason }) => {
                     report.validation_failures.push(WorkspaceValidationFailure {
                         repo_label: repo_label.clone(),
                         phase,
-                        check: spec.clone(),
+                        check: spec,
                         reason,
                     });
                 }
@@ -387,7 +389,7 @@ fn run_validators(
                     report.validation_failures.push(WorkspaceValidationFailure {
                         repo_label: repo_label.clone(),
                         phase,
-                        check: spec.clone(),
+                        check: spec,
                         reason: format!("validator error: {e}"),
                     });
                 }
@@ -577,21 +579,21 @@ fn inspect_managed_workspace_contract(
 }
 
 fn evaluate_check_specs(repo_root: &Path, specs: &[String]) -> Vec<WorkspaceCheckStatus> {
-    specs
-        .iter()
-        .map(|spec| match run_action(repo_root, spec) {
+    evaluate_actions_with_context(repo_root, &ActionContext::default(), specs)
+        .into_iter()
+        .map(|(spec, result)| match result {
             Ok(ActionResult::Pass | ActionResult::Notify { .. }) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: true,
                 reason: None,
             },
             Ok(ActionResult::Fail { reason }) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: false,
                 reason: Some(reason),
             },
             Err(error) => WorkspaceCheckStatus {
-                spec: spec.clone(),
+                spec,
                 passed: false,
                 reason: Some(format!("validator error: {error}")),
             },
@@ -1029,6 +1031,33 @@ mod tests {
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));
+    }
+
+    #[test]
+    fn inspection_uses_shared_validator_semantics_for_file_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-f");
+        std::fs::create_dir_all(&slides_root).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"x").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_size_min:output/deck.pptx:1024".into()];
+        policy.validation.on_completion = Vec::new();
+        write_workspace_policy(&slides_root, &policy).unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-f");
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(!status.turn_end_checks[0].passed);
+        let reason = status.turn_end_checks[0]
+            .reason
+            .as_deref()
+            .expect("inspection reason");
+        assert!(reason.contains("output/deck.pptx is 1 bytes, minimum is 1024"));
     }
 
     #[test]
