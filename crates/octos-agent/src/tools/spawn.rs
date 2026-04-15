@@ -61,6 +61,8 @@ pub struct SpawnTool {
     task_supervisor: Option<Arc<TaskSupervisor>>,
     /// Owning session key for tracked background subagents.
     session_key: Option<String>,
+    /// Append-only task ledger path for the owning parent session.
+    task_ledger_path: Option<PathBuf>,
     /// Optional agent config inherited from the parent session.
     worker_config: Option<AgentConfig>,
 }
@@ -87,6 +89,7 @@ impl SpawnTool {
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
             session_key: None,
+            task_ledger_path: None,
             worker_config: None,
         }
     }
@@ -115,6 +118,7 @@ impl SpawnTool {
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
             session_key: None,
+            task_ledger_path: None,
             worker_config: None,
         }
     }
@@ -161,9 +165,11 @@ impl SpawnTool {
         mut self,
         supervisor: Arc<TaskSupervisor>,
         session_key: impl Into<String>,
+        task_ledger_path: impl Into<PathBuf>,
     ) -> Self {
         self.task_supervisor = Some(supervisor);
         self.session_key = Some(session_key.into());
+        self.task_ledger_path = Some(task_ledger_path.into());
         self
     }
 
@@ -256,6 +262,16 @@ fn should_deliver_output_files(files: &[PathBuf]) -> bool {
             Some("md" | "txt" | "json" | "csv")
         )
     })
+}
+
+async fn deliver_background_result(
+    sender: Option<BackgroundResultSender>,
+    payload: BackgroundResultPayload,
+) -> bool {
+    match sender {
+        Some(sender) => sender(payload).await,
+        None => false,
+    }
 }
 
 #[async_trait]
@@ -459,11 +475,16 @@ impl Tool for SpawnTool {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            let task_ledger_path = self
+                .task_ledger_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
             let tracked_task_id = self.task_supervisor.as_ref().map(|supervisor| {
-                supervisor.register(
+                supervisor.register_with_lineage(
                     &label,
                     &format!("spawn-{worker_id}"),
                     self.session_key.as_deref(),
+                    task_ledger_path.as_deref(),
                 )
             });
             let llm = sub_llm;
@@ -581,19 +602,20 @@ impl Tool for SpawnTool {
                 // Direct injection path: inject as system message, no extra LLM call.
                 // If the actor has exited (idle timeout), the send fails and we
                 // fall through to the legacy InboundMessage relay path.
-                if let Some(sender) = bg_sender {
-                    if sender(BackgroundResultPayload {
+                if deliver_background_result(
+                    bg_sender,
+                    BackgroundResultPayload {
                         task_label,
                         content: content.clone(),
                         kind: result_kind,
                         media: result_media.clone(),
-                    })
-                    .await
-                    {
-                        return;
-                    }
-                    warn!("background result sender failed (actor dead?), falling back to relay");
+                    },
+                )
+                .await
+                {
+                    return;
                 }
+                warn!("background result sender failed (actor dead?), falling back to relay");
 
                 // Legacy path: relay via InboundMessage (triggers extra LLM call)
                 let content = match &result {
@@ -663,6 +685,7 @@ mod tests {
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
             session_key: None,
+            task_ledger_path: None,
             worker_config: None,
         };
 
@@ -686,7 +709,11 @@ mod tests {
             PathBuf::from("/tmp"),
             in_tx,
         )
-        .with_task_supervisor(supervisor.clone(), "api:test-session");
+        .with_task_supervisor(
+            supervisor.clone(),
+            "api:test-session",
+            PathBuf::from("/tmp/tasks.jsonl"),
+        );
 
         let result = tool
             .execute(&serde_json::json!({
@@ -715,6 +742,33 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_direct_background_result_short_circuits_legacy_fallback() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        let sender: BackgroundResultSender = Arc::new(move |_payload| {
+            let called_clone = Arc::clone(&called_clone);
+            Box::pin(async move {
+                called_clone.store(true, Ordering::SeqCst);
+                true
+            })
+        });
+
+        let payload = BackgroundResultPayload {
+            task_label: "child-task".to_string(),
+            content: "done".to_string(),
+            kind: BackgroundResultKind::Notification,
+            media: vec!["/tmp/output.mp3".to_string()],
+        };
+
+        assert!(deliver_background_result(Some(sender), payload.clone()).await);
+        assert!(called.load(Ordering::SeqCst));
+        assert!(
+            !deliver_background_result(None, payload).await,
+            "fallback should only be used when the direct sender is absent or rejected"
+        );
     }
 
     // Minimal mock provider for testing

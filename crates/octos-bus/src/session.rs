@@ -40,6 +40,15 @@ pub fn encode_path_component(s: &str) -> String {
     encoded
 }
 
+/// Derive a stable child session key from a parent session key and a child id.
+///
+/// The child id is percent-encoded so it remains safe for filenames and
+/// ledger metadata.
+pub fn child_session_key(parent: &SessionKey, child_id: &str) -> SessionKey {
+    let child_id = encode_path_component(child_id);
+    SessionKey(format!("{}#child-{child_id}", parent.0))
+}
+
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
 }
@@ -2199,5 +2208,15 @@ mod tests {
             path.parent().unwrap(),
             handle.session_path().parent().unwrap()
         );
+    }
+
+    #[test]
+    fn test_child_session_key_derivation_is_stable() {
+        let parent = SessionKey::new("api", "web-task-ledger");
+        let child = child_session_key(&parent, "spawn-01/alpha beta");
+
+        assert_eq!(child.0, "api:web-task-ledger#child-spawn-01%2Falpha%20beta");
+        assert_eq!(child.base_key(), "api:web-task-ledger");
+        assert_eq!(child.topic(), Some("child-spawn-01%2Falpha%20beta"));
     }
 }

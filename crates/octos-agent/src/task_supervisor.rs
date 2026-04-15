@@ -70,6 +70,14 @@ pub struct BackgroundTask {
     pub id: String,
     pub tool_name: String,
     pub tool_call_id: String,
+    /// Parent session that owns this task.
+    pub parent_session_key: Option<String>,
+    /// Stable child session key derived from the parent session and task id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<String>,
+    /// Append-only ledger path used to persist this task's snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_ledger_path: Option<String>,
     pub status: TaskStatus,
     pub runtime_state: TaskRuntimeState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +157,7 @@ impl TaskSupervisor {
             std::fs::create_dir_all(parent)?;
         }
 
+        let ledger_path = path.display().to_string();
         let restored = Self::load_persisted_tasks(&path)?;
         {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -160,6 +169,11 @@ impl TaskSupervisor {
                     }
                 }
             }
+            for task in tasks.values_mut() {
+                if task.task_ledger_path.as_deref() != Some(ledger_path.as_str()) {
+                    task.task_ledger_path = Some(ledger_path.clone());
+                }
+            }
         }
 
         let mut guard = self
@@ -167,6 +181,16 @@ impl TaskSupervisor {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *guard = Some(path);
+        drop(guard);
+
+        let snapshots: Vec<BackgroundTask> = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.values().cloned().collect()
+        };
+        for task in snapshots {
+            self.persist_snapshot(&task);
+        }
+
         Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
     }
 
@@ -183,11 +207,32 @@ impl TaskSupervisor {
         tool_call_id: &str,
         session_key: Option<&str>,
     ) -> String {
+        self.register_with_lineage(tool_name, tool_call_id, session_key, None)
+    }
+
+    /// Register a new background task with optional ledger-path lineage.
+    pub fn register_with_lineage(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+    ) -> String {
         let id = TaskId::new().to_string();
+        let derived_child_session_key = session_key.map(|parent| format!("{parent}#child-{id}"));
         let task = BackgroundTask {
             id: id.clone(),
             tool_name: tool_name.to_string(),
             tool_call_id: tool_call_id.to_string(),
+            parent_session_key: session_key.map(|s| s.to_string()),
+            child_session_key: derived_child_session_key,
+            task_ledger_path: task_ledger_path.map(|path| path.to_string()).or_else(|| {
+                self.persistence_path
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            }),
             status: TaskStatus::Spawned,
             runtime_state: TaskRuntimeState::Spawned,
             runtime_detail: None,
@@ -331,6 +376,20 @@ impl TaskSupervisor {
         }
     }
 
+    /// Return a snapshot for a specific task id.
+    pub fn get_task(&self, task_id: &str) -> Option<BackgroundTask> {
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(task_id).cloned()
+    }
+
+    /// Return the persistence path for task snapshots, if enabled.
+    pub fn persistence_path(&self) -> Option<PathBuf> {
+        self.persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn append_persisted_task(path: &PathBuf, json: &str) -> std::io::Result<()> {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{json}")?;
@@ -423,6 +482,34 @@ mod tests {
         assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Spawned);
         assert!(tasks[0].completed_at.is_none());
         assert!(tasks[0].updated_at >= tasks[0].started_at);
+    }
+
+    #[test]
+    fn should_register_task_with_lineage_and_ledger_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+
+        let id = supervisor.register_with_lineage(
+            "podcast_generate",
+            "call-42",
+            Some("api:session"),
+            Some(ledger_path.to_str().unwrap()),
+        );
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        let expected_child = format!("api:session#child-{id}");
+        assert_eq!(task.parent_session_key.as_deref(), Some("api:session"));
+        assert_eq!(
+            task.child_session_key.as_deref(),
+            Some(expected_child.as_str())
+        );
+        assert_eq!(
+            task.task_ledger_path.as_deref(),
+            Some(ledger_path.to_str().unwrap())
+        );
     }
 
     #[test]
@@ -523,7 +610,8 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         supervisor.enable_persistence(&ledger_path).unwrap();
 
-        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
+        let task_id =
+            supervisor.register_with_lineage("deep_search", "call-1", Some("api:session"), None);
         supervisor.mark_running(&task_id);
         supervisor.mark_runtime_state(
             &task_id,
@@ -543,6 +631,16 @@ mod tests {
             tasks[0].runtime_detail.as_deref(),
             Some("collecting evidence")
         );
+        let expected_child = format!("api:session#child-{task_id}");
+        assert_eq!(tasks[0].parent_session_key.as_deref(), Some("api:session"));
+        assert_eq!(
+            tasks[0].child_session_key.as_deref(),
+            Some(expected_child.as_str())
+        );
+        assert_eq!(
+            tasks[0].task_ledger_path.as_deref(),
+            Some(ledger_path.to_str().unwrap())
+        );
     }
 
     #[test]
@@ -553,7 +651,8 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         supervisor.enable_persistence(&ledger_path).unwrap();
 
-        let completed = supervisor.register("fm_tts", "call-2", Some("api:session"));
+        let completed =
+            supervisor.register_with_lineage("fm_tts", "call-2", Some("api:session"), None);
         supervisor.mark_running(&completed);
         supervisor.mark_runtime_state(
             &completed,
@@ -562,7 +661,12 @@ mod tests {
         );
         supervisor.mark_completed(&completed, vec!["/tmp/output.mp3".to_string()]);
 
-        let failed = supervisor.register("podcast_generate", "call-3", Some("api:session"));
+        let failed = supervisor.register_with_lineage(
+            "podcast_generate",
+            "call-3",
+            Some("api:session"),
+            None,
+        );
         supervisor.mark_running(&failed);
         supervisor.mark_failed(&failed, "No dialogue lines found in script".to_string());
 
@@ -579,6 +683,19 @@ mod tests {
         assert_eq!(completed_task.status, TaskStatus::Completed);
         assert_eq!(completed_task.runtime_state, TaskRuntimeState::Completed);
         assert_eq!(completed_task.output_files, vec!["/tmp/output.mp3"]);
+        let expected_completed_child = format!("api:session#child-{completed}");
+        assert_eq!(
+            completed_task.parent_session_key.as_deref(),
+            Some("api:session")
+        );
+        assert_eq!(
+            completed_task.child_session_key.as_deref(),
+            Some(expected_completed_child.as_str())
+        );
+        assert_eq!(
+            completed_task.task_ledger_path.as_deref(),
+            Some(ledger_path.to_str().unwrap())
+        );
 
         let failed_task = tasks
             .iter()
@@ -589,6 +706,19 @@ mod tests {
         assert_eq!(
             failed_task.error.as_deref(),
             Some("No dialogue lines found in script")
+        );
+        assert_eq!(
+            failed_task.parent_session_key.as_deref(),
+            Some("api:session")
+        );
+        let expected_failed_child = format!("api:session#child-{failed}");
+        assert_eq!(
+            failed_task.child_session_key.as_deref(),
+            Some(expected_failed_child.as_str())
+        );
+        assert_eq!(
+            failed_task.task_ledger_path.as_deref(),
+            Some(ledger_path.to_str().unwrap())
         );
     }
 }
