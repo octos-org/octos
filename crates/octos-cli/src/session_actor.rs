@@ -2946,7 +2946,7 @@ impl SessionActor {
                                 if let Some(ref si) = self.status_indicator {
                                     let _ = si
                                         .channel()
-                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .finish_stream(&self.chat_id, mid, &display_content)
                                         .await;
                                 }
                                 true
@@ -3618,7 +3618,7 @@ impl SessionActor {
                                 if let Some(ref si) = self.status_indicator {
                                     let _ = si
                                         .channel()
-                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .finish_stream(&self.chat_id, mid, &display_content)
                                         .await;
                                 }
                                 true
