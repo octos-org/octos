@@ -12,7 +12,9 @@ use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use metrics::counter;
-use octos_agent::tools::spawn::{ChildSessionLifecycleKind, ChildSessionLifecyclePayload};
+use octos_agent::tools::spawn::{
+    ChildSessionFailureAction, ChildSessionLifecycleKind, ChildSessionLifecyclePayload,
+};
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
@@ -24,7 +26,10 @@ use octos_agent::{
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
-    session::{ChildSessionContract, ChildSessionJoinState, ChildSessionTerminalState},
+    session::{
+        ChildSessionContract, ChildSessionFailureAction as PersistedChildSessionFailureAction,
+        ChildSessionJoinState, ChildSessionTerminalState,
+    },
 };
 use octos_core::AgentId;
 use octos_core::{
@@ -95,6 +100,12 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
 
+/// Bound actor inbox send/ack waits for background terminal delivery.
+const BACKGROUND_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound live outbound fanout so persistence never waits indefinitely on a slow channel.
+const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
     seq: usize,
@@ -125,6 +136,35 @@ async fn persist_assistant_message(
     }
 }
 
+async fn send_outbound_with_timeout(
+    session_key: &SessionKey,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    message: OutboundMessage,
+    fanout_kind: &'static str,
+) -> bool {
+    match tokio::time::timeout(BACKGROUND_RESULT_FANOUT_TIMEOUT, out_tx.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                fanout_kind,
+                "failed to fan out outbound message"
+            );
+            false
+        }
+        Err(_) => {
+            warn!(
+                session = %session_key,
+                timeout_ms = BACKGROUND_RESULT_FANOUT_TIMEOUT.as_millis(),
+                fanout_kind,
+                "timed out while fanning out outbound message"
+            );
+            false
+        }
+    }
+}
+
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
@@ -146,18 +186,20 @@ async fn persist_terminal_reply_and_fanout(
         return false;
     };
 
-    let _ = out_tx
-        .send(OutboundMessage {
+    send_outbound_with_timeout(
+        session_key,
+        out_tx,
+        OutboundMessage {
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             content,
             reply_to,
             media,
             metadata: serde_json::json!({}),
-        })
-        .await;
-
-    true
+        },
+        "terminal_reply",
+    )
+    .await
 }
 
 const CHILD_SESSION_HISTORY_COPY: usize = 6;
@@ -218,6 +260,22 @@ fn child_session_terminal_state(
     }
 }
 
+fn child_session_failure_action_label(action: ChildSessionFailureAction) -> &'static str {
+    match action {
+        ChildSessionFailureAction::Retry => "retry",
+        ChildSessionFailureAction::Escalate => "escalate",
+    }
+}
+
+fn persisted_child_session_failure_action(
+    action: ChildSessionFailureAction,
+) -> PersistedChildSessionFailureAction {
+    match action {
+        ChildSessionFailureAction::Retry => PersistedChildSessionFailureAction::Retry,
+        ChildSessionFailureAction::Escalate => PersistedChildSessionFailureAction::Escalate,
+    }
+}
+
 fn child_session_terminal_note(
     payload: &ChildSessionLifecyclePayload,
     join_state: ChildSessionJoinState,
@@ -252,6 +310,23 @@ fn child_session_terminal_note(
             ChildSessionJoinState::Orphaned => "orphaned",
         }
     ));
+    if let Some(action) = payload.failure_action {
+        lines.push(format!(
+            "Failure action: {}",
+            child_session_failure_action_label(action)
+        ));
+        lines.push(
+            match action {
+                ChildSessionFailureAction::Retry => {
+                    "Next step: retry from the parent session when prerequisites recover."
+                }
+                ChildSessionFailureAction::Escalate => {
+                    "Next step: escalate to the parent session or user; do not blindly retry."
+                }
+            }
+            .to_string(),
+        );
+    }
     if !payload.output_files.is_empty() {
         lines.push("Output files:".to_string());
         lines.extend(payload.output_files.iter().map(|path| format!("- {path}")));
@@ -269,7 +344,6 @@ async fn persist_child_session_lifecycle(
     let parent_key = SessionKey(payload.parent_session_key.clone());
     let child_key = SessionKey(payload.child_session_key.clone());
     let parent_exists = SessionHandle::session_exists(data_dir, &parent_key);
-    let child_exists = SessionHandle::session_exists(data_dir, &child_key);
 
     match payload.kind {
         ChildSessionLifecycleKind::Spawned => {
@@ -302,6 +376,7 @@ async fn persist_child_session_lifecycle(
                 terminal_state: None,
                 join_state: None,
                 joined_at: None,
+                failure_action: None,
                 error: None,
                 output_files: Vec::new(),
             };
@@ -311,13 +386,23 @@ async fn persist_child_session_lifecycle(
                 let _ = parent.upsert_child_contract(contract).await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
+            return Ok(parent_exists);
         }
         ChildSessionLifecycleKind::Completed
         | ChildSessionLifecycleKind::RetryableFailed
         | ChildSessionLifecycleKind::TerminalFailed => {
+            if parent_exists {
+                SessionHandle::fork_from_parent_if_missing(
+                    data_dir,
+                    &parent_key,
+                    &child_key,
+                    CHILD_SESSION_HISTORY_COPY,
+                )
+                .await?;
+            }
             let terminal_state = child_session_terminal_state(payload.kind)
                 .expect("terminal child lifecycle should have a state");
-            let join_state = if parent_exists && child_exists {
+            let join_state = if parent_exists {
                 ChildSessionJoinState::Joined
             } else {
                 ChildSessionJoinState::Orphaned
@@ -345,6 +430,9 @@ async fn persist_child_session_lifecycle(
                 } else {
                     None
                 },
+                failure_action: payload
+                    .failure_action
+                    .map(persisted_child_session_failure_action),
                 error: payload.error.clone(),
                 output_files: payload.output_files.clone(),
             };
@@ -364,8 +452,6 @@ async fn persist_child_session_lifecycle(
             return Ok(matches!(join_state, ChildSessionJoinState::Joined));
         }
     }
-
-    Ok(true)
 }
 
 fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -470,6 +556,7 @@ fn sanitize_task_for_response(
         "child_terminal_state": task.child_terminal_state,
         "child_join_state": task.child_join_state,
         "child_joined_at": task.child_joined_at,
+        "child_failure_action": task.child_failure_action,
         "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
         "error": task.error,
         "session_key": task.session_key,
@@ -527,6 +614,64 @@ fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
     sender_user_id
         .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
         .unwrap_or_else(|| serde_json::json!({}))
+}
+
+async fn dispatch_background_result_to_actor(
+    tx: mpsc::Sender<ActorMessage>,
+    payload: BackgroundResultPayload,
+) -> bool {
+    let task_label = payload.task_label.clone();
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let send_result = tokio::time::timeout(
+        BACKGROUND_RESULT_ACK_TIMEOUT,
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: payload.task_label,
+            content: payload.content,
+            kind: payload.kind,
+            media: payload.media,
+            ack: Some(ack_tx),
+        }),
+    )
+    .await;
+
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                task_label,
+                error = %error,
+                "failed to enqueue background result into session actor"
+            );
+            return false;
+        }
+        Err(_) => {
+            warn!(
+                task_label,
+                timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
+                "timed out enqueuing background result into session actor"
+            );
+            return false;
+        }
+    }
+
+    match tokio::time::timeout(BACKGROUND_RESULT_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(persisted)) => persisted,
+        Ok(Err(_)) => {
+            warn!(
+                task_label,
+                "background result actor acknowledgment channel closed"
+            );
+            false
+        }
+        Err(_) => {
+            warn!(
+                task_label,
+                timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
+                "timed out waiting for background result actor acknowledgment"
+            );
+            false
+        }
+    }
 }
 
 fn git_turn_summary(content: &str) -> String {
@@ -1298,19 +1443,7 @@ impl ActorFactory {
         spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
             move |payload: BackgroundResultPayload| {
                 let tx = bg_tx.clone();
-                Box::pin(async move {
-                    let (ack_tx, ack_rx) = oneshot::channel();
-                    tx.send(ActorMessage::BackgroundResult {
-                        task_label: payload.task_label,
-                        content: payload.content,
-                        kind: payload.kind,
-                        media: payload.media,
-                        ack: Some(ack_tx),
-                    })
-                    .await
-                    .is_ok()
-                        && ack_rx.await.unwrap_or(false)
-                })
+                Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
             },
         ));
 
@@ -1342,19 +1475,7 @@ impl ActorFactory {
         let bg_tx2 = tx.clone();
         tools.set_background_result_sender(Arc::new(move |payload: BackgroundResultPayload| {
             let tx = bg_tx2.clone();
-            Box::pin(async move {
-                let (ack_tx, ack_rx) = oneshot::channel();
-                tx.send(ActorMessage::BackgroundResult {
-                    task_label: payload.task_label,
-                    content: payload.content,
-                    kind: payload.kind,
-                    media: payload.media,
-                    ack: Some(ack_tx),
-                })
-                .await
-                .is_ok()
-                    && ack_rx.await.unwrap_or(false)
-            })
+            Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
         }));
 
         // Wire supervisor on_change callback to push task status via SSE.
@@ -2559,37 +2680,42 @@ impl SessionActor {
         )
         .await;
 
-        let metadata = match persisted.as_ref() {
-            Some(persisted_message) => serde_json::json!({
-                "topic": self.session_key.topic(),
-                "_history_persisted": true,
-                "_session_result": {
-                    "seq": persisted_message.seq,
-                    "role": "assistant",
-                    "content": content.clone(),
-                    "timestamp": persisted_message.timestamp.to_rfc3339(),
-                    "media": media.clone(),
-                }
-            }),
-            None => serde_json::json!({
-                "topic": self.session_key.topic(),
-                "_history_persisted": false
-            }),
+        let Some(persisted_message) = persisted else {
+            warn!(
+                session = %self.session_key,
+                "skipping background notification fanout because history was not persisted"
+            );
+            return false;
         };
 
-        let _ = self
-            .out_tx
-            .send(OutboundMessage {
+        let metadata = serde_json::json!({
+            "topic": self.session_key.topic(),
+            "_history_persisted": true,
+            "_session_result": {
+                "seq": persisted_message.seq,
+                "role": "assistant",
+                "content": content.clone(),
+                "timestamp": persisted_message.timestamp.to_rfc3339(),
+                "media": media.clone(),
+            }
+        });
+
+        let _ = send_outbound_with_timeout(
+            &self.session_key,
+            &self.out_tx,
+            OutboundMessage {
                 channel: self.channel.clone(),
                 chat_id: self.chat_id.clone(),
                 content,
                 reply_to: None,
                 media,
                 metadata,
-            })
-            .await;
+            },
+            "background_notification",
+        )
+        .await;
 
-        persisted.is_some()
+        true
     }
 
     async fn handle_background_result(
@@ -4518,10 +4644,17 @@ mod tests {
         assert_eq!(tasks[0]["runtime_state"], "completed");
         assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
         assert_eq!(tasks[0]["current_phase"], "deliver_result");
-        assert_eq!(tasks[0]["runtime_detail"]["workflow_kind"], "research_podcast");
-        assert_eq!(tasks[0]["runtime_detail"]["current_phase"], "deliver_result");
+        assert_eq!(
+            tasks[0]["runtime_detail"]["workflow_kind"],
+            "research_podcast"
+        );
+        assert_eq!(
+            tasks[0]["runtime_detail"]["current_phase"],
+            "deliver_result"
+        );
         assert_eq!(tasks[0]["child_terminal_state"], "completed");
         assert_eq!(tasks[0]["child_join_state"], "joined");
+        assert!(tasks[0]["child_failure_action"].is_null());
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
@@ -5349,6 +5482,48 @@ mod tests {
                 && message.media == vec![media_path.to_string_lossy().to_string()]
         });
         assert!(persisted, "media notification not found in session history");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_notification_ack_stays_persisted_when_live_fanout_is_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+        drop(rx);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background report should still count as persisted when live fanout is unavailable"
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content.contains("Background research completed")),
+            "persisted background result not found in session history"
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -6199,6 +6374,7 @@ mod tests {
             workflow_kind: Some("deep_research".to_string()),
             current_phase: Some("research".to_string()),
             output_files: Vec::new(),
+            failure_action: None,
             error: None,
         };
         assert!(
@@ -6284,6 +6460,7 @@ mod tests {
             workflow_kind: Some("deep_research".to_string()),
             current_phase: Some("deliver_result".to_string()),
             output_files: vec!["/tmp/orphaned.md".to_string()],
+            failure_action: None,
             error: None,
         };
 
@@ -6309,6 +6486,71 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("Join state: orphaned"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_repairs_join_when_terminal_arrives_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent-session");
+        let child = SessionKey("api:parent-session#child-task-555".to_string());
+
+        let mut parent_handle = SessionHandle::open(dir.path(), &parent);
+        parent_handle
+            .add_message(Message::user("Start research"))
+            .await
+            .unwrap();
+
+        let terminal = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::RetryableFailed,
+            task_id: "task-555".to_string(),
+            task_label: "Research retry".to_string(),
+            instruction: "Research with flaky upstream".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("research".to_string()),
+            output_files: Vec::new(),
+            failure_action: Some(ChildSessionFailureAction::Retry),
+            error: Some("Upstream timed out".to_string()),
+        };
+
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &terminal)
+                .await
+                .unwrap()
+        );
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content == "Start research"),
+            "terminal-only join should still seed recent parent history"
+        );
+        assert_eq!(
+            child_session.child_contracts[0].join_state,
+            Some(ChildSessionJoinState::Joined)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::RetryableFailure)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].failure_action,
+            Some(PersistedChildSessionFailureAction::Retry)
+        );
+        assert!(
+            child_session.messages.iter().any(|message| {
+                message.content.contains("Failure action: retry")
+                    && message
+                        .content
+                        .contains("Next step: retry from the parent session")
+            }),
+            "retry policy note missing from terminal child session update"
         );
     }
 

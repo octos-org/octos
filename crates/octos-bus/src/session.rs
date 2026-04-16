@@ -96,6 +96,14 @@ pub enum ChildSessionJoinState {
     Orphaned,
 }
 
+/// Explicit failure policy for terminal child-session outcomes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionFailureAction {
+    Retry,
+    Escalate,
+}
+
 /// Durable child-session contract persisted alongside the session history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChildSessionContract {
@@ -113,6 +121,8 @@ pub struct ChildSessionContract {
     pub join_state: Option<ChildSessionJoinState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_action: Option<ChildSessionFailureAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -226,6 +236,9 @@ impl Session {
         }
         if update.joined_at.is_some() {
             existing.joined_at = update.joined_at;
+        }
+        if update.failure_action.is_some() {
+            existing.failure_action = update.failure_action;
         }
         if update.error.is_some() {
             existing.error = update.error;
@@ -1020,9 +1033,10 @@ impl SessionHandle {
 
     /// Seed a child session from a parent session if the child does not already exist.
     ///
-    /// Copies the parent's most recent `copy_messages` messages into the child,
-    /// records the parent linkage, and persists the child session. If the child
-    /// session already has history or an existing parent link, it is left intact.
+    /// Copies the parent's most recent `copy_messages` messages into the child
+    /// when the child is empty, repairs a missing parent linkage on existing
+    /// child sessions, and persists the result. Existing child history is never
+    /// overwritten.
     pub async fn fork_from_parent_if_missing(
         data_dir: &Path,
         parent_key: &SessionKey,
@@ -1035,16 +1049,40 @@ impl SessionHandle {
         };
 
         let mut child = Self::open(data_dir, child_key);
-        if child.session.parent_key.is_some() || !child.session.messages.is_empty() {
+        if child
+            .session
+            .parent_key
+            .as_ref()
+            .is_some_and(|existing| existing != parent_key)
+        {
             record_child_session_fork("skipped_existing");
             return Ok(());
         }
 
-        child.session.parent_key = Some(parent_key.clone());
-        child.session.messages = parent_history;
+        let mut changed = false;
+        let mut seeded_history = false;
+
+        if child.session.parent_key.is_none() {
+            child.session.parent_key = Some(parent_key.clone());
+            changed = true;
+        }
+        if child.session.messages.is_empty() {
+            child.session.messages = parent_history;
+            changed = true;
+            seeded_history = true;
+        }
+        if !changed {
+            record_child_session_fork("skipped_existing");
+            return Ok(());
+        }
+
         child.session.updated_at = Utc::now();
         child.rewrite().await?;
-        record_child_session_fork("seeded");
+        record_child_session_fork(if seeded_history {
+            "seeded"
+        } else {
+            "linked_existing"
+        });
         Ok(())
     }
 
@@ -2040,6 +2078,7 @@ mod tests {
                     terminal_state: None,
                     join_state: None,
                     joined_at: None,
+                    failure_action: None,
                     error: None,
                     output_files: vec![],
                 })
@@ -2056,6 +2095,7 @@ mod tests {
                     terminal_state: Some(ChildSessionTerminalState::Completed),
                     join_state: Some(ChildSessionJoinState::Joined),
                     joined_at: Some(Utc::now()),
+                    failure_action: None,
                     error: None,
                     output_files: vec!["/tmp/report.md".to_string()],
                 })
@@ -2077,6 +2117,40 @@ mod tests {
         assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
         assert_eq!(contract.output_files, vec!["/tmp/report.md"]);
         assert!(contract.joined_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_history() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-linked");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "parent-msg"))
+                .await
+                .unwrap();
+        }
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .add_message(make_message(MessageRole::Assistant, "existing-child-msg"))
+                .await
+                .unwrap();
+            assert_eq!(child_handle.session().parent_key, None);
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent));
+        assert_eq!(child_session.messages.len(), 1);
+        assert_eq!(child_session.messages[0].content, "existing-child-msg");
     }
 
     #[tokio::test]

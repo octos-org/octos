@@ -49,6 +49,12 @@ pub enum ChildSessionLifecycleKind {
     TerminalFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildSessionFailureAction {
+    Retry,
+    Escalate,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChildSessionLifecyclePayload {
     pub kind: ChildSessionLifecycleKind,
@@ -60,6 +66,7 @@ pub struct ChildSessionLifecyclePayload {
     pub workflow_kind: Option<String>,
     pub current_phase: Option<String>,
     pub output_files: Vec<String>,
+    pub failure_action: Option<ChildSessionFailureAction>,
     pub error: Option<String>,
 }
 
@@ -120,6 +127,16 @@ fn child_session_lifecycle_kind_label(kind: ChildSessionLifecycleKind) -> &'stat
         ChildSessionLifecycleKind::Completed => "completed",
         ChildSessionLifecycleKind::RetryableFailed => "retryable_failed",
         ChildSessionLifecycleKind::TerminalFailed => "terminal_failed",
+    }
+}
+
+fn child_session_failure_action(
+    kind: ChildSessionLifecycleKind,
+) -> Option<ChildSessionFailureAction> {
+    match kind {
+        ChildSessionLifecycleKind::Spawned | ChildSessionLifecycleKind::Completed => None,
+        ChildSessionLifecycleKind::RetryableFailed => Some(ChildSessionFailureAction::Retry),
+        ChildSessionLifecycleKind::TerminalFailed => Some(ChildSessionFailureAction::Escalate),
     }
 }
 
@@ -798,6 +815,7 @@ impl Tool for SpawnTool {
                             .as_ref()
                             .map(|workflow| workflow.current_phase.clone()),
                         output_files: Vec::new(),
+                        failure_action: None,
                         error: None,
                     })
                     .await;
@@ -930,6 +948,7 @@ impl Tool for SpawnTool {
                                 .map(|workflow| workflow.workflow_kind.clone()),
                             current_phase: Some("deliver_result".to_string()),
                             output_files: tracked_output_files.clone(),
+                            failure_action: child_session_failure_action(terminal_kind),
                             error: None,
                         },
                         Ok(task_result) => ChildSessionLifecyclePayload {
@@ -946,6 +965,7 @@ impl Tool for SpawnTool {
                                 .as_ref()
                                 .map(|workflow| workflow.current_phase.clone()),
                             output_files: tracked_output_files.clone(),
+                            failure_action: child_session_failure_action(terminal_kind),
                             error: Some(task_result.output.clone()),
                         },
                         Err(error) => ChildSessionLifecyclePayload {
@@ -962,6 +982,7 @@ impl Tool for SpawnTool {
                                 .as_ref()
                                 .map(|workflow| workflow.current_phase.clone()),
                             output_files: tracked_output_files.clone(),
+                            failure_action: child_session_failure_action(terminal_kind),
                             error: Some(error.to_string()),
                         },
                     };
@@ -1444,6 +1465,22 @@ mod tests {
         assert_eq!(
             classify_child_session_lifecycle_kind(&result),
             ChildSessionLifecycleKind::RetryableFailed
+        );
+    }
+
+    #[test]
+    fn child_session_failure_action_matches_terminal_kind() {
+        assert_eq!(
+            child_session_failure_action(ChildSessionLifecycleKind::Completed),
+            None
+        );
+        assert_eq!(
+            child_session_failure_action(ChildSessionLifecycleKind::RetryableFailed),
+            Some(ChildSessionFailureAction::Retry)
+        );
+        assert_eq!(
+            child_session_failure_action(ChildSessionLifecycleKind::TerminalFailed),
+            Some(ChildSessionFailureAction::Escalate)
         );
     }
 

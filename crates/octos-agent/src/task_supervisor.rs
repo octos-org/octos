@@ -63,6 +63,14 @@ pub enum ChildSessionJoinState {
     Orphaned,
 }
 
+/// Explicit follow-up policy for terminal child-session failures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionFailureAction {
+    Retry,
+    Escalate,
+}
+
 /// Fine-grained runtime phase of a background task.
 ///
 /// `status` remains the coarse externally stable summary, while
@@ -99,6 +107,8 @@ pub struct BackgroundTask {
     pub child_join_state: Option<ChildSessionJoinState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_joined_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_failure_action: Option<ChildSessionFailureAction>,
     /// Append-only ledger path used to persist this task's snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_ledger_path: Option<String>,
@@ -151,6 +161,16 @@ fn child_join_outcome_label(state: &ChildSessionJoinState) -> &'static str {
     match state {
         ChildSessionJoinState::Joined => "joined",
         ChildSessionJoinState::Orphaned => "orphaned",
+    }
+}
+
+fn child_failure_action_for_terminal_state(
+    state: &ChildSessionTerminalState,
+) -> Option<ChildSessionFailureAction> {
+    match state {
+        ChildSessionTerminalState::Completed => None,
+        ChildSessionTerminalState::RetryableFailure => Some(ChildSessionFailureAction::Retry),
+        ChildSessionTerminalState::TerminalFailure => Some(ChildSessionFailureAction::Escalate),
     }
 }
 
@@ -277,6 +297,7 @@ impl TaskSupervisor {
             child_terminal_state: None,
             child_join_state: None,
             child_joined_at: None,
+            child_failure_action: None,
             task_ledger_path: task_ledger_path.map(|path| path.to_string()).or_else(|| {
                 self.persistence_path
                     .lock()
@@ -402,6 +423,7 @@ impl TaskSupervisor {
         terminal_state: ChildSessionTerminalState,
         join_state: ChildSessionJoinState,
     ) {
+        let failure_action = child_failure_action_for_terminal_state(&terminal_state);
         let kind_label = child_terminal_kind_label(&terminal_state);
         let outcome_label = child_join_outcome_label(&join_state);
         let snapshot = {
@@ -413,6 +435,7 @@ impl TaskSupervisor {
                     ChildSessionJoinState::Joined => Some(Utc::now()),
                     ChildSessionJoinState::Orphaned => None,
                 };
+                task.child_failure_action = failure_action;
                 task.updated_at = Utc::now();
                 Some(task.clone())
             } else {
@@ -570,6 +593,7 @@ mod tests {
         assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Spawned);
         assert!(tasks[0].child_terminal_state.is_none());
         assert!(tasks[0].child_join_state.is_none());
+        assert!(tasks[0].child_failure_action.is_none());
         assert!(tasks[0].completed_at.is_none());
         assert!(tasks[0].updated_at >= tasks[0].started_at);
     }
@@ -647,6 +671,10 @@ mod tests {
             Some(ChildSessionTerminalState::RetryableFailure)
         );
         assert_eq!(task.child_join_state, Some(ChildSessionJoinState::Joined));
+        assert_eq!(
+            task.child_failure_action,
+            Some(ChildSessionFailureAction::Retry)
+        );
         assert!(task.child_joined_at.is_some());
     }
 
@@ -825,6 +853,7 @@ mod tests {
             completed_task.child_join_state,
             Some(ChildSessionJoinState::Joined)
         );
+        assert_eq!(completed_task.child_failure_action, None);
         assert!(completed_task.child_joined_at.is_some());
 
         let failed_task = tasks
@@ -858,6 +887,10 @@ mod tests {
         assert_eq!(
             failed_task.child_join_state,
             Some(ChildSessionJoinState::Orphaned)
+        );
+        assert_eq!(
+            failed_task.child_failure_action,
+            Some(ChildSessionFailureAction::Escalate)
         );
         assert!(failed_task.child_joined_at.is_none());
     }
