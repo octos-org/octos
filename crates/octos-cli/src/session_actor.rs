@@ -2377,15 +2377,8 @@ impl SessionActor {
         }
     }
 
-    /// Inject a background task result into the conversation.
-    ///
-    /// For long results (>1000 chars), the full content is saved to the memory
-    /// bank and only a summary is injected into session context.  The agent can
-    /// retrieve the full report via `recall_memory("<slug>")`.
-    /// Inject a background task result into the conversation context.
-    ///
-    /// Sends a preview notification directly to the user and injects the result
-    /// into session history for subsequent turns.
+    /// Persist an assistant-visible background result and emit the matching
+    /// committed session-result event metadata for the web/runtime surfaces.
     async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -2435,15 +2428,17 @@ impl SessionActor {
             self.deliver_background_notification(content.to_string(), media)
                 .await
         } else {
-            self.inject_background_result(task_label, content).await
+            let report_message = self
+                .prepare_background_report_result(task_label, content)
+                .await;
+            self.deliver_background_notification(report_message, Vec::new())
+                .await
         }
     }
 
-    async fn inject_background_result(&self, task_label: &str, content: &str) -> bool {
+    async fn prepare_background_report_result(&self, task_label: &str, content: &str) -> String {
         const SUMMARY_THRESHOLD: usize = 1000;
-        const SUMMARY_CHARS: usize = 800;
-
-        let (context_content, notification) = if content.len() > SUMMARY_THRESHOLD {
+        if content.len() > SUMMARY_THRESHOLD {
             // Save full report to memory bank
             let slug = task_label
                 .chars()
@@ -2470,55 +2465,13 @@ impl SessionActor {
                 }
             }
 
-            // Truncate for context injection
-            let summary: String = content.chars().take(SUMMARY_CHARS).collect();
-            let ctx = format!(
-                "[Background task \"{task_label}\" completed]\n\n\
-                 {summary}\n\n[... truncated — full report ({} chars) saved to memory bank as \"{slug}\". \
-                 Use recall_memory(\"{slug}\") to load the complete report.]",
-                content.len(),
-            );
-
-            // Notification includes a preview for the user
             let preview: String = content.chars().take(300).collect();
-            let notif = format!(
+            format!(
                 "✅ **{task_label}** completed.\n\n{preview}...\n\n_Full report saved. Ask me to recall it for details._",
-            );
-
-            (ctx, notif)
+            )
         } else {
-            // Short result — inject fully
-            let ctx = format!("[Background task \"{task_label}\" completed]\n\n{content}");
-            let notif = format!("✅ **{task_label}** completed.\n\n{content}");
-            (ctx, notif)
-        };
-
-        let system_msg = Message::system(context_content);
-        let persisted = {
-            let mut handle = self.session_handle.lock().await;
-            if let Err(e) = handle.add_message(system_msg).await {
-                warn!(session = %self.session_key, error = %e, "failed to inject background result");
-                false
-            } else {
-                true
-            }
-        };
-
-        // Send raw preview directly; the injected context is available on the
-        // next turn without forcing a synthetic rewrite prompt.
-        let _ = self
-            .out_tx
-            .send(OutboundMessage {
-                channel: self.channel.clone(),
-                chat_id: self.chat_id.clone(),
-                content: notification,
-                reply_to: None,
-                media: vec![],
-                metadata: serde_json::json!({}),
-            })
-            .await;
-
-        persisted
+            format!("✅ **{task_label}** completed.\n\n{content}")
+        }
     }
 
     /// Copy media files from their original location (e.g. profile media_dir)
@@ -5017,11 +4970,21 @@ mod tests {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
             let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
             let session = handle.session();
-            let has_bg_msg = session
+            let report_messages: Vec<_> = session
                 .messages
                 .iter()
-                .any(|m| m.content.contains("Background task") && m.content.contains("research"));
-            assert!(has_bg_msg, "background result not found in session history");
+                .filter(|m| {
+                    m.role == MessageRole::Assistant
+                        && m.content.contains("research")
+                        && m.content.contains("completed")
+                })
+                .collect();
+            assert_eq!(
+                report_messages.len(),
+                1,
+                "expected exactly one persisted assistant report result, got: {:?}",
+                session.messages
+            );
         }
 
         drop(tx);
@@ -5077,12 +5040,19 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
         let session = session_handle.session();
+        let report_messages: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Assistant
+                    && m.content.contains("research")
+                    && m.content.contains("completed")
+            })
+            .collect();
         assert!(
-            session
-                .messages
-                .iter()
-                .any(|m| m.content.contains("Background task") && m.content.contains("research")),
-            "background result not found in session history"
+            report_messages.len() == 1,
+            "expected exactly one persisted assistant report result, got: {:?}",
+            session.messages
         );
         assert!(
             session
