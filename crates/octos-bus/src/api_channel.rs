@@ -37,12 +37,12 @@ use crate::file_handle::{
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 
-/// Shared state for the API channel's HTTP handlers.
-#[derive(Clone)]
 /// Callback invoked when a session is deleted via the API.
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Shared state for the API channel's HTTP handlers.
+#[derive(Clone)]
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
