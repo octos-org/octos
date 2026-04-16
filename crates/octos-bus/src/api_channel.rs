@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use chrono::Utc;
 use eyre::Result;
+use futures::stream::{self, StreamExt};
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
@@ -254,6 +255,13 @@ fn build_session_result_event(
     }))
 }
 
+fn build_session_result_event_from_message(message: MessageInfo) -> serde_json::Value {
+    serde_json::json!({
+        "type": "session_result",
+        "message": message,
+    })
+}
+
 fn initial_sse_events(has_media: bool) -> Vec<String> {
     let mut events = vec![
         serde_json::json!({
@@ -298,7 +306,10 @@ impl Channel for ApiChannel {
             .route("/chat", post(handle_chat))
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
-            .route("/sessions/{id}/events/stream", get(handle_session_event_stream))
+            .route(
+                "/sessions/{id}/events/stream",
+                get(handle_session_event_stream),
+            )
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
             .route("/sessions/{id}", delete(handle_delete_session))
@@ -729,6 +740,7 @@ async fn handle_session_event_stream(
     State(state): State<ApiState>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     if let Some(ref expected) = state.auth_token {
         let provided = headers
@@ -743,10 +755,14 @@ async fn handle_session_event_stream(
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     {
         let mut watchers = state.watchers.lock().await;
-        watchers.entry(id).or_default().push(tx);
+        watchers.entry(id.clone()).or_default().push(tx);
     }
 
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    let replay_events =
+        replay_committed_session_results(&state, &id, params.since_seq, params.topic.as_deref())
+            .await;
+
+    let live_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
             Some(data) => {
                 let event: Result<Event, Infallible> = Ok(Event::default().data(data));
@@ -755,6 +771,13 @@ async fn handle_session_event_stream(
             None => None,
         }
     });
+
+    let replay_stream = stream::iter(
+        replay_events
+            .into_iter()
+            .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
+    );
+    let stream = replay_stream.chain(live_stream);
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -927,6 +950,40 @@ fn message_info_from_history_message(
             })
             .unwrap_or_default(),
     }
+}
+
+async fn replay_committed_session_results(
+    state: &ApiState,
+    id: &str,
+    since_seq: Option<usize>,
+    topic: Option<&str>,
+) -> Vec<String> {
+    let Some(since_seq) = since_seq else {
+        return Vec::new();
+    };
+
+    let candidates = api_session_key_candidates(state.profile_id.as_deref(), id, topic);
+    let sess = state.sessions.lock().await;
+    let data_dir = sess.data_dir();
+
+    for candidate in &candidates {
+        if let Some(session) = sess.load(candidate).await {
+            return session
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(seq, message)| *seq > since_seq && message.role == MessageRole::Assistant)
+                .map(|(seq, message)| {
+                    build_session_result_event_from_message(message_info_from_history_message(
+                        message, &data_dir, seq,
+                    ))
+                    .to_string()
+                })
+                .collect();
+        }
+    }
+
+    Vec::new()
 }
 
 /// GET /sessions/:id/status — check if a session has an active task.
@@ -1648,6 +1705,48 @@ mod tests {
         assert_eq!(media.len(), 1);
         assert!(media[0].as_str().unwrap().starts_with("pf/"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "test-chat");
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("first result"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("second result"))
+                .await
+                .unwrap();
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+        };
+
+        let replayed = replay_committed_session_results(&state, "test-chat", Some(1), None).await;
+
+        assert_eq!(replayed.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
+        assert_eq!(parsed["type"], "session_result");
+        assert_eq!(parsed["message"]["seq"], 2);
+        assert_eq!(parsed["message"]["role"], "assistant");
+        assert_eq!(parsed["message"]["content"], "second result");
     }
 
     #[tokio::test]
