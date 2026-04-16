@@ -167,8 +167,9 @@ fn resolve_artifacts(
                 "contract expected output files but tool-reported files do not exist".into(),
             );
         }
+        let context = bind_explicit_files_to_artifacts(task_policy, files.clone())?;
         return Ok(ResolvedArtifacts {
-            context: ActionContext::default().with_named_target("$artifact", files.clone()),
+            context,
             paths: files,
         });
     }
@@ -206,6 +207,36 @@ fn resolve_artifacts(
         context,
         paths: artifact_paths,
     })
+}
+
+fn bind_explicit_files_to_artifacts(
+    task_policy: &WorkspaceSpawnTaskPolicy,
+    files: Vec<PathBuf>,
+) -> Result<ActionContext, String> {
+    let artifact_sources = task_policy.artifact_sources();
+    if artifact_sources.is_empty() {
+        return Err("workspace contract has no artifact source".into());
+    }
+
+    let mut context = ActionContext::default();
+    if artifact_sources.len() == 1 {
+        context = context.with_named_target(format!("${}", artifact_sources[0]), files.clone());
+    } else {
+        if artifact_sources.len() != files.len() {
+            return Err(format!(
+                "workspace contract expects {} explicit output files for {:?}, got {}",
+                artifact_sources.len(),
+                artifact_sources,
+                files.len()
+            ));
+        }
+
+        for (artifact_name, path) in artifact_sources.iter().zip(files.iter()) {
+            context = context.with_named_target(format!("${artifact_name}"), vec![path.clone()]);
+        }
+    }
+
+    Ok(context.with_named_target("$artifact", files))
 }
 
 fn resolve_glob_matches(
@@ -386,7 +417,52 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ToolRegistry, WorkspacePolicy, write_workspace_policy};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    use crate::{Tool, ToolRegistry, ToolResult, WorkspacePolicy, write_workspace_policy};
+
+    #[derive(Clone, Default)]
+    struct CaptureSendFileTool {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CaptureSendFileTool {
+        fn name(&self) -> &str {
+            "send_file"
+        }
+
+        fn description(&self) -> &str {
+            "capture send_file calls"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string" },
+                    "tool_call_id": { "type": "string" }
+                },
+                "required": ["file_path", "tool_call_id"]
+            })
+        }
+
+        async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            let file_path = args
+                .get("file_path")
+                .and_then(|value| value.as_str())
+                .expect("send_file should receive a file_path")
+                .to_string();
+            self.calls.lock().unwrap().push(file_path);
+            Ok(ToolResult {
+                success: true,
+                output: "sent".into(),
+                ..Default::default()
+            })
+        }
+    }
 
     #[tokio::test]
     async fn tts_contract_resolves_new_mp3_for_actor_delivery() {
@@ -530,7 +606,10 @@ mod tests {
         std::fs::write(&bundle, b"bundle").unwrap();
 
         let mut policy = WorkspacePolicy::for_session();
-        policy.artifacts.entries.insert("bundle".into(), "bundle.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("bundle".into(), "bundle.md".into());
         policy.spawn_tasks.insert(
             "bundle_generate".into(),
             WorkspaceSpawnTaskPolicy {
@@ -559,6 +638,123 @@ mod tests {
                 assert_eq!(output_files, vec![bundle.to_string_lossy().to_string()]);
             }
             other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_contract_binds_explicit_files_to_named_artifacts_for_delivery_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        let audio = temp.path().join("audio.mp3");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: Some("legacy".into()),
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: vec![
+                    "file_exists:$report".into(),
+                    "file_exists:$audio".into(),
+                    "file_size_min:$audio:1024".into(),
+                ],
+                on_complete: vec!["send_file:$legacy".into()],
+                on_deliver: vec!["send_file:$report".into(), "send_file:$audio".into()],
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let capture = CaptureSendFileTool::default();
+        let calls = capture.calls.clone();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(capture);
+
+        let result = enforce_spawn_task_contract(
+            &registry,
+            "bundle_generate",
+            "tool-call-5",
+            &[report.clone(), audio.clone()],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(
+                    output_files,
+                    vec![
+                        report.to_string_lossy().to_string(),
+                        audio.to_string_lossy().to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                report.to_string_lossy().to_string(),
+                audio.to_string_lossy().to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_contract_rejects_mismatched_explicit_output_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        std::fs::write(&report, b"report").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-6",
+            &[report.clone()],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, .. } => {
+                assert!(error.contains("expects 2 explicit output files"));
+            }
+            other => panic!("expected failure, got {other:?}"),
         }
     }
 
