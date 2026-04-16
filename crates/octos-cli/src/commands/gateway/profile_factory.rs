@@ -44,7 +44,9 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
         .provider
         .clone()
         .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
-        .unwrap_or_else(|| "anthropic".to_string());
+        .ok_or_else(|| {
+            eyre::eyre!("no LLM provider configured. Set provider in config or profile JSON")
+        })?;
 
     use crate::commands::chat::create_provider;
     let base_provider = create_provider(&provider_name, config, model, base_url)?;

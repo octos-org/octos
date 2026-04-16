@@ -105,7 +105,11 @@ impl ChatCommand {
                     .and_then(crate::config::detect_provider)
                     .map(String::from)
             })
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no LLM provider configured. Run `octos init` or set provider in config.json"
+                )
+            })?;
 
         // Create LLM provider (with optional failover chain)
         let base_provider: Arc<dyn LlmProvider> =

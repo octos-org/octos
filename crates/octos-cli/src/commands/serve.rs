@@ -280,6 +280,13 @@ impl ServeCommand {
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
+                    if p.config.provider.is_none() && p.config.model.is_none() {
+                        tracing::warn!(
+                            profile = %p.id,
+                            "skipping auto-start: no LLM provider configured"
+                        );
+                        continue;
+                    }
                     tracing::info!(profile = %p.id, "auto-starting gateway");
                     if let Err(e) = process_manager.start(p).await {
                         tracing::warn!(profile = %p.id, error = %e, "failed to auto-start gateway");
@@ -556,7 +563,11 @@ impl ServeCommand {
                     .and_then(crate::config::detect_provider)
                     .map(String::from)
             })
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no LLM provider configured. Run `octos init` or set provider in config.json"
+                )
+            })?;
 
         let base_provider: Arc<dyn LlmProvider> =
             create_provider(&provider_name, config, model, base_url)?;

@@ -478,6 +478,17 @@ impl ProcessManager {
                             rt.block_on(async move {
                                 if let Some(pm) = weak.upgrade() {
                                     if let Ok(Some(profile)) = ps2.get(&pid2) {
+                                        // Don't restart if no provider is configured — it will
+                                        // just crash-loop endlessly.
+                                        if profile.config.provider.is_none()
+                                            && profile.config.model.is_none()
+                                        {
+                                            tracing::warn!(
+                                                profile = %pid2,
+                                                "skipping auto-restart: no LLM provider configured"
+                                            );
+                                            return;
+                                        }
                                         tracing::info!(profile = %pid2, "auto-restarting crashed gateway");
                                         if let Err(e) = pm.start(&profile).await {
                                             tracing::error!(profile = %pid2, error = %e, "auto-restart failed");

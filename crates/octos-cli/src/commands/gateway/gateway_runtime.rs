@@ -171,7 +171,7 @@ impl GatewayRuntime {
             .provider
             .or(config.provider.clone())
             .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| eyre::eyre!("no LLM provider configured for this profile"))?;
 
         let gw_config = config
             .gateway
@@ -1016,15 +1016,8 @@ impl GatewayRuntime {
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
-            llm_strong: super::profile_factory::build_strong_chain(
-                &config,
-                &config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "anthropic".to_string()),
-                false,
-            )
-            .unwrap_or_else(|_| llm_for_compaction.clone()),
+            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
+                .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),
         };
         let profile_factory_builder =

@@ -88,11 +88,8 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     // Load config for provider/model info
     let config = Config::load(cwd, &data_dir).unwrap_or_default();
 
-    let provider = config.provider.as_deref().unwrap_or("anthropic");
-    let model = config
-        .model
-        .as_deref()
-        .unwrap_or("claude-sonnet-4-20250514");
+    let provider = config.provider.as_deref().unwrap_or("(not configured)");
+    let model = config.model.as_deref().unwrap_or("(not configured)");
     println!("{}: {}", "Provider".green(), provider);
     println!("{}: {}", "Model".green(), model);
 
