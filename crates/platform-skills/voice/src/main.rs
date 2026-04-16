@@ -697,6 +697,10 @@ fn handle_unload_model(input_json: &str) {
 // ── Main ─────────────────────────────────────────────────────────────
 
 fn main() {
+    if !cfg!(target_os = "macos") {
+        fail("voice skill requires macOS (ominix-api runs on Apple Silicon only)");
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let tool_name = args.get(1).map(|s| s.as_str()).unwrap_or("unknown");
 
