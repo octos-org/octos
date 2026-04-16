@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +128,30 @@ struct PersistedTaskRecord {
 
 fn default_task_ledger_schema() -> u32 {
     CURRENT_TASK_LEDGER_SCHEMA
+}
+
+fn record_child_session_lifecycle(kind: &'static str, outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => kind.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn child_terminal_kind_label(state: &ChildSessionTerminalState) -> &'static str {
+    match state {
+        ChildSessionTerminalState::Completed => "completed",
+        ChildSessionTerminalState::RetryableFailure => "retryable_failed",
+        ChildSessionTerminalState::TerminalFailure => "terminal_failed",
+    }
+}
+
+fn child_join_outcome_label(state: &ChildSessionJoinState) -> &'static str {
+    match state {
+        ChildSessionJoinState::Joined => "joined",
+        ChildSessionJoinState::Orphaned => "orphaned",
+    }
 }
 
 impl std::fmt::Debug for TaskSupervisor {
@@ -273,6 +298,14 @@ impl TaskSupervisor {
         tasks.insert(id.clone(), task);
         drop(tasks);
         self.persist_snapshot_by_id(&id);
+        record_child_session_lifecycle(
+            "tracked",
+            if session_key.is_some() {
+                "registered"
+            } else {
+                "detached"
+            },
+        );
         id
     }
 
@@ -371,6 +404,8 @@ impl TaskSupervisor {
         terminal_state: ChildSessionTerminalState,
         join_state: ChildSessionJoinState,
     ) {
+        let kind_label = child_terminal_kind_label(&terminal_state);
+        let outcome_label = child_join_outcome_label(&join_state);
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
@@ -389,6 +424,7 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            record_child_session_lifecycle(kind_label, outcome_label);
         }
     }
 

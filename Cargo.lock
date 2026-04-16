@@ -3547,6 +3547,7 @@ dependencies = [
  "ignore",
  "lettre",
  "libc",
+ "metrics",
  "octos-core",
  "octos-llm",
  "octos-memory",

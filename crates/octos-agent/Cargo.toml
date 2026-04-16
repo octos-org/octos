@@ -21,6 +21,7 @@ toml = { workspace = true }
 chrono = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 glob = { workspace = true }
 regex = { workspace = true }
 ignore = { workspace = true }

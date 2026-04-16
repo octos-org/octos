@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use metrics::counter;
 use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
@@ -111,6 +112,24 @@ fn classify_child_session_lifecycle_kind(
         }
         Err(_) => ChildSessionLifecycleKind::TerminalFailed,
     }
+}
+
+fn child_session_lifecycle_kind_label(kind: ChildSessionLifecycleKind) -> &'static str {
+    match kind {
+        ChildSessionLifecycleKind::Spawned => "spawned",
+        ChildSessionLifecycleKind::Completed => "completed",
+        ChildSessionLifecycleKind::RetryableFailed => "retryable_failed",
+        ChildSessionLifecycleKind::TerminalFailed => "terminal_failed",
+    }
+}
+
+fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => child_session_lifecycle_kind_label(kind).to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -765,7 +784,7 @@ impl Tool for SpawnTool {
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
                 ) {
-                    sender(ChildSessionLifecyclePayload {
+                    let joined = sender(ChildSessionLifecyclePayload {
                         kind: ChildSessionLifecycleKind::Spawned,
                         task_id: task_id.clone(),
                         task_label: task_label.clone(),
@@ -782,6 +801,10 @@ impl Tool for SpawnTool {
                         error: None,
                     })
                     .await;
+                    record_child_session_lifecycle(
+                        ChildSessionLifecycleKind::Spawned,
+                        if joined { "dispatched" } else { "not_joined" },
+                    );
                 }
 
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
@@ -943,6 +966,10 @@ impl Tool for SpawnTool {
                         },
                     };
                     let joined = sender(payload).await;
+                    record_child_session_lifecycle(
+                        terminal_kind,
+                        if joined { "dispatched" } else { "not_joined" },
+                    );
                     if let Some(supervisor) = task_supervisor.as_ref() {
                         if let Some(task_id) = tracked_task_id.as_ref() {
                             let terminal_state = match terminal_kind {
