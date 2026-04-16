@@ -805,6 +805,25 @@ impl ActorRegistry {
         });
     }
 
+    /// Stop and remove a session actor. Drops the sender so the actor's run
+    /// loop exits on the next recv(). Used when a session is deleted — the
+    /// actor must not survive and serve stale context to new messages.
+    pub fn remove_session(&mut self, session_key: &str) {
+        let scoped_suffix = format!(":{session_key}");
+        let keys_to_remove: Vec<String> = self
+            .actors
+            .keys()
+            .filter(|key| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            if let Some(handle) = self.actors.remove(&key) {
+                debug!(session = %key, "removing session actor on delete");
+                drop(handle.tx); // actor's recv() returns None → run loop exits
+            }
+        }
+    }
+
     /// Cancel a specific session actor.
     pub async fn cancel(&self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");

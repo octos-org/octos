@@ -39,6 +39,10 @@ pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
+/// Callback invoked when a session is deleted via the API.
+/// The gateway runtime wires this to stop the session actor.
+type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
@@ -47,6 +51,7 @@ struct ApiState {
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
+    on_session_deleted: Option<OnSessionDeletedFn>,
 }
 
 fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
@@ -89,6 +94,8 @@ pub struct ApiChannel {
     sessions: Arc<Mutex<SessionManager>>,
     /// Optional callback for querying background tasks by session key.
     task_query: Option<Arc<TaskQueryFn>>,
+    /// Optional callback invoked when a session is deleted via API.
+    on_session_deleted: Option<OnSessionDeletedFn>,
 }
 
 impl ApiChannel {
@@ -109,12 +116,23 @@ impl ApiChannel {
             last_content: Arc::new(Mutex::new(HashMap::new())),
             sessions,
             task_query: None,
+            on_session_deleted: None,
         }
     }
 
     /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
+        self
+    }
+
+    /// Attach a callback invoked when a session is deleted via the API.
+    /// The gateway runtime uses this to stop the session actor.
+    pub fn with_on_session_deleted(
+        mut self,
+        f: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_session_deleted = Some(Arc::new(f));
         self
     }
 
@@ -334,6 +352,7 @@ impl Channel for ApiChannel {
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
+            on_session_deleted: self.on_session_deleted.clone(),
         };
 
         let app = Router::new()
@@ -1214,16 +1233,23 @@ async fn handle_delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let mut sess = state.sessions.lock().await;
-    let mut last_error: Option<String> = None;
+    let mut cleared = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        match sess.clear(&candidate).await {
-            Ok(()) => return StatusCode::NO_CONTENT.into_response(),
-            Err(error) => last_error = Some(error.to_string()),
+        if sess.clear(&candidate).await.is_ok() {
+            cleared = true;
+            // Notify the gateway runtime to stop the session actor so it doesn't
+            // serve stale context if new messages arrive for this session ID.
+            if let Some(ref cb) = state.on_session_deleted {
+                cb(&id);
+            }
+            return StatusCode::NO_CONTENT.into_response();
         }
     }
-    match last_error {
-        Some(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
+    if cleared {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        // No session found — still return 204 (idempotent delete)
+        StatusCode::NO_CONTENT.into_response()
     }
 }
 

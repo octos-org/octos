@@ -93,6 +93,9 @@ pub(super) struct GatewayRuntime {
     heartbeat_service: Arc<HeartbeatService>,
     cron_service: Arc<CronService>,
 
+    // Session delete events from API handlers
+    session_delete_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+
     // Matrix (feature-gated)
     #[cfg(feature = "matrix")]
     matrix_channel: Option<Arc<octos_bus::MatrixChannel>>,
@@ -1087,8 +1090,14 @@ impl GatewayRuntime {
             });
         }
 
+        // Channel for session delete events from API → gateway main loop.
+        // The API handler sends the session ID, the main loop removes the actor.
+        let (session_delete_tx, session_delete_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+
         let mut channel_mgr = ChannelManager::new();
         {
+            let delete_tx = session_delete_tx.clone();
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
                 shutdown: &shutdown,
                 media_dir: &media_dir,
@@ -1101,6 +1110,9 @@ impl GatewayRuntime {
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                on_session_deleted: Some(Arc::new(move |id: &str| {
+                    let _ = delete_tx.send(id.to_string());
+                })),
                 #[cfg(feature = "matrix")]
                 matrix_channel: &mut matrix_channel,
             };
@@ -1278,6 +1290,7 @@ impl GatewayRuntime {
             persona_service,
             heartbeat_service,
             cron_service,
+            session_delete_rx,
             #[cfg(feature = "matrix")]
             matrix_channel,
         };
@@ -1294,6 +1307,13 @@ impl GatewayRuntime {
                 _ = shutdown_notify.notified() => {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
+                    }
+                    continue;
+                }
+                session_id = self.session_delete_rx.recv() => {
+                    if let Some(id) = session_id {
+                        tracing::debug!(session = %id, "stopping actor for deleted session");
+                        self.actor_registry.remove_session(&id);
                     }
                     continue;
                 }
