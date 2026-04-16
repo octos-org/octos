@@ -1714,7 +1714,10 @@ impl SessionActor {
                                 content: String::new(),
                                 reply_to: None,
                                 media: vec![],
-                                metadata: serde_json::json!({ "_task_status": task_json }),
+                                metadata: serde_json::json!({
+                                    "topic": self.session_key.topic(),
+                                    "_task_status": task_json
+                                }),
                             }).await;
                         }
                         Some(ActorMessage::Cancel) => {
@@ -2390,6 +2393,7 @@ impl SessionActor {
 
         let metadata = match persisted.as_ref() {
             Some(persisted_message) => serde_json::json!({
+                "topic": self.session_key.topic(),
                 "_history_persisted": true,
                 "_session_result": {
                     "seq": persisted_message.seq,
@@ -2399,7 +2403,10 @@ impl SessionActor {
                     "media": media.clone(),
                 }
             }),
-            None => serde_json::json!({ "_history_persisted": false }),
+            None => serde_json::json!({
+                "topic": self.session_key.topic(),
+                "_history_persisted": false
+            }),
         };
 
         let _ = self
@@ -3009,7 +3016,10 @@ impl SessionActor {
                                 content: String::new(),
                                 reply_to: None,
                                 media: vec![],
-                                metadata: serde_json::json!({ "_task_status": task_json }),
+                                metadata: serde_json::json!({
+                                    "topic": self.session_key.topic(),
+                                    "_task_status": task_json
+                                }),
                             }).await;
                         }
                         Some(ActorMessage::Cancel) => {
@@ -3253,7 +3263,9 @@ impl SessionActor {
                             content: String::new(),
                             reply_to: None,
                             media: vec![abs_file.to_string_lossy().into_owned()],
-                            metadata: serde_json::json!({}),
+                            metadata: serde_json::json!({
+                                "topic": self.session_key.topic()
+                            }),
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");

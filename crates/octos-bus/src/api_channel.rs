@@ -49,6 +49,13 @@ struct ApiState {
     task_query: Option<Arc<TaskQueryFn>>,
 }
 
+fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
+    match topic.filter(|value| !value.trim().is_empty()) {
+        Some(topic) => format!("{chat_id}::{}", topic.trim()),
+        None => chat_id.to_string(),
+    }
+}
+
 /// Request body for POST /chat.
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -208,7 +215,12 @@ impl ApiChannel {
         }
     }
 
-    async fn broadcast_session_event(&self, chat_id: &str, event: serde_json::Value) {
+    async fn broadcast_session_event(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+        event: serde_json::Value,
+    ) {
         let payload = event.to_string();
 
         {
@@ -221,10 +233,11 @@ impl ApiChannel {
         }
 
         let mut watchers = self.watchers.lock().await;
-        if let Some(subscribers) = watchers.get_mut(chat_id) {
+        let key = watcher_key(chat_id, topic);
+        if let Some(subscribers) = watchers.get_mut(&key) {
             subscribers.retain(|tx| tx.send(payload.clone()).is_ok());
             if subscribers.is_empty() {
-                watchers.remove(chat_id);
+                watchers.remove(&key);
             }
         }
     }
@@ -234,6 +247,7 @@ fn build_session_result_event(
     raw: &serde_json::Value,
     data_dir: &Path,
     materialized_media: Option<&[String]>,
+    topic: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut message = raw.clone();
     let obj = message.as_object_mut()?;
@@ -251,14 +265,34 @@ fn build_session_result_event(
 
     Some(serde_json::json!({
         "type": "session_result",
+        "topic": topic,
         "message": message,
     }))
 }
 
-fn build_session_result_event_from_message(message: MessageInfo) -> serde_json::Value {
+fn build_session_result_event_from_message(
+    message: MessageInfo,
+    topic: Option<&str>,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "session_result",
+        "topic": topic,
         "message": message,
+    })
+}
+
+fn build_task_status_event(task: serde_json::Value, topic: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "task_status",
+        "topic": topic,
+        "task": task,
+    })
+}
+
+fn build_replay_complete_event(topic: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "replay_complete",
+        "topic": topic,
     })
 }
 
@@ -343,6 +377,8 @@ impl Channel for ApiChannel {
             .unwrap_or(false);
         let session_result = msg.metadata.get("_session_result").cloned();
 
+        let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
+
         if !msg.media.is_empty() {
             let persisted_media = self
                 .materialize_media_for_session(&msg.chat_id, &msg.media)
@@ -393,9 +429,9 @@ impl Channel for ApiChannel {
             // over SSE but the assistant message only appeared after polling.
             if let Some(result) = session_result.as_ref() {
                 if let Some(event) =
-                    build_session_result_event(result, &data_dir, Some(&persisted_media))
+                    build_session_result_event(result, &data_dir, Some(&persisted_media), topic)
                 {
-                    self.broadcast_session_event(&msg.chat_id, event).await;
+                    self.broadcast_session_event(&msg.chat_id, topic, event).await;
                 }
                 return Ok(());
             }
@@ -403,7 +439,8 @@ impl Channel for ApiChannel {
             if let Some(message) = committed_message {
                 self.broadcast_session_event(
                     &msg.chat_id,
-                    build_session_result_event_from_message(message),
+                    topic,
+                    build_session_result_event_from_message(message, topic),
                 )
                 .await;
                 return Ok(());
@@ -442,11 +479,11 @@ impl Channel for ApiChannel {
 
         // Task status change — push raw JSON through SSE
         if let Some(task_json) = msg.metadata.get("_task_status").and_then(|v| v.as_str()) {
-            let event = serde_json::json!({
-                "type": "task_status",
-                "task": serde_json::from_str::<serde_json::Value>(task_json).unwrap_or_default(),
-            });
-            self.broadcast_session_event(&msg.chat_id, event).await;
+            let event = build_task_status_event(
+                serde_json::from_str::<serde_json::Value>(task_json).unwrap_or_default(),
+                topic,
+            );
+            self.broadcast_session_event(&msg.chat_id, topic, event).await;
             return Ok(());
         }
 
@@ -455,8 +492,8 @@ impl Channel for ApiChannel {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
             };
-            if let Some(event) = build_session_result_event(result, &data_dir, None) {
-                self.broadcast_session_event(&msg.chat_id, event).await;
+            if let Some(event) = build_session_result_event(result, &data_dir, None, topic) {
+                self.broadcast_session_event(&msg.chat_id, topic, event).await;
             }
             return Ok(());
         }
@@ -781,12 +818,18 @@ async fn handle_session_event_stream(
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     {
         let mut watchers = state.watchers.lock().await;
-        watchers.entry(id.clone()).or_default().push(tx);
+        watchers
+            .entry(watcher_key(&id, params.topic.as_deref()))
+            .or_default()
+            .push(tx);
     }
 
-    let replay_events =
+    let mut replay_events = replay_task_status_events(&state, &id, params.topic.as_deref()).await;
+    replay_events.extend(
         replay_committed_session_results(&state, &id, params.since_seq, params.topic.as_deref())
-            .await;
+            .await,
+    );
+    replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
 
     let live_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -978,16 +1021,32 @@ fn message_info_from_history_message(
     }
 }
 
+async fn replay_task_status_events(
+    state: &ApiState,
+    id: &str,
+    topic: Option<&str>,
+) -> Vec<String> {
+    let Some(ref query_fn) = state.task_query else {
+        return Vec::new();
+    };
+
+    let session_key =
+        current_profile_api_session_key_with_topic(state.profile_id.as_deref(), id, topic);
+    query_fn(&session_key.0)
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|task| build_task_status_event(task, topic).to_string())
+        .collect()
+}
+
 async fn replay_committed_session_results(
     state: &ApiState,
     id: &str,
     since_seq: Option<usize>,
     topic: Option<&str>,
 ) -> Vec<String> {
-    let Some(since_seq) = since_seq else {
-        return Vec::new();
-    };
-
     let candidates = api_session_key_candidates(state.profile_id.as_deref(), id, topic);
     let sess = state.sessions.lock().await;
     let data_dir = sess.data_dir();
@@ -998,11 +1057,15 @@ async fn replay_committed_session_results(
                 .messages
                 .iter()
                 .enumerate()
-                .filter(|(seq, message)| *seq > since_seq && message.role == MessageRole::Assistant)
+                .filter(|(seq, message)| {
+                    since_seq.is_none_or(|since| *seq > since)
+                        && message.role == MessageRole::Assistant
+                })
                 .map(|(seq, message)| {
-                    build_session_result_event_from_message(message_info_from_history_message(
-                        message, &data_dir, seq,
-                    ))
+                    build_session_result_event_from_message(
+                        message_info_from_history_message(message, &data_dir, seq),
+                        topic,
+                    )
                     .to_string()
                 })
                 .collect();
@@ -1773,6 +1836,92 @@ mod tests {
         assert_eq!(parsed["message"]["seq"], 2);
         assert_eq!(parsed["message"]["role"], "assistant");
         assert_eq!(parsed["message"]["content"], "second result");
+    }
+
+    #[tokio::test]
+    async fn replay_committed_session_results_without_since_seq_replays_all_assistant_messages() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "test-chat",
+            Some("slides launch"),
+        );
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("first result"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("second result"))
+                .await
+                .unwrap();
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+        };
+
+        let replayed = replay_committed_session_results(
+            &state,
+            "test-chat",
+            None,
+            Some("slides launch"),
+        )
+        .await;
+
+        assert_eq!(replayed.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&replayed[1]).unwrap();
+        assert_eq!(first["type"], "session_result");
+        assert_eq!(first["topic"], "slides launch");
+        assert_eq!(first["message"]["seq"], 1);
+        assert_eq!(second["message"]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn replay_task_status_events_replays_current_tasks_with_topic() {
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions: test_sessions(),
+            task_query: Some(Arc::new(|_| {
+                serde_json::json!([
+                    {
+                        "id": "task-1",
+                        "tool_name": "podcast_generate",
+                        "status": "running",
+                        "started_at": "2026-04-16T00:00:00Z",
+                        "error": null
+                    }
+                ])
+            })),
+        };
+
+        let replayed =
+            replay_task_status_events(&state, "test-chat", Some("site astro")).await;
+
+        assert_eq!(replayed.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
+        assert_eq!(parsed["type"], "task_status");
+        assert_eq!(parsed["topic"], "site astro");
+        assert_eq!(parsed["task"]["id"], "task-1");
+        assert_eq!(parsed["task"]["tool_name"], "podcast_generate");
     }
 
     #[tokio::test]
