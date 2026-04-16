@@ -38,6 +38,7 @@ pub mod tools;
 pub mod updater;
 #[cfg(feature = "api")]
 pub mod user_store;
+pub mod workflow_runtime;
 
 use commands::{Args, Executable};
 

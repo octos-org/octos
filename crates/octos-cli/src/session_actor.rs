@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
 /// Parameters for dispatching an inbound message to a session actor.
 pub struct DispatchParams<'a> {
@@ -75,106 +76,6 @@ struct ForwarderParams {
     active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pending_messages: PendingMessages,
     sender_user_id: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ForcedBackgroundWorkflow {
-    DeepResearch,
-    ResearchPodcast,
-}
-
-impl ForcedBackgroundWorkflow {
-    fn detect(content: &str) -> Option<Self> {
-        let lower = content.to_ascii_lowercase();
-        if Self::explicitly_foreground(&lower, content) {
-            return None;
-        }
-
-        let has_podcast =
-            lower.contains("podcast") || content.contains("播客") || content.contains("语音播客");
-        let has_research_signal = lower.contains("deep research")
-            || lower.contains("research")
-            || lower.contains("latest")
-            || lower.contains("news")
-            || content.contains("研究")
-            || content.contains("深入")
-            || content.contains("深度")
-            || content.contains("最新")
-            || content.contains("今日")
-            || content.contains("热点")
-            || content.contains("新闻")
-            || content.contains("搜索")
-            || content.contains("资料");
-
-        if has_podcast && has_research_signal {
-            return Some(Self::ResearchPodcast);
-        }
-
-        let has_deep_research = lower.contains("deep research")
-            || content.contains("深度研究")
-            || content.contains("深入研究")
-            || content.contains("深度调查")
-            || content.contains("深度搜索")
-            || content.contains("深度调研");
-        if has_deep_research {
-            return Some(Self::DeepResearch);
-        }
-
-        None
-    }
-
-    fn explicitly_foreground(lower: &str, original: &str) -> bool {
-        lower.contains("wait synchronously")
-            || lower.contains("wait for completion")
-            || lower.contains("don't use background")
-            || lower.contains("do not use background")
-            || original.contains("不要后台")
-            || original.contains("别后台")
-            || original.contains("同步")
-            || original.contains("等待完成")
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::DeepResearch => "Deep research",
-            Self::ResearchPodcast => "Research podcast",
-        }
-    }
-
-    fn ack_message(self) -> &'static str {
-        match self {
-            Self::DeepResearch => "深度研究已在后台启动。完成后会把最终研究结果发回当前会话。",
-            Self::ResearchPodcast => {
-                "研究和播客生成已在后台启动。完成后只会发送最终音频结果到当前会话。"
-            }
-        }
-    }
-
-    fn allowed_tools(self) -> Vec<String> {
-        match self {
-            Self::DeepResearch => vec!["run_pipeline".into()],
-            Self::ResearchPodcast => vec![
-                "deep_search".into(),
-                "news_fetch".into(),
-                "write_file".into(),
-                "read_file".into(),
-                "list_dir".into(),
-                "glob".into(),
-                "podcast_generate".into(),
-            ],
-        }
-    }
-
-    fn additional_instructions(self) -> &'static str {
-        match self {
-            Self::DeepResearch => {
-                "You are a background research analyst. Use run_pipeline with an inline DOT graph to complete the research in the background. Deliver exactly one final user-facing report. Do not emit intermediate status chatter or send intermediate files."
-            }
-            Self::ResearchPodcast => {
-                "You are a background news podcast producer. Research inside this worker, write a single podcast script in the exact format `[Character - voice, emotion] text`, and then call podcast_generate exactly once after the script is ready. Use the exact clone voices `clone:yangmi` for 杨幂 and `clone:douwentao` for 窦文涛 on every dialogue line. Do not substitute preset voices like alloy, nova, or vivian. Keep the research focused: gather only enough fresh evidence to support the script, stop after roughly 4-6 search passes, and do not keep recursively expanding side topics. Target a substantive but bounded final audio runtime of about 10-15 minutes unless the user explicitly asks for a longer show. That usually means about 18-28 dialogue lines total and no sprawling 30-45 minute scripts. Do not use fm_tts, voice_synthesize, or send_file. Do not deliver intermediate reports or script files. Only the final podcast audio may be delivered to the user."
-            }
-        }
-    }
 }
 
 /// Default actor inbox capacity.
@@ -2591,14 +2492,14 @@ impl SessionActor {
         inbound: &InboundMessage,
         image_media: &[String],
         attachment_media: &[String],
-    ) -> Option<ForcedBackgroundWorkflow> {
+    ) -> Option<WorkflowInstance> {
         if !image_media.is_empty() || !attachment_media.is_empty() {
             return None;
         }
         if self.channel == "system" {
             return None;
         }
-        ForcedBackgroundWorkflow::detect(&inbound.content)
+        WorkflowKind::detect_forced_background(&inbound.content).map(WorkflowKind::build)
     }
 
     async fn maybe_start_forced_background_workflow(
@@ -2622,12 +2523,15 @@ impl SessionActor {
             task.push_str(prompt);
         }
 
+        let workflow_label = workflow.label.clone();
+        let workflow_ack = workflow.ack_message.clone();
         let args = serde_json::json!({
             "task": task,
-            "label": workflow.label(),
+            "label": workflow_label,
             "mode": "background",
-            "allowed_tools": workflow.allowed_tools(),
-            "additional_instructions": workflow.additional_instructions(),
+            "allowed_tools": workflow.allowed_tools.clone(),
+            "additional_instructions": workflow.additional_instructions.clone(),
+            "workflow": workflow.clone(),
         });
 
         let tool_registry = self.agent.tool_registry();
@@ -2636,7 +2540,7 @@ impl SessionActor {
             Ok(result) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = workflow.label(),
+                    workflow = %workflow.label,
                     error = %result.output,
                     "forced background spawn returned failure"
                 );
@@ -2645,7 +2549,7 @@ impl SessionActor {
             Err(error) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = workflow.label(),
+                    workflow = %workflow.label,
                     error = %error,
                     "forced background spawn failed"
                 );
@@ -2673,7 +2577,7 @@ impl SessionActor {
             }
         }
 
-        let ack_content = workflow.ack_message().to_string();
+        let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
@@ -5952,27 +5856,27 @@ mod tests {
     #[test]
     fn forced_background_workflow_detects_deep_research() {
         assert_eq!(
-            ForcedBackgroundWorkflow::detect(
+            WorkflowKind::detect_forced_background(
                 "请对「全球AI代理竞争格局」做一次深度研究，并输出完整报告。"
             ),
-            Some(ForcedBackgroundWorkflow::DeepResearch)
+            Some(WorkflowKind::DeepResearch)
         );
     }
 
     #[test]
     fn forced_background_workflow_detects_research_podcast() {
         assert_eq!(
-            ForcedBackgroundWorkflow::detect(
+            WorkflowKind::detect_forced_background(
                 "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻，要求专业冷静。"
             ),
-            Some(ForcedBackgroundWorkflow::ResearchPodcast)
+            Some(WorkflowKind::ResearchPodcast)
         );
     }
 
     #[test]
     fn forced_background_workflow_respects_foreground_override() {
         assert_eq!(
-            ForcedBackgroundWorkflow::detect(
+            WorkflowKind::detect_forced_background(
                 "请同步等待完成，不要后台。对这个主题做深度研究并直接在这里输出。"
             ),
             None

@@ -9,7 +9,7 @@ use eyre::{Result, WrapErr};
 use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
@@ -34,6 +34,14 @@ pub struct BackgroundResultPayload {
     pub content: String,
     pub kind: BackgroundResultKind,
     pub media: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowMetadata {
+    workflow_kind: String,
+    current_phase: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_tools: Vec<String>,
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -249,6 +257,9 @@ struct Input {
     /// These are added after the parent's worker prompt, never replacing it.
     #[serde(default, alias = "system_prompt")]
     additional_instructions: Option<String>,
+    /// Optional structured workflow metadata from the session runtime.
+    #[serde(default)]
+    workflow: Option<WorkflowMetadata>,
 }
 
 fn default_mode() -> String {
@@ -262,6 +273,10 @@ fn should_deliver_output_files(files: &[PathBuf]) -> bool {
             Some("md" | "txt" | "json" | "csv")
         )
     })
+}
+
+fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
+    serde_json::to_string(workflow).ok()
 }
 
 async fn deliver_background_result(
@@ -370,6 +385,26 @@ impl Tool for SpawnTool {
                 "additional_instructions": {
                     "type": "string",
                     "description": "Extra instructions appended to the subagent's system prompt. Use to specialize behavior (e.g. 'Focus on OWASP Top 10 security issues.'). Cannot override or replace the base system prompt."
+                },
+                "workflow": {
+                    "type": "object",
+                    "description": "Optional structured workflow metadata for runtime-owned background workflows.",
+                    "properties": {
+                        "workflow_kind": {
+                            "type": "string",
+                            "description": "Stable workflow family identifier."
+                        },
+                        "current_phase": {
+                            "type": "string",
+                            "description": "Current workflow phase."
+                        },
+                        "allowed_tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Workflow-owned tool allowlist snapshot."
+                        }
+                    },
+                    "required": ["workflow_kind", "current_phase"]
                 }
             },
             "required": ["task"]
@@ -393,6 +428,7 @@ impl Tool for SpawnTool {
         };
 
         let allowed_tools = input.allowed_tools.clone();
+        let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
 
         info!(
@@ -501,12 +537,20 @@ impl Tool for SpawnTool {
             let plugin_extra_env = self.plugin_extra_env.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
+            let workflow_metadata = workflow.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
                     supervisor.mark_running(task_id);
+                    if let Some(workflow) = workflow_metadata.as_ref() {
+                        supervisor.mark_runtime_state(
+                            task_id,
+                            crate::task_supervisor::TaskRuntimeState::ExecutingTool,
+                            encode_workflow_detail(workflow),
+                        );
+                    }
                 }
 
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
@@ -563,6 +607,22 @@ impl Tool for SpawnTool {
                         .collect::<Vec<_>>(),
                     Err(_) => Vec::new(),
                 };
+
+                if matches!(&result, Ok(task_result) if task_result.success) {
+                    if let (Some(supervisor), Some(task_id), Some(workflow)) = (
+                        task_supervisor.as_ref(),
+                        tracked_task_id.as_ref(),
+                        workflow_metadata.as_ref(),
+                    ) {
+                        let mut deliver = workflow.clone();
+                        deliver.current_phase = "deliver_result".to_string();
+                        supervisor.mark_runtime_state(
+                            task_id,
+                            crate::task_supervisor::TaskRuntimeState::DeliveringOutputs,
+                            encode_workflow_detail(&deliver),
+                        );
+                    }
+                }
 
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
@@ -742,6 +802,77 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_background_spawn_persists_workflow_phase_transitions() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Produce a short podcast",
+                "label": "Research podcast",
+                "mode": "background",
+                "allowed_tools": ["podcast_generate"],
+                "workflow": {
+                    "workflow_kind": "research_podcast",
+                    "current_phase": "research",
+                    "allowed_tools": ["podcast_generate"]
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let details: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                record
+                    .get("task")
+                    .and_then(|task| task.get("runtime_detail"))
+                    .and_then(|detail| detail.as_str())
+                    .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
+            })
+            .collect();
+
+        assert!(details.iter().any(|detail| {
+            detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
+                && detail.get("current_phase").and_then(|v| v.as_str()) == Some("research")
+        }));
+        assert!(details.iter().any(|detail| {
+            detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
+                && detail.get("current_phase").and_then(|v| v.as_str())
+                    == Some("deliver_result")
+        }));
     }
 
     #[tokio::test]
