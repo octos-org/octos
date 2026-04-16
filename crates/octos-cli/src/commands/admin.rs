@@ -1,6 +1,9 @@
-//! Admin commands for tenant and tunnel management.
+//! Admin commands for tenant, tunnel, and operator management.
+
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
+use colored::Colorize;
 use eyre::{Result, bail};
 use uuid::Uuid;
 
@@ -73,6 +76,18 @@ pub enum AdminAction {
         /// Data directory override.
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
+    },
+    /// Show a condensed operator view of runtime observability counters.
+    OperatorSummary {
+        /// Base URL of the running octos API.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Admin or user bearer token for the API.
+        #[arg(long)]
+        auth_token: Option<String>,
+        /// Emit raw JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -204,6 +219,151 @@ impl Executable for AdminCommand {
 
                 Ok(())
             }
+            AdminAction::OperatorSummary {
+                base_url,
+                auth_token,
+                json,
+            } => {
+                let base_url = resolve_base_url(base_url);
+                let auth_token = resolve_auth_token(auth_token);
+                let summary = fetch_operator_summary(&base_url, auth_token.as_deref())?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print_operator_summary(&base_url, &summary);
+                }
+
+                Ok(())
+            }
         }
+    }
+}
+
+fn resolve_base_url(cli_value: Option<String>) -> String {
+    cli_value
+        .or_else(|| std::env::var("OCTOS_BASE_URL").ok())
+        .or_else(|| std::env::var("OCTOS_TEST_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+}
+
+fn resolve_auth_token(cli_value: Option<String>) -> Option<String> {
+    cli_value
+        .or_else(|| std::env::var("OCTOS_AUTH_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn fetch_operator_summary(base_url: &str, auth_token: Option<&str>) -> Result<serde_json::Value> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let url = format!(
+        "{}/api/admin/operator/summary",
+        base_url.trim_end_matches('/')
+    );
+    let mut request = client.get(url);
+    if let Some(token) = auth_token {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        bail!(
+            "operator summary request failed: {status} {}",
+            body.lines().next().unwrap_or_default()
+        );
+    }
+
+    Ok(response.json()?)
+}
+
+fn print_operator_summary(base_url: &str, summary: &serde_json::Value) {
+    println!("{}", "octos Operator Summary".cyan().bold());
+    println!("{}", "═".repeat(60));
+    println!("{}: {}", "Base URL".green(), base_url);
+    println!(
+        "{}: {}",
+        "Metrics".green(),
+        if summary
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "available".green().to_string()
+        } else {
+            "no samples yet".yellow().to_string()
+        }
+    );
+    println!();
+
+    println!("{}", "Totals".cyan().bold());
+    println!("{}", "─".repeat(60).dimmed());
+    if let Some(totals) = summary.get("totals").and_then(serde_json::Value::as_object) {
+        for (key, value) in totals {
+            let count = value.as_u64().unwrap_or(0);
+            println!("  {:<28} {}", key.replace('_', "-"), count);
+        }
+    }
+
+    print_breakdown_section(summary, "retry_reasons", "Retry Reasons");
+    print_breakdown_section(summary, "timeout_reasons", "Timeout Reasons");
+    print_breakdown_section(summary, "duplicate_suppressions", "Duplicate Suppressions");
+    print_breakdown_section(summary, "child_session_orphans", "Child Session Orphans");
+    print_breakdown_section(summary, "workflow_phase_transitions", "Workflow Phase Transitions");
+    print_breakdown_section(summary, "result_delivery", "Result Delivery");
+    print_breakdown_section(summary, "session_replay", "Session Replay");
+}
+
+fn print_breakdown_section(summary: &serde_json::Value, key: &str, title: &str) {
+    let Some(rows) = summary
+        .get("breakdowns")
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    if rows.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{}", title.cyan().bold());
+    println!("{}", "─".repeat(60).dimmed());
+
+    for row in rows {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        let count = object
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let dims = object
+            .iter()
+            .filter(|(name, _)| *name != "count")
+            .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or("unknown")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {:<48} {}", dims, count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_prefers_cli_then_env_then_default() {
+        assert_eq!(resolve_base_url(Some("https://example.com".into())), "https://example.com");
+        assert_eq!(resolve_base_url(None), "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn auth_token_filters_blank_values() {
+        assert_eq!(resolve_auth_token(Some("token".into())), Some("token".into()));
+        assert_eq!(resolve_auth_token(Some("   ".into())), None);
     }
 }

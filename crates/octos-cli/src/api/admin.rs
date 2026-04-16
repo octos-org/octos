@@ -1444,6 +1444,17 @@ pub async fn system_metrics(
     })))
 }
 
+/// GET /api/admin/operator/summary — summarize runtime observability counters.
+pub async fn operator_summary(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<super::metrics::OperatorSummary>, StatusCode> {
+    let rendered = match state.metrics_handle {
+        Some(ref handle) => handle.render(),
+        None => String::new(),
+    };
+    Ok(Json(super::metrics::build_operator_summary(&rendered)))
+}
+
 // ── Monitor control endpoints ────────────────────────────────────────
 
 /// GET /api/admin/monitor/status — returns watchdog/alerts status.
