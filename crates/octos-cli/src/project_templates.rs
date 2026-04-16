@@ -817,7 +817,7 @@ pub fn scaffold_site_project(
     write_site_support_files(&project_dir, &metadata)?;
     write_workspace_policy(
         &project_dir,
-        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites),
+        &WorkspacePolicy::for_site_build_output(&metadata.build_output_dir),
     )
     .map_err(|e| format!("write site workspace policy failed: {e}"))?;
     initialize_and_commit(
@@ -1018,5 +1018,18 @@ mod tests {
         assert!(prompt.contains("website builder"));
         assert!(prompt.contains("sites/vision-forum/mofa-site-session.json"));
         assert!(prompt.contains("/api/preview/<profile-id>/<session-id>/vision-forum/"));
+    }
+
+    #[test]
+    fn site_workspace_policy_tracks_template_build_output() {
+        let policy = WorkspacePolicy::for_site_build_output("out");
+        assert_eq!(
+            policy.validation.on_completion,
+            vec!["file_exists:out/index.html"]
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("entrypoint").map(String::as_str),
+            Some("out/index.html")
+        );
     }
 }

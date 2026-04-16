@@ -266,6 +266,26 @@ impl WorkspacePolicy {
             spawn_tasks,
         }
     }
+
+    pub fn for_site_build_output(build_output_dir: &str) -> Self {
+        let mut policy = Self::for_kind(WorkspaceProjectKind::Sites);
+        policy.validation = ValidationPolicy {
+            on_turn_end: vec![
+                "file_exists:mofa-site-session.json".into(),
+                "file_exists:site-plan.json".into(),
+                "file_exists:optimized-prompt.md".into(),
+            ],
+            on_source_change: Vec::new(),
+            on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
+        };
+        policy.artifacts = WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([(
+                "entrypoint".into(),
+                format!("{build_output_dir}/index.html"),
+            )]),
+        };
+        policy
+    }
 }
 
 pub fn workspace_policy_path(project_root: &Path) -> PathBuf {
@@ -379,6 +399,27 @@ mod tests {
         let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites);
         assert!(policy.tracking.ignore.iter().any(|item| item == "dist/**"));
         assert!(policy.tracking.ignore.iter().any(|item| item == ".next/**"));
+    }
+
+    #[test]
+    fn site_build_output_policy_requires_entrypoint() {
+        let policy = WorkspacePolicy::for_site_build_output("dist");
+        assert_eq!(
+            policy.validation.on_turn_end,
+            vec![
+                "file_exists:mofa-site-session.json",
+                "file_exists:site-plan.json",
+                "file_exists:optimized-prompt.md",
+            ]
+        );
+        assert_eq!(
+            policy.validation.on_completion,
+            vec!["file_exists:dist/index.html"]
+        );
+        assert_eq!(
+            policy.artifacts.entries.get("entrypoint").map(String::as_str),
+            Some("dist/index.html")
+        );
     }
 
     #[test]
