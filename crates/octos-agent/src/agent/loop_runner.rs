@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use std::{collections::HashMap, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
@@ -17,9 +18,71 @@ use super::turn_state::LoopTurnState;
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
+use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 impl Agent {
+    fn enforce_session_limits_on_tool_calls(
+        &self,
+        response: &ChatResponse,
+    ) -> (ChatResponse, Vec<Message>) {
+        let Some(limits) = self.session_limits.as_ref() else {
+            return (response.clone(), Vec::new());
+        };
+        if response.tool_calls.is_empty() {
+            return (response.clone(), Vec::new());
+        }
+
+        let mut usage = self.session_usage.lock().unwrap_or_else(|e| e.into_inner());
+        let round_allowed = limits
+            .max_tool_rounds
+            .is_none_or(|max_rounds| usage.tool_rounds < max_rounds);
+
+        let mut allowed_calls = Vec::new();
+        let mut blocked_messages = Vec::new();
+        let mut recorded_round = false;
+
+        for tool_call in &response.tool_calls {
+            if !round_allowed {
+                blocked_messages.push(session_limit_message(
+                    tool_call,
+                    format!(
+                        "[SESSION LIMIT] Tool '{}' exceeded the workflow tool-round budget. Do not retry this tool in this run.",
+                        tool_call.name
+                    ),
+                ));
+                continue;
+            }
+
+            let call_allowed = check_per_tool_limit(&usage, tool_call.name.as_str(), limits);
+            if call_allowed {
+                if !recorded_round {
+                    usage.record_tool_round();
+                    recorded_round = true;
+                }
+                usage.record_tool_call(&tool_call.name);
+                allowed_calls.push(tool_call.clone());
+            } else {
+                let max_calls = limits
+                    .per_tool_limits
+                    .get(&tool_call.name)
+                    .copied()
+                    .unwrap_or_default();
+                blocked_messages.push(session_limit_message(
+                    tool_call,
+                    format!(
+                        "[SESSION LIMIT] Tool '{}' exceeded its workflow limit (max {}). Do not retry this tool in this run.",
+                        tool_call.name, max_calls
+                    ),
+                ));
+            }
+        }
+
+        let mut limited = response.clone();
+        limited.tool_calls = allowed_calls;
+        (limited, blocked_messages)
+    }
+
     /// Build a `ChatConfig` with optional `chat_max_tokens` override from `AgentConfig`.
     fn chat_config(&self) -> ChatConfig {
         let mut c = ChatConfig::default();
@@ -684,9 +747,16 @@ impl Agent {
             }
         }
         messages.push(self.response_to_message(&response));
+        let (limited_response, blocked_messages) =
+            self.enforce_session_limits_on_tool_calls(&response);
         let (tool_messages, tool_files, tool_send_files, tool_tokens) =
-            self.execute_tools(&response).await?;
-        messages.extend(tool_messages);
+            self.execute_tools(&limited_response).await?;
+        messages.extend(merge_tool_messages_in_order(
+            &response,
+            &limited_response,
+            tool_messages,
+            blocked_messages,
+        ));
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
@@ -694,6 +764,67 @@ impl Agent {
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
         Ok(())
     }
+}
+
+fn check_per_tool_limit(
+    usage: &crate::session::SessionUsage,
+    tool_name: &str,
+    limits: &SessionLimits,
+) -> bool {
+    limits
+        .per_tool_limits
+        .get(tool_name)
+        .is_none_or(|max_calls| usage.tool_calls.get(tool_name).copied().unwrap_or(0) < *max_calls)
+}
+
+fn session_limit_message(tool_call: &octos_core::ToolCall, content: String) -> Message {
+    Message {
+        role: MessageRole::Tool,
+        content,
+        media: vec![],
+        tool_calls: None,
+        tool_call_id: Some(tool_call.id.clone()),
+        reasoning_content: None,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+fn merge_tool_messages_in_order(
+    original_response: &ChatResponse,
+    limited_response: &ChatResponse,
+    executed_messages: Vec<Message>,
+    blocked_messages: Vec<Message>,
+) -> Vec<Message> {
+    if blocked_messages.is_empty() {
+        return executed_messages;
+    }
+
+    let mut executed_by_id: VecDeque<Message> = executed_messages.into();
+    let blocked_by_id: HashMap<String, Message> = blocked_messages
+        .into_iter()
+        .filter_map(|message| message.tool_call_id.clone().map(|id| (id, message)))
+        .collect();
+
+    let allowed_ids: std::collections::HashSet<&str> = limited_response
+        .tool_calls
+        .iter()
+        .map(|tool_call| tool_call.id.as_str())
+        .collect();
+
+    let mut ordered = Vec::new();
+    for tool_call in &original_response.tool_calls {
+        if !allowed_ids.contains(tool_call.id.as_str()) {
+            if let Some(message) = blocked_by_id.get(&tool_call.id) {
+                ordered.push(message.clone());
+            }
+            continue;
+        }
+        if let Some(message) = executed_by_id.pop_front() {
+            ordered.push(message);
+        }
+    }
+    ordered.extend(executed_by_id);
+    ordered
 }
 
 #[cfg(test)]
@@ -890,6 +1021,100 @@ mod tests {
         }
     }
 
+    struct CountingEchoTool {
+        name: &'static str,
+        output: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingEchoTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Echo while tracking execution count"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ToolResult {
+                output: self.output.to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct PodcastGenerateTwiceProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PodcastGenerateTwiceProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let response = match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_podcast_generate_1".to_string(),
+                        name: "podcast_generate".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_podcast_generate_2".to_string(),
+                        name: "podcast_generate".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            };
+            Ok(response)
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
     #[tokio::test]
     async fn run_task_collects_files_to_send_without_file_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -974,5 +1199,46 @@ mod tests {
             result.messages[5].tool_call_id.as_deref(),
             Some("call_gamma")
         );
+    }
+
+    #[tokio::test]
+    async fn process_message_blocks_second_podcast_generate_when_session_limit_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(CountingEchoTool {
+            name: "podcast_generate",
+            output: "podcast ok",
+            calls: Arc::clone(&calls),
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(PodcastGenerateTwiceProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory)
+            .with_session_limits(crate::session::SessionLimits {
+                per_tool_limits: [("podcast_generate".into(), 1)].into(),
+                ..Default::default()
+            });
+
+        let result = agent
+            .process_message("make a podcast", &[], vec![])
+            .await
+            .unwrap();
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        let tool_contents: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(|message| message.content.clone())
+            .collect();
+
+        assert!(tool_contents.iter().any(|content| content == "podcast ok"));
+        assert!(tool_contents.iter().any(|content| {
+            content.contains("[SESSION LIMIT]")
+                && content.contains("podcast_generate")
+                && content.contains("max 1")
+        }));
     }
 }

@@ -23,6 +23,7 @@ use octos_memory::EpisodeStore;
 
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
+use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 
 tokio::task_local! {
@@ -142,6 +143,10 @@ pub struct Agent {
     pub(super) hook_context: std::sync::Mutex<Option<HookContext>>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
+    /// Optional per-session runtime limits for tool rounds and per-tool calls.
+    pub(super) session_limits: Option<SessionLimits>,
+    /// Mutable usage tracked against `session_limits`.
+    pub(super) session_usage: std::sync::Mutex<SessionUsage>,
 }
 
 impl Agent {
@@ -166,6 +171,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -191,6 +198,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -268,6 +277,13 @@ impl Agent {
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+        self
+    }
+
+    /// Set per-session runtime limits for tool execution.
+    pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
+        self.session_limits = Some(limits);
+        self.session_usage = std::sync::Mutex::new(SessionUsage::default());
         self
     }
 
