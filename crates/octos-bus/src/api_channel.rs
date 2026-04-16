@@ -373,7 +373,7 @@ impl Channel for ApiChannel {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !history_already_persisted {
+            let committed_message = if !history_already_persisted {
                 let session_msg = Message {
                     role: MessageRole::Assistant,
                     content: file_desc,
@@ -383,8 +383,10 @@ impl Channel for ApiChannel {
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
-                self.persist_to_session(&msg.chat_id, session_msg).await;
-            }
+                self.persist_to_session(&msg.chat_id, session_msg).await
+            } else {
+                None
+            };
 
             // Forward a committed session result as one authoritative event.
             // This avoids the old split-brain path where file delivery arrived
@@ -398,7 +400,19 @@ impl Channel for ApiChannel {
                 return Ok(());
             }
 
-            // Send SSE file event so the web client receives it in real-time
+            if let Some(message) = committed_message {
+                self.broadcast_session_event(
+                    &msg.chat_id,
+                    build_session_result_event_from_message(message),
+                )
+                .await;
+                return Ok(());
+            }
+
+            // Fallback for already-persisted callers that did not supply
+            // session_result metadata. This keeps legacy realtime delivery
+            // working until every media path is upgraded to the committed
+            // session_result contract.
             let pending = self.pending.lock().await;
             if let Some(tx) = pending.get(&msg.chat_id) {
                 for (original_path, persisted_path) in msg.media.iter().zip(persisted_media.iter())
@@ -462,7 +476,7 @@ impl Channel for ApiChannel {
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
-                self.persist_to_session(&msg.chat_id, session_msg).await;
+                let _ = self.persist_to_session(&msg.chat_id, session_msg).await;
             }
             return Ok(());
         }
@@ -579,15 +593,25 @@ impl Channel for ApiChannel {
 }
 
 impl ApiChannel {
-    /// Persist a message to the session JSONL for the given chat_id.
-    async fn persist_to_session(&self, chat_id: &str, message: Message) {
+    /// Persist a message to the session JSONL for the given chat_id and
+    /// return the authoritative committed message shape when available.
+    async fn persist_to_session(&self, chat_id: &str, message: Message) -> Option<MessageInfo> {
         let key = current_profile_api_session_key(self.profile_id.as_deref(), chat_id);
         let mut sess = self.sessions.lock().await;
-        if let Err(e) = sess.add_message(&key, message.clone()).await {
-            tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
-        } else {
-            info!(chat_id = %chat_id, key = %key.0, "persisted file/notification to session");
-        }
+        let committed = match sess.add_message_with_seq(&key, message.clone()).await {
+            Ok(seq) => {
+                info!(chat_id = %chat_id, key = %key.0, seq, "persisted file/notification to session");
+                Some(message_info_from_history_message(
+                    &message,
+                    &sess.data_dir(),
+                    seq,
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
+                None
+            }
+        };
 
         // Also write to the per-user SessionHandle path so the web client
         // (which reads from per-user JSONL via source=full) can see file deliveries.
@@ -622,6 +646,8 @@ impl ApiChannel {
         } else {
             tracing::debug!(chat_id = %chat_id, path = %per_user_path.display(), "per-user session path not found, skipping");
         }
+
+        committed
     }
 }
 
@@ -1905,6 +1931,62 @@ mod tests {
         assert!(history[0].content.contains("[file:pf/"));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
+    }
+
+    #[tokio::test]
+    async fn send_file_message_emits_committed_session_result_event() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-file".into(), tx);
+        }
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("report.pdf");
+        std::fs::write(&source, b"report").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-file".into(),
+            content: "Generated report".into(),
+            reply_to: None,
+            media: vec![source.to_string_lossy().to_string()],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "session_result");
+        let message = parsed["message"].as_object().expect("message payload");
+        assert_eq!(
+            message.get("role").and_then(|v| v.as_str()),
+            Some("assistant")
+        );
+        assert!(
+            message
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("Generated report")
+        );
+        let media = message
+            .get("media")
+            .and_then(|v| v.as_array())
+            .expect("media array");
+        assert_eq!(media.len(), 1);
+        let persisted = media[0].as_str().expect("persisted path");
+        assert!(persisted.starts_with("pf/"));
     }
 
     #[tokio::test]
