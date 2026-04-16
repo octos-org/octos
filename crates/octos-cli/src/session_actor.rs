@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use octos_agent::tools::spawn::{ChildSessionLifecycleKind, ChildSessionLifecyclePayload};
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
@@ -153,6 +154,99 @@ async fn persist_terminal_reply_and_fanout(
         .await;
 
     true
+}
+
+const CHILD_SESSION_HISTORY_COPY: usize = 6;
+
+fn child_session_spawn_note(payload: &ChildSessionLifecyclePayload) -> String {
+    let mut lines = vec![
+        format!(
+            "[Background child session created for \"{}\"]",
+            payload.task_label
+        ),
+        format!("Parent session: {}", payload.parent_session_key),
+        format!("Child session: {}", payload.child_session_key),
+    ];
+    if let Some(ref workflow_kind) = payload.workflow_kind {
+        lines.push(format!("Workflow: {workflow_kind}"));
+    }
+    if let Some(ref phase) = payload.current_phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    lines.push(format!("Instruction: {}", payload.instruction));
+    lines.join("\n")
+}
+
+fn child_session_terminal_note(payload: &ChildSessionLifecyclePayload) -> String {
+    let mut lines = vec![match payload.kind {
+        ChildSessionLifecycleKind::Completed => {
+            format!("Background task \"{}\" completed.", payload.task_label)
+        }
+        ChildSessionLifecycleKind::Failed => {
+            format!("Background task \"{}\" failed.", payload.task_label)
+        }
+        ChildSessionLifecycleKind::Spawned => {
+            format!("Background task \"{}\" spawned.", payload.task_label)
+        }
+    }];
+    if let Some(ref workflow_kind) = payload.workflow_kind {
+        lines.push(format!("Workflow: {workflow_kind}"));
+    }
+    if let Some(ref phase) = payload.current_phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    if !payload.output_files.is_empty() {
+        lines.push("Output files:".to_string());
+        lines.extend(payload.output_files.iter().map(|path| format!("- {path}")));
+    }
+    if let Some(ref error) = payload.error {
+        lines.push(format!("Error: {error}"));
+    }
+    lines.join("\n")
+}
+
+async fn persist_child_session_lifecycle(
+    data_dir: &Path,
+    payload: &ChildSessionLifecyclePayload,
+) -> eyre::Result<()> {
+    let parent_key = SessionKey(payload.parent_session_key.clone());
+    let child_key = SessionKey(payload.child_session_key.clone());
+
+    match payload.kind {
+        ChildSessionLifecycleKind::Spawned => {
+            SessionHandle::fork_from_parent_if_missing(
+                data_dir,
+                &parent_key,
+                &child_key,
+                CHILD_SESSION_HISTORY_COPY,
+            )
+            .await?;
+
+            let note = child_session_spawn_note(payload);
+            let mut child = SessionHandle::open(data_dir, &child_key);
+            let exists = child
+                .session()
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::System && message.content == note);
+            if !exists {
+                child.add_message(Message::system(note)).await?;
+            }
+        }
+        ChildSessionLifecycleKind::Completed | ChildSessionLifecycleKind::Failed => {
+            let note = child_session_terminal_note(payload);
+            let mut child = SessionHandle::open(data_dir, &child_key);
+            let exists =
+                child.session().messages.iter().any(|message| {
+                    message.role == MessageRole::Assistant && message.content == note
+                });
+            if !exists {
+                child.add_message(Message::assistant(note)).await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1052,6 +1146,25 @@ impl ActorFactory {
                     .await
                     .is_ok()
                         && ack_rx.await.unwrap_or(false)
+                })
+            },
+        ));
+
+        let child_data_dir = self.data_dir.clone();
+        spawn_tool = spawn_tool.with_child_session_sender(Arc::new(
+            move |payload: ChildSessionLifecyclePayload| {
+                let child_data_dir = child_data_dir.clone();
+                Box::pin(async move {
+                    if let Err(error) =
+                        persist_child_session_lifecycle(&child_data_dir, &payload).await
+                    {
+                        warn!(
+                            parent_session = %payload.parent_session_key,
+                            child_session = %payload.child_session_key,
+                            error = %error,
+                            "failed to persist child-session lifecycle event"
+                        );
+                    }
                 })
             },
         ));
@@ -5851,6 +5964,79 @@ mod tests {
         assert_eq!(news.get_history(10).len(), 1);
         assert_eq!(weather.get_history(10)[0].content, "weather message");
         assert_eq!(news.get_history(10)[0].content, "news message");
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_creates_child_history_and_terminal_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent");
+        let child = SessionKey("api:parent#child-task-123".to_string());
+
+        let mut parent_handle = SessionHandle::open(dir.path(), &parent);
+        parent_handle
+            .add_message(Message::user("Research today’s market moves"))
+            .await
+            .unwrap();
+        parent_handle
+            .add_message(Message::assistant("Starting research"))
+            .await
+            .unwrap();
+
+        let spawned = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Spawned,
+            task_id: "task-123".to_string(),
+            task_label: "Research report".to_string(),
+            instruction: "Research today’s market moves".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("research".to_string()),
+            output_files: Vec::new(),
+            error: None,
+        };
+        persist_child_session_lifecycle(dir.path(), &spawned)
+            .await
+            .unwrap();
+
+        let completed = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Completed,
+            current_phase: Some("deliver_result".to_string()),
+            output_files: vec!["/tmp/report.md".to_string()],
+            ..spawned.clone()
+        };
+        persist_child_session_lifecycle(dir.path(), &completed)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent));
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content == "Starting research"),
+            "child session should copy recent parent history"
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::System
+                    && message.content.contains("Background child session created")),
+            "child session should record spawn note"
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message
+                        .content
+                        .contains("Background task \"Research report\" completed.")
+                    && message.content.contains("/tmp/report.md")),
+            "child session should record terminal result"
+        );
     }
 
     #[test]

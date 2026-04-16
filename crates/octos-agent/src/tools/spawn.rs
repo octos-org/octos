@@ -22,6 +22,10 @@ use crate::{Agent, AgentConfig};
 pub type BackgroundResultSender =
     Arc<dyn Fn(BackgroundResultPayload) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
+pub type ChildSessionLifecycleSender = Arc<
+    dyn Fn(ChildSessionLifecyclePayload) -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundResultKind {
     Notification,
@@ -34,6 +38,27 @@ pub struct BackgroundResultPayload {
     pub content: String,
     pub kind: BackgroundResultKind,
     pub media: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildSessionLifecycleKind {
+    Spawned,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildSessionLifecyclePayload {
+    pub kind: ChildSessionLifecycleKind,
+    pub task_id: String,
+    pub task_label: String,
+    pub instruction: String,
+    pub parent_session_key: String,
+    pub child_session_key: String,
+    pub workflow_kind: Option<String>,
+    pub current_phase: Option<String>,
+    pub output_files: Vec<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +95,8 @@ pub struct SpawnTool {
     worker_prompt: Option<String>,
     /// Direct delivery channel to session actor (bypasses InboundMessage relay).
     background_result_sender: Option<BackgroundResultSender>,
+    /// Optional lifecycle bridge for durable child-session state.
+    child_session_sender: Option<ChildSessionLifecycleSender>,
     /// Plugin directories to load into subagent registries.
     /// Subagents can use plugin tools (fm_tts, etc.) when listed in allowed_tools.
     plugin_dirs: Vec<PathBuf>,
@@ -103,6 +130,7 @@ impl SpawnTool {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            child_session_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -132,6 +160,7 @@ impl SpawnTool {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            child_session_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -146,6 +175,12 @@ impl SpawnTool {
     /// into the session without triggering an extra LLM call.
     pub fn with_background_result_sender(mut self, sender: BackgroundResultSender) -> Self {
         self.background_result_sender = Some(sender);
+        self
+    }
+
+    /// Set a child-session lifecycle sender for background workers.
+    pub fn with_child_session_sender(mut self, sender: ChildSessionLifecycleSender) -> Self {
+        self.child_session_sender = Some(sender);
         self
     }
 
@@ -619,6 +654,12 @@ impl Tool for SpawnTool {
                     task_ledger_path.as_deref(),
                 )
             });
+            let tracked_child_session_key = tracked_task_id.as_ref().and_then(|task_id| {
+                self.task_supervisor
+                    .as_ref()
+                    .and_then(|supervisor| supervisor.get_task(task_id))
+                    .and_then(|task| task.child_session_key)
+            });
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -628,12 +669,14 @@ impl Tool for SpawnTool {
             let additional_instructions = input.additional_instructions;
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
+            let child_session_sender = self.child_session_sender.clone();
             let task_label = label.clone();
             let plugin_dirs = self.plugin_dirs.clone();
             let plugin_extra_env = self.plugin_extra_env.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
             let workflow_metadata = workflow.clone();
+            let parent_session_key = self.session_key.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -647,6 +690,36 @@ impl Tool for SpawnTool {
                             encode_workflow_detail(workflow),
                         );
                     }
+                }
+
+                if let (
+                    Some(sender),
+                    Some(task_id),
+                    Some(parent_session_key),
+                    Some(child_session_key),
+                ) = (
+                    child_session_sender.as_ref(),
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                    tracked_child_session_key.as_ref(),
+                ) {
+                    sender(ChildSessionLifecyclePayload {
+                        kind: ChildSessionLifecycleKind::Spawned,
+                        task_id: task_id.clone(),
+                        task_label: task_label.clone(),
+                        instruction: task_desc.clone(),
+                        parent_session_key: parent_session_key.clone(),
+                        child_session_key: child_session_key.clone(),
+                        workflow_kind: workflow_metadata
+                            .as_ref()
+                            .map(|workflow| workflow.workflow_kind.clone()),
+                        current_phase: workflow_metadata
+                            .as_ref()
+                            .map(|workflow| workflow.current_phase.clone()),
+                        output_files: Vec::new(),
+                        error: None,
+                    })
+                    .await;
                 }
 
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
@@ -744,6 +817,68 @@ impl Tool for SpawnTool {
                             supervisor.mark_failed(task_id, error.to_string());
                         }
                     }
+                }
+
+                if let (
+                    Some(sender),
+                    Some(task_id),
+                    Some(parent_session_key),
+                    Some(child_session_key),
+                ) = (
+                    child_session_sender.as_ref(),
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                    tracked_child_session_key.as_ref(),
+                ) {
+                    let payload = match &result {
+                        Ok(task_result) if task_result.success => ChildSessionLifecyclePayload {
+                            kind: ChildSessionLifecycleKind::Completed,
+                            task_id: task_id.clone(),
+                            task_label: task_label.clone(),
+                            instruction: task_desc.clone(),
+                            parent_session_key: parent_session_key.clone(),
+                            child_session_key: child_session_key.clone(),
+                            workflow_kind: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.workflow_kind.clone()),
+                            current_phase: Some("deliver_result".to_string()),
+                            output_files: tracked_output_files.clone(),
+                            error: None,
+                        },
+                        Ok(task_result) => ChildSessionLifecyclePayload {
+                            kind: ChildSessionLifecycleKind::Failed,
+                            task_id: task_id.clone(),
+                            task_label: task_label.clone(),
+                            instruction: task_desc.clone(),
+                            parent_session_key: parent_session_key.clone(),
+                            child_session_key: child_session_key.clone(),
+                            workflow_kind: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.workflow_kind.clone()),
+                            current_phase: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.current_phase.clone()),
+                            output_files: tracked_output_files.clone(),
+                            error: Some(task_result.output.clone()),
+                        },
+                        Err(error) => ChildSessionLifecyclePayload {
+                            kind: ChildSessionLifecycleKind::Failed,
+                            task_id: task_id.clone(),
+                            task_label: task_label.clone(),
+                            instruction: task_desc.clone(),
+                            parent_session_key: parent_session_key.clone(),
+                            child_session_key: child_session_key.clone(),
+                            workflow_kind: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.workflow_kind.clone()),
+                            current_phase: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.current_phase.clone()),
+                            output_files: tracked_output_files.clone(),
+                            error: Some(error.to_string()),
+                        },
+                    };
+                    sender(payload).await;
                 }
 
                 let content = match &result {
@@ -867,6 +1002,7 @@ mod tests {
             provider_router: None,
             worker_prompt: None,
             background_result_sender: None,
+            child_session_sender: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -1030,8 +1166,7 @@ mod tests {
         }));
         assert!(details.iter().any(|detail| {
             detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
-                && detail.get("current_phase").and_then(|v| v.as_str())
-                    == Some("deliver_result")
+                && detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
         }));
     }
 
@@ -1060,6 +1195,68 @@ mod tests {
             !deliver_background_result(None, payload).await,
             "fallback should only be used when the direct sender is absent or rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn test_background_spawn_emits_child_session_lifecycle_events() {
+        let memory = Arc::new(create_test_store().await);
+        let llm = Arc::new(MockProvider);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let temp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let ledger = temp.path().join("tasks.jsonl");
+        let events = Arc::new(std::sync::Mutex::new(
+            Vec::<ChildSessionLifecyclePayload>::new(),
+        ));
+        let events_ref = Arc::clone(&events);
+        let sender: ChildSessionLifecycleSender = Arc::new(move |payload| {
+            let events_ref = Arc::clone(&events_ref);
+            Box::pin(async move {
+                events_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(payload);
+            })
+        });
+
+        let tool = SpawnTool::with_context(
+            llm,
+            memory,
+            temp.path().to_path_buf(),
+            tx,
+            "api",
+            "test-chat",
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session".to_string(), ledger)
+        .with_child_session_sender(sender);
+
+        let args = serde_json::json!({
+            "task": "Draft the report",
+            "mode": "background",
+            "allowed_tools": []
+        });
+        let result = tool.execute(&args).await.unwrap();
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let events = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if events.len() >= 2 {
+                assert_eq!(events[0].kind, ChildSessionLifecycleKind::Spawned);
+                assert_eq!(events[1].kind, ChildSessionLifecycleKind::Completed);
+                assert_eq!(events[0].parent_session_key, "api:test-session");
+                assert_eq!(events[1].parent_session_key, "api:test-session");
+                assert_eq!(events[0].child_session_key, events[1].child_session_key);
+                assert_eq!(events[0].task_id, events[1].task_id);
+                return;
+            }
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "child-session lifecycle events did not arrive in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     // Minimal mock provider for testing

@@ -845,6 +845,33 @@ impl SessionHandle {
         }
     }
 
+    /// Seed a child session from a parent session if the child does not already exist.
+    ///
+    /// Copies the parent's most recent `copy_messages` messages into the child,
+    /// records the parent linkage, and persists the child session. If the child
+    /// session already has history or an existing parent link, it is left intact.
+    pub async fn fork_from_parent_if_missing(
+        data_dir: &Path,
+        parent_key: &SessionKey,
+        child_key: &SessionKey,
+        copy_messages: usize,
+    ) -> Result<()> {
+        let parent_history = {
+            let parent = Self::open(data_dir, parent_key);
+            parent.get_history(copy_messages).to_vec()
+        };
+
+        let mut child = Self::open(data_dir, child_key);
+        if child.session.parent_key.is_some() || !child.session.messages.is_empty() {
+            return Ok(());
+        }
+
+        child.session.parent_key = Some(parent_key.clone());
+        child.session.messages = parent_history;
+        child.session.updated_at = Utc::now();
+        child.rewrite().await
+    }
+
     /// Encode a path component (base key) for safe directory names.
     fn encode_path_component(s: &str) -> String {
         encode_path_component(s)
@@ -1717,6 +1744,76 @@ mod tests {
         assert_eq!(child.parent_key, Some(parent));
         assert_eq!(child.messages.len(), 1);
         assert_eq!(child.messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_copies_recent_history() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-123");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg0"))
+                .await
+                .unwrap();
+            parent_handle
+                .add_message(make_message(MessageRole::Assistant, "msg1"))
+                .await
+                .unwrap();
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg2"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 2)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert_eq!(child_session.messages.len(), 2);
+        assert_eq!(child_session.messages[0].content, "msg1");
+        assert_eq!(child_session.messages[1].content, "msg2");
+    }
+
+    #[tokio::test]
+    async fn test_session_handle_fork_from_parent_if_missing_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+        let child = child_session_key(&parent, "task-123");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "msg0"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .add_message(make_message(MessageRole::Assistant, "child-result"))
+                .await
+                .unwrap();
+        }
+
+        SessionHandle::fork_from_parent_if_missing(tmp.path(), &parent, &child, 1)
+            .await
+            .unwrap();
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.messages.len(), 2);
+        assert_eq!(child_session.messages[1].content, "child-result");
     }
 
     #[tokio::test]
