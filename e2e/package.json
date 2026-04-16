@@ -5,6 +5,10 @@
   },
   "scripts": {
     "test": "npx playwright test",
-    "test:headed": "npx playwright test --headed"
+    "test:headed": "npx playwright test --headed",
+    "test:live:smoke": "npx playwright test tests/live-browser.spec.ts",
+    "test:live:capabilities": "npx playwright test tests/refactor-capabilities.spec.ts",
+    "test:live:recovery": "npx playwright test tests/session-recovery.spec.ts",
+    "test:live:acceptance": "npx playwright test --workers=1 tests/live-browser.spec.ts tests/refactor-capabilities.spec.ts tests/session-recovery.spec.ts"
   }
 }
