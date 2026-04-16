@@ -23,7 +23,7 @@ pub type BackgroundResultSender =
     Arc<dyn Fn(BackgroundResultPayload) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
 pub type ChildSessionLifecycleSender = Arc<
-    dyn Fn(ChildSessionLifecyclePayload) -> futures::future::BoxFuture<'static, ()> + Send + Sync,
+    dyn Fn(ChildSessionLifecyclePayload) -> futures::future::BoxFuture<'static, bool> + Send + Sync,
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,8 @@ pub struct BackgroundResultPayload {
 pub enum ChildSessionLifecycleKind {
     Spawned,
     Completed,
-    Failed,
+    RetryableFailed,
+    TerminalFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,39 @@ struct WorkflowMetadata {
     allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_output: Option<WorkflowTerminalOutputPolicy>,
+}
+
+fn is_retryable_child_failure(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "token budget exceeded",
+        "timed out",
+        "timeout",
+        "temporarily",
+        "retry",
+        "rate limit",
+        "connection reset",
+        "overloaded",
+        "unavailable",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn classify_child_session_lifecycle_kind(
+    result: &Result<octos_core::TaskResult>,
+) -> ChildSessionLifecycleKind {
+    match result {
+        Ok(task_result) if task_result.success => ChildSessionLifecycleKind::Completed,
+        Ok(task_result) if is_retryable_child_failure(&task_result.output) => {
+            ChildSessionLifecycleKind::RetryableFailed
+        }
+        Ok(_) => ChildSessionLifecycleKind::TerminalFailed,
+        Err(error) if is_retryable_child_failure(&error.to_string()) => {
+            ChildSessionLifecycleKind::RetryableFailed
+        }
+        Err(_) => ChildSessionLifecycleKind::TerminalFailed,
+    }
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -831,6 +865,8 @@ impl Tool for SpawnTool {
                     }
                 }
 
+                let terminal_kind = classify_child_session_lifecycle_kind(&result);
+
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
@@ -860,7 +896,7 @@ impl Tool for SpawnTool {
                 ) {
                     let payload = match &result {
                         Ok(task_result) if task_result.success => ChildSessionLifecyclePayload {
-                            kind: ChildSessionLifecycleKind::Completed,
+                            kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
                             instruction: task_desc.clone(),
@@ -874,7 +910,7 @@ impl Tool for SpawnTool {
                             error: None,
                         },
                         Ok(task_result) => ChildSessionLifecyclePayload {
-                            kind: ChildSessionLifecycleKind::Failed,
+                            kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
                             instruction: task_desc.clone(),
@@ -890,7 +926,7 @@ impl Tool for SpawnTool {
                             error: Some(task_result.output.clone()),
                         },
                         Err(error) => ChildSessionLifecyclePayload {
-                            kind: ChildSessionLifecycleKind::Failed,
+                            kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
                             instruction: task_desc.clone(),
@@ -906,7 +942,34 @@ impl Tool for SpawnTool {
                             error: Some(error.to_string()),
                         },
                     };
-                    sender(payload).await;
+                    let joined = sender(payload).await;
+                    if let Some(supervisor) = task_supervisor.as_ref() {
+                        if let Some(task_id) = tracked_task_id.as_ref() {
+                            let terminal_state = match terminal_kind {
+                                ChildSessionLifecycleKind::Completed => {
+                                    crate::task_supervisor::ChildSessionTerminalState::Completed
+                                }
+                                ChildSessionLifecycleKind::RetryableFailed => {
+                                    crate::task_supervisor::ChildSessionTerminalState::RetryableFailure
+                                }
+                                ChildSessionLifecycleKind::TerminalFailed => {
+                                    crate::task_supervisor::ChildSessionTerminalState::TerminalFailure
+                                }
+                                ChildSessionLifecycleKind::Spawned => unreachable!(
+                                    "child session terminal handling should never see Spawned"
+                                ),
+                            };
+                            supervisor.mark_child_session_outcome(
+                                task_id,
+                                terminal_state,
+                                if joined {
+                                    crate::task_supervisor::ChildSessionJoinState::Joined
+                                } else {
+                                    crate::task_supervisor::ChildSessionJoinState::Orphaned
+                                },
+                            );
+                        }
+                    }
                 }
 
                 let content = match &result {
@@ -1296,6 +1359,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(payload);
+                true
             })
         });
 
@@ -1337,6 +1401,23 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[test]
+    fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
+        let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+            success: false,
+            output: "Token budget exceeded (120 of 100).".to_string(),
+            files_modified: vec![],
+            files_to_send: vec![],
+            subtasks: vec![],
+            token_usage: Default::default(),
+        });
+
+        assert_eq!(
+            classify_child_session_lifecycle_kind(&result),
+            ChildSessionLifecycleKind::RetryableFailed
+        );
     }
 
     // Minimal mock provider for testing

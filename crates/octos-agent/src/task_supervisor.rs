@@ -45,6 +45,23 @@ impl TaskStatus {
     }
 }
 
+/// Structured terminal outcome for a child session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionTerminalState {
+    Completed,
+    RetryableFailure,
+    TerminalFailure,
+}
+
+/// Join state for a child session contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionJoinState {
+    Joined,
+    Orphaned,
+}
+
 /// Fine-grained runtime phase of a background task.
 ///
 /// `status` remains the coarse externally stable summary, while
@@ -75,6 +92,12 @@ pub struct BackgroundTask {
     /// Stable child session key derived from the parent session and task id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_terminal_state: Option<ChildSessionTerminalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_join_state: Option<ChildSessionJoinState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_joined_at: Option<DateTime<Utc>>,
     /// Append-only ledger path used to persist this task's snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_ledger_path: Option<String>,
@@ -226,6 +249,9 @@ impl TaskSupervisor {
             tool_call_id: tool_call_id.to_string(),
             parent_session_key: session_key.map(|s| s.to_string()),
             child_session_key: derived_child_session_key,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
             task_ledger_path: task_ledger_path.map(|path| path.to_string()).or_else(|| {
                 self.persistence_path
                     .lock()
@@ -327,6 +353,34 @@ impl TaskSupervisor {
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error);
+                Some(task.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
+            self.notify_change(task);
+        }
+    }
+
+    /// Record the child-session contract outcome for a task.
+    pub fn mark_child_session_outcome(
+        &self,
+        task_id: &str,
+        terminal_state: ChildSessionTerminalState,
+        join_state: ChildSessionJoinState,
+    ) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.child_terminal_state = Some(terminal_state);
+                task.child_join_state = Some(join_state.clone());
+                task.child_joined_at = match join_state {
+                    ChildSessionJoinState::Joined => Some(Utc::now()),
+                    ChildSessionJoinState::Orphaned => None,
+                };
+                task.updated_at = Utc::now();
                 Some(task.clone())
             } else {
                 None
@@ -480,6 +534,8 @@ mod tests {
         assert_eq!(tasks[0].tool_call_id, "call-123");
         assert_eq!(tasks[0].status, TaskStatus::Spawned);
         assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Spawned);
+        assert!(tasks[0].child_terminal_state.is_none());
+        assert!(tasks[0].child_join_state.is_none());
         assert!(tasks[0].completed_at.is_none());
         assert!(tasks[0].updated_at >= tasks[0].started_at);
     }
@@ -538,6 +594,26 @@ mod tests {
         assert_eq!(task.runtime_state, TaskRuntimeState::Completed);
         assert!(task.completed_at.is_some());
         assert_eq!(task.output_files, vec!["output.mp3"]);
+    }
+
+    #[test]
+    fn should_persist_child_session_outcome_state() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("tts", "call-7", Some("api:session"));
+
+        supervisor.mark_child_session_outcome(
+            &id,
+            ChildSessionTerminalState::RetryableFailure,
+            ChildSessionJoinState::Joined,
+        );
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(
+            task.child_terminal_state,
+            Some(ChildSessionTerminalState::RetryableFailure)
+        );
+        assert_eq!(task.child_join_state, Some(ChildSessionJoinState::Joined));
+        assert!(task.child_joined_at.is_some());
     }
 
     #[test]
@@ -660,6 +736,11 @@ mod tests {
             Some("send_file".to_string()),
         );
         supervisor.mark_completed(&completed, vec!["/tmp/output.mp3".to_string()]);
+        supervisor.mark_child_session_outcome(
+            &completed,
+            ChildSessionTerminalState::Completed,
+            ChildSessionJoinState::Joined,
+        );
 
         let failed = supervisor.register_with_lineage(
             "podcast_generate",
@@ -669,6 +750,11 @@ mod tests {
         );
         supervisor.mark_running(&failed);
         supervisor.mark_failed(&failed, "No dialogue lines found in script".to_string());
+        supervisor.mark_child_session_outcome(
+            &failed,
+            ChildSessionTerminalState::TerminalFailure,
+            ChildSessionJoinState::Orphaned,
+        );
 
         let restored = TaskSupervisor::new();
         restored.enable_persistence(&ledger_path).unwrap();
@@ -696,6 +782,15 @@ mod tests {
             completed_task.task_ledger_path.as_deref(),
             Some(ledger_path.to_str().unwrap())
         );
+        assert_eq!(
+            completed_task.child_terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert_eq!(
+            completed_task.child_join_state,
+            Some(ChildSessionJoinState::Joined)
+        );
+        assert!(completed_task.child_joined_at.is_some());
 
         let failed_task = tasks
             .iter()
@@ -720,5 +815,14 @@ mod tests {
             failed_task.task_ledger_path.as_deref(),
             Some(ledger_path.to_str().unwrap())
         );
+        assert_eq!(
+            failed_task.child_terminal_state,
+            Some(ChildSessionTerminalState::TerminalFailure)
+        );
+        assert_eq!(
+            failed_task.child_join_state,
+            Some(ChildSessionJoinState::Orphaned)
+        );
+        assert!(failed_task.child_joined_at.is_none());
     }
 }

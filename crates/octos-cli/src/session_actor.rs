@@ -21,7 +21,10 @@ use octos_agent::{
     TurnAttachmentContext, WorkspacePolicy, read_workspace_policy, workspace_policy_path,
     write_workspace_policy,
 };
-use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
+use octos_bus::{
+    ActiveSessionStore, SessionHandle, SessionManager,
+    session::{ChildSessionContract, ChildSessionJoinState, ChildSessionTerminalState},
+};
 use octos_core::AgentId;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
@@ -177,12 +180,36 @@ fn child_session_spawn_note(payload: &ChildSessionLifecyclePayload) -> String {
     lines.join("\n")
 }
 
-fn child_session_terminal_note(payload: &ChildSessionLifecyclePayload) -> String {
+fn child_session_terminal_state(
+    kind: ChildSessionLifecycleKind,
+) -> Option<ChildSessionTerminalState> {
+    match kind {
+        ChildSessionLifecycleKind::Completed => Some(ChildSessionTerminalState::Completed),
+        ChildSessionLifecycleKind::RetryableFailed => {
+            Some(ChildSessionTerminalState::RetryableFailure)
+        }
+        ChildSessionLifecycleKind::TerminalFailed => {
+            Some(ChildSessionTerminalState::TerminalFailure)
+        }
+        ChildSessionLifecycleKind::Spawned => None,
+    }
+}
+
+fn child_session_terminal_note(
+    payload: &ChildSessionLifecyclePayload,
+    join_state: ChildSessionJoinState,
+) -> String {
     let mut lines = vec![match payload.kind {
         ChildSessionLifecycleKind::Completed => {
             format!("Background task \"{}\" completed.", payload.task_label)
         }
-        ChildSessionLifecycleKind::Failed => {
+        ChildSessionLifecycleKind::RetryableFailed => {
+            format!(
+                "Background task \"{}\" failed and may be retried.",
+                payload.task_label
+            )
+        }
+        ChildSessionLifecycleKind::TerminalFailed => {
             format!("Background task \"{}\" failed.", payload.task_label)
         }
         ChildSessionLifecycleKind::Spawned => {
@@ -195,6 +222,13 @@ fn child_session_terminal_note(payload: &ChildSessionLifecyclePayload) -> String
     if let Some(ref phase) = payload.current_phase {
         lines.push(format!("Phase: {phase}"));
     }
+    lines.push(format!(
+        "Join state: {}",
+        match join_state {
+            ChildSessionJoinState::Joined => "joined",
+            ChildSessionJoinState::Orphaned => "orphaned",
+        }
+    ));
     if !payload.output_files.is_empty() {
         lines.push("Output files:".to_string());
         lines.extend(payload.output_files.iter().map(|path| format!("- {path}")));
@@ -208,9 +242,11 @@ fn child_session_terminal_note(payload: &ChildSessionLifecyclePayload) -> String
 async fn persist_child_session_lifecycle(
     data_dir: &Path,
     payload: &ChildSessionLifecyclePayload,
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
     let parent_key = SessionKey(payload.parent_session_key.clone());
     let child_key = SessionKey(payload.child_session_key.clone());
+    let parent_exists = SessionHandle::session_exists(data_dir, &parent_key);
+    let child_exists = SessionHandle::session_exists(data_dir, &child_key);
 
     match payload.kind {
         ChildSessionLifecycleKind::Spawned => {
@@ -232,9 +268,37 @@ async fn persist_child_session_lifecycle(
             if !exists {
                 child.add_message(Message::system(note)).await?;
             }
+
+            let contract = ChildSessionContract {
+                task_id: payload.task_id.clone(),
+                task_label: payload.task_label.clone(),
+                parent_session_key: payload.parent_session_key.clone(),
+                child_session_key: payload.child_session_key.clone(),
+                workflow_kind: payload.workflow_kind.clone(),
+                current_phase: payload.current_phase.clone(),
+                terminal_state: None,
+                join_state: None,
+                joined_at: None,
+                error: None,
+                output_files: Vec::new(),
+            };
+            let _ = child.upsert_child_contract(contract.clone()).await?;
+            if parent_exists {
+                let mut parent = SessionHandle::open(data_dir, &parent_key);
+                let _ = parent.upsert_child_contract(contract).await?;
+            }
         }
-        ChildSessionLifecycleKind::Completed | ChildSessionLifecycleKind::Failed => {
-            let note = child_session_terminal_note(payload);
+        ChildSessionLifecycleKind::Completed
+        | ChildSessionLifecycleKind::RetryableFailed
+        | ChildSessionLifecycleKind::TerminalFailed => {
+            let terminal_state = child_session_terminal_state(payload.kind)
+                .expect("terminal child lifecycle should have a state");
+            let join_state = if parent_exists && child_exists {
+                ChildSessionJoinState::Joined
+            } else {
+                ChildSessionJoinState::Orphaned
+            };
+            let note = child_session_terminal_note(payload, join_state.clone());
             let mut child = SessionHandle::open(data_dir, &child_key);
             let exists =
                 child.session().messages.iter().any(|message| {
@@ -243,10 +307,33 @@ async fn persist_child_session_lifecycle(
             if !exists {
                 child.add_message(Message::assistant(note)).await?;
             }
+            let contract = ChildSessionContract {
+                task_id: payload.task_id.clone(),
+                task_label: payload.task_label.clone(),
+                parent_session_key: payload.parent_session_key.clone(),
+                child_session_key: payload.child_session_key.clone(),
+                workflow_kind: payload.workflow_kind.clone(),
+                current_phase: payload.current_phase.clone(),
+                terminal_state: Some(terminal_state),
+                join_state: Some(join_state.clone()),
+                joined_at: if matches!(join_state, ChildSessionJoinState::Joined) {
+                    Some(chrono::Utc::now())
+                } else {
+                    None
+                },
+                error: payload.error.clone(),
+                output_files: payload.output_files.clone(),
+            };
+            let _ = child.upsert_child_contract(contract.clone()).await?;
+            if parent_exists {
+                let mut parent = SessionHandle::open(data_dir, &parent_key);
+                let _ = parent.upsert_child_contract(contract).await?;
+            }
+            return Ok(matches!(join_state, ChildSessionJoinState::Joined));
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -325,6 +412,9 @@ fn sanitize_task_for_response(
         "completed_at": task.completed_at,
         "runtime_state": task.runtime_state,
         "runtime_detail": task.runtime_detail,
+        "child_terminal_state": task.child_terminal_state,
+        "child_join_state": task.child_join_state,
+        "child_joined_at": task.child_joined_at,
         "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
         "error": task.error,
         "session_key": task.session_key,
@@ -1174,15 +1264,17 @@ impl ActorFactory {
             move |payload: ChildSessionLifecyclePayload| {
                 let child_data_dir = child_data_dir.clone();
                 Box::pin(async move {
-                    if let Err(error) =
-                        persist_child_session_lifecycle(&child_data_dir, &payload).await
-                    {
-                        warn!(
-                            parent_session = %payload.parent_session_key,
-                            child_session = %payload.child_session_key,
-                            error = %error,
-                            "failed to persist child-session lifecycle event"
-                        );
+                    match persist_child_session_lifecycle(&child_data_dir, &payload).await {
+                        Ok(joined) => joined,
+                        Err(error) => {
+                            warn!(
+                                parent_session = %payload.parent_session_key,
+                                child_session = %payload.child_session_key,
+                                error = %error,
+                                "failed to persist child-session lifecycle event"
+                            );
+                            false
+                        }
                     }
                 })
             },
@@ -5995,9 +6087,11 @@ mod tests {
             output_files: Vec::new(),
             error: None,
         };
-        persist_child_session_lifecycle(dir.path(), &spawned)
-            .await
-            .unwrap();
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &spawned)
+                .await
+                .unwrap()
+        );
 
         let completed = ChildSessionLifecyclePayload {
             kind: ChildSessionLifecycleKind::Completed,
@@ -6005,13 +6099,24 @@ mod tests {
             output_files: vec!["/tmp/report.md".to_string()],
             ..spawned.clone()
         };
-        persist_child_session_lifecycle(dir.path(), &completed)
-            .await
-            .unwrap();
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &completed)
+                .await
+                .unwrap()
+        );
 
         let child_handle = SessionHandle::open(dir.path(), &child);
         let child_session = child_handle.session();
-        assert_eq!(child_session.parent_key, Some(parent));
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert_eq!(child_session.child_contracts.len(), 1);
+        let contract = &child_session.child_contracts[0];
+        assert_eq!(contract.task_id, "task-123");
+        assert_eq!(
+            contract.terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
+        assert!(contract.joined_at.is_some());
         assert!(
             child_session
                 .messages
@@ -6035,8 +6140,61 @@ mod tests {
                     && message
                         .content
                         .contains("Background task \"Research report\" completed.")
+                    && message.content.contains("Join state: joined")
                     && message.content.contains("/tmp/report.md")),
             "child session should record terminal result"
+        );
+
+        let parent_handle = SessionHandle::open(dir.path(), &parent);
+        let parent_session = parent_handle.session();
+        assert_eq!(parent_session.child_contracts.len(), 1);
+        assert_eq!(
+            parent_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_marks_orphaned_terminal_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "missing-parent");
+        let child = SessionKey("api:missing-parent#child-task-404".to_string());
+
+        let completed = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Completed,
+            task_id: "task-404".to_string(),
+            task_label: "Orphaned research".to_string(),
+            instruction: "Research the missing context".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("deliver_result".to_string()),
+            output_files: vec!["/tmp/orphaned.md".to_string()],
+            error: None,
+        };
+
+        assert!(
+            !persist_child_session_lifecycle(dir.path(), &completed)
+                .await
+                .unwrap()
+        );
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.child_contracts.len(), 1);
+        assert_eq!(
+            child_session.child_contracts[0].join_state,
+            Some(ChildSessionJoinState::Orphaned)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Join state: orphaned"))
         );
     }
 

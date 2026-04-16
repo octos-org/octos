@@ -53,6 +53,64 @@ fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
 }
 
+/// Structured terminal outcome for a child session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionTerminalState {
+    Completed,
+    RetryableFailure,
+    TerminalFailure,
+}
+
+/// Whether the child session terminal contract was joined back to a parent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionJoinState {
+    Joined,
+    Orphaned,
+}
+
+/// Durable child-session contract persisted alongside the session history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildSessionContract {
+    pub task_id: String,
+    pub task_label: String,
+    pub parent_session_key: String,
+    pub child_session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<ChildSessionTerminalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_state: Option<ChildSessionJoinState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_files: Vec<String>,
+}
+
+fn merge_child_contracts(
+    flat: Vec<ChildSessionContract>,
+    per_user: Vec<ChildSessionContract>,
+) -> Vec<ChildSessionContract> {
+    let mut merged = flat;
+    for contract in per_user {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.task_id == contract.task_id)
+        {
+            Session::merge_child_contract(contract, existing);
+        } else {
+            merged.push(contract);
+        }
+    }
+    merged
+}
+
 /// Metadata stored as the first line of each JSONL session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionMeta {
@@ -68,6 +126,8 @@ struct SessionMeta {
     /// Short summary of the session (first user message, truncated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    child_contracts: Vec<ChildSessionContract>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -82,6 +142,8 @@ pub struct Session {
     pub topic: Option<String>,
     /// Short summary of the session content.
     pub summary: Option<String>,
+    /// Durable child-session contracts associated with this session.
+    pub child_contracts: Vec<ChildSessionContract>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -96,6 +158,7 @@ impl Session {
             parent_key: None,
             topic,
             summary: None,
+            child_contracts: vec![],
             messages: vec![],
             created_at: now,
             updated_at: now,
@@ -117,6 +180,48 @@ impl Session {
     /// insertion order for messages with identical timestamps.
     pub fn sort_by_timestamp(&mut self) {
         self.messages.sort_by_key(|m| m.timestamp);
+    }
+
+    fn merge_child_contract(update: ChildSessionContract, existing: &mut ChildSessionContract) {
+        existing.task_label = update.task_label;
+        existing.parent_session_key = update.parent_session_key;
+        existing.child_session_key = update.child_session_key;
+        if update.workflow_kind.is_some() {
+            existing.workflow_kind = update.workflow_kind;
+        }
+        if update.current_phase.is_some() {
+            existing.current_phase = update.current_phase;
+        }
+        if update.terminal_state.is_some() {
+            existing.terminal_state = update.terminal_state;
+        }
+        if update.join_state.is_some() {
+            existing.join_state = update.join_state;
+        }
+        if update.joined_at.is_some() {
+            existing.joined_at = update.joined_at;
+        }
+        if update.error.is_some() {
+            existing.error = update.error;
+        }
+        if !update.output_files.is_empty() {
+            existing.output_files = update.output_files;
+        }
+    }
+
+    /// Insert or update a durable child-session contract.
+    pub fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> bool {
+        if let Some(existing) = self
+            .child_contracts
+            .iter_mut()
+            .find(|existing| existing.task_id == contract.task_id)
+        {
+            Self::merge_child_contract(contract, existing);
+            true
+        } else {
+            self.child_contracts.push(contract);
+            false
+        }
     }
 }
 
@@ -277,6 +382,7 @@ impl SessionManager {
         key: &SessionKey,
         message: Message,
     ) -> Result<usize> {
+        let _ = self.get_or_create(key).await;
         self.append_to_disk(key, &message).await?;
         let session = self.get_or_create(key).await;
         session.messages.push(message);
@@ -426,6 +532,7 @@ impl SessionManager {
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
                     summary: meta.summary,
+                    child_contracts: meta.child_contracts,
                     messages,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
@@ -467,6 +574,10 @@ impl SessionManager {
                         parent_key: per_user.parent_key.or(flat.parent_key),
                         topic: per_user.topic.or(flat.topic),
                         summary: per_user.summary.or(flat.summary),
+                        child_contracts: merge_child_contracts(
+                            flat.child_contracts,
+                            per_user.child_contracts,
+                        ),
                         messages: merged_messages,
                         created_at: flat.created_at.min(per_user.created_at),
                         updated_at: flat.updated_at.max(per_user.updated_at),
@@ -501,6 +612,9 @@ impl SessionManager {
         let parent_key = session_peek.and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
         let topic = session_peek.and_then(|s| s.topic.clone());
         let summary = session_peek.and_then(|s| s.summary.clone());
+        let child_contracts = session_peek
+            .map(|session| session.child_contracts.clone())
+            .unwrap_or_default();
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -535,6 +649,7 @@ impl SessionManager {
                     parent_key,
                     topic,
                     summary,
+                    child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
@@ -566,6 +681,7 @@ impl SessionManager {
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: session.topic.clone(),
             summary: session.summary.clone(),
+            child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
         };
@@ -619,6 +735,7 @@ impl SessionManager {
             parent_key: Some(parent_key.clone()),
             topic: None,
             summary: None,
+            child_contracts: vec![],
             messages,
             created_at: now,
             updated_at: now,
@@ -773,6 +890,7 @@ impl SessionManager {
                     Some(topic.to_string())
                 },
                 summary: None,
+                child_contracts: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -843,6 +961,26 @@ impl SessionHandle {
             sessions_dir: user_sessions_dir,
             session,
         }
+    }
+
+    /// Check whether a session file exists in either the per-user or legacy layout.
+    pub fn session_exists(data_dir: &Path, key: &SessionKey) -> bool {
+        let base_key = key.base_key();
+        let encoded_base = Self::encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = Self::encode_path_component(topic);
+
+        let per_user_path = data_dir
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        if per_user_path.exists() {
+            return true;
+        }
+
+        let legacy_path = SessionManager::session_path_static(&data_dir.join("sessions"), key);
+        legacy_path.exists()
     }
 
     /// Seed a child session from a parent session if the child does not already exist.
@@ -923,6 +1061,14 @@ impl SessionHandle {
         Ok(self.session.messages.len().saturating_sub(1))
     }
 
+    /// Insert or update a durable child-session contract and persist it.
+    pub async fn upsert_child_contract(&mut self, contract: ChildSessionContract) -> Result<bool> {
+        let existed = self.session.upsert_child_contract(contract);
+        self.session.updated_at = Utc::now();
+        self.rewrite().await?;
+        Ok(existed)
+    }
+
     /// Sort messages by timestamp (for speculative overflow ordering).
     pub fn sort_by_timestamp(&mut self) {
         self.session.sort_by_timestamp();
@@ -936,6 +1082,7 @@ impl SessionHandle {
             parent_key: self.session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: self.session.topic.clone(),
             summary: self.session.summary.clone(),
+            child_contracts: self.session.child_contracts.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
         };
@@ -992,6 +1139,7 @@ impl SessionHandle {
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
         let summary = self.session.summary.clone();
+        let child_contracts = self.session.child_contracts.clone();
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -1022,6 +1170,7 @@ impl SessionHandle {
                     parent_key,
                     topic,
                     summary,
+                    child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
@@ -1069,6 +1218,7 @@ impl SessionHandle {
             parent_key: meta.parent_key.map(SessionKey),
             topic: meta.topic,
             summary: meta.summary,
+            child_contracts: meta.child_contracts,
             messages,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
@@ -1814,6 +1964,72 @@ mod tests {
         let child_session = child_handle.session();
         assert_eq!(child_session.messages.len(), 2);
         assert_eq!(child_session.messages[1].content, "child-result");
+    }
+
+    #[tokio::test]
+    async fn test_child_session_contract_round_trips_through_disk() {
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent");
+        let child = child_session_key(&parent, "task-contract");
+
+        {
+            let mut parent_handle = SessionHandle::open(tmp.path(), &parent);
+            parent_handle
+                .add_message(make_message(MessageRole::User, "seed"))
+                .await
+                .unwrap();
+        }
+
+        {
+            let mut child_handle = SessionHandle::open(tmp.path(), &child);
+            child_handle
+                .upsert_child_contract(ChildSessionContract {
+                    task_id: "task-123".to_string(),
+                    task_label: "Research".to_string(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: Some("deep_research".to_string()),
+                    current_phase: Some("research".to_string()),
+                    terminal_state: None,
+                    join_state: None,
+                    joined_at: None,
+                    error: None,
+                    output_files: vec![],
+                })
+                .await
+                .unwrap();
+            child_handle
+                .upsert_child_contract(ChildSessionContract {
+                    task_id: "task-123".to_string(),
+                    task_label: "Research".to_string(),
+                    parent_session_key: parent.to_string(),
+                    child_session_key: child.to_string(),
+                    workflow_kind: Some("deep_research".to_string()),
+                    current_phase: Some("deliver_result".to_string()),
+                    terminal_state: Some(ChildSessionTerminalState::Completed),
+                    join_state: Some(ChildSessionJoinState::Joined),
+                    joined_at: Some(Utc::now()),
+                    error: None,
+                    output_files: vec!["/tmp/report.md".to_string()],
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(SessionHandle::session_exists(tmp.path(), &child));
+
+        let child_handle = SessionHandle::open(tmp.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.child_contracts.len(), 1);
+        let contract = &child_session.child_contracts[0];
+        assert_eq!(contract.task_id, "task-123");
+        assert_eq!(
+            contract.terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
+        assert_eq!(contract.output_files, vec!["/tmp/report.md"]);
+        assert!(contract.joined_at.is_some());
     }
 
     #[tokio::test]
