@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use metrics::counter;
 use octos_agent::tools::spawn::{ChildSessionLifecycleKind, ChildSessionLifecyclePayload};
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
@@ -161,6 +162,28 @@ async fn persist_terminal_reply_and_fanout(
 
 const CHILD_SESSION_HISTORY_COPY: usize = 6;
 
+fn child_session_lifecycle_kind_label(kind: ChildSessionLifecycleKind) -> &'static str {
+    match kind {
+        ChildSessionLifecycleKind::Spawned => "spawned",
+        ChildSessionLifecycleKind::Completed => "completed",
+        ChildSessionLifecycleKind::RetryableFailed => "retryable_failed",
+        ChildSessionLifecycleKind::TerminalFailed => "terminal_failed",
+    }
+}
+
+fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => child_session_lifecycle_kind_label(kind).to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_timeout(reason: &'static str) {
+    counter!("octos_timeout_total", "reason" => reason.to_string()).increment(1);
+}
+
 fn child_session_spawn_note(payload: &ChildSessionLifecyclePayload) -> String {
     let mut lines = vec![
         format!(
@@ -287,6 +310,7 @@ async fn persist_child_session_lifecycle(
                 let mut parent = SessionHandle::open(data_dir, &parent_key);
                 let _ = parent.upsert_child_contract(contract).await?;
             }
+            record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
         }
         ChildSessionLifecycleKind::Completed
         | ChildSessionLifecycleKind::RetryableFailed
@@ -329,6 +353,14 @@ async fn persist_child_session_lifecycle(
                 let mut parent = SessionHandle::open(data_dir, &parent_key);
                 let _ = parent.upsert_child_contract(contract).await?;
             }
+            record_child_session_lifecycle(
+                payload.kind,
+                if matches!(join_state, ChildSessionJoinState::Joined) {
+                    "joined"
+                } else {
+                    "orphaned"
+                },
+            );
             return Ok(matches!(join_state, ChildSessionJoinState::Joined));
         }
     }
@@ -1267,6 +1299,7 @@ impl ActorFactory {
                     match persist_child_session_lifecycle(&child_data_dir, &payload).await {
                         Ok(joined) => joined,
                         Err(error) => {
+                            record_child_session_lifecycle(payload.kind, "persist_failed");
                             warn!(
                                 parent_session = %payload.parent_session_key,
                                 child_session = %payload.child_session_key,
@@ -1842,6 +1875,7 @@ impl SessionActor {
                     }
                 }
                 _ = tokio::time::sleep(self.idle_timeout) => {
+                    record_timeout("idle_actor");
                     debug!(session = %self.session_key, "idle timeout, shutting down actor");
                     break;
                 }
@@ -3501,6 +3535,7 @@ impl SessionActor {
                 .await;
             }
             Err(_) => {
+                record_timeout("session_turn");
                 tracing::error!(session = %self.session_key, "session processing timed out");
                 let content = "Processing timed out. Please try again.".to_string();
                 let _ = persist_terminal_reply_and_fanout(
@@ -3790,6 +3825,7 @@ impl SessionActor {
                     .await;
                 }
                 Err(_) => {
+                    record_timeout("overflow_turn");
                     let content = "Processing timed out.".to_string();
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
@@ -4194,6 +4230,7 @@ impl SessionActor {
                 .await;
             }
             Err(_) => {
+                record_timeout("session_turn");
                 tracing::error!(session = %self.session_key, "session processing timed out");
                 let content = "Processing timed out. Please try again.".to_string();
                 let _ = persist_terminal_reply_and_fanout(
