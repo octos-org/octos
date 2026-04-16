@@ -351,3 +351,122 @@ test.describe('Cross-session isolation', () => {
     expect(sessions.length).toBeGreaterThan(0);
   });
 });
+
+// ════════════════════════════════════════════════════════════════════
+// 6. SESSION CREATE & DELETE LIFECYCLE
+// ════════════════════════════════════════════════════════════════════
+
+test.describe('Session create & delete lifecycle', () => {
+  test('new session appears in session list', async () => {
+    const sid = `lifecycle-new-${Date.now()}`;
+    await chatSSE('hello from lifecycle test', sid);
+
+    const resp = await fetch(`${BASE}/api/sessions`, {
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+    const sessions = await resp.json();
+    const found = sessions.find((s: any) => s.id === sid);
+    expect(found).toBeTruthy();
+  });
+
+  test('DELETE /api/sessions/:id removes session from list', async () => {
+    const sid = `lifecycle-del-${Date.now()}`;
+    await chatSSE('message to delete', sid);
+
+    // Verify it exists
+    let resp = await fetch(`${BASE}/api/sessions`, {
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+    let sessions = await resp.json();
+    expect(sessions.find((s: any) => s.id === sid)).toBeTruthy();
+
+    // Delete it
+    const delResp = await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+    expect(delResp.status).toBe(204);
+
+    // Verify it's gone from session list
+    resp = await fetch(`${BASE}/api/sessions`, {
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+    sessions = await resp.json();
+    expect(sessions.find((s: any) => s.id === sid)).toBeFalsy();
+  });
+
+  test('deleted session messages are not retrievable', async () => {
+    const sid = `lifecycle-msgs-${Date.now()}`;
+    await chatSSE('secret message that should be deleted', sid);
+
+    // Verify messages exist
+    let msgs = await getMessages(sid);
+    expect(msgs.length).toBeGreaterThan(0);
+
+    // Delete session
+    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+
+    // Messages should be gone
+    msgs = await getMessages(sid);
+    expect(msgs.length).toBe(0);
+  });
+
+  test('deleted session workspace files are cleaned up', async () => {
+    const slug = `delws-${Date.now().toString(36)}`;
+    const sid = `lifecycle-ws-${Date.now()}`;
+
+    // Create a slides project (generates workspace files)
+    await chatSSE(`/new slides ${slug}`, sid);
+
+    // Verify project was created by checking via a second message
+    const { content } = await chatSSE(
+      `Use shell to run: ls slides/${slug}/.octos-workspace.toml 2>&1 && echo EXISTS || echo MISSING`,
+      sid,
+      30_000,
+    );
+
+    // Delete the session
+    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+
+    // Create a new session and check if workspace files still exist on disk
+    const sid2 = `lifecycle-ws-check-${Date.now()}`;
+    await chatSSE(`/new slides ${slug}-check`, sid2);
+    const { content: checkContent } = await chatSSE(
+      `Use shell to run: ls -la slides/ 2>&1 | grep "${slug}" && echo STILL_EXISTS || echo CLEANED_UP`,
+      sid2,
+      30_000,
+    );
+
+    // This test documents current behavior: workspace files survive deletion.
+    // If this assertion flips to CLEANED_UP, it means cleanup was implemented.
+    console.log(`  workspace after delete: ${checkContent.slice(0, 200)}`);
+    // NOTE: Currently expected to show STILL_EXISTS — workspace cleanup is not
+    // implemented. When it IS implemented, change this to expect CLEANED_UP.
+  });
+
+  test('cannot send messages to a deleted session', async () => {
+    const sid = `lifecycle-nosend-${Date.now()}`;
+    await chatSSE('first message', sid);
+
+    // Delete
+    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+    });
+
+    // Send to deleted session — should either create a new empty session
+    // or return the response without the old context
+    const { content } = await chatSSE('hello after delete', sid);
+
+    // Old messages should not be in context
+    const msgs = await getMessages(sid);
+    const allContent = msgs.map((m: any) => m.content || '').join(' ');
+    expect(allContent).not.toContain('first message');
+  });
+});

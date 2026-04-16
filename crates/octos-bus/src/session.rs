@@ -8,7 +8,7 @@ use eyre::Result;
 use lru::LruCache;
 use octos_core::{Message, SessionKey};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
@@ -636,12 +636,80 @@ impl SessionManager {
     }
 
     /// Clear a session's history (both in-memory and on disk).
+    ///
+    /// Removes session data from:
+    /// 1. In-memory LRU cache
+    /// 2. Flat layout JSONL (`sessions/{encoded_key}.jsonl`)
+    /// 3. Per-user layout JSONL (`users/{encoded_base}/sessions/{topic}.jsonl`)
+    /// 4. Per-user workspace directory (`users/{encoded_base}/workspace/`)
     pub async fn clear(&mut self, key: &SessionKey) -> Result<()> {
         self.cache.pop(&key.0);
-        let path = self.session_path(key);
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
+
+        // 1. Flat layout JSONL
+        let flat_path = self.session_path(key);
+        if flat_path.exists() {
+            tokio::fs::remove_file(&flat_path).await?;
         }
+
+        // 2. Per-user layout JSONL + workspace
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        let user_dir = users_dir.join(&encoded_base);
+
+        if user_dir.exists() {
+            // Delete the topic JSONL if it exists
+            let topic = key.topic().unwrap_or("default");
+            let encoded_topic = encode_path_component(topic);
+            let per_user_path = user_dir
+                .join("sessions")
+                .join(format!("{encoded_topic}.jsonl"));
+            if per_user_path.exists() {
+                if let Err(e) = tokio::fs::remove_file(&per_user_path).await {
+                    warn!(
+                        key = %key,
+                        path = %per_user_path.display(),
+                        error = %e,
+                        "failed to delete per-user session file"
+                    );
+                }
+            }
+
+            // Check if this user directory has any remaining session files.
+            // If not, remove the entire user directory (sessions + workspace).
+            let sessions_dir = user_dir.join("sessions");
+            let has_remaining = if sessions_dir.exists() {
+                match tokio::fs::read_dir(&sessions_dir).await {
+                    Ok(mut rd) => rd.next_entry().await.ok().flatten().is_some(),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+
+            if !has_remaining {
+                // No more sessions for this user — clean up everything
+                if let Err(e) = tokio::fs::remove_dir_all(&user_dir).await {
+                    warn!(
+                        key = %key,
+                        path = %user_dir.display(),
+                        error = %e,
+                        "failed to remove user directory"
+                    );
+                } else {
+                    info!(
+                        key = %key,
+                        path = %user_dir.display(),
+                        "removed empty user directory and workspace"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
