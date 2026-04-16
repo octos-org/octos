@@ -35,6 +35,7 @@ uuid = { workspace = true }
 cron = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 serde_yml = { workspace = true }

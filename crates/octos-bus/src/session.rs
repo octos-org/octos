@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use lru::LruCache;
+use metrics::counter;
 use octos_core::{Message, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -51,6 +52,31 @@ pub fn child_session_key(parent: &SessionKey, child_id: &str) -> SessionKey {
 
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
+}
+
+fn record_session_persist(outcome: &'static str) {
+    counter!(
+        "octos_session_persist_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_session_rewrite(outcome: &'static str) {
+    counter!(
+        "octos_session_rewrite_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_child_session_fork(outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => "fork".to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
 }
 
 /// Structured terminal outcome for a child session.
@@ -383,10 +409,14 @@ impl SessionManager {
         message: Message,
     ) -> Result<usize> {
         let _ = self.get_or_create(key).await;
-        self.append_to_disk(key, &message).await?;
+        if let Err(error) = self.append_to_disk(key, &message).await {
+            record_session_persist("failed");
+            return Err(error);
+        }
         let session = self.get_or_create(key).await;
         session.messages.push(message);
         session.updated_at = Utc::now();
+        record_session_persist("committed");
         Ok(session.messages.len().saturating_sub(1))
     }
 
@@ -696,7 +726,7 @@ impl SessionManager {
         let path = self.session_path(key);
         let key_display = key.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = path.with_extension("jsonl.tmp");
             let mut file = std::fs::File::create(&tmp_path)?;
@@ -707,9 +737,14 @@ impl SessionManager {
             Ok::<_, eyre::Report>(())
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
+        if let Err(error) = rewrite_result {
+            record_session_rewrite("failed");
+            return Err(error);
+        }
 
         debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
+        record_session_rewrite("committed");
         Ok(())
     }
 
@@ -1001,13 +1036,16 @@ impl SessionHandle {
 
         let mut child = Self::open(data_dir, child_key);
         if child.session.parent_key.is_some() || !child.session.messages.is_empty() {
+            record_child_session_fork("skipped_existing");
             return Ok(());
         }
 
         child.session.parent_key = Some(parent_key.clone());
         child.session.messages = parent_history;
         child.session.updated_at = Utc::now();
-        child.rewrite().await
+        child.rewrite().await?;
+        record_child_session_fork("seeded");
+        Ok(())
     }
 
     /// Encode a path component (base key) for safe directory names.
@@ -1057,7 +1095,11 @@ impl SessionHandle {
     pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
-        self.append_to_disk(&message).await?;
+        if let Err(error) = self.append_to_disk(&message).await {
+            record_session_persist("failed");
+            return Err(error);
+        }
+        record_session_persist("committed");
         Ok(self.session.messages.len().saturating_sub(1))
     }
 
@@ -1097,7 +1139,7 @@ impl SessionHandle {
         let path = self.session_path();
         let key_display = self.session.key.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = path.with_extension("jsonl.tmp");
             let mut file = std::fs::File::create(&tmp_path)?;
@@ -1107,9 +1149,14 @@ impl SessionHandle {
             Ok::<_, eyre::Report>(())
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
+        if let Err(error) = rewrite_result {
+            record_session_rewrite("failed");
+            return Err(error);
+        }
 
         debug!(key = %key_display, messages = msg_count, "Rewrote session to disk");
+        record_session_rewrite("committed");
         Ok(())
     }
 

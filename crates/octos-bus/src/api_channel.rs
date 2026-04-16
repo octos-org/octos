@@ -21,6 +21,7 @@ use axum::routing::{delete, get, post};
 use chrono::Utc;
 use eyre::Result;
 use futures::stream::{self, StreamExt};
+use metrics::counter;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
@@ -59,6 +60,16 @@ fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
         Some(topic) => format!("{chat_id}::{}", topic.trim()),
         None => chat_id.to_string(),
     }
+}
+
+fn record_replay(kind: &'static str, outcome: &'static str, count: usize) {
+    let increment = count.min(u64::MAX as usize) as u64;
+    counter!(
+        "octos_session_replay_total",
+        "kind" => kind.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(increment);
 }
 
 /// Request body for POST /chat.
@@ -128,10 +139,7 @@ impl ApiChannel {
 
     /// Attach a callback invoked when a session is deleted via the API.
     /// The gateway runtime uses this to stop the session actor.
-    pub fn with_on_session_deleted(
-        mut self,
-        f: impl Fn(&str) + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_on_session_deleted(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_session_deleted = Some(Arc::new(f));
         self
     }
@@ -450,7 +458,8 @@ impl Channel for ApiChannel {
                 if let Some(event) =
                     build_session_result_event(result, &data_dir, Some(&persisted_media), topic)
                 {
-                    self.broadcast_session_event(&msg.chat_id, topic, event).await;
+                    self.broadcast_session_event(&msg.chat_id, topic, event)
+                        .await;
                 }
                 return Ok(());
             }
@@ -502,7 +511,8 @@ impl Channel for ApiChannel {
                 serde_json::from_str::<serde_json::Value>(task_json).unwrap_or_default(),
                 topic,
             );
-            self.broadcast_session_event(&msg.chat_id, topic, event).await;
+            self.broadcast_session_event(&msg.chat_id, topic, event)
+                .await;
             return Ok(());
         }
 
@@ -512,7 +522,8 @@ impl Channel for ApiChannel {
                 sess.data_dir()
             };
             if let Some(event) = build_session_result_event(result, &data_dir, None, topic) {
-                self.broadcast_session_event(&msg.chat_id, topic, event).await;
+                self.broadcast_session_event(&msg.chat_id, topic, event)
+                    .await;
             }
             return Ok(());
         }
@@ -849,6 +860,7 @@ async fn handle_session_event_stream(
             .await,
     );
     replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
+    record_replay("stream", "opened", 1);
 
     let live_stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -1040,24 +1052,27 @@ fn message_info_from_history_message(
     }
 }
 
-async fn replay_task_status_events(
-    state: &ApiState,
-    id: &str,
-    topic: Option<&str>,
-) -> Vec<String> {
+async fn replay_task_status_events(state: &ApiState, id: &str, topic: Option<&str>) -> Vec<String> {
     let Some(ref query_fn) = state.task_query else {
+        record_replay("task_status", "disabled", 1);
         return Vec::new();
     };
 
     let session_key =
         current_profile_api_session_key_with_topic(state.profile_id.as_deref(), id, topic);
-    query_fn(&session_key.0)
+    let events: Vec<String> = query_fn(&session_key.0)
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .map(|task| build_task_status_event(task, topic).to_string())
-        .collect()
+        .collect();
+    if events.is_empty() {
+        record_replay("task_status", "empty", 1);
+    } else {
+        record_replay("task_status", "emitted", events.len());
+    }
+    events
 }
 
 async fn replay_committed_session_results(
@@ -1072,7 +1087,7 @@ async fn replay_committed_session_results(
 
     for candidate in &candidates {
         if let Some(session) = sess.load(candidate).await {
-            return session
+            let events: Vec<String> = session
                 .messages
                 .iter()
                 .enumerate()
@@ -1088,9 +1103,16 @@ async fn replay_committed_session_results(
                     .to_string()
                 })
                 .collect();
+            if events.is_empty() {
+                record_replay("session_result", "empty", 1);
+            } else {
+                record_replay("session_result", "emitted", events.len());
+            }
+            return events;
         }
     }
 
+    record_replay("session_result", "missing_session", 1);
     Vec::new()
 }
 
@@ -1515,8 +1537,9 @@ mod tests {
     }
 
     fn test_sessions() -> Arc<Mutex<SessionManager>> {
-        let dir = tempfile::tempdir().unwrap();
-        test_sessions_in(dir.path())
+        let dir = std::env::temp_dir().join(format!("octos-bus-tests-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        test_sessions_in(&dir)
     }
 
     #[test]
@@ -1558,6 +1581,7 @@ mod tests {
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 sessions: test_sessions(),
                 task_query: None,
+                on_session_deleted: None,
             });
 
         let response = app
@@ -1601,6 +1625,7 @@ mod tests {
                         { "id": "task-1", "tool_name": "run_pipeline", "status": "running" }
                     ])
                 })),
+                on_session_deleted: None,
             });
 
         let response = app
@@ -1852,6 +1877,7 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            on_session_deleted: None,
         };
 
         let replayed = replay_committed_session_results(&state, "test-chat", Some(1), None).await;
@@ -1898,15 +1924,12 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            on_session_deleted: None,
         };
 
-        let replayed = replay_committed_session_results(
-            &state,
-            "test-chat",
-            None,
-            Some("slides launch"),
-        )
-        .await;
+        let replayed =
+            replay_committed_session_results(&state, "test-chat", None, Some("slides launch"))
+                .await;
 
         assert_eq!(replayed.len(), 2);
         let first: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
@@ -1937,10 +1960,10 @@ mod tests {
                     }
                 ])
             })),
+            on_session_deleted: None,
         };
 
-        let replayed =
-            replay_task_status_events(&state, "test-chat", Some("site astro")).await;
+        let replayed = replay_task_status_events(&state, "test-chat", Some("site astro")).await;
 
         assert_eq!(replayed.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
@@ -2362,6 +2385,7 @@ mod tests {
                 sessions,
                 profile_id: Some("dspfac".into()),
                 task_query: None,
+                on_session_deleted: None,
             });
 
         let response = app
