@@ -118,7 +118,7 @@ pub async fn enforce_spawn_task_contract(
         TaskRuntimeState::DeliveringOutputs,
         Some(format!("handoff outputs for {tool_name}")),
     );
-    if task_policy.on_complete.is_empty() {
+    if task_policy.delivery_actions().is_empty() {
         let output_files = resolved_artifacts
             .paths
             .iter()
@@ -127,11 +127,11 @@ pub async fn enforce_spawn_task_contract(
         return SpawnTaskContractResult::Satisfied { output_files };
     }
 
-    match run_complete_actions(
+    match run_delivery_actions(
         tools,
         workspace_root,
         tool_call_id,
-        &task_policy.on_complete,
+        task_policy.delivery_actions(),
         &resolved_artifacts,
     )
     .await
@@ -276,7 +276,7 @@ fn run_verify_actions(
     }
 }
 
-async fn run_complete_actions(
+async fn run_delivery_actions(
     tools: &ToolRegistry,
     workspace_root: &Path,
     tool_call_id: &str,
@@ -313,16 +313,24 @@ async fn run_complete_actions(
         }
 
         match run_action_with_context(workspace_root, &resolved_artifacts.context, action)
-            .map_err(|error| format!("completion action error: {error}"))?
+            .map_err(|error| format!("delivery action error: {error}"))?
         {
             ActionResult::Pass | ActionResult::Notify { .. } => continue,
             ActionResult::Fail { reason } => {
-                return Err(format!("completion action failed: {action}: {reason}"));
+                return Err(format!("delivery action failed: {action}: {reason}"));
             }
         }
     }
 
-    Ok(delivered_files)
+    if delivered_files.is_empty() {
+        Ok(resolved_artifacts
+            .paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect())
+    } else {
+        Ok(delivered_files)
+    }
 }
 
 fn run_failure_actions(
@@ -480,6 +488,7 @@ mod tests {
                     "file_size_min:$audio:1024".into(),
                 ],
                 on_complete: Vec::new(),
+                on_deliver: Vec::new(),
                 on_failure: Vec::new(),
             },
         );
@@ -509,6 +518,45 @@ mod tests {
                         audio.to_string_lossy().to_string(),
                     ]
                 );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_contract_prefers_explicit_delivery_actions_over_legacy_completion_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle.md");
+        std::fs::write(&bundle, b"bundle").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy.artifacts.entries.insert("bundle".into(), "bundle.md".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: Some("bundle".into()),
+                artifacts: vec!["bundle".into()],
+                on_verify: vec!["file_exists:$bundle".into()],
+                on_complete: vec!["file_exists:missing.txt".into()],
+                on_deliver: vec!["notify_user:bundle delivered".into()],
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-4",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![bundle.to_string_lossy().to_string()]);
             }
             other => panic!("expected success, got {other:?}"),
         }

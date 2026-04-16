@@ -1146,6 +1146,40 @@ mod tests {
     }
 
     #[test]
+    fn inspection_uses_shared_validator_semantics_for_file_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-g");
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("output/slide-01.png"), b"png").unwrap();
+        std::fs::write(slides_root.join("output/slide-02.png"), b"png").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.artifacts.entries.clear();
+        policy.validation.on_turn_end = vec!["file_count_eq:output/*.png:2".into()];
+        policy.validation.on_completion = vec!["any_exists:output/*.png|output/*.pdf".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+        initialize_and_commit(
+            &slides_root,
+            WorkspaceProjectKind::Slides,
+            "Initialize slides workspace",
+        )
+        .unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-g");
+        assert!(status.ready);
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(status.turn_end_checks[0].passed);
+        assert_eq!(status.turn_end_checks[0].spec, "file_count_eq:output/*.png:2");
+        assert_eq!(status.completion_checks.len(), 1);
+        assert!(status.completion_checks[0].passed);
+        assert_eq!(status.completion_checks[0].spec, "any_exists:output/*.png|output/*.pdf");
+    }
+
+    #[test]
     fn detects_git_index_lock_errors() {
         assert!(is_git_index_lock_error(
             "fatal: Unable to create 'C:/tmp/.git/index.lock': File exists."

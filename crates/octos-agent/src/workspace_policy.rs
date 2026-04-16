@@ -110,8 +110,12 @@ pub struct WorkspaceSpawnTaskPolicy {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub on_verify: Vec<String>,
-    #[serde(default)]
+    /// Legacy completion hook retained for compatibility. Prefer `on_deliver`
+    /// for explicit handoff/delivery actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_complete: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_deliver: Vec<String>,
     #[serde(default)]
     pub on_failure: Vec<String>,
 }
@@ -122,6 +126,14 @@ impl WorkspaceSpawnTaskPolicy {
             self.artifact.iter().map(String::as_str).collect()
         } else {
             self.artifacts.iter().map(String::as_str).collect()
+        }
+    }
+
+    pub fn delivery_actions(&self) -> &[String] {
+        if self.on_deliver.is_empty() {
+            &self.on_complete
+        } else {
+            &self.on_deliver
         }
     }
 }
@@ -215,6 +227,7 @@ impl WorkspacePolicy {
                 "file_size_min:$artifact:1024".into(),
             ],
             on_complete: vec![],
+            on_deliver: vec![],
             on_failure: vec!["notify_user:TTS generation failed".into()],
         };
 
@@ -226,6 +239,7 @@ impl WorkspacePolicy {
                 "file_size_min:$artifact:4096".into(),
             ],
             on_complete: vec![],
+            on_deliver: vec![],
             on_failure: vec!["notify_user:Podcast generation failed".into()],
         };
 
@@ -383,6 +397,7 @@ mod tests {
         assert_eq!(task.artifact.as_deref(), Some("primary_audio"));
         assert!(task.artifacts.is_empty());
         assert!(task.on_complete.is_empty());
+        assert!(task.on_deliver.is_empty());
 
         assert_eq!(
             policy
@@ -404,6 +419,7 @@ mod tests {
                 .iter()
                 .any(|action| action == "file_size_min:$artifact:4096")
         );
+        assert!(podcast_task.on_deliver.is_empty());
     }
 
     #[test]
@@ -413,6 +429,7 @@ mod tests {
             artifacts: vec!["report".into(), "audio".into()],
             on_verify: Vec::new(),
             on_complete: Vec::new(),
+            on_deliver: Vec::new(),
             on_failure: Vec::new(),
         };
 
@@ -426,6 +443,7 @@ mod tests {
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: Vec::new(),
+            on_deliver: Vec::new(),
             on_failure: Vec::new(),
         };
 
@@ -439,6 +457,7 @@ mod tests {
             artifacts: Vec::new(),
             on_verify: vec!["file_exists:$artifact".into()],
             on_complete: Vec::new(),
+            on_deliver: Vec::new(),
             on_failure: Vec::new(),
         };
 
@@ -446,6 +465,34 @@ mod tests {
         assert!(!rendered.contains("artifacts = []"));
         let roundtrip: WorkspaceSpawnTaskPolicy = toml::from_str(&rendered).unwrap();
         assert_eq!(roundtrip.artifact_sources(), vec!["primary_audio"]);
+    }
+
+    #[test]
+    fn spawn_task_delivery_actions_prefer_explicit_delivery_list() {
+        let task = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec!["notify_user:legacy".into()],
+            on_deliver: vec!["notify_user:deliver".into()],
+            on_failure: Vec::new(),
+        };
+
+        assert_eq!(task.delivery_actions(), &["notify_user:deliver".to_string()]);
+    }
+
+    #[test]
+    fn spawn_task_delivery_actions_fall_back_to_legacy_completion_list() {
+        let task = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec!["notify_user:legacy".into()],
+            on_deliver: Vec::new(),
+            on_failure: Vec::new(),
+        };
+
+        assert_eq!(task.delivery_actions(), &["notify_user:legacy".to_string()]);
     }
 
     #[test]

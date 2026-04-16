@@ -93,6 +93,11 @@ pub fn notifications(results: &[(String, ActionResult)]) -> Vec<String> {
 /// Supported actions:
 /// - `file_exists:<glob>` — at least one file matches the glob pattern
 /// - `file_size_min:<glob>:<bytes>` — matched files are at least N bytes
+/// - `file_count_eq:<glob>:<count>` — exactly N files match the glob or named target
+/// - `file_count_min:<glob>:<count>` — at least N files match the glob or named target
+/// - `file_count_max:<glob>:<count>` — at most N files match the glob or named target
+/// - `any_exists:<glob>|<glob>|...` — at least one target resolves to an existing file
+/// - `all_exist:<glob>|<glob>|...` — every listed target resolves to an existing file
 /// - `cleanup:<glob>` — remove files matching the glob (always passes)
 /// - `notify_user:<message>` — log a notification (always passes, actual
 ///   delivery wired by caller)
@@ -110,6 +115,11 @@ pub(crate) fn run_action_with_context(
     match kind {
         "file_exists" => action_file_exists(workspace_root, context, arg),
         "file_size_min" => action_file_size_min(workspace_root, context, arg),
+        "file_count_eq" => action_file_count_eq(workspace_root, context, arg),
+        "file_count_min" => action_file_count_min(workspace_root, context, arg),
+        "file_count_max" => action_file_count_max(workspace_root, context, arg),
+        "any_exists" => action_any_exists(workspace_root, context, arg),
+        "all_exist" => action_all_exist(workspace_root, context, arg),
         "cleanup" => action_cleanup(workspace_root, context, arg),
         "notify_user" => action_notify_user(arg),
         _ => Err(eyre!("unknown behaviour action: {kind}")),
@@ -262,6 +272,139 @@ fn action_file_size_min(
     Ok(ActionResult::Pass)
 }
 
+fn action_file_count_eq(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
+    let (pattern, expected) = parse_count_spec("file_count_eq", arg)?;
+    let count = count_existing_files(workspace_root, context, pattern)?;
+    if count == expected {
+        info!(pattern, count, expected, "file_count_eq check passed");
+        Ok(ActionResult::Pass)
+    } else {
+        Ok(ActionResult::Fail {
+            reason: format!("{pattern} matched {count} files, expected {expected}"),
+        })
+    }
+}
+
+fn action_file_count_min(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
+    let (pattern, minimum) = parse_count_spec("file_count_min", arg)?;
+    let count = count_existing_files(workspace_root, context, pattern)?;
+    if count >= minimum {
+        info!(pattern, count, minimum, "file_count_min check passed");
+        Ok(ActionResult::Pass)
+    } else {
+        Ok(ActionResult::Fail {
+            reason: format!("{pattern} matched {count} files, minimum is {minimum}"),
+        })
+    }
+}
+
+fn action_file_count_max(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
+    let (pattern, maximum) = parse_count_spec("file_count_max", arg)?;
+    let count = count_existing_files(workspace_root, context, pattern)?;
+    if count <= maximum {
+        info!(pattern, count, maximum, "file_count_max check passed");
+        Ok(ActionResult::Pass)
+    } else {
+        Ok(ActionResult::Fail {
+            reason: format!("{pattern} matched {count} files, maximum is {maximum}"),
+        })
+    }
+}
+
+fn action_any_exists(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
+    let targets = split_target_list(arg);
+    if targets.is_empty() {
+        return Err(eyre!("any_exists requires at least one target"));
+    }
+
+    for target in &targets {
+        if !resolve_existing_files(workspace_root, context, target)?.is_empty() {
+            info!(target, "any_exists check passed");
+            return Ok(ActionResult::Pass);
+        }
+    }
+
+    Ok(ActionResult::Fail {
+        reason: format!("none of the targets exist: {}", targets.join("|")),
+    })
+}
+
+fn action_all_exist(
+    workspace_root: &Path,
+    context: &ActionContext,
+    arg: &str,
+) -> Result<ActionResult> {
+    let targets = split_target_list(arg);
+    if targets.is_empty() {
+        return Err(eyre!("all_exist requires at least one target"));
+    }
+
+    for target in &targets {
+        let matches = resolve_existing_files(workspace_root, context, target)?;
+        if matches.is_empty() {
+            return Ok(ActionResult::Fail {
+                reason: format!("missing target: {target}"),
+            });
+        }
+    }
+
+    info!(targets = %targets.join("|"), "all_exist check passed");
+    Ok(ActionResult::Pass)
+}
+
+fn parse_count_spec<'a>(action: &'a str, arg: &'a str) -> Result<(&'a str, usize)> {
+    let (pattern, count_str) = arg
+        .rsplit_once(':')
+        .ok_or_else(|| eyre!("{action} requires pattern:count, got: {arg}"))?;
+    let count: usize = count_str
+        .parse()
+        .map_err(|_| eyre!("{action}: invalid count: {count_str}"))?;
+    Ok((pattern, count))
+}
+
+fn resolve_existing_files(
+    workspace_root: &Path,
+    context: &ActionContext,
+    target: &str,
+) -> Result<Vec<PathBuf>> {
+    Ok(context
+        .resolve_targets(workspace_root, target)?
+        .into_iter()
+        .filter(|path| path.exists() && path.is_file())
+        .collect())
+}
+
+fn count_existing_files(
+    workspace_root: &Path,
+    context: &ActionContext,
+    target: &str,
+) -> Result<usize> {
+    Ok(resolve_existing_files(workspace_root, context, target)?.len())
+}
+
+fn split_target_list(arg: &str) -> Vec<&str> {
+    arg.split('|')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .collect()
+}
+
 fn action_cleanup(
     workspace_root: &Path,
     context: &ActionContext,
@@ -338,6 +481,37 @@ mod tests {
         std::fs::write(temp.path().join("audio.mp3"), vec![0u8; 2048]).unwrap();
         let result = run_action(temp.path(), "file_size_min:audio.mp3:1024").unwrap();
         assert_eq!(result, ActionResult::Pass);
+    }
+
+    #[test]
+    fn should_count_matching_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("output")).unwrap();
+        std::fs::write(temp.path().join("output/a.png"), b"a").unwrap();
+        std::fs::write(temp.path().join("output/b.png"), b"b").unwrap();
+
+        let eq = run_action(temp.path(), "file_count_eq:output/*.png:2").unwrap();
+        let min = run_action(temp.path(), "file_count_min:output/*.png:1").unwrap();
+        let max = run_action(temp.path(), "file_count_max:output/*.png:2").unwrap();
+
+        assert_eq!(eq, ActionResult::Pass);
+        assert_eq!(min, ActionResult::Pass);
+        assert_eq!(max, ActionResult::Pass);
+    }
+
+    #[test]
+    fn should_resolve_any_and_all_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        std::fs::write(&report, b"report").unwrap();
+
+        let any = run_action(temp.path(), "any_exists:missing.txt|report.md").unwrap();
+        let all = run_action(temp.path(), "all_exist:report.md").unwrap();
+        let all_fail = run_action(temp.path(), "all_exist:report.md|missing.txt").unwrap();
+
+        assert_eq!(any, ActionResult::Pass);
+        assert_eq!(all, ActionResult::Pass);
+        assert!(matches!(all_fail, ActionResult::Fail { .. }));
     }
 
     #[test]
