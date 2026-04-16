@@ -143,8 +143,12 @@ async fn send_outbound_with_timeout(
     fanout_kind: &'static str,
 ) -> bool {
     match tokio::time::timeout(BACKGROUND_RESULT_FANOUT_TIMEOUT, out_tx.send(message)).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => {
+            record_result_delivery(fanout_kind, "sent", "assistant");
+            true
+        }
         Ok(Err(error)) => {
+            record_result_delivery(fanout_kind, "channel_closed", "assistant");
             warn!(
                 session = %session_key,
                 error = %error,
@@ -154,6 +158,7 @@ async fn send_outbound_with_timeout(
             false
         }
         Err(_) => {
+            record_result_delivery(fanout_kind, "timeout", "assistant");
             warn!(
                 session = %session_key,
                 timeout_ms = BACKGROUND_RESULT_FANOUT_TIMEOUT.as_millis(),
@@ -179,6 +184,7 @@ async fn persist_terminal_reply_and_fanout(
         persist_assistant_message(session_handle, session_key, content.clone(), media.clone())
             .await
     else {
+        record_result_delivery("terminal_reply", "history_not_persisted", "assistant");
         warn!(
             session = %session_key,
             "skipping live fanout because terminal reply was not persisted"
@@ -224,6 +230,20 @@ fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'st
 
 fn record_timeout(reason: &'static str) {
     counter!("octos_timeout_total", "reason" => reason.to_string()).increment(1);
+}
+
+fn record_retry(reason: &'static str) {
+    counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
+}
+
+fn record_result_delivery(path: &'static str, outcome: &'static str, kind: &'static str) {
+    counter!(
+        "octos_result_delivery_total",
+        "path" => path.to_string(),
+        "outcome" => outcome.to_string(),
+        "kind" => kind.to_string()
+    )
+    .increment(1);
 }
 
 fn child_session_spawn_note(payload: &ChildSessionLifecyclePayload) -> String {
@@ -637,6 +657,7 @@ async fn dispatch_background_result_to_actor(
     match send_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
+            record_retry("background_result_actor_closed");
             warn!(
                 task_label,
                 error = %error,
@@ -645,6 +666,7 @@ async fn dispatch_background_result_to_actor(
             return false;
         }
         Err(_) => {
+            record_retry("background_result_enqueue_timeout");
             warn!(
                 task_label,
                 timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
@@ -657,6 +679,7 @@ async fn dispatch_background_result_to_actor(
     match tokio::time::timeout(BACKGROUND_RESULT_ACK_TIMEOUT, ack_rx).await {
         Ok(Ok(persisted)) => persisted,
         Ok(Err(_)) => {
+            record_retry("background_result_ack_channel_closed");
             warn!(
                 task_label,
                 "background result actor acknowledgment channel closed"
@@ -664,6 +687,7 @@ async fn dispatch_background_result_to_actor(
             false
         }
         Err(_) => {
+            record_retry("background_result_ack_timeout");
             warn!(
                 task_label,
                 timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
@@ -2681,6 +2705,11 @@ impl SessionActor {
         .await;
 
         let Some(persisted_message) = persisted else {
+            record_result_delivery(
+                "background_notification",
+                "history_not_persisted",
+                "notification",
+            );
             warn!(
                 session = %self.session_key,
                 "skipping background notification fanout because history was not persisted"

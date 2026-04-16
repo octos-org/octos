@@ -149,6 +149,36 @@ fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'st
     .increment(1);
 }
 
+fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
+    match kind {
+        BackgroundResultKind::Notification => "notification",
+        BackgroundResultKind::Report => "report",
+    }
+}
+
+fn record_result_delivery(path: &'static str, outcome: &'static str, kind: BackgroundResultKind) {
+    counter!(
+        "octos_result_delivery_total",
+        "path" => path.to_string(),
+        "outcome" => outcome.to_string(),
+        "kind" => background_result_kind_label(kind).to_string()
+    )
+    .increment(1);
+}
+
+fn record_terminal_result_reason(kind: BackgroundResultKind, reason: &'static str) {
+    counter!(
+        "octos_terminal_result_reason_total",
+        "kind" => background_result_kind_label(kind).to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+fn record_retry(reason: &'static str) {
+    counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
+}
+
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
     llm: Arc<dyn LlmProvider>,
@@ -502,9 +532,21 @@ async fn deliver_background_result(
     sender: Option<BackgroundResultSender>,
     payload: BackgroundResultPayload,
 ) -> bool {
+    let kind = payload.kind;
     match sender {
-        Some(sender) => sender(payload).await,
-        None => false,
+        Some(sender) => {
+            let delivered = sender(payload).await;
+            record_result_delivery(
+                "direct_session_actor",
+                if delivered { "accepted" } else { "unavailable" },
+                kind,
+            );
+            delivered
+        }
+        None => {
+            record_result_delivery("direct_session_actor", "missing_sender", kind);
+            false
+        }
     }
 }
 
@@ -1037,6 +1079,10 @@ impl Tool for SpawnTool {
                         )
                         .unwrap_or_default();
                         if !workflow_media.is_empty() {
+                            record_terminal_result_reason(
+                                BackgroundResultKind::Notification,
+                                "workflow_terminal_artifact",
+                            );
                             (
                                 BackgroundResultKind::Notification,
                                 workflow_media
@@ -1045,6 +1091,10 @@ impl Tool for SpawnTool {
                                     .collect::<Vec<_>>(),
                             )
                         } else if should_deliver_output_files(&r.files_to_send) {
+                            record_terminal_result_reason(
+                                BackgroundResultKind::Notification,
+                                "explicit_output_files",
+                            );
                             (
                                 BackgroundResultKind::Notification,
                                 r.files_to_send
@@ -1053,10 +1103,20 @@ impl Tool for SpawnTool {
                                     .collect::<Vec<_>>(),
                             )
                         } else {
+                            record_terminal_result_reason(
+                                BackgroundResultKind::Report,
+                                "report_summary",
+                            );
                             (BackgroundResultKind::Report, Vec::new())
                         }
                     }
-                    _ => (BackgroundResultKind::Report, Vec::new()),
+                    _ => {
+                        record_terminal_result_reason(
+                            BackgroundResultKind::Report,
+                            "task_failure_report",
+                        );
+                        (BackgroundResultKind::Report, Vec::new())
+                    }
                 };
 
                 // Direct injection path: inject as system message, no extra LLM call.
@@ -1075,6 +1135,7 @@ impl Tool for SpawnTool {
                 {
                     return;
                 }
+                record_retry("background_result_relay_fallback");
                 warn!("background result sender failed (actor dead?), falling back to relay");
 
                 // Legacy path: relay via InboundMessage (triggers extra LLM call)
@@ -1107,7 +1168,10 @@ impl Tool for SpawnTool {
                 };
 
                 if let Err(e) = inbound_tx.send(announce).await {
+                    record_result_delivery("relay_inbound_message", "enqueue_failed", result_kind);
                     warn!(error = %e, "failed to announce subagent result");
+                } else {
+                    record_result_delivery("relay_inbound_message", "enqueued", result_kind);
                 }
             });
 

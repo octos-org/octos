@@ -72,6 +72,25 @@ fn record_replay(kind: &'static str, outcome: &'static str, count: usize) {
     .increment(increment);
 }
 
+fn record_result_delivery(path: &'static str, outcome: &'static str, kind: &'static str) {
+    counter!(
+        "octos_result_delivery_total",
+        "path" => path.to_string(),
+        "outcome" => outcome.to_string(),
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+fn record_duplicate_result_suppressed(reason: &'static str) {
+    counter!(
+        "octos_result_duplicate_suppressed_total",
+        "surface" => "api_channel".to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
 /// Request body for POST /chat.
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -458,6 +477,14 @@ impl Channel for ApiChannel {
                 if let Some(event) =
                     build_session_result_event(result, &data_dir, Some(&persisted_media), topic)
                 {
+                    record_result_delivery(
+                        "session_result_event",
+                        "metadata_with_media",
+                        "session_result",
+                    );
+                    record_duplicate_result_suppressed(
+                        "session_result_preferred_over_legacy_file_event",
+                    );
                     self.broadcast_session_event(&msg.chat_id, topic, event)
                         .await;
                 }
@@ -465,6 +492,14 @@ impl Channel for ApiChannel {
             }
 
             if let Some(message) = committed_message {
+                record_result_delivery(
+                    "session_result_event",
+                    "committed_media_message",
+                    "session_result",
+                );
+                record_duplicate_result_suppressed(
+                    "committed_session_result_preferred_over_legacy_file_event",
+                );
                 self.broadcast_session_event(
                     &msg.chat_id,
                     topic,
@@ -480,6 +515,7 @@ impl Channel for ApiChannel {
             // session_result contract.
             let pending = self.pending.lock().await;
             if let Some(tx) = pending.get(&msg.chat_id) {
+                record_result_delivery("legacy_file_event", "fallback", "file");
                 for (original_path, persisted_path) in msg.media.iter().zip(persisted_media.iter())
                 {
                     let filename = std::path::Path::new(original_path)
@@ -522,6 +558,7 @@ impl Channel for ApiChannel {
                 sess.data_dir()
             };
             if let Some(event) = build_session_result_event(result, &data_dir, None, topic) {
+                record_result_delivery("session_result_event", "metadata", "session_result");
                 self.broadcast_session_event(&msg.chat_id, topic, event)
                     .await;
             }

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use metrics::counter;
 use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
 
@@ -147,6 +148,39 @@ fn record_child_session_lifecycle(kind: &'static str, outcome: &'static str) {
         "outcome" => outcome.to_string()
     )
     .increment(1);
+}
+
+fn record_child_session_orphan(reason: &'static str) {
+    counter!(
+        "octos_child_session_orphan_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+fn record_workflow_phase_transition(workflow_kind: &str, from_phase: &str, to_phase: &str) {
+    counter!(
+        "octos_workflow_phase_transition_total",
+        "workflow_kind" => workflow_kind.to_string(),
+        "from_phase" => from_phase.to_string(),
+        "to_phase" => to_phase.to_string()
+    )
+    .increment(1);
+}
+
+fn workflow_labels(detail: Option<&str>) -> (Option<String>, Option<String>) {
+    let parsed = detail
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null);
+    let workflow_kind = parsed
+        .get("workflow_kind")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let current_phase = parsed
+        .get("current_phase")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    (workflow_kind, current_phase)
 }
 
 fn child_terminal_kind_label(state: &ChildSessionTerminalState) -> &'static str {
@@ -357,20 +391,35 @@ impl TaskSupervisor {
         runtime_state: TaskRuntimeState,
         runtime_detail: Option<String>,
     ) {
-        let snapshot = {
+        let (snapshot, previous_detail) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                let previous_detail = task.runtime_detail.clone();
                 task.runtime_state = runtime_state;
                 task.runtime_detail = runtime_detail;
                 task.updated_at = Utc::now();
-                Some(task.clone())
+                (Some(task.clone()), previous_detail)
             } else {
-                None
+                (None, None)
             }
         };
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            let (previous_kind, previous_phase) = workflow_labels(previous_detail.as_deref());
+            let (current_kind, current_phase) = workflow_labels(task.runtime_detail.as_deref());
+            if let (Some(workflow_kind), Some(to_phase)) =
+                (current_kind.as_deref(), current_phase.as_deref())
+            {
+                let from_phase = if previous_kind.as_deref() == Some(workflow_kind) {
+                    previous_phase.as_deref().unwrap_or("untracked")
+                } else {
+                    "untracked"
+                };
+                if from_phase != to_phase {
+                    record_workflow_phase_transition(workflow_kind, from_phase, to_phase);
+                }
+            }
         }
     }
 
@@ -446,6 +495,9 @@ impl TaskSupervisor {
             self.persist_snapshot(task);
             self.notify_change(task);
             record_child_session_lifecycle(kind_label, outcome_label);
+            if matches!(join_state, ChildSessionJoinState::Orphaned) {
+                record_child_session_orphan("terminal_event_not_joined");
+            }
         }
     }
 
