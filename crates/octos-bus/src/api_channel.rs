@@ -53,6 +53,7 @@ struct ApiState {
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
     on_session_deleted: Option<OnSessionDeletedFn>,
+    metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
@@ -126,6 +127,8 @@ pub struct ApiChannel {
     task_query: Option<Arc<TaskQueryFn>>,
     /// Optional callback invoked when a session is deleted via API.
     on_session_deleted: Option<OnSessionDeletedFn>,
+    /// Optional Prometheus render callback shared from the child gateway.
+    metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl ApiChannel {
@@ -147,12 +150,19 @@ impl ApiChannel {
             sessions,
             task_query: None,
             on_session_deleted: None,
+            metrics_renderer: None,
         }
     }
 
     /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
+        self
+    }
+
+    /// Attach a Prometheus render callback for the `/metrics` endpoint.
+    pub fn with_metrics_renderer(mut self, render: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
+        self.metrics_renderer = Some(render);
         self
     }
 
@@ -380,9 +390,11 @@ impl Channel for ApiChannel {
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
             on_session_deleted: self.on_session_deleted.clone(),
+            metrics_renderer: self.metrics_renderer.clone(),
         };
 
         let app = Router::new()
+            .route("/metrics", get(handle_metrics))
             .route("/chat", post(handle_chat))
             .route("/sessions", get(handle_list_sessions))
             .route("/sessions/{id}/messages", get(handle_session_messages))
@@ -694,6 +706,14 @@ impl Channel for ApiChannel {
         self.shutdown.store(true, Ordering::SeqCst);
         Ok(())
     }
+}
+
+async fn handle_metrics(State(state): State<ApiState>) -> String {
+    state
+        .metrics_renderer
+        .as_ref()
+        .map(|render| render())
+        .unwrap_or_default()
 }
 
 impl ApiChannel {
@@ -1619,6 +1639,7 @@ mod tests {
                 sessions: test_sessions(),
                 task_query: None,
                 on_session_deleted: None,
+                metrics_renderer: None,
             });
 
         let response = app
@@ -1663,6 +1684,7 @@ mod tests {
                     ])
                 })),
                 on_session_deleted: None,
+                metrics_renderer: None,
             });
 
         let response = app
@@ -1915,6 +1937,7 @@ mod tests {
             sessions,
             task_query: None,
             on_session_deleted: None,
+            metrics_renderer: None,
         };
 
         let replayed = replay_committed_session_results(&state, "test-chat", Some(1), None).await;
@@ -1962,6 +1985,7 @@ mod tests {
             sessions,
             task_query: None,
             on_session_deleted: None,
+            metrics_renderer: None,
         };
 
         let replayed =
@@ -1998,6 +2022,7 @@ mod tests {
                 ])
             })),
             on_session_deleted: None,
+            metrics_renderer: None,
         };
 
         let replayed = replay_task_status_events(&state, "test-chat", Some("site astro")).await;
@@ -2423,6 +2448,7 @@ mod tests {
                 profile_id: Some("dspfac".into()),
                 task_query: None,
                 on_session_deleted: None,
+                metrics_renderer: None,
             });
 
         let response = app
@@ -2444,5 +2470,44 @@ mod tests {
             .filter(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("slides-123"))
             .collect();
         assert_eq!(matching.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_renders_child_prometheus_snapshot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let channel = ApiChannel::new(
+            port,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        )
+        .with_metrics_renderer(Arc::new(|| {
+            "octos_test_metric_total{kind=\"child\"} 7\n".to_string()
+        }));
+
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let shutdown = channel.shutdown.clone();
+        let server = tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let body = reqwest::get(format!("http://127.0.0.1:{port}/metrics"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("octos_test_metric_total"));
+        assert!(body.contains("kind=\"child\""));
+
+        shutdown.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

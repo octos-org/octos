@@ -11,6 +11,7 @@ pub fn register(
     entry: &ChannelEntry,
     shutdown: &Arc<AtomicBool>,
     session_mgr: &Arc<Mutex<SessionManager>>,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
     gateway_profile_id: Option<&str>,
     api_port_override: Option<u16>,
@@ -35,6 +36,9 @@ pub fn register(
         session_mgr.clone(),
         gateway_profile_id.map(str::to_string),
     );
+    if let Some(handle) = metrics_handle {
+        channel = channel.with_metrics_renderer(Arc::new(move || handle.render()));
+    }
     if let Some(task_query) = task_query {
         channel = channel.with_task_query(task_query);
     }

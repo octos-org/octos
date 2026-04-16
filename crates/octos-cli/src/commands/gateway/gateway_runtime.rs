@@ -117,6 +117,7 @@ impl GatewayRuntime {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
         let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        let metrics_handle = Some(crate::api::init_metrics());
 
         let mut profile_id: Option<String> = None;
         eprintln!(
@@ -1107,6 +1108,7 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                metrics_handle: metrics_handle.clone(),
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use axum::extract::State;
 use metrics::{counter, histogram};
@@ -11,11 +12,17 @@ use serde_json::{Value, json};
 
 use super::AppState;
 
+static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
 /// Initialize the Prometheus metrics recorder and return a handle for rendering.
 pub fn init_metrics() -> PrometheusHandle {
-    PrometheusBuilder::new()
-        .install_recorder()
-        .expect("failed to install Prometheus recorder")
+    METRICS_HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("failed to install Prometheus recorder")
+        })
+        .clone()
 }
 
 /// GET /metrics -- render Prometheus text exposition format.
@@ -151,6 +158,20 @@ pub fn build_operator_summary(metrics_text: &str) -> OperatorSummary {
     }
 }
 
+pub fn build_operator_summary_from_texts<I, S>(metrics_texts: I) -> OperatorSummary
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let combined = metrics_texts
+        .into_iter()
+        .map(|text| text.as_ref().trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    build_operator_summary(&combined)
+}
+
 fn total_for_metric(samples: &[ParsedMetricSample], metric: &str) -> u64 {
     samples
         .iter()
@@ -202,7 +223,9 @@ fn breakdown(samples: &[ParsedMetricSample], metric: &str, keys: &[&str]) -> Vec
     rows.sort_by(|left, right| {
         let left_count = left.get("count").and_then(Value::as_u64).unwrap_or(0);
         let right_count = right.get("count").and_then(Value::as_u64).unwrap_or(0);
-        right_count.cmp(&left_count).then_with(|| left.to_string().cmp(&right.to_string()))
+        right_count
+            .cmp(&left_count)
+            .then_with(|| left.to_string().cmp(&right.to_string()))
     });
     rows
 }
@@ -374,7 +397,10 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         assert_eq!(retry_rows[0]["reason"], "background_result_actor_closed");
         assert_eq!(retry_rows[0]["count"], 3);
 
-        let workflow_rows = summary.breakdowns.get("workflow_phase_transitions").unwrap();
+        let workflow_rows = summary
+            .breakdowns
+            .get("workflow_phase_transitions")
+            .unwrap();
         assert_eq!(workflow_rows[0]["workflow_kind"], "research_podcast");
         assert_eq!(workflow_rows[0]["from_phase"], "queued");
         assert_eq!(workflow_rows[0]["to_phase"], "render");
@@ -385,9 +411,25 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
     fn operator_summary_handles_empty_metrics_text() {
         let summary = build_operator_summary("");
         assert!(!summary.available);
-        assert!(summary
-            .totals
-            .values()
-            .all(|count| *count == 0));
+        assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn operator_summary_aggregates_across_sources() {
+        let summary = build_operator_summary_from_texts([
+            r#"
+octos_session_persist_total{outcome="ok"} 2
+octos_timeout_total{reason="session_turn"} 1
+"#,
+            r#"
+octos_session_persist_total{outcome="ok"} 3
+octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
+"#,
+        ]);
+
+        assert!(summary.available);
+        assert_eq!(summary.totals.get("session_persists"), Some(&5));
+        assert_eq!(summary.totals.get("timeouts"), Some(&1));
+        assert_eq!(summary.totals.get("session_replays"), Some(&4));
     }
 }

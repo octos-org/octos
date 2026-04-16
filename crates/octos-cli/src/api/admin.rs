@@ -1,6 +1,7 @@
 //! Admin API handlers for profile and gateway management.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -1448,11 +1449,52 @@ pub async fn system_metrics(
 pub async fn operator_summary(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<super::metrics::OperatorSummary>, StatusCode> {
-    let rendered = match state.metrics_handle {
-        Some(ref handle) => handle.render(),
-        None => String::new(),
-    };
-    Ok(Json(super::metrics::build_operator_summary(&rendered)))
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut metrics_texts = Vec::new();
+    if let Some(ref handle) = state.metrics_handle {
+        let rendered = handle.render();
+        if !rendered.trim().is_empty() {
+            metrics_texts.push(rendered);
+        }
+    }
+
+    let statuses = pm.all_statuses().await;
+    for (profile_id, status) in statuses {
+        if !status.running {
+            continue;
+        }
+        if let Some(port) = pm.api_port(&profile_id).await {
+            if let Some(rendered) = scrape_gateway_metrics(&state.http_client, port).await {
+                if !rendered.trim().is_empty() {
+                    metrics_texts.push(rendered);
+                }
+            }
+        }
+    }
+
+    Ok(Json(super::metrics::build_operator_summary_from_texts(
+        metrics_texts,
+    )))
+}
+
+async fn scrape_gateway_metrics(client: &reqwest::Client, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/metrics");
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    response.text().await.ok()
 }
 
 // ── Monitor control endpoints ────────────────────────────────────────
