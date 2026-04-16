@@ -21,8 +21,10 @@ use crate::config::Config;
 /// Start the REST API server.
 #[derive(Debug, Args)]
 pub struct ServeCommand {
-    /// Port to listen on.
-    #[arg(short, long, default_value = "8080")]
+    /// Port to listen on. Default lives in IANA's Dynamic/Private range
+    /// (49152–65535) to avoid collisions with `http-alt` services like
+    /// Tomcat/Jenkins/ominix-api. See issue #417.
+    #[arg(short, long, default_value = "50080")]
     pub port: u16,
 
     /// Host address to bind to. Defaults to localhost for security.

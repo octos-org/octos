@@ -1,6 +1,6 @@
 //! REST API and SSE streaming for octos.
 //!
-//! Feature-gated behind `api`. Start with `octos serve [--port 8080]`.
+//! Feature-gated behind `api`. Start with `octos serve [--port 50080]`.
 
 pub mod admin;
 pub mod auth_handlers;

@@ -33,8 +33,9 @@ pub enum AdminAction {
         /// frps control port.
         #[arg(long, default_value = "7000")]
         port: u16,
-        /// Local octos serve port on the tenant machine.
-        #[arg(long, default_value = "8080")]
+        /// Local octos serve port on the tenant machine. Matches the
+        /// `octos serve` default (see serve.rs / issue #417).
+        #[arg(long, default_value = "50080")]
         local_port: u16,
         /// Dashboard auth token (auto-generated if not provided).
         #[arg(long)]
