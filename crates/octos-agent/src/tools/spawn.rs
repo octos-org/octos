@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
-use crate::session::SessionLimits;
 use crate::task_supervisor::TaskSupervisor;
 use crate::{Agent, AgentConfig};
 
@@ -70,28 +69,12 @@ struct WorkflowTerminalOutputPolicy {
     required_artifact_kind: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct WorkflowUsageLimits {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_search_passes: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_pipeline_runs: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_dialogue_lines: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    target_audio_minutes: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_generate_calls: Option<u32>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkflowMetadata {
     workflow_kind: String,
     current_phase: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    limits: Option<WorkflowUsageLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_output: Option<WorkflowTerminalOutputPolicy>,
 }
@@ -341,42 +324,6 @@ fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
     serde_json::to_string(workflow).ok()
 }
 
-fn workflow_session_limits(workflow: Option<&WorkflowMetadata>) -> Option<SessionLimits> {
-    let limits = workflow?.limits.as_ref()?;
-    let mut session_limits = SessionLimits::default();
-
-    if let Some(max_search_passes) = limits.max_search_passes {
-        // Bound the expensive research tools but leave file I/O unrestricted.
-        session_limits
-            .per_tool_limits
-            .insert("deep_search".to_string(), max_search_passes);
-        session_limits
-            .per_tool_limits
-            .insert("news_fetch".to_string(), max_search_passes);
-    }
-
-    if let Some(max_pipeline_runs) = limits.max_pipeline_runs {
-        session_limits
-            .per_tool_limits
-            .insert("run_pipeline".to_string(), max_pipeline_runs);
-    }
-
-    if let Some(max_generate_calls) = limits.max_generate_calls {
-        session_limits
-            .per_tool_limits
-            .insert("podcast_generate".to_string(), max_generate_calls);
-    }
-
-    if session_limits.max_turns.is_none()
-        && session_limits.max_tool_rounds.is_none()
-        && session_limits.per_tool_limits.is_empty()
-    {
-        return None;
-    }
-
-    Some(session_limits)
-}
-
 fn workflow_artifact_matches_kind(path: &PathBuf, kind: &str) -> bool {
     match kind {
         "audio" => matches!(
@@ -385,6 +332,20 @@ fn workflow_artifact_matches_kind(path: &PathBuf, kind: &str) -> bool {
                 .map(|ext| ext.to_ascii_lowercase())
                 .as_deref(),
             Some("mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg")
+        ),
+        "presentation" => matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .as_deref(),
+            Some("pptx" | "ppt" | "pdf")
+        ),
+        "site" => matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .as_deref(),
+            Some("html" | "htm" | "xhtml")
         ),
         "report" => matches!(
             path.extension().and_then(|ext| ext.to_str()),
@@ -416,6 +377,20 @@ fn select_preferred_terminal_output(
                     score += 10;
                 }
                 if name.ends_with(".mp3") {
+                    score += 5;
+                }
+            } else if required_artifact_kind == "presentation" {
+                if name.contains("deck") {
+                    score += 10;
+                }
+                if name.ends_with(".pptx") {
+                    score += 5;
+                }
+            } else if required_artifact_kind == "site" {
+                if name.ends_with("index.html") {
+                    score += 10;
+                }
+                if name.contains("site") {
                     score += 5;
                 }
             }
@@ -577,17 +552,6 @@ impl Tool for SpawnTool {
                             "items": { "type": "string" },
                             "description": "Workflow-owned tool allowlist snapshot."
                         },
-                        "limits": {
-                            "type": "object",
-                            "description": "Optional runtime-owned tool and generation budgets for the workflow family.",
-                            "properties": {
-                                "max_search_passes": { "type": "integer" },
-                                "max_pipeline_runs": { "type": "integer" },
-                                "max_dialogue_lines": { "type": "integer" },
-                                "target_audio_minutes": { "type": "integer" },
-                                "max_generate_calls": { "type": "integer" }
-                            }
-                        },
                         "terminal_output": {
                             "type": "object",
                             "description": "Runtime-owned final output policy for workflow families.",
@@ -661,9 +625,6 @@ impl Tool for SpawnTool {
             let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
             if let Some(ref config) = self.worker_config {
                 worker = worker.with_config(config.clone());
-            }
-            if let Some(limits) = workflow_session_limits(workflow.as_ref()) {
-                worker = worker.with_session_limits(limits);
             }
             // Base prompt: configured worker prompt, or compiled-in default.
             // Additional instructions are appended, never replacing the base.
@@ -813,9 +774,6 @@ impl Tool for SpawnTool {
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
                 if let Some(ref config) = worker_config {
                     worker = worker.with_config(config.clone());
-                }
-                if let Some(limits) = workflow_session_limits(workflow_metadata.as_ref()) {
-                    worker = worker.with_session_limits(limits);
                 }
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
@@ -1142,10 +1100,6 @@ mod tests {
             workflow_kind: "research_podcast".to_string(),
             current_phase: "generate_audio".to_string(),
             allowed_tools: vec!["podcast_generate".to_string()],
-            limits: Some(WorkflowUsageLimits {
-                max_generate_calls: Some(1),
-                ..Default::default()
-            }),
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
                 deliver_media_only: true,
@@ -1169,49 +1123,55 @@ mod tests {
     }
 
     #[test]
-    fn workflow_session_limits_enforce_podcast_budget_fields() {
+    fn workflow_terminal_output_prefers_final_presentation_and_skips_scratch_files() {
         let workflow = WorkflowMetadata {
-            workflow_kind: "research_podcast".to_string(),
-            current_phase: "research".to_string(),
-            allowed_tools: vec![
-                "deep_search".to_string(),
-                "news_fetch".to_string(),
-                "podcast_generate".to_string(),
-            ],
-            limits: Some(WorkflowUsageLimits {
-                max_search_passes: Some(6),
-                max_pipeline_runs: Some(1),
-                max_generate_calls: Some(1),
-                ..Default::default()
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
             }),
-            terminal_output: None,
         };
 
-        let limits = workflow_session_limits(Some(&workflow)).expect("derived limits");
-        assert_eq!(limits.per_tool_limits.get("deep_search"), Some(&6));
-        assert_eq!(limits.per_tool_limits.get("news_fetch"), Some(&6));
-        assert_eq!(limits.per_tool_limits.get("run_pipeline"), Some(&1));
-        assert_eq!(limits.per_tool_limits.get("podcast_generate"), Some(&1));
+        let files_to_send = vec![
+            PathBuf::from("/tmp/output/slide-01.png"),
+            PathBuf::from("/tmp/output/deck.pptx"),
+            PathBuf::from("/tmp/output/notes.txt"),
+        ];
+
+        let selected =
+            select_workflow_terminal_files(&files_to_send, &[], Some(&workflow)).unwrap();
+
+        assert_eq!(selected, vec![PathBuf::from("/tmp/output/deck.pptx")]);
     }
 
     #[test]
-    fn workflow_session_limits_map_report_pipeline_budget() {
+    fn workflow_terminal_output_prefers_site_entrypoint_and_skips_assets() {
         let workflow = WorkflowMetadata {
-            workflow_kind: "deep_research".to_string(),
-            current_phase: "research".to_string(),
-            allowed_tools: vec!["run_pipeline".to_string()],
-            limits: Some(WorkflowUsageLimits {
-                max_search_passes: Some(6),
-                max_pipeline_runs: Some(1),
-                ..Default::default()
+            workflow_kind: "site".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["shell".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "site".to_string(),
             }),
-            terminal_output: None,
         };
 
-        let limits = workflow_session_limits(Some(&workflow)).expect("derived limits");
-        assert_eq!(limits.per_tool_limits.get("run_pipeline"), Some(&1));
-        assert_eq!(limits.per_tool_limits.get("deep_search"), Some(&6));
-        assert_eq!(limits.per_tool_limits.get("news_fetch"), Some(&6));
+        let files_to_send = vec![
+            PathBuf::from("/tmp/site/dist/assets/logo.png"),
+            PathBuf::from("/tmp/site/dist/index.html"),
+            PathBuf::from("/tmp/site/dist/about.html"),
+        ];
+
+        let selected =
+            select_workflow_terminal_files(&files_to_send, &[], Some(&workflow)).unwrap();
+
+        assert_eq!(selected, vec![PathBuf::from("/tmp/site/dist/index.html")]);
     }
 
     #[tokio::test]
@@ -1239,9 +1199,6 @@ mod tests {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
                     "allowed_tools": ["podcast_generate"],
-                    "limits": {
-                        "max_generate_calls": 1
-                    },
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "deliver_media_only": true,

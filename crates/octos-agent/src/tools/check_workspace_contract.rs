@@ -199,4 +199,34 @@ mod tests {
         assert_eq!(contracts[0]["repo_label"], "slides/broken");
         assert_eq!(contracts[0]["ready"], false);
     }
+
+    #[tokio::test]
+    async fn returns_ready_contract_for_matching_site_project_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("sites/news");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        write_workspace_policy(
+            &repo_root,
+            &WorkspacePolicy::for_site_build_output("out"),
+        )
+        .unwrap();
+        write_file(repo_root.join("mofa-site-session.json"), "{}");
+        write_file(repo_root.join("site-plan.json"), "{}");
+        write_file(repo_root.join("optimized-prompt.md"), "# prompt");
+        write_file(repo_root.join("out/index.html"), "<html></html>");
+
+        let tool = CheckWorkspaceContractTool::new(tmp.path());
+        let result = tool
+            .execute(&json!({"project": "sites/news"}))
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(payload["repo_count"], 1);
+        assert_eq!(payload["ready_count"], 1);
+        assert_eq!(payload["contracts"][0]["repo_label"], "sites/news");
+        assert_eq!(payload["contracts"][0]["ready"], true);
+        assert_eq!(payload["contracts"][0]["artifacts"][0]["name"], "entrypoint");
+        assert_eq!(payload["contracts"][0]["artifacts"][0]["pattern"], "out/index.html");
+    }
 }

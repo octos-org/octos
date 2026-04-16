@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use octos_agent::{
-    WorkspacePolicy, WorkspaceProjectKind, initialize_and_commit, write_workspace_policy,
+    WorkspaceProjectKind, initialize_and_commit, write_workspace_policy,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
+
+use crate::workflows::{site_delivery, slides_delivery};
 
 /// Slugify a project name for use as a directory name.
 fn slugify(s: &str) -> String {
@@ -91,10 +93,7 @@ module.exports = [];
             .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
-    write_workspace_policy(
-        &project_dir,
-        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
-    )
+    write_workspace_policy(&project_dir, &slides_delivery::workspace_policy())
     .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
 
     initialize_and_commit(
@@ -499,15 +498,6 @@ fn site_pages_for_preset(preset_key: &str) -> Vec<SitePlanPage> {
     }
 }
 
-fn site_build_output_dir(template: &str) -> &'static str {
-    match template {
-        "astro-site" => "dist",
-        "nextjs-app" => "out",
-        "react-vite" => "dist",
-        _ => "docs",
-    }
-}
-
 fn site_preview_base_path(profile_id: &str, session_id: &str, site_slug: &str) -> String {
     format!("/api/preview/{profile_id}/{session_id}/{site_slug}")
 }
@@ -522,7 +512,7 @@ fn site_preview_root_url(profile_id: &str, session_id: &str, site_slug: &str) ->
 fn site_system_prompt(session_topic: &str) -> Option<String> {
     let preset = site_preset_from_topic(session_topic)?;
     let site_slug = slugify(preset.site_name);
-    let build_output_dir = site_build_output_dir(preset.template);
+    let build_output_dir = site_delivery::build_output_dir_for_template(preset.template);
 
     Some(format!(
         r#"You are a website builder for the "{site_name}" project.
@@ -630,7 +620,7 @@ pub fn build_site_project_metadata(
     let site_slug = slugify(preset.site_name);
     let preview_base_path = site_preview_base_path(profile_id, session_id, &site_slug);
     let preview_url = site_preview_root_url(profile_id, session_id, &site_slug);
-    let build_output_dir = site_build_output_dir(preset.template).to_string();
+    let build_output_dir = site_delivery::build_output_dir_for_template(preset.template).to_string();
 
     Some(SiteProjectMetadata {
         version: 1,
@@ -817,7 +807,7 @@ pub fn scaffold_site_project(
     write_site_support_files(&project_dir, &metadata)?;
     write_workspace_policy(
         &project_dir,
-        &WorkspacePolicy::for_site_build_output(&metadata.build_output_dir),
+        &site_delivery::workspace_policy_for_template(&metadata.template),
     )
     .map_err(|e| format!("write site workspace policy failed: {e}"))?;
     initialize_and_commit(
@@ -1007,6 +997,14 @@ mod tests {
     }
 
     #[test]
+    fn site_build_output_dir_is_template_aware() {
+        assert_eq!(site_delivery::build_output_dir_for_template("astro-site"), "dist");
+        assert_eq!(site_delivery::build_output_dir_for_template("nextjs-app"), "out");
+        assert_eq!(site_delivery::build_output_dir_for_template("react-vite"), "dist");
+        assert_eq!(site_delivery::build_output_dir_for_template("unknown"), "docs");
+    }
+
+    #[test]
     fn should_activate_site_template_and_write_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let reply = try_activate_site_template(tmp.path(), "site nextjs").expect("site reply");
@@ -1022,7 +1020,7 @@ mod tests {
 
     #[test]
     fn site_workspace_policy_tracks_template_build_output() {
-        let policy = WorkspacePolicy::for_site_build_output("out");
+        let policy = octos_agent::WorkspacePolicy::for_site_build_output("out");
         assert_eq!(
             policy.validation.on_completion,
             vec!["file_exists:out/index.html"]

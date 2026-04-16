@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum WorkflowKind {
     DeepResearch,
     ResearchPodcast,
+    Slides,
+    Site,
 }
 
 impl WorkflowKind {
@@ -52,6 +54,8 @@ impl WorkflowKind {
         match self {
             Self::DeepResearch => workflows::research_report::build(),
             Self::ResearchPodcast => workflows::research_podcast::build(),
+            Self::Slides => workflows::slides_delivery::build(),
+            Self::Site => workflows::site_delivery::build(),
         }
     }
 }
@@ -162,14 +166,40 @@ mod tests {
     fn workflow_instance_serializes_spawn_metadata_shape() {
         let workflow = WorkflowKind::DeepResearch.build();
         let value = serde_json::to_value(&workflow).unwrap();
-        assert_eq!(
-            value.get("workflow_kind").and_then(|v| v.as_str()),
-            Some("deep_research")
-        );
+        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("deep_research"));
         assert_eq!(value.get("kind"), None);
+        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("research"));
+    }
+
+    #[test]
+    fn workflow_instance_serializes_slides_metadata_shape() {
+        let workflow = WorkflowKind::Slides.build();
+        let value = serde_json::to_value(&workflow).unwrap();
+        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("slides"));
+        assert_eq!(value.get("kind"), None);
+        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("design"));
         assert_eq!(
-            value.get("current_phase").and_then(|v| v.as_str()),
-            Some("research")
+            value
+                .get("terminal_output")
+                .and_then(|output| output.get("required_artifact_kind"))
+                .and_then(|v| v.as_str()),
+            Some("presentation")
+        );
+    }
+
+    #[test]
+    fn workflow_instance_serializes_site_metadata_shape() {
+        let workflow = WorkflowKind::Site.build();
+        let value = serde_json::to_value(&workflow).unwrap();
+        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("site"));
+        assert_eq!(value.get("kind"), None);
+        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("scaffold"));
+        assert_eq!(
+            value
+                .get("terminal_output")
+                .and_then(|output| output.get("required_artifact_kind"))
+                .and_then(|v| v.as_str()),
+            Some("site")
         );
     }
 }
