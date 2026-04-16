@@ -43,7 +43,9 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
-    /// Wall-clock timeout for the entire agent run. None = unlimited.
+    /// Activity timeout for the entire agent run. None = unlimited.
+    /// This is only enforced when the loop has not reported recent progress,
+    /// so active long-running turns are not killed just because wall time grew.
     pub max_timeout: Option<std::time::Duration>,
     /// Whether to save episodes to memory.
     pub save_episodes: bool,

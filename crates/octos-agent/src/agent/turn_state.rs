@@ -13,7 +13,7 @@ pub(crate) enum LoopBudgetStopKind {
     Shutdown,
     MaxIterations,
     MaxTokens,
-    WallClockTimeout,
+    ActivityTimeout,
     IdleProgressTimeout,
 }
 
@@ -23,7 +23,7 @@ impl From<&BudgetStop> for LoopBudgetStopKind {
             BudgetStop::Shutdown => Self::Shutdown,
             BudgetStop::MaxIterations => Self::MaxIterations,
             BudgetStop::MaxTokens { .. } => Self::MaxTokens,
-            BudgetStop::WallClockTimeout { .. } => Self::WallClockTimeout,
+            BudgetStop::ActivityTimeout { .. } => Self::ActivityTimeout,
             BudgetStop::IdleProgressTimeout { .. } => Self::IdleProgressTimeout,
         }
     }

@@ -43,6 +43,11 @@ impl LoopActivityState {
         self.idle_elapsed() >= limit
     }
 
+    /// Returns `true` when the loop has reported progress within `limit`.
+    pub(crate) fn recently_active_within(&self, limit: Duration) -> bool {
+        self.idle_elapsed() < limit
+    }
+
     #[cfg(test)]
     pub(crate) fn set_last_activity_at(&self, instant: Instant) {
         *self
@@ -113,6 +118,7 @@ mod tests {
 
         assert_eq!(delegate.calls.load(Ordering::SeqCst), 1);
         assert!(!activity.has_timed_out(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)));
+        assert!(activity.recently_active_within(Duration::from_secs(1)));
     }
 
     #[test]
@@ -123,5 +129,6 @@ mod tests {
         );
 
         assert!(activity.has_timed_out(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)));
+        assert!(!activity.recently_active_within(Duration::from_secs(1)));
     }
 }
