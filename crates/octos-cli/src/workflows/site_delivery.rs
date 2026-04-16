@@ -1,19 +1,23 @@
+use crate::workflow_runtime::workflow_families::SiteTemplate;
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
 use octos_agent::WorkspacePolicy;
 
+pub fn build_output_dir_for_template_kind(template: SiteTemplate) -> &'static str {
+    template.output_dir()
+}
+
 pub fn build_output_dir_for_template(template: &str) -> &'static str {
-    match template {
-        "astro-site" => "dist",
-        "nextjs-app" => "out",
-        "react-vite" => "dist",
-        _ => "docs",
-    }
+    build_output_dir_for_template_kind(SiteTemplate::from_slug(template))
+}
+
+pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePolicy {
+    WorkspacePolicy::for_site_build_output(build_output_dir_for_template_kind(template))
 }
 
 pub fn workspace_policy_for_template(template: &str) -> WorkspacePolicy {
-    WorkspacePolicy::for_site_build_output(build_output_dir_for_template(template))
+    workspace_policy_for_template_kind(SiteTemplate::from_slug(template))
 }
 
 pub fn build() -> WorkflowInstance {
@@ -73,6 +77,22 @@ mod tests {
         assert_eq!(build_output_dir_for_template("nextjs-app"), "out");
         assert_eq!(build_output_dir_for_template("react-vite"), "dist");
         assert_eq!(build_output_dir_for_template("other"), "docs");
+    }
+
+    #[test]
+    fn build_output_dir_is_template_typed() {
+        assert_eq!(
+            build_output_dir_for_template_kind(SiteTemplate::AstroSite),
+            "dist"
+        );
+        assert_eq!(
+            build_output_dir_for_template_kind(SiteTemplate::NextjsApp),
+            "out"
+        );
+        assert_eq!(
+            build_output_dir_for_template_kind(SiteTemplate::Docs),
+            "docs"
+        );
     }
 
     #[test]

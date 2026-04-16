@@ -1,5 +1,7 @@
-use crate::workflows;
 use serde::{Deserialize, Serialize};
+
+#[path = "workflow_families/mod.rs"]
+pub mod workflow_families;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,12 +53,11 @@ impl WorkflowKind {
     }
 
     pub fn build(self) -> WorkflowInstance {
-        match self {
-            Self::DeepResearch => workflows::research_report::build(),
-            Self::ResearchPodcast => workflows::research_podcast::build(),
-            Self::Slides => workflows::slides_delivery::build(),
-            Self::Site => workflows::site_delivery::build(),
-        }
+        workflow_families::compile_default(self)
+    }
+
+    pub fn plan(self) -> workflow_families::WorkflowPlan {
+        workflow_families::WorkflowPlanRequest::default_for_kind(self).compile()
     }
 }
 
@@ -166,18 +167,30 @@ mod tests {
     fn workflow_instance_serializes_spawn_metadata_shape() {
         let workflow = WorkflowKind::DeepResearch.build();
         let value = serde_json::to_value(&workflow).unwrap();
-        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("deep_research"));
+        assert_eq!(
+            value.get("workflow_kind").and_then(|v| v.as_str()),
+            Some("deep_research")
+        );
         assert_eq!(value.get("kind"), None);
-        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("research"));
+        assert_eq!(
+            value.get("current_phase").and_then(|v| v.as_str()),
+            Some("research")
+        );
     }
 
     #[test]
     fn workflow_instance_serializes_slides_metadata_shape() {
         let workflow = WorkflowKind::Slides.build();
         let value = serde_json::to_value(&workflow).unwrap();
-        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("slides"));
+        assert_eq!(
+            value.get("workflow_kind").and_then(|v| v.as_str()),
+            Some("slides")
+        );
         assert_eq!(value.get("kind"), None);
-        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("design"));
+        assert_eq!(
+            value.get("current_phase").and_then(|v| v.as_str()),
+            Some("design")
+        );
         assert_eq!(
             value
                 .get("terminal_output")
@@ -191,9 +204,15 @@ mod tests {
     fn workflow_instance_serializes_site_metadata_shape() {
         let workflow = WorkflowKind::Site.build();
         let value = serde_json::to_value(&workflow).unwrap();
-        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("site"));
+        assert_eq!(
+            value.get("workflow_kind").and_then(|v| v.as_str()),
+            Some("site")
+        );
         assert_eq!(value.get("kind"), None);
-        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("scaffold"));
+        assert_eq!(
+            value.get("current_phase").and_then(|v| v.as_str()),
+            Some("scaffold")
+        );
         assert_eq!(
             value
                 .get("terminal_output")
@@ -201,5 +220,30 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("site")
         );
+    }
+
+    #[test]
+    fn workflow_kind_plan_compiles_via_registry() {
+        let plan = WorkflowKind::ResearchPodcast.plan();
+        assert_eq!(plan.kind(), WorkflowKind::ResearchPodcast);
+
+        let workflow = plan.clone().into_instance();
+        assert_eq!(workflow.kind, WorkflowKind::ResearchPodcast);
+        assert_eq!(workflow.current_phase.as_str(), "research");
+    }
+
+    #[test]
+    fn workflow_kind_build_uses_registry_defaults() {
+        let kinds = [
+            WorkflowKind::DeepResearch,
+            WorkflowKind::ResearchPodcast,
+            WorkflowKind::Slides,
+            WorkflowKind::Site,
+        ];
+
+        for kind in kinds {
+            let workflow = kind.build();
+            assert_eq!(workflow.kind, kind);
+        }
     }
 }
