@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-03-22T06:00:00Z",
+  "updated_at": "2026-04-16T22:00:15Z",
   "models": [
     {
       "provider": "minimax/MiniMax-M2.7",
@@ -13,6 +13,19 @@
       "ds_output": 7848,
       "context_window": 200000,
       "max_output": 131072
+    },
+    {
+      "provider": "wisemodel/minimax-m2.5-highspeed",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 1044,
+      "p95_ms": 1846,
+      "score": 0.0,
+      "cost_in": 0.001,
+      "cost_out": 0.001,
+      "ds_output": 0,
+      "context_window": 200000,
+      "max_output": 16384
     },
     {
       "provider": "zai/glm-5",

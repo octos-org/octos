@@ -1,0 +1,72 @@
+[
+  {
+    "provider": "wisemodel/minimax-m2.5-highspeed",
+    "stability": [
+      {
+        "tool_count": 5,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 863,
+        "p95_latency_ms": 1108
+      },
+      {
+        "tool_count": 10,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 842,
+        "p95_latency_ms": 959
+      },
+      {
+        "tool_count": 15,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 878,
+        "p95_latency_ms": 1070
+      },
+      {
+        "tool_count": 20,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 807,
+        "p95_latency_ms": 823
+      },
+      {
+        "tool_count": 25,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 937,
+        "p95_latency_ms": 1420
+      },
+      {
+        "tool_count": 30,
+        "attempts": 5,
+        "successes": 5,
+        "empty_responses": 0,
+        "errors": 0,
+        "response_rate": 1.0,
+        "avg_latency_ms": 1937,
+        "p95_latency_ms": 5696
+      }
+    ],
+    "quality": null,
+    "stress": null,
+    "cliff_point": 30,
+    "max_tools_90pct": 30,
+    "overall_score": 1.0
+  }
+]

@@ -473,6 +473,16 @@ fn create_providers() -> Vec<ProviderInfo> {
         });
     }
 
+    // WiseModel / minimax-m2.5-highspeed (OpenAI-compatible)
+    if let Ok(key) = std::env::var("WISEMODEL_API_KEY") {
+        let p = OpenAIProvider::new(&key, "minimax-m2.5-highspeed")
+            .with_base_url("https://open.ospreyai.cn/v1");
+        providers.push(ProviderInfo {
+            name: "wisemodel/minimax-m2.5-highspeed".into(),
+            provider: Box::new(p),
+        });
+    }
+
     // Z.AI / GLM-5 (Anthropic-compatible API)
     if let Ok(key) = std::env::var("ZAI_API_KEY") {
         let p =
