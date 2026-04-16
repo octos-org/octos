@@ -45,6 +45,7 @@ scripts/deploy.sh
 !docs/app-skill-dev-guide-zh.md
 !docs/TESTING.md
 !docs/ARCHITECTURE.md
+!docs/OCTOS_RUNTIME_PHASE2.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 
