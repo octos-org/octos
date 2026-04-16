@@ -6,12 +6,12 @@ use tracing::{info, warn};
 use super::Agent;
 
 impl Agent {
-    pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) {
+    pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
         use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
         use octos_llm::context::{estimate_message_tokens, estimate_tokens};
 
         if messages.len() <= 1 + MIN_RECENT_MESSAGES {
-            return;
+            return false;
         }
 
         let window = self.llm.context_window();
@@ -19,7 +19,7 @@ impl Agent {
 
         let total: u32 = messages.iter().map(estimate_message_tokens).sum();
         if total <= budget {
-            return;
+            return false;
         }
 
         let system_tokens = estimate_message_tokens(&messages[0]);
@@ -28,7 +28,7 @@ impl Agent {
                 system_tokens,
                 budget, "system prompt exceeds context window budget, cannot trim"
             );
-            return;
+            return false;
         }
 
         let split = find_recent_boundary(messages, budget, system_tokens);
@@ -36,13 +36,12 @@ impl Agent {
 
         // If recent messages alone exceed budget, fall back to simple truncation
         if system_tokens + recent_tokens >= budget {
-            self.fallback_truncate(messages, budget);
-            return;
+            return self.fallback_truncate(messages, budget);
         }
 
         let old_messages = &messages[1..split];
         if old_messages.is_empty() {
-            return;
+            return false;
         }
 
         let summary_budget = budget - system_tokens - recent_tokens;
@@ -74,10 +73,11 @@ impl Agent {
             "compacted conversation history ({} token budget)",
             budget
         );
+        true
     }
 
     /// Simple truncation fallback when even recent messages exceed budget.
-    pub(super) fn fallback_truncate(&self, messages: &mut Vec<Message>, limit: u32) {
+    pub(super) fn fallback_truncate(&self, messages: &mut Vec<Message>, limit: u32) -> bool {
         let system_tokens = octos_llm::context::estimate_message_tokens(&messages[0]);
         let mut kept_tokens = system_tokens;
         let mut keep_from = messages.len();
@@ -111,6 +111,8 @@ impl Agent {
                 "fallback truncation ({} token limit)",
                 limit
             );
+            return dropped > 0;
         }
+        false
     }
 }

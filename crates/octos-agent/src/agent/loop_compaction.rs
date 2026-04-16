@@ -12,6 +12,7 @@ use super::message_repair::{
     normalize_system_messages, normalize_tool_call_ids, repair_message_order, repair_tool_pairs,
     synthesize_missing_tool_results, truncate_old_tool_results,
 };
+use super::turn_state::{LoopRepairReason, LoopTurnState};
 
 /// Prepare a conversation turn for the next model call.
 ///
@@ -23,14 +24,32 @@ use super::message_repair::{
 /// 4. synthesize missing tool results as a last resort
 /// 5. truncate old tool outputs
 /// 6. normalize tool call IDs
-pub(crate) fn prepare_conversation_messages(agent: &Agent, messages: &mut Vec<Message>) {
-    agent.trim_to_context_window(messages);
-    normalize_system_messages(messages);
-    repair_message_order(messages);
-    repair_tool_pairs(messages);
-    synthesize_missing_tool_results(messages);
-    truncate_old_tool_results(messages);
-    normalize_tool_call_ids(messages);
+pub(crate) fn prepare_conversation_messages(
+    agent: &Agent,
+    messages: &mut Vec<Message>,
+    turn: &mut LoopTurnState,
+) {
+    if agent.trim_to_context_window(messages) {
+        turn.record_repair(LoopRepairReason::ContextTrimmed);
+    }
+    if normalize_system_messages(messages) {
+        turn.record_repair(LoopRepairReason::SystemMessagesNormalized);
+    }
+    if repair_message_order(messages) {
+        turn.record_repair(LoopRepairReason::MessageOrderRepaired);
+    }
+    if repair_tool_pairs(messages) {
+        turn.record_repair(LoopRepairReason::ToolPairsRepaired);
+    }
+    if synthesize_missing_tool_results(messages) {
+        turn.record_repair(LoopRepairReason::MissingToolResultsSynthesized);
+    }
+    if truncate_old_tool_results(messages) {
+        turn.record_repair(LoopRepairReason::OldToolResultsTruncated);
+    }
+    if normalize_tool_call_ids(messages) {
+        turn.record_repair(LoopRepairReason::ToolCallIdsNormalized);
+    }
 }
 
 /// Prepare a task turn for the next model call.
@@ -38,9 +57,17 @@ pub(crate) fn prepare_conversation_messages(agent: &Agent, messages: &mut Vec<Me
 /// Task loops currently only need context trimming plus tool-call ID
 /// normalization.  Keeping this as a dedicated helper makes the task loop
 /// testable without the surrounding orchestration.
-pub(crate) fn prepare_task_messages(agent: &Agent, messages: &mut Vec<Message>) {
-    agent.trim_to_context_window(messages);
-    normalize_tool_call_ids(messages);
+pub(crate) fn prepare_task_messages(
+    agent: &Agent,
+    messages: &mut Vec<Message>,
+    turn: &mut LoopTurnState,
+) {
+    if agent.trim_to_context_window(messages) {
+        turn.record_repair(LoopRepairReason::ContextTrimmed);
+    }
+    if normalize_tool_call_ids(messages) {
+        turn.record_repair(LoopRepairReason::ToolCallIdsNormalized);
+    }
 }
 
 #[cfg(test)]
@@ -53,6 +80,7 @@ mod tests {
     use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::EpisodeStore;
     use std::sync::Arc;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     use crate::tools::ToolRegistry;
@@ -186,6 +214,7 @@ mod tests {
     #[tokio::test]
     async fn should_budget_oversized_tool_outputs_deterministically() {
         let (_dir, agent) = setup_agent(300).await;
+        let mut turn = LoopTurnState::new(Instant::now());
         let huge = "x".repeat(5_000);
         let base = vec![
             sys("prompt"),
@@ -200,8 +229,9 @@ mod tests {
 
         let mut first = base.clone();
         let mut second = base.clone();
-        prepare_conversation_messages(&agent, &mut first);
-        prepare_conversation_messages(&agent, &mut second);
+        prepare_conversation_messages(&agent, &mut first, &mut turn);
+        let mut second_turn = LoopTurnState::new(Instant::now());
+        prepare_conversation_messages(&agent, &mut second, &mut second_turn);
 
         assert_eq!(projection(&first), projection(&second));
         let truncated_tool = first
@@ -214,11 +244,20 @@ mod tests {
                 .contains("[... truncated for brevity]")
         );
         assert!(truncated_tool.content.len() <= 830);
+        assert!(!turn.repair_reasons().is_empty());
+        assert!(
+            turn.repair_reasons()
+                .contains(&LoopRepairReason::ContextTrimmed)
+                || turn
+                    .repair_reasons()
+                    .contains(&LoopRepairReason::OldToolResultsTruncated)
+        );
     }
 
     #[tokio::test]
     async fn should_preserve_tool_result_validity_after_compaction() {
         let (_dir, agent) = setup_agent(300).await;
+        let mut turn = LoopTurnState::new(Instant::now());
         let huge = "y".repeat(5_000);
         let mut messages = vec![
             sys("prompt"),
@@ -231,7 +270,7 @@ mod tests {
             user("current question"),
         ];
 
-        prepare_conversation_messages(&agent, &mut messages);
+        prepare_conversation_messages(&agent, &mut messages, &mut turn);
 
         let assistant_idx = messages
             .iter()

@@ -24,7 +24,7 @@ pub(crate) fn sanitize_tool_call_id(id: &str) -> String {
 /// This rewrites ALL tool_call_ids to a consistent format, ensuring both
 /// the assistant message's tool_calls[].id and the tool message's
 /// tool_call_id match.
-pub(crate) fn normalize_tool_call_ids(messages: &mut [Message]) {
+pub(crate) fn normalize_tool_call_ids(messages: &mut [Message]) -> bool {
     use std::collections::HashMap;
 
     // Build a mapping of old_id → normalized_id
@@ -43,24 +43,32 @@ pub(crate) fn normalize_tool_call_ids(messages: &mut [Message]) {
     }
 
     if id_map.is_empty() {
-        return;
+        return false;
     }
 
     // Second pass: rewrite IDs in both assistant tool_calls and tool messages
+    let mut changed = false;
     for msg in messages.iter_mut() {
         if let Some(ref mut tool_calls) = msg.tool_calls {
             for tc in tool_calls.iter_mut() {
                 if let Some(new_id) = id_map.get(&tc.id) {
+                    if tc.id != *new_id {
+                        changed = true;
+                    }
                     tc.id = new_id.clone();
                 }
             }
         }
         if let Some(ref old_id) = msg.tool_call_id {
             if let Some(new_id) = id_map.get(old_id) {
+                if old_id != new_id {
+                    changed = true;
+                }
                 msg.tool_call_id = Some(new_id.clone());
             }
         }
     }
+    changed
 }
 
 fn normalize_one_id(id: &str) -> String {
@@ -81,15 +89,16 @@ fn normalize_one_id(id: &str) -> String {
 /// After context compaction or session history reload, system messages can end
 /// up scattered throughout the message list.  This collects their content into
 /// the first system message and removes the rest.
-pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
+pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) -> bool {
     if messages.len() <= 1 {
-        return;
+        return false;
     }
 
     // Convert context-bearing system messages (background task results,
     // conversation summaries) to user messages so they don't bloat the
     // system prompt.  These contain prior conversation content, not
     // instructions for the model.
+    let mut changed = false;
     for m in messages.iter_mut().skip(1) {
         if m.role == MessageRole::System
             && (m.content.starts_with("[Background task")
@@ -97,6 +106,7 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
         {
             m.role = MessageRole::User;
             m.content = format!("[System note] {}", m.content);
+            changed = true;
         }
     }
 
@@ -109,7 +119,7 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
         }
     }
     if extra_indices.is_empty() {
-        return;
+        return changed;
     }
     let extra_content: Vec<String> = extra_indices
         .iter()
@@ -124,10 +134,13 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
             first.content.push_str("\n\n");
             first.content.push_str(&text);
         }
+        changed = true;
     }
     for &i in extra_indices.iter().rev() {
         messages.remove(i);
+        changed = true;
     }
+    changed
 }
 
 /// Gather scattered tool results to be contiguous with their parent assistant.
@@ -146,10 +159,11 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) {
 ///
 /// This handles backward-stranded results (e.g. from overflow tasks saving
 /// results before the assistant message) and duplicate results.
-pub(crate) fn repair_message_order(messages: &mut Vec<Message>) {
+pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
     use std::collections::{HashMap, HashSet};
 
     let mut i = 0;
+    let mut changed = false;
     while i < messages.len() {
         // Find assistant message with tool_calls
         let has_tool_calls = messages[i].role == MessageRole::Assistant
@@ -187,6 +201,7 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) {
                     .is_some_and(|id| expected_ids.contains(id));
             if is_match {
                 let msg = messages.remove(j);
+                changed = true;
                 // Overwrite keeps the last occurrence (latest result)
                 let id = msg.tool_call_id.clone().unwrap();
                 collected.insert(id, msg);
@@ -210,12 +225,14 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) {
         for id in &call_ids {
             if let Some(msg) = collected.remove(id) {
                 messages.insert(insert_pos, msg);
+                changed = true;
                 insert_pos += 1;
             }
         }
 
         i = insert_pos;
     }
+    changed
 }
 
 /// Repair orphaned tool_call / tool_result pairs in the message list.
@@ -226,7 +243,7 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) {
 ///
 /// Strategy: find matched pairs (call ID exists in both assistant tool_calls
 /// AND tool result messages). Strip anything unmatched.
-pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
+pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) -> bool {
     use std::collections::HashSet;
 
     // Collect all tool_call IDs from assistant messages
@@ -252,6 +269,7 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
     let matched: HashSet<&String> = call_ids.intersection(&result_ids).collect();
 
     // Strip tool_calls from assistant messages where ANY call ID is unmatched
+    let mut changed = false;
     for m in messages.iter_mut() {
         if m.role == MessageRole::Assistant {
             if let Some(ref calls) = m.tool_calls {
@@ -261,6 +279,7 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
                         m.content = format!("[Called tools: {}]", names.join(", "));
                     }
                     m.tool_calls = None;
+                    changed = true;
                 }
             }
         }
@@ -279,6 +298,7 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
         })
         .collect();
 
+    let original_len = messages.len();
     messages.retain(|m| {
         if m.role == MessageRole::Tool {
             match m.tool_call_id {
@@ -288,6 +308,7 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
         }
         true
     });
+    changed || messages.len() != original_len
 }
 
 /// Ensure every assistant message with tool_calls has a matching tool result
@@ -298,10 +319,11 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) {
 /// repair_tool_pairs.  It handles edge cases where tool results were lost
 /// (e.g. session write failure, crash between assistant save and tool result
 /// save, or ID mismatch after sanitization).
-pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
+pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bool {
     use std::collections::HashSet;
 
     let mut i = 0;
+    let mut changed = false;
     while i < messages.len() {
         let has_tool_calls = messages[i].role == MessageRole::Assistant
             && messages[i]
@@ -359,12 +381,14 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
                         timestamp: messages[i].timestamp,
                     },
                 );
+                changed = true;
                 inserted += 1;
             }
         }
 
         i = insert_pos + inserted;
     }
+    changed
 }
 
 /// Truncate long tool result messages from prior conversation rounds.
@@ -379,16 +403,17 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) {
 /// `MAX_OLD_TOOL_RESULT_CHARS`.  Tool results in the current conversation
 /// round (after the last user message) are kept intact so the agent can
 /// reference them.
-pub(crate) fn truncate_old_tool_results(messages: &mut [Message]) {
+pub(crate) fn truncate_old_tool_results(messages: &mut [Message]) -> bool {
     const MAX_OLD_TOOL_RESULT_CHARS: usize = 800;
 
     // Find the last user message -- everything before it is "old" context
     let last_user_idx = messages.iter().rposition(|m| m.role == MessageRole::User);
     let boundary = match last_user_idx {
         Some(idx) => idx,
-        None => return, // no user message, nothing to truncate
+        None => return false, // no user message, nothing to truncate
     };
 
+    let mut changed = false;
     for msg in messages[..boundary].iter_mut() {
         if msg.role == MessageRole::Tool && msg.content.len() > MAX_OLD_TOOL_RESULT_CHARS {
             let truncated: String = msg
@@ -397,8 +422,10 @@ pub(crate) fn truncate_old_tool_results(messages: &mut [Message]) {
                 .take(MAX_OLD_TOOL_RESULT_CHARS)
                 .collect();
             msg.content = format!("{truncated}\n\n[... truncated for brevity]");
+            changed = true;
         }
     }
+    changed
 }
 
 #[cfg(test)]

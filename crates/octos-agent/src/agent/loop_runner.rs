@@ -14,12 +14,22 @@ use tracing::{Instrument, info, info_span, warn};
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::message_repair::sanitize_tool_call_id;
-use super::turn_state::LoopTurnState;
+use super::turn_state::{LoopRetryReason, LoopTurnState};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
+
+const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
+
+fn split_tool_calls<'a>(
+    tool_calls: &'a [octos_core::ToolCall],
+    batch_size: usize,
+) -> Vec<&'a [octos_core::ToolCall]> {
+    debug_assert!(batch_size > 0);
+    tool_calls.chunks(batch_size).collect()
+}
 
 impl Agent {
     fn enforce_session_limits_on_tool_calls(
@@ -256,7 +266,8 @@ impl Agent {
                     }
 
                     let tools_spec = self.tools.specs();
-                    prepare_conversation_messages(self, &mut messages);
+                    prepare_conversation_messages(self, &mut messages, &mut turn);
+                    let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
                         tracing::warn!(
@@ -278,7 +289,8 @@ impl Agent {
                             &tools_spec,
                             &config,
                             iteration,
-                            turn.total_usage(),
+                            &total_usage,
+                            &mut turn,
                         )
                         .await
                     {
@@ -286,6 +298,9 @@ impl Agent {
                         Err(e) if e.to_string().contains("empty response after") => {
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
+                            turn.record_retry(LoopRetryReason::ProviderFailover {
+                                reason: "adaptive failover after empty response".to_string(),
+                            });
                             warn!(error = %e, "retrying LLM call for adaptive failover");
                             self.reporter().report(ProgressEvent::LlmStatus {
                                 message: "Switching provider...".to_string(),
@@ -296,7 +311,8 @@ impl Agent {
                                 &tools_spec,
                                 &config,
                                 iteration,
-                                turn.total_usage(),
+                                &total_usage,
+                                &mut turn,
                             )
                             .await?
                         }
@@ -516,7 +532,8 @@ impl Agent {
                 }
 
                 let tools_spec = self.tools.specs();
-                prepare_task_messages(self, &mut messages);
+                prepare_task_messages(self, &mut messages, &mut turn);
+                let total_usage = turn.total_usage().clone();
 
                 let (response, _streamed) = self
                     .call_llm_with_hooks(
@@ -524,7 +541,8 @@ impl Agent {
                         &tools_spec,
                         &config,
                         iteration,
-                        turn.total_usage(),
+                        &total_usage,
+                        &mut turn,
                     )
                     .await?;
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
@@ -749,8 +767,35 @@ impl Agent {
         messages.push(self.response_to_message(&response));
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
-        let (tool_messages, tool_files, tool_send_files, tool_tokens) =
-            self.execute_tools(&limited_response).await?;
+        let tool_batches = split_tool_calls(
+            &limited_response.tool_calls,
+            MAX_PARALLEL_TOOL_CALLS_PER_BATCH,
+        );
+        if tool_batches.len() > 1 {
+            tracing::info!(
+                requested_tools = limited_response.tool_calls.len(),
+                batch_size = MAX_PARALLEL_TOOL_CALLS_PER_BATCH,
+                batches = tool_batches.len(),
+                "capping parallel tool execution per turn"
+            );
+        }
+
+        let mut tool_messages = Vec::new();
+        let mut tool_files = Vec::new();
+        let mut tool_send_files = Vec::new();
+        let mut tool_tokens = TokenUsage::default();
+        for batch in tool_batches {
+            let mut batch_response = limited_response.clone();
+            batch_response.tool_calls = batch.to_vec();
+            let (batch_messages, batch_files, batch_send_files, batch_tokens) =
+                self.execute_tools(&batch_response).await?;
+            tool_messages.extend(batch_messages);
+            tool_files.extend(batch_files);
+            tool_send_files.extend(batch_send_files);
+            tool_tokens.input_tokens += batch_tokens.input_tokens;
+            tool_tokens.output_tokens += batch_tokens.output_tokens;
+        }
+
         messages.extend(merge_tool_messages_in_order(
             &response,
             &limited_response,
@@ -1240,5 +1285,24 @@ mod tests {
                 && content.contains("podcast_generate")
                 && content.contains("max 1")
         }));
+    }
+
+    #[test]
+    fn split_tool_calls_caps_parallel_batches() {
+        let tool_calls: Vec<ToolCall> = (0..9)
+            .map(|i| ToolCall {
+                id: format!("call_{i}"),
+                name: format!("tool_{i}"),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            })
+            .collect();
+
+        let batches = split_tool_calls(&tool_calls, MAX_PARALLEL_TOOL_CALLS_PER_BATCH);
+        let batch_sizes: Vec<_> = batches.iter().map(|batch| batch.len()).collect();
+
+        assert_eq!(batch_sizes, vec![8, 1]);
+        assert_eq!(batches[0][0].id, "call_0");
+        assert_eq!(batches[1][0].id, "call_8");
     }
 }

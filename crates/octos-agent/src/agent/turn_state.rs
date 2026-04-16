@@ -37,11 +37,31 @@ pub(crate) enum LoopTerminalReason {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoopRetryReason {
+    EmptyResponse { attempt: u32, reason: String },
+    StreamError { attempt: u32, error: String },
+    ProviderFailover { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoopRepairReason {
+    ContextTrimmed,
+    SystemMessagesNormalized,
+    MessageOrderRepaired,
+    ToolPairsRepaired,
+    MissingToolResultsSynthesized,
+    OldToolResultsTruncated,
+    ToolCallIdsNormalized,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoopTurnState {
     started_at: Instant,
     iteration: u32,
     total_usage: TokenUsage,
+    retry_reasons: Vec<LoopRetryReason>,
+    repair_reasons: Vec<LoopRepairReason>,
     terminal_reason: Option<LoopTerminalReason>,
 }
 
@@ -51,6 +71,8 @@ impl LoopTurnState {
             started_at,
             iteration: 0,
             total_usage: TokenUsage::default(),
+            retry_reasons: Vec::new(),
+            repair_reasons: Vec::new(),
             terminal_reason: None,
         }
     }
@@ -66,6 +88,16 @@ impl LoopTurnState {
 
     pub(crate) fn total_usage(&self) -> &TokenUsage {
         &self.total_usage
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_reasons(&self) -> &[LoopRetryReason] {
+        &self.retry_reasons
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repair_reasons(&self) -> &[LoopRepairReason] {
+        &self.repair_reasons
     }
 
     pub(crate) fn record_usage(
@@ -86,6 +118,14 @@ impl LoopTurnState {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+    }
+
+    pub(crate) fn record_retry(&mut self, reason: LoopRetryReason) {
+        self.retry_reasons.push(reason);
+    }
+
+    pub(crate) fn record_repair(&mut self, reason: LoopRepairReason) {
+        self.repair_reasons.push(reason);
     }
 
     pub(crate) fn check_budget(
@@ -137,6 +177,41 @@ mod tests {
                 kind: LoopBudgetStopKind::MaxTokens,
                 message: "Token budget exceeded (120 of 100).".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn records_retry_and_repair_history() {
+        let mut state = LoopTurnState::new(Instant::now());
+
+        state.record_retry(LoopRetryReason::EmptyResponse {
+            attempt: 1,
+            reason: "empty response".to_string(),
+        });
+        state.record_retry(LoopRetryReason::ProviderFailover {
+            reason: "streaming retries exhausted".to_string(),
+        });
+        state.record_repair(LoopRepairReason::ContextTrimmed);
+        state.record_repair(LoopRepairReason::ToolCallIdsNormalized);
+
+        assert_eq!(
+            state.retry_reasons(),
+            &[
+                LoopRetryReason::EmptyResponse {
+                    attempt: 1,
+                    reason: "empty response".to_string(),
+                },
+                LoopRetryReason::ProviderFailover {
+                    reason: "streaming retries exhausted".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            state.repair_reasons(),
+            &[
+                LoopRepairReason::ContextTrimmed,
+                LoopRepairReason::ToolCallIdsNormalized,
+            ]
         );
     }
 }

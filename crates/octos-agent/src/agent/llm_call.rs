@@ -9,6 +9,7 @@ use octos_llm::{ChatConfig, ChatResponse, StopReason, ToolSpec};
 use tracing::{info, warn};
 
 use super::Agent;
+use super::turn_state::{LoopRetryReason, LoopTurnState};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 
@@ -25,6 +26,7 @@ impl Agent {
         config: &ChatConfig,
         iteration: u32,
         total_usage: &TokenUsage,
+        turn: &mut LoopTurnState,
     ) -> Result<(ChatResponse, bool)> {
         let ctx = self.hook_ctx();
         if let Some(ref hooks) = self.hooks {
@@ -105,6 +107,9 @@ impl Agent {
                         } else {
                             "empty response (no content or tool_calls)"
                         };
+                        turn.record_retry(LoopRetryReason::ProviderFailover {
+                            reason: format!("streaming retries exhausted: {reason}"),
+                        });
                         self.llm.report_late_failure();
                         warn!(
                             attempts = Self::LLM_RETRY_MAX + 1,
@@ -145,6 +150,10 @@ impl Agent {
                     } else {
                         "empty response (no content/tool_calls)"
                     };
+                    turn.record_retry(LoopRetryReason::EmptyResponse {
+                        attempt: attempt + 1,
+                        reason: reason.to_string(),
+                    });
                     warn!(
                         attempt = attempt + 1,
                         max = Self::LLM_RETRY_MAX,
@@ -172,6 +181,10 @@ impl Agent {
                 Err(e) => {
                     if attempt < Self::LLM_RETRY_MAX && Self::is_retryable_stream_error(&e) {
                         let delay = Duration::from_secs(1 << attempt);
+                        turn.record_retry(LoopRetryReason::StreamError {
+                            attempt: attempt + 1,
+                            error: e.to_string(),
+                        });
                         warn!(
                             attempt = attempt + 1,
                             max = Self::LLM_RETRY_MAX,
@@ -196,6 +209,9 @@ impl Agent {
                         tokio::time::sleep(delay).await;
                     } else if attempt == Self::LLM_RETRY_MAX {
                         // Stream retries exhausted — try non-streaming with full fallback chain
+                        turn.record_retry(LoopRetryReason::ProviderFailover {
+                            reason: "stream retries exhausted".to_string(),
+                        });
                         self.llm.report_late_failure();
                         warn!(
                             error = %e,
