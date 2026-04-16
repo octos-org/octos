@@ -1,3 +1,4 @@
+use crate::workflows;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,29 +50,14 @@ impl WorkflowKind {
 
     pub fn build(self) -> WorkflowInstance {
         match self {
-            Self::DeepResearch => WorkflowInstance {
-                kind: self,
-                label: "Deep research".to_string(),
-                ack_message: "深度研究已在后台启动。完成后会把最终研究结果发回当前会话。"
-                    .to_string(),
-                current_phase: WorkflowPhase::Research,
-                allowed_tools: vec!["run_pipeline".into()],
-                limits: WorkflowLimits::default(),
-                terminal_output: WorkflowTerminalOutput {
-                    deliver_final_artifact_only: true,
-                    deliver_media_only: false,
-                    forbid_intermediate_files: true,
-                    required_artifact_kind: "report".into(),
-                },
-                additional_instructions: "You are a background research analyst. Use run_pipeline with an inline DOT graph to complete the research in the background. Deliver exactly one final user-facing report. Do not emit intermediate status chatter or send intermediate files.".to_string(),
-            },
+            Self::DeepResearch => workflows::research_report::build(),
             Self::ResearchPodcast => WorkflowInstance {
                 kind: self,
                 label: "Research podcast".to_string(),
                 ack_message:
                     "研究和播客生成已在后台启动。完成后只会发送最终音频结果到当前会话。"
                         .to_string(),
-                current_phase: WorkflowPhase::Research,
+                current_phase: WorkflowPhase::new("research"),
                 allowed_tools: vec![
                     "deep_search".into(),
                     "news_fetch".into(),
@@ -99,14 +85,18 @@ impl WorkflowKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowPhase {
-    Research,
-    WriteScript,
-    GenerateAudio,
-    DeliverResult,
-    Failed,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkflowPhase(String);
+
+impl WorkflowPhase {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +121,7 @@ pub struct WorkflowTerminalOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowInstance {
+    #[serde(rename = "workflow_kind")]
     pub kind: WorkflowKind,
     pub label: String,
     pub ack_message: String,
@@ -192,5 +183,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn workflow_instance_serializes_spawn_metadata_shape() {
+        let workflow = WorkflowKind::DeepResearch.build();
+        let value = serde_json::to_value(&workflow).unwrap();
+        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("deep_research"));
+        assert_eq!(value.get("kind"), None);
+        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("research"));
     }
 }
