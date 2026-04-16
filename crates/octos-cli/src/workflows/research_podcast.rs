@@ -23,6 +23,7 @@ pub fn build() -> WorkflowInstance {
             max_dialogue_lines: Some(28),
             target_audio_minutes: Some(15),
             max_generate_calls: Some(1),
+            ..Default::default()
         },
         terminal_output: WorkflowTerminalOutput {
             deliver_final_artifact_only: true,

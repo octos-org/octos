@@ -75,6 +75,8 @@ struct WorkflowUsageLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_search_passes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_pipeline_runs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     max_dialogue_lines: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target_audio_minutes: Option<u32>,
@@ -353,6 +355,12 @@ fn workflow_session_limits(workflow: Option<&WorkflowMetadata>) -> Option<Sessio
             .insert("news_fetch".to_string(), max_search_passes);
     }
 
+    if let Some(max_pipeline_runs) = limits.max_pipeline_runs {
+        session_limits
+            .per_tool_limits
+            .insert("run_pipeline".to_string(), max_pipeline_runs);
+    }
+
     if let Some(max_generate_calls) = limits.max_generate_calls {
         session_limits
             .per_tool_limits
@@ -574,6 +582,7 @@ impl Tool for SpawnTool {
                             "description": "Optional runtime-owned tool and generation budgets for the workflow family.",
                             "properties": {
                                 "max_search_passes": { "type": "integer" },
+                                "max_pipeline_runs": { "type": "integer" },
                                 "max_dialogue_lines": { "type": "integer" },
                                 "target_audio_minutes": { "type": "integer" },
                                 "max_generate_calls": { "type": "integer" }
@@ -1171,6 +1180,7 @@ mod tests {
             ],
             limits: Some(WorkflowUsageLimits {
                 max_search_passes: Some(6),
+                max_pipeline_runs: Some(1),
                 max_generate_calls: Some(1),
                 ..Default::default()
             }),
@@ -1180,7 +1190,28 @@ mod tests {
         let limits = workflow_session_limits(Some(&workflow)).expect("derived limits");
         assert_eq!(limits.per_tool_limits.get("deep_search"), Some(&6));
         assert_eq!(limits.per_tool_limits.get("news_fetch"), Some(&6));
+        assert_eq!(limits.per_tool_limits.get("run_pipeline"), Some(&1));
         assert_eq!(limits.per_tool_limits.get("podcast_generate"), Some(&1));
+    }
+
+    #[test]
+    fn workflow_session_limits_map_report_pipeline_budget() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "deep_research".to_string(),
+            current_phase: "research".to_string(),
+            allowed_tools: vec!["run_pipeline".to_string()],
+            limits: Some(WorkflowUsageLimits {
+                max_search_passes: Some(6),
+                max_pipeline_runs: Some(1),
+                ..Default::default()
+            }),
+            terminal_output: None,
+        };
+
+        let limits = workflow_session_limits(Some(&workflow)).expect("derived limits");
+        assert_eq!(limits.per_tool_limits.get("run_pipeline"), Some(&1));
+        assert_eq!(limits.per_tool_limits.get("deep_search"), Some(&6));
+        assert_eq!(limits.per_tool_limits.get("news_fetch"), Some(&6));
     }
 
     #[tokio::test]

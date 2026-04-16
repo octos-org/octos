@@ -75,6 +75,8 @@ pub struct WorkflowLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_search_passes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pipeline_runs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_dialogue_lines: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_audio_minutes: Option<u32>,
@@ -160,8 +162,14 @@ mod tests {
     fn workflow_instance_serializes_spawn_metadata_shape() {
         let workflow = WorkflowKind::DeepResearch.build();
         let value = serde_json::to_value(&workflow).unwrap();
-        assert_eq!(value.get("workflow_kind").and_then(|v| v.as_str()), Some("deep_research"));
+        assert_eq!(
+            value.get("workflow_kind").and_then(|v| v.as_str()),
+            Some("deep_research")
+        );
         assert_eq!(value.get("kind"), None);
-        assert_eq!(value.get("current_phase").and_then(|v| v.as_str()), Some("research"));
+        assert_eq!(
+            value.get("current_phase").and_then(|v| v.as_str()),
+            Some("research")
+        );
     }
 }
