@@ -428,10 +428,31 @@ fn task_response_path(data_dir: &Path, path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+fn task_runtime_detail_for_response(
+    detail: Option<&str>,
+) -> (serde_json::Value, Option<String>, Option<String>) {
+    let runtime_detail = match detail {
+        Some(detail) => serde_json::from_str(detail)
+            .unwrap_or_else(|_| serde_json::Value::String(detail.to_string())),
+        None => serde_json::Value::Null,
+    };
+    let workflow_kind = runtime_detail
+        .get("workflow_kind")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let current_phase = runtime_detail
+        .get("current_phase")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    (runtime_detail, workflow_kind, current_phase)
+}
+
 fn sanitize_task_for_response(
     data_dir: &Path,
     task: &octos_agent::BackgroundTask,
 ) -> serde_json::Value {
+    let (runtime_detail, workflow_kind, current_phase) =
+        task_runtime_detail_for_response(task.runtime_detail.as_deref());
     serde_json::json!({
         "id": task.id,
         "tool_name": task.tool_name,
@@ -443,7 +464,9 @@ fn sanitize_task_for_response(
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
         "runtime_state": task.runtime_state,
-        "runtime_detail": task.runtime_detail,
+        "runtime_detail": runtime_detail,
+        "workflow_kind": workflow_kind,
+        "current_phase": current_phase,
         "child_terminal_state": task.child_terminal_state,
         "child_join_state": task.child_join_state,
         "child_joined_at": task.child_joined_at,
@@ -4431,7 +4454,7 @@ mod tests {
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["runtime_state"], "completed");
-        assert!(tasks[0]["runtime_detail"].is_null());
+        assert_eq!(tasks[0]["runtime_detail"], "send_file");
         let files = tasks[0]["output_files"].as_array().unwrap();
         assert_eq!(files.len(), 1);
         let handle = files[0].as_str().unwrap();
@@ -4445,6 +4468,60 @@ mod tests {
                 .starts_with("api:session#child-")
         );
         assert!(tasks[0]["task_ledger_path"].is_null());
+    }
+
+    #[test]
+    fn session_task_query_store_exposes_parsed_workflow_runtime_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        let workspace = data_dir
+            .join("users")
+            .join("api%3Asession")
+            .join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "podcast_generate",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::DeliveringOutputs,
+            Some(
+                serde_json::json!({
+                    "workflow_kind": "research_podcast",
+                    "current_phase": "deliver_result"
+                })
+                .to_string(),
+            ),
+        );
+        supervisor.mark_completed(&task_id, vec![]);
+        supervisor.mark_child_session_outcome(
+            &task_id,
+            octos_agent::task_supervisor::ChildSessionTerminalState::Completed,
+            octos_agent::task_supervisor::ChildSessionJoinState::Joined,
+        );
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["runtime_state"], "completed");
+        assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
+        assert_eq!(tasks[0]["current_phase"], "deliver_result");
+        assert_eq!(tasks[0]["runtime_detail"]["workflow_kind"], "research_podcast");
+        assert_eq!(tasks[0]["runtime_detail"]["current_phase"], "deliver_result");
+        assert_eq!(tasks[0]["child_terminal_state"], "completed");
+        assert_eq!(tasks[0]["child_join_state"], "joined");
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────

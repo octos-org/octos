@@ -360,7 +360,6 @@ impl TaskSupervisor {
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Completed;
                 task.runtime_state = TaskRuntimeState::Completed;
-                task.runtime_detail = None;
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.output_files = output_files;
@@ -382,7 +381,6 @@ impl TaskSupervisor {
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
                 task.runtime_state = TaskRuntimeState::Failed;
-                task.runtime_detail = None;
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error);
@@ -804,6 +802,7 @@ mod tests {
             .expect("completed task missing");
         assert_eq!(completed_task.status, TaskStatus::Completed);
         assert_eq!(completed_task.runtime_state, TaskRuntimeState::Completed);
+        assert_eq!(completed_task.runtime_detail.as_deref(), Some("send_file"));
         assert_eq!(completed_task.output_files, vec!["/tmp/output.mp3"]);
         let expected_completed_child = format!("api:session#child-{completed}");
         assert_eq!(
@@ -834,6 +833,7 @@ mod tests {
             .expect("failed task missing");
         assert_eq!(failed_task.status, TaskStatus::Failed);
         assert_eq!(failed_task.runtime_state, TaskRuntimeState::Failed);
+        assert_eq!(failed_task.runtime_detail, None);
         assert_eq!(
             failed_task.error.as_deref(),
             Some("No dialogue lines found in script")
