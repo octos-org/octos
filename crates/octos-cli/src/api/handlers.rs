@@ -1,5 +1,6 @@
 //! API request handlers.
 
+use std::convert::Infallible;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -501,6 +502,14 @@ pub struct TopicQueryParams {
     pub topic: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SessionEventStreamQueryParams {
+    #[serde(default)]
+    pub since_seq: Option<usize>,
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
 fn default_page_limit() -> usize {
     100
 }
@@ -523,6 +532,17 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
             "?topic="
         });
         path.push_str(&octos_bus::session::encode_path_component(topic));
+    }
+}
+
+fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
+    if let Some(since_seq) = since_seq {
+        path.push_str(if path.contains('?') {
+            "&since_seq="
+        } else {
+            "?since_seq="
+        });
+        path.push_str(&since_seq.to_string());
     }
 }
 
@@ -638,6 +658,30 @@ pub async fn session_status(
         "active": false,
     }))
     .into_response()
+}
+
+/// GET /api/sessions/:id/events/stream -- subscribe to committed session events.
+pub async fn session_event_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
+) -> Response {
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let mut path = format!("/sessions/{id}/events/stream");
+        append_since_seq_query(&mut path, params.since_seq);
+        append_topic_query(&mut path, params.topic.as_deref());
+        return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
+    }
+
+    let replay_complete = serde_json::json!({
+        "type": "replay_complete",
+        "topic": params.topic,
+    })
+    .to_string();
+    let stream =
+        futures::stream::iter(vec![Ok::<Event, Infallible>(Event::default().data(replay_complete))]);
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.
@@ -2856,6 +2900,23 @@ mod tests {
         assert_eq!(
             path,
             "/sessions/slides-123/messages?limit=100&topic=slides%20untitled-deck"
+        );
+    }
+
+    #[test]
+    fn append_since_seq_query_uses_question_mark_for_clean_path() {
+        let mut path = "/sessions/slides-123/events/stream".to_string();
+        append_since_seq_query(&mut path, Some(8));
+        assert_eq!(path, "/sessions/slides-123/events/stream?since_seq=8");
+    }
+
+    #[test]
+    fn append_since_seq_query_uses_ampersand_when_query_exists() {
+        let mut path = "/sessions/slides-123/events/stream?topic=slides".to_string();
+        append_since_seq_query(&mut path, Some(8));
+        assert_eq!(
+            path,
+            "/sessions/slides-123/events/stream?topic=slides&since_seq=8"
         );
     }
 

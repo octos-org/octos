@@ -94,6 +94,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/messages",
             get(handlers::session_messages),
         )
+        .route(
+            "/api/sessions/{id}/events/stream",
+            get(handlers::session_event_stream),
+        )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
         .route("/api/sessions/{id}/files", get(handlers::session_files))

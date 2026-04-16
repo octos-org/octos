@@ -51,6 +51,7 @@ impl Agent {
                 let reporter = self.reporter();
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
+                let suppress_auto_send_files = self.config.suppress_auto_send_files;
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
@@ -492,26 +493,28 @@ impl Agent {
                                 });
                             }
 
-                            // Auto-send files explicitly declared by the plugin via files_to_send.
-                            // No heuristic path detection — plugins must opt-in by including
-                            // "files_to_send": ["/path/to/file"] in their JSON output.
-                            let files: Vec<String> = tool_result.files_to_send
-                                .iter()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .collect();
+                            if !suppress_auto_send_files {
+                                // Auto-send files explicitly declared by the plugin via files_to_send.
+                                // No heuristic path detection — plugins must opt-in by including
+                                // "files_to_send": ["/path/to/file"] in their JSON output.
+                                let files: Vec<String> = tool_result.files_to_send
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect();
 
-                            for path_str in &files {
-                                info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
-                                let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
-                                match tools.execute("send_file", &send_args).await {
-                                    Ok(r) if r.success => {
-                                        info!(tool = %tc_name, file = %path_str, "file auto-sent");
-                                    }
-                                    Ok(r) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
-                                    }
-                                    Err(e) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                for path_str in &files {
+                                    info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
+                                    let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
+                                    match tools.execute("send_file", &send_args).await {
+                                        Ok(r) if r.success => {
+                                            info!(tool = %tc_name, file = %path_str, "file auto-sent");
+                                        }
+                                        Ok(r) => {
+                                            warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
+                                        }
+                                        Err(e) => {
+                                            warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                        }
                                     }
                                 }
                             }

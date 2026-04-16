@@ -58,6 +58,10 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Suppress the generic auto-send loop for tool `files_to_send`.
+    /// Background spawned workers rely on their outer workflow/session runtime
+    /// to persist terminal results exactly once.
+    pub suppress_auto_send_files: bool,
 }
 
 /// Default tool execution timeout in seconds.
@@ -77,6 +81,7 @@ impl Default for AgentConfig {
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             chat_max_tokens: None,
+            suppress_auto_send_files: false,
         }
     }
 }

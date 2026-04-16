@@ -772,9 +772,9 @@ impl Tool for SpawnTool {
                     tools.set_provider_policy(pp);
                 }
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
-                if let Some(ref config) = worker_config {
-                    worker = worker.with_config(config.clone());
-                }
+                let mut effective_config = worker_config.clone().unwrap_or_default();
+                effective_config.suppress_auto_send_files = true;
+                worker = worker.with_config(effective_config);
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
