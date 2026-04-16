@@ -37,11 +37,21 @@ pub struct BackgroundResultPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowTerminalOutputPolicy {
+    deliver_final_artifact_only: bool,
+    deliver_media_only: bool,
+    forbid_intermediate_files: bool,
+    required_artifact_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkflowMetadata {
     workflow_kind: String,
     current_phase: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_output: Option<WorkflowTerminalOutputPolicy>,
 }
 
 /// Tool that spawns background worker agents for long-running tasks.
@@ -279,6 +289,82 @@ fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
     serde_json::to_string(workflow).ok()
 }
 
+fn workflow_artifact_matches_kind(path: &PathBuf, kind: &str) -> bool {
+    match kind {
+        "audio" => matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .as_deref(),
+            Some("mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg")
+        ),
+        "report" => matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("md" | "txt" | "pdf" | "html")
+        ),
+        _ => true,
+    }
+}
+
+fn select_preferred_terminal_output(
+    files: &[PathBuf],
+    required_artifact_kind: &str,
+) -> Option<PathBuf> {
+    files
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, path)| {
+            let name = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let mut score = 0_i32;
+            if name.contains("final") || name.contains("full") {
+                score += 20;
+            }
+            if required_artifact_kind == "audio" {
+                if name.contains("podcast") {
+                    score += 10;
+                }
+                if name.ends_with(".mp3") {
+                    score += 5;
+                }
+            }
+            (score, *index as i32)
+        })
+        .map(|(_, path)| path.clone())
+}
+
+fn select_workflow_terminal_files(
+    files_to_send: &[PathBuf],
+    files_modified: &[PathBuf],
+    workflow: Option<&WorkflowMetadata>,
+) -> Option<Vec<PathBuf>> {
+    let policy = workflow?.terminal_output.as_ref()?;
+    let mut candidates = if policy.forbid_intermediate_files {
+        files_to_send.to_vec()
+    } else {
+        files_to_send
+            .iter()
+            .chain(files_modified.iter())
+            .cloned()
+            .collect()
+    };
+
+    candidates.retain(|path| workflow_artifact_matches_kind(path, &policy.required_artifact_kind));
+
+    if policy.deliver_final_artifact_only {
+        return Some(
+            select_preferred_terminal_output(&candidates, &policy.required_artifact_kind)
+                .into_iter()
+                .collect(),
+        );
+    }
+
+    Some(candidates)
+}
+
 async fn deliver_background_result(
     sender: Option<BackgroundResultSender>,
     payload: BackgroundResultPayload,
@@ -402,6 +488,16 @@ impl Tool for SpawnTool {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Workflow-owned tool allowlist snapshot."
+                        },
+                        "terminal_output": {
+                            "type": "object",
+                            "description": "Runtime-owned final output policy for workflow families.",
+                            "properties": {
+                                "deliver_final_artifact_only": { "type": "boolean" },
+                                "deliver_media_only": { "type": "boolean" },
+                                "forbid_intermediate_files": { "type": "boolean" },
+                                "required_artifact_kind": { "type": "string" }
+                            }
                         }
                     },
                     "required": ["workflow_kind", "current_phase"]
@@ -599,12 +695,22 @@ impl Tool for SpawnTool {
 
                 let result = worker.run_task(&subtask).await;
                 let tracked_output_files = match &result {
-                    Ok(task_result) => task_result
-                        .files_to_send
-                        .iter()
-                        .chain(task_result.files_modified.iter())
-                        .map(|path| path.to_string_lossy().to_string())
-                        .collect::<Vec<_>>(),
+                    Ok(task_result) => select_workflow_terminal_files(
+                        &task_result.files_to_send,
+                        &task_result.files_modified,
+                        workflow_metadata.as_ref(),
+                    )
+                    .unwrap_or_else(|| {
+                        task_result
+                            .files_to_send
+                            .iter()
+                            .chain(task_result.files_modified.iter())
+                            .cloned()
+                            .collect()
+                    })
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
                     Err(_) => Vec::new(),
                 };
 
@@ -649,13 +755,33 @@ impl Tool for SpawnTool {
                     Err(e) => format!("Status: FAILED\nError: {e}"),
                 };
                 let (result_kind, result_media) = match &result {
-                    Ok(r) if r.success && should_deliver_output_files(&r.files_to_send) => (
-                        BackgroundResultKind::Notification,
-                        r.files_to_send
-                            .iter()
-                            .map(|path| path.to_string_lossy().to_string())
-                            .collect::<Vec<_>>(),
-                    ),
+                    Ok(r) if r.success => {
+                        let workflow_media = select_workflow_terminal_files(
+                            &r.files_to_send,
+                            &r.files_modified,
+                            workflow_metadata.as_ref(),
+                        )
+                        .unwrap_or_default();
+                        if !workflow_media.is_empty() {
+                            (
+                                BackgroundResultKind::Notification,
+                                workflow_media
+                                    .into_iter()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>(),
+                            )
+                        } else if should_deliver_output_files(&r.files_to_send) {
+                            (
+                                BackgroundResultKind::Notification,
+                                r.files_to_send
+                                    .iter()
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>(),
+                            )
+                        } else {
+                            (BackgroundResultKind::Report, Vec::new())
+                        }
+                    }
                     _ => (BackgroundResultKind::Report, Vec::new()),
                 };
 
@@ -804,6 +930,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_terminal_output_prefers_final_audio_and_skips_intermediates() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "research_podcast".to_string(),
+            current_phase: "generate_audio".to_string(),
+            allowed_tools: vec!["podcast_generate".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: true,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "audio".to_string(),
+            }),
+        };
+
+        let files_to_send = vec![
+            PathBuf::from("/tmp/podcast_part_1.mp3"),
+            PathBuf::from("/tmp/research_report.md"),
+            PathBuf::from("/tmp/podcast_full_final.mp3"),
+        ];
+        let files_modified = vec![PathBuf::from("/tmp/script.md")];
+
+        let selected =
+            select_workflow_terminal_files(&files_to_send, &files_modified, Some(&workflow))
+                .unwrap();
+
+        assert_eq!(selected, vec![PathBuf::from("/tmp/podcast_full_final.mp3")]);
+    }
+
     #[tokio::test]
     async fn test_background_spawn_persists_workflow_phase_transitions() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
@@ -828,7 +982,13 @@ mod tests {
                 "workflow": {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
-                    "allowed_tools": ["podcast_generate"]
+                    "allowed_tools": ["podcast_generate"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "deliver_media_only": true,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "audio"
+                    }
                 }
             }))
             .await
