@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use octos_core::TokenUsage;
 
+use super::activity::LoopActivityState;
 use super::budget::BudgetStop;
 use super::{Agent, TokenTracker};
 
@@ -13,6 +14,7 @@ pub(crate) enum LoopBudgetStopKind {
     MaxIterations,
     MaxTokens,
     WallClockTimeout,
+    IdleProgressTimeout,
 }
 
 impl From<&BudgetStop> for LoopBudgetStopKind {
@@ -22,6 +24,7 @@ impl From<&BudgetStop> for LoopBudgetStopKind {
             BudgetStop::MaxIterations => Self::MaxIterations,
             BudgetStop::MaxTokens { .. } => Self::MaxTokens,
             BudgetStop::WallClockTimeout { .. } => Self::WallClockTimeout,
+            BudgetStop::IdleProgressTimeout { .. } => Self::IdleProgressTimeout,
         }
     }
 }
@@ -85,8 +88,12 @@ impl LoopTurnState {
         }
     }
 
-    pub(crate) fn check_budget(&self, agent: &Agent) -> Option<BudgetStop> {
-        agent.check_budget(self.iteration, self.started_at, &self.total_usage)
+    pub(crate) fn check_budget(
+        &self,
+        agent: &Agent,
+        activity: &LoopActivityState,
+    ) -> Option<BudgetStop> {
+        agent.check_budget(self.iteration, self.started_at, &self.total_usage, activity)
     }
 
     pub(crate) fn record_budget_stop(&mut self, stop: &BudgetStop) {

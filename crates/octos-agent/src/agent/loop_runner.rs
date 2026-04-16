@@ -1,6 +1,7 @@
 //! Main agent loop: process_message and run_task orchestration.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eyre::Result;
@@ -9,10 +10,11 @@ use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
+use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::LoopTurnState;
-use super::{Agent, ConversationResponse, TokenTracker};
+use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
@@ -95,8 +97,15 @@ impl Agent {
         attachments: TurnAttachmentContext,
         tracker: Option<&TokenTracker>,
     ) -> Result<ConversationResponse> {
+        let activity = Arc::new(LoopActivityState::new(Instant::now()));
+        let activity_reporter = Arc::new(ActivityTrackingReporter::new(
+            activity.clone(),
+            self.reporter(),
+        ));
         TURN_ATTACHMENT_CTX
-            .scope(attachments, async {
+            .scope(
+                attachments,
+                TASK_REPORTER.scope(activity_reporter, async move {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
 
@@ -154,7 +163,7 @@ impl Agent {
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
-                    if let Some(stop) = turn.check_budget(self) {
+                    if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         turn.record_budget_stop(&stop);
                         // Skip system prompt + history; return only new messages
                         return Ok(ConversationResponse {
@@ -382,7 +391,8 @@ impl Agent {
                         }
                     }
                 }
-            })
+                }),
+            )
             .await
     }
     /// Run a task to completion (used by spawn tool).
@@ -394,7 +404,14 @@ impl Agent {
             agent_id = %self.id,
         );
 
-        async {
+        let activity = Arc::new(LoopActivityState::new(task_start));
+        let activity_reporter = Arc::new(ActivityTrackingReporter::new(
+            activity.clone(),
+            self.reporter(),
+        ));
+
+        TASK_REPORTER
+            .scope(activity_reporter, async move {
             info!("starting task");
             self.reporter().report(ProgressEvent::TaskStarted {
                 task_id: task.id.to_string(),
@@ -407,7 +424,7 @@ impl Agent {
             let config = self.chat_config();
 
             loop {
-                if let Some(stop) = turn.check_budget(self) {
+                if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                     turn.record_budget_stop(&stop);
                     self.report_budget_stop(&stop, turn.iteration());
                     return Ok(TaskResult {
@@ -585,9 +602,9 @@ impl Agent {
                     }
                 }
             }
-        }
-        .instrument(span)
-        .await
+            })
+            .instrument(span)
+            .await
     }
 
     fn build_result(

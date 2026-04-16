@@ -6,6 +6,7 @@ use octos_core::TokenUsage;
 use tracing::{info, warn};
 
 use super::Agent;
+use super::activity::{DEFAULT_IDLE_TIMEOUT_SECS, LoopActivityState};
 use crate::progress::ProgressEvent;
 
 /// Reason why the agent loop stopped due to budget constraints.
@@ -14,6 +15,7 @@ pub(super) enum BudgetStop {
     MaxIterations,
     MaxTokens { used: u32, limit: u32 },
     WallClockTimeout { limit: Duration },
+    IdleProgressTimeout { limit: Duration },
 }
 
 impl BudgetStop {
@@ -27,6 +29,12 @@ impl BudgetStop {
             Self::WallClockTimeout { limit } => {
                 format!("Wall-clock timeout ({:.0}s limit).", limit.as_secs_f64())
             }
+            Self::IdleProgressTimeout { limit } => {
+                format!(
+                    "Idle progress timeout ({:.0}s without progress).",
+                    limit.as_secs_f64()
+                )
+            }
         }
     }
 }
@@ -38,6 +46,7 @@ impl Agent {
         iteration: u32,
         start: Instant,
         total_usage: &TokenUsage,
+        activity: &LoopActivityState,
     ) -> Option<BudgetStop> {
         use std::sync::atomic::Ordering;
 
@@ -51,6 +60,12 @@ impl Agent {
             if start.elapsed() > timeout {
                 return Some(BudgetStop::WallClockTimeout { limit: timeout });
             }
+        }
+        let idle_timeout = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
+        if activity.has_timed_out(idle_timeout) {
+            return Some(BudgetStop::IdleProgressTimeout {
+                limit: idle_timeout,
+            });
         }
         if let Some(max_tokens) = self.config.max_tokens {
             let used = total_usage.input_tokens + total_usage.output_tokens;
@@ -97,6 +112,12 @@ impl Agent {
                         elapsed: *limit,
                         limit: *limit,
                     });
+            }
+            BudgetStop::IdleProgressTimeout { limit } => {
+                warn!(limit_s = limit.as_secs(), "hit idle progress timeout");
+                self.reporter().report(ProgressEvent::TaskInterrupted {
+                    iterations: iteration,
+                });
             }
         }
     }
@@ -178,6 +199,22 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("timeout"),
             "expected 'timeout' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn budget_stop_idle_progress_timeout_message() {
+        let msg = BudgetStop::IdleProgressTimeout {
+            limit: Duration::from_secs(120),
+        }
+        .message();
+        assert!(
+            msg.to_lowercase().contains("idle"),
+            "expected 'idle' in: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("progress"),
+            "expected 'progress' in: {msg}"
         );
     }
 

@@ -1,5 +1,6 @@
 //! Agent implementation.
 
+mod activity;
 mod budget;
 mod compaction;
 mod detection;
