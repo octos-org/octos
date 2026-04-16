@@ -106,12 +106,24 @@ pub struct WorkspaceArtifactsPolicy {
 pub struct WorkspaceSpawnTaskPolicy {
     #[serde(default)]
     pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     #[serde(default)]
     pub on_verify: Vec<String>,
     #[serde(default)]
     pub on_complete: Vec<String>,
     #[serde(default)]
     pub on_failure: Vec<String>,
+}
+
+impl WorkspaceSpawnTaskPolicy {
+    pub fn artifact_sources(&self) -> Vec<&str> {
+        if self.artifacts.is_empty() {
+            self.artifact.iter().map(String::as_str).collect()
+        } else {
+            self.artifacts.iter().map(String::as_str).collect()
+        }
+    }
 }
 
 impl WorkspacePolicy {
@@ -197,6 +209,7 @@ impl WorkspacePolicy {
 
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
             on_verify: vec![
                 "file_exists:$artifact".into(),
                 "file_size_min:$artifact:1024".into(),
@@ -207,6 +220,7 @@ impl WorkspacePolicy {
 
         let podcast_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("podcast_audio".into()),
+            artifacts: Vec::new(),
             on_verify: vec![
                 "file_exists:$artifact".into(),
                 "file_size_min:$artifact:4096".into(),
@@ -367,6 +381,7 @@ mod tests {
         );
         let task = policy.spawn_tasks.get("fm_tts").expect("fm_tts contract");
         assert_eq!(task.artifact.as_deref(), Some("primary_audio"));
+        assert!(task.artifacts.is_empty());
         assert!(task.on_complete.is_empty());
 
         assert_eq!(
@@ -382,12 +397,55 @@ mod tests {
             .get("podcast_generate")
             .expect("podcast_generate contract");
         assert_eq!(podcast_task.artifact.as_deref(), Some("podcast_audio"));
+        assert!(podcast_task.artifacts.is_empty());
         assert!(
             podcast_task
                 .on_verify
                 .iter()
                 .any(|action| action == "file_size_min:$artifact:4096")
         );
+    }
+
+    #[test]
+    fn spawn_task_artifact_sources_prefer_multi_artifact_list() {
+        let task = WorkspaceSpawnTaskPolicy {
+            artifact: Some("legacy".into()),
+            artifacts: vec!["report".into(), "audio".into()],
+            on_verify: Vec::new(),
+            on_complete: Vec::new(),
+            on_failure: Vec::new(),
+        };
+
+        assert_eq!(task.artifact_sources(), vec!["report", "audio"]);
+    }
+
+    #[test]
+    fn spawn_task_artifact_sources_fall_back_to_single_artifact() {
+        let task = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: Vec::new(),
+            on_failure: Vec::new(),
+        };
+
+        assert_eq!(task.artifact_sources(), vec!["primary_audio"]);
+    }
+
+    #[test]
+    fn spawn_task_artifact_sources_roundtrip_omits_empty_list() {
+        let task = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: vec!["file_exists:$artifact".into()],
+            on_complete: Vec::new(),
+            on_failure: Vec::new(),
+        };
+
+        let rendered = toml::to_string_pretty(&task).unwrap();
+        assert!(!rendered.contains("artifacts = []"));
+        let roundtrip: WorkspaceSpawnTaskPolicy = toml::from_str(&rendered).unwrap();
+        assert_eq!(roundtrip.artifact_sources(), vec!["primary_audio"]);
     }
 
     #[test]

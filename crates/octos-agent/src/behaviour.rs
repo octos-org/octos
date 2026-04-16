@@ -52,6 +52,17 @@ impl ActionContext {
         self
     }
 
+    pub(crate) fn with_named_targets<I, N>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = (N, Vec<PathBuf>)>,
+        N: Into<String>,
+    {
+        for (name, paths) in targets {
+            self.named_targets.insert(name.into(), paths);
+        }
+        self
+    }
+
     pub(crate) fn resolve_targets(
         &self,
         workspace_root: &Path,
@@ -408,6 +419,26 @@ mod tests {
             run_action_with_context(temp.path(), &context, "file_size_min:$artifact:1024").unwrap();
 
         assert_eq!(result, ActionResult::Pass);
+    }
+
+    #[test]
+    fn should_resolve_multiple_named_targets_for_file_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.md");
+        let audio = temp.path().join("audio.mp3");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+
+        let context = ActionContext::default()
+            .with_named_targets([("$report", vec![report]), ("$audio", vec![audio])]);
+
+        let report_result =
+            run_action_with_context(temp.path(), &context, "file_exists:$report").unwrap();
+        let audio_result =
+            run_action_with_context(temp.path(), &context, "file_size_min:$audio:1024").unwrap();
+
+        assert_eq!(report_result, ActionResult::Pass);
+        assert_eq!(audio_result, ActionResult::Pass);
     }
 
     #[test]

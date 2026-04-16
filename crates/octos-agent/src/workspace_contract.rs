@@ -27,6 +27,12 @@ pub enum SpawnTaskContractResult {
     },
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedArtifacts {
+    context: ActionContext,
+    paths: Vec<PathBuf>,
+}
+
 pub async fn enforce_spawn_task_contract(
     tools: &ToolRegistry,
     tool_name: &str,
@@ -76,16 +82,16 @@ pub async fn enforce_spawn_task_contract(
         TaskRuntimeState::ResolvingOutputs,
         Some(format!("resolve outputs for {tool_name}")),
     );
-    let artifact_paths = match resolve_artifacts(
+    let resolved_artifacts = match resolve_artifacts(
         workspace_root,
         &policy,
         &task_policy,
         files_to_send,
         task_started_at,
     ) {
-        Ok(paths) => paths,
+        Ok(resolved) => resolved,
         Err(error) => {
-            run_failure_actions(workspace_root, supervisor, &task_policy.on_failure, &[]);
+            run_failure_actions(workspace_root, supervisor, &task_policy.on_failure, None);
             return SpawnTaskContractResult::Failed { error, notify_user };
         }
     };
@@ -95,13 +101,14 @@ pub async fn enforce_spawn_task_contract(
         TaskRuntimeState::VerifyingOutputs,
         Some(format!("verify outputs for {tool_name}")),
     );
-    if let Err(error) = run_verify_actions(workspace_root, &task_policy.on_verify, &artifact_paths)
+    if let Err(error) =
+        run_verify_actions(workspace_root, &task_policy.on_verify, &resolved_artifacts)
     {
         run_failure_actions(
             workspace_root,
             supervisor,
             &task_policy.on_failure,
-            &artifact_paths,
+            Some(&resolved_artifacts),
         );
         return SpawnTaskContractResult::Failed { error, notify_user };
     }
@@ -112,7 +119,8 @@ pub async fn enforce_spawn_task_contract(
         Some(format!("handoff outputs for {tool_name}")),
     );
     if task_policy.on_complete.is_empty() {
-        let output_files = artifact_paths
+        let output_files = resolved_artifacts
+            .paths
             .iter()
             .map(|path| path.to_string_lossy().to_string())
             .collect();
@@ -124,7 +132,7 @@ pub async fn enforce_spawn_task_contract(
         workspace_root,
         tool_call_id,
         &task_policy.on_complete,
-        &artifact_paths,
+        &resolved_artifacts,
     )
     .await
     {
@@ -134,7 +142,7 @@ pub async fn enforce_spawn_task_contract(
                 workspace_root,
                 supervisor,
                 &task_policy.on_failure,
-                &artifact_paths,
+                Some(&resolved_artifacts),
             );
             SpawnTaskContractResult::Failed { error, notify_user }
         }
@@ -147,7 +155,7 @@ fn resolve_artifacts(
     task_policy: &WorkspaceSpawnTaskPolicy,
     files_to_send: &[PathBuf],
     task_started_at: SystemTime,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<ResolvedArtifacts, String> {
     if !files_to_send.is_empty() {
         let files: Vec<PathBuf> = files_to_send
             .iter()
@@ -159,27 +167,45 @@ fn resolve_artifacts(
                 "contract expected output files but tool-reported files do not exist".into(),
             );
         }
-        return Ok(files);
+        return Ok(ResolvedArtifacts {
+            context: ActionContext::default().with_named_target("$artifact", files.clone()),
+            paths: files,
+        });
     }
 
-    let artifact_name = task_policy
-        .artifact
-        .as_deref()
-        .ok_or_else(|| "workspace contract has no artifact source".to_string())?;
-    let pattern = policy.artifacts.entries.get(artifact_name).ok_or_else(|| {
-        format!("workspace contract references unknown artifact '{artifact_name}'")
-    })?;
+    let artifact_sources = task_policy.artifact_sources();
+    if artifact_sources.is_empty() {
+        return Err("workspace contract has no artifact source".into());
+    }
 
-    let mut matches = resolve_glob_matches(workspace_root, pattern, Some(task_started_at))?;
-    if matches.is_empty() {
-        matches = resolve_glob_matches(workspace_root, pattern, None)?;
+    let mut context = ActionContext::default();
+    let mut artifact_paths = Vec::new();
+
+    for artifact_name in artifact_sources {
+        let pattern = policy.artifacts.entries.get(artifact_name).ok_or_else(|| {
+            format!("workspace contract references unknown artifact '{artifact_name}'")
+        })?;
+
+        let mut matches = resolve_glob_matches(workspace_root, pattern, Some(task_started_at))?;
+        if matches.is_empty() {
+            matches = resolve_glob_matches(workspace_root, pattern, None)?;
+        }
+        if matches.is_empty() {
+            return Err(format!(
+                "contract could not find artifact '{artifact_name}' matching '{pattern}'"
+            ));
+        }
+
+        context = context.with_named_target(format!("${artifact_name}"), matches.clone());
+        artifact_paths.extend(matches);
     }
-    if matches.is_empty() {
-        return Err(format!(
-            "contract could not find artifact matching '{pattern}'"
-        ));
-    }
-    Ok(matches)
+
+    context = context.with_named_target("$artifact", artifact_paths.clone());
+
+    Ok(ResolvedArtifacts {
+        context,
+        paths: artifact_paths,
+    })
 }
 
 fn resolve_glob_matches(
@@ -231,11 +257,12 @@ fn resolve_glob_matches(
 fn run_verify_actions(
     workspace_root: &Path,
     actions: &[String],
-    artifact_paths: &[PathBuf],
+    resolved_artifacts: &ResolvedArtifacts,
 ) -> Result<(), String> {
-    let context = ActionContext::default().with_named_target("$artifact", artifact_paths.to_vec());
     let mut failures = Vec::new();
-    for (spec, result) in evaluate_actions_with_context(workspace_root, &context, actions) {
+    for (spec, result) in
+        evaluate_actions_with_context(workspace_root, &resolved_artifacts.context, actions)
+    {
         match result {
             Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
             Ok(ActionResult::Fail { reason }) => failures.push(format!("{spec}: {reason}")),
@@ -254,15 +281,14 @@ async fn run_complete_actions(
     workspace_root: &Path,
     tool_call_id: &str,
     actions: &[String],
-    artifact_paths: &[PathBuf],
+    resolved_artifacts: &ResolvedArtifacts,
 ) -> Result<Vec<String>, String> {
-    let action_context =
-        ActionContext::default().with_named_target("$artifact", artifact_paths.to_vec());
     let mut delivered_files = Vec::new();
 
     for action in actions {
         if let Some(target) = action.strip_prefix("send_file:") {
-            for path in action_context
+            for path in resolved_artifacts
+                .context
                 .resolve_targets(workspace_root, target)
                 .map_err(|error| format!("send_file target resolution failed: {error}"))?
             {
@@ -286,7 +312,7 @@ async fn run_complete_actions(
             continue;
         }
 
-        match run_action_with_context(workspace_root, &action_context, action)
+        match run_action_with_context(workspace_root, &resolved_artifacts.context, action)
             .map_err(|error| format!("completion action error: {error}"))?
         {
             ActionResult::Pass | ActionResult::Notify { .. } => continue,
@@ -303,7 +329,7 @@ fn run_failure_actions(
     workspace_root: &Path,
     supervisor: Option<(&TaskSupervisor, &str)>,
     actions: &[String],
-    artifact_paths: &[PathBuf],
+    resolved_artifacts: Option<&ResolvedArtifacts>,
 ) {
     if actions.iter().any(|action| action.starts_with("cleanup:")) {
         set_runtime_state(
@@ -312,8 +338,15 @@ fn run_failure_actions(
             Some("cleanup failed outputs".to_string()),
         );
     }
-    let action_context =
-        ActionContext::default().with_named_target("$artifact", artifact_paths.to_vec());
+    let action_context = resolved_artifacts
+        .map(|resolved| resolved.context.clone())
+        .unwrap_or_default()
+        .with_named_target(
+            "$artifact",
+            resolved_artifacts
+                .map(|resolved| resolved.paths.clone())
+                .unwrap_or_default(),
+        );
     for action in actions {
         let _ = run_action_with_context(workspace_root, &action_context, action);
     }
@@ -425,6 +458,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_contract_resolves_multiple_artifact_sources_for_runtime_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        policy
+            .artifacts
+            .entries
+            .insert("report".into(), "report.md".into());
+        policy
+            .artifacts
+            .entries
+            .insert("audio".into(), "audio.mp3".into());
+        policy.spawn_tasks.insert(
+            "bundle_generate".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: vec!["report".into(), "audio".into()],
+                on_verify: vec![
+                    "file_exists:$report".into(),
+                    "file_exists:$audio".into(),
+                    "file_size_min:$audio:1024".into(),
+                ],
+                on_complete: Vec::new(),
+                on_failure: Vec::new(),
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let report = temp.path().join("report.md");
+        let audio = temp.path().join("audio.mp3");
+        std::fs::write(&report, b"report").unwrap();
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "bundle_generate",
+            "tool-call-4",
+            &[],
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(
+                    output_files,
+                    vec![
+                        report.to_string_lossy().to_string(),
+                        audio.to_string_lossy().to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn session_tts_contract_is_required_when_policy_file_is_missing() {
         let temp = tempfile::tempdir().unwrap();
 
@@ -476,10 +566,16 @@ mod tests {
         let artifact = temp.path().join("output.mp3");
         std::fs::write(&artifact, b"x").unwrap();
 
+        let resolved_artifacts = ResolvedArtifacts {
+            context: ActionContext::default()
+                .with_named_target("$artifact", vec![artifact.clone()]),
+            paths: vec![artifact.clone()],
+        };
+
         let error = run_verify_actions(
             temp.path(),
             &["file_size_min:$artifact:1024".into()],
-            std::slice::from_ref(&artifact),
+            &resolved_artifacts,
         )
         .unwrap_err();
 

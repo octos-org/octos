@@ -82,6 +82,14 @@ pub struct WorkspaceTurnSnapshotFailure {
     pub error: String,
 }
 
+#[derive(Clone, Debug)]
+struct PendingValidation {
+    repo_root: PathBuf,
+    repo_label: String,
+    specs: Vec<String>,
+    context: ActionContext,
+}
+
 enum WorkspaceTurnSnapshotPlan {
     LegacyGit,
     PolicyGit {
@@ -90,6 +98,7 @@ enum WorkspaceTurnSnapshotPlan {
         turn_end_validators: Vec<String>,
         completion_validators: Vec<String>,
         artifact_patterns: Vec<String>,
+        artifact_context: ActionContext,
     },
     Skip,
 }
@@ -143,7 +152,9 @@ pub fn detect_workspace_repo(base_dir: &Path, changed_path: &Path) -> Option<Wor
 }
 
 pub fn init_workspace_repo(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
-    with_repo_git_lock(project_root, || init_workspace_repo_unlocked(project_root, kind))
+    with_repo_git_lock(project_root, || {
+        init_workspace_repo_unlocked(project_root, kind)
+    })
 }
 
 fn init_workspace_repo_unlocked(project_root: &Path, kind: WorkspaceProjectKind) -> Result<()> {
@@ -281,8 +292,8 @@ pub fn snapshot_workspace_turn(
 
     // Collect (repo_root, validators) from the plan phase so we don't re-read
     // the workspace policy during validation.
-    let mut pending_turn_end_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
-    let mut pending_completion_validations: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    let mut pending_turn_end_validations: Vec<PendingValidation> = Vec::new();
+    let mut pending_completion_validations: Vec<PendingValidation> = Vec::new();
 
     for repo in &repos {
         let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
@@ -300,6 +311,7 @@ pub fn snapshot_workspace_turn(
                 turn_end_validators,
                 completion_validators,
                 artifact_patterns,
+                artifact_context,
             }) => {
                 match commit_all_if_dirty_with_options(&repo.root, repo.kind, &message, auto_init) {
                     Ok(true) => report.committed.push(repo_label.clone()),
@@ -314,20 +326,22 @@ pub fn snapshot_workspace_turn(
                     }
                 }
                 if !turn_end_validators.is_empty() {
-                    pending_turn_end_validations.push((
-                        repo.root.clone(),
-                        repo_label.clone(),
-                        turn_end_validators,
-                    ));
+                    pending_turn_end_validations.push(PendingValidation {
+                        repo_root: repo.root.clone(),
+                        repo_label: repo_label.clone(),
+                        specs: turn_end_validators,
+                        context: artifact_context.clone(),
+                    });
                 }
                 if !completion_validators.is_empty()
                     && repo_has_declared_artifacts(&repo.root, &artifact_patterns)
                 {
-                    pending_completion_validations.push((
-                        repo.root.clone(),
+                    pending_completion_validations.push(PendingValidation {
+                        repo_root: repo.root.clone(),
                         repo_label,
-                        completion_validators,
-                    ));
+                        specs: completion_validators,
+                        context: artifact_context.clone(),
+                    });
                 }
             }
             Err(error) => {
@@ -360,18 +374,20 @@ pub fn snapshot_workspace_turn(
 /// the snapshot plan phase, avoiding a second policy read from disk.
 fn run_validators(
     phase: WorkspaceValidationPhase,
-    validations: &[(PathBuf, String, Vec<String>)],
+    validations: &[PendingValidation],
     report: &mut WorkspaceTurnSnapshotReport,
 ) {
-    for (repo_root, repo_label, specs) in validations {
-        for (spec, result) in
-            evaluate_actions_with_context(repo_root, &ActionContext::default(), specs)
-        {
+    for validation in validations {
+        for (spec, result) in evaluate_actions_with_context(
+            &validation.repo_root,
+            &validation.context,
+            &validation.specs,
+        ) {
             match result {
                 Ok(ActionResult::Pass | ActionResult::Notify { .. }) => {}
                 Ok(ActionResult::Fail { reason }) => {
                     report.validation_failures.push(WorkspaceValidationFailure {
-                        repo_label: repo_label.clone(),
+                        repo_label: validation.repo_label.clone(),
                         phase,
                         check: spec,
                         reason,
@@ -379,13 +395,13 @@ fn run_validators(
                 }
                 Err(e) => {
                     warn!(
-                        repo = %repo_label,
+                        repo = %validation.repo_label,
                         check = %spec,
                         error = %e,
                         "turn-end validator failed to execute"
                     );
                     report.validation_failures.push(WorkspaceValidationFailure {
-                        repo_label: repo_label.clone(),
+                        repo_label: validation.repo_label.clone(),
                         phase,
                         check: spec,
                         reason: format!("validator error: {e}"),
@@ -458,12 +474,16 @@ fn snapshot_plan_for_repo(repo: &WorkspaceRepo) -> Result<WorkspaceTurnSnapshotP
         return Ok(WorkspaceTurnSnapshotPlan::Skip);
     }
 
+    let artifact_context = artifact_validation_context(&repo.root, &policy.artifacts.entries);
+    let artifact_patterns = policy.artifacts.entries.into_values().collect();
+
     Ok(WorkspaceTurnSnapshotPlan::PolicyGit {
         auto_init: policy.version_control.auto_init,
         fail_on_error: policy.version_control.fail_on_error,
         turn_end_validators: policy.validation.on_turn_end,
         completion_validators: policy.validation.on_completion,
-        artifact_patterns: policy.artifacts.entries.into_values().collect(),
+        artifact_patterns,
+        artifact_context,
     })
 }
 
@@ -541,6 +561,7 @@ fn inspect_managed_workspace_contract(
     policy: &WorkspacePolicy,
 ) -> WorkspaceContractStatus {
     let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+    let artifact_context = artifact_validation_context(&repo.root, &policy.artifacts.entries);
     let artifacts = policy
         .artifacts
         .entries
@@ -555,8 +576,16 @@ fn inspect_managed_workspace_contract(
             }
         })
         .collect::<Vec<_>>();
-    let turn_end_checks = evaluate_check_specs(&repo.root, &policy.validation.on_turn_end);
-    let completion_checks = evaluate_check_specs(&repo.root, &policy.validation.on_completion);
+    let turn_end_checks = evaluate_check_specs(
+        &repo.root,
+        &artifact_context,
+        &policy.validation.on_turn_end,
+    );
+    let completion_checks = evaluate_check_specs(
+        &repo.root,
+        &artifact_context,
+        &policy.validation.on_completion,
+    );
     let ready = check_list_passed(&turn_end_checks)
         && check_list_passed(&completion_checks)
         && artifacts.iter().all(|artifact| artifact.present);
@@ -576,8 +605,12 @@ fn inspect_managed_workspace_contract(
     }
 }
 
-fn evaluate_check_specs(repo_root: &Path, specs: &[String]) -> Vec<WorkspaceCheckStatus> {
-    evaluate_actions_with_context(repo_root, &ActionContext::default(), specs)
+fn evaluate_check_specs(
+    repo_root: &Path,
+    context: &ActionContext,
+    specs: &[String],
+) -> Vec<WorkspaceCheckStatus> {
+    evaluate_actions_with_context(repo_root, context, specs)
         .into_iter()
         .map(|(spec, result)| match result {
             Ok(ActionResult::Pass | ActionResult::Notify { .. }) => WorkspaceCheckStatus {
@@ -597,6 +630,20 @@ fn evaluate_check_specs(repo_root: &Path, specs: &[String]) -> Vec<WorkspaceChec
             },
         })
         .collect()
+}
+
+fn artifact_validation_context(
+    repo_root: &Path,
+    artifacts: &std::collections::BTreeMap<String, String>,
+) -> ActionContext {
+    let named_targets = artifacts.iter().map(|(name, pattern)| {
+        let matches = resolve_artifact_matches(repo_root, pattern)
+            .into_iter()
+            .map(|relative| repo_root.join(relative))
+            .collect::<Vec<_>>();
+        (format!("${name}"), matches)
+    });
+    ActionContext::default().with_named_targets(named_targets)
 }
 
 fn check_list_passed(checks: &[WorkspaceCheckStatus]) -> bool {
@@ -947,6 +994,46 @@ mod tests {
 
         assert_eq!(report.committed, vec!["slides/deck-b"]);
         assert!(report.validation_failures.is_empty());
+    }
+
+    #[test]
+    fn inspection_uses_named_artifact_bindings_for_validator_specs() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-bundle");
+        std::fs::create_dir_all(slides_root.join("output").join("imgs")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
+        std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(
+            slides_root.join("output/imgs/manifest.json"),
+            "{\"slides\":[]}\n",
+        )
+        .unwrap();
+        std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
+
+        let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        policy.validation.on_turn_end = vec!["file_exists:$deck".into()];
+        policy.validation.on_completion = vec!["file_exists:$manifest".into()];
+        write_workspace_policy(&slides_root, &policy).unwrap();
+        initialize_and_commit(
+            &slides_root,
+            WorkspaceProjectKind::Slides,
+            "Initialize slides workspace",
+        )
+        .unwrap();
+
+        let statuses = inspect_workspace_contracts(temp.path()).unwrap();
+        let status = &statuses[0];
+
+        assert_eq!(status.repo_label, "slides/deck-bundle");
+        assert!(status.ready);
+        assert_eq!(status.turn_end_checks.len(), 1);
+        assert!(status.turn_end_checks[0].passed);
+        assert_eq!(status.turn_end_checks[0].spec, "file_exists:$deck");
+        assert_eq!(status.completion_checks.len(), 1);
+        assert!(status.completion_checks[0].passed);
+        assert_eq!(status.completion_checks[0].spec, "file_exists:$manifest");
     }
 
     #[test]
