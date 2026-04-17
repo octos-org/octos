@@ -28,6 +28,26 @@ Phase 3 work.
 
 ## Ordered Phase 3 Sequence
 
+## Issue Map
+
+Primary Phase 3 issue set:
+
+- `#412`: Phase 3 umbrella
+- `#413`: canary soak and regression triage
+- `#414`: coding/debugging loop hardening
+- `#415`: hard-case live acceptance
+- `#416`: operator surface
+
+Harness issue set:
+
+- `#433`: harness runtime epic
+- `#434`: policy v1
+- `#435`: generic lifecycle hooks
+- `#436`: validator runner and completion gating
+- `#437`: policy-driven artifact truth and delivery
+- `#438`: spawn-only verify/complete/failure lifecycle
+- `#439`: first-party harness templates
+
 ### Phase 3A: Canary Trust And Regression Closure
 
 Primary issues:
