@@ -324,7 +324,9 @@ test.describe('Live browser smoke', () => {
 
     expect(result.responseLen).toBeGreaterThan(0);
 
-    await page.reload({ waitUntil: 'networkidle' });
+    // Deep research keeps background runtime channels active, so waiting for
+    // networkidle can hang even when the page has restored correctly.
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 

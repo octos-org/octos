@@ -539,6 +539,24 @@ fn workflow_uses_contract_terminal_delivery(workflow: &WorkflowMetadata) -> bool
     )
 }
 
+fn build_subagent_tool_policy(
+    allowed_tools: Vec<String>,
+    workflow: Option<&WorkflowMetadata>,
+) -> ToolPolicy {
+    let mut deny = vec!["spawn".to_string()];
+    if workflow.is_some_and(workflow_uses_contract_terminal_delivery) {
+        // Contract-owned workflow families must have exactly one runtime-owned
+        // terminal delivery path. Deny explicit send_file so child workers
+        // cannot double-deliver slides/site artifacts.
+        deny.push("send_file".to_string());
+    }
+    ToolPolicy {
+        allow: allowed_tools,
+        deny,
+        ..Default::default()
+    }
+}
+
 fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
     match required_artifact_kind {
         "presentation" => &["deck"],
@@ -583,10 +601,10 @@ fn most_recent_contract_match(
     }
 
     candidates.into_iter().max_by_key(|path| {
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok()
-        })
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    })
 }
 
 fn format_workspace_contract_failure(status: &WorkspaceContractStatus) -> String {
@@ -896,11 +914,7 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
-            let policy = ToolPolicy {
-                allow: allowed_tools,
-                deny: vec!["spawn".into()],
-                ..Default::default()
-            };
+            let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
@@ -1050,11 +1064,7 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
-                let policy = ToolPolicy {
-                    allow: allowed_tools,
-                    deny: vec!["spawn".into()],
-                    ..Default::default()
-                };
+                let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
@@ -1545,6 +1555,26 @@ mod tests {
             select_workflow_terminal_files(&files_to_send, &[], Some(&workflow)).unwrap();
 
         assert_eq!(selected, vec![PathBuf::from("/tmp/site/dist/index.html")]);
+    }
+
+    #[test]
+    fn contract_owned_workflow_denies_send_file_in_subagent_policy() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
+            }),
+        };
+
+        let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
+
+        assert!(policy.deny.contains(&"spawn".to_string()));
+        assert!(policy.deny.contains(&"send_file".to_string()));
     }
 
     #[test]

@@ -219,11 +219,18 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
 
   // Look for a file event in the SSE stream
   const fileEvents = events.filter((e) => e.type === 'file');
+  const sessionResultMediaEvents = events.filter(
+    (e) => e.type === 'session_result' && Array.isArray(e.message?.media) && e.message.media.length > 0,
+  );
 
   // If the agent successfully created and sent the file, we should see a file event
-  if (fileEvents.length > 0) {
-    expect(fileEvents[0].filename).toBeTruthy();
-    expect(fileEvents[0].path).toBeTruthy();
+  if (fileEvents.length > 0 || sessionResultMediaEvents.length > 0) {
+    if (fileEvents.length > 0) {
+      expect(fileEvents[0].filename).toBeTruthy();
+      expect(fileEvents[0].path).toBeTruthy();
+    } else {
+      expect(sessionResultMediaEvents[0].message.media[0]).toBeTruthy();
+    }
   } else {
     // Agent might not have used send_file — check that the response at least
     // mentions the file was created (acceptable fallback)

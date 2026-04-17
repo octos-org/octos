@@ -136,6 +136,41 @@ async fn persist_assistant_message(
     }
 }
 
+fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
+    let topic = session_key.topic()?;
+    let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
+    let expected = crate::project_templates::build_site_project_metadata(
+        profile_id,
+        session_key.chat_id(),
+        topic,
+        user_workspace,
+    )?;
+    let project_dir = user_workspace.join(&expected.project_dir);
+    crate::project_templates::read_site_project_metadata(&project_dir)
+        .map(|metadata| metadata.preview_url)
+        .or(Some(expected.preview_url))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn finalize_assistant_content(
+    session_key: &SessionKey,
+    user_workspace: &Path,
+    content: &str,
+) -> String {
+    let is_site = session_key
+        .topic()
+        .is_some_and(|topic| topic == "site" || topic.starts_with("site "));
+    if !is_site || content.trim().is_empty() || content.contains("/api/preview/") {
+        return content.to_string();
+    }
+
+    let Some(preview_url) = site_preview_url_for_session(session_key, user_workspace) else {
+        return content.to_string();
+    };
+
+    format!("{content}\n\nPreview URL: {preview_url}")
+}
+
 async fn send_outbound_with_timeout(
     session_key: &SessionKey,
     out_tx: &mpsc::Sender<OutboundMessage>,
@@ -2696,6 +2731,7 @@ impl SessionActor {
     /// Persist an assistant-visible background result and emit the matching
     /// committed session-result event metadata for the web/runtime surfaces.
     async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
+        let content = finalize_assistant_content(&self.session_key, &self.user_workspace, &content);
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
@@ -3495,6 +3531,11 @@ impl SessionActor {
         };
         match agent_result {
             Ok(Ok(conv_response)) => {
+                let final_content = finalize_assistant_content(
+                    &self.session_key,
+                    &self.user_workspace,
+                    &conv_response.content,
+                );
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
@@ -3520,7 +3561,7 @@ impl SessionActor {
                     if !conv_response.content.is_empty() {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
+                            content: final_content.clone(),
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
@@ -3597,7 +3638,7 @@ impl SessionActor {
                 }
 
                 // Send reply
-                let content = strip_think_tags(&conv_response.content);
+                let content = strip_think_tags(&final_content);
                 let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
                 let is_silent = content.trim().is_empty()
                     || content.contains("[SILENT]")
@@ -3930,6 +3971,11 @@ impl SessionActor {
 
             match result {
                 Ok(Ok(conv_response)) => {
+                    let final_content = finalize_assistant_content(
+                        &session_key,
+                        &user_workspace,
+                        &conv_response.content,
+                    );
                     // Save ONLY the final assistant reply to session history.
                     // Intermediate tool_call/tool_result messages are NOT saved
                     // to avoid tool_call ID collisions when multiple overflow
@@ -3938,7 +3984,7 @@ impl SessionActor {
                         let mut handle = session_handle.lock().await;
                         let final_reply = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
+                            content: final_content.clone(),
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
@@ -3948,7 +3994,7 @@ impl SessionActor {
                         let _ = handle.add_message(final_reply).await;
                     }
 
-                    let reply = strip_think_tags(&conv_response.content);
+                    let reply = strip_think_tags(&final_content);
                     // Prepend thinking content when show_thinking is enabled
                     let reply = if user_status_config.show_thinking {
                         let prefix =
@@ -4249,6 +4295,11 @@ impl SessionActor {
 
         match result {
             Ok(Ok(conv_response)) => {
+                let final_content = finalize_assistant_content(
+                    &self.session_key,
+                    &self.user_workspace,
+                    &conv_response.content,
+                );
                 // Save all messages from the agent (user msg, tool calls, tool
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
@@ -4286,7 +4337,7 @@ impl SessionActor {
                     if !conv_response.content.is_empty() {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
+                            content: final_content.clone(),
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
@@ -4310,7 +4361,7 @@ impl SessionActor {
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
-                let content = strip_think_tags(&conv_response.content);
+                let content = strip_think_tags(&final_content);
 
                 let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
                 let is_silent = content.trim().is_empty()
@@ -4570,6 +4621,56 @@ mod tests {
         let resolved = resolve_builtin_slides_styles_dir(&current_data);
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn finalize_assistant_content_appends_site_preview_url_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::with_profile_topic("dspfac", "api", "web-123", "site astro");
+        let metadata = crate::project_templates::build_site_project_metadata(
+            "dspfac",
+            "web-123",
+            "site astro",
+            dir.path(),
+        )
+        .expect("site metadata");
+        let project_dir = dir.path().join(&metadata.project_dir);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("mofa-site-session.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let finalized = finalize_assistant_content(&session_key, dir.path(), "✅ Site rebuilt.");
+
+        assert!(finalized.contains("✅ Site rebuilt."));
+        assert!(finalized.contains(&metadata.preview_url));
+    }
+
+    #[test]
+    fn finalize_assistant_content_keeps_existing_site_preview_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::with_profile_topic("dspfac", "api", "web-123", "site astro");
+        let metadata = crate::project_templates::build_site_project_metadata(
+            "dspfac",
+            "web-123",
+            "site astro",
+            dir.path(),
+        )
+        .expect("site metadata");
+        let project_dir = dir.path().join(&metadata.project_dir);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("mofa-site-session.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let original = format!("✅ Site rebuilt.\n\nPreview URL: {}", metadata.preview_url);
+        let finalized = finalize_assistant_content(&session_key, dir.path(), &original);
+
+        assert_eq!(finalized, original);
     }
 
     #[test]

@@ -307,15 +307,28 @@ fn build_session_result_event(
     let mut message = raw.clone();
     let obj = message.as_object_mut()?;
 
-    if let Some(paths) = materialized_media {
-        let response_media: Vec<String> = paths
-            .iter()
-            .map(|path| {
-                response_path_for_session_file(data_dir, Path::new(path))
-                    .unwrap_or_else(|| path.clone())
+    let response_media: Option<Vec<String>> = materialized_media
+        .map(|paths| {
+            paths.iter()
+                .map(|path| {
+                    response_path_for_session_file(data_dir, Path::new(path))
+                        .unwrap_or_else(|| path.clone())
+                })
+                .collect()
+        })
+        .or_else(|| {
+            obj.get("media").and_then(|value| value.as_array()).map(|paths| {
+                paths.iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|path| {
+                        response_path_for_session_file(data_dir, Path::new(path))
+                            .unwrap_or_else(|| path.to_string())
+                    })
+                    .collect()
             })
-            .collect();
-        obj.insert("media".to_string(), serde_json::json!(response_media));
+        });
+    if let Some(paths) = response_media {
+        obj.insert("media".to_string(), serde_json::json!(paths));
     }
 
     Some(serde_json::json!({
@@ -438,12 +451,16 @@ impl Channel for ApiChannel {
         let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
 
         if !msg.media.is_empty() {
-            let persisted_media = self
-                .materialize_media_for_session(&msg.chat_id, &msg.media)
-                .await;
             let data_dir = {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
+            };
+            let should_materialize_media = !history_already_persisted || session_result.is_none();
+            let persisted_media = if should_materialize_media {
+                self.materialize_media_for_session(&msg.chat_id, &msg.media)
+                    .await
+            } else {
+                msg.media.clone()
             };
 
             // File message — persist to session history AND send SSE event.
@@ -1737,6 +1754,53 @@ mod tests {
                 .contains(&artifact.to_string_lossy().to_string())
         );
         assert!(info.content.contains("[file:pf/"));
+    }
+
+    #[test]
+    fn build_session_result_event_normalizes_persisted_media_paths_like_history_replay() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let artifact = data_dir
+            .path()
+            .join("users")
+            .join("dspfac%3Aapi%3Aweb-1")
+            .join("workspace")
+            .join(".artifacts")
+            .join("deck.pptx");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"pptx").unwrap();
+
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "Deck ready",
+            "media": [artifact.to_string_lossy().to_string()],
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+
+        let event = build_session_result_event(&raw, data_dir.path(), None, Some("slides demo"))
+            .expect("session result event");
+        let event_media = event["message"]["media"]
+            .as_array()
+            .expect("event media array")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        let replay_media = message_info_from_history_message(
+            &Message {
+                role: MessageRole::Assistant,
+                content: "Deck ready".into(),
+                media: vec![artifact.to_string_lossy().to_string()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: Utc::now(),
+            },
+            data_dir.path(),
+            1,
+        )
+        .media;
+
+        assert_eq!(event_media, replay_media);
     }
 
     #[tokio::test]
