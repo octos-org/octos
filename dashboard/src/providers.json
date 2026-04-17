@@ -2,12 +2,16 @@
   "anthropic": {
     "env": "ANTHROPIC_API_KEY",
     "models": [
+      { "id": "claude-opus-4-7", "input": 5.0, "output": 25.0, "max_output": 128000 },
       { "id": "claude-sonnet-4-6", "input": 3.0, "output": 15.0, "max_output": 128000 },
       { "id": "claude-opus-4-6", "input": 5.0, "output": 25.0, "max_output": 128000 },
+      { "id": "claude-opus-4-5-20251101", "input": 5.0, "output": 25.0, "max_output": 128000 },
       { "id": "claude-haiku-4-5-20251001", "input": 1.0, "output": 5.0, "max_output": 8192 },
       { "id": "claude-sonnet-4-5-20250929", "input": 3.0, "output": 15.0, "max_output": 128000 },
       { "id": "claude-sonnet-4-20250514", "input": 3.0, "output": 15.0, "max_output": 64000 },
-      { "id": "claude-opus-4-20250514", "input": 15.0, "output": 75.0, "max_output": 32000 }
+      { "id": "claude-opus-4-20250514", "input": 15.0, "output": 75.0, "max_output": 32000 },
+      { "id": "claude-3-5-haiku-20241022", "input": 0.8, "output": 4.0, "max_output": 8192 },
+      { "id": "claude-3-haiku-20240307", "input": 0.25, "output": 1.25, "max_output": 4096 }
     ]
   },
   "openai": {
