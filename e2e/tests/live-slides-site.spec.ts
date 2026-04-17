@@ -26,8 +26,25 @@ test.setTimeout(600_000);
 async function collectPreviewUrls(page: Page): Promise<string[]> {
   const text = await getAssistantMessageText(page);
   const matches =
-    text.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas\/index\.html/gi) || [];
-  return Array.from(new Set(matches.filter((value) => value.trim().length > 0)));
+    text.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas(?:\/index\.html|\/)/gi) || [];
+  return Array.from(
+    new Set(
+      matches
+        .map((value) => normalizePreviewUrl(value))
+        .filter((value) => value.trim().length > 0),
+    ),
+  );
+}
+
+function normalizePreviewUrl(url: string): string {
+  const trimmed = url.trim();
+  const match = trimmed.match(/^([^?#]+)(.*)$/);
+  if (!match) return trimmed;
+  let base = match[1].replace(/\/index\.html$/i, "/");
+  if (!base.endsWith("/")) {
+    base = `${base}/`;
+  }
+  return `${base}${match[2] || ""}`;
 }
 
 async function waitForPreviewBody(
@@ -53,6 +70,14 @@ async function waitForPreviewBody(
   );
 }
 
+function assistantNeedsSlidesConfirmation(text: string): boolean {
+  return (
+    /ready to generate/i.test(text) ||
+    /reply\s+"generate"/i.test(text) ||
+    /reply\s+"go"/i.test(text)
+  );
+}
+
 test.describe('Live deliverable flows', () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
@@ -69,7 +94,7 @@ test.describe('Live deliverable flows', () => {
 
     await sendAndWait(
       page,
-      'Design a 2-slide deck about browser acceptance. Slide 1 should say "Browser Slides Acceptance". Slide 2 should prove the final deck is visible. Do not generate yet.',
+      'Design a 2-slide deck about browser acceptance. Slide 1 should say "Browser Slides Acceptance". Slide 2 should prove the final deck is visible. Use style nb-pro. Show the outline only. Do not generate yet.',
       {
         label: 'slides-design',
         maxWait: 90_000,
@@ -82,6 +107,15 @@ test.describe('Live deliverable flows', () => {
     });
 
     const deckButton = page.getByRole('button', { name: /deck\.pptx/i });
+    if ((await deckButton.count()) === 0) {
+      const assistantText = await getAssistantMessageText(page);
+      if (assistantNeedsSlidesConfirmation(assistantText)) {
+        await sendAndWait(page, 'go', {
+          label: 'slides-confirm',
+          maxWait: 300_000,
+        });
+      }
+    }
 
     await expect.poll(async () => deckButton.count(), {
       timeout: 240_000,
@@ -116,9 +150,7 @@ test.describe('Live deliverable flows', () => {
       maxWait: 90_000,
     });
 
-    const creationText = await getAssistantMessageText(page);
-    const previewUrls =
-      creationText.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas\/index\.html/gi) || [];
+    const previewUrls = await collectPreviewUrls(page);
     expect(previewUrls).toHaveLength(1);
 
     const previewUrl = previewUrls[0];

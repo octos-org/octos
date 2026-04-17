@@ -15,6 +15,14 @@ use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
 use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
 
+fn should_auto_send_tool_files(
+    suppress_auto_send_files: bool,
+    explicit_send_file_requested: bool,
+    tool_name: &str,
+) -> bool {
+    !suppress_auto_send_files && !(explicit_send_file_requested && tool_name != "send_file")
+}
+
 impl Agent {
     pub(super) async fn execute_tools(
         &self,
@@ -31,6 +39,8 @@ impl Agent {
             .iter()
             .map(|tc| tc.name.as_str())
             .collect();
+        let explicit_send_file_requested =
+            response.tool_calls.iter().any(|tc| tc.name == "send_file");
         tracing::info!(
             parallel_tools = response.tool_calls.len(),
             tool_names = %tool_names.join(", "),
@@ -52,6 +62,7 @@ impl Agent {
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
                 let suppress_auto_send_files = self.config.suppress_auto_send_files;
+                let explicit_send_file_requested = explicit_send_file_requested;
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
@@ -493,7 +504,11 @@ impl Agent {
                                 });
                             }
 
-                            if !suppress_auto_send_files {
+                            if should_auto_send_tool_files(
+                                suppress_auto_send_files,
+                                explicit_send_file_requested,
+                                &tc_name,
+                            ) {
                                 // Auto-send files explicitly declared by the plugin via files_to_send.
                                 // No heuristic path detection — plugins must opt-in by including
                                 // "files_to_send": ["/path/to/file"] in their JSON output.
@@ -517,6 +532,14 @@ impl Agent {
                                         }
                                     }
                                 }
+                            } else if explicit_send_file_requested
+                                && tc_name != "send_file"
+                                && !tool_result.files_to_send.is_empty()
+                            {
+                                debug!(
+                                    tool = %tc_name,
+                                    "skipping auto-send because the same model turn already issued send_file"
+                                );
                             }
 
                             let mut tool_files_modified = Vec::new();
@@ -682,10 +705,7 @@ impl Agent {
             };
 
         // Log completion of all parallel tools
-        let result_sizes: Vec<usize> = results
-            .iter()
-            .map(|(m, _, _, _)| m.content.len())
-            .collect();
+        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _, _)| m.content.len()).collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
             parallel_tools = results.len(),
@@ -711,5 +731,21 @@ impl Agent {
         }
 
         Ok((messages, files_modified, files_to_send, tokens_used))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_send_tool_files;
+
+    #[test]
+    fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
+        assert!(!should_auto_send_tool_files(false, true, "mofa_slides"));
+        assert!(should_auto_send_tool_files(false, true, "send_file"));
+    }
+
+    #[test]
+    fn auto_send_respects_global_suppression_flag() {
+        assert!(!should_auto_send_tool_files(true, false, "mofa_slides"));
     }
 }

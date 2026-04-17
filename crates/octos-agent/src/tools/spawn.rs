@@ -528,6 +528,193 @@ fn select_workflow_terminal_files(
     Some(candidates)
 }
 
+fn workflow_uses_contract_terminal_delivery(workflow: &WorkflowMetadata) -> bool {
+    matches!(
+        workflow
+            .terminal_output
+            .as_ref()
+            .map(|policy| policy.required_artifact_kind.as_str()),
+        Some("presentation" | "site")
+    )
+}
+
+fn build_subagent_tool_policy(
+    allowed_tools: Vec<String>,
+    workflow: Option<&WorkflowMetadata>,
+) -> ToolPolicy {
+    let mut deny = vec!["spawn".to_string()];
+    if workflow.is_some_and(workflow_uses_contract_terminal_delivery) {
+        // Contract-owned workflow families must have exactly one runtime-owned
+        // terminal delivery path. Deny explicit send_file so child workers
+        // cannot double-deliver slides/site artifacts.
+        deny.push("send_file".to_string());
+    }
+    ToolPolicy {
+        allow: allowed_tools,
+        deny,
+        ..Default::default()
+    }
+}
+
+fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
+    match required_artifact_kind {
+        "presentation" => &["deck"],
+        "site" => &["entrypoint"],
+        _ => &[],
+    }
+}
+
+fn preferred_contract_basename(artifact: &WorkspaceArtifactStatus) -> Option<&'static str> {
+    match artifact.name.as_str() {
+        "deck" => Some("deck.pptx"),
+        "entrypoint" => Some("index.html"),
+        _ => None,
+    }
+}
+
+fn most_recent_contract_match(
+    workspace_root: &std::path::Path,
+    artifact: &WorkspaceArtifactStatus,
+) -> Option<PathBuf> {
+    let mut candidates = artifact
+        .matches
+        .iter()
+        .map(|relative| workspace_root.join(relative))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+
+    if let Some(preferred) = preferred_contract_basename(artifact) {
+        let exact = candidates
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.eq_ignore_ascii_case(preferred))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            candidates = exact;
+        }
+    }
+
+    candidates.into_iter().max_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    })
+}
+
+fn format_workspace_contract_failure(status: &WorkspaceContractStatus) -> String {
+    let mut failures = Vec::new();
+    if let Some(error) = status.error.as_deref() {
+        failures.push(error.to_string());
+    }
+    failures.extend(
+        status
+            .turn_end_checks
+            .iter()
+            .chain(status.completion_checks.iter())
+            .filter(|check| !check.passed)
+            .map(|check| match check.reason.as_deref() {
+                Some(reason) if !reason.is_empty() => format!("{}: {}", check.spec, reason),
+                _ => format!("{}: failed", check.spec),
+            }),
+    );
+    failures.extend(
+        status
+            .artifacts
+            .iter()
+            .filter(|artifact| !artifact.present)
+            .map(|artifact| {
+                format!(
+                    "missing artifact '{}' matching '{}'",
+                    artifact.name, artifact.pattern
+                )
+            }),
+    );
+
+    if failures.is_empty() {
+        format!("workspace contract for {} is not ready", status.repo_label)
+    } else {
+        format!(
+            "workspace contract for {} is not ready: {}",
+            status.repo_label,
+            failures.join("; ")
+        )
+    }
+}
+
+fn resolve_contract_terminal_files(
+    workspace_root: &std::path::Path,
+    workflow: Option<&WorkflowMetadata>,
+) -> std::result::Result<Option<Vec<PathBuf>>, String> {
+    let Some(workflow) = workflow else {
+        return Ok(None);
+    };
+    if !workflow_uses_contract_terminal_delivery(workflow) {
+        return Ok(None);
+    }
+
+    let status = crate::inspect_workspace_contract_at_root(workspace_root)
+        .map_err(|error| format!("workspace contract inspection failed: {error}"))?;
+    if !status.policy_managed {
+        return Err(format!(
+            "workspace contract missing for {}",
+            status.repo_label
+        ));
+    }
+    if !status.ready {
+        return Err(format_workspace_contract_failure(&status));
+    }
+
+    let terminal_output = workflow
+        .terminal_output
+        .as_ref()
+        .ok_or_else(|| "workflow terminal output policy missing".to_string())?;
+    let mut selected = Vec::new();
+    let mut matched_named_artifact = false;
+
+    for artifact_name in contract_artifact_priority(&terminal_output.required_artifact_kind) {
+        if let Some(artifact) = status
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == *artifact_name && artifact.present)
+        {
+            matched_named_artifact = true;
+            if terminal_output.deliver_final_artifact_only {
+                if let Some(path) = most_recent_contract_match(workspace_root, artifact) {
+                    return Ok(Some(vec![path]));
+                }
+            } else {
+                selected.extend(
+                    artifact
+                        .matches
+                        .iter()
+                        .map(|relative| workspace_root.join(relative))
+                        .filter(|path| path.is_file()),
+                );
+            }
+        }
+    }
+
+    if !selected.is_empty() {
+        return Ok(Some(selected));
+    }
+
+    if matched_named_artifact {
+        return Err(format!(
+            "workspace contract for {} is ready but the declared terminal artifact could not be resolved",
+            status.repo_label
+        ));
+    }
+
+    Err(format!(
+        "workspace contract for {} is ready but has no declared terminal artifact for '{}'",
+        status.repo_label, terminal_output.required_artifact_kind
+    ))
+}
 async fn deliver_background_result(
     sender: Option<BackgroundResultSender>,
     payload: BackgroundResultPayload,
@@ -725,11 +912,7 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
-            let policy = ToolPolicy {
-                allow: allowed_tools,
-                deny: vec!["spawn".into()],
-                ..Default::default()
-            };
+            let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
@@ -879,11 +1062,7 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
-                let policy = ToolPolicy {
-                    allow: allowed_tools,
-                    deny: vec!["spawn".into()],
-                    ..Default::default()
-                };
+                let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
@@ -1349,6 +1528,93 @@ mod tests {
         assert_eq!(selected, vec![PathBuf::from("/tmp/site/dist/index.html")]);
     }
 
+    #[test]
+    fn contract_owned_workflow_denies_send_file_in_subagent_policy() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
+            }),
+        };
+
+        let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
+
+        assert!(policy.deny.contains(&"spawn".to_string()));
+        assert!(policy.deny.contains(&"send_file".to_string()));
+    }
+
+    #[test]
+    fn contract_terminal_output_prefers_declared_slides_deck_name_over_newer_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        std::fs::create_dir_all(repo_root.join("output")).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(repo_root.join("output/deck-draft.pptx"), "draft").unwrap();
+        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+
+        let workflow = WorkflowMetadata {
+            workflow_kind: "slides".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["mofa_slides".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "presentation".to_string(),
+            }),
+        };
+
+        let selected = resolve_contract_terminal_files(&repo_root, Some(&workflow))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected, vec![repo_root.join("output/deck.pptx")]);
+    }
+
+    #[test]
+    fn contract_terminal_output_fails_when_site_entrypoint_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("sites/news");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_site_build_output("out"),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("mofa-site-session.json"), "{}").unwrap();
+        std::fs::write(repo_root.join("site-plan.json"), "{}").unwrap();
+        std::fs::write(repo_root.join("optimized-prompt.md"), "# prompt").unwrap();
+
+        let workflow = WorkflowMetadata {
+            workflow_kind: "site".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["shell".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                deliver_media_only: false,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "site".to_string(),
+            }),
+        };
+
+        let error = resolve_contract_terminal_files(&repo_root, Some(&workflow)).unwrap_err();
+        assert!(error.contains("workspace contract"));
+        assert!(error.contains("out/index.html"));
+    }
     #[tokio::test]
     async fn test_background_spawn_persists_workflow_phase_transitions() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);

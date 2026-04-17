@@ -4,9 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use octos_agent::{
-    WorkspaceProjectKind, initialize_and_commit, write_workspace_policy,
-};
+use octos_agent::{WorkspaceProjectKind, initialize_and_commit, write_workspace_policy};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -94,7 +92,7 @@ module.exports = [];
     }
 
     write_workspace_policy(&project_dir, &slides_delivery::workspace_policy())
-    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+        .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
 
     initialize_and_commit(
         &project_dir,
@@ -146,11 +144,14 @@ WORKFLOW (follow in order):
 1. STYLE — if user picks a template, use it. If custom, create styles/{{name}}.toml first.
 2. DESIGN — write slides/{slug}/script.js. Show outline to user. Wait for confirmation.
 3. GENERATE — on user confirmation ("生成"/"generate"/"go"), call mofa_slides.
+4. DELIVER — after successful generation, confirm the deck was delivered to the chat.
 
 RULES:
 - ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
 - BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
 - ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+- AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
+- Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
 - NEVER pass slides array inline. ALWAYS use the input file.
 - On failure: report error, do NOT retry via shell.
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
@@ -620,7 +621,8 @@ pub fn build_site_project_metadata(
     let site_slug = slugify(preset.site_name);
     let preview_base_path = site_preview_base_path(profile_id, session_id, &site_slug);
     let preview_url = site_preview_root_url(profile_id, session_id, &site_slug);
-    let build_output_dir = site_delivery::build_output_dir_for_template(preset.template).to_string();
+    let build_output_dir =
+        site_delivery::build_output_dir_for_template(preset.template).to_string();
 
     Some(SiteProjectMetadata {
         version: 1,
@@ -961,6 +963,8 @@ mod tests {
         assert!(prompt.contains("If `mofa_slides` is not available"));
         assert!(prompt.contains("Runtime owns workspace contract enforcement"));
         assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
+        assert!(prompt.contains("runtime auto-delivers"));
+        assert!(prompt.contains("Do not ask the user whether you should send it"));
         assert!(!prompt.contains("glob(\"slides/{slug}/output/*.pptx\")"));
         assert!(!prompt.contains("On every meaningful edit: increment NNN"));
         assert!(!prompt.contains("ps aux | grep mofa_slides | grep -v grep"));
@@ -998,10 +1002,22 @@ mod tests {
 
     #[test]
     fn site_build_output_dir_is_template_aware() {
-        assert_eq!(site_delivery::build_output_dir_for_template("astro-site"), "dist");
-        assert_eq!(site_delivery::build_output_dir_for_template("nextjs-app"), "out");
-        assert_eq!(site_delivery::build_output_dir_for_template("react-vite"), "dist");
-        assert_eq!(site_delivery::build_output_dir_for_template("unknown"), "docs");
+        assert_eq!(
+            site_delivery::build_output_dir_for_template("astro-site"),
+            "dist"
+        );
+        assert_eq!(
+            site_delivery::build_output_dir_for_template("nextjs-app"),
+            "out"
+        );
+        assert_eq!(
+            site_delivery::build_output_dir_for_template("react-vite"),
+            "dist"
+        );
+        assert_eq!(
+            site_delivery::build_output_dir_for_template("unknown"),
+            "docs"
+        );
     }
 
     #[test]
@@ -1026,7 +1042,11 @@ mod tests {
             vec!["file_exists:out/index.html"]
         );
         assert_eq!(
-            policy.artifacts.entries.get("entrypoint").map(String::as_str),
+            policy
+                .artifacts
+                .entries
+                .get("entrypoint")
+                .map(String::as_str),
             Some("out/index.html")
         );
     }
