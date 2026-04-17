@@ -15,7 +15,8 @@
 Thumbs.db
 
 # Octos runtime state (keep config, ignore runtime data)
-.octos/
+.octos/*
+!.octos/AGENTS.md
 
 # Node
 node_modules/
@@ -38,6 +39,7 @@ scripts/deploy.sh
 !ORG-README.md
 !CLAUDE.md
 !CHANGELOG.md
+!.octos/AGENTS.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
@@ -46,6 +48,10 @@ scripts/deploy.sh
 !docs/TESTING.md
 !docs/ARCHITECTURE.md
 !docs/OCTOS_RUNTIME_PHASE2.md
+!docs/OCTOS_RUNTIME_PHASE3.md
+!docs/OCTOS_RUNTIME_PHASE3_CONTRACT.md
+!docs/OCTOS_RELEASE_CONTRACT_2026-04-17.md
+!docs/OCTOS_HARNESS_MASTER_PLAN.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 

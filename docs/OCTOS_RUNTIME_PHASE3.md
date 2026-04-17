@@ -4,6 +4,11 @@ Phase 3 starts after the Phase 2 runtime hardening work is green on live canary.
 The goal is to exploit the new foundation instead of continuing to churn the same
 runtime seams.
 
+The high-level overview in this file is paired with the tracked execution
+contract in:
+
+- `docs/OCTOS_RUNTIME_PHASE3_CONTRACT.md`
+
 ## Lanes
 
 1. Canary soak and regression triage
