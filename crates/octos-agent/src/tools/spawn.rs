@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::task_supervisor::TaskSupervisor;
+use crate::workspace_git::{WorkspaceArtifactStatus, WorkspaceContractStatus};
 use crate::{Agent, AgentConfig};
 
 /// Callback for delivering background task results directly to the session actor.

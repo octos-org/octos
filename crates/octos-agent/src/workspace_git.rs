@@ -492,6 +492,21 @@ pub fn inspect_workspace_contracts(base_dir: &Path) -> Result<Vec<WorkspaceContr
     Ok(repos.iter().map(inspect_workspace_contract).collect())
 }
 
+pub fn inspect_workspace_contract_at_root(project_root: &Path) -> Result<WorkspaceContractStatus> {
+    let kind = infer_kind_from_root(project_root)?;
+    let slug = project_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| eyre!("cannot infer workspace slug from {}", project_root.display()))?
+        .to_string();
+    let repo = WorkspaceRepo {
+        kind,
+        root: project_root.to_path_buf(),
+        slug,
+    };
+    Ok(inspect_workspace_contract(&repo))
+}
+
 pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
     let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
     let revision = git_head_revision(&repo.root);
