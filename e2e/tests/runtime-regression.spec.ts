@@ -198,6 +198,35 @@ test.describe('SSE streaming', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// 2B. CODING SHELL REPAIR
+// ════════════════════════════════════════════════════════════════════
+
+test.describe('Coding shell repair', () => {
+  test('shell repair returns the recovered diff without timing out', async () => {
+    const sid = `shell-repair-${Date.now()}`;
+    const marker = `phase3-shell-${Date.now()}`;
+    const prompt = [
+      'Use shell tool only.',
+      `Create a temporary git repo at /tmp/${marker}.`,
+      'Inside it, create notes.txt with exactly two lines: alpha and beta.',
+      'Make exactly one edit: change beta to gamma.',
+      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
+      'Then recover by running the same diff from the repo root.',
+      'Return only the final unified diff, nothing else.',
+      'Do not start background work.',
+    ].join(' ');
+
+    const { content, doneEvent } = await chatSSE(prompt, sid, 90_000);
+    expect(doneEvent).toBeTruthy();
+    expect(content).toContain('diff --git');
+    expect(content).toContain('notes.txt');
+    expect(content).toContain('-beta');
+    expect(content).toContain('+gamma');
+    expect(content.length).toBeLessThan(4_000);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
 // 3. BACKGROUND TASK LIFECYCLE (TTS)
 // ════════════════════════════════════════════════════════════════════
 

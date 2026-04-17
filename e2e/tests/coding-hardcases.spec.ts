@@ -70,10 +70,43 @@ test.describe('Phase 3 coding hard cases', () => {
     test.expect(response.length).toBeLessThan(4_000);
   });
 
-  test.fixme('failing test is repaired without starting a second ghost turn', async ({ page }) => {
+  test('shell repair stays in one turn and returns the repaired diff', async ({ page }) => {
     await login(page);
     await createNewSession(page);
-    await sendAndWait(page, 'TODO: seed failing test fixture and ask for targeted repair');
+
+    const marker = `phase3-repair-${Date.now()}`;
+    const prompt = [
+      'Use shell tool only.',
+      `Create a temporary git repo at /tmp/${marker}.`,
+      'Inside it, create notes.txt with exactly two lines: alpha and beta.',
+      'Make exactly one edit: change beta to gamma.',
+      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
+      'Then recover by running the same diff from the repo root.',
+      'Return only the final unified diff, nothing else.',
+      'Do not start background work.',
+    ].join(' ');
+
+    const result = await sendAndWait(page, prompt, {
+      maxWait: 180_000,
+      label: 'shell-repair-diff',
+    });
+
+    const response = result.responseText;
+    if (!response) {
+      throw new Error('Expected repaired diff output, got empty assistant response');
+    }
+
+    const userBubbles = await countUserBubbles(page);
+    const assistantBubbles = await countAssistantBubbles(page);
+
+    test.expect(userBubbles).toBe(1);
+    test.expect(assistantBubbles).toBe(1);
+    test.expect(response).toContain('diff --git');
+    test.expect(response).toContain('notes.txt');
+    test.expect(response).toContain('-beta');
+    test.expect(response).toContain('+gamma');
+    test.expect(response).toContain('@@');
+    test.expect(response.length).toBeLessThan(4_000);
   });
 
   test.fixme('coding fanout creates bounded child sessions and joins them cleanly', async ({
