@@ -68,8 +68,8 @@ pub use workspace_git::{
     WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,
     WorkspaceValidationFailure, WorkspaceValidationPhase, commit_all_if_dirty,
     detect_workspace_repo, init_workspace_repo, initialize_and_commit, inspect_workspace_contract,
-    inspect_workspace_contracts, list_workspace_repos, snapshot_workspace_change,
-    snapshot_workspace_turn,
+    inspect_workspace_contract_at_root, inspect_workspace_contracts, list_workspace_repos,
+    snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
     ValidationPolicy, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
