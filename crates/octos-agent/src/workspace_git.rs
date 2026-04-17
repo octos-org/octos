@@ -1005,16 +1005,11 @@ mod tests {
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
         std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
-        std::fs::write(
-            slides_root.join("output/imgs/manifest.json"),
-            "{\"slides\":[]}\n",
-        )
-        .unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
 
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
         policy.validation.on_turn_end = vec!["file_exists:$deck".into()];
-        policy.validation.on_completion = vec!["file_exists:$manifest".into()];
+        policy.validation.on_completion = vec!["file_exists:$previews".into()];
         write_workspace_policy(&slides_root, &policy).unwrap();
         initialize_and_commit(
             &slides_root,
@@ -1033,7 +1028,7 @@ mod tests {
         assert_eq!(status.turn_end_checks[0].spec, "file_exists:$deck");
         assert_eq!(status.completion_checks.len(), 1);
         assert!(status.completion_checks[0].passed);
-        assert_eq!(status.completion_checks[0].spec, "file_exists:$manifest");
+        assert_eq!(status.completion_checks[0].spec, "file_exists:$previews");
     }
 
     #[test]
@@ -1060,7 +1055,7 @@ mod tests {
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
         policy.validation.on_completion = vec![
             "file_exists:output/*.pptx".into(),
-            "file_exists:output/**/manifest.json".into(),
+            "file_exists:output/**/slide-*.png".into(),
         ];
         write_workspace_policy(&slides_root, &policy).unwrap();
 
@@ -1073,7 +1068,7 @@ mod tests {
         );
         assert_eq!(
             report.validation_failures[0].check,
-            "file_exists:output/**/manifest.json"
+            "file_exists:output/**/slide-*.png"
         );
     }
 
@@ -1086,11 +1081,6 @@ mod tests {
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
         std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
-        std::fs::write(
-            slides_root.join("output/imgs/manifest.json"),
-            "{\"slides\":[]}\n",
-        )
-        .unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
         write_workspace_policy(
             &slides_root,
@@ -1112,7 +1102,7 @@ mod tests {
         assert!(status.ready);
         assert!(status.revision.is_some());
         assert!(!status.dirty);
-        assert_eq!(status.artifacts.len(), 3);
+        assert_eq!(status.artifacts.len(), 2);
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));

@@ -112,6 +112,35 @@ export async function getChatThreadText(page: Page): Promise<string> {
   return texts.join('\n');
 }
 
+export interface AssistantLink {
+  text: string;
+  href: string;
+  download: string;
+}
+
+export async function getAssistantLinks(page: Page): Promise<AssistantLink[]> {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-testid='assistant-message'] a")).map(
+      (node) => {
+        const el = node as HTMLAnchorElement;
+        return {
+          text: (el.textContent || '').trim(),
+          href: el.href || '',
+          download: el.download || '',
+        };
+      },
+    ),
+  );
+}
+
+export async function getAssistantMessageText(page: Page): Promise<string> {
+  const texts = await page
+    .locator("[data-testid='assistant-message']")
+    .allTextContents()
+    .catch(() => []);
+  return texts.join('\n');
+}
+
 export async function countUserBubbles(page: Page) {
   return page.locator(SEL.userMessage).count();
 }

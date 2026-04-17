@@ -150,7 +150,6 @@ mod tests {
         write_file(repo_root.join("memory.md"), "# memory");
         write_file(repo_root.join("changelog.md"), "# changelog");
         write_file(repo_root.join("output/deck.pptx"), "deck");
-        write_file(repo_root.join("output/imgs/manifest.json"), "{}");
         write_file(repo_root.join("output/imgs/slide-01.png"), "png");
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
@@ -184,7 +183,6 @@ mod tests {
             write_file(root.join("changelog.md"), "# changelog");
         }
         write_file(ready_root.join("output/deck.pptx"), "deck");
-        write_file(ready_root.join("output/imgs/manifest.json"), "{}");
         write_file(ready_root.join("output/imgs/slide-01.png"), "png");
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());

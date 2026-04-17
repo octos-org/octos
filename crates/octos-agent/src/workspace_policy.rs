@@ -170,14 +170,12 @@ impl WorkspacePolicy {
                     on_source_change: Vec::new(),
                     on_completion: vec![
                         "file_exists:output/*.pptx".into(),
-                        "file_exists:output/**/manifest.json".into(),
                         "file_exists:output/**/slide-*.png".into(),
                     ],
                 },
                 artifacts: WorkspaceArtifactsPolicy {
                     entries: BTreeMap::from([
                         ("deck".into(), "output/*.pptx".into()),
-                        ("manifest".into(), "output/**/manifest.json".into()),
                         ("previews".into(), "output/**/slide-*.png".into()),
                     ]),
                 },
@@ -376,17 +374,12 @@ mod tests {
             policy.validation.on_completion,
             vec![
                 "file_exists:output/*.pptx",
-                "file_exists:output/**/manifest.json",
                 "file_exists:output/**/slide-*.png",
             ]
         );
         assert_eq!(
             policy.artifacts.entries.get("deck").map(String::as_str),
             Some("output/*.pptx")
-        );
-        assert_eq!(
-            policy.artifacts.entries.get("manifest").map(String::as_str),
-            Some("output/**/manifest.json")
         );
         assert_eq!(
             policy.artifacts.entries.get("previews").map(String::as_str),

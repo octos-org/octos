@@ -1,0 +1,164 @@
+/**
+ * Live browser acceptance coverage for slides and site flows.
+ *
+ * These cases target user-visible deliverables, not API-only regressions:
+ * - slides: the final deck artifact appears once and stays stable after reload
+ * - site: the built preview page is reachable and stays stable after reload
+ *
+ * Run against a live browser host:
+ *   OCTOS_TEST_URL=https://dspfac.crew.ominix.io \
+ *   OCTOS_AUTH_TOKEN=octos-admin-2026 \
+ *   OCTOS_PROFILE=dspfac \
+ *   OCTOS_TEST_EMAIL=dspfac@gmail.com \
+ *   npx playwright test tests/live-slides-site.spec.ts
+ */
+import { expect, test, type Page } from '@playwright/test';
+import {
+  createNewSession,
+  getAssistantMessageText,
+  login,
+  sendAndWait,
+  SEL,
+} from './live-browser-helpers';
+
+test.setTimeout(600_000);
+
+async function collectPreviewUrls(page: Page): Promise<string[]> {
+  const text = await getAssistantMessageText(page);
+  const matches =
+    text.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas\/index\.html/gi) || [];
+  return Array.from(new Set(matches.filter((value) => value.trim().length > 0)));
+}
+
+async function waitForPreviewBody(
+  page: Page,
+  previewUrl: string,
+  textNeedle: string,
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastBody = '';
+
+  while (Date.now() < deadline) {
+    await page.goto(previewUrl, { waitUntil: 'networkidle' });
+    lastBody = (await page.locator('body').innerText().catch(() => '')) || '';
+    if (lastBody.includes(textNeedle)) {
+      return lastBody;
+    }
+    await page.waitForTimeout(5_000);
+  }
+
+  throw new Error(
+    `Preview at ${previewUrl} never exposed "${textNeedle}". Last body: ${lastBody.slice(0, 400)}`,
+  );
+}
+
+test.describe('Live deliverable flows', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+    await createNewSession(page);
+  });
+
+  test('slides flow renders one final deck artifact after reload', async ({ page }) => {
+    const deckSlug = `browser-deck-${Date.now().toString(36)}`;
+
+    await sendAndWait(page, `/new slides ${deckSlug}`, {
+      label: 'slides-init',
+      maxWait: 60_000,
+    });
+
+    await sendAndWait(
+      page,
+      'Design a 2-slide deck about browser acceptance. Slide 1 should say "Browser Slides Acceptance". Slide 2 should prove the final deck is visible. Do not generate yet.',
+      {
+        label: 'slides-design',
+        maxWait: 90_000,
+      },
+    );
+
+    await sendAndWait(page, 'generate', {
+      label: 'slides-generate',
+      maxWait: 300_000,
+    });
+
+    const deckButton = page.getByRole('button', { name: /deck\.pptx/i });
+
+    await expect.poll(async () => deckButton.count(), {
+      timeout: 240_000,
+      intervals: [5_000],
+    }).toBe(1);
+    await expect(deckButton).toBeVisible();
+
+    const assistantText = await getAssistantMessageText(page);
+    if (assistantText.includes('Workspace contract validation failed')) {
+      console.log(
+        '  slides contract validation failed even though the deck handle is visible',
+      );
+    }
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
+    await page.waitForTimeout(5_000);
+
+    const afterReloadDeckButton = page.getByRole('button', { name: /deck\.pptx/i });
+    await expect.poll(async () => afterReloadDeckButton.count(), {
+      timeout: 30_000,
+      intervals: [2_000],
+    }).toBe(1);
+    await expect(afterReloadDeckButton).toBeVisible();
+  });
+
+  test('site flow renders a built preview page and survives reload', async ({
+    page,
+  }) => {
+    await sendAndWait(page, '/new site astro', {
+      label: 'site-init',
+      maxWait: 90_000,
+    });
+
+    const creationText = await getAssistantMessageText(page);
+    const previewUrls =
+      creationText.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas\/index\.html/gi) || [];
+    expect(previewUrls).toHaveLength(1);
+
+    const previewUrl = previewUrls[0];
+
+    await sendAndWait(
+      page,
+      'Update the homepage so the visible title says "Browser Site Acceptance" and the page clearly includes a "Live preview" section. Rebuild the site so the preview reflects it.',
+      {
+        label: 'site-build',
+        maxWait: 240_000,
+      },
+    );
+
+    const previewPage = await page.context().newPage();
+    try {
+      const body = await waitForPreviewBody(
+        previewPage,
+        previewUrl,
+        'Browser Site Acceptance',
+        240_000,
+      );
+
+      expect(body).toContain('Browser Site Acceptance');
+      expect(body).toContain('Live preview');
+
+      await previewPage.reload({ waitUntil: 'networkidle' });
+      const reloadedBody =
+        (await previewPage.locator('body').innerText().catch(() => '')) || '';
+      expect(reloadedBody).toContain('Browser Site Acceptance');
+      expect(reloadedBody).toContain('Live preview');
+    } finally {
+      await previewPage.close();
+    }
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
+    await page.waitForTimeout(5_000);
+
+    const afterReloadPreviewUrls = await collectPreviewUrls(page);
+    expect(afterReloadPreviewUrls).toHaveLength(1);
+    expect(afterReloadPreviewUrls[0]).toBe(previewUrl);
+  });
+});

@@ -447,30 +447,14 @@ impl Channel for ApiChannel {
             };
 
             // File message — persist to session history AND send SSE event.
-            let file_desc = msg
-                .media
-                .iter()
-                .zip(persisted_media.iter())
-                .map(|(original_path, persisted_path)| {
-                    let name = std::path::Path::new(original_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let handle =
-                        response_path_for_session_file(&data_dir, Path::new(persisted_path))
-                            .unwrap_or_else(|| persisted_path.clone());
-                    if msg.content.is_empty() {
-                        format!("[file:{handle}] {name}")
-                    } else {
-                        format!("[file:{handle}] {name} — {}", msg.content)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
             let committed_message = if !history_already_persisted {
                 let session_msg = Message {
                     role: MessageRole::Assistant,
-                    content: file_desc,
+                    // Preserve only the human-facing caption. The API/web path
+                    // already has structured media handles, so persisting
+                    // synthetic legacy `[file:...]` lines here creates
+                    // duplicate terminal file deliveries for the same artifact.
+                    content: msg.content.clone(),
                     media: persisted_media.clone(),
                     tool_calls: None,
                     tool_call_id: None,
@@ -1755,6 +1739,43 @@ mod tests {
         assert!(info.content.contains("[file:pf/"));
     }
 
+    #[tokio::test]
+    async fn api_channel_persists_media_without_legacy_file_marker_content() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let channel = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let artifact = data_dir.path().join("deck.pptx");
+        std::fs::write(&artifact, b"pptx").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "web-legacy-media".into(),
+            content: "".into(),
+            reply_to: None,
+            media: vec![artifact.to_string_lossy().to_string()],
+            metadata: serde_json::json!({}),
+        };
+
+        channel.send(&msg).await.unwrap();
+
+        let info = {
+            let sess = sessions.lock().await;
+            let data_dir = sess.data_dir();
+            let key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "web-legacy-media");
+            let loaded = sess.load(&key).await.unwrap();
+            message_info_from_history_message(&loaded.messages[0], &data_dir, 0)
+        };
+
+        assert_eq!(info.media.len(), 1);
+        assert!(info.content.trim().is_empty());
+    }
+
     #[test]
     fn api_session_key_candidates_prefer_current_profile() {
         let keys = api_session_key_candidates(Some("dspfac--newsbot"), "web-123", None);
@@ -2188,7 +2209,6 @@ mod tests {
         let persisted = &history[0].media[0];
         assert_ne!(persisted, &source.to_string_lossy().to_string());
         assert!(!history[0].content.contains(persisted));
-        assert!(history[0].content.contains("[file:pf/"));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
     }
