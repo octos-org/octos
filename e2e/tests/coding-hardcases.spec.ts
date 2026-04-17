@@ -40,7 +40,7 @@ test.describe('Phase 3 coding hard cases', () => {
     const marker = `phase3-${Date.now()}`;
     const prompt = [
       'Use shell tool only.',
-      `Create a temporary git repo at /tmp/${marker}.`,
+      `Inside the current workspace, create a temporary git repo named ${marker}.`,
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
       'Make exactly one edit: change beta to gamma.',
       'Then run git diff -- notes.txt.',
@@ -77,10 +77,10 @@ test.describe('Phase 3 coding hard cases', () => {
     const marker = `phase3-repair-${Date.now()}`;
     const prompt = [
       'Use shell tool only.',
-      `Create a temporary git repo at /tmp/${marker}.`,
+      `Inside the current workspace, create a temporary git repo named ${marker}.`,
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
       'Make exactly one edit: change beta to gamma.',
-      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
+      'Intentionally run `git diff -- notes.txt` from the parent workspace once so it fails.',
       'Then recover by running the same diff from the repo root.',
       'Return only the final unified diff, nothing else.',
       'Do not start background work.',

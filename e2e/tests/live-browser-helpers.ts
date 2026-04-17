@@ -195,7 +195,7 @@ export async function sendAndWait(
       stableCount = 0;
     }
 
-    if (assistantCount > 0 && currentText.length > 0 && currentText === lastText) {
+    if (!isStreaming && assistantCount > 0 && currentText.length > 0 && currentText === lastText) {
       textStableCount++;
       if (textStableCount >= 3) break;
     } else {

@@ -136,6 +136,39 @@ Based on the current code/review state:
 - `#439` slides/site template work exists, but coding-harness expansion is not
   done
 
+## Delivered In This Branch
+
+This Phase 3 branch lands the concrete slices that moved canary behavior:
+
+- `#437` background contract truth now selects and persists terminal artifacts
+  from declared workspace policy for contract-owned slides/site workflows
+- `#414` shell-retry recovery is tighter and bounded, and live coding hard-case
+  acceptance now has real passing coverage for bounded diff and one-turn shell
+  repair
+- `#416` operator summary now reports per-source scrape provenance instead of
+  only merged counters
+- `octos-web` reload persistence now restores long-running task watchers and
+  cleans up stale resume bubbles after replay
+
+## Validation Matrix
+
+The release gate for this branch was:
+
+- `tests/live-slides-site.spec.ts` against public canary: green
+- `tests/live-browser.spec.ts` reload cases for deep research + research
+  podcast: green
+- `tests/runtime-regression.spec.ts --grep "Background task lifecycle"`: green
+- `tests/coding-hardcases.spec.ts` bounded diff + shell repair cases: green
+- targeted Rust tests for:
+  - contract-backed artifact selection
+  - shell retry recovery
+  - operator summary aggregation/provenance
+- `octos-web` typecheck + eslint on the persistence/reload slice: green
+
+Public release truth remained:
+
+- `https://dspfac.crew.ominix.io`
+
 ## Explicitly Out Until Earlier Phases Are Green
 
 - broad schema redesign for its own sake
