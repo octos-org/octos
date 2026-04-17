@@ -96,6 +96,7 @@ pub struct ConversationResponse {
     pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
+    pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,
     /// All messages generated during processing (assistant replies, tool calls,
     /// tool results). Includes the user message at the front. Callers should

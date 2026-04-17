@@ -337,6 +337,7 @@ mod tests {
                 ..Default::default()
             },
             files_modified: vec![],
+            files_to_send: vec![],
             streamed: false,
             messages: vec![],
         };

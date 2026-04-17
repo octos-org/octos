@@ -232,6 +232,7 @@ impl Agent {
 
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
+                let mut files_to_send = Vec::new();
                 let mut turn = LoopTurnState::new(Instant::now());
                 let mut loop_detector = LoopDetector::new(12);
 
@@ -245,6 +246,7 @@ impl Agent {
                             provider_metadata: None,
                             token_usage: turn.total_usage().clone(),
                             files_modified,
+                            files_to_send,
                             streamed: false,
                             messages: LoopTurnState::new_messages(&messages, history.len()),
                         });
@@ -362,6 +364,7 @@ impl Agent {
                                 ),
                                 token_usage: turn.total_usage().clone(),
                                 files_modified,
+                                files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                             });
@@ -382,6 +385,7 @@ impl Agent {
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
                                             files_modified,
+                                            files_to_send,
                                             streamed,
                                             messages: LoopTurnState::new_messages(
                                                 &messages,
@@ -397,6 +401,7 @@ impl Agent {
                                         provider_metadata: None,
                                         token_usage: turn.total_usage().clone(),
                                         files_modified,
+                                        files_to_send,
                                         streamed,
                                         messages: LoopTurnState::new_messages(
                                             &messages,
@@ -409,7 +414,7 @@ impl Agent {
                                 &response,
                                 &mut messages,
                                 &mut files_modified,
-                                None,
+                                Some(&mut files_to_send),
                                 &mut turn,
                                 tracker,
                             )
@@ -427,6 +432,7 @@ impl Agent {
                                     ),
                                     token_usage: turn.total_usage().clone(),
                                     files_modified,
+                                    files_to_send,
                                     streamed,
                                     messages: LoopTurnState::new_messages(
                                         &messages,
@@ -465,6 +471,7 @@ impl Agent {
                                     ),
                                     token_usage: turn.total_usage().clone(),
                                     files_modified,
+                                    files_to_send,
                                     streamed,
                                     messages: LoopTurnState::new_messages(&messages, history.len()),
                                 });
@@ -480,6 +487,7 @@ impl Agent {
                                 ),
                                 token_usage: turn.total_usage().clone(),
                                 files_modified,
+                                files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                             });
@@ -501,6 +509,7 @@ impl Agent {
                                 ),
                                 token_usage: turn.total_usage().clone(),
                                 files_modified,
+                                files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                             });

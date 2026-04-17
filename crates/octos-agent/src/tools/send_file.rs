@@ -15,6 +15,7 @@ pub struct SendFileTool {
     out_tx: mpsc::Sender<OutboundMessage>,
     default_channel: std::sync::Mutex<String>,
     default_chat_id: std::sync::Mutex<String>,
+    default_topic: std::sync::Mutex<Option<String>>,
     /// Base directory for path resolution and validation. Relative paths are
     /// resolved against this directory. File paths must resolve under this
     /// directory (prevents exfiltrating files from other profiles).
@@ -48,6 +49,7 @@ impl SendFileTool {
             out_tx,
             default_channel: std::sync::Mutex::new(String::new()),
             default_chat_id: std::sync::Mutex::new(String::new()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
@@ -63,9 +65,20 @@ impl SendFileTool {
             out_tx,
             default_channel: std::sync::Mutex::new(channel.into()),
             default_chat_id: std::sync::Mutex::new(chat_id.into()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
+    }
+
+    /// Bind the current session topic so API send_file deliveries are persisted
+    /// into the correct topic-scoped history instead of default.jsonl.
+    pub fn with_topic(mut self, topic: Option<String>) -> Self {
+        *self
+            .default_topic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = topic;
+        self
     }
 
     /// Set the base directory for file path resolution and validation.
@@ -236,18 +249,24 @@ impl Tool for SendFileTool {
             });
         }
 
-        let channel = input.channel.unwrap_or_else(|| {
-            self.default_channel
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
-        let chat_id = input.chat_id.unwrap_or_else(|| {
-            self.default_chat_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
+        let default_channel = self
+            .default_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let default_chat_id = self
+            .default_chat_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let default_topic = self
+            .default_topic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let channel = input.channel.unwrap_or_else(|| default_channel.clone());
+        let chat_id = input.chat_id.unwrap_or_else(|| default_chat_id.clone());
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok(ToolResult {
@@ -263,6 +282,11 @@ impl Tool for SendFileTool {
                 "tool_call_id".to_string(),
                 serde_json::Value::String(tc_id.clone()),
             );
+        }
+        if channel == default_channel && chat_id == default_chat_id {
+            if let Some(topic) = default_topic.filter(|value| !value.trim().is_empty()) {
+                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
+            }
         }
 
         let msg = OutboundMessage {
@@ -573,6 +597,31 @@ mod tests {
         assert_eq!(
             msg.metadata.get("tool_call_id").and_then(|v| v.as_str()),
             Some("call_abc123"),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_include_topic_metadata_for_default_api_context() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool =
+            SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo".into()));
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "deck").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("topic").and_then(|v| v.as_str()),
+            Some("slides demo"),
         );
     }
 

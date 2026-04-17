@@ -117,7 +117,8 @@ impl Tool for ActivateToolsTool {
             });
         }
 
-        let mut all_activated = Vec::new();
+        let mut activated_now = Vec::new();
+        let mut already_active = Vec::new();
 
         // Activate by individual tool names — find which group each belongs to
         if !tool_names.is_empty() {
@@ -130,11 +131,23 @@ impl Tool for ActivateToolsTool {
 
                 if let Some(gn) = group_name {
                     let activated = registry.activate(gn);
-                    all_activated.extend(activated);
+                    if activated.is_empty() {
+                        if registry.get(tool_name).is_some() {
+                            already_active.push(tool_name.clone());
+                        }
+                    } else {
+                        activated_now.extend(activated);
+                    }
                 } else {
                     // Try as a direct group name
                     let activated = registry.activate(tool_name);
-                    all_activated.extend(activated);
+                    if activated.is_empty() {
+                        if registry.get(tool_name).is_some() {
+                            already_active.push(tool_name.clone());
+                        }
+                    } else {
+                        activated_now.extend(activated);
+                    }
                 }
             }
         }
@@ -142,26 +155,55 @@ impl Tool for ActivateToolsTool {
         // Legacy: activate by group name
         if !group.is_empty() {
             let activated = registry.activate(group);
-            all_activated.extend(activated);
+            if activated.is_empty() {
+                if let Some(info) = super::policy::tool_group_info(group) {
+                    already_active.extend(
+                        info.tools
+                            .iter()
+                            .filter(|&&tool| registry.get(tool).is_some())
+                            .map(|&tool| tool.to_string()),
+                    );
+                } else if registry.get(group).is_some() {
+                    already_active.push(group.to_string());
+                }
+            } else {
+                activated_now.extend(activated);
+            }
         }
 
         // Deduplicate
-        all_activated.sort();
-        all_activated.dedup();
+        activated_now.sort();
+        activated_now.dedup();
+        already_active.sort();
+        already_active.dedup();
 
-        if all_activated.is_empty() {
+        if activated_now.is_empty() && already_active.is_empty() {
             Ok(ToolResult {
                 output: "No tools matched. Call activate_tools with no arguments to see available tools.".to_string(),
                 success: false,
                 ..Default::default()
             })
         } else {
-            Ok(ToolResult {
-                output: format!(
+            let output = match (activated_now.is_empty(), already_active.is_empty()) {
+                (false, true) => format!(
                     "Loaded {} tool(s): {}",
-                    all_activated.len(),
-                    all_activated.join(", ")
+                    activated_now.len(),
+                    activated_now.join(", ")
                 ),
+                (true, false) => format!(
+                    "Already active: {}",
+                    already_active.join(", ")
+                ),
+                (false, false) => format!(
+                    "Loaded {} tool(s): {}. Already active: {}",
+                    activated_now.len(),
+                    activated_now.join(", "),
+                    already_active.join(", ")
+                ),
+                (true, true) => unreachable!(),
+            };
+            Ok(ToolResult {
+                output,
                 success: true,
                 ..Default::default()
             })
@@ -239,5 +281,38 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn should_report_tool_already_active() {
+        let registry = Arc::new(ToolRegistry::with_builtins(PathBuf::from("/tmp")));
+
+        let tool = ActivateToolsTool::new();
+        tool.set_registry(Arc::downgrade(&registry));
+
+        let result = tool
+            .execute(&serde_json::json!({"tools": ["shell"]}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Already active"));
+        assert!(result.output.contains("shell"));
+    }
+
+    #[tokio::test]
+    async fn should_report_group_already_active() {
+        let registry = Arc::new(ToolRegistry::with_builtins(PathBuf::from("/tmp")));
+
+        let tool = ActivateToolsTool::new();
+        tool.set_registry(Arc::downgrade(&registry));
+
+        let result = tool
+            .execute(&serde_json::json!({"group": "group:web"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Already active"));
+        assert!(result.output.contains("web_search"));
+        assert!(result.output.contains("browser"));
     }
 }

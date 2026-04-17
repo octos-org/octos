@@ -219,6 +219,79 @@ impl PluginTool {
 
         effective_args
     }
+
+    fn detect_output_file(
+        &self,
+        effective_args: &serde_json::Value,
+        output: &str,
+        files_to_send: &mut Vec<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        let out_file = effective_args
+            .get("out")
+            .and_then(|v| v.as_str())
+            .map(|p| {
+                let path = std::path::PathBuf::from(p);
+                if path.is_absolute() && path.exists() {
+                    return Some(path);
+                }
+                let candidates: Vec<std::path::PathBuf> = [
+                    self.work_dir.as_ref().map(|d| d.join(&path)),
+                    std::env::current_dir().ok().map(|d| d.join(&path)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                candidates
+                    .into_iter()
+                    .find(|c| c.exists())
+                    .or_else(|| self.work_dir.as_ref().map(|d| d.join(&path)))
+                    .or_else(|| std::env::current_dir().ok().map(|d| d.join(&path)))
+                    .or(Some(path))
+            })
+            .flatten();
+        let from_output = if out_file.is_none() {
+            output.lines().find_map(|line| {
+                line.strip_prefix("Generated PPTX: ")
+                    .or_else(|| line.strip_prefix("Generated: "))
+                    .map(|p| std::path::PathBuf::from(p.trim()))
+                    .and_then(|path| {
+                        if path.exists() {
+                            return Some(path.clone());
+                        }
+                        let in_work = self.work_dir.as_ref().map(|d| d.join(&path));
+                        let in_cwd = std::env::current_dir().ok().map(|d| d.join(&path));
+                        in_work
+                            .clone()
+                            .filter(|p| p.exists())
+                            .or_else(|| in_cwd.clone().filter(|p| p.exists()))
+                            .or(in_work)
+                            .or(in_cwd)
+                            .or(Some(path))
+                    })
+            })
+        } else {
+            None
+        };
+        let found = out_file.or(from_output).map(|path| {
+            if path.exists() {
+                return path;
+            }
+
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if path.exists() {
+                    return path;
+                }
+            }
+
+            path
+        });
+        if let Some(ref abs) = found {
+            tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
+            files_to_send.push(abs.clone());
+        }
+        found
+    }
 }
 
 fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool {
@@ -533,51 +606,7 @@ impl Tool for PluginTool {
             // Auto-deliver output file when plugin didn't report it.
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
-                // Try from `out` arg
-                let out_file = effective_args
-                    .get("out")
-                    .and_then(|v| v.as_str())
-                    .and_then(|p| {
-                        let path = std::path::PathBuf::from(p);
-                        if path.is_absolute() && path.exists() {
-                            return Some(path);
-                        }
-                        // Try work_dir, then cwd
-                        let candidates: Vec<std::path::PathBuf> = [
-                            self.work_dir.as_ref().map(|d| d.join(&path)),
-                            std::env::current_dir().ok().map(|d| d.join(&path)),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                        candidates.into_iter().find(|c| c.exists())
-                    });
-                // Also try parsing file path from output text (e.g. "Generated PPTX: path.pptx")
-                let from_output = if out_file.is_none() {
-                    output.lines().find_map(|line| {
-                        line.strip_prefix("Generated PPTX: ")
-                            .or_else(|| line.strip_prefix("Generated: "))
-                            .map(|p| std::path::PathBuf::from(p.trim()))
-                            .and_then(|path| {
-                                if path.exists() {
-                                    return Some(path.clone());
-                                }
-                                let in_work = self.work_dir.as_ref().map(|d| d.join(&path));
-                                let in_cwd = std::env::current_dir().ok().map(|d| d.join(&path));
-                                in_work
-                                    .filter(|p| p.exists())
-                                    .or_else(|| in_cwd.filter(|p| p.exists()))
-                            })
-                    })
-                } else {
-                    None
-                };
-                let found = out_file.or(from_output);
-                if let Some(ref abs) = found {
-                    tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
-                    files_to_send.push(abs.clone());
-                }
-                found
+                self.detect_output_file(&effective_args, &output, &mut files_to_send)
             } else {
                 file_modified
             };
@@ -600,9 +629,14 @@ impl Tool for PluginTool {
             output.push_str(&stderr_text);
         }
 
+        let mut files_to_send = Vec::new();
+        let file_modified = self.detect_output_file(&effective_args, &output, &mut files_to_send);
+
         Ok(ToolResult {
             output,
             success: exit_status.success(),
+            file_modified,
+            files_to_send,
             ..Default::default()
         })
     }
@@ -887,6 +921,81 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("plain text output"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_fallback_detects_generated_pptx_as_file_to_send() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output_rel = "slides/demo/output/deck.pptx";
+        let output_abs = dir.path().join(output_rel);
+        std::fs::create_dir_all(output_abs.parent().unwrap()).unwrap();
+        std::fs::write(&output_abs, b"fake pptx").unwrap();
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho 'Generated PPTX: slides/demo/output/deck.pptx'\n",
+        );
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides output".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
+        assert_eq!(result.files_to_send, vec![output_abs]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_fallback_waits_briefly_for_generated_pptx_to_appear() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output_rel = "slides/demo/output/deck.pptx";
+        let output_abs = dir.path().join(output_rel);
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nnohup sh -c 'sleep 0.2; mkdir -p slides/demo/output; printf fake > slides/demo/output/deck.pptx' >/dev/null 2>&1 &\necho 'Generated PPTX: slides/demo/output/deck.pptx'\n",
+        );
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides output".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
+        assert_eq!(result.files_to_send, vec![output_abs.clone()]);
+        assert!(output_abs.exists(), "generated deck should appear after fallback wait");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
