@@ -1902,6 +1902,7 @@ fn should_skip_listing_dir(dir_name: &str, include_build: bool) -> bool {
     let lower = dir_name.to_ascii_lowercase();
     lower.starts_with('.')
         || matches!(lower.as_str(), "node_modules" | "coverage" | "target")
+        || lower == "output_old"
         || (!include_build && matches!(lower.as_str(), "dist" | "out" | "docs" | "build"))
 }
 
@@ -2832,6 +2833,7 @@ mod tests {
         assert!(should_skip_listing_dir("out", false));
         assert!(should_skip_listing_dir("docs", false));
         assert!(should_skip_listing_dir("build", false));
+        assert!(should_skip_listing_dir("output_old", false));
         assert!(should_skip_listing_dir("node_modules", false));
         assert!(should_skip_listing_dir(".cache", false));
     }
@@ -2842,6 +2844,7 @@ mod tests {
         assert!(!should_skip_listing_dir("out", true));
         assert!(!should_skip_listing_dir("docs", true));
         assert!(!should_skip_listing_dir("build", true));
+        assert!(should_skip_listing_dir("output_old", true));
         assert!(should_skip_listing_dir("node_modules", true));
         assert!(should_skip_listing_dir("target", true));
     }

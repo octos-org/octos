@@ -1,6 +1,6 @@
 //! Send file tool for delivering files to chat channels.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -22,6 +22,24 @@ pub struct SendFileTool {
     /// Additional allowed directories beyond base_dir (e.g. data_dir for
     /// pipeline-generated files). Absolute paths under these dirs are accepted.
     extra_allowed_dirs: Vec<PathBuf>,
+}
+
+fn is_stale_slides_backup(path: &Path) -> bool {
+    let mut saw_slides = false;
+    for component in path.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        let name = segment.to_string_lossy();
+        if name == "slides" {
+            saw_slides = true;
+            continue;
+        }
+        if saw_slides && name == "output_old" {
+            return true;
+        }
+    }
+    false
 }
 
 impl SendFileTool {
@@ -202,6 +220,17 @@ impl Tool for SendFileTool {
         if !path.is_file() {
             return Ok(ToolResult {
                 output: format!("Error: Not a file: {}", input.file_path),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        if is_stale_slides_backup(&path) {
+            return Ok(ToolResult {
+                output: format!(
+                    "Error: Refusing to send stale slides backup artifact: {}",
+                    input.file_path
+                ),
                 success: false,
                 ..Default::default()
             });
@@ -564,5 +593,38 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn stale_slides_backup_detection_matches_output_old_paths() {
+        assert!(is_stale_slides_backup(Path::new(
+            "/tmp/workspace/slides/demo/output_old/deck.pptx"
+        )));
+        assert!(!is_stale_slides_backup(Path::new(
+            "/tmp/workspace/slides/demo/output/deck.pptx"
+        )));
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_slides_backup_artifacts() {
+        let base = tempfile::tempdir().unwrap();
+        let backup_dir = base.path().join("slides/demo/output_old");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let backup = backup_dir.join("deck.pptx");
+        std::fs::write(&backup, "pptx data").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": "slides/demo/output_old/deck.pptx"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("stale slides backup artifact"));
+        assert!(rx.try_recv().is_err());
     }
 }
