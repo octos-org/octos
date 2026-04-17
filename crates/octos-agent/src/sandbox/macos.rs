@@ -98,7 +98,7 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
-        let profile = format!(
+let profile = format!(
             r#"(version 1)
 (deny default)
 (allow process-exec)
@@ -111,6 +111,7 @@ impl Sandbox for MacosSandbox {
 (allow signal)
 (allow file-ioctl)
 {read_rules}
+(allow file-write* (literal "/dev/null"))
 (allow file-write* (subpath "{cwd}"))
 {network_rule}
 "#,
@@ -176,6 +177,10 @@ mod tests {
         assert!(
             !profile.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
             "SBPL should NOT allow writes to /private/var/folders"
+        );
+        assert!(
+            profile.contains("(allow file-write* (literal \"/dev/null\"))"),
+            "SBPL should allow write access to /dev/null for git and shell redirections"
         );
     }
 

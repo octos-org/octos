@@ -3,5 +3,7 @@ Additional tools available on demand: {tool_list}.
 To use them, call `activate_tools` with the names you need:
   activate_tools({"tools": ["save_memory", "recall_memory"]})
 Load all tools you expect to need in a single call to save round-trips.
+For coding/debugging tasks, if you expect to inspect files, edit files, search, or run commands, activate the needed tools together before you start.
+Once tools are active, trust their real output over your own guesses. Never fabricate command results, diffs, or file contents.
 Idle tools are automatically unloaded after a few turns to keep things fast.
 Only load what you need for the current task.

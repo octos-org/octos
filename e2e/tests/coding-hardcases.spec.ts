@@ -20,17 +20,54 @@
  */
 import { test } from '@playwright/test';
 
-import { createNewSession, login, sendAndWait } from './live-browser-helpers';
+import {
+  createNewSession,
+  login,
+  sendAndWait,
+  countAssistantBubbles,
+  countUserBubbles,
+} from './live-browser-helpers';
 
 test.setTimeout(600_000);
 
 test.describe('Phase 3 coding hard cases', () => {
-  test.fixme('repo edit task writes a bounded diff and exposes reviewable output', async ({
+  test('repo edit task writes a bounded diff and exposes reviewable output', async ({
     page,
   }) => {
     await login(page);
     await createNewSession(page);
-    await sendAndWait(page, 'TODO: seed fixture repo and ask for one deterministic edit');
+
+    const marker = `phase3-${Date.now()}`;
+    const prompt = [
+      'Use shell tool only.',
+      `Create a temporary git repo at /tmp/${marker}.`,
+      'Inside it, create notes.txt with exactly two lines: alpha and beta.',
+      'Make exactly one edit: change beta to gamma.',
+      'Then run git diff -- notes.txt.',
+      'Return only the unified diff, nothing else.',
+      'Do not start background work.',
+    ].join(' ');
+
+    const result = await sendAndWait(page, prompt, {
+      maxWait: 180_000,
+      label: 'bounded-diff',
+    });
+
+    const response = result.responseText;
+    if (!response) {
+      throw new Error('Expected a reviewable diff response, got empty assistant output');
+    }
+
+    const userBubbles = await countUserBubbles(page);
+    const assistantBubbles = await countAssistantBubbles(page);
+
+    test.expect(userBubbles).toBe(1);
+    test.expect(assistantBubbles).toBe(1);
+    test.expect(response).toContain('diff --git');
+    test.expect(response).toContain('notes.txt');
+    test.expect(response).toContain('-beta');
+    test.expect(response).toContain('+gamma');
+    test.expect(response.length).toBeLessThan(4_000);
   });
 
   test.fixme('failing test is repaired without starting a second ghost turn', async ({ page }) => {

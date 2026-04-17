@@ -372,6 +372,23 @@ impl Agent {
                                 if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
                                 {
                                     warn!("loop detected — breaking agent loop");
+                                    if let Some(recovered) =
+                                        recover_shell_retry_output(&messages, 8)
+                                    {
+                                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                                        return Ok(ConversationResponse {
+                                            content: recovered,
+                                            reasoning_content: None,
+                                            provider_metadata: None,
+                                            token_usage: turn.total_usage().clone(),
+                                            files_modified,
+                                            streamed,
+                                            messages: LoopTurnState::new_messages(
+                                                &messages,
+                                                history.len(),
+                                            ),
+                                        });
+                                    }
                                     // Don't execute the tools — break out with a message
                                     self.emit_cost_update(turn.total_usage(), &response.usage);
                                     return Ok(ConversationResponse {
@@ -397,6 +414,26 @@ impl Agent {
                                 tracker,
                             )
                             .await?;
+
+                            if let Some(recovered) = recover_shell_retry_output(&messages, 8) {
+                                self.emit_cost_update(turn.total_usage(), &response.usage);
+                                return Ok(ConversationResponse {
+                                    content: recovered,
+                                    reasoning_content: None,
+                                    provider_metadata: Some(
+                                        self.llm.provider_metadata_for_index(
+                                            response.provider_index,
+                                        ),
+                                    ),
+                                    token_usage: turn.total_usage().clone(),
+                                    files_modified,
+                                    streamed,
+                                    messages: LoopTurnState::new_messages(
+                                        &messages,
+                                        history.len(),
+                                    ),
+                                });
+                            }
 
                             if self.tools.spawn_only_was_invoked() {
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
@@ -872,6 +909,83 @@ fn merge_tool_messages_in_order(
     ordered
 }
 
+fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> Option<String> {
+    let recent = recent_tool_results(messages, min_shell_streak * 2);
+    let shell_streak: Vec<&str> = recent
+        .iter()
+        .take_while(|(tool_name, _)| *tool_name == "shell")
+        .map(|(_, content)| content.as_str())
+        .collect();
+
+    if shell_streak.len() < min_shell_streak {
+        return None;
+    }
+
+    shell_streak
+        .iter()
+        .find(|content| is_diff_like_shell_output(content))
+        .or_else(|| shell_streak.iter().find(|content| is_useful_shell_output(content)))
+        .map(|content| strip_success_exit_suffix(content))
+}
+
+fn recent_tool_results(messages: &[Message], limit: usize) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+
+    for idx in (0..messages.len()).rev() {
+        let message = &messages[idx];
+        if message.role != MessageRole::Tool {
+            continue;
+        }
+        let Some(tool_name) = resolve_tool_name(messages, idx) else {
+            continue;
+        };
+        results.push((tool_name.to_string(), message.content.clone()));
+        if results.len() >= limit {
+            break;
+        }
+    }
+
+    results
+}
+
+fn resolve_tool_name(messages: &[Message], tool_msg_index: usize) -> Option<&str> {
+    let tool_call_id = messages.get(tool_msg_index)?.tool_call_id.as_deref()?;
+
+    messages[..tool_msg_index].iter().rev().find_map(|message| {
+        if message.role != MessageRole::Assistant {
+            return None;
+        }
+        message.tool_calls.as_ref().and_then(|tool_calls| {
+            tool_calls
+                .iter()
+                .find(|tool_call| tool_call.id == tool_call_id)
+                .map(|tool_call| tool_call.name.as_str())
+        })
+    })
+}
+
+fn is_useful_shell_output(content: &str) -> bool {
+    let trimmed = content.trim();
+    content.contains("Exit code: 0")
+        && !trimmed.is_empty()
+        && trimmed != "Exit code: 0"
+        && !trimmed.starts_with("(no output)")
+}
+
+fn is_diff_like_shell_output(content: &str) -> bool {
+    is_useful_shell_output(content)
+        && (content.contains("diff --git")
+            || (content.contains("\n--- ") && content.contains("\n+++ "))
+            || content.contains("\n@@ "))
+}
+
+fn strip_success_exit_suffix(content: &str) -> String {
+    content
+        .strip_suffix("\n\nExit code: 0")
+        .unwrap_or(content)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,5 +1418,108 @@ mod tests {
         assert_eq!(batch_sizes, vec![8, 1]);
         assert_eq!(batches[0][0].id, "call_0");
         assert_eq!(batches[1][0].id, "call_8");
+    }
+
+    #[test]
+    fn recover_shell_retry_output_prefers_diff_like_success() {
+        let messages = vec![
+            Message::user("show a diff"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "fatal: not a git repository\n\nExit code: 128".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cd /tmp && git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git status --short"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "(no output)\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "fatal: not a git repository\n\nExit code: 128".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let recovered = recover_shell_retry_output(&messages, 4).expect("should recover");
+        assert!(recovered.contains("diff --git"));
+        assert!(!recovered.contains("Exit code: 0"));
     }
 }
