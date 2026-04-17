@@ -497,7 +497,12 @@ pub fn inspect_workspace_contract_at_root(project_root: &Path) -> Result<Workspa
     let slug = project_root
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| eyre!("cannot infer workspace slug from {}", project_root.display()))?
+        .ok_or_else(|| {
+            eyre!(
+                "cannot infer workspace slug from {}",
+                project_root.display()
+            )
+        })?
         .to_string();
     let repo = WorkspaceRepo {
         kind,
@@ -505,6 +510,52 @@ pub fn inspect_workspace_contract_at_root(project_root: &Path) -> Result<Workspa
         slug,
     };
     Ok(inspect_workspace_contract(&repo))
+}
+
+pub(crate) fn resolve_workspace_contract_artifact_paths(
+    project_root: &Path,
+    artifact_name: &str,
+) -> Result<Vec<PathBuf>> {
+    let Some(policy) = read_workspace_policy(project_root)? else {
+        return Ok(Vec::new());
+    };
+    let Some(pattern) = policy.artifacts.entries.get(artifact_name) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(resolve_artifact_matches(project_root, pattern)
+        .into_iter()
+        .map(|relative| project_root.join(relative))
+        .filter(|path| path.is_file())
+        .collect())
+}
+
+pub(crate) fn resolve_preferred_workspace_contract_artifact_path(
+    project_root: &Path,
+    artifact_name: &str,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = resolve_workspace_contract_artifact_paths(project_root, artifact_name)?;
+    if let Some(preferred) = preferred_contract_basename(artifact_name) {
+        let exact = candidates
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.eq_ignore_ascii_case(preferred))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            candidates = exact;
+        }
+    }
+
+    Ok(candidates.into_iter().max_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    }))
 }
 
 pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
@@ -699,6 +750,14 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
     matches.sort();
     matches.dedup();
     matches
+}
+
+fn preferred_contract_basename(artifact_name: &str) -> Option<&'static str> {
+    match artifact_name {
+        "deck" => Some("deck.pptx"),
+        "entrypoint" => Some("index.html"),
+        _ => None,
+    }
 }
 
 fn git_head_revision(project_root: &Path) -> Option<String> {
@@ -1178,10 +1237,39 @@ mod tests {
         assert!(status.ready);
         assert_eq!(status.turn_end_checks.len(), 1);
         assert!(status.turn_end_checks[0].passed);
-        assert_eq!(status.turn_end_checks[0].spec, "file_count_eq:output/*.png:2");
+        assert_eq!(
+            status.turn_end_checks[0].spec,
+            "file_count_eq:output/*.png:2"
+        );
         assert_eq!(status.completion_checks.len(), 1);
         assert!(status.completion_checks[0].passed);
-        assert_eq!(status.completion_checks[0].spec, "any_exists:output/*.png|output/*.pdf");
+        assert_eq!(
+            status.completion_checks[0].spec,
+            "any_exists:output/*.png|output/*.pdf"
+        );
+    }
+
+    #[test]
+    fn resolves_preferred_declared_artifact_match_for_slides_deck() {
+        let temp = tempfile::tempdir().unwrap();
+        let slides_root = temp.path().join("slides").join("deck-h");
+        std::fs::create_dir_all(slides_root.join("output")).unwrap();
+        std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
+        std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
+        std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), b"final").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(slides_root.join("output/deck-backup.pptx"), b"backup").unwrap();
+        write_workspace_policy(
+            &slides_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_preferred_workspace_contract_artifact_path(&slides_root, "deck").unwrap();
+
+        assert_eq!(resolved, Some(slides_root.join("output/deck.pptx")));
     }
 
     #[test]
