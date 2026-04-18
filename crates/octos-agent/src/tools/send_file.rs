@@ -45,8 +45,11 @@ fn is_stale_slides_backup(path: &Path) -> bool {
     false
 }
 
-const CANONICALIZE_RETRY_ATTEMPTS: usize = 10;
-const CANONICALIZE_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Generated artifacts can be discovered slightly before the filesystem entry is
+// fully visible on slower hosts. Give send_file a few seconds to resolve those
+// paths so final deliverables do not get dropped after successful generation.
+const CANONICALIZE_RETRY_ATTEMPTS: usize = 40;
+const CANONICALIZE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 async fn canonicalize_with_retry(path: &Path) -> io::Result<PathBuf> {
     let mut last_err = None;
@@ -568,6 +571,41 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "expected delayed file delivery to succeed");
+        let msg = rx.recv().await.unwrap();
+        let canonical_deck = std::fs::canonicalize(&deck).unwrap();
+        assert_eq!(
+            msg.media,
+            vec![canonical_deck.to_string_lossy().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_waits_for_slow_generated_file_to_appear() {
+        let base = tempfile::tempdir().unwrap();
+        let deck = base.path().join("output").join("deck.pptx");
+        let deck_for_writer = deck.clone();
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(900)).await;
+            std::fs::create_dir_all(deck_for_writer.parent().unwrap()).unwrap();
+            std::fs::write(&deck_for_writer, "pptx data").unwrap();
+        });
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": deck.to_string_lossy().to_string()
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected slow delayed file delivery to succeed: {}",
+            result.output
+        );
         let msg = rx.recv().await.unwrap();
         let canonical_deck = std::fs::canonicalize(&deck).unwrap();
         assert_eq!(
