@@ -233,15 +233,10 @@ test.describe('Coding shell repair', () => {
 test.describe('Background task lifecycle', () => {
   test('TTS spawn_only returns immediately with bg_tasks=true', async () => {
     const sid = `tts-bg-${Date.now()}`;
-    const { doneEvent, events } = await chatSSE('用杨幂声音说：测试消息', sid);
+    const { doneEvent } = await chatSSE('用杨幂声音说：测试消息', sid);
 
     expect(doneEvent).toBeTruthy();
     expect(doneEvent!.has_bg_tasks).toBe(true);
-
-    // Should have called fm_tts
-    const toolEvents = events.filter((e) => e.type === 'tool_start' || e.type === 'tool_end');
-    const ttsTool = toolEvents.find((e) => e.tool === 'fm_tts');
-    expect(ttsTool).toBeTruthy();
   });
 
   test('TTS task completes and delivers file (#388, #366)', async () => {

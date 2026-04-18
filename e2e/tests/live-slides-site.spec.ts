@@ -78,6 +78,20 @@ function assistantNeedsSlidesConfirmation(text: string): boolean {
   );
 }
 
+async function waitForSlidesConfirmationResolution(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const deckCount = await page.getByRole('button', { name: /deck\.pptx/i }).count();
+    if (deckCount > 0) return;
+
+    const assistantText = await getAssistantMessageText(page);
+    if (!assistantNeedsSlidesConfirmation(assistantText)) return;
+
+    await page.waitForTimeout(5_000);
+  }
+}
+
 test.describe('Live deliverable flows', () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
@@ -108,6 +122,7 @@ test.describe('Live deliverable flows', () => {
 
     const deckButton = page.getByRole('button', { name: /deck\.pptx/i });
     if ((await deckButton.count()) === 0) {
+      await waitForSlidesConfirmationResolution(page, 60_000);
       const assistantText = await getAssistantMessageText(page);
       if (assistantNeedsSlidesConfirmation(assistantText)) {
         await sendAndWait(page, 'go', {
