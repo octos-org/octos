@@ -2067,6 +2067,9 @@ mod tests {
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(
                 dir.path(),
             )),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(
+                dir.path(),
+            )),
             metrics_handle: None,
             profile_store: Some(profile_store.clone()),
             process_manager: None,

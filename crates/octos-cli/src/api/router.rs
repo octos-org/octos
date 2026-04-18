@@ -247,14 +247,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
         // First-run setup wizard
+        .route("/api/admin/token/status", get(admin_setup::token_status))
+        .route("/api/admin/token/rotate", post(admin_setup::rotate_token))
+        .route("/api/admin/setup/state", get(admin_setup::get_setup_state))
+        .route("/api/admin/setup/step", post(admin_setup::post_setup_step))
         .route(
-            "/api/admin/token/status",
-            get(admin_setup::token_status),
+            "/api/admin/setup/complete",
+            post(admin_setup::post_setup_complete),
         )
-        .route(
-            "/api/admin/token/rotate",
-            post(admin_setup::rotate_token),
-        )
+        .route("/api/admin/setup/skip", post(admin_setup::post_setup_skip))
         // Sub-account management
         .route(
             "/api/admin/profiles/{id}/accounts",
@@ -818,9 +819,8 @@ mod tests {
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: Utc::now(),
             auth_token: Some("admin-secret".into()),
-            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(
-                dir.path(),
-            )),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
