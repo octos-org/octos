@@ -3,6 +3,7 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 
+pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
 pub mod auth;

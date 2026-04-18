@@ -36,6 +36,8 @@ rustyline = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
+getrandom = "0.2"
+constant_time_eq = "0.3"
 open = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
