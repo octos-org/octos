@@ -6,16 +6,12 @@ use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use eyre::{Result, WrapErr, bail};
+use eyre::{Result, bail};
 use uuid::Uuid;
 
 use super::Executable;
+use crate::admin_token_store::AdminTokenStore;
 use crate::tenant::{TenantConfig, TenantStatus, TenantStore, render_frpc_config};
-
-/// Matches the constant defined alongside `AdminTokenStore` in
-/// `crate::admin_token_store`. Kept local here so the reset subcommand works
-/// even before `AdminTokenStore` lands; refactor to delegate once it exists.
-const ADMIN_TOKEN_FILE: &str = "admin_token.json";
 
 /// Admin commands for tenant and tunnel management.
 #[derive(Debug, Args)]
@@ -238,10 +234,11 @@ impl Executable for AdminCommand {
             }
             AdminAction::ResetToken { data_dir, yes } => {
                 let data_dir = super::resolve_data_dir(data_dir)?;
+                let store = AdminTokenStore::new(&data_dir);
                 if !yes {
                     print!(
                         "Reset admin token at {}? [y/N]: ",
-                        data_dir.join(ADMIN_TOKEN_FILE).display()
+                        store.path().display()
                     );
                     std::io::stdout().flush().ok();
                     let mut input = String::new();
@@ -282,14 +279,7 @@ impl Executable for AdminCommand {
 /// Delete the admin token file under `data_dir`, returning Ok if the file is
 /// absent. Factored out of the `ResetToken` handler for testability.
 pub(crate) fn run_reset_token(data_dir: &Path) -> Result<()> {
-    let path = data_dir.join(ADMIN_TOKEN_FILE);
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => {
-            Err(e).wrap_err_with(|| format!("failed to delete {}", path.display()))
-        }
-    }
+    AdminTokenStore::new(data_dir).clear()
 }
 
 fn resolve_base_url(cli_value: Option<String>) -> String {
@@ -422,17 +412,17 @@ mod tests {
     #[test]
     fn reset_token_removes_file() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join(ADMIN_TOKEN_FILE);
-        std::fs::write(&path, "{}").unwrap();
-        assert!(path.exists());
+        let store = AdminTokenStore::new(dir.path());
+        std::fs::write(store.path(), "{}").unwrap();
+        assert!(store.exists());
         run_reset_token(dir.path()).unwrap();
-        assert!(!path.exists());
+        assert!(!store.exists());
     }
 
     #[test]
     fn reset_token_is_idempotent_when_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         run_reset_token(dir.path()).unwrap();
-        assert!(!dir.path().join(ADMIN_TOKEN_FILE).exists());
+        assert!(!AdminTokenStore::new(dir.path()).exists());
     }
 }
