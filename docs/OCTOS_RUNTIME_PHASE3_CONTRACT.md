@@ -2,6 +2,11 @@
 
 This document is the execution contract for Phase 3.
 
+Detailed kickoff planning for the remaining open work lives in:
+
+- `docs/OCTOS_RUNTIME_PHASE3_KICKOFF.md`
+- `docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md`
+
 Phase 3 is not permission to keep refactoring forever. It exists to finish a
 small number of user-visible improvements on top of the Phase 2 foundation.
 

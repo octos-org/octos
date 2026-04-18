@@ -8,6 +8,7 @@ The high-level overview in this file is paired with the tracked execution
 contract in:
 
 - `docs/OCTOS_RUNTIME_PHASE3_CONTRACT.md`
+- `docs/OCTOS_RUNTIME_PHASE3_KICKOFF.md`
 
 ## Lanes
 
