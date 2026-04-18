@@ -1,14 +1,21 @@
 //! Admin commands for tenant, tunnel, and operator management.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
-use eyre::{Result, bail};
+use eyre::{Result, WrapErr, bail};
 use uuid::Uuid;
 
 use super::Executable;
 use crate::tenant::{TenantConfig, TenantStatus, TenantStore, render_frpc_config};
+
+/// Matches the constant defined alongside `AdminTokenStore` in
+/// `crate::admin_token_store`. Kept local here so the reset subcommand works
+/// even before `AdminTokenStore` lands; refactor to delegate once it exists.
+const ADMIN_TOKEN_FILE: &str = "admin_token.json";
 
 /// Admin commands for tenant and tunnel management.
 #[derive(Debug, Args)]
@@ -77,6 +84,15 @@ pub enum AdminAction {
         /// Data directory override.
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
+    },
+    /// Reset the admin token, restoring bootstrap-token auth on the next request.
+    ResetToken {
+        /// Data directory. Defaults to the value used by `octos serve`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Show a condensed operator view of runtime observability counters.
     OperatorSummary {
@@ -220,6 +236,28 @@ impl Executable for AdminCommand {
 
                 Ok(())
             }
+            AdminAction::ResetToken { data_dir, yes } => {
+                let data_dir = super::resolve_data_dir(data_dir)?;
+                if !yes {
+                    print!(
+                        "Reset admin token at {}? [y/N]: ",
+                        data_dir.join(ADMIN_TOKEN_FILE).display()
+                    );
+                    std::io::stdout().flush().ok();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let answer = input.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                run_reset_token(&data_dir)?;
+                println!(
+                    "Admin token reset. The next request will accept the bootstrap token from config/env."
+                );
+                Ok(())
+            }
             AdminAction::OperatorSummary {
                 base_url,
                 auth_token,
@@ -237,6 +275,19 @@ impl Executable for AdminCommand {
 
                 Ok(())
             }
+        }
+    }
+}
+
+/// Delete the admin token file under `data_dir`, returning Ok if the file is
+/// absent. Factored out of the `ResetToken` handler for testability.
+pub(crate) fn run_reset_token(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(ADMIN_TOKEN_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).wrap_err_with(|| format!("failed to delete {}", path.display()))
         }
     }
 }
@@ -366,5 +417,22 @@ mod tests {
     fn auth_token_filters_blank_values() {
         assert_eq!(resolve_auth_token(Some("token".into())), Some("token".into()));
         assert_eq!(resolve_auth_token(Some("   ".into())), None);
+    }
+
+    #[test]
+    fn reset_token_removes_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(ADMIN_TOKEN_FILE);
+        std::fs::write(&path, "{}").unwrap();
+        assert!(path.exists());
+        run_reset_token(dir.path()).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn reset_token_is_idempotent_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_reset_token(dir.path()).unwrap();
+        assert!(!dir.path().join(ADMIN_TOKEN_FILE).exists());
     }
 }
