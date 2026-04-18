@@ -240,6 +240,9 @@ impl ServeCommand {
             broadcaster,
             started_at: chrono::Utc::now(),
             auth_token,
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(
+                &data_dir,
+            )),
             metrics_handle,
             profile_store: Some(profile_store.clone()),
             process_manager: Some(process_manager.clone()),

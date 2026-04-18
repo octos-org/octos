@@ -384,6 +384,9 @@ mod tests {
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: Utc::now(),
             auth_token: None,
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(
+                dir.path(),
+            )),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,

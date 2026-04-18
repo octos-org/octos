@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::admin_token_store::AdminTokenStore;
 use crate::content_catalog::ContentCatalogManager;
 use crate::login_allowlist::LoginAllowlistStore;
 use crate::otp::AuthManager;
@@ -86,8 +87,13 @@ pub struct AppState {
     pub broadcaster: Arc<SseBroadcaster>,
     /// Server start time.
     pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Auth token (if configured).
+    /// Bootstrap admin auth token from config/env (used only until the
+    /// hashed admin-token file is created via dashboard rotation).
     pub auth_token: Option<String>,
+    /// Hashed admin token store at `{data_dir}/admin_token.json`.
+    /// When present, authoritative for admin auth — the bootstrap token is
+    /// ignored until the file is cleared via `octos admin reset-token`.
+    pub admin_token_store: Arc<AdminTokenStore>,
     /// Prometheus metrics handle.
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// Profile store for admin dashboard.
@@ -141,12 +147,18 @@ impl AppState {
     /// };
     /// ```
     pub(crate) fn empty_for_tests() -> Self {
+        let tmp = std::env::temp_dir().join(format!(
+            "octos-test-admin-token-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).ok();
         Self {
             agent: None,
             sessions: None,
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
+            admin_token_store: Arc::new(AdminTokenStore::new(&tmp)),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
