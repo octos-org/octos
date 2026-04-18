@@ -136,6 +136,10 @@ async fn persist_assistant_message(
     }
 }
 
+fn completion_has_bg_tasks(tools: &ToolRegistry, supervisor: &TaskSupervisor) -> bool {
+    tools.spawn_only_was_invoked() || !supervisor.get_all_tasks().is_empty()
+}
+
 fn persisted_session_result_metadata(
     session_key: &SessionKey,
     persisted: &PersistedSessionMessage,
@@ -3014,6 +3018,42 @@ impl SessionActor {
         }
     }
 
+    fn should_pre_activate_fm_tts(
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> bool {
+        if !image_media.is_empty() || !attachment_media.is_empty() {
+            return false;
+        }
+
+        let lower = inbound.content.to_ascii_lowercase();
+        let mentions_podcast = lower.contains("podcast") || inbound.content.contains("播客");
+        if mentions_podcast {
+            return false;
+        }
+
+        lower.contains("text to speech")
+            || lower.contains("read aloud")
+            || lower.contains("say in")
+            || lower.contains("tts")
+            || inbound.content.contains("声音说")
+            || inbound.content.contains("朗读")
+            || inbound.content.contains("念出来")
+            || inbound.content.contains("读出来")
+    }
+
+    fn maybe_pre_activate_turn_tools(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) {
+        if Self::should_pre_activate_fm_tts(inbound, image_media, attachment_media) {
+            self.agent.tool_registry().activate("fm_tts");
+        }
+    }
+
     fn forced_background_workflow_for_turn(
         &self,
         inbound: &InboundMessage,
@@ -3190,6 +3230,8 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
+        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
 
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
@@ -3574,10 +3616,11 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        let supervisor = self.agent.tool_registry().supervisor();
+        let tools = self.agent.tool_registry();
+        let supervisor = tools.supervisor();
         let bg_tasks = supervisor.task_count();
         let all_tasks = supervisor.get_all_tasks();
-        let had_bg_tasks = !all_tasks.is_empty(); // any task was spawned, even if completed
+        let had_bg_tasks = completion_has_bg_tasks(tools, &supervisor);
         let bg_task_details: Vec<_> = supervisor.get_active_tasks();
         if !all_tasks.is_empty() {
             for t in &all_tasks {
@@ -4196,6 +4239,8 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
+        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
 
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
@@ -6013,18 +6058,16 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
             .to_string_lossy()
             .to_string();
-        assert_eq!(
-            persisted.media,
-            vec![expected_deck]
-        );
+        assert_eq!(persisted.media, vec![expected_deck]);
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -6073,9 +6116,10 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
@@ -6130,9 +6174,10 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
@@ -7239,5 +7284,72 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_detects_direct_voice_request() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(SessionActor::should_pre_activate_fm_tts(&inbound, &[], &[]));
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_does_not_match_podcast_request() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻。".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(!SessionActor::should_pre_activate_fm_tts(
+            &inbound,
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_requires_plain_text_turn() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(!SessionActor::should_pre_activate_fm_tts(
+            &inbound,
+            &[],
+            &[String::from("/tmp/voice.txt")]
+        ));
+    }
+
+    #[test]
+    fn completion_has_bg_tasks_when_spawn_only_invoked_without_task_snapshot() {
+        let tools = ToolRegistry::with_builtins("/tmp");
+        let supervisor = tools.supervisor();
+
+        assert!(!completion_has_bg_tasks(&tools, &supervisor));
+
+        tools.mark_spawn_only_invoked();
+        assert!(completion_has_bg_tasks(&tools, &supervisor));
     }
 }

@@ -315,7 +315,8 @@ fn build_session_result_event(
 
     let response_media: Option<Vec<String>> = materialized_media
         .map(|paths| {
-            paths.iter()
+            paths
+                .iter()
                 .map(|path| {
                     response_path_for_session_file(data_dir, Path::new(path))
                         .unwrap_or_else(|| path.clone())
@@ -323,15 +324,18 @@ fn build_session_result_event(
                 .collect()
         })
         .or_else(|| {
-            obj.get("media").and_then(|value| value.as_array()).map(|paths| {
-                paths.iter()
-                    .filter_map(|value| value.as_str())
-                    .map(|path| {
-                        response_path_for_session_file(data_dir, Path::new(path))
-                            .unwrap_or_else(|| path.to_string())
-                    })
-                    .collect()
-            })
+            obj.get("media")
+                .and_then(|value| value.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(|path| {
+                            response_path_for_session_file(data_dir, Path::new(path))
+                                .unwrap_or_else(|| path.to_string())
+                        })
+                        .collect()
+                })
         });
     if let Some(paths) = response_media {
         obj.insert("media".to_string(), serde_json::json!(paths));
@@ -600,7 +604,9 @@ impl Channel for ApiChannel {
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
-                let _ = self.persist_to_session(&msg.chat_id, topic, session_msg).await;
+                let _ = self
+                    .persist_to_session(&msg.chat_id, topic, session_msg)
+                    .await;
             }
             return Ok(());
         }
@@ -616,9 +622,19 @@ impl Channel for ApiChannel {
                     .get("has_bg_tasks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let content = if msg.content.is_empty() {
+                    self.last_content
+                        .lock()
+                        .await
+                        .get(&msg.chat_id)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    msg.content.clone()
+                };
                 let done = serde_json::json!({
                     "type": "done",
-                    "content": "",
+                    "content": content,
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
                     "provider": msg.metadata.get("provider").cloned().unwrap_or(serde_json::Value::Null),
                     "model_id": msg.metadata.get("model_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -640,6 +656,11 @@ impl Channel for ApiChannel {
                 });
                 if tx.send(event.to_string()).is_err() {
                     pending.remove(&msg.chat_id);
+                } else {
+                    self.last_content
+                        .lock()
+                        .await
+                        .insert(msg.chat_id.clone(), msg.content.clone());
                 }
             }
         }
@@ -758,9 +779,13 @@ impl ApiChannel {
         let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
-        let topic_name = topic.filter(|value| !value.trim().is_empty()).unwrap_or("default");
-        let per_user_path =
-            per_user_dir.join(format!("{}.jsonl", crate::session::encode_path_component(topic_name)));
+        let topic_name = topic
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("default");
+        let per_user_path = per_user_dir.join(format!(
+            "{}.jsonl",
+            crate::session::encode_path_component(topic_name)
+        ));
         if per_user_path.exists() {
             if let Ok(msg_json) = serde_json::to_string(&message) {
                 let path_clone = per_user_path.clone();
@@ -2251,6 +2276,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_completion_reuses_last_replace_content_when_completion_is_empty() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat".into(), tx);
+        }
+
+        let replace = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat".into(),
+            content: "Background work started. I will send the audio when it is ready.".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        };
+        ch.send(&replace).await.unwrap();
+        let replace_event = rx.recv().await.unwrap();
+        let replace_json: serde_json::Value = serde_json::from_str(&replace_event).unwrap();
+        assert_eq!(replace_json["type"], "replace");
+
+        let completion = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "has_bg_tasks": true
+            }),
+        };
+        ch.send(&completion).await.unwrap();
+
+        let done_event = rx.recv().await.unwrap();
+        let done_json: serde_json::Value = serde_json::from_str(&done_event).unwrap();
+        assert_eq!(done_json["type"], "done");
+        assert_eq!(
+            done_json["content"],
+            "Background work started. I will send the audio when it is ready."
+        );
+        assert_eq!(done_json["has_bg_tasks"], true);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn send_file_message_persists_to_session() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
@@ -2319,7 +2396,8 @@ mod tests {
         ch.send(&msg).await.unwrap();
 
         let mut sess = sessions.lock().await;
-        let topic_key = SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-topic", "slides demo");
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-topic", "slides demo");
         let topic_session = sess.get_or_create(&topic_key).await;
         assert_eq!(topic_session.get_history(10).len(), 1);
         assert_eq!(topic_session.get_history(10)[0].media.len(), 1);
