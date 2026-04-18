@@ -28,6 +28,7 @@ pub mod profiles;
 pub mod project_templates;
 mod qos_catalog;
 pub mod session_actor;
+pub mod setup_state_store;
 pub mod skills_scope;
 pub mod soul_service;
 pub mod status_indicator;
