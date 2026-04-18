@@ -251,6 +251,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/token/status",
             get(admin_setup::token_status),
         )
+        .route(
+            "/api/admin/token/rotate",
+            post(admin_setup::rotate_token),
+        )
         // Sub-account management
         .route(
             "/api/admin/profiles/{id}/accounts",
