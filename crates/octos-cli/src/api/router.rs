@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
+use super::admin_setup;
 use super::auth_handlers;
 use super::frps_plugin;
 use super::handlers;
@@ -245,6 +246,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/test-provider", post(admin::test_provider))
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
+        // First-run setup wizard
+        .route(
+            "/api/admin/token/status",
+            get(admin_setup::token_status),
+        )
         // Sub-account management
         .route(
             "/api/admin/profiles/{id}/accounts",

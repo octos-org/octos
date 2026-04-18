@@ -3,6 +3,7 @@
 //! Feature-gated behind `api`. Start with `octos serve [--port 50080]`.
 
 pub mod admin;
+pub mod admin_setup;
 pub mod auth_handlers;
 mod frps_plugin;
 mod handlers;
