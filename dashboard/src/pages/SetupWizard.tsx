@@ -2,8 +2,30 @@ import { useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import WizardNav from '../components/WizardNav'
+import StepLlmProvider from './wizard/StepLlmProvider'
+import StepEmail from './wizard/StepEmail'
+import StepChannel from './wizard/StepChannel'
+import StepDeployMode from './wizard/StepDeployMode'
+import StepFinish from './wizard/StepFinish'
 
-const TOTAL_STEPS = 6
+const TOTAL_STEPS = 5
+
+function renderStep(step: number) {
+  switch (step) {
+    case 0:
+      return <StepLlmProvider />
+    case 1:
+      return <StepEmail />
+    case 2:
+      return <StepChannel />
+    case 3:
+      return <StepDeployMode />
+    case 4:
+      return <StepFinish />
+    default:
+      return <StepLlmProvider />
+  }
+}
 
 export default function SetupWizard() {
   const navigate = useNavigate()
@@ -50,9 +72,7 @@ export default function SetupWizard() {
         <div className="text-xs text-gray-500 mb-2">
           Step {step + 1} of {TOTAL_STEPS}
         </div>
-        <div className="min-h-[16rem]">
-          <div>Step {step}</div>
-        </div>
+        <div className="min-h-[16rem]">{renderStep(step)}</div>
         <WizardNav
           step={step}
           totalSteps={TOTAL_STEPS}

@@ -222,6 +222,18 @@ export const api = {
   completeSetup: () => requestNoContent('/setup/complete', { method: 'POST' }),
 
   skipSetup: () => requestNoContent('/setup/skip', { method: 'POST' }),
+
+  testProvider: (data: {
+    provider: string
+    model: string
+    api_key?: string
+    api_key_env?: string
+    base_url?: string
+  }) =>
+    request<{ ok: boolean; message?: string; error?: string }>('/test-provider', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 }
 
 // ── Setup wizard types ─────────────────────────────────────────────
