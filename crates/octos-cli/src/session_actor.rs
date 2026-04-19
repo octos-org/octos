@@ -136,6 +136,14 @@ async fn persist_assistant_message(
     }
 }
 
+fn completion_has_bg_tasks(tools: &ToolRegistry, supervisor: &TaskSupervisor) -> bool {
+    tools.spawn_only_was_invoked() || !supervisor.get_all_tasks().is_empty()
+}
+
+fn forced_background_completion_has_bg_tasks(spawn_succeeded: bool, bg_task_count: usize) -> bool {
+    spawn_succeeded || bg_task_count > 0
+}
+
 fn persisted_session_result_metadata(
     session_key: &SessionKey,
     persisted: &PersistedSessionMessage,
@@ -3014,6 +3022,52 @@ impl SessionActor {
         }
     }
 
+    fn should_pre_activate_fm_tts(
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> bool {
+        if !image_media.is_empty() || !attachment_media.is_empty() {
+            return false;
+        }
+
+        let lower = inbound.content.to_ascii_lowercase();
+        let mentions_podcast = lower.contains("podcast") || inbound.content.contains("播客");
+        if mentions_podcast {
+            return false;
+        }
+
+        lower.contains("text to speech")
+            || lower.contains("read aloud")
+            || lower.contains("say in")
+            || lower.contains("tts")
+            || inbound.content.contains("声音说")
+            || inbound.content.contains("朗读")
+            || inbound.content.contains("念出来")
+            || inbound.content.contains("读出来")
+    }
+
+    fn should_force_background_tts(
+        channel: &str,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> bool {
+        channel != "system"
+            && Self::should_pre_activate_fm_tts(inbound, image_media, attachment_media)
+    }
+
+    fn maybe_pre_activate_turn_tools(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) {
+        if Self::should_pre_activate_fm_tts(inbound, image_media, attachment_media) {
+            self.agent.tool_registry().activate("fm_tts");
+        }
+    }
+
     fn forced_background_workflow_for_turn(
         &self,
         inbound: &InboundMessage,
@@ -3038,27 +3092,49 @@ impl SessionActor {
         persisted_user_content: &str,
         reply_to: Option<String>,
     ) -> bool {
-        let Some(workflow) =
-            self.forced_background_workflow_for_turn(inbound, image_media, attachment_media)
-        else {
-            return false;
-        };
-
         let mut task = inbound.content.clone();
         if let Some(prompt) = attachment_prompt.filter(|value| !value.trim().is_empty()) {
             task.push_str("\n\nAttachment context:\n");
             task.push_str(prompt);
         }
 
-        let workflow_label = workflow.label.clone();
-        let workflow_ack = workflow.ack_message.clone();
+        let (workflow_label, workflow_ack, allowed_tools, additional_instructions, workflow) =
+            if Self::should_force_background_tts(
+                &self.channel,
+                inbound,
+                image_media,
+                attachment_media,
+            ) {
+                (
+                    "Direct TTS".to_string(),
+                    "语音生成已在后台启动。完成后会把最终音频发送到当前会话。".to_string(),
+                    vec!["fm_tts".to_string()],
+                    "You are a background TTS worker. The user's request already specifies what should be spoken and which voice to use. Call fm_tts exactly once with the requested voice and spoken text, then stop. Do not answer normally. Do not use any other tool. Do not emit intermediate files or reports.".to_string(),
+                    None,
+                )
+            } else {
+                let Some(workflow) = self.forced_background_workflow_for_turn(
+                    inbound,
+                    image_media,
+                    attachment_media,
+                ) else {
+                    return false;
+                };
+                (
+                    workflow.label.clone(),
+                    workflow.ack_message.clone(),
+                    workflow.allowed_tools.clone(),
+                    workflow.additional_instructions.clone(),
+                    Some(workflow),
+                )
+            };
         let args = serde_json::json!({
             "task": task,
             "label": workflow_label,
             "mode": "background",
-            "allowed_tools": workflow.allowed_tools.clone(),
-            "additional_instructions": workflow.additional_instructions.clone(),
-            "workflow": workflow.clone(),
+            "allowed_tools": allowed_tools,
+            "additional_instructions": additional_instructions,
+            "workflow": workflow,
         });
 
         let tool_registry = self.agent.tool_registry();
@@ -3067,7 +3143,7 @@ impl SessionActor {
             Ok(result) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = %workflow.label,
+                    workflow = %workflow_label,
                     error = %result.output,
                     "forced background spawn returned failure"
                 );
@@ -3076,7 +3152,7 @@ impl SessionActor {
             Err(error) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = %workflow.label,
+                    workflow = %workflow_label,
                     error = %error,
                     "forced background spawn failed"
                 );
@@ -3136,6 +3212,8 @@ impl SessionActor {
                 .filter(|task| task.status.is_active())
                 .map(|task| sanitize_task_for_response(&self.data_dir, &task))
                 .collect::<Vec<_>>();
+            let has_bg_tasks =
+                forced_background_completion_has_bg_tasks(spawn_result.success, bg_tasks.len());
 
             let _ = self
                 .out_tx
@@ -3147,7 +3225,7 @@ impl SessionActor {
                     media: vec![],
                     metadata: serde_json::json!({
                         "_completion": true,
-                        "has_bg_tasks": !bg_tasks.is_empty(),
+                        "has_bg_tasks": has_bg_tasks,
                         "bg_tasks": bg_tasks,
                     }),
                 })
@@ -3190,6 +3268,8 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
+        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
 
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
@@ -3574,10 +3654,11 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        let supervisor = self.agent.tool_registry().supervisor();
+        let tools = self.agent.tool_registry();
+        let supervisor = tools.supervisor();
         let bg_tasks = supervisor.task_count();
         let all_tasks = supervisor.get_all_tasks();
-        let had_bg_tasks = !all_tasks.is_empty(); // any task was spawned, even if completed
+        let had_bg_tasks = completion_has_bg_tasks(tools, &supervisor);
         let bg_task_details: Vec<_> = supervisor.get_active_tasks();
         if !all_tasks.is_empty() {
             for t in &all_tasks {
@@ -4196,6 +4277,8 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
+        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
 
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
@@ -6013,18 +6096,16 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
             .to_string_lossy()
             .to_string();
-        assert_eq!(
-            persisted.media,
-            vec![expected_deck]
-        );
+        assert_eq!(persisted.media, vec![expected_deck]);
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -6073,9 +6154,10 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
@@ -6130,9 +6212,10 @@ mod tests {
 
         let session_handle = SessionHandle::open(dir.path(), &session_key);
         let session = session_handle.session();
-        let persisted = session.messages.iter().find(|message| {
-            message.role == MessageRole::Assistant && message.content == "done"
-        });
+        let persisted = session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
         let persisted = persisted.expect("assistant reply should be persisted");
         let expected_deck = std::fs::canonicalize(&absolute_deck)
             .unwrap_or_else(|_| absolute_deck.clone())
@@ -7239,5 +7322,122 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_detects_direct_voice_request() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(SessionActor::should_pre_activate_fm_tts(&inbound, &[], &[]));
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_does_not_match_podcast_request() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻。".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(!SessionActor::should_pre_activate_fm_tts(
+            &inbound,
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn pre_activate_fm_tts_requires_plain_text_turn() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(!SessionActor::should_pre_activate_fm_tts(
+            &inbound,
+            &[],
+            &[String::from("/tmp/voice.txt")]
+        ));
+    }
+
+    #[test]
+    fn force_background_tts_detects_direct_voice_request_for_api_channel() {
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(SessionActor::should_force_background_tts(
+            "api",
+            &inbound,
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn force_background_tts_skips_system_channel() {
+        let inbound = InboundMessage {
+            channel: "system".to_string(),
+            chat_id: "chat".to_string(),
+            sender_id: "user".to_string(),
+            content: "用杨幂声音说：测试消息".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({}),
+            message_id: None,
+        };
+
+        assert!(!SessionActor::should_force_background_tts(
+            "system",
+            &inbound,
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn forced_background_completion_has_bg_tasks_when_spawn_succeeds_before_snapshot() {
+        assert!(forced_background_completion_has_bg_tasks(true, 0));
+        assert!(forced_background_completion_has_bg_tasks(true, 1));
+        assert!(!forced_background_completion_has_bg_tasks(false, 0));
+        assert!(forced_background_completion_has_bg_tasks(false, 1));
+    }
+
+    #[test]
+    fn completion_has_bg_tasks_when_spawn_only_invoked_without_task_snapshot() {
+        let tools = ToolRegistry::with_builtins("/tmp");
+        let supervisor = tools.supervisor();
+
+        assert!(!completion_has_bg_tasks(&tools, &supervisor));
+
+        tools.mark_spawn_only_invoked();
+        assert!(completion_has_bg_tasks(&tools, &supervisor));
     }
 }

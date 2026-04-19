@@ -1,5 +1,6 @@
 //! Shell tool for executing commands.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +54,30 @@ impl ShellTool {
         self.sandbox = sandbox;
         self
     }
+}
+
+fn frontend_tool_cache_dir(cwd: &Path) -> PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let cache_key = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let preferred = std::env::temp_dir()
+        .join("octos-frontend-tool-cache")
+        .join(user)
+        .join(cache_key);
+    let _ = std::fs::create_dir_all(&preferred);
+    preferred
+}
+
+fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
+    let cache_dir = frontend_tool_cache_dir(cwd);
+    cmd.env("ASTRO_TELEMETRY_DISABLED", "1")
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir);
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +164,7 @@ impl Tool for ShellTool {
         // (wait_with_output() takes ownership of child, so we save the PID first.)
         let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        apply_frontend_tool_env(&mut cmd, &self.cwd);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -307,5 +333,26 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("requires approval"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_sets_frontend_build_env() {
+        let cwd = std::env::temp_dir().join(format!("octos-shell-env-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let tool = ShellTool::new(&cwd);
+        let result = tool
+            .execute(&serde_json::json!({
+                "command": "printf '%s\\n%s\\n' \"$ASTRO_TELEMETRY_DISABLED\" \"$NPM_CONFIG_CACHE\""
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let mut lines = result.output.lines();
+        assert_eq!(lines.next(), Some("1"));
+        let cache = lines.next().unwrap_or_default();
+        assert!(cache.contains("octos-frontend-tool-cache"));
+        assert!(!cache.contains(".octos-tool-cache"));
     }
 }

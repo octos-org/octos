@@ -1,7 +1,7 @@
 //! API request handlers.
 
-use std::convert::Infallible;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -679,9 +679,12 @@ pub async fn session_event_stream(
         "topic": params.topic,
     })
     .to_string();
-    let stream =
-        futures::stream::iter(vec![Ok::<Event, Infallible>(Event::default().data(replay_complete))]);
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
+        Event::default().data(replay_complete),
+    )]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.
@@ -1574,6 +1577,31 @@ fn site_build_needed(project_dir: &std::path::Path, output_dir: &std::path::Path
     }
 }
 
+fn site_build_cache_dir(project_dir: &std::path::Path) -> std::path::PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let project_key = project_dir
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let preferred = std::env::temp_dir()
+        .join("octos-site-build-npm-cache")
+        .join(user)
+        .join(project_key);
+    let _ = std::fs::create_dir_all(&preferred);
+    preferred
+}
+
+fn apply_site_build_env(command: &mut std::process::Command, project_dir: &std::path::Path) {
+    let cache_dir = site_build_cache_dir(project_dir);
+    command
+        .env("ASTRO_TELEMETRY_DISABLED", "1")
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir);
+}
+
 fn run_build_command(command: &mut std::process::Command, label: &str) -> Result<(), String> {
     let output = command
         .output()
@@ -1631,10 +1659,12 @@ fn ensure_site_build_output(
             if !project_dir.join("node_modules").exists() {
                 let mut install = std::process::Command::new("npm");
                 install.current_dir(project_dir).arg("install");
+                apply_site_build_env(&mut install, project_dir);
                 run_build_command(&mut install, "npm install")?;
             }
             let mut build = std::process::Command::new("npm");
             build.current_dir(project_dir).arg("run").arg("build");
+            apply_site_build_env(&mut build, project_dir);
             run_build_command(&mut build, "npm run build")?;
         }
         other => return Err(format!("unsupported site template: {other}")),
@@ -2717,6 +2747,15 @@ mod tests {
                 .join("api%3Aslides-123")
                 .join("workspace")
         );
+    }
+
+    #[test]
+    fn site_build_cache_dir_prefers_project_local_cache() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let cache_dir = site_build_cache_dir(project_dir.path());
+
+        assert!(cache_dir.starts_with(std::env::temp_dir()));
+        assert!(cache_dir.to_string_lossy().contains("octos-site-build-npm-cache"));
     }
 
     #[test]

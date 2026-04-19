@@ -1,5 +1,6 @@
 //! Send file tool for delivering files to chat channels.
 
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
@@ -7,6 +8,7 @@ use eyre::{Result, WrapErr};
 use octos_core::OutboundMessage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 
 use super::{Tool, ToolResult};
 
@@ -43,6 +45,29 @@ fn is_stale_slides_backup(path: &Path) -> bool {
     false
 }
 
+// Generated artifacts can be discovered slightly before the filesystem entry is
+// fully visible on slower hosts. Give send_file a few seconds to resolve those
+// paths so final deliverables do not get dropped after successful generation.
+const CANONICALIZE_RETRY_ATTEMPTS: usize = 40;
+const CANONICALIZE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+async fn canonicalize_with_retry(path: &Path) -> io::Result<PathBuf> {
+    let mut last_err = None;
+    for attempt in 0..=CANONICALIZE_RETRY_ATTEMPTS {
+        match std::fs::canonicalize(path) {
+            Ok(canonical) => return Ok(canonical),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt == CANONICALIZE_RETRY_ATTEMPTS {
+                    break;
+                }
+                sleep(CANONICALIZE_RETRY_DELAY).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found")))
+}
+
 impl SendFileTool {
     pub fn new(out_tx: mpsc::Sender<OutboundMessage>) -> Self {
         Self {
@@ -74,10 +99,7 @@ impl SendFileTool {
     /// Bind the current session topic so API send_file deliveries are persisted
     /// into the correct topic-scoped history instead of default.jsonl.
     pub fn with_topic(mut self, topic: Option<String>) -> Self {
-        *self
-            .default_topic
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = topic;
+        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic;
         self
     }
 
@@ -183,7 +205,7 @@ impl Tool for SendFileTool {
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
         // /tmp/ is always allowed since skills commonly write output there.
-        if let Some(ref base_dir) = self.base_dir {
+        let path = if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
@@ -192,7 +214,7 @@ impl Tool for SendFileTool {
                 .iter()
                 .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
                 .collect();
-            match std::fs::canonicalize(&path) {
+            match canonicalize_with_retry(&path).await {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
                         || canonical_path.starts_with(&tmp_dir)
@@ -209,6 +231,7 @@ impl Tool for SendFileTool {
                             ..Default::default()
                         });
                     }
+                    canonical_path
                 }
                 Err(_) => {
                     // Path can't be canonicalized (broken symlink, non-existent, etc.).
@@ -220,7 +243,9 @@ impl Tool for SendFileTool {
                     });
                 }
             }
-        }
+        } else {
+            path
+        };
 
         // Validate file exists
         if !path.exists() {
@@ -521,6 +546,72 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("Cannot resolve file path"));
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_waits_briefly_for_generated_file_to_appear() {
+        let base = tempfile::tempdir().unwrap();
+        let deck = base.path().join("output").join("deck.pptx");
+        let deck_for_writer = deck.clone();
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            std::fs::create_dir_all(deck_for_writer.parent().unwrap()).unwrap();
+            std::fs::write(&deck_for_writer, "pptx data").unwrap();
+        });
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": deck.to_string_lossy().to_string()
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected delayed file delivery to succeed");
+        let msg = rx.recv().await.unwrap();
+        let canonical_deck = std::fs::canonicalize(&deck).unwrap();
+        assert_eq!(
+            msg.media,
+            vec![canonical_deck.to_string_lossy().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_base_dir_waits_for_slow_generated_file_to_appear() {
+        let base = tempfile::tempdir().unwrap();
+        let deck = base.path().join("output").join("deck.pptx");
+        let deck_for_writer = deck.clone();
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(900)).await;
+            std::fs::create_dir_all(deck_for_writer.parent().unwrap()).unwrap();
+            std::fs::write(&deck_for_writer, "pptx data").unwrap();
+        });
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": deck.to_string_lossy().to_string()
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected slow delayed file delivery to succeed: {}",
+            result.output
+        );
+        let msg = rx.recv().await.unwrap();
+        let canonical_deck = std::fs::canonicalize(&deck).unwrap();
+        assert_eq!(
+            msg.media,
+            vec![canonical_deck.to_string_lossy().to_string()]
+        );
     }
 
     #[tokio::test]

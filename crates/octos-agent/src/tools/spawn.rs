@@ -560,6 +560,29 @@ fn build_subagent_tool_policy(
     }
 }
 
+fn ensure_subagent_tools_available(
+    tools: &ToolRegistry,
+    allowed_tools: &[String],
+) -> std::result::Result<(), String> {
+    for tool_name in allowed_tools {
+        tools.activate(tool_name);
+    }
+
+    let missing = allowed_tools
+        .iter()
+        .filter(|tool_name| tools.get(tool_name).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "required tool(s) not available on this host: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
     match required_artifact_kind {
         "presentation" => &["deck"],
@@ -1012,6 +1035,8 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
+            ensure_subagent_tools_available(&tools, &allowed_tools)
+                .map_err(|error| eyre::eyre!(error))?;
             let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
@@ -1162,6 +1187,8 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
+                let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
+                    .map_err(|error| eyre::eyre!(error));
                 let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
@@ -1190,7 +1217,10 @@ impl Tool for SpawnTool {
                     },
                 );
 
-                let result = worker.run_task(&subtask).await;
+                let result = match availability_check {
+                    Ok(()) => worker.run_task(&subtask).await,
+                    Err(error) => Err(error),
+                };
                 let contract_failure = match &result {
                     Ok(task_result) if task_result.success => resolve_background_terminal_files(
                         &working_dir,
@@ -1840,6 +1870,28 @@ mod tests {
 
         assert!(policy.deny.contains(&"spawn".to_string()));
         assert!(policy.deny.contains(&"send_file".to_string()));
+    }
+
+    #[test]
+    fn subagent_tool_preflight_activates_deferred_allowed_tool() {
+        let mut tools = ToolRegistry::with_builtins("/tmp");
+        tools.defer(["shell".to_string()]);
+        assert!(tools.specs().iter().all(|spec| spec.name != "shell"));
+
+        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
+
+        assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
+    }
+
+    #[test]
+    fn subagent_tool_preflight_reports_missing_allowed_tool() {
+        let tools = ToolRegistry::with_builtins("/tmp");
+
+        let error = ensure_subagent_tools_available(&tools, &[String::from("podcast_generate")])
+            .unwrap_err();
+
+        assert!(error.contains("required tool(s) not available on this host"));
+        assert!(error.contains("podcast_generate"));
     }
 
     #[test]
