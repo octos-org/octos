@@ -55,6 +55,7 @@ export default function Sidebar() {
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Access" />
                 <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
                 <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
+                <SidebarLink to="/setup/wizard" icon={<WizardIcon />} label="Setup Wizard" />
               </>
             )}
           </>
@@ -212,6 +213,14 @@ function PulseIcon() {
   return (
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M3 12h4l3-9 4 18 3-9h4" />
+    </svg>
+  )
+}
+
+function WizardIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l3-3 3 3m-6 14l3 3 3-3M5 9l-3 3 3 3m14-6l3 3-3 3M12 8v8m-4-4h8" />
     </svg>
   )
 }
