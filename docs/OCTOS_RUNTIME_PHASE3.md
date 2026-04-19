@@ -24,6 +24,13 @@ runtime seams.
    - Turn raw counters into a human-usable runtime summary.
    - Keep the first surface simple and scriptable.
 
+5. Structured configuration contracts
+   - Replace free-form dashboard/profile config seams with typed durable
+     contracts.
+   - Reserve `env_vars` for low-level secrets and explicit overrides only.
+   - Move first-party app settings under first-class config sections instead of
+     hiding product behavior behind generic env-var editing.
+
 ## First Operator Surface
 
 The first operator-facing summary is intentionally small:
@@ -86,3 +93,45 @@ The kickoff is complete when:
 
 The broader Phase 3 program is complete only when the new coding hard cases run
 green against a live canary.
+
+## Structured Config Hardening Contract
+
+This is a required Phase 3 lane, not optional cleanup.
+
+The current dashboard still has several product settings that are effectively
+free-form because they are persisted as generic `config` JSON patches or as
+plain `env_vars` entries. That weakens the Octos OS position because customer
+skills/apps cannot rely on a clear contractual API.
+
+The next structured-config slice must do all of the following:
+
+1. Replace raw config merge in `admin.rs` with typed request parsing per
+   section.
+2. Move `SearchApiTab` from `env_vars` to a structured `search` contract.
+3. Move `DeepCrawlTab` from `env_vars` to a structured `deep_crawl` contract.
+4. Move `PptConfigTab` into a first-party `slides` app contract under the
+   harness framework.
+5. Reserve `env_vars` for true low-level secrets/overrides only, not normal
+   product settings.
+
+### Required Invariants
+
+- Product settings must be persisted under typed profile config sections.
+- UI sections must map to durable backend structs, not loose JSON patches.
+- Runtime consumers must read the typed config first, not scrape product
+  behavior from `env_vars`.
+- First-party app settings must look like app contracts, not generic shell env.
+- Secret material may still be referenced by env-var name, but the product
+  behavior using those secrets must live in structured config.
+
+### Immediate Target Sections
+
+- `config.llm`
+- `config.search`
+- `config.deep_crawl`
+- `config.apps.slides`
+
+### Explicit Non-Goal
+
+Do not solve this by introducing one giant opaque JSON blob. The contract must
+be sectioned, typed, and durable.

@@ -37,6 +37,7 @@ use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
+use crate::profiles::{SearchConfig, UserProfile};
 use crate::qos_catalog::{
     load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
 };
@@ -49,6 +50,115 @@ use crate::status_layers::StatusComposer;
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
+
+fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "tavily" => Some("TAVILY_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "brave" => Some("BRAVE_API_KEY"),
+        "you" => Some("YDC_API_KEY"),
+        _ => None,
+    }
+}
+
+fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+
+    if let Some(search) = profile.config.search.as_ref() {
+        env.extend(search_provider_bindings(search, &resolved_env_vars));
+    }
+
+    if let Some(slides) = profile
+        .config
+        .apps
+        .as_ref()
+        .and_then(|apps| apps.slides.as_ref())
+    {
+        if let Some(template_dir) = slides.template_dir.as_ref() {
+            env.push(("PPT_TEMPLATE_DIR".into(), template_dir.clone()));
+        }
+        if let Some(default_theme) = slides.default_theme.as_ref() {
+            env.push(("PPT_DEFAULT_THEME".into(), default_theme.clone()));
+        }
+    }
+
+    env
+}
+
+fn search_provider_bindings(
+    search: &SearchConfig,
+    resolved_env_vars: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    search
+        .providers
+        .iter()
+        .filter_map(|(provider_id, provider)| {
+            let canonical_key = canonical_search_env(provider_id.as_str())?;
+            let source_key = provider.api_key_env.as_deref()?;
+            let secret = resolved_env_vars
+                .get(source_key)
+                .cloned()
+                .or_else(|| std::env::var(source_key).ok())?;
+            Some((canonical_key.to_string(), secret))
+        })
+        .collect()
+}
+
+async fn apply_profile_runtime_contracts(
+    profile: &UserProfile,
+    tool_config: &octos_agent::ToolConfigStore,
+) -> Result<()> {
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+
+    #[allow(unsafe_code)]
+    unsafe {
+        if let Some(search) = profile.config.search.as_ref() {
+            for (key, value) in search_provider_bindings(search, &resolved_env_vars) {
+                std::env::set_var(key, value);
+            }
+        }
+
+        if let Some(slides) = profile
+            .config
+            .apps
+            .as_ref()
+            .and_then(|apps| apps.slides.as_ref())
+        {
+            if let Some(template_dir) = slides.template_dir.as_ref() {
+                std::env::set_var("PPT_TEMPLATE_DIR", template_dir);
+            }
+            if let Some(default_theme) = slides.default_theme.as_ref() {
+                std::env::set_var("PPT_DEFAULT_THEME", default_theme);
+            }
+        }
+    }
+
+    if let Some(deep_crawl) = profile.config.deep_crawl.as_ref() {
+        match deep_crawl.page_settle_ms {
+            Some(value) => {
+                tool_config
+                    .set("deep_crawl", "page_settle_ms", serde_json::json!(value))
+                    .await?;
+            }
+            None => tool_config.remove("deep_crawl", "page_settle_ms").await?,
+        }
+
+        match deep_crawl.max_output_chars {
+            Some(value) => {
+                tool_config
+                    .set("deep_crawl", "max_output_chars", serde_json::json!(value))
+                    .await?;
+            }
+            None => tool_config.remove("deep_crawl", "max_output_chars").await?,
+        }
+    } else {
+        tool_config.remove("deep_crawl", "page_settle_ms").await?;
+        tool_config.remove("deep_crawl", "max_output_chars").await?;
+    }
+
+    Ok(())
+}
 
 /// Holds all state needed by the gateway's main message loop.
 ///
@@ -120,6 +230,7 @@ impl GatewayRuntime {
         let metrics_handle = Some(crate::api::init_metrics());
 
         let mut profile_id: Option<String> = None;
+        let mut resolved_profile: Option<UserProfile> = None;
         eprintln!(
             "[gateway] loading config (profile={:?})",
             cmd.profile.as_deref().map(|p| p.display().to_string())
@@ -134,7 +245,7 @@ impl GatewayRuntime {
             profile_id = Some(profile.id.clone());
             admin_mode = profile.config.admin_mode;
 
-            // Sub-account: merge LLM provider config from parent profile
+            // Sub-account: inherit the parent's structured config sections.
             if let Some(ref parent_path) = cmd.parent_profile {
                 if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
                     if let Ok(parent) =
@@ -143,20 +254,27 @@ impl GatewayRuntime {
                         info!(
                             parent = %parent.id,
                             sub_account = %profile.id,
-                            "inheriting provider config from parent profile"
+                            "inheriting llm contract from parent profile"
                         );
-                        profile.config.provider = parent.config.provider;
-                        profile.config.model = parent.config.model;
-                        profile.config.base_url = parent.config.base_url;
-                        profile.config.api_key_env = parent.config.api_key_env;
-                        profile.config.api_type = parent.config.api_type;
-                        profile.config.fallback_models = parent.config.fallback_models;
+                        profile.config.llm = parent.config.llm;
+                        if profile.config.search.is_none() {
+                            profile.config.search = parent.config.search;
+                        }
+                        if profile.config.deep_crawl.is_none() {
+                            profile.config.deep_crawl = parent.config.deep_crawl;
+                        }
+                        if profile.config.apps.is_none() {
+                            profile.config.apps = parent.config.apps;
+                        }
                         if profile.config.email.is_none() {
                             profile.config.email = parent.config.email;
                         }
                     }
                 }
             }
+
+            profile.config.normalize_llm_contract();
+            resolved_profile = Some(profile.clone());
 
             crate::profiles::config_from_profile(
                 &profile,
@@ -491,6 +609,11 @@ impl GatewayRuntime {
                 .await
                 .wrap_err("failed to open tool config store")?,
         );
+        if let Some(profile) = resolved_profile.as_ref() {
+            apply_profile_runtime_contracts(profile, &tool_config)
+                .await
+                .wrap_err("failed to apply profile runtime contracts")?;
+        }
 
         // Session-specific tools (message, send_file, spawn, cron, pipeline)
         // are NOT registered in the base registry — they are created per-session
@@ -507,6 +630,9 @@ impl GatewayRuntime {
         // Build env vars to inject into plugin processes so skills can route
         // API calls through the configured provider/gateway (e.g. r9s.ai).
         let mut plugin_env = build_plugin_env(&config, &provider_name);
+        if let Some(profile) = resolved_profile.as_ref() {
+            plugin_env.extend(profile_plugin_env(profile));
+        }
         // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
         // resolve storage relative to the correct profile, not the gateway root.
         plugin_env.push((

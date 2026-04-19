@@ -37,8 +37,7 @@ pub struct UserProfile {
     #[serde(default)]
     pub data_dir: Option<String>,
     /// If set, this profile is a sub-account of the given parent profile.
-    /// Sub-accounts inherit LLM provider config (provider, model, base_url,
-    /// api_key_env, fallback_models, env_vars) from their parent.
+    /// Sub-accounts inherit the parent's LLM contract and low-level env vars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     /// Inline configuration.
@@ -53,27 +52,8 @@ pub struct UserProfile {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
-    ///
-    /// This is the durable source of truth for model family, model, and
-    /// selected provider route/endpoint. Legacy scalar fields below are still
-    /// mirrored for backward compatibility with older code paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
-    /// LLM provider name (anthropic, openai, moonshot, deepseek, etc.).
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// Model name.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Custom base URL override. If set, takes priority over provider mapping.
-    #[serde(default)]
-    pub base_url: Option<String>,
-    /// Env var name for API key.
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    /// Fallback models for provider failover chain.
-    #[serde(default)]
-    pub fallback_models: Vec<FallbackModelConfig>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
@@ -161,10 +141,6 @@ pub enum PatchField<T> {
 }
 
 impl<T> PatchField<T> {
-    fn is_specified(&self) -> bool {
-        !matches!(self, Self::Absent)
-    }
-
     pub fn into_value(self) -> Option<T> {
         match self {
             Self::Value(value) => Some(value),
@@ -194,16 +170,6 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub llm: PatchField<LlmProfileConfig>,
     #[serde(default)]
-    pub provider: PatchField<String>,
-    #[serde(default)]
-    pub model: PatchField<String>,
-    #[serde(default)]
-    pub base_url: PatchField<String>,
-    #[serde(default)]
-    pub api_key_env: PatchField<String>,
-    #[serde(default)]
-    pub fallback_models: Option<Vec<FallbackModelConfig>>,
-    #[serde(default)]
     pub search: PatchField<SearchConfig>,
     #[serde(default)]
     pub deep_crawl: PatchField<DeepCrawlConfig>,
@@ -215,8 +181,6 @@ pub struct ProfileConfigPatch {
     pub gateway: Option<GatewaySettingsPatch>,
     #[serde(default)]
     pub email: PatchField<EmailSettings>,
-    #[serde(default)]
-    pub api_type: PatchField<String>,
     #[serde(default)]
     pub env_vars: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -381,74 +345,24 @@ impl EmailSettings {
     }
 }
 
-/// A fallback model entry for the provider failover chain.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct FallbackModelConfig {
-    /// Provider name (e.g. "openai", "moonshot", "deepseek").
-    pub provider: String,
-    /// Model name.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Custom base URL override (for DashScope, MiniMax, NVIDIA NIM, etc.).
-    #[serde(default)]
-    pub base_url: Option<String>,
-    /// Env var name for API key (if different from primary).
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    /// API protocol type: "openai" or "anthropic".
-    #[serde(default)]
-    pub api_type: Option<String>,
-    /// Published output price in USD per million tokens (for cost-aware routing).
-    #[serde(default)]
-    pub cost_per_m: Option<f64>,
-    /// Mark as strong model (reliable with 30+ tools, large payloads).
-    #[serde(default = "crate::config::default_true")]
-    pub strong: bool,
-}
-
 impl ProfileConfig {
-    pub fn apply_patch(&mut self, patch: ProfileConfigPatch) {
-        let llm_patch_present = patch.llm.is_specified();
-        let legacy_llm_override = !llm_patch_present
-            && (patch.provider.is_specified()
-                || patch.model.is_specified()
-                || patch.base_url.is_specified()
-                || patch.api_key_env.is_specified()
-                || patch.api_type.is_specified()
-                || patch.fallback_models.is_some());
+    pub fn primary_llm(&self) -> Option<&LlmModelSelectionConfig> {
+        self.llm.as_ref().and_then(|llm| llm.primary.as_ref())
+    }
 
+    pub fn primary_provider(&self) -> Option<&str> {
+        self.primary_llm().and_then(|selection| selection.family_id.as_deref())
+    }
+
+    pub fn primary_model(&self) -> Option<&str> {
+        self.primary_llm().and_then(|selection| selection.model_id.as_deref())
+    }
+
+    pub fn apply_patch(&mut self, patch: ProfileConfigPatch) {
         match patch.llm {
             PatchField::Absent => {}
-            PatchField::Clear => {
-                self.llm = None;
-                self.clear_legacy_llm_contract();
-            }
-            PatchField::Value(llm) => {
-                self.llm = Some(llm);
-            }
-        }
-        match patch.provider {
-            PatchField::Absent => {}
-            PatchField::Clear => self.provider = None,
-            PatchField::Value(provider) => self.provider = Some(provider),
-        }
-        match patch.model {
-            PatchField::Absent => {}
-            PatchField::Clear => self.model = None,
-            PatchField::Value(model) => self.model = Some(model),
-        }
-        match patch.base_url {
-            PatchField::Absent => {}
-            PatchField::Clear => self.base_url = None,
-            PatchField::Value(base_url) => self.base_url = Some(base_url),
-        }
-        match patch.api_key_env {
-            PatchField::Absent => {}
-            PatchField::Clear => self.api_key_env = None,
-            PatchField::Value(api_key_env) => self.api_key_env = Some(api_key_env),
-        }
-        if let Some(fallback_models) = patch.fallback_models {
-            self.fallback_models = fallback_models;
+            PatchField::Clear => self.llm = None,
+            PatchField::Value(llm) => self.llm = Some(llm),
         }
         match patch.search {
             PatchField::Absent => {}
@@ -476,11 +390,6 @@ impl ProfileConfig {
             PatchField::Clear => self.email = None,
             PatchField::Value(email) => self.email = Some(email),
         }
-        match patch.api_type {
-            PatchField::Absent => {}
-            PatchField::Clear => self.api_type = None,
-            PatchField::Value(api_type) => self.api_type = Some(api_type),
-        }
         if let Some(env_vars) = patch.env_vars {
             self.env_vars = env_vars;
         }
@@ -499,9 +408,6 @@ impl ProfileConfig {
             PatchField::Value(adaptive_routing) => self.adaptive_routing = Some(adaptive_routing),
         }
 
-        if legacy_llm_override {
-            self.llm = None;
-        }
         self.normalize_llm_contract();
     }
 
@@ -509,94 +415,25 @@ impl ProfileConfig {
         let mut normalized = self.clone();
         normalized.normalize_llm_contract();
         normalized
-            .llm
-            .as_ref()
-            .and_then(|llm| llm.primary.as_ref())
+            .primary_llm()
             .is_some_and(|primary| primary.family_id.is_some() || primary.model_id.is_some())
     }
 
     pub fn normalize_llm_contract(&mut self) {
-        let mut llm = self.llm.clone().unwrap_or_default();
+        let Some(mut llm) = self.llm.take() else {
+            return;
+        };
 
-        if llm.primary.is_none() {
-            llm.primary = self.legacy_primary_selection();
+        if llm.primary.as_ref().is_some_and(LlmModelSelectionConfig::is_empty) {
+            llm.primary = None;
         }
-        if llm.fallbacks.is_empty() && !self.fallback_models.is_empty() {
-            llm.fallbacks = self
-                .fallback_models
-                .iter()
-                .map(LlmModelSelectionConfig::from)
-                .collect();
-        }
+        llm.fallbacks.retain(|selection| !selection.is_empty());
 
-        if llm.primary.is_some() || !llm.fallbacks.is_empty() {
-            self.apply_llm_contract_to_legacy(&llm);
-            self.llm = Some(llm);
-        }
-    }
-
-    fn clear_legacy_llm_contract(&mut self) {
-        self.provider = None;
-        self.model = None;
-        self.base_url = None;
-        self.api_key_env = None;
-        self.api_type = None;
-        self.fallback_models.clear();
-    }
-
-    fn legacy_primary_selection(&self) -> Option<LlmModelSelectionConfig> {
-        let family_id = self.provider.clone();
-        let model_id = self.model.clone();
-        let route =
-            if self.base_url.is_some() || self.api_key_env.is_some() || self.api_type.is_some() {
-                Some(LlmRouteConfig {
-                    route_id: None,
-                    label: None,
-                    base_url: self.base_url.clone(),
-                    api_key_env: self.api_key_env.clone(),
-                    api_type: self.api_type.clone(),
-                })
-            } else {
-                None
-            };
-
-        if family_id.is_none() && model_id.is_none() && route.is_none() {
-            return None;
-        }
-
-        Some(LlmModelSelectionConfig {
-            family_id,
-            model_id,
-            route,
-            model_hints: None,
-            cost_per_m: None,
-            strong: None,
-        })
-    }
-
-    fn apply_llm_contract_to_legacy(&mut self, llm: &LlmProfileConfig) {
-        if let Some(primary) = &llm.primary {
-            self.provider = primary.family_id.clone();
-            self.model = primary.model_id.clone();
-            self.base_url = primary
-                .route
-                .as_ref()
-                .and_then(|route| route.base_url.clone());
-            self.api_key_env = primary
-                .route
-                .as_ref()
-                .and_then(|route| route.api_key_env.clone());
-            self.api_type = primary
-                .route
-                .as_ref()
-                .and_then(|route| route.api_type.clone());
-        }
-
-        self.fallback_models = llm
-            .fallbacks
-            .iter()
-            .map(FallbackModelConfig::from)
-            .collect();
+        self.llm = if llm.primary.is_none() && llm.fallbacks.is_empty() {
+            None
+        } else {
+            Some(llm)
+        };
     }
 }
 
@@ -641,45 +478,22 @@ impl GatewaySettingsPatch {
     }
 }
 
-impl From<&FallbackModelConfig> for LlmModelSelectionConfig {
-    fn from(value: &FallbackModelConfig) -> Self {
-        Self {
-            family_id: Some(value.provider.clone()),
-            model_id: value.model.clone(),
-            route: Some(LlmRouteConfig {
-                route_id: None,
-                label: None,
-                base_url: value.base_url.clone(),
-                api_key_env: value.api_key_env.clone(),
-                api_type: value.api_type.clone(),
-            }),
-            model_hints: None,
-            cost_per_m: value.cost_per_m,
-            strong: Some(value.strong),
-        }
-    }
-}
+impl LlmModelSelectionConfig {
+    fn is_empty(&self) -> bool {
+        let route_empty = self.route.as_ref().is_none_or(|route| {
+            route.route_id.is_none()
+                && route.label.is_none()
+                && route.base_url.is_none()
+                && route.api_key_env.is_none()
+                && route.api_type.is_none()
+        });
 
-impl From<&LlmModelSelectionConfig> for FallbackModelConfig {
-    fn from(value: &LlmModelSelectionConfig) -> Self {
-        Self {
-            provider: value.family_id.clone().unwrap_or_default(),
-            model: value.model_id.clone(),
-            base_url: value
-                .route
-                .as_ref()
-                .and_then(|route| route.base_url.clone()),
-            api_key_env: value
-                .route
-                .as_ref()
-                .and_then(|route| route.api_key_env.clone()),
-            api_type: value
-                .route
-                .as_ref()
-                .and_then(|route| route.api_type.clone()),
-            cost_per_m: value.cost_per_m,
-            strong: value.strong.unwrap_or_else(crate::config::default_true),
-        }
+        self.family_id.is_none()
+            && self.model_id.is_none()
+            && route_empty
+            && self.model_hints.is_none()
+            && self.cost_per_m.is_none()
+            && self.strong.is_none()
     }
 }
 
@@ -1104,7 +918,7 @@ impl ProfileStore {
 
     /// Create a sub-account under a parent profile.
     ///
-    /// The sub-account inherits LLM provider config from the parent at runtime.
+    /// The sub-account inherits the parent's LLM contract at runtime.
     /// It has its own channels, gateway settings, and data directory.
     pub fn create_sub_account(
         &self,
@@ -1148,12 +962,6 @@ impl ProfileStore {
             parent_id: Some(parent_id.to_string()),
             config: ProfileConfig {
                 llm: None,
-                // LLM fields left empty — inherited at runtime from parent
-                provider: None,
-                model: None,
-                base_url: None,
-                api_key_env: None,
-                fallback_models: vec![],
                 // Sub-account's own settings
                 channels,
                 gateway,
@@ -1187,14 +995,8 @@ pub fn resolve_effective_profile(
     let pc = &parent.config;
     let ec = &mut effective.config;
 
-    // Inherit LLM provider config from parent
+    // Inherit the LLM contract from parent.
     ec.llm = pc.llm.clone();
-    ec.provider = pc.provider.clone();
-    ec.model = pc.model.clone();
-    ec.base_url = pc.base_url.clone();
-    ec.api_key_env = pc.api_key_env.clone();
-    ec.api_type = pc.api_type.clone();
-    ec.fallback_models = pc.fallback_models.clone();
     if ec.search.is_none() {
         ec.search = pc.search.clone();
     }
@@ -1289,6 +1091,7 @@ pub(crate) fn config_from_profile(
     let mut normalized = profile.clone();
     normalized.config.normalize_llm_contract();
     let profile = &normalized;
+    let primary = profile.config.llm.as_ref().and_then(|llm| llm.primary.as_ref());
 
     let channels: Vec<ChannelEntry> = profile
         .config
@@ -1315,39 +1118,44 @@ pub(crate) fn config_from_profile(
 
     let fallback_models: Vec<FallbackModel> = profile
         .config
-        .fallback_models
-        .iter()
+        .llm
+        .as_ref()
+        .map(|llm| llm.fallbacks.iter())
+        .into_iter()
+        .flatten()
         .map(|fb| FallbackModel {
-            provider: fb.provider.clone(),
-            model: fb.model.clone(),
-            base_url: fb.base_url.clone(),
-            api_key_env: fb.api_key_env.clone(),
-            model_hints: profile.config.llm.as_ref().and_then(|llm| {
-                llm.fallbacks
-                    .iter()
-                    .find(|selection| {
-                        selection.family_id.as_deref() == Some(fb.provider.as_str())
-                            && selection.model_id == fb.model
-                            && selection
-                                .route
-                                .as_ref()
-                                .and_then(|route| route.base_url.clone())
-                                == fb.base_url
-                    })
-                    .and_then(|selection| selection.model_hints.clone())
-            }),
-            api_type: fb.api_type.clone(),
+            provider: fb.family_id.clone().unwrap_or_default(),
+            model: fb.model_id.clone(),
+            base_url: fb.route.as_ref().and_then(|route| route.base_url.clone()),
+            api_key_env: fb.route.as_ref().and_then(|route| route.api_key_env.clone()),
+            model_hints: fb.model_hints.clone(),
+            api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
-            strong: fb.strong,
+            strong: fb.strong.unwrap_or_else(crate::config::default_true),
         })
         .collect();
 
     Config {
-        provider: profile.config.provider.clone(),
-        model: profile.config.model.clone(),
-        base_url: profile.config.base_url.clone(),
-        api_key_env: profile.config.api_key_env.clone(),
-        api_type: profile.config.api_type.clone(),
+        provider: primary.and_then(|selection| selection.family_id.clone()),
+        model: primary.and_then(|selection| selection.model_id.clone()),
+        base_url: primary.and_then(|selection| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|route| route.base_url.clone())
+        }),
+        api_key_env: primary.and_then(|selection| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.clone())
+        }),
+        api_type: primary.and_then(|selection| {
+            selection
+                .route
+                .as_ref()
+                .and_then(|route| route.api_type.clone())
+        }),
         max_iterations: profile.config.gateway.max_iterations,
         gateway: Some(GatewayConfig {
             channels,
@@ -1361,12 +1169,7 @@ pub(crate) fn config_from_profile(
         fallback_models,
         // Fields not configured through profiles — use defaults
         version: None,
-        model_hints: profile
-            .config
-            .llm
-            .as_ref()
-            .and_then(|llm| llm.primary.as_ref())
-            .and_then(|selection| selection.model_hints.clone()),
+        model_hints: primary.and_then(|selection| selection.model_hints.clone()),
         mcp_servers: vec![],
         sandbox: profile.config.sandbox.clone(),
         tool_policy: None,
@@ -1580,8 +1383,7 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: provider, model, base_url, api_key_env, channels,
-///   fallback_models, env_vars.
+/// Restart-required: llm, channels, env_vars.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1594,30 +1396,11 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
         restart_fields.push("parent_id".into());
     }
 
-    // Provider/model changes are hot-reloadable (switch_model tool does live
-    // swap via SwappableProvider and persists to profile; restarting the
-    // gateway would kill the in-flight response).
-    if oc.provider != nc.provider || oc.model != nc.model {
-        tracing::debug!(
-            old_provider = ?oc.provider,
-            new_provider = ?nc.provider,
-            old_model = ?oc.model,
-            new_model = ?nc.model,
-            "provider/model change detected — treating as hot-reload (switch_model already applied)"
-        );
-    }
-    // base_url and api_key_env still require restart
-    if oc.base_url != nc.base_url {
-        restart_fields.push("base_url".into());
-    }
-    if oc.api_key_env != nc.api_key_env {
-        restart_fields.push("api_key_env".into());
+    if oc.llm != nc.llm {
+        restart_fields.push("llm".into());
     }
     if oc.channels != nc.channels {
         restart_fields.push("channels".into());
-    }
-    if oc.fallback_models != nc.fallback_models {
-        restart_fields.push("fallback_models".into());
     }
     if oc.env_vars != nc.env_vars {
         restart_fields.push("env_vars".into());
@@ -1675,6 +1458,36 @@ pub fn api_channel_port(profile: &UserProfile) -> Option<u16> {
 mod tests {
     use super::*;
 
+    fn llm_selection(
+        family_id: &str,
+        model_id: &str,
+        api_key_env: Option<&str>,
+        base_url: Option<&str>,
+    ) -> LlmModelSelectionConfig {
+        LlmModelSelectionConfig {
+            family_id: Some(family_id.into()),
+            model_id: Some(model_id.into()),
+            route: Some(LlmRouteConfig {
+                route_id: None,
+                label: None,
+                base_url: base_url.map(str::to_string),
+                api_key_env: api_key_env.map(str::to_string),
+                api_type: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn llm_profile(
+        primary: LlmModelSelectionConfig,
+        fallbacks: Vec<LlmModelSelectionConfig>,
+    ) -> LlmProfileConfig {
+        LlmProfileConfig {
+            primary: Some(primary),
+            fallbacks,
+        }
+    }
+
     #[test]
     fn test_validate_profile_id() {
         assert!(validate_profile_id("alice").is_ok());
@@ -1701,9 +1514,15 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("anthropic".into()),
-                model: Some("claude-sonnet-4-20250514".into()),
-                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                llm: Some(llm_profile(
+                    llm_selection(
+                        "anthropic",
+                        "claude-sonnet-4-20250514",
+                        Some("ANTHROPIC_API_KEY"),
+                        None,
+                    ),
+                    vec![],
+                )),
                 channels: vec![ChannelCredentials::Telegram {
                     token_env: "TG_TOKEN".into(),
                     allowed_senders: String::new(),
@@ -1741,8 +1560,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("openai".into()),
-                model: Some("gpt-4o".into()),
+                llm: Some(llm_profile(
+                    llm_selection("openai", "gpt-4o", None, None),
+                    vec![],
+                )),
                 channels: vec![
                     ChannelCredentials::Telegram {
                         token_env: "TG".into(),
@@ -1783,9 +1604,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("moonshot".into()),
-                model: Some("kimi-k2.5".into()),
-                api_key_env: Some("MOONSHOT_API_KEY".into()),
+                llm: Some(llm_profile(
+                    llm_selection("moonshot", "kimi-k2.5", Some("MOONSHOT_API_KEY"), None),
+                    vec![],
+                )),
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -1799,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_save_normalizes_legacy_llm_contract() {
+    fn test_save_persists_structured_llm_contract() {
         let dir = tempfile::tempdir().unwrap();
         let store = ProfileStore::open(dir.path()).unwrap();
 
@@ -1811,19 +1633,28 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("moonshot".into()),
-                model: Some("kimi-k2.5".into()),
-                base_url: Some("https://www.autodl.art/api/v1".into()),
-                api_key_env: Some("AUTODL_API_KEY".into()),
-                fallback_models: vec![FallbackModelConfig {
-                    provider: "minimax".into(),
-                    model: Some("MiniMax-M2.5-highspeed".into()),
-                    base_url: Some("https://api.wisemodel.cn/v1".into()),
-                    api_key_env: Some("WISEMODEL_API_KEY".into()),
-                    api_type: Some("openai".into()),
-                    cost_per_m: Some(3.2),
-                    strong: true,
-                }],
+                llm: Some(llm_profile(
+                    llm_selection(
+                        "moonshot",
+                        "kimi-k2.5",
+                        Some("AUTODL_API_KEY"),
+                        Some("https://www.autodl.art/api/v1"),
+                    ),
+                    vec![LlmModelSelectionConfig {
+                        family_id: Some("minimax".into()),
+                        model_id: Some("MiniMax-M2.5-highspeed".into()),
+                        route: Some(LlmRouteConfig {
+                            route_id: Some("wisemodel".into()),
+                            label: Some("WiseModel".into()),
+                            base_url: Some("https://api.wisemodel.cn/v1".into()),
+                            api_key_env: Some("WISEMODEL_API_KEY".into()),
+                            api_type: Some("openai".into()),
+                        }),
+                        cost_per_m: Some(3.2),
+                        strong: Some(true),
+                        ..Default::default()
+                    }],
+                )),
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2007,16 +1838,10 @@ mod tests {
     #[test]
     fn test_profile_config_patch_clears_structured_llm_contract() {
         let mut config = ProfileConfig {
-            llm: Some(LlmProfileConfig {
-                primary: Some(LlmModelSelectionConfig {
-                    family_id: Some("openai".into()),
-                    model_id: Some("gpt-4.1".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            provider: Some("openai".into()),
-            model: Some("gpt-4.1".into()),
+            llm: Some(llm_profile(
+                llm_selection("openai", "gpt-4.1", None, None),
+                vec![],
+            )),
             ..Default::default()
         };
 
@@ -2026,31 +1851,24 @@ mod tests {
         });
 
         assert!(config.llm.is_none());
-        assert!(config.provider.is_none());
-        assert!(config.model.is_none());
         assert!(!config.has_llm_selection());
     }
 
     #[test]
-    fn test_profile_config_patch_rebuilds_structured_llm_from_legacy_fields() {
+    fn test_profile_config_patch_replaces_structured_llm_contract() {
         let mut config = ProfileConfig {
-            llm: Some(LlmProfileConfig {
-                primary: Some(LlmModelSelectionConfig {
-                    family_id: Some("openai".into()),
-                    model_id: Some("gpt-4.1".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            provider: Some("openai".into()),
-            model: Some("gpt-4.1".into()),
+            llm: Some(llm_profile(
+                llm_selection("openai", "gpt-4.1", None, None),
+                vec![],
+            )),
             ..Default::default()
         };
 
         config.apply_patch(ProfileConfigPatch {
-            provider: PatchField::Value("moonshot".into()),
-            model: PatchField::Value("kimi-k2.5".into()),
-            api_key_env: PatchField::Value("MOONSHOT_API_KEY".into()),
+            llm: PatchField::Value(llm_profile(
+                llm_selection("moonshot", "kimi-k2.5", Some("MOONSHOT_API_KEY"), None),
+                vec![],
+            )),
             ..Default::default()
         });
 
@@ -2080,8 +1898,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("anthropic".into()),
-                model: Some("claude-sonnet-4-20250514".into()),
+                llm: Some(llm_profile(
+                    llm_selection("anthropic", "claude-sonnet-4-20250514", None, None),
+                    vec![],
+                )),
                 channels: vec![ChannelCredentials::WhatsApp {
                     bridge_url: "ws://localhost:3001".into(),
                 }],
@@ -2249,8 +2069,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("openai".into()),
-                model: Some("gpt-4o".into()),
+                llm: Some(llm_profile(
+                    llm_selection("openai", "gpt-4o", None, None),
+                    vec![],
+                )),
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2258,12 +2080,14 @@ mod tests {
         };
 
         let mut changed = base.clone();
-        changed.config.model = Some("gpt-4o-mini".into());
+        changed.config.llm = Some(llm_profile(
+            llm_selection("openai", "gpt-4o-mini", None, None),
+            vec![],
+        ));
 
-        // Provider/model changes are hot-reloadable (switch_model does live swap)
         assert!(matches!(
             diff_profiles(&base, &changed),
-            ProfileChange::HotReloadable | ProfileChange::Unchanged
+            ProfileChange::RestartRequired(fields) if fields == vec!["llm"]
         ));
     }
 
@@ -2277,7 +2101,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("openai".into()),
+                llm: Some(llm_profile(
+                    llm_selection("openai", "gpt-4o", None, None),
+                    vec![],
+                )),
                 gateway: GatewaySettings {
                     system_prompt: Some("old".into()),
                     ..Default::default()
@@ -2335,9 +2162,10 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("openai".into()),
-                model: Some("gpt-4o".into()),
-                api_key_env: Some("OPENAI_API_KEY".into()),
+                llm: Some(llm_profile(
+                    llm_selection("openai", "gpt-4o", Some("OPENAI_API_KEY"), None),
+                    vec![],
+                )),
                 env_vars: [("OPENAI_API_KEY".into(), "sk-test-key".into())].into(),
                 ..Default::default()
             },
@@ -2363,7 +2191,7 @@ mod tests {
 
         assert_eq!(sub.id, "parent--work-bot");
         assert_eq!(sub.parent_id, Some("parent".into()));
-        assert!(sub.config.provider.is_none()); // Not set — inherited at runtime
+        assert!(sub.config.llm.is_none()); // Not set — inherited at runtime
         assert_eq!(sub.config.channels.len(), 1);
 
         // List sub-accounts
@@ -2490,20 +2318,20 @@ mod tests {
             parent_id: None,
             public_subdomain: None,
             config: ProfileConfig {
-                provider: Some("openai".into()),
-                model: Some("gpt-4o".into()),
-                base_url: Some("https://custom.api.com/v1".into()),
-                api_key_env: Some("OPENAI_API_KEY".into()),
+                llm: Some(llm_profile(
+                    llm_selection(
+                        "openai",
+                        "gpt-4o",
+                        Some("OPENAI_API_KEY"),
+                        Some("https://custom.api.com/v1"),
+                    ),
+                    vec![llm_selection("anthropic", "claude-sonnet-4-20250514", None, None)],
+                )),
                 env_vars: [
                     ("OPENAI_API_KEY".into(), "sk-parent-key".into()),
                     ("SHARED_VAR".into(), "parent-value".into()),
                 ]
                 .into(),
-                fallback_models: vec![FallbackModelConfig {
-                    provider: "anthropic".into(),
-                    model: Some("claude-sonnet-4-20250514".into()),
-                    ..Default::default()
-                }],
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2543,13 +2371,24 @@ mod tests {
         let effective = resolve_effective_profile(&store, &sub).unwrap();
 
         // Inherited from parent
-        assert_eq!(effective.config.provider.as_deref(), Some("openai"));
-        assert_eq!(effective.config.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(effective.config.primary_provider(), Some("openai"));
+        assert_eq!(effective.config.primary_model(), Some("gpt-4o"));
         assert_eq!(
-            effective.config.base_url.as_deref(),
+            effective
+                .config
+                .primary_llm()
+                .and_then(|selection| selection.route.as_ref())
+                .and_then(|route| route.base_url.as_deref()),
             Some("https://custom.api.com/v1")
         );
-        assert_eq!(effective.config.fallback_models.len(), 1);
+        assert_eq!(
+            effective
+                .config
+                .llm
+                .as_ref()
+                .map(|llm| llm.fallbacks.len()),
+            Some(1)
+        );
 
         // Sub-account's own settings preserved
         assert_eq!(effective.config.channels.len(), 1);
@@ -2566,7 +2405,7 @@ mod tests {
         // Top-level profile returns as-is
         let effective_parent = resolve_effective_profile(&store, &parent).unwrap();
         assert_eq!(effective_parent.id, "parent");
-        assert_eq!(effective_parent.config.provider.as_deref(), Some("openai"));
+        assert_eq!(effective_parent.config.primary_provider(), Some("openai"));
     }
 
     #[test]

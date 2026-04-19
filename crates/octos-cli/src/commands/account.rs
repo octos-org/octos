@@ -403,11 +403,11 @@ impl Executable for AccountCommand {
                         Ok(eff) => {
                             println!(
                                 "  Provider: {} (inherited)",
-                                eff.config.provider.as_deref().unwrap_or("none")
+                                eff.config.primary_provider().unwrap_or("none")
                             );
                             println!(
                                 "  Model: {} (inherited)",
-                                eff.config.model.as_deref().unwrap_or("none")
+                                eff.config.primary_model().unwrap_or("none")
                             );
                         }
                         Err(e) => {

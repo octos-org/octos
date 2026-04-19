@@ -24,8 +24,8 @@ function formatUptime(secs: number | null): string {
 export default function ProfileCard({ profile, subAccounts = [], onStart, onStop }: Props) {
   const [expanded, setExpanded] = useState(true)
   const channels = profile.config.channels || []
-  const provider = profile.config.provider || 'anthropic'
-  const model = profile.config.model || 'default'
+  const provider = profile.config.llm?.primary?.family_id || 'anthropic'
+  const model = profile.config.llm?.primary?.model_id || 'default'
 
   return (
     <div className="bg-surface rounded-xl border border-gray-700/50 p-5 hover:border-gray-600/50 transition-colors group flex flex-col">

@@ -6,49 +6,67 @@ interface Props {
 }
 
 export default function DeepCrawlTab({ config, onChange }: Props) {
-  const envVars = config.env_vars || {}
+  const updateDeepCrawl = (
+    key: 'page_settle_ms' | 'max_output_chars',
+    value: string,
+  ) => {
+    const normalized = value.trim()
+    const parsed = normalized === '' ? undefined : Number.parseInt(normalized, 10)
+    const nextDeepCrawl = {
+      ...(config.deep_crawl ?? {}),
+      [key]: Number.isFinite(parsed) ? parsed : undefined,
+    }
 
-  const updateEnv = (key: string, value: string) => {
-    onChange({ ...config, env_vars: { ...envVars, [key]: value } })
+    onChange({
+      ...config,
+      deep_crawl: Object.values(nextDeepCrawl).some((entry) => entry != null)
+        ? nextDeepCrawl
+        : undefined,
+    })
   }
 
   return (
     <div className="space-y-4">
-      <p className="text-xs text-gray-500">
-        Configure the deep web crawling tool for research tasks. The agent can crawl websites,
-        extract content, and follow links to gather information.
-      </p>
-
-      <div>
-        <label className="block text-sm font-medium text-gray-300 mb-1.5">Max Crawl Depth</label>
-        <input
-          value={envVars['CRAWL_MAX_DEPTH'] || ''}
-          onChange={(e) => updateEnv('CRAWL_MAX_DEPTH', e.target.value)}
-          placeholder="3"
-          className="input max-w-[120px]"
-        />
-        <p className="text-xs text-gray-600 mt-1">Maximum link depth to follow from the starting URL (default: 3).</p>
+      <div className="text-xs text-gray-400 space-y-1.5 bg-surface-dark/50 rounded-lg p-3 border border-gray-700/50">
+        <p className="font-medium text-gray-300">Deep Crawl</p>
+        <p>
+          Configure the structured <code className="bg-gray-800 px-1 rounded">config.deep_crawl</code>{' '}
+          section used by the <code className="bg-gray-800 px-1 rounded">deep_crawl</code> tool.
+        </p>
       </div>
 
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-1.5">Max Pages</label>
+        <label className="block text-sm font-medium text-gray-300 mb-1.5">Page Settle Time (ms)</label>
         <input
-          value={envVars['CRAWL_MAX_PAGES'] || ''}
-          onChange={(e) => updateEnv('CRAWL_MAX_PAGES', e.target.value)}
-          placeholder="50"
-          className="input max-w-[120px]"
+          type="number"
+          min={500}
+          max={10000}
+          step={100}
+          value={config.deep_crawl?.page_settle_ms ?? ''}
+          onChange={(e) => updateDeepCrawl('page_settle_ms', e.target.value)}
+          placeholder="3000"
+          className="input max-w-[160px]"
         />
-        <p className="text-xs text-gray-600 mt-1">Maximum number of pages to crawl per request (default: 50).</p>
+        <p className="text-xs text-gray-600 mt-1">
+          How long the crawler waits for client-side rendering before extracting content. Default: 3000.
+        </p>
       </div>
 
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-1.5">Request Timeout (seconds)</label>
+        <label className="block text-sm font-medium text-gray-300 mb-1.5">Max Output Characters</label>
         <input
-          value={envVars['CRAWL_TIMEOUT_SECS'] || ''}
-          onChange={(e) => updateEnv('CRAWL_TIMEOUT_SECS', e.target.value)}
-          placeholder="30"
-          className="input max-w-[120px]"
+          type="number"
+          min={10000}
+          max={200000}
+          step={1000}
+          value={config.deep_crawl?.max_output_chars ?? ''}
+          onChange={(e) => updateDeepCrawl('max_output_chars', e.target.value)}
+          placeholder="50000"
+          className="input max-w-[160px]"
         />
+        <p className="text-xs text-gray-600 mt-1">
+          Truncation limit for extracted crawl output. Default: 50000.
+        </p>
       </div>
     </div>
   )

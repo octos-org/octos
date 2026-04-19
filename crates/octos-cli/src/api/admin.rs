@@ -2683,8 +2683,8 @@ pub async fn config_check(
         .collect();
 
     // Check LLM provider
-    let provider = profile.config.provider.as_deref().unwrap_or("unknown");
-    let model = profile.config.model.as_deref().unwrap_or("unknown");
+    let provider = profile.config.primary_provider().unwrap_or("unknown");
+    let model = profile.config.primary_model().unwrap_or("unknown");
 
     // Check skills
     let skills_dir = data_dir.join("skills");
