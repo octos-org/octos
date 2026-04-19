@@ -57,14 +57,20 @@ impl ShellTool {
 }
 
 fn frontend_tool_cache_dir(cwd: &Path) -> PathBuf {
-    let preferred = cwd.join(".octos-tool-cache").join("npm");
-    if std::fs::create_dir_all(&preferred).is_ok() {
-        return preferred;
-    }
-
-    let fallback = std::env::temp_dir().join("octos-shell-npm-cache");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let cache_key = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let preferred = std::env::temp_dir()
+        .join("octos-frontend-tool-cache")
+        .join(user)
+        .join(cache_key);
+    let _ = std::fs::create_dir_all(&preferred);
+    preferred
 }
 
 fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
@@ -346,6 +352,7 @@ mod tests {
         let mut lines = result.output.lines();
         assert_eq!(lines.next(), Some("1"));
         let cache = lines.next().unwrap_or_default();
-        assert!(cache.contains(".octos-tool-cache") || cache.contains("octos-shell-npm-cache"));
+        assert!(cache.contains("octos-frontend-tool-cache"));
+        assert!(!cache.contains(".octos-tool-cache"));
     }
 }

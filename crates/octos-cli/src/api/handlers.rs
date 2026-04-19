@@ -1578,14 +1578,20 @@ fn site_build_needed(project_dir: &std::path::Path, output_dir: &std::path::Path
 }
 
 fn site_build_cache_dir(project_dir: &std::path::Path) -> std::path::PathBuf {
-    let preferred = project_dir.join(".octos-tool-cache").join("npm");
-    if std::fs::create_dir_all(&preferred).is_ok() {
-        return preferred;
-    }
-
-    let fallback = std::env::temp_dir().join("octos-site-build-npm-cache");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let project_key = project_dir
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let preferred = std::env::temp_dir()
+        .join("octos-site-build-npm-cache")
+        .join(user)
+        .join(project_key);
+    let _ = std::fs::create_dir_all(&preferred);
+    preferred
 }
 
 fn apply_site_build_env(command: &mut std::process::Command, project_dir: &std::path::Path) {
@@ -2748,8 +2754,8 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let cache_dir = site_build_cache_dir(project_dir.path());
 
-        assert!(cache_dir.starts_with(project_dir.path()));
-        assert!(cache_dir.ends_with("npm"));
+        assert!(cache_dir.starts_with(std::env::temp_dir()));
+        assert!(cache_dir.to_string_lossy().contains("octos-site-build-npm-cache"));
     }
 
     #[test]

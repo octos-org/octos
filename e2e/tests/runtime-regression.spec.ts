@@ -237,6 +237,27 @@ test.describe('Background task lifecycle', () => {
 
     expect(doneEvent).toBeTruthy();
     expect(doneEvent!.has_bg_tasks).toBe(true);
+
+    let sawTtsTaskOrAudio = false;
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const tasks = await getTasks(sid);
+      const msgs = await getMessages(sid);
+      sawTtsTaskOrAudio =
+        tasks.some(
+          (task: any) =>
+            task.tool_name === 'fm_tts' ||
+            task.tool_name === 'Direct TTS' ||
+            task.child_session_key,
+        ) ||
+        msgs.some(
+          (m: any) =>
+            Array.isArray(m.media) && m.media.some((path: string) => /\.mp3$/i.test(path)),
+        );
+      if (sawTtsTaskOrAudio) break;
+    }
+
+    expect(sawTtsTaskOrAudio).toBe(true);
   });
 
   test('TTS task completes and delivers file (#388, #366)', async () => {
