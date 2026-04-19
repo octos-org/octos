@@ -40,6 +40,17 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json()
 }
 
+async function requestNoContent(path: string, opts?: RequestInit): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: getHeaders(),
+    ...opts,
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(text || `HTTP ${res.status}`)
+  }
+}
+
 async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -190,6 +201,37 @@ export const api = {
 
   removeProfileSkill: (id: string, name: string) =>
     request<ActionResponse>(`/profiles/${id}/skills/${name}`, { method: 'DELETE' }),
+
+  // Setup wizard + admin token rotation
+  getTokenStatus: () => request<TokenStatus>('/token/status'),
+
+  rotateToken: (new_token: string) =>
+    requestNoContent('/token/rotate', {
+      method: 'POST',
+      body: JSON.stringify({ new_token }),
+    }),
+
+  getSetupState: () => request<SetupState>('/setup/state'),
+
+  postSetupStep: (step: number) =>
+    requestNoContent('/setup/step', {
+      method: 'POST',
+      body: JSON.stringify({ step }),
+    }),
+
+  completeSetup: () => requestNoContent('/setup/complete', { method: 'POST' }),
+
+  skipSetup: () => requestNoContent('/setup/skip', { method: 'POST' }),
+}
+
+// ── Setup wizard types ─────────────────────────────────────────────
+
+export type TokenStatus = { rotated: boolean }
+
+export type SetupState = {
+  wizard_completed_at: string | null
+  wizard_skipped: boolean
+  wizard_last_step_reached: number
 }
 
 // ── Auth API (public) ───────────────────────────────────────────────
