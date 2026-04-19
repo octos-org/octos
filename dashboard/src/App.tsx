@@ -13,6 +13,7 @@ import UsersPage from './pages/UsersPage'
 import AdminBotPage from './pages/AdminBotPage'
 import ServerMetricsPage from './pages/ServerMetricsPage'
 import SetupRotateToken from './pages/SetupRotateToken'
+import SetupWelcome from './pages/SetupWelcome'
 import SetupWizard from './pages/SetupWizard'
 import { HomePage, LlmPage, MessagingPage, ToolsPage, SkillsPage, SystemPage } from './pages/profile'
 
@@ -23,8 +24,10 @@ export default function App() {
         <Routes>
           <Route path="login" element={<LoginPage />} />
           <Route element={<AuthGuard><BootstrapGate><Outlet /></BootstrapGate></AuthGuard>}>
-            {/* Setup flow — rotate-token renders without the main Layout so it
-                remains reachable before the admin has completed rotation. */}
+            {/* Setup flow — welcome + rotate-token render without the main
+                Layout so they remain reachable before the admin has completed
+                rotation. */}
+            <Route path="setup/welcome" element={<SetupWelcome />} />
             <Route path="setup/rotate-token" element={<SetupRotateToken />} />
 
             <Route element={<Layout />}>
