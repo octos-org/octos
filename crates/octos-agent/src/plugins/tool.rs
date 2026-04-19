@@ -118,10 +118,16 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style" {
-                if let Some(style) = value.as_str()
-                    && let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir)
+            if key == "style"
+                && let Some(style) = value.as_str()
+            {
+                if self.tool_def.name.starts_with("mofa_")
+                    && let Some(normalized) = normalize_mofa_style_name(style)
                 {
+                    rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                    continue;
+                }
+                if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
                     rewritten.insert(key.clone(), serde_json::Value::String(resolved));
                     continue;
                 }
@@ -364,6 +370,22 @@ fn resolve_slides_style_in_work_dir(style: &str, work_dir: &std::path::Path) -> 
     resolved
         .exists()
         .then(|| resolved.to_string_lossy().into_owned())
+}
+
+fn normalize_mofa_style_name(style: &str) -> Option<String> {
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = std::path::Path::new(trimmed);
+    let filename = candidate.file_name()?.to_str()?.trim();
+    let mut normalized = filename;
+    while let Some(stripped) = normalized.strip_suffix(".toml") {
+        normalized = stripped;
+    }
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
 #[async_trait]
@@ -799,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_workspace_file_args_resolves_workspace_style_paths() {
+    fn rewrite_workspace_file_args_keeps_mofa_style_as_name() {
         let dir = tempfile::tempdir().unwrap();
         let styles = dir.path().join("styles");
         std::fs::create_dir_all(&styles).unwrap();
@@ -825,7 +847,63 @@ mod tests {
             "style": "cyberpunk-neon"
         }));
 
-        assert_eq!(rewritten["style"], style.to_string_lossy().to_string());
+        assert_eq!(rewritten["style"], "cyberpunk-neon");
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_strips_mofa_style_toml_paths_to_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let styles = dir.path().join("styles");
+        std::fs::create_dir_all(&styles).unwrap();
+        let style = styles.join("cyberpunk-neon.toml");
+        std::fs::write(&style, b"[meta]\nname='Cyberpunk'\n").unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "style": style.to_string_lossy().to_string()
+        }));
+
+        assert_eq!(rewritten["style"], "cyberpunk-neon");
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_strips_repeated_mofa_style_toml_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "style": "/tmp/styles/nb-pro.toml.toml"
+        }));
+
+        assert_eq!(rewritten["style"], "nb-pro");
     }
 
     #[test]

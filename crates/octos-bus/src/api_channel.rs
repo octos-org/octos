@@ -92,6 +92,22 @@ fn record_duplicate_result_suppressed(reason: &'static str) {
     .increment(1);
 }
 
+fn is_slides_topic(topic: Option<&str>) -> bool {
+    topic.is_some_and(|value| value.starts_with("slides"))
+}
+
+fn path_looks_like_presentation(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".pptx") || lower.contains(".pptx?")
+}
+
+fn message_has_presentation_media(message: &Message) -> bool {
+    message
+        .media
+        .iter()
+        .any(|path| path_looks_like_presentation(path))
+}
+
 /// Request body for POST /chat.
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -191,6 +207,40 @@ impl ApiChannel {
         name.replace(['/', '\\', '\0'], "_")
     }
 
+    fn find_matching_artifact_copy(
+        artifact_dir: &Path,
+        source: &Path,
+        safe_name: &str,
+    ) -> Option<PathBuf> {
+        let source_meta = std::fs::metadata(source).ok()?;
+        let source_len = source_meta.len();
+        let source_bytes = std::fs::read(source).ok()?;
+
+        std::fs::read_dir(artifact_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|item| item.path()))
+            .find(|candidate| {
+                if !candidate.is_file() {
+                    return false;
+                }
+                let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
+                    return false;
+                };
+                if name != safe_name && !name.ends_with(&format!("-{safe_name}")) {
+                    return false;
+                }
+                let Ok(candidate_meta) = std::fs::metadata(candidate) else {
+                    return false;
+                };
+                if candidate_meta.len() != source_len {
+                    return false;
+                }
+                std::fs::read(candidate)
+                    .map(|bytes| bytes == source_bytes)
+                    .unwrap_or(false)
+            })
+    }
+
     fn copy_media_into_session_artifacts(artifact_dir: &Path, media: &[String]) -> Vec<String> {
         if let Err(error) = std::fs::create_dir_all(artifact_dir) {
             warn!(
@@ -225,6 +275,13 @@ impl ApiChannel {
                 }
 
                 let safe_name = Self::sanitize_artifact_name(&canonical_source);
+                if let Some(existing) = Self::find_matching_artifact_copy(
+                    &canonical_artifact_dir,
+                    &canonical_source,
+                    &safe_name,
+                ) {
+                    return existing.to_string_lossy().to_string();
+                }
                 let dest =
                     canonical_artifact_dir.join(format!("{}-{safe_name}", uuid::Uuid::now_v7()));
 
@@ -367,6 +424,36 @@ fn build_task_status_event(task: serde_json::Value, topic: Option<&str>) -> serd
     })
 }
 
+fn compatibility_tool_name_for_task(task: &serde_json::Value) -> Option<&'static str> {
+    match task.get("tool_name").and_then(|value| value.as_str()) {
+        Some("Direct TTS") => Some("fm_tts"),
+        _ => None,
+    }
+}
+
+fn build_bg_task_tool_start_events(tasks: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    tasks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|task| {
+            matches!(
+                task.get("status").and_then(|value| value.as_str()),
+                Some("spawned" | "running")
+            )
+        })
+        .filter_map(compatibility_tool_name_for_task)
+        .filter(|tool_name| seen.insert((*tool_name).to_string()))
+        .map(|tool_name| {
+            serde_json::json!({
+                "type": "tool_start",
+                "tool": tool_name,
+            })
+        })
+        .collect()
+}
+
 fn build_replay_complete_event(topic: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "type": "replay_complete",
@@ -461,6 +548,21 @@ impl Channel for ApiChannel {
         let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
 
         if !msg.media.is_empty() {
+            if !history_already_persisted
+                && self
+                    .should_suppress_duplicate_slides_delivery(&msg.chat_id, topic, &msg.media)
+                    .await
+            {
+                record_duplicate_result_suppressed("slides_duplicate_deck_same_user_turn");
+                info!(
+                    chat_id = %msg.chat_id,
+                    topic = topic.unwrap_or_default(),
+                    media = ?msg.media,
+                    "suppressing duplicate slides deck delivery in same user turn"
+                );
+                return Ok(());
+            }
+
             let data_dir = {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
@@ -622,19 +724,22 @@ impl Channel for ApiChannel {
                     .get("has_bg_tasks")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let content = if msg.content.is_empty() {
-                    self.last_content
-                        .lock()
-                        .await
-                        .get(&msg.chat_id)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    msg.content.clone()
-                };
+                if has_bg {
+                    if let Some(query_fn) = self.task_query.as_ref() {
+                        let session_key = current_profile_api_session_key_with_topic(
+                            self.profile_id.as_deref(),
+                            &msg.chat_id,
+                            topic,
+                        );
+                        let tasks = query_fn(&session_key.0);
+                        for event in build_bg_task_tool_start_events(&tasks) {
+                            let _ = tx.send(event.to_string());
+                        }
+                    }
+                }
                 let done = serde_json::json!({
                     "type": "done",
-                    "content": content,
+                    "content": "",
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
                     "provider": msg.metadata.get("provider").cloned().unwrap_or(serde_json::Value::Null),
                     "model_id": msg.metadata.get("model_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -656,11 +761,6 @@ impl Channel for ApiChannel {
                 });
                 if tx.send(event.to_string()).is_err() {
                     pending.remove(&msg.chat_id);
-                } else {
-                    self.last_content
-                        .lock()
-                        .await
-                        .insert(msg.chat_id.clone(), msg.content.clone());
                 }
             }
         }
@@ -746,6 +846,33 @@ async fn handle_metrics(State(state): State<ApiState>) -> String {
 }
 
 impl ApiChannel {
+    async fn should_suppress_duplicate_slides_delivery(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+        media: &[String],
+    ) -> bool {
+        if !is_slides_topic(topic) || !media.iter().any(|path| path_looks_like_presentation(path)) {
+            return false;
+        }
+
+        let key =
+            current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
+        let mut sess = self.sessions.lock().await;
+        let history = sess.get_or_create(&key).await.get_history(256).to_vec();
+
+        for message in history.iter().rev() {
+            if message.role == MessageRole::User {
+                break;
+            }
+            if message.role == MessageRole::Assistant && message_has_presentation_media(message) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Persist a message to the session JSONL for the given chat_id and
     /// return the authoritative committed message shape when available.
     async fn persist_to_session(
@@ -779,13 +906,7 @@ impl ApiChannel {
         let base_key = key.base_key();
         let encoded = crate::session::encode_path_component(base_key);
         let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
-        let topic_name = topic
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("default");
-        let per_user_path = per_user_dir.join(format!(
-            "{}.jsonl",
-            crate::session::encode_path_component(topic_name)
-        ));
+        let per_user_path = per_user_dir.join("default.jsonl");
         if per_user_path.exists() {
             if let Ok(msg_json) = serde_json::to_string(&message) {
                 let path_clone = per_user_path.clone();
@@ -1881,6 +2002,36 @@ mod tests {
     }
 
     #[test]
+    fn copy_media_into_session_artifacts_reuses_existing_copy_for_identical_file() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact_dir = root.path().join(".artifacts");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+
+        let source = root
+            .path()
+            .join("slides")
+            .join("demo")
+            .join("output")
+            .join("deck.pptx");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"same deck bytes").unwrap();
+
+        let first = ApiChannel::copy_media_into_session_artifacts(
+            &artifact_dir,
+            &[source.display().to_string()],
+        );
+        let second = ApiChannel::copy_media_into_session_artifacts(
+            &artifact_dir,
+            &[source.display().to_string()],
+        );
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0], second[0]);
+        assert!(std::path::Path::new(&first[0]).exists());
+    }
+
+    #[test]
     fn api_session_key_candidates_prefer_current_profile() {
         let keys = api_session_key_candidates(Some("dspfac--newsbot"), "web-123", None);
 
@@ -1946,6 +2097,21 @@ mod tests {
         assert_eq!(parsed[0]["type"], "thinking");
         assert_eq!(parsed[1]["type"], "tool_progress");
         assert_eq!(parsed[1]["tool"], "preprocessing");
+    }
+
+    #[test]
+    fn build_bg_task_tool_start_events_adds_tts_compatibility_event() {
+        let tasks = serde_json::json!([
+            { "id": "task-1", "tool_name": "Direct TTS", "status": "running" },
+            { "id": "task-2", "tool_name": "Direct TTS", "status": "spawned" },
+            { "id": "task-3", "tool_name": "Research Podcast", "status": "running" }
+        ]);
+
+        let events = build_bg_task_tool_start_events(&tasks);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "tool_start");
+        assert_eq!(events[0]["tool"], "fm_tts");
     }
 
     #[tokio::test]
@@ -2276,55 +2442,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_completion_reuses_last_replace_content_when_completion_is_empty() {
+    async fn send_completion_with_bg_tasks_emits_compat_tool_start_before_done() {
         let ch = ApiChannel::new(
             8091,
             None,
             Arc::new(AtomicBool::new(false)),
             test_sessions(),
             Some(TEST_PROFILE_ID.to_string()),
-        );
+        )
+        .with_task_query(Arc::new(|_| {
+            serde_json::json!([
+                { "id": "task-1", "tool_name": "Direct TTS", "status": "running" }
+            ])
+        }));
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         {
             let mut pending = ch.pending.lock().await;
-            pending.insert("test-chat".into(), tx);
+            pending.insert("test-bg-compat".into(), tx);
         }
 
-        let replace = OutboundMessage {
+        let msg = OutboundMessage {
             channel: "api".into(),
-            chat_id: "test-chat".into(),
-            content: "Background work started. I will send the audio when it is ready.".into(),
-            reply_to: None,
-            media: vec![],
-            metadata: serde_json::json!({}),
-        };
-        ch.send(&replace).await.unwrap();
-        let replace_event = rx.recv().await.unwrap();
-        let replace_json: serde_json::Value = serde_json::from_str(&replace_event).unwrap();
-        assert_eq!(replace_json["type"], "replace");
-
-        let completion = OutboundMessage {
-            channel: "api".into(),
-            chat_id: "test-chat".into(),
+            chat_id: "test-bg-compat".into(),
             content: String::new(),
             reply_to: None,
             media: vec![],
-            metadata: serde_json::json!({
-                "_completion": true,
-                "has_bg_tasks": true
-            }),
+            metadata: serde_json::json!({"_completion": true, "has_bg_tasks": true}),
         };
-        ch.send(&completion).await.unwrap();
+        ch.send(&msg).await.unwrap();
 
-        let done_event = rx.recv().await.unwrap();
-        let done_json: serde_json::Value = serde_json::from_str(&done_event).unwrap();
-        assert_eq!(done_json["type"], "done");
-        assert_eq!(
-            done_json["content"],
-            "Background work started. I will send the audio when it is ready."
-        );
-        assert_eq!(done_json["has_bg_tasks"], true);
-        assert!(rx.recv().await.is_none());
+        let first: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+
+        assert_eq!(first["type"], "tool_start");
+        assert_eq!(first["tool"], "fm_tts");
+        assert_eq!(second["type"], "done");
+        assert_eq!(second["has_bg_tasks"], true);
     }
 
     #[tokio::test]
@@ -2367,44 +2520,6 @@ mod tests {
         assert!(!history[0].content.contains(persisted));
         assert!(Path::new(persisted).exists());
         assert_eq!(std::fs::read(Path::new(persisted)).unwrap(), b"audio");
-    }
-
-    #[tokio::test]
-    async fn send_file_message_persists_to_topic_scoped_session() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let sessions = test_sessions_in(data_dir.path());
-        let ch = ApiChannel::new(
-            8091,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            sessions.clone(),
-            Some(TEST_PROFILE_ID.to_string()),
-        );
-        let source_dir = data_dir.path().join("source");
-        std::fs::create_dir_all(&source_dir).unwrap();
-        let source = source_dir.join("deck.pptx");
-        std::fs::write(&source, b"pptx").unwrap();
-
-        let msg = OutboundMessage {
-            channel: "api".into(),
-            chat_id: "slides-topic".into(),
-            content: String::new(),
-            reply_to: None,
-            media: vec![source.to_string_lossy().to_string()],
-            metadata: serde_json::json!({ "topic": "slides demo" }),
-        };
-        ch.send(&msg).await.unwrap();
-
-        let mut sess = sessions.lock().await;
-        let topic_key =
-            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-topic", "slides demo");
-        let topic_session = sess.get_or_create(&topic_key).await;
-        assert_eq!(topic_session.get_history(10).len(), 1);
-        assert_eq!(topic_session.get_history(10)[0].media.len(), 1);
-
-        let base_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "slides-topic");
-        let base_session = sess.get_or_create(&base_key).await;
-        assert!(base_session.get_history(10).is_empty());
     }
 
     #[tokio::test]
@@ -2540,6 +2655,181 @@ mod tests {
         let persisted = std::fs::canonicalize(&history[0].media[0]).unwrap();
         let existing = std::fs::canonicalize(&existing).unwrap();
         assert_eq!(persisted, existing);
+    }
+
+    #[tokio::test]
+    async fn send_file_message_with_topic_persists_to_topic_session() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("deck.pptx");
+        std::fs::write(&source, b"pptx").unwrap();
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "topic-file-chat".into(),
+            content: "".into(),
+            reply_to: None,
+            media: vec![source.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let topic_key = SessionKey::with_profile_topic(
+            TEST_PROFILE_ID,
+            "api",
+            "topic-file-chat",
+            "slides demo",
+        );
+        let base_key = SessionKey::with_profile(TEST_PROFILE_ID, "api", "topic-file-chat");
+        let topic_history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        let base_history = sess.get_or_create(&base_key).await.get_history(10).to_vec();
+
+        assert_eq!(topic_history.len(), 1);
+        assert!(base_history.is_empty());
+        assert_eq!(topic_history[0].media.len(), 1);
+        assert!(topic_history[0].media[0].contains(".artifacts"));
+        assert!(topic_history[0].media[0].contains("deck.pptx"));
+    }
+
+    #[tokio::test]
+    async fn slides_topic_suppresses_duplicate_deck_delivery_until_new_user_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-chat", "slides demo");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("go"))
+                .await
+                .unwrap();
+        }
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first = source_dir.join("deck-one.pptx");
+        let second = source_dir.join("deck-two.pptx");
+        std::fs::write(&first, b"pptx-one").unwrap();
+        std::fs::write(&second, b"pptx-two").unwrap();
+
+        for source in [&first, &second] {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "slides-chat".into(),
+                content: String::new(),
+                reply_to: None,
+                media: vec![source.to_string_lossy().to_string()],
+                metadata: serde_json::json!({ "topic": "slides demo" }),
+            };
+            ch.send(&msg).await.unwrap();
+        }
+
+        let mut sess = sessions.lock().await;
+        let history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, MessageRole::User);
+        assert_eq!(history[1].role, MessageRole::Assistant);
+        assert_eq!(history[1].media.len(), 1);
+        assert!(history[1].media[0].contains("deck-one.pptx"));
+    }
+
+    #[tokio::test]
+    async fn slides_topic_allows_new_deck_after_new_user_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions.clone(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let topic_key =
+            SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", "slides-chat-2", "slides demo");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("go"))
+                .await
+                .unwrap();
+        }
+
+        let source_dir = data_dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let first = source_dir.join("deck-one.pptx");
+        let second = source_dir.join("deck-two.pptx");
+        std::fs::write(&first, b"pptx-one").unwrap();
+        std::fs::write(&second, b"pptx-two").unwrap();
+
+        let first_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "slides-chat-2".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![first.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&first_msg).await.unwrap();
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("regenerate"))
+                .await
+                .unwrap();
+        }
+
+        let second_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "slides-chat-2".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![second.to_string_lossy().to_string()],
+            metadata: serde_json::json!({ "topic": "slides demo" }),
+        };
+        ch.send(&second_msg).await.unwrap();
+
+        let mut sess = sessions.lock().await;
+        let history = sess
+            .get_or_create(&topic_key)
+            .await
+            .get_history(10)
+            .to_vec();
+        let assistant_media = history
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| message.media.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 4);
+        assert_eq!(assistant_media.len(), 2);
+        assert!(assistant_media[0].contains("deck-one.pptx"));
+        assert!(assistant_media[1].contains("deck-two.pptx"));
     }
 
     #[tokio::test]

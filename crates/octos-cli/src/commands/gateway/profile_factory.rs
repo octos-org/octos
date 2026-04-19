@@ -4,6 +4,7 @@
 //! Matrix child bot), this builder constructs a dedicated [`ActorFactory`] with
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -27,6 +28,29 @@ use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
     SnapshotToolRegistryFactory, ToolRegistryFactory,
 };
+
+fn profile_search_provider_keys(profile: &crate::profiles::UserProfile) -> HashMap<String, String> {
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+    profile
+        .config
+        .search
+        .as_ref()
+        .map(|search| {
+            search
+                .providers
+                .iter()
+                .filter_map(|(provider_id, provider)| {
+                    let source_key = provider.api_key_env.as_deref()?;
+                    let secret = resolved_env_vars
+                        .get(source_key)
+                        .cloned()
+                        .or_else(|| std::env::var(source_key).ok())?;
+                    Some((provider_id.clone(), secret))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 /// (full LLM, provider name, adaptive router, strong-only LLM for slides)
@@ -412,10 +436,19 @@ impl ProfileActorFactoryBuilder {
             }
             actor_plugin_dirs = plugin_dirs.clone();
             actor_plugin_env = plugin_env;
+            let search_provider_keys = profile_search_provider_keys(&effective_profile);
+            if !search_provider_keys.is_empty() {
+                tools.register(
+                    octos_agent::WebSearchTool::new()
+                        .with_config(self.tool_config.clone())
+                        .with_provider_keys(search_provider_keys.clone()),
+                );
+            }
 
-            tools.register(octos_agent::DeepSearchTool::new(
-                profile_data_dir.join("research"),
-            ));
+            tools.register(
+                octos_agent::DeepSearchTool::new(profile_data_dir.join("research"))
+                    .with_provider_keys(search_provider_keys),
+            );
             tools.register(octos_agent::SynthesizeResearchTool::new(
                 llm.clone(),
                 profile_data_dir.clone(),

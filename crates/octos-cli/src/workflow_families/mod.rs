@@ -10,7 +10,7 @@ use self::site::SitePlan;
 use self::slides::SlidesPlan;
 use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
-pub use registry::{registry, WorkflowFamilyDescriptor};
+pub use registry::{WorkflowFamilyDescriptor, registry};
 pub use site::SiteTemplate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

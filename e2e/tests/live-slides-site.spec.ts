@@ -36,6 +36,24 @@ async function collectPreviewUrls(page: Page): Promise<string[]> {
   );
 }
 
+async function waitForPreviewUrls(
+  page: Page,
+  expectedCount: number,
+  timeoutMs: number,
+): Promise<string[]> {
+  let latest: string[] = [];
+  await expect
+    .poll(async () => {
+      latest = await collectPreviewUrls(page);
+      return latest.length;
+    }, {
+      timeout: timeoutMs,
+      intervals: [2_000, 5_000],
+    })
+    .toBe(expectedCount);
+  return latest;
+}
+
 function normalizePreviewUrl(url: string): string {
   const trimmed = url.trim();
   const match = trimmed.match(/^([^?#]+)(.*)$/);
@@ -50,23 +68,27 @@ function normalizePreviewUrl(url: string): string {
 async function waitForPreviewBody(
   page: Page,
   previewUrl: string,
-  textNeedle: string,
+  textNeedles: string | string[],
   timeoutMs: number,
 ) {
   const deadline = Date.now() + timeoutMs;
   let lastBody = '';
+  const needles = (Array.isArray(textNeedles) ? textNeedles : [textNeedles]).map((needle) =>
+    needle.toLowerCase(),
+  );
 
   while (Date.now() < deadline) {
     await page.goto(previewUrl, { waitUntil: 'networkidle' });
     lastBody = (await page.locator('body').innerText().catch(() => '')) || '';
-    if (lastBody.includes(textNeedle)) {
+    const normalizedBody = lastBody.toLowerCase();
+    if (needles.every((needle) => normalizedBody.includes(needle))) {
       return lastBody;
     }
     await page.waitForTimeout(5_000);
   }
 
   throw new Error(
-    `Preview at ${previewUrl} never exposed "${textNeedle}". Last body: ${lastBody.slice(0, 400)}`,
+    `Preview at ${previewUrl} never exposed ${needles.map((needle) => JSON.stringify(needle)).join(', ')}. Last body: ${lastBody.slice(0, 400)}`,
   );
 }
 
@@ -76,20 +98,6 @@ function assistantNeedsSlidesConfirmation(text: string): boolean {
     /reply\s+"generate"/i.test(text) ||
     /reply\s+"go"/i.test(text)
   );
-}
-
-async function waitForSlidesConfirmationResolution(page: Page, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const deckCount = await page.getByRole('button', { name: /deck\.pptx/i }).count();
-    if (deckCount > 0) return;
-
-    const assistantText = await getAssistantMessageText(page);
-    if (!assistantNeedsSlidesConfirmation(assistantText)) return;
-
-    await page.waitForTimeout(5_000);
-  }
 }
 
 test.describe('Live deliverable flows', () => {
@@ -121,8 +129,16 @@ test.describe('Live deliverable flows', () => {
     });
 
     const deckButton = page.getByRole('button', { name: /deck\.pptx/i });
-    if ((await deckButton.count()) === 0) {
-      await waitForSlidesConfirmationResolution(page, 60_000);
+    const deckAppearedWithoutConfirmation = await expect
+      .poll(async () => deckButton.count(), {
+        timeout: 30_000,
+        intervals: [2_000, 5_000],
+      })
+      .toBeGreaterThan(0)
+      .then(() => true)
+      .catch(() => false);
+
+    if (!deckAppearedWithoutConfirmation) {
       const assistantText = await getAssistantMessageText(page);
       if (assistantNeedsSlidesConfirmation(assistantText)) {
         await sendAndWait(page, 'go', {
@@ -145,7 +161,7 @@ test.describe('Live deliverable flows', () => {
       );
     }
 
-    await page.reload({ waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
@@ -165,7 +181,7 @@ test.describe('Live deliverable flows', () => {
       maxWait: 90_000,
     });
 
-    const previewUrls = await collectPreviewUrls(page);
+    const previewUrls = await waitForPreviewUrls(page, 1, 30_000);
     expect(previewUrls).toHaveLength(1);
 
     const previewUrl = previewUrls[0];
@@ -184,7 +200,7 @@ test.describe('Live deliverable flows', () => {
       const body = await waitForPreviewBody(
         previewPage,
         previewUrl,
-        'Browser Site Acceptance',
+        ['Browser Site Acceptance', 'Live preview'],
         240_000,
       );
 
@@ -200,11 +216,11 @@ test.describe('Live deliverable flows', () => {
       await previewPage.close();
     }
 
-    await page.reload({ waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
-    const afterReloadPreviewUrls = await collectPreviewUrls(page);
+    const afterReloadPreviewUrls = await waitForPreviewUrls(page, 1, 30_000);
     expect(afterReloadPreviewUrls).toHaveLength(1);
     expect(afterReloadPreviewUrls[0]).toBe(previewUrl);
   });

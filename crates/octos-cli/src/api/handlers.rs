@@ -189,6 +189,7 @@ pub async fn chat(
             req.topic.as_deref(),
             &req.media,
             req.attach_only,
+            req.stream,
         )
         .await;
     }

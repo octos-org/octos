@@ -46,7 +46,7 @@ async function chatSSE(
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await request.post(`${baseURL}/api/chat`, {
       headers: headers(),
-      data: { message, session_id: attempt === 0 ? sid : `${sid}-r` },
+      data: { message, session_id: attempt === 0 ? sid : `${sid}-r`, stream: true },
       timeout: timeoutMs,
     });
 

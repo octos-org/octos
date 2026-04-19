@@ -1,6 +1,5 @@
 //! Send file tool for delivering files to chat channels.
 
-use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
@@ -8,7 +7,6 @@ use eyre::{Result, WrapErr};
 use octos_core::OutboundMessage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
 
 use super::{Tool, ToolResult};
 
@@ -45,29 +43,6 @@ fn is_stale_slides_backup(path: &Path) -> bool {
     false
 }
 
-// Generated artifacts can be discovered slightly before the filesystem entry is
-// fully visible on slower hosts. Give send_file a few seconds to resolve those
-// paths so final deliverables do not get dropped after successful generation.
-const CANONICALIZE_RETRY_ATTEMPTS: usize = 40;
-const CANONICALIZE_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-async fn canonicalize_with_retry(path: &Path) -> io::Result<PathBuf> {
-    let mut last_err = None;
-    for attempt in 0..=CANONICALIZE_RETRY_ATTEMPTS {
-        match std::fs::canonicalize(path) {
-            Ok(canonical) => return Ok(canonical),
-            Err(err) => {
-                last_err = Some(err);
-                if attempt == CANONICALIZE_RETRY_ATTEMPTS {
-                    break;
-                }
-                sleep(CANONICALIZE_RETRY_DELAY).await;
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found")))
-}
-
 impl SendFileTool {
     pub fn new(out_tx: mpsc::Sender<OutboundMessage>) -> Self {
         Self {
@@ -96,10 +71,9 @@ impl SendFileTool {
         }
     }
 
-    /// Bind the current session topic so API send_file deliveries are persisted
-    /// into the correct topic-scoped history instead of default.jsonl.
-    pub fn with_topic(mut self, topic: Option<String>) -> Self {
-        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic;
+    /// Set the default topic context for topic-scoped API sessions.
+    pub fn with_topic(self, topic: Option<impl Into<String>>) -> Self {
+        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic.map(Into::into);
         self
     }
 
@@ -142,6 +116,8 @@ struct Input {
     /// file events so the web client can link delivered files to their source message.
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[async_trait]
@@ -205,7 +181,7 @@ impl Tool for SendFileTool {
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
         // /tmp/ is always allowed since skills commonly write output there.
-        let path = if let Some(ref base_dir) = self.base_dir {
+        if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
@@ -214,7 +190,7 @@ impl Tool for SendFileTool {
                 .iter()
                 .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
                 .collect();
-            match canonicalize_with_retry(&path).await {
+            match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
                         || canonical_path.starts_with(&tmp_dir)
@@ -231,7 +207,6 @@ impl Tool for SendFileTool {
                             ..Default::default()
                         });
                     }
-                    canonical_path
                 }
                 Err(_) => {
                     // Path can't be canonicalized (broken symlink, non-existent, etc.).
@@ -243,9 +218,7 @@ impl Tool for SendFileTool {
                     });
                 }
             }
-        } else {
-            path
-        };
+        }
 
         // Validate file exists
         if !path.exists() {
@@ -274,24 +247,18 @@ impl Tool for SendFileTool {
             });
         }
 
-        let default_channel = self
-            .default_channel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let default_chat_id = self
-            .default_chat_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let default_topic = self
-            .default_topic
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-
-        let channel = input.channel.unwrap_or_else(|| default_channel.clone());
-        let chat_id = input.chat_id.unwrap_or_else(|| default_chat_id.clone());
+        let channel = input.channel.unwrap_or_else(|| {
+            self.default_channel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        let chat_id = input.chat_id.unwrap_or_else(|| {
+            self.default_chat_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok(ToolResult {
@@ -308,10 +275,14 @@ impl Tool for SendFileTool {
                 serde_json::Value::String(tc_id.clone()),
             );
         }
-        if channel == default_channel && chat_id == default_chat_id {
-            if let Some(topic) = default_topic.filter(|value| !value.trim().is_empty()) {
-                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
-            }
+        let topic = input.topic.or_else(|| {
+            self.default_topic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        if let Some(topic) = topic {
+            metadata.insert("topic".to_string(), serde_json::Value::String(topic));
         }
 
         let msg = OutboundMessage {
@@ -549,72 +520,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_base_dir_waits_briefly_for_generated_file_to_appear() {
-        let base = tempfile::tempdir().unwrap();
-        let deck = base.path().join("output").join("deck.pptx");
-        let deck_for_writer = deck.clone();
-
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(25)).await;
-            std::fs::create_dir_all(deck_for_writer.parent().unwrap()).unwrap();
-            std::fs::write(&deck_for_writer, "pptx data").unwrap();
-        });
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "file_path": deck.to_string_lossy().to_string()
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success, "expected delayed file delivery to succeed");
-        let msg = rx.recv().await.unwrap();
-        let canonical_deck = std::fs::canonicalize(&deck).unwrap();
-        assert_eq!(
-            msg.media,
-            vec![canonical_deck.to_string_lossy().to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_base_dir_waits_for_slow_generated_file_to_appear() {
-        let base = tempfile::tempdir().unwrap();
-        let deck = base.path().join("output").join("deck.pptx");
-        let deck_for_writer = deck.clone();
-
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(900)).await;
-            std::fs::create_dir_all(deck_for_writer.parent().unwrap()).unwrap();
-            std::fs::write(&deck_for_writer, "pptx data").unwrap();
-        });
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "file_path": deck.to_string_lossy().to_string()
-            }))
-            .await
-            .unwrap();
-
-        assert!(
-            result.success,
-            "expected slow delayed file delivery to succeed: {}",
-            result.output
-        );
-        let msg = rx.recv().await.unwrap();
-        let canonical_deck = std::fs::canonicalize(&deck).unwrap();
-        assert_eq!(
-            msg.media,
-            vec![canonical_deck.to_string_lossy().to_string()]
-        );
-    }
-
-    #[tokio::test]
     async fn test_base_dir_resolves_relative_path() {
         // Relative paths should be resolved against base_dir, not OS cwd
         let base = tempfile::tempdir().unwrap();
@@ -692,31 +597,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_include_topic_metadata_for_default_api_context() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let tool =
-            SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo".into()));
-
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "deck").unwrap();
-        let path = tmp.path().to_string_lossy().to_string();
-
-        let result = tool
-            .execute(&serde_json::json!({
-                "file_path": path,
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        let msg = rx.recv().await.unwrap();
-        assert_eq!(
-            msg.metadata.get("topic").and_then(|v| v.as_str()),
-            Some("slides demo"),
-        );
-    }
-
-    #[tokio::test]
     async fn should_omit_tool_call_id_from_metadata_when_absent() {
         let (tx, mut rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "api", "sess-1");
@@ -733,6 +613,31 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_include_default_topic_in_metadata_when_configured() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo"));
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "pptx data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "caption": "deck"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("topic").and_then(|v| v.as_str()),
+            Some("slides demo"),
+        );
     }
 
     #[test]

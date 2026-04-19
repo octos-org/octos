@@ -12,6 +12,7 @@
 //! the next one is attempted. Perplexity is last because it costs the most but
 //! gives the best answers (AI-synthesized with citations).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ use super::{Tool, ToolResult};
 pub struct WebSearchTool {
     client: Client,
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
+    provider_keys: HashMap<String, String>,
 }
 
 impl WebSearchTool {
@@ -38,12 +40,25 @@ impl WebSearchTool {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             config: None,
+            provider_keys: HashMap::new(),
         }
     }
 
     pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
         self.config = Some(config);
         self
+    }
+
+    pub fn with_provider_keys(mut self, provider_keys: HashMap<String, String>) -> Self {
+        self.provider_keys = provider_keys;
+        self
+    }
+
+    fn provider_key(&self, provider_id: &str, env_var: &str) -> Option<String> {
+        self.provider_keys
+            .get(provider_id)
+            .cloned()
+            .or_else(|| std::env::var(env_var).ok())
     }
 }
 
@@ -201,7 +216,7 @@ impl Tool for WebSearchTool {
         // 6. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
 
         // Tavily (AI-optimized search — best for recent/niche topics)
-        if let Ok(api_key) = std::env::var("TAVILY_API_KEY") {
+        if let Some(api_key) = self.provider_key("tavily", "TAVILY_API_KEY") {
             let result = self.tavily_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
@@ -232,7 +247,7 @@ impl Tool for WebSearchTool {
         }
 
         // Brave Search
-        if let Ok(api_key) = std::env::var("BRAVE_API_KEY") {
+        if let Some(api_key) = self.provider_key("brave", "BRAVE_API_KEY") {
             let result = self.brave_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
@@ -243,7 +258,7 @@ impl Tool for WebSearchTool {
         }
 
         // You.com
-        if let Ok(api_key) = std::env::var("YDC_API_KEY") {
+        if let Some(api_key) = self.provider_key("you", "YDC_API_KEY") {
             let result = self.you_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
@@ -254,7 +269,7 @@ impl Tool for WebSearchTool {
         }
 
         // Perplexity Sonar as last resort (AI-synthesized, costs money)
-        if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
+        if let Some(api_key) = self.provider_key("perplexity", "PERPLEXITY_API_KEY") {
             info!(provider = "perplexity", query = %input.query, "web search");
             return self.perplexity_search(&input.query, &api_key).await;
         }
