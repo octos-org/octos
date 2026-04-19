@@ -49,25 +49,45 @@ mod tests {
         let workflow = build();
         assert_eq!(workflow.kind, WorkflowKind::Slides);
         assert_eq!(workflow.current_phase.as_str(), "design");
-        assert_eq!(workflow.terminal_output.required_artifact_kind, "presentation");
+        assert_eq!(
+            workflow.terminal_output.required_artifact_kind,
+            "presentation"
+        );
         assert!(workflow.terminal_output.deliver_final_artifact_only);
         assert!(!workflow.terminal_output.deliver_media_only);
         assert!(workflow.terminal_output.forbid_intermediate_files);
-        assert!(workflow.allowed_tools.iter().any(|tool| tool == "mofa_slides"));
-        assert!(workflow
-            .allowed_tools
-            .iter()
-            .any(|tool| tool == "check_workspace_contract"));
+        assert!(
+            workflow
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "mofa_slides")
+        );
+        assert!(
+            workflow
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "check_workspace_contract")
+        );
     }
 
     #[test]
     fn slides_workspace_policy_is_standardized() {
         let policy = workspace_policy();
-        assert_eq!(policy.workspace.kind, octos_agent::WorkspacePolicyKind::Slides);
-        assert!(policy.validation.on_turn_end.contains(&"file_exists:script.js".to_string()));
-        assert!(policy
-            .validation
-            .on_completion
-            .contains(&"file_exists:output/*.pptx".to_string()));
+        assert_eq!(
+            policy.workspace.kind,
+            octos_agent::WorkspacePolicyKind::Slides
+        );
+        assert!(
+            policy
+                .validation
+                .on_turn_end
+                .contains(&"file_exists:script.js".to_string())
+        );
+        assert!(
+            policy
+                .validation
+                .on_completion
+                .contains(&"file_exists:output/*.pptx".to_string())
+        );
     }
 }

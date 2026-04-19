@@ -166,6 +166,7 @@ where
 
 /// Partial profile config update from the admin/self-service API.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfigPatch {
     #[serde(default)]
     pub llm: PatchField<LlmProfileConfig>,
@@ -194,6 +195,7 @@ pub struct ProfileConfigPatch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewaySettingsPatch {
     #[serde(default)]
     pub max_history: PatchField<usize>,
@@ -351,11 +353,13 @@ impl ProfileConfig {
     }
 
     pub fn primary_provider(&self) -> Option<&str> {
-        self.primary_llm().and_then(|selection| selection.family_id.as_deref())
+        self.primary_llm()
+            .and_then(|selection| selection.family_id.as_deref())
     }
 
     pub fn primary_model(&self) -> Option<&str> {
-        self.primary_llm().and_then(|selection| selection.model_id.as_deref())
+        self.primary_llm()
+            .and_then(|selection| selection.model_id.as_deref())
     }
 
     pub fn apply_patch(&mut self, patch: ProfileConfigPatch) {
@@ -424,7 +428,11 @@ impl ProfileConfig {
             return;
         };
 
-        if llm.primary.as_ref().is_some_and(LlmModelSelectionConfig::is_empty) {
+        if llm
+            .primary
+            .as_ref()
+            .is_some_and(LlmModelSelectionConfig::is_empty)
+        {
             llm.primary = None;
         }
         llm.fallbacks.retain(|selection| !selection.is_empty());
@@ -1091,7 +1099,11 @@ pub(crate) fn config_from_profile(
     let mut normalized = profile.clone();
     normalized.config.normalize_llm_contract();
     let profile = &normalized;
-    let primary = profile.config.llm.as_ref().and_then(|llm| llm.primary.as_ref());
+    let primary = profile
+        .config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref());
 
     let channels: Vec<ChannelEntry> = profile
         .config
@@ -1127,7 +1139,10 @@ pub(crate) fn config_from_profile(
             provider: fb.family_id.clone().unwrap_or_default(),
             model: fb.model_id.clone(),
             base_url: fb.route.as_ref().and_then(|route| route.base_url.clone()),
-            api_key_env: fb.route.as_ref().and_then(|route| route.api_key_env.clone()),
+            api_key_env: fb
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.clone()),
             model_hints: fb.model_hints.clone(),
             api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
@@ -1383,7 +1398,7 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: llm, channels, env_vars.
+/// Restart-required: llm, search, deep_crawl, apps, channels, env_vars.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1398,6 +1413,15 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
 
     if oc.llm != nc.llm {
         restart_fields.push("llm".into());
+    }
+    if oc.search != nc.search {
+        restart_fields.push("search".into());
+    }
+    if oc.deep_crawl != nc.deep_crawl {
+        restart_fields.push("deep_crawl".into());
+    }
+    if oc.apps != nc.apps {
+        restart_fields.push("apps".into());
     }
     if oc.channels != nc.channels {
         restart_fields.push("channels".into());
@@ -2125,6 +2149,72 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_profiles_structured_sections_require_restart() {
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                search: Some(SearchConfig {
+                    providers: [(
+                        "tavily".into(),
+                        SearchProviderConfig {
+                            api_key_env: Some("TAVILY_PARENT".into()),
+                        },
+                    )]
+                    .into(),
+                }),
+                deep_crawl: Some(DeepCrawlConfig {
+                    page_settle_ms: Some(1500),
+                    max_output_chars: Some(32_000),
+                }),
+                apps: Some(AppsConfig {
+                    slides: Some(SlidesAppConfig {
+                        template_dir: Some("/opt/octos/slides".into()),
+                        default_theme: Some("crew".into()),
+                    }),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.search = Some(SearchConfig {
+            providers: [(
+                "tavily".into(),
+                SearchProviderConfig {
+                    api_key_env: Some("TAVILY_CHILD".into()),
+                },
+            )]
+            .into(),
+        });
+        changed.config.deep_crawl = Some(DeepCrawlConfig {
+            page_settle_ms: Some(2500),
+            max_output_chars: Some(48_000),
+        });
+        changed.config.apps = Some(AppsConfig {
+            slides: Some(SlidesAppConfig {
+                template_dir: Some("/srv/slides".into()),
+                default_theme: Some("ocean".into()),
+            }),
+        });
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(fields.contains(&"search".into()));
+                assert!(fields.contains(&"deep_crawl".into()));
+                assert!(fields.contains(&"apps".into()));
+            }
+            other => panic!("expected RestartRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_diff_profiles_unchanged() {
         let base = UserProfile {
             id: "diff-test".into(),
@@ -2325,7 +2415,12 @@ mod tests {
                         Some("OPENAI_API_KEY"),
                         Some("https://custom.api.com/v1"),
                     ),
-                    vec![llm_selection("anthropic", "claude-sonnet-4-20250514", None, None)],
+                    vec![llm_selection(
+                        "anthropic",
+                        "claude-sonnet-4-20250514",
+                        None,
+                        None,
+                    )],
                 )),
                 env_vars: [
                     ("OPENAI_API_KEY".into(), "sk-parent-key".into()),
@@ -2382,11 +2477,7 @@ mod tests {
             Some("https://custom.api.com/v1")
         );
         assert_eq!(
-            effective
-                .config
-                .llm
-                .as_ref()
-                .map(|llm| llm.fallbacks.len()),
+            effective.config.llm.as_ref().map(|llm| llm.fallbacks.len()),
             Some(1)
         );
 
@@ -2553,6 +2644,30 @@ mod tests {
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 6);
+    }
+
+    #[test]
+    fn test_profile_config_patch_rejects_unknown_root_field() {
+        let err = serde_json::from_value::<ProfileConfigPatch>(serde_json::json!({
+            "gateway": { "max_history": 100 },
+            "bogus": true
+        }))
+        .expect_err("unknown root field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `bogus`"));
+    }
+
+    #[test]
+    fn test_profile_config_patch_rejects_unknown_gateway_field() {
+        let err = serde_json::from_value::<ProfileConfigPatch>(serde_json::json!({
+            "gateway": {
+                "max_history": 100,
+                "bogus": true
+            }
+        }))
+        .expect_err("unknown gateway field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `bogus`"));
     }
 
     // ── Keychain marker tests ──────────────────────────────────────────

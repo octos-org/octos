@@ -15,6 +15,7 @@ pub struct SendFileTool {
     out_tx: mpsc::Sender<OutboundMessage>,
     default_channel: std::sync::Mutex<String>,
     default_chat_id: std::sync::Mutex<String>,
+    default_topic: std::sync::Mutex<Option<String>>,
     /// Base directory for path resolution and validation. Relative paths are
     /// resolved against this directory. File paths must resolve under this
     /// directory (prevents exfiltrating files from other profiles).
@@ -48,6 +49,7 @@ impl SendFileTool {
             out_tx,
             default_channel: std::sync::Mutex::new(String::new()),
             default_chat_id: std::sync::Mutex::new(String::new()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
@@ -63,9 +65,16 @@ impl SendFileTool {
             out_tx,
             default_channel: std::sync::Mutex::new(channel.into()),
             default_chat_id: std::sync::Mutex::new(chat_id.into()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
+    }
+
+    /// Set the default topic context for topic-scoped API sessions.
+    pub fn with_topic(self, topic: Option<impl Into<String>>) -> Self {
+        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic.map(Into::into);
+        self
     }
 
     /// Set the base directory for file path resolution and validation.
@@ -107,6 +116,8 @@ struct Input {
     /// file events so the web client can link delivered files to their source message.
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[async_trait]
@@ -263,6 +274,15 @@ impl Tool for SendFileTool {
                 "tool_call_id".to_string(),
                 serde_json::Value::String(tc_id.clone()),
             );
+        }
+        let topic = input.topic.or_else(|| {
+            self.default_topic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+        if let Some(topic) = topic {
+            metadata.insert("topic".to_string(), serde_json::Value::String(topic));
         }
 
         let msg = OutboundMessage {
@@ -593,6 +613,31 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_include_default_topic_in_metadata_when_configured() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo"));
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "pptx data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "caption": "deck"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("topic").and_then(|v| v.as_str()),
+            Some("slides demo"),
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
-use crate::profiles::{SearchConfig, UserProfile};
+use crate::profiles::UserProfile;
 use crate::qos_catalog::{
     load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
 };
@@ -61,13 +61,39 @@ fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
     }
 }
 
-fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
-    let mut env = Vec::new();
+fn profile_search_provider_keys(profile: &UserProfile) -> HashMap<String, String> {
     let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+    profile
+        .config
+        .search
+        .as_ref()
+        .map(|search| {
+            search
+                .providers
+                .iter()
+                .filter_map(|(provider_id, provider)| {
+                    let source_key = provider.api_key_env.as_deref()?;
+                    let secret = resolved_env_vars
+                        .get(source_key)
+                        .cloned()
+                        .or_else(|| std::env::var(source_key).ok())?;
+                    Some((provider_id.clone(), secret))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    if let Some(search) = profile.config.search.as_ref() {
-        env.extend(search_provider_bindings(search, &resolved_env_vars));
-    }
+fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = profile_search_provider_keys(profile)
+        .into_iter()
+        .filter_map(|(provider_id, secret)| {
+            Some((
+                canonical_search_env(provider_id.as_str())?.to_string(),
+                secret,
+            ))
+        })
+        .collect();
 
     if let Some(slides) = profile
         .config
@@ -86,54 +112,10 @@ fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
     env
 }
 
-fn search_provider_bindings(
-    search: &SearchConfig,
-    resolved_env_vars: &std::collections::HashMap<String, String>,
-) -> Vec<(String, String)> {
-    search
-        .providers
-        .iter()
-        .filter_map(|(provider_id, provider)| {
-            let canonical_key = canonical_search_env(provider_id.as_str())?;
-            let source_key = provider.api_key_env.as_deref()?;
-            let secret = resolved_env_vars
-                .get(source_key)
-                .cloned()
-                .or_else(|| std::env::var(source_key).ok())?;
-            Some((canonical_key.to_string(), secret))
-        })
-        .collect()
-}
-
 async fn apply_profile_runtime_contracts(
     profile: &UserProfile,
     tool_config: &octos_agent::ToolConfigStore,
 ) -> Result<()> {
-    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
-
-    #[allow(unsafe_code)]
-    unsafe {
-        if let Some(search) = profile.config.search.as_ref() {
-            for (key, value) in search_provider_bindings(search, &resolved_env_vars) {
-                std::env::set_var(key, value);
-            }
-        }
-
-        if let Some(slides) = profile
-            .config
-            .apps
-            .as_ref()
-            .and_then(|apps| apps.slides.as_ref())
-        {
-            if let Some(template_dir) = slides.template_dir.as_ref() {
-                std::env::set_var("PPT_TEMPLATE_DIR", template_dir);
-            }
-            if let Some(default_theme) = slides.default_theme.as_ref() {
-                std::env::set_var("PPT_DEFAULT_THEME", default_theme);
-            }
-        }
-    }
-
     if let Some(deep_crawl) = profile.config.deep_crawl.as_ref() {
         match deep_crawl.page_settle_ms {
             Some(value) => {
@@ -227,7 +209,10 @@ impl GatewayRuntime {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
         let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        #[cfg(feature = "api")]
         let metrics_handle = Some(crate::api::init_metrics());
+        #[cfg(not(feature = "api"))]
+        let metrics_handle: Option<()> = None;
 
         let mut profile_id: Option<String> = None;
         let mut resolved_profile: Option<UserProfile> = None;
@@ -609,6 +594,10 @@ impl GatewayRuntime {
                 .await
                 .wrap_err("failed to open tool config store")?,
         );
+        let profile_search_keys = resolved_profile
+            .as_ref()
+            .map(profile_search_provider_keys)
+            .unwrap_or_default();
         if let Some(profile) = resolved_profile.as_ref() {
             apply_profile_runtime_contracts(profile, &tool_config)
                 .await
@@ -671,6 +660,13 @@ impl GatewayRuntime {
             let sandbox = octos_agent::create_sandbox(&sandbox_config);
             tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
             tools.inject_tool_config(tool_config.clone());
+            if !profile_search_keys.is_empty() {
+                tools.register(
+                    octos_agent::WebSearchTool::new()
+                        .with_config(tool_config.clone())
+                        .with_provider_keys(profile_search_keys.clone()),
+                );
+            }
 
             // Override browser tool with configured timeout (replaces default 300s)
             if let Some(secs) = gw_config.browser_timeout_secs {
@@ -1234,7 +1230,10 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),
+                #[cfg(not(feature = "api"))]
+                metrics_handle,
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),

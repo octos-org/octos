@@ -203,11 +203,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("sites/news");
         std::fs::create_dir_all(&repo_root).unwrap();
-        write_workspace_policy(
-            &repo_root,
-            &WorkspacePolicy::for_site_build_output("out"),
-        )
-        .unwrap();
+        write_workspace_policy(&repo_root, &WorkspacePolicy::for_site_build_output("out")).unwrap();
         write_file(repo_root.join("mofa-site-session.json"), "{}");
         write_file(repo_root.join("site-plan.json"), "{}");
         write_file(repo_root.join("optimized-prompt.md"), "# prompt");
@@ -224,7 +220,13 @@ mod tests {
         assert_eq!(payload["ready_count"], 1);
         assert_eq!(payload["contracts"][0]["repo_label"], "sites/news");
         assert_eq!(payload["contracts"][0]["ready"], true);
-        assert_eq!(payload["contracts"][0]["artifacts"][0]["name"], "entrypoint");
-        assert_eq!(payload["contracts"][0]["artifacts"][0]["pattern"], "out/index.html");
+        assert_eq!(
+            payload["contracts"][0]["artifacts"][0]["name"],
+            "entrypoint"
+        );
+        assert_eq!(
+            payload["contracts"][0]["artifacts"][0]["pattern"],
+            "out/index.html"
+        );
     }
 }

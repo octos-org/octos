@@ -158,6 +158,7 @@ pub async fn api_chat_proxy(
     topic: Option<&str>,
     media: &[String],
     attach_only: bool,
+    stream: bool,
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
@@ -196,20 +197,108 @@ pub async fn api_chat_proxy(
         );
     }
 
-    // Stream the SSE response body directly back to the client
-    let stream = resp.bytes_stream();
-    match Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(stream))
-    {
-        Ok(r) => r,
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("failed to build SSE response: {e}"),
+    if stream {
+        let stream = resp.bytes_stream();
+        return match Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(stream))
+        {
+            Ok(r) => r,
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to build SSE response: {e}"),
+            ),
+        };
+    }
+
+    match resp.bytes().await {
+        Ok(body) => match parse_sync_chat_response_from_sse(&body) {
+            Ok(payload) => (StatusCode::OK, axum::Json(payload)).into_response(),
+            Err(error) => json_error(StatusCode::BAD_GATEWAY, &error),
+        },
+        Err(error) => json_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("failed to read gateway SSE response: {error}"),
         ),
     }
+}
+
+fn parse_sync_chat_response_from_sse(body: &[u8]) -> Result<serde_json::Value, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|error| format!("gateway SSE response was not valid UTF-8: {error}"))?;
+
+    let mut content = String::new();
+    let mut saw_done = false;
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
+
+    for frame in text.split("\n\n") {
+        for line in frame.lines() {
+            let data = if let Some(raw) = line.strip_prefix("data:") {
+                raw.trim()
+            } else if let Some(raw) = line.strip_prefix("data: ") {
+                raw.trim()
+            } else {
+                continue;
+            };
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+
+            let event: serde_json::Value = serde_json::from_str(data)
+                .map_err(|error| format!("failed to parse gateway SSE event: {error}"))?;
+            match event.get("type").and_then(|value| value.as_str()) {
+                Some("token") => {
+                    if let Some(text) = event.get("text").and_then(|value| value.as_str()) {
+                        content.push_str(text);
+                    }
+                }
+                Some("replace") => {
+                    if let Some(text) = event.get("text").and_then(|value| value.as_str()) {
+                        content = text.to_string();
+                    }
+                }
+                Some("done") => {
+                    saw_done = true;
+                    if let Some(text) = event.get("content").and_then(|value| value.as_str()) {
+                        if !text.is_empty() {
+                            content = text.to_string();
+                        }
+                    }
+                    input_tokens = event
+                        .get("tokens_in")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0);
+                    output_tokens = event
+                        .get("tokens_out")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0);
+                }
+                Some("error") => {
+                    let message = event
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("gateway SSE returned an error event");
+                    return Err(message.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !saw_done {
+        return Err("gateway SSE response ended without a done event".to_string());
+    }
+
+    Ok(serde_json::json!({
+        "content": content,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }))
 }
 
 /// Proxy a GET request to the gateway's API channel.
@@ -295,4 +384,49 @@ pub async fn api_delete_proxy(state: &AppState, port: u16, path: &str) -> Respon
 fn json_error(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({"error": message});
     (status, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sync_chat_response_from_sse;
+
+    #[test]
+    fn parse_sync_chat_response_from_sse_uses_done_metadata() {
+        let body = br#"data: {"type":"thinking","iteration":0}
+
+data: {"type":"replace","text":"partial"}
+
+data: {"type":"done","content":"final answer","tokens_in":12,"tokens_out":34}
+
+"#;
+
+        let parsed = parse_sync_chat_response_from_sse(body).unwrap();
+        assert_eq!(parsed["content"], "final answer");
+        assert_eq!(parsed["input_tokens"], 12);
+        assert_eq!(parsed["output_tokens"], 34);
+    }
+
+    #[test]
+    fn parse_sync_chat_response_from_sse_falls_back_to_streamed_content() {
+        let body = br#"data: {"type":"token","text":"hel"}
+
+data: {"type":"token","text":"lo"}
+
+data: {"type":"done","content":"","tokens_in":1,"tokens_out":2}
+
+"#;
+
+        let parsed = parse_sync_chat_response_from_sse(body).unwrap();
+        assert_eq!(parsed["content"], "hello");
+    }
+
+    #[test]
+    fn parse_sync_chat_response_from_sse_errors_without_done() {
+        let body = br#"data: {"type":"replace","text":"partial only"}
+
+"#;
+
+        let error = parse_sync_chat_response_from_sse(body).unwrap_err();
+        assert!(error.contains("done event"));
+    }
 }

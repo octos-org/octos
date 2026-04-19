@@ -40,8 +40,11 @@ test.describe('Phase 3 coding hard cases', () => {
     const marker = `phase3-${Date.now()}`;
     const prompt = [
       'Use shell tool only.',
-      `Create a temporary git repo at /tmp/${marker}.`,
+      'If shell is not already active, activate it first.',
+      `Create a temporary git repo inside the current workspace at ./${marker}.`,
+      'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
+      'Run git add notes.txt so the file is tracked before editing it.',
       'Make exactly one edit: change beta to gamma.',
       'Then run git diff -- notes.txt.',
       'Return only the unified diff, nothing else.',

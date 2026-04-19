@@ -3,6 +3,7 @@
 //! Saves each crawled page as a markdown file under `.octos/research/<query-slug>/`.
 //! Returns a concise index so the LLM can selectively read files for synthesis.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -32,6 +33,11 @@ impl DeepSearchTool {
                 .unwrap_or_else(|_| Client::new()),
             research_base: research_base.into(),
         }
+    }
+
+    pub fn with_provider_keys(mut self, provider_keys: HashMap<String, String>) -> Self {
+        self.search = self.search.with_provider_keys(provider_keys);
+        self
     }
 
     /// Directory where research results are saved.

@@ -1,7 +1,7 @@
 //! API request handlers.
 
-use std::convert::Infallible;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -189,6 +189,7 @@ pub async fn chat(
             req.topic.as_deref(),
             &req.media,
             req.attach_only,
+            req.stream,
         )
         .await;
     }
@@ -679,9 +680,12 @@ pub async fn session_event_stream(
         "topic": params.topic,
     })
     .to_string();
-    let stream =
-        futures::stream::iter(vec![Ok::<Event, Infallible>(Event::default().data(replay_complete))]);
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
+        Event::default().data(replay_complete),
+    )]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.

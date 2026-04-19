@@ -205,6 +205,7 @@ async fn send_outbound_with_timeout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
@@ -441,7 +442,7 @@ async fn persist_child_session_lifecycle(
                 let _ = parent.upsert_child_contract(contract).await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
-            return Ok(parent_exists);
+            Ok(parent_exists)
         }
         ChildSessionLifecycleKind::Completed
         | ChildSessionLifecycleKind::RetryableFailed
@@ -504,7 +505,7 @@ async fn persist_child_session_lifecycle(
                     "orphaned"
                 },
             );
-            return Ok(matches!(join_state, ChildSessionJoinState::Joined));
+            Ok(matches!(join_state, ChildSessionJoinState::Joined))
         }
     }
 }
@@ -777,6 +778,11 @@ fn merge_optional_text(existing: Option<String>, incoming: Option<String>) -> Op
         (None, Some(incoming)) => Some(incoming),
         (None, None) => None,
     }
+}
+
+fn topic_requires_serial_delivery(topic: Option<&str>) -> bool {
+    topic.is_some_and(|value| value.starts_with("slides"))
+        || topic.is_some_and(|value| value == "site" || value.starts_with("site "))
 }
 
 async fn snapshot_workspace_turn_for_path(
@@ -1441,6 +1447,7 @@ impl ActorFactory {
         // write_file/read_file) so the LLM can write+send in one flow.
         // data_dir is an extra allowed directory for pipeline-generated files.
         let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
+            .with_topic(session_key.topic().map(str::to_string))
             .with_base_dir(&user_workspace)
             .with_extra_allowed_dir(&self.data_dir);
 
@@ -2017,11 +2024,15 @@ impl SessionActor {
                             let final_attachment_media =
                                 self.copy_media_to_workspace(final_attachment_media);
 
-                            // Use speculative path for API channel (web client) and
-                            // Speculative queue mode. The speculative path spawns the
-                            // agent call and handles overflow messages concurrently,
-                            // so users aren't blocked during long tool calls (pipelines).
-                            if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
+                            // Most API sessions use speculative overflow so the web
+                            // client stays responsive during long tool calls. Contract-
+                            // owned slides/site sessions are the exception: allowing
+                            // overflow there can replay artifact-producing turns and
+                            // duplicate final deliveries, so keep those serialized.
+                            if !topic_requires_serial_delivery(self.session_key.topic())
+                                && (self.queue_mode == QueueMode::Speculative
+                                    || self.channel == "api")
+                            {
                                 self.process_inbound_speculative(
                                     final_message,
                                     final_media,
@@ -4785,6 +4796,17 @@ mod tests {
         assert_eq!(tasks[0]["child_terminal_state"], "completed");
         assert_eq!(tasks[0]["child_join_state"], "joined");
         assert!(tasks[0]["child_failure_action"].is_null());
+    }
+
+    #[test]
+    fn contract_owned_topics_require_serial_delivery() {
+        assert!(topic_requires_serial_delivery(Some(
+            "slides browser-acceptance"
+        )));
+        assert!(topic_requires_serial_delivery(Some("site")));
+        assert!(topic_requires_serial_delivery(Some("site astro-demo")));
+        assert!(!topic_requires_serial_delivery(Some("research")));
+        assert!(!topic_requires_serial_delivery(None));
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────

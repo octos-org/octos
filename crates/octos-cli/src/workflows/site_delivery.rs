@@ -65,10 +65,12 @@ mod tests {
         assert!(workflow.terminal_output.deliver_final_artifact_only);
         assert!(!workflow.terminal_output.deliver_media_only);
         assert!(workflow.terminal_output.forbid_intermediate_files);
-        assert!(workflow
-            .allowed_tools
-            .iter()
-            .any(|tool| tool == "check_workspace_contract"));
+        assert!(
+            workflow
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "check_workspace_contract")
+        );
     }
 
     #[test]
@@ -103,7 +105,11 @@ mod tests {
             vec!["file_exists:out/index.html"]
         );
         assert_eq!(
-            policy.artifacts.entries.get("entrypoint").map(String::as_str),
+            policy
+                .artifacts
+                .entries
+                .get("entrypoint")
+                .map(String::as_str),
             Some("out/index.html")
         );
     }
