@@ -480,9 +480,7 @@ impl ProcessManager {
                                     if let Ok(Some(profile)) = ps2.get(&pid2) {
                                         // Don't restart if no provider is configured — it will
                                         // just crash-loop endlessly.
-                                        if profile.config.provider.is_none()
-                                            && profile.config.model.is_none()
-                                        {
+                                        if !profile.config.has_llm_selection() {
                                             tracing::warn!(
                                                 profile = %pid2,
                                                 "skipping auto-restart: no LLM provider configured"

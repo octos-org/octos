@@ -12,7 +12,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
+use crate::profiles::{ProfileConfig, ProfileConfigPatch, UserProfile, mask_secrets};
 
 /// Basic email format validation.
 pub(crate) fn validate_email(email: &str) -> Result<(), String> {
@@ -53,7 +53,7 @@ pub struct UpdateProfileRequest {
     #[serde(default)]
     pub data_dir: Option<Option<String>>,
     #[serde(default)]
-    pub config: Option<ProfileConfig>,
+    pub config: Option<ProfileConfigPatch>,
     /// Set or update the email address for OTP login.
     #[serde(default)]
     pub email: Option<String>,
@@ -336,22 +336,8 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    // Merge config: parse the raw JSON "config" object and overlay only the
-    // keys that are explicitly present, preserving all other existing fields.
-    // This lets the admin tool send `{"config":{"model":"x"}}` without wiping
-    // channels/env_vars, while the dashboard can still send a full config object.
-    {
-        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        if let Some(config_patch) = raw.get("config") {
-            if config_patch.is_object() {
-                let mut existing =
-                    serde_json::to_value(&profile.config).unwrap_or(serde_json::json!({}));
-                json_merge(&mut existing, config_patch);
-                if let Ok(merged) = serde_json::from_value(existing) {
-                    profile.config = merged;
-                }
-            }
-        }
+    if let Some(config) = req.config {
+        profile.config.apply_patch(config);
     }
     profile.updated_at = Utc::now();
 
@@ -490,7 +476,7 @@ pub async fn start_gateway(
     // Validate LLM provider is configured (resolve inheritance for sub-accounts)
     let effective = crate::profiles::resolve_effective_profile(store, &profile)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if effective.config.provider.is_none() && effective.config.model.is_none() {
+    if !effective.config.has_llm_selection() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Cannot start: LLM provider must be configured first".into(),
@@ -842,23 +828,6 @@ async fn fetch_provider_models(
         ids.sort();
         ids
     })
-}
-
-/// Recursively merge `patch` into `target` (RFC 7396 JSON Merge Patch).
-/// Only keys present in `patch` are overwritten; absent keys are preserved.
-fn json_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if let (Some(target_obj), Some(patch_obj)) = (target.as_object_mut(), patch.as_object()) {
-        for (key, value) in patch_obj {
-            if value.is_object() && target_obj.get(key).is_some_and(|v| v.is_object()) {
-                // Recursively merge nested objects (e.g. gateway settings)
-                json_merge(target_obj.get_mut(key).unwrap(), value);
-            } else {
-                target_obj.insert(key.clone(), value.clone());
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
 }
 
 /// Resolve an API key from the user's saved profile by env var name.
@@ -4198,6 +4167,83 @@ mod register_flow_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_profile_request_deserializes_typed_config_sections() {
+        let req: UpdateProfileRequest = serde_json::from_value(serde_json::json!({
+            "name": "DSP Fac",
+            "config": {
+                "gateway": {
+                    "max_history": 128
+                },
+                "search": {
+                    "providers": {
+                        "tavily": {
+                            "api_key_env": "TAVILY_API_KEY"
+                        }
+                    }
+                },
+                "deep_crawl": {
+                    "page_settle_ms": 1500,
+                    "max_output_chars": 32000
+                },
+                "apps": {
+                    "slides": {
+                        "template_dir": "/srv/slides",
+                        "default_theme": "crew"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let config = req.config.expect("config patch");
+        assert_eq!(
+            config.gateway.map(|gateway| gateway.max_history),
+            Some(crate::profiles::PatchField::Value(128))
+        );
+        assert_eq!(
+            config
+                .search
+                .clone()
+                .into_value()
+                .and_then(|search| search.providers.get("tavily").cloned())
+                .and_then(|provider| provider.api_key_env),
+            Some("TAVILY_API_KEY".to_string())
+        );
+        assert_eq!(
+            config
+                .deep_crawl
+                .clone()
+                .into_value()
+                .and_then(|cfg| cfg.page_settle_ms),
+            Some(1500)
+        );
+        assert_eq!(
+            config
+                .apps
+                .clone()
+                .into_value()
+                .and_then(|apps| apps.slides)
+                .and_then(|slides| slides.default_theme),
+            Some("crew".to_string())
+        );
+    }
+
+    #[test]
+    fn update_profile_request_preserves_explicit_section_clear() {
+        let req: UpdateProfileRequest = serde_json::from_value(serde_json::json!({
+            "config": {
+                "llm": null,
+                "search": null
+            }
+        }))
+        .unwrap();
+
+        let config = req.config.expect("config patch");
+        assert!(matches!(config.llm, crate::profiles::PatchField::Clear));
+        assert!(matches!(config.search, crate::profiles::PatchField::Clear));
+    }
 
     #[test]
     fn shell_request_deserialize_minimal() {

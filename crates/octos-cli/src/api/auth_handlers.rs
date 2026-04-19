@@ -73,10 +73,7 @@ fn is_local_request_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn resolve_routed_profile_id_candidate(
-    state: &AppState,
-    candidate: &str,
-) -> Option<String> {
+fn resolve_routed_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
     let candidate = candidate.trim();
     if candidate.is_empty()
         || matches!(
@@ -890,7 +887,7 @@ pub async fn update_my_profile(
         profile.enabled = enabled;
     }
     if let Some(config) = req.config {
-        profile.config = config;
+        profile.config.apply_patch(config);
     }
     profile.updated_at = chrono::Utc::now();
 
@@ -1229,7 +1226,7 @@ pub async fn start_my_gateway(
     let profile = resolve_my_profile(&identity, ps)?;
 
     // Validate LLM provider is configured
-    if profile.config.provider.is_none() && profile.config.model.is_none() {
+    if !profile.config.has_llm_selection() {
         return Ok(Json(ActionResponse {
             ok: false,
             message: Some("Cannot start: LLM provider must be configured first".into()),
@@ -1532,8 +1529,7 @@ pub async fn create_my_sub_account(
     if let Some(email) = &req.email {
         let email = email.trim().to_lowercase();
         if !email.is_empty() {
-            super::admin::validate_email(&email)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             if let Some(user_store) = state.user_store.as_ref() {
                 if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
                     return Err((
@@ -1617,7 +1613,7 @@ pub async fn update_my_sub_account(
         sub.enabled = enabled;
     }
     if let Some(config) = req.config {
-        sub.config = config;
+        sub.config.apply_patch(config);
     }
     sub.updated_at = chrono::Utc::now();
 
@@ -1627,8 +1623,7 @@ pub async fn update_my_sub_account(
     if let Some(email) = &req.email {
         let email = email.trim().to_lowercase();
         if !email.is_empty() {
-            super::admin::validate_email(&email)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
             if let Some(user_store) = state.user_store.as_ref() {
                 if let Ok(Some(existing)) = user_store.get_by_email(&email) {
                     if existing.id != sub_id {
@@ -2213,7 +2208,8 @@ mod tests {
         child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
 
-        let scoped = trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
+        let scoped =
+            trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
         assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
     }
 
@@ -2274,7 +2270,92 @@ mod tests {
         };
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert_eq!(err.1, "sub-accounts cannot change their own public subdomain");
+        assert_eq!(
+            err.1,
+            "sub-accounts cannot change their own public subdomain"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_my_profile_applies_typed_config_patch_without_wiping_sections() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.channels = vec![crate::profiles::ChannelCredentials::Telegram {
+            token_env: "TG_TOKEN".into(),
+            allowed_senders: String::new(),
+        }];
+        profile.config.gateway = crate::profiles::GatewaySettings {
+            max_history: Some(32),
+            system_prompt: Some("keep me".into()),
+            ..Default::default()
+        };
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "gateway": {
+                        "max_history": 128
+                    },
+                    "search": {
+                        "providers": {
+                            "tavily": {
+                                "api_key_env": "TAVILY_API_KEY"
+                            }
+                        }
+                    },
+                    "deep_crawl": {
+                        "page_settle_ms": 2000
+                    },
+                    "apps": {
+                        "slides": {
+                            "default_theme": "crew"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.profile.config.channels.len(), 1);
+        assert_eq!(resp.profile.config.gateway.max_history, Some(128));
+        assert_eq!(
+            resp.profile.config.gateway.system_prompt.as_deref(),
+            Some("keep me")
+        );
+        assert_eq!(
+            resp.profile
+                .config
+                .search
+                .as_ref()
+                .and_then(|search| search.providers.get("tavily"))
+                .and_then(|provider| provider.api_key_env.as_deref()),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(
+            resp.profile
+                .config
+                .deep_crawl
+                .as_ref()
+                .and_then(|cfg| cfg.page_settle_ms),
+            Some(2000)
+        );
+        assert_eq!(
+            resp.profile
+                .config
+                .apps
+                .as_ref()
+                .and_then(|apps| apps.slides.as_ref())
+                .and_then(|slides| slides.default_theme.as_deref()),
+            Some("crew")
+        );
     }
 
     #[tokio::test]
