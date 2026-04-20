@@ -72,13 +72,42 @@ fn new_sse_channel() -> (SseSender, SseReceiver) {
     broadcast::channel(SSE_CHANNEL_CAPACITY)
 }
 
+fn session_result_seq_from_payload(payload: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("type")?.as_str()? != "session_result" {
+        return None;
+    }
+    value
+        .get("message")?
+        .get("seq")?
+        .as_u64()
+        .and_then(|seq| usize::try_from(seq).ok())
+}
+
+fn should_drop_replayed_session_result(
+    payload: &str,
+    max_replayed_session_seq: Option<usize>,
+) -> bool {
+    let Some(max_seq) = max_replayed_session_seq else {
+        return false;
+    };
+    session_result_seq_from_payload(payload).is_some_and(|seq| seq <= max_seq)
+}
+
 fn sse_stream_from_receiver(
     rx: SseReceiver,
+    max_replayed_session_seq: Option<usize>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    stream::unfold(rx, |mut rx| async move {
+    stream::unfold(rx, move |mut rx| async move {
         loop {
             match rx.recv().await {
                 Ok(data) => {
+                    if should_drop_replayed_session_result(&data, max_replayed_session_seq) {
+                        record_duplicate_result_suppressed(
+                            "replayed_session_result_already_streamed",
+                        );
+                        continue;
+                    }
                     let event: Result<Event, Infallible> = Ok(Event::default().data(data));
                     return Some((event, rx));
                 }
@@ -134,6 +163,20 @@ fn message_has_presentation_media(message: &Message) -> bool {
         .media
         .iter()
         .any(|path| path_looks_like_presentation(path))
+}
+
+fn content_looks_like_committed_session_result(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('✓')
+        || trimmed.starts_with('✗')
+        || trimmed.starts_with('✅')
+        || trimmed.starts_with('❌')
+}
+
+fn message_should_replay_as_session_result(message: &Message) -> bool {
+    message.role == MessageRole::Assistant
+        && (!message.media.is_empty()
+            || content_looks_like_committed_session_result(&message.content))
 }
 
 /// Request body for POST /chat.
@@ -1056,7 +1099,7 @@ async fn handle_chat(
         .into_response();
     };
 
-    Sse::new(sse_stream_from_receiver(rx))
+    Sse::new(sse_stream_from_receiver(rx, None))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -1093,10 +1136,14 @@ async fn handle_session_event_stream(
         replay_committed_session_results(&state, &id, params.since_seq, params.topic.as_deref())
             .await,
     );
+    let max_replayed_session_seq = replay_events
+        .iter()
+        .filter_map(|payload| session_result_seq_from_payload(payload))
+        .max();
     replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
     record_replay("stream", "opened", 1);
 
-    let live_stream = sse_stream_from_receiver(rx);
+    let live_stream = sse_stream_from_receiver(rx, max_replayed_session_seq);
 
     let replay_stream = stream::iter(
         replay_events
@@ -1342,7 +1389,7 @@ async fn replay_committed_session_results(
                 .enumerate()
                 .filter(|(seq, message)| {
                     since_seq.is_none_or(|since| *seq > since)
-                        && message.role == MessageRole::Assistant
+                        && message_should_replay_as_session_result(message)
                 })
                 .map(|(seq, message)| {
                     build_session_result_event_from_message(
@@ -2263,7 +2310,10 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("second result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("✓ report completed — file delivered"),
+                )
                 .await
                 .unwrap();
         }
@@ -2287,7 +2337,10 @@ mod tests {
         assert_eq!(parsed["type"], "session_result");
         assert_eq!(parsed["message"]["seq"], 2);
         assert_eq!(parsed["message"]["role"], "assistant");
-        assert_eq!(parsed["message"]["content"], "second result");
+        assert_eq!(
+            parsed["message"]["content"],
+            "✓ report completed — file delivered"
+        );
     }
 
     #[tokio::test]
@@ -2299,6 +2352,9 @@ mod tests {
             "test-chat",
             Some("slides launch"),
         );
+        let deck_path = data_dir.path().join("slides").join("final-deck.pptx");
+        std::fs::create_dir_all(deck_path.parent().unwrap()).unwrap();
+        std::fs::write(&deck_path, b"deck").unwrap();
 
         {
             let mut manager = sessions.lock().await;
@@ -2311,7 +2367,18 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("second result"))
+                .add_message_with_seq(
+                    &key,
+                    Message {
+                        role: MessageRole::Assistant,
+                        content: "final deck".to_string(),
+                        media: vec![deck_path.to_string_lossy().into_owned()],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -2332,13 +2399,111 @@ mod tests {
             replay_committed_session_results(&state, "test-chat", None, Some("slides launch"))
                 .await;
 
-        assert_eq!(replayed.len(), 2);
-        let first: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
-        let second: serde_json::Value = serde_json::from_str(&replayed[1]).unwrap();
-        assert_eq!(first["type"], "session_result");
-        assert_eq!(first["topic"], "slides launch");
-        assert_eq!(first["message"]["seq"], 1);
-        assert_eq!(second["message"]["seq"], 2);
+        assert_eq!(replayed.len(), 1);
+        let only: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
+        assert_eq!(only["type"], "session_result");
+        assert_eq!(only["topic"], "slides launch");
+        assert_eq!(only["message"]["seq"], 2);
+        let media = only["message"]["media"].as_array().unwrap();
+        assert_eq!(media.len(), 1);
+        assert!(media[0].as_str().unwrap().starts_with("pf/"));
+    }
+
+    #[tokio::test]
+    async fn replay_committed_session_results_skips_plain_assistant_replies_recovered_via_history()
+    {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "test-chat");
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("terminal response recovered from history"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed = replay_committed_session_results(&state, "test-chat", None, None).await;
+
+        assert!(replayed.is_empty());
+    }
+
+    #[test]
+    fn should_drop_replayed_session_result_only_for_already_replayed_seq() {
+        let replayed = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 7,
+                "role": "assistant",
+                "content": "done",
+            }
+        })
+        .to_string();
+        let newer = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 8,
+                "role": "assistant",
+                "content": "later",
+            }
+        })
+        .to_string();
+        let replace = serde_json::json!({
+            "type": "replace",
+            "text": "partial",
+        })
+        .to_string();
+
+        assert!(should_drop_replayed_session_result(&replayed, Some(7)));
+        assert!(should_drop_replayed_session_result(&replayed, Some(9)));
+        assert!(!should_drop_replayed_session_result(&newer, Some(7)));
+        assert!(!should_drop_replayed_session_result(&replace, Some(7)));
+        assert!(!should_drop_replayed_session_result(&replayed, None));
+    }
+
+    #[test]
+    fn session_result_seq_from_payload_reads_message_seq() {
+        let payload = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "seq": 3,
+                "role": "assistant",
+                "content": "hello",
+            }
+        })
+        .to_string();
+        let no_seq = serde_json::json!({
+            "type": "session_result",
+            "message": {
+                "role": "assistant",
+                "content": "hello",
+            }
+        })
+        .to_string();
+
+        assert_eq!(session_result_seq_from_payload(&payload), Some(3));
+        assert_eq!(session_result_seq_from_payload(&no_seq), None);
+        assert_eq!(session_result_seq_from_payload("{not-json"), None);
     }
 
     #[tokio::test]
