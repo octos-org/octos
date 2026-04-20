@@ -97,12 +97,14 @@ pub struct ProfileConfig {
 
 /// Search configuration persisted in the profile contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub providers: HashMap<String, SearchProviderConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
@@ -110,6 +112,7 @@ pub struct SearchProviderConfig {
 
 /// Deep crawl defaults persisted in the profile contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeepCrawlConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_settle_ms: Option<u64>,
@@ -119,12 +122,14 @@ pub struct DeepCrawlConfig {
 
 /// First-party app configuration persisted in the profile contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slides: Option<SlidesAppConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlidesAppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_dir: Option<String>,
@@ -213,6 +218,7 @@ pub struct GatewaySettingsPatch {
 
 /// Structured LLM contract for a profile.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary: Option<LlmModelSelectionConfig>,
@@ -222,6 +228,7 @@ pub struct LlmProfileConfig {
 
 /// A concrete model selection inside the LLM contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmModelSelectionConfig {
     /// Canonical model family / provider family (e.g. "moonshot", "deepseek").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,6 +252,7 @@ pub struct LlmModelSelectionConfig {
 
 /// A provider route / endpoint choice for one model.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmRouteConfig {
     /// Stable route ID from the catalog (e.g. "official", "autodl", "wisemodel").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2666,6 +2674,38 @@ mod tests {
             }
         }))
         .expect_err("unknown gateway field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `bogus`"));
+    }
+
+    #[test]
+    fn test_profile_config_patch_rejects_unknown_deep_crawl_field() {
+        let err = serde_json::from_value::<ProfileConfigPatch>(serde_json::json!({
+            "deep_crawl": {
+                "page_settle_ms": 1000,
+                "max_chrs": 32000
+            }
+        }))
+        .expect_err("unknown deep_crawl field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `max_chrs`"));
+    }
+
+    #[test]
+    fn test_profile_config_patch_rejects_unknown_llm_route_field() {
+        let err = serde_json::from_value::<ProfileConfigPatch>(serde_json::json!({
+            "llm": {
+                "primary": {
+                    "family_id": "moonshot",
+                    "model_id": "kimi-k2.5",
+                    "route": {
+                        "route_id": "official",
+                        "bogus": true
+                    }
+                }
+            }
+        }))
+        .expect_err("unknown llm route field should be rejected");
 
         assert!(err.to_string().contains("unknown field `bogus`"));
     }

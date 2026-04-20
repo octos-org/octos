@@ -226,7 +226,7 @@ impl PluginTool {
         effective_args
     }
 
-    fn detect_output_file(
+    async fn detect_output_file(
         &self,
         effective_args: &serde_json::Value,
         output: &str,
@@ -278,25 +278,36 @@ impl PluginTool {
         } else {
             None
         };
-        let found = out_file.or(from_output).map(|path| {
-            if path.exists() {
-                return path;
-            }
-
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        let found = match out_file.or(from_output) {
+            Some(path) => {
                 if path.exists() {
-                    return path;
+                    Some(path)
+                } else {
+                    Some(self.wait_for_output_file(path).await)
                 }
             }
-
-            path
-        });
+            None => None,
+        };
         if let Some(ref abs) = found {
             tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
             files_to_send.push(abs.clone());
         }
         found
+    }
+
+    async fn wait_for_output_file(&self, path: std::path::PathBuf) -> std::path::PathBuf {
+        if path.exists() {
+            return path;
+        }
+
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if path.exists() {
+                return path;
+            }
+        }
+
+        path
     }
 }
 
@@ -629,6 +640,7 @@ impl Tool for PluginTool {
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
                 self.detect_output_file(&effective_args, &output, &mut files_to_send)
+                    .await
             } else {
                 file_modified
             };
@@ -652,7 +664,9 @@ impl Tool for PluginTool {
         }
 
         let mut files_to_send = Vec::new();
-        let file_modified = self.detect_output_file(&effective_args, &output, &mut files_to_send);
+        let file_modified = self
+            .detect_output_file(&effective_args, &output, &mut files_to_send)
+            .await;
 
         Ok(ToolResult {
             output,
@@ -1032,7 +1046,10 @@ mod tests {
             .with_work_dir(dir.path().to_path_buf())
             .with_timeout(Duration::from_secs(5));
 
-        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
 
         assert!(result.success);
         assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
@@ -1068,12 +1085,18 @@ mod tests {
             .with_work_dir(dir.path().to_path_buf())
             .with_timeout(Duration::from_secs(5));
 
-        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
 
         assert!(result.success);
         assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
         assert_eq!(result.files_to_send, vec![output_abs.clone()]);
-        assert!(output_abs.exists(), "generated deck should appear after fallback wait");
+        assert!(
+            output_abs.exists(),
+            "generated deck should appear after fallback wait"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

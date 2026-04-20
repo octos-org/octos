@@ -112,6 +112,47 @@ fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
     env
 }
 
+fn discover_ominix_url() -> Option<String> {
+    std::env::var("OMINIX_API_URL").ok().or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
+        std::fs::read_to_string(discovery)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn push_runtime_plugin_env(
+    plugin_env: &mut Vec<(String, String)>,
+    data_dir: &std::path::Path,
+    octos_home: &std::path::Path,
+    profile_id: Option<&str>,
+    ominix_url: Option<&str>,
+) {
+    plugin_env.push((
+        "OCTOS_DATA_DIR".to_string(),
+        data_dir.to_string_lossy().to_string(),
+    ));
+    plugin_env.push((
+        "OCTOS_HOME".to_string(),
+        octos_home.to_string_lossy().to_string(),
+    ));
+    if let Some(profile_id) = profile_id {
+        plugin_env.push(("OCTOS_PROFILE_ID".to_string(), profile_id.to_string()));
+    }
+    plugin_env.push((
+        "OCTOS_VOICE_DIR".to_string(),
+        data_dir
+            .join("voice_profiles")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    if let Some(ominix_url) = ominix_url {
+        plugin_env.push(("OMINIX_API_URL".to_string(), ominix_url.to_string()));
+    }
+}
+
 async fn apply_profile_runtime_contracts(
     profile: &UserProfile,
     tool_config: &octos_agent::ToolConfigStore,
@@ -460,20 +501,6 @@ impl GatewayRuntime {
                 .ok()
                 .map(Arc::new);
 
-        // Export env vars for skill/plugin child processes. These are read by
-        // spawned binaries (mofa-fm, account-manager, voice skill), not by
-        // concurrent Rust threads. Consolidated here before any tokio::spawn
-        // calls to minimize the UB window (tokio worker threads exist but are
-        // idle at this point).
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OCTOS_DATA_DIR", &data_dir);
-            std::env::set_var("OCTOS_HOME", &effective_octos_home);
-            if let Some(ref pid) = profile_id {
-                std::env::set_var("OCTOS_PROFILE_ID", pid);
-            }
-        }
-
         // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
@@ -538,27 +565,15 @@ impl GatewayRuntime {
             .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR)
             .join("voice")
             .join("main");
-        let ominix_url = std::env::var("OMINIX_API_URL").ok().or_else(|| {
-            let home = std::env::var_os("HOME")?;
-            let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-            std::fs::read_to_string(discovery)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
-        let asr_binary = if let Some(url) = ominix_url.filter(|_| voice_binary_path.exists()) {
-            println!("{}: voice platform skill ({})", "Transcriber".green(), url);
-            println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
-            // Export so the voice skill binary can find the OminiX server.
-            // Read by child processes only, not concurrent Rust threads.
-            #[allow(unsafe_code)]
-            unsafe {
-                std::env::set_var("OMINIX_API_URL", &url);
-            }
-            Some(voice_binary_path)
-        } else {
-            None
-        };
+        let ominix_url = discover_ominix_url();
+        let asr_binary =
+            if let Some(url) = ominix_url.as_deref().filter(|_| voice_binary_path.exists()) {
+                println!("{}: voice platform skill ({})", "Transcriber".green(), url);
+                println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
+                Some(voice_binary_path)
+            } else {
+                None
+            };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
         // Customer-installed skills are strictly account-scoped.
@@ -622,19 +637,13 @@ impl GatewayRuntime {
         if let Some(profile) = resolved_profile.as_ref() {
             plugin_env.extend(profile_plugin_env(profile));
         }
-        // Per-profile data_dir so skills (voice profiles, mofa-fm voices, etc.)
-        // resolve storage relative to the correct profile, not the gateway root.
-        plugin_env.push((
-            "OCTOS_DATA_DIR".to_string(),
-            data_dir.to_string_lossy().to_string(),
-        ));
-        plugin_env.push((
-            "OCTOS_VOICE_DIR".to_string(),
-            data_dir
-                .join("voice_profiles")
-                .to_string_lossy()
-                .to_string(),
-        ));
+        push_runtime_plugin_env(
+            &mut plugin_env,
+            &data_dir,
+            &effective_octos_home,
+            profile_id.as_deref(),
+            ominix_url.as_deref(),
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let shutdown_notify = Arc::new(Notify::new());
@@ -659,6 +668,7 @@ impl GatewayRuntime {
             }
             let sandbox = octos_agent::create_sandbox(&sandbox_config);
             tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+            tools.set_output_dir_hint(data_dir.join("skill-output").to_string_lossy().to_string());
             tools.inject_tool_config(tool_config.clone());
             if !profile_search_keys.is_empty() {
                 tools.register(
