@@ -1,6 +1,6 @@
 //! Spawn tool for background subagent execution.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
