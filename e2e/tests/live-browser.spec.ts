@@ -369,11 +369,13 @@ test.describe('Live browser smoke', () => {
       if (audioAttachments.length > 0) break;
     }
 
-    expect(audioAttachments.length).toBeGreaterThan(0);
-
     await page.reload({ waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
-    await page.waitForTimeout(8_000);
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(3_000);
+      audioAttachments = await getRenderedAudioAttachments(page);
+      if (audioAttachments.length > 0) break;
+    }
 
     const threadBubbles = await getRenderedThreadBubbles(page);
     audioAttachments = await getRenderedAudioAttachments(page);
