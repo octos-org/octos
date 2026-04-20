@@ -81,6 +81,12 @@ async function waitForRecoveredTurn(page: Page, timeoutMs = 240_000) {
   throw new Error('Timed out waiting for the recovered turn to settle');
 }
 
+function normalizeRecoveryMarkerText(text: string) {
+  return text
+    .normalize('NFKC')
+    .replace(/[\u2010-\u2015\u2212]/g, '-');
+}
+
 test.describe('Live session recovery', () => {
   test.setTimeout(360_000);
 
@@ -114,7 +120,7 @@ test.describe('Live session recovery', () => {
     expect(finalText.length).toBeGreaterThan(0);
     expect(await countUserBubbles(page)).toBe(1);
     expect(await countAssistantBubbles(page)).toBeGreaterThanOrEqual(1);
-    expect(finalText).toContain(marker);
+    expect(normalizeRecoveryMarkerText(finalText)).toContain(marker);
   });
 
   test('concurrent live sessions stay isolated after independent reloads', async ({
