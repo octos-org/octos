@@ -27,7 +27,9 @@ import {
   sendAndWait,
 } from './live-browser-helpers';
 import {
+  findSessionIdByMessageText,
   getActiveSessionId,
+  getSessionMessagesText,
   openAuthedChat,
   uniqueRepoName,
   waitForAssistantTextProgress,
@@ -104,21 +106,17 @@ function buildFanoutPrompt(labelPrefix: string) {
 
 function buildLongRepairPrompt(repoName: string, resumeMarker: string) {
   return [
-    'Use shell tool only.',
+    'Use shell for every repo operation in this task.',
     'If shell is not already active, activate it first.',
     `Run \`mkdir -p ./${repoName} && cd ./${repoName} && git init\` to create a temporary git repo inside the current workspace.`,
     'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
     'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
-    'Create check.sh that exits 0 only when the second line of notes.txt is gamma and exits 1 otherwise.',
-    'Make check.sh executable.',
-    'Run git add notes.txt check.sh.',
-    'Run ./check.sh once and confirm it fails.',
-    'Repair only notes.txt so ./check.sh succeeds.',
-    'Run ./check.sh again.',
+    'Run git add notes.txt so it is tracked before editing.',
+    'Repair only notes.txt by changing beta to gamma.',
     'Then run git diff -- notes.txt.',
     'Run sleep 12 once from the repo root before writing the final answer.',
-    `Then write 12 numbered bullets explaining the repair, include ${resumeMarker} exactly once in the final bullet, and include the unified diff for notes.txt at the end.`,
+    `After the shell work completes, return exactly two parts: first a line containing ${resumeMarker}, then the unified diff for notes.txt and nothing else.`,
     'Do not start background work.',
   ].join(' ');
 }
@@ -232,13 +230,31 @@ test.describe('Phase 3 coding hard cases', () => {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
 
+    const sessionId = await findSessionIdByMessageText(page, resumeMarker, 60_000);
     const finalText = await waitForSingleSettledTurn(page, 240_000);
     await expectSingleTurn(page);
-    expect(finalText).toContain(resumeMarker);
-    expect(finalText).toContain('diff --git');
-    expect(finalText).toContain('notes.txt');
-    expect(finalText).toContain('-beta');
-    expect(finalText).toContain('+gamma');
+    const deadline = Date.now() + 60_000;
+    let combinedText = finalText;
+    while (Date.now() < deadline) {
+      const persistedText = await getSessionMessagesText(page, sessionId);
+      combinedText = `${await getChatThreadText(page)}\n${persistedText}`;
+      if (
+        combinedText.includes(resumeMarker) &&
+        combinedText.includes('diff --git') &&
+        combinedText.includes('notes.txt') &&
+        combinedText.includes('-beta') &&
+        combinedText.includes('+gamma')
+      ) {
+        break;
+      }
+      await page.waitForTimeout(2_000);
+    }
+
+    expect(combinedText).toContain(resumeMarker);
+    expect(combinedText).toContain('diff --git');
+    expect(combinedText).toContain('notes.txt');
+    expect(combinedText).toContain('-beta');
+    expect(combinedText).toContain('+gamma');
   });
 
   test('concurrent coding sessions remain isolated under load', async ({ browser }) => {

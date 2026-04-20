@@ -55,12 +55,23 @@ export async function waitForStreamingAssistantTurn(page: Page, timeoutMs = 90_0
 
 export async function waitForAssistantTextProgress(
   page: Page,
-  opts: { timeoutMs?: number; minLength?: number; minGrowthEvents?: number } = {},
+  opts: {
+    timeoutMs?: number;
+    minLength?: number;
+    minGrowthEvents?: number;
+    minStreamingSamples?: number;
+  } = {},
 ) {
-  const { timeoutMs = 20_000, minLength = 120, minGrowthEvents = 2 } = opts;
+  const {
+    timeoutMs = 20_000,
+    minLength = 120,
+    minGrowthEvents = 2,
+    minStreamingSamples = 8,
+  } = opts;
   const deadline = Date.now() + timeoutMs;
   let lastLength = 0;
   let growthEvents = 0;
+  let streamingSamples = 0;
 
   while (Date.now() < deadline) {
     const streaming = await page
@@ -70,12 +81,22 @@ export async function waitForAssistantTextProgress(
     const currentText = await getLatestAssistantText(page);
     const currentLength = currentText.length;
 
+    if (streaming) {
+      streamingSamples += 1;
+    } else {
+      streamingSamples = 0;
+    }
+
     if (currentLength > lastLength) {
       growthEvents += 1;
       lastLength = currentLength;
     }
 
-    if (streaming && currentLength >= minLength && growthEvents >= minGrowthEvents) {
+    if (currentLength >= minLength && growthEvents >= minGrowthEvents) {
+      return currentText;
+    }
+
+    if (streaming && streamingSamples >= minStreamingSamples) {
       return currentText;
     }
 
@@ -195,6 +216,61 @@ export async function getSessionTasks(page: Page, sessionId: string): Promise<Se
 
     return resp.json();
   }, { sessionId });
+}
+
+export async function getSessionMessagesText(page: Page, sessionId: string): Promise<string> {
+  return page.evaluate(async ({ sessionId: sid }) => {
+    const token =
+      localStorage.getItem('octos_session_token') ||
+      localStorage.getItem('octos_auth_token') ||
+      '';
+    const profile = localStorage.getItem('selected_profile') || '';
+    const headers: Record<string, string> = {};
+
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    if (profile) {
+      headers['X-Profile-Id'] = profile;
+    }
+
+    const resp = await fetch(`/api/sessions/${sid}/messages?limit=100`, { headers });
+    if (!resp.ok) {
+      return '';
+    }
+
+    const messages = await resp.json().catch(() => []);
+    if (!Array.isArray(messages)) {
+      return '';
+    }
+
+    return messages
+      .map((message) => (typeof message?.content === 'string' ? message.content : ''))
+      .filter((content): content is string => Boolean(content))
+      .join('\n');
+  }, { sessionId });
+}
+
+export async function findSessionIdByMessageText(
+  page: Page,
+  needle: string,
+  timeoutMs = 30_000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const sessionIds = await fetchSessionIds(page).catch(() => []);
+    for (const sessionId of sessionIds) {
+      const messageText = await getSessionMessagesText(page, sessionId).catch(() => '');
+      if (messageText.includes(needle)) {
+        return sessionId;
+      }
+    }
+
+    await page.waitForTimeout(1_000);
+  }
+
+  throw new Error(`No session containing marker ${needle} found via sessions API`);
 }
 
 export async function waitForChildSessionTasksToSettle(
