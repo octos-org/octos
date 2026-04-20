@@ -2382,11 +2382,11 @@ mod tests {
                 "task": "Produce a short podcast",
                 "label": "Research podcast",
                 "mode": "background",
-                "allowed_tools": ["podcast_generate"],
+                "allowed_tools": [],
                 "workflow": {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
-                    "allowed_tools": ["podcast_generate"],
+                    "allowed_tools": [],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "forbid_intermediate_files": true,
