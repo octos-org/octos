@@ -286,10 +286,14 @@ test.describe('Live browser smoke', () => {
   test('short TTS success renders exactly one audio attachment', async ({
     page,
   }) => {
-    await sendAndWait(page, '用自定义声音 yangmi 说：你好世界', {
+    await sendAndWait(
+      page,
+      '直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），文本只说：你好世界。不要先检查声音，也不要解释。',
+      {
       label: 'live-short-tts-smoke',
       maxWait: 60_000,
-    });
+      },
+    );
 
     let audioAttachments: RenderedAudioAttachment[] = [];
     for (let i = 0; i < 15; i++) {
