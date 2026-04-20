@@ -190,10 +190,7 @@ impl Tool for ActivateToolsTool {
                     activated_now.len(),
                     activated_now.join(", ")
                 ),
-                (true, false) => format!(
-                    "Already active: {}",
-                    already_active.join(", ")
-                ),
+                (true, false) => format!("Already active: {}", already_active.join(", ")),
                 (false, false) => format!(
                     "Loaded {} tool(s): {}. Already active: {}",
                     activated_now.len(),

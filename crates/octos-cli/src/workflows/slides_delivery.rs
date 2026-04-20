@@ -1,12 +1,12 @@
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
+use octos_agent::workspace_policy::WorkspacePolicyWorkspace;
 use octos_agent::{
     ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
     WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
     WorkspaceVersionControlProvider,
 };
-use octos_agent::workspace_policy::WorkspacePolicyWorkspace;
 use std::collections::BTreeMap;
 
 pub fn build() -> WorkflowInstance {

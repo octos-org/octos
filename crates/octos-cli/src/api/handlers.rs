@@ -2756,7 +2756,11 @@ mod tests {
         let cache_dir = site_build_cache_dir(project_dir.path());
 
         assert!(cache_dir.starts_with(std::env::temp_dir()));
-        assert!(cache_dir.to_string_lossy().contains("octos-site-build-npm-cache"));
+        assert!(
+            cache_dir
+                .to_string_lossy()
+                .contains("octos-site-build-npm-cache")
+        );
     }
 
     #[test]
