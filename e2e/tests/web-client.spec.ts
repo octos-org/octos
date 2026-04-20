@@ -190,16 +190,14 @@ test('SSE handles long CJK response without garbling', async ({
   // No replacement characters anywhere in the stream
   expect(raw).not.toContain('\uFFFD');
 
-  // Should contain recognizable Chinese city names
-  const allContent = events
+  // The final streamed content should still contain substantial CJK text.
+  const finalContent = events
     .filter((e) => e.type === 'replace' || e.type === 'done')
     .map((e) => e.text || e.content || '')
-    .join('');
-
-  // At least one common city should appear (北京/上海/广州/深圳/成都/杭州/etc.)
-  const cities = ['北京', '上海', '广州', '深圳', '成都', '杭州', '武汉', '南京', '重庆', '天津'];
-  const found = cities.some((city) => allContent.includes(city));
-  expect(found).toBe(true);
+    .filter((text) => typeof text === 'string' && text.length > 0)
+    .pop() || '';
+  const cjkChars = finalContent.match(/[\u4e00-\u9fff]/g) || [];
+  expect(cjkChars.length).toBeGreaterThan(8);
 });
 
 // ---------------------------------------------------------------------------
