@@ -96,7 +96,10 @@ case "$SUITE" in
     ensure_deps
     run_suite "ocean-deliverables" "$OCEAN_URL" \
       tests/live-slides-site.spec.ts \
-      tests/refactor-capabilities.spec.ts \
+      tests/refactor-capabilities.spec.ts
+    # Coding hard-case acceptance exercises the general chat/coding surface,
+    # which currently lives behind the crew host, not the ocean deliverables host.
+    run_suite "ocean-deliverables" "$CREW_URL" \
       tests/coding-hardcases.spec.ts
     ;;
   all)

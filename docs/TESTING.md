@@ -37,7 +37,10 @@ npm --prefix e2e run test:milestone:ocean
 
 The E2E milestone runner installs Playwright dependencies on first use. Set
 `OCTOS_TEST_URL` for a shared base URL, or override `OCTOS_CREW_URL`,
-`OCTOS_BOT_URL`, and `OCTOS_OCEAN_URL` per suite.
+`OCTOS_BOT_URL`, and `OCTOS_OCEAN_URL` per suite. The `test:milestone:ocean`
+umbrella still runs `coding-hardcases.spec.ts` against `OCTOS_CREW_URL`,
+because those coding acceptance checks target the general chat/coding surface
+rather than the ocean deliverables host.
 
 ---
 
