@@ -160,6 +160,16 @@ fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'st
     .increment(1);
 }
 
+async fn dispatch_child_session_lifecycle(
+    sender: Option<&ChildSessionLifecycleSender>,
+    payload: ChildSessionLifecyclePayload,
+) -> bool {
+    match sender {
+        Some(sender) => sender(payload).await,
+        None => false,
+    }
+}
+
 fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
     match kind {
         BackgroundResultKind::Notification => "notification",
@@ -1255,34 +1265,31 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                if let (
-                    Some(sender),
-                    Some(task_id),
-                    Some(parent_session_key),
-                    Some(child_session_key),
-                ) = (
-                    child_session_sender.as_ref(),
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
                     tracked_task_id.as_ref(),
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
                 ) {
-                    let joined = sender(ChildSessionLifecyclePayload {
-                        kind: ChildSessionLifecycleKind::Spawned,
-                        task_id: task_id.clone(),
-                        task_label: task_label.clone(),
-                        instruction: task_desc.clone(),
-                        parent_session_key: parent_session_key.clone(),
-                        child_session_key: child_session_key.clone(),
-                        workflow_kind: workflow_metadata
-                            .as_ref()
-                            .map(|workflow| workflow.workflow_kind.clone()),
-                        current_phase: workflow_metadata
-                            .as_ref()
-                            .map(|workflow| workflow.current_phase.clone()),
-                        output_files: Vec::new(),
-                        failure_action: None,
-                        error: None,
-                    })
+                    let joined = dispatch_child_session_lifecycle(
+                        child_session_sender.as_ref(),
+                        ChildSessionLifecyclePayload {
+                            kind: ChildSessionLifecycleKind::Spawned,
+                            task_id: task_id.clone(),
+                            task_label: task_label.clone(),
+                            instruction: task_desc.clone(),
+                            parent_session_key: parent_session_key.clone(),
+                            child_session_key: child_session_key.clone(),
+                            workflow_kind: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.workflow_kind.clone()),
+                            current_phase: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.current_phase.clone()),
+                            output_files: Vec::new(),
+                            failure_action: None,
+                            error: None,
+                        },
+                    )
                     .await;
                     record_child_session_lifecycle(
                         ChildSessionLifecycleKind::Spawned,
@@ -1495,13 +1502,7 @@ impl Tool for SpawnTool {
                     (Err(error), _) => error.to_string(),
                 };
 
-                if let (
-                    Some(sender),
-                    Some(task_id),
-                    Some(parent_session_key),
-                    Some(child_session_key),
-                ) = (
-                    child_session_sender.as_ref(),
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
                     tracked_task_id.as_ref(),
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
@@ -1574,7 +1575,9 @@ impl Tool for SpawnTool {
                             error: Some(error.to_string()),
                         },
                     };
-                    let joined = sender(payload).await;
+                    let joined =
+                        dispatch_child_session_lifecycle(child_session_sender.as_ref(), payload)
+                            .await;
                     record_child_session_lifecycle(
                         terminal_kind,
                         if joined { "dispatched" } else { "not_joined" },
@@ -2640,6 +2643,29 @@ mod tests {
             child_session_failure_action(ChildSessionLifecycleKind::TerminalFailed),
             Some(ChildSessionFailureAction::Escalate)
         );
+    }
+
+    #[tokio::test]
+    async fn child_session_lifecycle_dispatch_defaults_to_not_joined_without_sender() {
+        let joined = dispatch_child_session_lifecycle(
+            None,
+            ChildSessionLifecyclePayload {
+                kind: ChildSessionLifecycleKind::Spawned,
+                task_id: "task-123".to_string(),
+                task_label: "Child task".to_string(),
+                instruction: "Do work".to_string(),
+                parent_session_key: "api:parent".to_string(),
+                child_session_key: "api:parent#child-task-123".to_string(),
+                workflow_kind: Some("deep_research".to_string()),
+                current_phase: Some("execute".to_string()),
+                output_files: Vec::new(),
+                failure_action: None,
+                error: None,
+            },
+        )
+        .await;
+
+        assert!(!joined);
     }
 
     // Minimal mock provider for testing
