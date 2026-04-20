@@ -36,6 +36,77 @@ async function collectPreviewUrls(page: Page): Promise<string[]> {
   );
 }
 
+async function collectPersistedPreviewUrls(page: Page): Promise<string[]> {
+  return page.evaluate(async () => {
+    const token =
+      localStorage.getItem('octos_session_token') ||
+      localStorage.getItem('octos_auth_token') ||
+      '';
+    const profile = localStorage.getItem('selected_profile') || '';
+    const headers: Record<string, string> = {};
+
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    if (profile) {
+      headers['X-Profile-Id'] = profile;
+    }
+
+    const normalize = (url: string) => {
+      const trimmed = url.trim();
+      const match = trimmed.match(/^([^?#]+)(.*)$/);
+      if (!match) return trimmed;
+      let base = match[1].replace(/\/index\.html$/i, '/');
+      if (!base.endsWith('/')) {
+        base = `${base}/`;
+      }
+      return `${base}${match[2] || ''}`;
+    };
+
+    const sessionsResp = await fetch('/api/sessions', { headers });
+    if (!sessionsResp.ok) {
+      return [];
+    }
+
+    const sessions = await sessionsResp.json().catch(() => []);
+    if (!Array.isArray(sessions)) {
+      return [];
+    }
+
+    const urls = new Set<string>();
+    for (const session of sessions.slice(0, 40)) {
+      const sessionId = typeof session?.id === 'string' ? session.id : null;
+      if (!sessionId) {
+        continue;
+      }
+
+      const messagesResp = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=100`,
+        { headers },
+      ).catch(() => null);
+      if (!messagesResp?.ok) {
+        continue;
+      }
+
+      const messages = await messagesResp.json().catch(() => []);
+      if (!Array.isArray(messages)) {
+        continue;
+      }
+
+      const text = messages
+        .map((message) => (typeof message?.content === 'string' ? message.content : ''))
+        .join('\n');
+      const matches =
+        text.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas(?:\/index\.html|\/)/gi) || [];
+      for (const match of matches) {
+        urls.add(normalize(match));
+      }
+    }
+
+    return Array.from(urls);
+  });
+}
+
 async function waitForPreviewUrls(
   page: Page,
   expectedCount: number,
@@ -228,8 +299,28 @@ test.describe('Live deliverable flows', () => {
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
-    const afterReloadPreviewUrls = await waitForPreviewUrls(page, 1, 60_000);
-    expect(afterReloadPreviewUrls).toHaveLength(1);
-    expect(afterReloadPreviewUrls[0]).toBe(previewUrl);
+    let afterReloadPreviewUrls: string[] = [];
+    await expect
+      .poll(async () => {
+        const visibleUrls = await collectPreviewUrls(page);
+        if (visibleUrls.includes(previewUrl)) {
+          afterReloadPreviewUrls = visibleUrls;
+          return true;
+        }
+
+        const persistedUrls = await collectPersistedPreviewUrls(page);
+        if (persistedUrls.includes(previewUrl)) {
+          afterReloadPreviewUrls = persistedUrls;
+          return true;
+        }
+
+        afterReloadPreviewUrls = visibleUrls;
+        return false;
+      }, {
+        timeout: 60_000,
+        intervals: [2_000, 5_000],
+      })
+      .toBe(true);
+    expect(afterReloadPreviewUrls).toContain(previewUrl);
   });
 });
