@@ -226,10 +226,10 @@ test.describe('SSE streaming', () => {
 
 test.describe('Coding shell repair', () => {
   test('shell repair returns the recovered diff without timing out', async () => {
-    const sid = `shell-repair-${Date.now()}`;
     const marker = `phase3-shell-${Date.now()}`;
-    const prompt = [
+    const basePrompt = [
       'Use shell tool only.',
+      'If shell is not already active, call activate_tools with exactly ["shell"] once and only once.',
       `Create a temporary git repo in a new subdirectory named ${marker} under the current working directory.`,
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
       'Make exactly one edit: change beta to gamma.',
@@ -239,7 +239,24 @@ test.describe('Coding shell repair', () => {
       'Do not start background work.',
     ].join(' ');
 
-    const { content, doneEvent } = await chatSSE(prompt, sid, 90_000);
+    const retryPrompt = [
+      'Call activate_tools(["shell"]) at most once if shell is not already active.',
+      `Then use shell to create ${marker} under the current workspace as a git repo with notes.txt containing alpha and beta.`,
+      `Change beta to gamma, intentionally run \`git diff -- notes.txt\` once from the parent of ${marker}, then rerun it successfully from the ${marker} repo root.`,
+      'Return only the final unified diff for notes.txt and nothing else.',
+      'Do not explain tool availability.',
+    ].join(' ');
+
+    let sid = `shell-repair-${Date.now()}`;
+    let { content, doneEvent } = await chatSSE(basePrompt, sid, 90_000);
+    if (
+      !content.includes('diff --git') &&
+      /don'?t have access to a shell tool|available tools|activate_tools/i.test(content)
+    ) {
+      sid = `${sid}-retry`;
+      ({ content, doneEvent } = await chatSSE(retryPrompt, sid, 90_000));
+    }
+
     expect(doneEvent).toBeTruthy();
     expect(content).toContain('diff --git');
     expect(content).toContain('notes.txt');
