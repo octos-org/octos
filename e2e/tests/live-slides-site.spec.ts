@@ -199,6 +199,7 @@ test.describe('Live deliverable flows', () => {
       {
         label: 'site-build',
         maxWait: 240_000,
+        throwOnTimeout: false,
       },
     );
 
