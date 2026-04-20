@@ -2354,6 +2354,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_qos_ranking_changes_lane_selection() {
+        let config = AdaptiveConfig {
+            probe_probability: 0.0,
+            ..AdaptiveConfig::default()
+        };
         let router = AdaptiveRouter::new(
             vec![
                 Arc::new(MockProvider {
@@ -2372,7 +2376,7 @@ mod tests {
                 }),
             ],
             &[0.0, 0.0],
-            AdaptiveConfig::default(),
+            config,
         );
         router.seed_catalog(&[
             ModelCatalogEntry {
