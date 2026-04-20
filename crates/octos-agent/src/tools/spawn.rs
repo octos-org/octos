@@ -545,7 +545,7 @@ fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
     serde_json::to_string(workflow).ok()
 }
 
-fn workflow_artifact_matches_kind(path: &PathBuf, kind: &str) -> bool {
+fn workflow_artifact_matches_kind(path: &Path, kind: &str) -> bool {
     match kind {
         "audio" => matches!(
             path.extension()

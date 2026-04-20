@@ -235,7 +235,7 @@ impl PluginTool {
         let out_file = effective_args
             .get("out")
             .and_then(|v| v.as_str())
-            .map(|p| {
+            .and_then(|p| {
                 let path = std::path::PathBuf::from(p);
                 if path.is_absolute() && path.exists() {
                     return Some(path);
@@ -253,8 +253,7 @@ impl PluginTool {
                     .or_else(|| self.work_dir.as_ref().map(|d| d.join(&path)))
                     .or_else(|| std::env::current_dir().ok().map(|d| d.join(&path)))
                     .or(Some(path))
-            })
-            .flatten();
+            });
         let from_output = if out_file.is_none() {
             output.lines().find_map(|line| {
                 line.strip_prefix("Generated PPTX: ")
