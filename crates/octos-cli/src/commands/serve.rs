@@ -282,7 +282,7 @@ impl ServeCommand {
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
-                    if p.config.provider.is_none() && p.config.model.is_none() {
+                    if p.config.primary_provider().is_none() && p.config.primary_model().is_none() {
                         tracing::warn!(
                             profile = %p.id,
                             "skipping auto-start: no LLM provider configured"

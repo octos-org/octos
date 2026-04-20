@@ -1226,7 +1226,7 @@ pub async fn start_my_gateway(
     let profile = resolve_my_profile(&identity, ps)?;
 
     // Validate LLM provider is configured
-    if profile.config.provider.is_none() && profile.config.model.is_none() {
+    if profile.config.primary_provider().is_none() && profile.config.primary_model().is_none() {
         return Ok(Json(ActionResponse {
             ok: false,
             message: Some("Cannot start: LLM provider must be configured first".into()),

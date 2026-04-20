@@ -490,7 +490,7 @@ pub async fn start_gateway(
     // Validate LLM provider is configured (resolve inheritance for sub-accounts)
     let effective = crate::profiles::resolve_effective_profile(store, &profile)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if effective.config.provider.is_none() && effective.config.model.is_none() {
+    if effective.config.primary_provider().is_none() && effective.config.primary_model().is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Cannot start: LLM provider must be configured first".into(),
@@ -2740,8 +2740,8 @@ pub async fn config_check(
         .collect();
 
     // Check LLM provider
-    let provider = profile.config.provider.as_deref().unwrap_or("unknown");
-    let model = profile.config.model.as_deref().unwrap_or("unknown");
+    let provider = profile.config.primary_provider().unwrap_or("unknown");
+    let model = profile.config.primary_model().unwrap_or("unknown");
 
     // Check skills
     let skills_dir = data_dir.join("skills");
