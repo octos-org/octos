@@ -973,15 +973,6 @@ fn recover_shell_retry(
             content: strip_success_exit_suffix(content),
         })
         .or_else(|| {
-            shell_results
-                .iter()
-                .find(|content| is_useful_shell_output(content))
-                .map(|content| ShellRetryRecovery {
-                    kind: ShellRetryRecoveryKind::UsefulSuccess,
-                    content: strip_success_exit_suffix(content),
-                })
-        })
-        .or_else(|| {
             (failed_shells >= 2)
                 .then(|| {
                     shell_results
@@ -991,6 +982,19 @@ fn recover_shell_retry(
                 .flatten()
                 .map(|content| ShellRetryRecovery {
                     kind: ShellRetryRecoveryKind::ValidationSuccess,
+                    content: strip_success_exit_suffix(content),
+                })
+        })
+        .or_else(|| {
+            (failed_shells >= 1)
+                .then(|| {
+                    shell_results
+                        .iter()
+                        .find(|content| is_useful_shell_output(content))
+                })
+                .flatten()
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::UsefulSuccess,
                     content: strip_success_exit_suffix(content),
                 })
         })
@@ -1859,6 +1863,211 @@ mod tests {
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
         assert!(recovered.content.contains("src/lib.rs"));
         assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
+        let messages = vec![
+            Message::user("repair the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: first failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --workspace"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: second failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test broken_case -- --nocapture"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "test result: ok. 1 passed; 0 failed\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --locked"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: third failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::ValidationSuccess);
+        assert!(recovered.content.contains("test result: ok"));
+        assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_requires_failure_before_useful_success() {
+        let messages = vec![
+            Message::user("inspect the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "/tmp/octos\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls src"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "lib.rs\nmain.rs\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git status --short"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cat Cargo.toml"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "[package]\nname = \"octos\"\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(recover_shell_retry(&messages, 4).is_none());
     }
 
     #[test]
