@@ -534,28 +534,15 @@ pub(crate) fn resolve_preferred_workspace_contract_artifact_path(
     project_root: &Path,
     artifact_name: &str,
 ) -> Result<Option<PathBuf>> {
-    let mut candidates = resolve_workspace_contract_artifact_paths(project_root, artifact_name)?;
-    if let Some(preferred) = preferred_contract_basename(artifact_name) {
-        let exact = candidates
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.eq_ignore_ascii_case(preferred))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            candidates = exact;
-        }
-    }
-
-    Ok(candidates.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    }))
+    Ok(
+        resolve_workspace_contract_artifact_paths(project_root, artifact_name)?
+            .into_iter()
+            .max_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            }),
+    )
 }
 
 pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStatus {
@@ -750,14 +737,6 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
     matches.sort();
     matches.dedup();
     matches
-}
-
-fn preferred_contract_basename(artifact_name: &str) -> Option<&'static str> {
-    match artifact_name {
-        "deck" => Some("deck.pptx"),
-        "entrypoint" => Some("index.html"),
-        _ => None,
-    }
 }
 
 fn git_head_revision(project_root: &Path) -> Option<String> {
@@ -1176,7 +1155,7 @@ mod tests {
         assert!(status.ready);
         assert!(status.revision.is_some());
         assert!(!status.dirty);
-        assert_eq!(status.artifacts.len(), 2);
+        assert_eq!(status.artifacts.len(), 3);
         assert!(status.artifacts.iter().all(|artifact| artifact.present));
         assert!(status.turn_end_checks.iter().all(|check| check.passed));
         assert!(status.completion_checks.iter().all(|check| check.passed));

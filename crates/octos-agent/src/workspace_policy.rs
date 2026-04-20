@@ -169,13 +169,14 @@ impl WorkspacePolicy {
                     ],
                     on_source_change: Vec::new(),
                     on_completion: vec![
-                        "file_exists:output/*.pptx".into(),
+                        "file_exists:output/deck.pptx".into(),
                         "file_exists:output/**/slide-*.png".into(),
                     ],
                 },
                 artifacts: WorkspaceArtifactsPolicy {
                     entries: BTreeMap::from([
-                        ("deck".into(), "output/*.pptx".into()),
+                        ("primary".into(), "output/deck.pptx".into()),
+                        ("deck".into(), "output/deck.pptx".into()),
                         ("previews".into(), "output/**/slide-*.png".into()),
                     ]),
                 },
@@ -277,10 +278,13 @@ impl WorkspacePolicy {
             on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
         };
         policy.artifacts = WorkspaceArtifactsPolicy {
-            entries: BTreeMap::from([(
-                "entrypoint".into(),
-                format!("{build_output_dir}/index.html"),
-            )]),
+            entries: BTreeMap::from([
+                ("primary".into(), format!("{build_output_dir}/index.html")),
+                (
+                    "entrypoint".into(),
+                    format!("{build_output_dir}/index.html"),
+                ),
+            ]),
         };
         policy
     }
@@ -373,13 +377,17 @@ mod tests {
         assert_eq!(
             policy.validation.on_completion,
             vec![
-                "file_exists:output/*.pptx",
+                "file_exists:output/deck.pptx",
                 "file_exists:output/**/slide-*.png",
             ]
         );
         assert_eq!(
+            policy.artifacts.entries.get("primary").map(String::as_str),
+            Some("output/deck.pptx")
+        );
+        assert_eq!(
             policy.artifacts.entries.get("deck").map(String::as_str),
-            Some("output/*.pptx")
+            Some("output/deck.pptx")
         );
         assert_eq!(
             policy.artifacts.entries.get("previews").map(String::as_str),
@@ -410,7 +418,15 @@ mod tests {
             vec!["file_exists:dist/index.html"]
         );
         assert_eq!(
-            policy.artifacts.entries.get("entrypoint").map(String::as_str),
+            policy.artifacts.entries.get("primary").map(String::as_str),
+            Some("dist/index.html")
+        );
+        assert_eq!(
+            policy
+                .artifacts
+                .entries
+                .get("entrypoint")
+                .map(String::as_str),
             Some("dist/index.html")
         );
     }
@@ -512,7 +528,10 @@ mod tests {
             on_failure: Vec::new(),
         };
 
-        assert_eq!(task.delivery_actions(), &["notify_user:deliver".to_string()]);
+        assert_eq!(
+            task.delivery_actions(),
+            &["notify_user:deliver".to_string()]
+        );
     }
 
     #[test]

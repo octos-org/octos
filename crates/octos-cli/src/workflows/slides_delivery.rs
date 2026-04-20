@@ -87,7 +87,7 @@ mod tests {
             policy
                 .validation
                 .on_completion
-                .contains(&"file_exists:output/*.pptx".to_string())
+                .contains(&"file_exists:output/deck.pptx".to_string())
         );
     }
 }

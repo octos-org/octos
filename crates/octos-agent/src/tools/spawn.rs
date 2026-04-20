@@ -691,13 +691,7 @@ fn ensure_subagent_tools_available(
     }
 }
 
-fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
-    match required_artifact_kind {
-        "presentation" => &["deck"],
-        "site" => &["entrypoint"],
-        _ => &[],
-    }
-}
+const PRIMARY_CONTRACT_ARTIFACT: &str = "primary";
 
 fn workflow_contract_kind_label(kind: WorkspaceProjectKind) -> &'static str {
     match kind {
@@ -901,49 +895,60 @@ fn resolve_contract_terminal_files(
         .as_ref()
         .ok_or_else(|| "workflow terminal output policy missing".to_string())?;
     let mut selected = Vec::new();
-    let mut matched_named_artifact = false;
+    let primary_declared = status
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == PRIMARY_CONTRACT_ARTIFACT);
+    let primary_ready = status
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == PRIMARY_CONTRACT_ARTIFACT && artifact.present);
 
-    for artifact_name in contract_artifact_priority(&terminal_output.required_artifact_kind) {
-        if let Some(_artifact) = status
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.name == *artifact_name && artifact.present)
-        {
-            matched_named_artifact = true;
-            if terminal_output.deliver_final_artifact_only {
-                let path = resolve_preferred_workspace_contract_artifact_path(
-                    workspace_root,
-                    artifact_name,
-                )
-                .map_err(|error| format!("workspace contract resolution failed: {error}"))?;
-                if let Some(path) = path {
-                    return Ok(Some(vec![path]));
-                }
-            } else {
-                selected.extend(
-                    resolve_workspace_contract_artifact_paths(workspace_root, artifact_name)
-                        .map_err(|error| {
-                            format!("workspace contract resolution failed: {error}")
-                        })?,
-                );
-            }
+    if terminal_output.deliver_final_artifact_only {
+        if !primary_declared {
+            return Err(format!(
+                "workspace contract for {} is ready but does not declare a '{}' artifact",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            ));
         }
+
+        if !primary_ready {
+            return Err(format!(
+                "workspace contract for {} is ready but its '{}' artifact is missing",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            ));
+        }
+
+        let path = resolve_preferred_workspace_contract_artifact_path(
+            workspace_root,
+            PRIMARY_CONTRACT_ARTIFACT,
+        )
+        .map_err(|error| format!("workspace contract resolution failed: {error}"))?;
+        return path.map(|path| Some(vec![path])).ok_or_else(|| {
+            format!(
+                "workspace contract for {} is ready but the '{}' artifact could not be resolved",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            )
+        });
     }
+
+    for artifact in status.artifacts.iter().filter(|artifact| artifact.present) {
+        selected.extend(
+            resolve_workspace_contract_artifact_paths(workspace_root, &artifact.name)
+                .map_err(|error| format!("workspace contract resolution failed: {error}"))?,
+        );
+    }
+
+    selected.sort();
+    selected.dedup();
 
     if !selected.is_empty() {
         return Ok(Some(selected));
     }
 
-    if matched_named_artifact {
-        return Err(format!(
-            "workspace contract for {} is ready but the declared terminal artifact could not be resolved",
-            status.repo_label
-        ));
-    }
-
     Err(format!(
-        "workspace contract for {} is ready but has no declared terminal artifact for '{}'",
-        status.repo_label, terminal_output.required_artifact_kind
+        "workspace contract for {} is ready but has no resolved artifact paths",
+        status.repo_label
     ))
 }
 async fn deliver_background_result(
