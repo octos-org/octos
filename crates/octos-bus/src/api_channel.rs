@@ -26,7 +26,7 @@ use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage, SessionKey,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::SessionManager;
@@ -42,12 +42,17 @@ pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+const SSE_CHANNEL_CAPACITY: usize = 1024;
+
+type SseSender = broadcast::Sender<String>;
+type SseReceiver = broadcast::Receiver<String>;
+
 /// Shared state for the API channel's HTTP handlers.
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: mpsc::Sender<InboundMessage>,
-    pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
-    watchers: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>>,
+    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     auth_token: Option<String>,
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
@@ -61,6 +66,29 @@ fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
         Some(topic) => format!("{chat_id}::{}", topic.trim()),
         None => chat_id.to_string(),
     }
+}
+
+fn new_sse_channel() -> (SseSender, SseReceiver) {
+    broadcast::channel(SSE_CHANNEL_CAPACITY)
+}
+
+fn sse_stream_from_receiver(
+    rx: SseReceiver,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(data) => {
+                    let event: Result<Event, Infallible> = Ok(Event::default().data(data));
+                    return Some((event, rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "dropping lagged SSE events");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
 }
 
 fn record_replay(kind: &'static str, outcome: &'static str, count: usize) {
@@ -134,8 +162,8 @@ pub struct ApiChannel {
     auth_token: Option<String>,
     profile_id: Option<String>,
     shutdown: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
-    watchers: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>>,
+    pending: Arc<Mutex<HashMap<String, SseSender>>>,
+    watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     /// Track last sent content per chat_id for delta computation.
     last_content: Arc<Mutex<HashMap<String, String>>>,
     sessions: Arc<Mutex<SessionManager>>,
@@ -352,9 +380,8 @@ impl ApiChannel {
 
         let mut watchers = self.watchers.lock().await;
         let key = watcher_key(chat_id, topic);
-        if let Some(subscribers) = watchers.get_mut(&key) {
-            subscribers.retain(|tx| tx.send(payload.clone()).is_ok());
-            if subscribers.is_empty() {
+        if let Some(tx) = watchers.get(&key) {
+            if tx.send(payload).is_err() {
                 watchers.remove(&key);
             }
         }
@@ -963,10 +990,7 @@ async fn handle_chat(
     let rx = {
         let mut pending = state.pending.lock().await;
         let stale = if let Some(old_tx) = pending.get(&session_id) {
-            // Test if the receiver is still alive by sending a keepalive
-            old_tx
-                .send(serde_json::json!({"type":"keepalive"}).to_string())
-                .is_err()
+            old_tx.receiver_count() == 0
         } else {
             false
         };
@@ -978,7 +1002,7 @@ async fn handle_chat(
             // Previous stream still active — queue on existing
             None
         } else {
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let (tx, rx) = new_sse_channel();
             for event in initial_sse_events(!req.media.is_empty()) {
                 let _ = tx.send(event);
             }
@@ -1032,18 +1056,7 @@ async fn handle_chat(
         .into_response();
     };
 
-    // Return SSE stream that forwards events from the unbounded receiver
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, Infallible> = Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None, // Channel closed (sender dropped) → stream ends
-        }
-    });
-
-    Sse::new(stream)
+    Sse::new(sse_stream_from_receiver(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -1064,14 +1077,16 @@ async fn handle_session_event_stream(
         }
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    {
+    let rx = {
         let mut watchers = state.watchers.lock().await;
         watchers
             .entry(watcher_key(&id, params.topic.as_deref()))
-            .or_default()
-            .push(tx);
-    }
+            .or_insert_with(|| {
+                let (tx, _rx) = new_sse_channel();
+                tx
+            })
+            .subscribe()
+    };
 
     let mut replay_events = replay_task_status_events(&state, &id, params.topic.as_deref()).await;
     replay_events.extend(
@@ -1081,15 +1096,7 @@ async fn handle_session_event_stream(
     replay_events.push(build_replay_complete_event(params.topic.as_deref()).to_string());
     record_replay("stream", "opened", 1);
 
-    let live_stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, Infallible> = Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None,
-        }
-    });
+    let live_stream = sse_stream_from_receiver(rx);
 
     let replay_stream = stream::iter(
         replay_events
@@ -1706,6 +1713,7 @@ async fn handle_admin_shell(
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -2099,6 +2107,20 @@ mod tests {
         assert_eq!(parsed[1]["tool"], "preprocessing");
     }
 
+    #[tokio::test]
+    async fn sse_channel_bounds_buffer_and_drops_oldest_events() {
+        let (tx, mut rx) = new_sse_channel();
+        for i in 0..=SSE_CHANNEL_CAPACITY {
+            let _ = tx.send(i.to_string());
+        }
+
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        assert_eq!(rx.recv().await.unwrap(), "1");
+    }
+
     #[test]
     fn build_bg_task_tool_start_events_adds_tts_compatibility_event() {
         let tasks = serde_json::json!([
@@ -2123,7 +2145,7 @@ mod tests {
             test_sessions(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -2156,7 +2178,7 @@ mod tests {
             sessions,
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -2335,7 +2357,7 @@ mod tests {
             test_sessions(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-chat".into(), tx);
@@ -2371,7 +2393,10 @@ mod tests {
         assert_eq!(parsed["tokens_out"], 456);
 
         // Sender was removed — next recv returns None
-        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -2389,7 +2414,7 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         let source = source_dir.join("test.mp3");
         std::fs::write(&source, b"bg-audio").unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-bg".into(), tx);
@@ -2413,7 +2438,10 @@ mod tests {
         assert_eq!(parsed["has_bg_tasks"], true);
 
         // SSE closes immediately — client will poll session history
-        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
 
         // Background file arrives later — persisted to session history
         let file_msg = OutboundMessage {
@@ -2455,7 +2483,7 @@ mod tests {
                 { "id": "task-1", "tool_name": "Direct TTS", "status": "running" }
             ])
         }));
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-bg-compat".into(), tx);
@@ -2533,7 +2561,7 @@ mod tests {
             sessions.clone(),
             Some(TEST_PROFILE_ID.to_string()),
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = new_sse_channel();
         {
             let mut pending = ch.pending.lock().await;
             pending.insert("test-file".into(), tx);
