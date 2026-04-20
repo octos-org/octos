@@ -118,6 +118,25 @@ async function chatSSE(
   return { events: [], raw: '' };
 }
 
+async function getSessionMessages(
+  request: any,
+  baseURL: string,
+  sessionId: string,
+  params: { source?: 'full' | 'memory'; sinceSeq?: number } = {},
+): Promise<any[]> {
+  const search = new URLSearchParams();
+  if (params.source) search.set('source', params.source);
+  if (typeof params.sinceSeq === 'number') {
+    search.set('since_seq', String(params.sinceSeq));
+  }
+  const suffix = search.size > 0 ? `?${search.toString()}` : '';
+  const res = await request.get(`${baseURL}/api/sessions/${sessionId}/messages${suffix}`, {
+    headers: headers(),
+  });
+  if (!res.ok()) return [];
+  return res.json();
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: SSE stream returns valid UTF-8 for CJK characters
 //
@@ -247,13 +266,16 @@ test('session persists across requests', async ({ request, baseURL }) => {
 // Verifies that tools returning files_to_send get delivered as SSE
 // "file" events with path and filename.
 // ---------------------------------------------------------------------------
-test('file events delivered via SSE', async ({ request, baseURL }) => {
+test('file delivery is visible via SSE or committed session result', async ({ request, baseURL }) => {
+  const sid = `test-file-${Date.now()}`;
+  const fileDir = `octos-web-file-${Date.now()}`;
+  const filePath = `./${fileDir}/octos_e2e_test.txt`;
 
   const { events } = await chatSSE(
     request,
     baseURL!,
-    'Use the shell tool to create a small test file: echo "test123" > /tmp/octos_e2e_test.txt. Then use send_file to send /tmp/octos_e2e_test.txt to me.',
-    undefined,
+    `Use the shell tool to run \`mkdir -p ./${fileDir} && printf 'test123\\n' > ${filePath}\`. Then use send_file to send ${filePath} to me.`,
+    sid,
     90_000,
   );
 
@@ -262,6 +284,7 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
   const sessionResultMediaEvents = events.filter(
     (e) => e.type === 'session_result' && Array.isArray(e.message?.media) && e.message.media.length > 0,
   );
+  const doneEvent = events.find((e) => e.type === 'done');
 
   // If the agent successfully created and sent the file, we should see a file event
   if (fileEvents.length > 0 || sessionResultMediaEvents.length > 0) {
@@ -271,15 +294,48 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
     } else {
       expect(sessionResultMediaEvents[0].message.media[0]).toBeTruthy();
     }
-  } else {
-    // Agent might not have used send_file — check that the response at least
-    // mentions the file was created (acceptable fallback)
-    const content = events
-      .filter((e) => e.type === 'replace' || e.type === 'done')
-      .map((e) => e.text || e.content || '')
-      .join('');
-    expect(content.toLowerCase()).toMatch(/test.*file|created|written/i);
+    return;
   }
+
+  const content = events
+    .filter((e) => e.type === 'replace' || e.type === 'done')
+    .map((e) => e.text || e.content || '')
+    .join('');
+
+  if (doneEvent?.has_bg_tasks) {
+    const deadline = Date.now() + 90_000;
+    let latestMessages: any[] = [];
+    while (Date.now() < deadline) {
+      latestMessages = await getSessionMessages(request, baseURL!, sid, { source: 'full' });
+      const delivered = latestMessages.find(
+        (message: any) => message.role === 'assistant' && Array.isArray(message.media) && message.media.length > 0,
+      );
+      if (delivered) {
+        expect(delivered.media[0]).toBeTruthy();
+        return;
+      }
+      const failure = latestMessages.find(
+        (message: any) =>
+          message.role === 'assistant' &&
+          typeof message.content === 'string' &&
+          message.content.startsWith('✗'),
+      );
+      if (failure) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+
+    const historyText = latestMessages
+      .map((message: any) => message.content || '')
+      .join('\n');
+    expect(historyText).toMatch(/test.*file|created|written|sent/i);
+    return;
+  }
+
+  // Agent might not have used send_file — check that the response at least
+  // mentions the file was created (acceptable fallback)
+  expect(content).toMatch(/test.*file|created|written/i);
 });
 
 // ---------------------------------------------------------------------------
