@@ -17,6 +17,8 @@
 import { expect, test } from '@playwright/test';
 
 import {
+  countAssistantBubbles,
+  countUserBubbles,
   SEL,
   createNewSession,
   expectSingleTurn,
@@ -47,7 +49,7 @@ function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
 
   return [
     'Use shell tool only.',
-    'If shell is not already active, activate it first.',
+    'If shell is not already active, call activate_tools with exactly ["shell"] once and only once.',
     `Run \`mkdir -p ./${repoName} && cd ./${repoName} && git init\` to create a temporary git repo inside the current workspace.`,
     'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
     'All subsequent shell commands must run from that repo root unless a step says otherwise.',
@@ -56,6 +58,7 @@ function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
     'Make exactly one edit: change beta to gamma.',
     'Then run git diff -- notes.txt.',
     tail,
+    'Do not explain tool availability.',
     'Do not start background work.',
   ].join(' ');
 }
@@ -287,8 +290,10 @@ test.describe('Phase 3 coding hard cases', () => {
       const alphaText = await getChatThreadText(first.page);
       const betaText = await getChatThreadText(second.page);
 
-      await expectSingleTurn(first.page);
-      await expectSingleTurn(second.page);
+      await expect.poll(() => countUserBubbles(first.page)).toBe(1);
+      await expect.poll(() => countUserBubbles(second.page)).toBe(1);
+      await expect.poll(() => countAssistantBubbles(first.page)).toBeGreaterThan(0);
+      await expect.poll(() => countAssistantBubbles(second.page)).toBeGreaterThan(0);
 
       expect(alphaResult.responseText).toContain(alphaToken);
       expect(betaResult.responseText).toContain(betaToken);
