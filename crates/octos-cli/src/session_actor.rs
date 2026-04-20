@@ -602,6 +602,7 @@ fn sanitize_task_for_response(
         "parent_session_key": task.parent_session_key,
         "child_session_key": task.child_session_key,
         "status": task.status,
+        "lifecycle_state": task.lifecycle_state(),
         "started_at": task.started_at,
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
@@ -4799,6 +4800,7 @@ mod tests {
         let payload = store.query_json(&session_key.to_string());
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["lifecycle_state"], "ready");
         assert_eq!(tasks[0]["runtime_state"], "completed");
         assert_eq!(tasks[0]["runtime_detail"], "send_file");
         let files = tasks[0]["output_files"].as_array().unwrap();
@@ -4861,6 +4863,7 @@ mod tests {
         let payload = store.query_json(&session_key.to_string());
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["lifecycle_state"], "ready");
         assert_eq!(tasks[0]["runtime_state"], "completed");
         assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
         assert_eq!(tasks[0]["current_phase"], "deliver_result");
@@ -4875,6 +4878,52 @@ mod tests {
         assert_eq!(tasks[0]["child_terminal_state"], "completed");
         assert_eq!(tasks[0]["child_join_state"], "joined");
         assert!(tasks[0]["child_failure_action"].is_null());
+    }
+
+    #[test]
+    fn session_task_query_store_projects_verifying_lifecycle_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "site_build",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::VerifyingOutputs,
+            Some(
+                serde_json::json!({
+                    "workflow_kind": "site",
+                    "current_phase": "verify_contract"
+                })
+                .to_string(),
+            ),
+        );
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["lifecycle_state"], "verifying");
+        assert_eq!(tasks[0]["runtime_state"], "verifying_outputs");
+        assert_eq!(tasks[0]["workflow_kind"], "site");
+        assert_eq!(tasks[0]["current_phase"], "verify_contract");
+        assert_eq!(tasks[0]["runtime_detail"]["workflow_kind"], "site");
+        assert_eq!(
+            tasks[0]["runtime_detail"]["current_phase"],
+            "verify_contract"
+        );
     }
 
     #[test]

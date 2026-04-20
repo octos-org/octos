@@ -53,7 +53,9 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
-pub use task_supervisor::{BackgroundTask, TaskRuntimeState, TaskStatus, TaskSupervisor};
+pub use task_supervisor::{
+    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+};
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,

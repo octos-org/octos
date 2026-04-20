@@ -91,6 +91,21 @@ pub enum TaskRuntimeState {
     Failed,
 }
 
+/// Stable externally-facing lifecycle state for background tasks.
+///
+/// This is the coarse public contract that callers and UIs should consume.
+/// It intentionally groups several internal runtime phases under `verifying`
+/// so the runtime can evolve without leaking extra state-machine detail.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleState {
+    Queued,
+    Running,
+    Verifying,
+    Ready,
+    Failed,
+}
+
 /// A tracked background task spawned by a spawn_only tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundTask {
@@ -125,6 +140,27 @@ pub struct BackgroundTask {
     /// Session that owns this task (for per-session filtering).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+}
+
+impl BackgroundTask {
+    pub fn lifecycle_state(&self) -> TaskLifecycleState {
+        match self.status {
+            TaskStatus::Spawned => TaskLifecycleState::Queued,
+            TaskStatus::Completed => TaskLifecycleState::Ready,
+            TaskStatus::Failed => TaskLifecycleState::Failed,
+            TaskStatus::Running => match self.runtime_state {
+                TaskRuntimeState::Spawned | TaskRuntimeState::ExecutingTool => {
+                    TaskLifecycleState::Running
+                }
+                TaskRuntimeState::ResolvingOutputs
+                | TaskRuntimeState::VerifyingOutputs
+                | TaskRuntimeState::DeliveringOutputs
+                | TaskRuntimeState::CleaningUp
+                | TaskRuntimeState::Completed => TaskLifecycleState::Verifying,
+                TaskRuntimeState::Failed => TaskLifecycleState::Failed,
+            },
+        }
+    }
 }
 
 /// Callback invoked when a task's status changes.
@@ -682,11 +718,14 @@ mod tests {
     fn should_transition_through_lifecycle_states() {
         let supervisor = TaskSupervisor::new();
         let id = supervisor.register("tts", "call-1", None);
+        let task = &supervisor.get_all_tasks()[0];
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Queued);
 
         supervisor.mark_running(&id);
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(task.runtime_state, TaskRuntimeState::ExecutingTool);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Running);
 
         supervisor.mark_runtime_state(
             &id,
@@ -697,11 +736,13 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(task.runtime_state, TaskRuntimeState::DeliveringOutputs);
         assert_eq!(task.runtime_detail.as_deref(), Some("send_file"));
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Verifying);
 
         supervisor.mark_completed(&id, vec!["output.mp3".to_string()]);
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Completed);
         assert_eq!(task.runtime_state, TaskRuntimeState::Completed);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Ready);
         assert!(task.completed_at.is_some());
         assert_eq!(task.output_files, vec!["output.mp3"]);
     }
@@ -741,6 +782,7 @@ mod tests {
         let task = &supervisor.get_all_tasks()[0];
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.runtime_state, TaskRuntimeState::Failed);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Failed);
         assert_eq!(task.error.as_deref(), Some("connection refused"));
         assert!(task.completed_at.is_some());
     }
