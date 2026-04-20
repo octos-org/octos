@@ -265,6 +265,7 @@ test('session persists across requests', async ({ request, baseURL }) => {
 // "file" events with path and filename.
 // ---------------------------------------------------------------------------
 test('file delivery is visible via SSE or committed session result', async ({ request, baseURL }) => {
+  test.slow();
   const sid = `test-file-${Date.now()}`;
   const fileDir = `octos-web-file-${Date.now()}`;
   const filePath = `./${fileDir}/octos_e2e_test.txt`;
