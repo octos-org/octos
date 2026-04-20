@@ -46,8 +46,9 @@ function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
   return [
     'Use shell tool only.',
     'If shell is not already active, activate it first.',
-    `Create a temporary git repo inside the current workspace at ./${repoName}.`,
+    `Run \`mkdir -p ./${repoName} && cd ./${repoName} && git init\` to create a temporary git repo inside the current workspace.`,
     'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
+    'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
     'Run git add notes.txt so the file is tracked before editing it.',
     'Make exactly one edit: change beta to gamma.',
@@ -65,8 +66,9 @@ function buildRepairPrompt(repoName: string, returnToken?: string) {
   return [
     'Use shell tool only.',
     'If shell is not already active, activate it first.',
-    `Create a temporary git repo inside the current workspace at ./${repoName}.`,
+    `Run \`mkdir -p ./${repoName} && cd ./${repoName} && git init\` to create a temporary git repo inside the current workspace.`,
     'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
+    'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
     'Create check.sh that exits 0 only when the second line of notes.txt is gamma and exits 1 otherwise.',
     'Make check.sh executable.',
@@ -103,8 +105,9 @@ function buildLongRepairPrompt(repoName: string, resumeMarker: string) {
   return [
     'Use shell tool only.',
     'If shell is not already active, activate it first.',
-    `Create a temporary git repo inside the current workspace at ./${repoName}.`,
+    `Run \`mkdir -p ./${repoName} && cd ./${repoName} && git init\` to create a temporary git repo inside the current workspace.`,
     'Stay inside the current workspace; do not use /tmp or any other absolute temp directory.',
+    'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
     'Create check.sh that exits 0 only when the second line of notes.txt is gamma and exits 1 otherwise.',
     'Make check.sh executable.',
