@@ -23,7 +23,7 @@ pub async fn handle_skills_command(
     match parts.first().copied().unwrap_or("list") {
         "" | "list" => match crate::commands::skills::list_skills(&skills_dir) {
             Ok(entries) if entries.is_empty() => {
-                "No skills installed.\nInstall with: /skills install <user/repo>".to_string()
+                "No skills installed.\nInstall with: /skills install <user/repo | git-url | local-path>".to_string()
             }
             Ok(entries) => {
                 let mut lines = vec![format!("{} skill(s) installed:", entries.len())];
@@ -53,7 +53,7 @@ pub async fn handle_skills_command(
         "install" => {
             let repo = parts.get(1).copied().unwrap_or("").trim();
             if repo.is_empty() {
-                return "Usage: /skills install <user/repo>".to_string();
+                return "Usage: /skills install <user/repo | git-url | local-path>".to_string();
             }
             let skills_dir_c = skills_dir.clone();
             let repo_c = repo.to_string();
@@ -102,7 +102,7 @@ pub async fn handle_skills_command(
         }
 
         other => format!(
-            "Unknown /skills subcommand: {other}\nUsage:\n  /skills — list installed skills\n  /skills install <user/repo> — install from GitHub\n  /skills remove <name> — remove a skill"
+            "Unknown /skills subcommand: {other}\nUsage:\n  /skills — list installed skills\n  /skills install <user/repo | git-url | local-path> — install a skill\n  /skills remove <name> — remove a skill"
         ),
     }
 }

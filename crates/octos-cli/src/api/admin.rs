@@ -1596,6 +1596,7 @@ pub async fn list_profile_skills(
 
 #[derive(Deserialize)]
 pub struct InstallSkillRequest {
+    /// Skill source: GitHub shorthand, full Git URL, or local path.
     pub repo: String,
     #[serde(default)]
     pub force: bool,
@@ -1607,7 +1608,7 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
-/// POST /api/admin/profiles/:id/skills — install a skill from GitHub.
+/// POST /api/admin/profiles/:id/skills — install a skill from GitHub shorthand, a full Git URL, or a local path.
 pub async fn install_profile_skill(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

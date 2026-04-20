@@ -110,7 +110,7 @@ export default function SkillsPage() {
 
         {skills.length === 0 ? (
           <div className="px-5 py-8 text-center text-gray-500 text-sm">
-            No skills installed. Install one from GitHub below.
+            No skills installed. Install one from GitHub shorthand, a Git URL, or a local path below.
           </div>
         ) : (
           <div className="divide-y divide-gray-700/30">
@@ -157,25 +157,25 @@ export default function SkillsPage() {
         )}
       </div>
 
-      {/* Install from GitHub */}
+      {/* Install skill source */}
       {isAdmin && (
         <div className="bg-surface rounded-xl border border-gray-700/50 overflow-hidden">
           <div className="px-5 py-4 border-b border-gray-700/30">
             <h2 className="text-sm font-semibold text-gray-300">
-              Install from GitHub
+              Install Skill
             </h2>
           </div>
           <div className="p-5 space-y-4">
             <div className="flex gap-3">
               <div className="flex-1">
                 <label className="block text-xs text-gray-400 mb-1">
-                  Repository (user/repo or user/repo/skill-name)
+                  Source (GitHub shorthand, Git URL, or local path)
                 </label>
                 <input
                   type="text"
                   value={repo}
                   onChange={(e) => setRepo(e.target.value)}
-                  placeholder="e.g. hagency-org/crew-skills"
+                  placeholder="e.g. octos-org/system-skills, https://host/org/repo.git, or ./skills/my-skill"
                   className="w-full px-3 py-2 bg-black/30 border border-gray-700 rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-accent"
                   onKeyDown={(e) => e.key === 'Enter' && handleInstall()}
                 />
@@ -213,7 +213,7 @@ export default function SkillsPage() {
               )}
             </div>
             <p className="text-xs text-gray-600">
-              Skills are installed to the profile's data directory. The gateway must be restarted to load new skills.
+              Skills are installed to the profile&apos;s data directory. Accepted inputs: user/repo, user/repo/skill-name, full Git URL, or local path. Branch applies to Git installs. The gateway must be restarted to load new skills.
             </p>
           </div>
         </div>
