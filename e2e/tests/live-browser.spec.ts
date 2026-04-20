@@ -286,7 +286,7 @@ test.describe('Live browser smoke', () => {
   test('short TTS success renders exactly one audio attachment', async ({
     page,
   }) => {
-    await sendAndWait(page, '用杨幂声音说：你好世界', {
+    await sendAndWait(page, '用自定义声音 yangmi 说：你好世界', {
       label: 'live-short-tts-smoke',
       maxWait: 60_000,
     });

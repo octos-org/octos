@@ -233,7 +233,7 @@ test.describe('Coding shell repair', () => {
 test.describe('Background task lifecycle', () => {
   test('TTS spawn_only returns immediately with bg_tasks=true', async () => {
     const sid = `tts-bg-${Date.now()}`;
-    const { doneEvent } = await chatSSE('用杨幂声音说：测试消息', sid);
+    const { doneEvent } = await chatSSE('用自定义声音 yangmi 说：测试消息', sid);
 
     expect(doneEvent).toBeTruthy();
     expect(doneEvent!.has_bg_tasks).toBe(true);
@@ -262,7 +262,7 @@ test.describe('Background task lifecycle', () => {
 
   test('TTS task completes and delivers file (#388, #366)', async () => {
     const sid = `tts-deliver-${Date.now()}`;
-    await chatSSE('用杨幂声音说：你好世界', sid);
+    await chatSSE('用自定义声音 yangmi 说：你好世界', sid);
 
     // Poll for task completion (up to 30s)
     let completed = false;
@@ -291,7 +291,7 @@ test.describe('Background task lifecycle', () => {
   test('regular messages work while TTS runs in background', async () => {
     const sid = `tts-nonblock-${Date.now()}`;
     // Start TTS
-    await chatSSE('用杨幂声音说：后台测试', sid);
+    await chatSSE('用自定义声音 yangmi 说：后台测试', sid);
 
     // Immediately send a regular question — should not be blocked
     const { content, doneEvent } = await chatSSE('what is 3+3', sid, 30_000);
