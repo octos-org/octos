@@ -32,43 +32,83 @@ function headers() {
  * Profile is resolved from X-Profile-Id header or auth token.
  */
 async function chatSSE(
-  request: any,
+  _request: any,
   baseURL: string,
   message: string,
   sessionId?: string,
-  timeoutMs = 30_000,
+  timeoutMs = 60_000,
 ): Promise<{ events: any[]; raw: string }> {
   const sid = sessionId || `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  // Playwright's request.post reads the full response body, which works
-  // for SSE since the server closes the stream after the done event.
-  // We retry once on empty response (race condition with SSE flush).
+  // Use a real streaming reader for SSE. Playwright's request.post buffers the
+  // full body and can time out on longer streams before the server closes it.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await request.post(`${baseURL}/api/chat`, {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(`${baseURL}/api/chat`, {
+      method: 'POST',
       headers: headers(),
-      data: { message, session_id: attempt === 0 ? sid : `${sid}-r`, stream: true },
-      timeout: timeoutMs,
+      body: JSON.stringify({
+        message,
+        session_id: attempt === 0 ? sid : `${sid}-r`,
+        stream: true,
+      }),
+      signal: controller.signal,
     });
 
-    const raw = await res.text();
-    const events: any[] = [];
+    if (!res.ok) {
+      clearTimeout(timeout);
+      const body = await res.text().catch(() => '');
+      throw new Error(`chat failed: ${res.status} ${body.slice(0, 200)}`);
+    }
 
-    // Parse SSE format: "data: {...}\n\n"
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('data:')) {
-        const json = trimmed.slice(5).trim();
-        if (json) {
+    if (!res.body) {
+      clearTimeout(timeout);
+      if (attempt === 1) {
+        return { events: [], raw: '' };
+      }
+      continue;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let raw = '';
+    let buffer = '';
+    const events: any[] = [];
+    let sawDone = false;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        raw += chunk;
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const json = trimmed.slice(5).trim();
+          if (!json || json === '[DONE]') continue;
           try {
-            events.push(JSON.parse(json));
+            const event = JSON.parse(json);
+            events.push(event);
+            if (event?.type === 'done') {
+              sawDone = true;
+              return { events, raw };
+            }
           } catch {
             // skip non-JSON lines
           }
         }
       }
+    } finally {
+      clearTimeout(timeout);
+      reader.releaseLock();
     }
 
-    if (events.length > 0 || attempt === 1) {
+    if (sawDone || events.length > 0 || attempt === 1) {
       return { events, raw };
     }
     // Empty response — wait briefly and retry with fresh session
@@ -214,7 +254,7 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
     baseURL!,
     'Use the shell tool to create a small test file: echo "test123" > /tmp/octos_e2e_test.txt. Then use send_file to send /tmp/octos_e2e_test.txt to me.',
     undefined,
-    45_000,
+    90_000,
   );
 
   // Look for a file event in the SSE stream
