@@ -32,6 +32,20 @@ fn split_tool_calls<'a>(
     tool_calls.chunks(batch_size).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellRetryRecoveryKind {
+    DiffLikeSuccess,
+    UsefulSuccess,
+    ValidationSuccess,
+    RetryLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellRetryRecovery {
+    kind: ShellRetryRecoveryKind,
+    content: String,
+}
+
 impl Agent {
     fn enforce_session_limits_on_tool_calls(
         &self,
@@ -376,13 +390,17 @@ impl Agent {
                                 if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
                                 {
                                     warn!("loop detected — breaking agent loop");
-                                    if let Some(recovered) = recover_shell_retry_output(
+                                    if let Some(recovery) = recover_shell_retry(
                                         &messages,
                                         SHELL_RETRY_RECOVERY_THRESHOLD,
                                     ) {
+                                        warn!(
+                                            recovery_kind = ?recovery.kind,
+                                            "loop detected after repeated shell attempts; returning recovered shell output"
+                                        );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
-                                            content: recovered,
+                                            content: recovery.content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -422,13 +440,17 @@ impl Agent {
                             )
                             .await?;
 
-                            if let Some(recovered) = recover_shell_retry_output(
+                            if let Some(recovery) = recover_shell_retry(
                                 &messages,
                                 SHELL_RETRY_RECOVERY_THRESHOLD,
                             ) {
+                                warn!(
+                                    recovery_kind = ?recovery.kind,
+                                    "ending turn after repeated shell attempts with recovered shell output"
+                                );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
-                                    content: recovered,
+                                    content: recovery.content,
                                     reasoning_content: None,
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(
@@ -923,7 +945,10 @@ fn merge_tool_messages_in_order(
     ordered
 }
 
-fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> Option<String> {
+fn recover_shell_retry(
+    messages: &[Message],
+    min_shell_streak: usize,
+) -> Option<ShellRetryRecovery> {
     let recent = recent_tool_results(messages, min_shell_streak * 3);
     let shell_results: Vec<&str> = recent
         .iter()
@@ -943,7 +968,19 @@ fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> 
     shell_results
         .iter()
         .find(|content| is_diff_like_shell_output(content))
-        .map(|content| strip_success_exit_suffix(content))
+        .map(|content| ShellRetryRecovery {
+            kind: ShellRetryRecoveryKind::DiffLikeSuccess,
+            content: strip_success_exit_suffix(content),
+        })
+        .or_else(|| {
+            shell_results
+                .iter()
+                .find(|content| is_useful_shell_output(content))
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::UsefulSuccess,
+                    content: strip_success_exit_suffix(content),
+                })
+        })
         .or_else(|| {
             (failed_shells >= 2)
                 .then(|| {
@@ -952,13 +989,19 @@ fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> 
                         .find(|content| is_validation_like_shell_output(content))
                 })
                 .flatten()
-                .map(|content| strip_success_exit_suffix(content))
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::ValidationSuccess,
+                    content: strip_success_exit_suffix(content),
+                })
         })
         .or_else(|| {
             (failed_shells >= min_shell_streak.saturating_sub(1))
                 .then(|| shell_results.first().copied())
                 .flatten()
-                .map(shell_retry_limit_message)
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::RetryLimit,
+                    content: shell_retry_limit_message(content),
+                })
         })
 }
 
@@ -1581,9 +1624,10 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should recover");
-        assert!(recovered.contains("diff --git"));
-        assert!(!recovered.contains("Exit code: 0"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
+        assert!(recovered.content.contains("diff --git"));
+        assert!(!recovered.content.contains("Exit code: 0"));
     }
 
     #[test]
@@ -1707,9 +1751,114 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should recover");
-        assert!(recovered.contains("diff --git"));
-        assert!(!recovered.contains("Exit code: 0"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
+        assert!(recovered.content.contains("diff --git"));
+        assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_accepts_useful_non_diff_success() {
+        let messages = vec![
+            Message::user("repair the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: first failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --workspace"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: second failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git status --short"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --locked"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: third failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
+        assert!(recovered.content.contains("src/lib.rs"));
+        assert!(!recovered.content.contains("Exit code: 0"));
     }
 
     #[test]
@@ -1810,8 +1959,9 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should stop");
-        assert!(recovered.contains("[SHELL RETRY LIMIT]"));
-        assert!(recovered.contains("could not find Cargo.toml"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should stop");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
+        assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
+        assert!(recovered.content.contains("could not find Cargo.toml"));
     }
 }

@@ -80,6 +80,54 @@ fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
         .env("npm_config_cache", &cache_dir);
 }
 
+#[cfg(windows)]
+const NULL_DEVICE_PATH: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE_PATH: &str = "/dev/null";
+
+fn contains_git_invocation(command: &str) -> bool {
+    command
+        .split(['\n', ';'])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .any(segment_invokes_git)
+}
+
+fn segment_invokes_git(segment: &str) -> bool {
+    let mut remaining = segment.trim_start();
+    loop {
+        if remaining == "git" || remaining.starts_with("git ") {
+            return true;
+        }
+        let Some(token_end) = remaining.find(char::is_whitespace) else {
+            return false;
+        };
+        let token = &remaining[..token_end];
+        if token == "env" || looks_like_env_assignment(token) {
+            remaining = remaining[token_end..].trim_start();
+            continue;
+        }
+        return false;
+    }
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn apply_git_tool_env(cmd: &mut tokio::process::Command, command: &str) {
+    if contains_git_invocation(command) {
+        cmd.env("GIT_CONFIG_GLOBAL", NULL_DEVICE_PATH)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ShellInput {
     command: String,
@@ -165,6 +213,7 @@ impl Tool for ShellTool {
         let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, &self.cwd);
+        apply_git_tool_env(&mut cmd, &input.command);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -354,5 +403,15 @@ mod tests {
         let cache = lines.next().unwrap_or_default();
         assert!(cache.contains("octos-frontend-tool-cache"));
         assert!(!cache.contains(".octos-tool-cache"));
+    }
+
+    #[test]
+    fn detects_git_invocation_in_compound_shell_command() {
+        assert!(contains_git_invocation(
+            "cd /tmp/repo && git diff -- notes.txt"
+        ));
+        assert!(contains_git_invocation("GIT_DIR=.git git status --short"));
+        assert!(contains_git_invocation("env GIT_DIR=.git git status"));
+        assert!(!contains_git_invocation("printf 'git diff -- notes.txt'"));
     }
 }
