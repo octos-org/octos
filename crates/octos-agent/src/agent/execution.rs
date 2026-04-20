@@ -20,7 +20,7 @@ fn should_auto_send_tool_files(
     explicit_send_file_requested: bool,
     tool_name: &str,
 ) -> bool {
-    !suppress_auto_send_files && !(explicit_send_file_requested && tool_name != "send_file")
+    !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
 }
 
 impl Agent {
@@ -62,7 +62,6 @@ impl Agent {
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
                 let suppress_auto_send_files = self.config.suppress_auto_send_files;
-                let explicit_send_file_requested = explicit_send_file_requested;
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();

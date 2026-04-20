@@ -24,10 +24,10 @@ use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
-fn split_tool_calls<'a>(
-    tool_calls: &'a [octos_core::ToolCall],
+fn split_tool_calls(
+    tool_calls: &[octos_core::ToolCall],
     batch_size: usize,
-) -> Vec<&'a [octos_core::ToolCall]> {
+) -> Vec<&[octos_core::ToolCall]> {
     debug_assert!(batch_size > 0);
     tool_calls.chunks(batch_size).collect()
 }
