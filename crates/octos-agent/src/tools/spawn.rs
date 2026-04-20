@@ -213,6 +213,64 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
     }
 }
 
+fn parse_modified_spawn_verify_output_files(
+    modified: serde_json::Value,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let files = match modified {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut object) => object
+            .remove("output_files")
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| {
+                "before_spawn_verify hook must return {\"output_files\": [...]} or a JSON string array"
+                    .to_string()
+            })?,
+        _ => {
+            return Err(
+                "before_spawn_verify hook must return {\"output_files\": [...]} or a JSON string array"
+                    .to_string(),
+            )
+        }
+    };
+
+    files
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(path) => Ok(PathBuf::from(path)),
+            _ => Err("before_spawn_verify output_files entries must be strings".to_string()),
+        })
+        .collect()
+}
+
+async fn run_before_spawn_verify_hook(
+    hooks: Option<&Arc<HookExecutor>>,
+    payload: HookPayload,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let default_files = payload
+        .output_files
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let Some(hooks) = hooks else {
+        return Ok(default_files);
+    };
+    let event = payload.event;
+
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => Ok(default_files),
+        HookResult::Modified(modified) => parse_modified_spawn_verify_output_files(modified),
+        HookResult::Deny(reason) => Err(reason),
+        HookResult::Error(error) => {
+            warn!(
+                event = ?event,
+                error,
+                "pre-verify lifecycle hook failed; continuing with runtime output files"
+            );
+            Ok(default_files)
+        }
+    }
+}
+
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
     llm: Arc<dyn LlmProvider>,
@@ -1284,7 +1342,7 @@ impl Tool for SpawnTool {
                     Ok(()) => worker.run_task(&subtask).await,
                     Err(error) => Err(error),
                 };
-                let contract_failure = match &result {
+                let mut contract_failure = match &result {
                     Ok(task_result) if task_result.success => resolve_background_terminal_files(
                         &working_dir,
                         &task_result.files_to_send,
@@ -1294,7 +1352,7 @@ impl Tool for SpawnTool {
                     .err(),
                     _ => None,
                 };
-                let terminal_files = match (&result, contract_failure.as_ref()) {
+                let mut terminal_files = match (&result, contract_failure.as_ref()) {
                     (Ok(task_result), None) if task_result.success => {
                         resolve_background_terminal_files(
                             &working_dir,
@@ -1306,10 +1364,6 @@ impl Tool for SpawnTool {
                     }
                     _ => Vec::new(),
                 };
-                let tracked_output_files = terminal_files
-                    .iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>();
                 let workflow_kind = workflow_metadata
                     .as_ref()
                     .map(|workflow| workflow.workflow_kind.clone());
@@ -1319,6 +1373,50 @@ impl Tool for SpawnTool {
                 let verify_phase = workflow_phase
                     .clone()
                     .or_else(|| Some("verify_outputs".to_string()));
+
+                if matches!((&result, contract_failure.as_ref()), (Ok(task_result), None) if task_result.success)
+                {
+                    if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                        tracked_task_id.as_ref(),
+                        parent_session_key.as_ref(),
+                        tracked_child_session_key.as_ref(),
+                    ) {
+                        let before_verify_payload = HookPayload::before_spawn_verify(
+                            task_id.clone(),
+                            task_label.clone(),
+                            parent_session_key.clone(),
+                            child_session_key.clone(),
+                            workflow_kind.clone(),
+                            verify_phase.clone(),
+                            Some("candidate terminal outputs resolved"),
+                            terminal_files
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect(),
+                            hook_context_template.as_ref(),
+                        );
+                        match run_before_spawn_verify_hook(
+                            worker_hooks.as_ref(),
+                            before_verify_payload,
+                        )
+                        .await
+                        {
+                            Ok(modified_files) => {
+                                terminal_files = modified_files;
+                            }
+                            Err(reason) => {
+                                contract_failure =
+                                    Some(format!("spawn verify denied by hook: {reason}"));
+                                terminal_files.clear();
+                            }
+                        }
+                    }
+                }
+
+                let tracked_output_files = terminal_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
 
                 if matches!((&result, contract_failure.as_ref()), (Ok(task_result), None) if task_result.success)
                 {
@@ -1699,6 +1797,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn rewrite_output_files_hook(replacement_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event: HookEvent::BeforeSpawnVerify,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"cat >/dev/null; printf '{"output_files":["%s"]}\n' "$1"; exit 2"#.into(),
+                "sh".into(),
+                replacement_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn test_spawn_returns_immediately() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
@@ -1877,6 +1991,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn test_before_spawn_verify_hook_can_replace_output_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let replacement = temp.path().join("final-reviewed.pptx");
+        std::fs::write(&replacement, "reviewed").unwrap();
+
+        let hooks = Arc::new(HookExecutor::new(vec![rewrite_output_files_hook(
+            &replacement,
+        )]));
+        let payload = HookPayload::before_spawn_verify(
+            "task-1",
+            "Slides deliverable",
+            "api:test-session",
+            "api:test-session:child",
+            Some("slides"),
+            Some("verify_outputs"),
+            Some("candidate terminal outputs resolved"),
+            vec!["/tmp/original-deck.pptx".to_string()],
+            Some(&HookContext {
+                session_id: Some("api:test-session".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+        );
+
+        let modified_files = run_before_spawn_verify_hook(Some(&hooks), payload)
+            .await
+            .unwrap();
+
+        assert_eq!(modified_files, vec![replacement]);
+    }
+
+    #[tokio::test]
     async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
         let temp = tempfile::tempdir().unwrap();
@@ -1938,6 +2084,88 @@ mod tests {
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(5),
                 "background spawn task did not fail in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_background_spawn_emits_failure_hook_for_contract_failure() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        let hook_log = temp.path().join("spawn-failure-hooks.jsonl");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let hooks = Arc::new(HookExecutor::new(vec![capture_hook(
+            HookEvent::OnSpawnFailure,
+            &hook_log,
+        )]));
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
+        .with_hooks(hooks)
+        .with_hook_context(HookContext {
+            session_id: Some("api:test-session".to_string()),
+            profile_id: Some("test-profile".to_string()),
+        });
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Build the deck",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["mofa_slides"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["mofa_slides"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "deliver_media_only": false,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            let hook_lines = std::fs::read_to_string(&hook_log).unwrap_or_default();
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Failed
+                    && hook_lines.contains("\"event\":\"on_spawn_failure\"")
+                {
+                    assert!(hook_lines.contains("\"failure_action\":\"escalate\""));
+                    assert!(hook_lines.contains("\"workflow_kind\":\"slides\""));
+                    assert!(hook_lines.contains("\"result\":\""));
+                    return;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn failure hook did not arrive in time"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

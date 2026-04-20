@@ -31,6 +31,7 @@ pub enum HookEvent {
     AfterLlmCall,
     OnResume,
     OnTurnEnd,
+    BeforeSpawnVerify,
     OnSpawnVerify,
     OnSpawnComplete,
     OnSpawnFailure,
@@ -208,8 +209,9 @@ impl HookPayload {
 
     /// Payload for a turn-end hook.
     pub fn on_turn_end(turn_summary: impl Into<String>, ctx: Option<&HookContext>) -> Self {
+        let turn_summary = truncate_string(&turn_summary.into(), MAX_PAYLOAD_FIELD_BYTES);
         let mut p = Self {
-            turn_summary: Some(turn_summary.into()),
+            turn_summary: Some(turn_summary),
             ..Self::empty(HookEvent::OnTurnEnd)
         };
         p.apply_context(ctx);
@@ -342,7 +344,7 @@ impl HookPayload {
             child_session_key: Some(child_session_key.into()),
             workflow_kind: workflow_kind.map(Into::into),
             current_phase: current_phase.map(Into::into),
-            result: result.map(Into::into),
+            result: result.map(|value| truncate_string(&value.into(), MAX_PAYLOAD_FIELD_BYTES)),
             success,
             output_files,
             failure_action: failure_action.map(Into::into),
@@ -350,6 +352,34 @@ impl HookPayload {
         };
         p.apply_context(ctx);
         p
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn before_spawn_verify(
+        task_id: impl Into<String>,
+        task_label: impl Into<String>,
+        parent_session_key: impl Into<String>,
+        child_session_key: impl Into<String>,
+        workflow_kind: Option<impl Into<String>>,
+        current_phase: Option<impl Into<String>>,
+        result: Option<impl Into<String>>,
+        output_files: Vec<String>,
+        ctx: Option<&HookContext>,
+    ) -> Self {
+        Self::spawn_lifecycle(
+            HookEvent::BeforeSpawnVerify,
+            task_id,
+            task_label,
+            parent_session_key,
+            child_session_key,
+            workflow_kind,
+            current_phase,
+            result,
+            None,
+            output_files,
+            None::<String>,
+            ctx,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -488,8 +518,8 @@ pub enum HookResult {
     Allow,
     /// A before-hook denied the operation.
     Deny(String),
-    /// A before-hook modified the tool arguments (exit code 2, stdout = new args JSON).
-    /// Like Claude Agent SDK's `updatedInput` pattern.
+    /// A before-hook modified the pending input for the event (exit code 2,
+    /// stdout = replacement JSON payload).
     Modified(serde_json::Value),
     /// A hook encountered an error (does not block).
     Error(String),
@@ -569,7 +599,12 @@ impl HookExecutor {
                     self.failures[i].store(0, Ordering::Relaxed);
                 }
                 Ok((1, stdout)) => {
-                    if matches!(event, HookEvent::BeforeToolCall | HookEvent::BeforeLlmCall) {
+                    if matches!(
+                        event,
+                        HookEvent::BeforeToolCall
+                            | HookEvent::BeforeLlmCall
+                            | HookEvent::BeforeSpawnVerify
+                    ) {
                         self.failures[i].store(0, Ordering::Relaxed);
                         return HookResult::Deny(stdout);
                     }
@@ -583,15 +618,19 @@ impl HookExecutor {
                     last_error = Some(msg);
                 }
                 Ok((2, stdout)) => {
-                    // Exit 2 = modified args (before-hooks only).
-                    // Stdout contains the modified tool arguments as JSON.
-                    if matches!(event, HookEvent::BeforeToolCall) {
+                    // Exit 2 = modified input (before-hooks only).
+                    // Stdout contains the replacement JSON payload.
+                    if matches!(
+                        event,
+                        HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
+                    ) {
                         self.failures[i].store(0, Ordering::Relaxed);
                         match serde_json::from_str::<serde_json::Value>(&stdout) {
                             Ok(modified_args) => {
                                 tracing::info!(
                                     hook_command = ?hook.command,
-                                    "hook modified tool arguments"
+                                    ?event,
+                                    "hook modified event payload"
                                 );
                                 return HookResult::Modified(modified_args);
                             }
@@ -869,6 +908,21 @@ mod tests {
         assert_eq!(on_turn_end.event, HookEvent::OnTurnEnd);
         assert_eq!(on_turn_end.turn_summary.as_deref(), Some("turn finished"));
 
+        let before_spawn_verify = HookPayload::before_spawn_verify(
+            "task-1",
+            "Render deck",
+            "parent-session",
+            "child-session",
+            Some("slides"),
+            Some("verify_outputs"),
+            Some("candidate outputs resolved"),
+            vec!["deck.pdf".into()],
+            None,
+        );
+        assert_eq!(before_spawn_verify.event, HookEvent::BeforeSpawnVerify);
+        assert_eq!(before_spawn_verify.output_files, vec!["deck.pdf"]);
+        assert!(before_spawn_verify.success.is_none());
+
         let on_spawn_verify = HookPayload::on_spawn_verify(
             "task-1",
             "Render deck",
@@ -914,6 +968,38 @@ mod tests {
         assert_eq!(on_spawn_failure.event, HookEvent::OnSpawnFailure);
         assert_eq!(on_spawn_failure.success, Some(false));
         assert_eq!(on_spawn_failure.failure_action.as_deref(), Some("retry"));
+    }
+
+    #[test]
+    fn test_lifecycle_payloads_truncate_large_text_fields() {
+        let large = "x".repeat(MAX_PAYLOAD_FIELD_BYTES * 2);
+
+        let turn_end = HookPayload::on_turn_end(large.clone(), None);
+        assert!(
+            turn_end
+                .turn_summary
+                .as_deref()
+                .is_some_and(|value| value.ends_with("... (truncated)"))
+        );
+
+        let failure = HookPayload::on_spawn_failure(
+            "task-1",
+            "Render deck",
+            "parent-session",
+            "child-session",
+            Some("slides"),
+            Some("verify"),
+            large,
+            vec![],
+            "retry",
+            None,
+        );
+        assert!(
+            failure
+                .result
+                .as_deref()
+                .is_some_and(|value| value.ends_with("... (truncated)"))
+        );
     }
 
     #[test]

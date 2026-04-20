@@ -3128,6 +3128,8 @@ impl SessionActor {
                 .await;
         }
 
+        self.emit_turn_end_hook(persisted_user_content).await;
+
         true
     }
 
@@ -5293,6 +5295,128 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("\"turn_summary\":\"hello hook turn\""))
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_forced_background_turn_emits_turn_end_hook() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook_log = dir.path().join("forced-background-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![capture_hook(
+            HookEvent::OnTurnEnd,
+            &hook_log,
+        )]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let (inbox_tx, inbox_rx) = mpsc::channel::<ActorMessage>(32);
+        let (spawn_tx, _spawn_rx) = mpsc::channel::<InboundMessage>(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        tools.register(octos_agent::SpawnTool::new(
+            Arc::new(DelayedMockProvider::new(
+                "forced-background-worker",
+                vec![(Duration::ZERO, make_response("background complete"))],
+            )),
+            Arc::clone(&memory),
+            dir.path().to_path_buf(),
+            spawn_tx,
+        ));
+
+        let agent = Agent::new(
+            AgentId::new("test-forced-background-hooks"),
+            Arc::new(DelayedMockProvider::new(
+                "forced-background-primary",
+                vec![(Duration::ZERO, make_response("foreground fallback"))],
+            )),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 1,
+            ..Default::default()
+        });
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: Some(hooks),
+            hook_context: Some(HookContext {
+                session_id: Some("cli:test".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        inbox_tx
+            .send(make_inbound("请对这个主题做一次深度研究，并输出完整报告。"))
+            .await
+            .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        loop {
+            let lines = std::fs::read_to_string(&hook_log)
+                .ok()
+                .map(|contents| contents.lines().map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            if lines
+                .iter()
+                .any(|line| line.contains("\"event\":\"on_turn_end\""))
+            {
+                assert!(lines.iter().any(|line| {
+                    line.contains(
+                        "\"turn_summary\":\"请对这个主题做一次深度研究，并输出完整报告。\"",
+                    )
+                }));
+                break;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "forced-background turn-end hook did not arrive in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        drop(inbox_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Build a minimal SessionActor with speculative mode + adaptive router.
