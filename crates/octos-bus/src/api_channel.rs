@@ -1278,6 +1278,27 @@ fn message_info_from_history_message(
     }
 }
 
+async fn snapshot_session_disk_loader(
+    sessions: &Arc<Mutex<SessionManager>>,
+) -> Option<(PathBuf, SessionManager)> {
+    let data_dir = {
+        let sess = sessions.lock().await;
+        sess.data_dir()
+    };
+
+    match SessionManager::open(&data_dir) {
+        Ok(loader) => Some((data_dir, loader)),
+        Err(error) => {
+            warn!(
+                path = %data_dir.display(),
+                error = %error,
+                "failed to prepare session disk loader"
+            );
+            None
+        }
+    }
+}
+
 async fn replay_task_status_events(state: &ApiState, id: &str, topic: Option<&str>) -> Vec<String> {
     let Some(ref query_fn) = state.task_query else {
         record_replay("task_status", "disabled", 1);
@@ -1308,11 +1329,13 @@ async fn replay_committed_session_results(
     topic: Option<&str>,
 ) -> Vec<String> {
     let candidates = api_session_key_candidates(state.profile_id.as_deref(), id, topic);
-    let sess = state.sessions.lock().await;
-    let data_dir = sess.data_dir();
+    let Some((data_dir, session_loader)) = snapshot_session_disk_loader(&state.sessions).await
+    else {
+        return Vec::new();
+    };
 
     for candidate in &candidates {
-        if let Some(session) = sess.load(candidate).await {
+        if let Some(session) = session_loader.load(candidate).await {
             let events: Vec<String> = session
                 .messages
                 .iter()
@@ -1422,14 +1445,20 @@ async fn handle_session_messages(
     };
     let candidates =
         api_session_key_candidates(state.profile_id.as_deref(), &id, params.topic.as_deref());
+    let Some((data_dir, session_loader)) = snapshot_session_disk_loader(&state.sessions).await
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session storage unavailable",
+        )
+            .into_response();
+    };
 
     // source=full reads the append-only JSONL file (complete history).
     // Default reads from in-memory (may be compacted for LLM context).
     if params.source.as_deref() == Some("full") {
-        let sess = state.sessions.lock().await;
-        let data_dir = sess.data_dir();
         for candidate in &candidates {
-            if let Some(session) = sess.load(candidate).await {
+            if let Some(session) = session_loader.load(candidate).await {
                 let messages: Vec<MessageInfo> = session
                     .messages
                     .iter()
@@ -1447,10 +1476,8 @@ async fn handle_session_messages(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let sess = state.sessions.lock().await;
-    let data_dir = sess.data_dir();
     for candidate in &candidates {
-        if let Some(session) = sess.load(candidate).await {
+        if let Some(session) = session_loader.load(candidate).await {
             let total_messages = session.messages.len();
             let history = session.get_history(fetch_count).to_vec();
             let base_seq = total_messages.saturating_sub(history.len());
@@ -3002,6 +3029,122 @@ mod tests {
             .filter(|entry| entry.get("id").and_then(|id| id.as_str()) == Some("slides-123"))
             .collect();
         assert_eq!(matching.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_messages_full_source_reads_from_disk_snapshot() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "web-history");
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("hello"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("first result"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("second result"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some(TEST_PROFILE_ID.into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/web-history/messages?source=full&since_seq=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["seq"], 2);
+        assert_eq!(messages[0]["content"], "second result");
+    }
+
+    #[tokio::test]
+    async fn session_messages_default_source_returns_recent_window_with_absolute_seq() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "web-history");
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("one"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("two"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("three"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::assistant("four"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}/messages", get(handle_session_messages))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some(TEST_PROFILE_ID.into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/web-history/messages?limit=1&offset=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["seq"], 3);
+        assert_eq!(messages[0]["content"], "four");
     }
 
     #[tokio::test]
