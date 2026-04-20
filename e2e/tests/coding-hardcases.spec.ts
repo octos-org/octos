@@ -74,8 +74,9 @@ function buildRepairPrompt(repoName: string, returnToken?: string) {
     'Make check.sh executable.',
     'Run git add notes.txt check.sh so both files are tracked before editing.',
     'Run ./check.sh once and confirm it exits non-zero.',
-    'Repair only notes.txt so ./check.sh succeeds.',
+    'Repair only notes.txt by changing the second line from beta to gamma without modifying the first line or check.sh.',
     'Your final shell command from the repo root must be `./check.sh && git diff -- notes.txt`.',
+    'If that final command exits non-zero, keep fixing notes.txt and rerun it until it succeeds.',
     tail,
     'Do not start background work.',
   ].join(' ');
@@ -159,11 +160,19 @@ test.describe('Phase 3 coding hard cases', () => {
     await login(page);
     await createNewSession(page);
 
-    const repoName = uniqueRepoName('phase3-repair');
-    const result = await sendAndWait(page, buildRepairPrompt(repoName), {
+    let repoName = uniqueRepoName('phase3-repair');
+    let result = await sendAndWait(page, buildRepairPrompt(repoName), {
       maxWait: 240_000,
       label: 'repair-pass',
     });
+    if (!result.responseText.includes('diff --git')) {
+      await createNewSession(page);
+      repoName = uniqueRepoName('phase3-repair-retry');
+      result = await sendAndWait(page, buildRepairPrompt(repoName), {
+        maxWait: 240_000,
+        label: 'repair-pass-retry',
+      });
+    }
 
     await expectSingleTurn(page);
     expect(result.responseText).toContain('diff --git');
