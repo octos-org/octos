@@ -94,7 +94,6 @@ pub fn build() -> WorkflowInstance {
         },
         terminal_output: WorkflowTerminalOutput {
             deliver_final_artifact_only: true,
-            deliver_media_only: false,
             forbid_intermediate_files: true,
             required_artifact_kind: "site".into(),
         },
@@ -113,7 +112,6 @@ mod tests {
         assert_eq!(workflow.current_phase.as_str(), "scaffold");
         assert_eq!(workflow.terminal_output.required_artifact_kind, "site");
         assert!(workflow.terminal_output.deliver_final_artifact_only);
-        assert!(!workflow.terminal_output.deliver_media_only);
         assert!(workflow.terminal_output.forbid_intermediate_files);
         assert!(
             workflow

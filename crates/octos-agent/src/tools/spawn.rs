@@ -77,7 +77,6 @@ pub struct ChildSessionLifecyclePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkflowTerminalOutputPolicy {
     deliver_final_artifact_only: bool,
-    deliver_media_only: bool,
     forbid_intermediate_files: bool,
     required_artifact_kind: String,
 }
@@ -1102,7 +1101,6 @@ impl Tool for SpawnTool {
                             "description": "Runtime-owned final output policy for workflow families.",
                             "properties": {
                                 "deliver_final_artifact_only": { "type": "boolean" },
-                                "deliver_media_only": { "type": "boolean" },
                                 "forbid_intermediate_files": { "type": "boolean" },
                                 "required_artifact_kind": { "type": "string" }
                             }
@@ -1925,7 +1923,9 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new());
         supervisor.enable_persistence(&ledger).unwrap();
         let tool = SpawnTool::new(
-            Arc::new(MockProvider),
+            Arc::new(ShellThenEndProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
             Arc::new(create_test_store().await),
             temp.path().to_path_buf(),
             in_tx,
@@ -1934,17 +1934,16 @@ mod tests {
 
         let result = tool
             .execute(&serde_json::json!({
-                "task": "Build the deck",
+                "task": "Acknowledge the request and stop.",
                 "label": "Slides deliverable",
                 "mode": "background",
-                "allowed_tools": ["mofa_slides"],
+                "allowed_tools": ["shell"],
                 "workflow": {
                     "workflow_kind": "slides",
                     "current_phase": "design",
-                    "allowed_tools": ["mofa_slides"],
+                    "allowed_tools": ["shell"],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
-                        "deliver_media_only": false,
                         "forbid_intermediate_files": true,
                         "required_artifact_kind": "presentation"
                     }
@@ -2049,7 +2048,9 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new());
         supervisor.enable_persistence(&ledger).unwrap();
         let tool = SpawnTool::new(
-            Arc::new(MockProvider),
+            Arc::new(ShellThenEndProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
             Arc::new(create_test_store().await),
             temp.path().to_path_buf(),
             in_tx,
@@ -2058,17 +2059,16 @@ mod tests {
 
         let result = tool
             .execute(&serde_json::json!({
-                "task": "Build the deck",
+                "task": "Acknowledge the request and stop.",
                 "label": "Slides deliverable",
                 "mode": "background",
-                "allowed_tools": ["mofa_slides"],
+                "allowed_tools": ["shell"],
                 "workflow": {
                     "workflow_kind": "slides",
                     "current_phase": "design",
-                    "allowed_tools": ["mofa_slides"],
+                    "allowed_tools": ["shell"],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
-                        "deliver_media_only": false,
                         "forbid_intermediate_files": true,
                         "required_artifact_kind": "presentation"
                     }
@@ -2085,7 +2085,7 @@ mod tests {
             if let Some(task) = tasks.first() {
                 if task.status == crate::task_supervisor::TaskStatus::Failed {
                     let error = task.error.as_deref().unwrap_or_default();
-                    assert!(error.contains("workspace contract"));
+                    assert!(error.contains("workspace contract"), "{error}");
                     return;
                 }
             }
@@ -2187,7 +2187,6 @@ mod tests {
             allowed_tools: vec!["podcast_generate".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: true,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "audio".to_string(),
             }),
@@ -2215,7 +2214,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -2241,7 +2239,6 @@ mod tests {
             allowed_tools: vec!["shell".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
@@ -2267,7 +2264,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -2325,7 +2321,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -2358,7 +2353,6 @@ mod tests {
             allowed_tools: vec!["shell".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
@@ -2395,7 +2389,6 @@ mod tests {
                     "allowed_tools": ["podcast_generate"],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
-                        "deliver_media_only": true,
                         "forbid_intermediate_files": true,
                         "required_artifact_kind": "audio"
                     }
@@ -2671,6 +2664,10 @@ mod tests {
     // Minimal mock provider for testing
     struct MockProvider;
 
+    struct ShellThenEndProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
     #[async_trait]
     impl LlmProvider for MockProvider {
         async fn chat(
@@ -2689,6 +2686,52 @@ mod tests {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ShellThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({
+                            "command": "printf ready",
+                        }),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+
+            Ok(octos_llm::ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
                 provider_index: None,
             })
         }

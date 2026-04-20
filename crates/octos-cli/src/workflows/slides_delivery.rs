@@ -34,7 +34,6 @@ pub fn build() -> WorkflowInstance {
         },
         terminal_output: WorkflowTerminalOutput {
             deliver_final_artifact_only: true,
-            deliver_media_only: false,
             forbid_intermediate_files: true,
             required_artifact_kind: "presentation".into(),
         },
@@ -100,7 +99,6 @@ mod tests {
             "presentation"
         );
         assert!(workflow.terminal_output.deliver_final_artifact_only);
-        assert!(!workflow.terminal_output.deliver_media_only);
         assert!(workflow.terminal_output.forbid_intermediate_files);
         assert!(
             workflow
