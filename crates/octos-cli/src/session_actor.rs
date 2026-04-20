@@ -20,9 +20,9 @@ use octos_agent::tools::{
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
-    TurnAttachmentContext, WorkspacePolicy, read_workspace_policy, workspace_policy_path,
-    write_workspace_policy,
+    Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult, TaskSupervisor,
+    TokenTracker, TurnAttachmentContext, WorkspacePolicy, read_workspace_policy,
+    workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -1450,6 +1450,10 @@ impl ActorFactory {
             .with_topic(session_key.topic().map(str::to_string))
             .with_base_dir(&user_workspace)
             .with_extra_allowed_dir(&self.data_dir);
+        let session_hook_context = self.hook_context_template.as_ref().map(|ctx| HookContext {
+            session_id: Some(session_key.to_string()),
+            profile_id: ctx.profile_id.clone(),
+        });
 
         // Create tool registry with cwd-bound tools pointing to the per-user workspace.
         // A fresh sandbox is created per user so the SBPL profile restricts writes
@@ -1502,6 +1506,12 @@ impl ActorFactory {
         if !self.plugin_dirs.is_empty() {
             spawn_tool = spawn_tool
                 .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone());
+        }
+        if let Some(ref hooks) = self.hooks {
+            spawn_tool = spawn_tool.with_hooks(hooks.clone());
+        }
+        if let Some(ref ctx) = session_hook_context {
+            spawn_tool = spawn_tool.with_hook_context(ctx.clone());
         }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
@@ -1704,11 +1714,8 @@ impl ActorFactory {
         if let Some(ref hooks) = self.hooks {
             agent = agent.with_hooks(hooks.clone());
         }
-        if let Some(ref ctx) = self.hook_context_template {
-            agent = agent.with_hook_context(HookContext {
-                session_id: Some(session_key.to_string()),
-                profile_id: ctx.profile_id.clone(),
-            });
+        if let Some(ref ctx) = session_hook_context {
+            agent = agent.with_hook_context(ctx.clone());
         }
 
         // Wire the activate_tools back-reference now that tools are in Arc
@@ -1723,6 +1730,8 @@ impl ActorFactory {
             chat_id: chat_id.to_string(),
             inbox: rx,
             agent: Arc::new(agent),
+            hooks: self.hooks.clone(),
+            hook_context: session_hook_context,
             session_handle,
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
@@ -1862,6 +1871,8 @@ struct SessionActor {
     inbox: mpsc::Receiver<ActorMessage>,
 
     agent: Arc<Agent>,
+    hooks: Option<Arc<HookExecutor>>,
+    hook_context: Option<HookContext>,
 
     /// Per-actor session handle — owns this session's data, no shared mutex.
     session_handle: Arc<Mutex<SessionHandle>>,
@@ -1910,6 +1921,52 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn emit_hook_payload(&self, payload: HookPayload) {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let event = payload.event;
+        match hooks.run(event, &payload).await {
+            HookResult::Allow => {}
+            HookResult::Modified(_) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    "lifecycle hook attempted to modify payload; ignoring"
+                );
+            }
+            HookResult::Deny(reason) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    reason,
+                    "lifecycle hook attempted to deny a non-blocking event"
+                );
+            }
+            HookResult::Error(error) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    error,
+                    "lifecycle hook failed"
+                );
+            }
+        }
+    }
+
+    async fn emit_resume_hook(&self) {
+        self.emit_hook_payload(HookPayload::on_resume(self.hook_context.as_ref()))
+            .await;
+    }
+
+    async fn emit_turn_end_hook(&self, turn_summary: &str) {
+        self.emit_hook_payload(HookPayload::on_turn_end(
+            git_turn_summary(turn_summary),
+            self.hook_context.as_ref(),
+        ))
+        .await;
+    }
+
     async fn snapshot_workspace_turn_if_needed(
         &self,
         turn_summary: &str,
@@ -1950,6 +2007,7 @@ impl SessionActor {
     }
 
     async fn run(mut self) {
+        self.emit_resume_hook().await;
         loop {
             tokio::select! {
                 msg = self.inbox.recv() => {
@@ -3784,6 +3842,7 @@ impl SessionActor {
 
         self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
+        self.emit_turn_end_hook(&inbound.content).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
@@ -4489,6 +4548,7 @@ impl SessionActor {
 
         self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
+        self.emit_turn_end_hook(&inbound.content).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);
@@ -4570,8 +4630,25 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use octos_agent::{HookConfig, HookEvent};
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(unix)]
+    fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
+                "sh".into(),
+                log_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
 
     #[test]
     fn test_strip_think_tags() {
@@ -5004,6 +5081,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),
@@ -5070,6 +5149,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),
@@ -5102,6 +5183,116 @@ mod tests {
 
         let handle = tokio::spawn(actor.run());
         (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_session_actor_emits_resume_and_turn_end_hooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook_log = dir.path().join("session-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![
+            capture_hook(HookEvent::OnResume, &hook_log),
+            capture_hook(HookEvent::OnTurnEnd, &hook_log),
+        ]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        let agent = Agent::new(
+            AgentId::new("test-hooks"),
+            Arc::new(DelayedMockProvider::new(
+                "hooks",
+                vec![(Duration::ZERO, make_response("hook response"))],
+            )),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 1,
+            ..Default::default()
+        });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: Some(hooks),
+            hook_context: Some(HookContext {
+                session_id: Some("cli:test".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        inbox_tx
+            .send(make_inbound("hello   hook   turn"))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap();
+
+        drop(inbox_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        let lines = std::fs::read_to_string(&hook_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"event\":\"on_resume\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"event\":\"on_turn_end\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("\"session_id\":\"cli:test\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\"turn_summary\":\"hello hook turn\""))
+        );
     }
 
     /// Build a minimal SessionActor with speculative mode + adaptive router.
@@ -5157,6 +5348,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),

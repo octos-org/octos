@@ -19,7 +19,7 @@ use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
 };
-use crate::{Agent, AgentConfig};
+use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
 
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
@@ -144,6 +144,13 @@ fn child_session_failure_action(
     }
 }
 
+fn child_session_failure_action_label(action: ChildSessionFailureAction) -> &'static str {
+    match action {
+        ChildSessionFailureAction::Retry => "retry",
+        ChildSessionFailureAction::Escalate => "escalate",
+    }
+}
+
 fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'static str) {
     counter!(
         "octos_child_session_lifecycle_total",
@@ -183,6 +190,29 @@ fn record_retry(reason: &'static str) {
     counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
 }
 
+async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPayload) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let event = payload.event;
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => {}
+        HookResult::Modified(_) => {
+            warn!(event = ?event, "lifecycle hook attempted to modify payload; ignoring");
+        }
+        HookResult::Deny(reason) => {
+            warn!(
+                event = ?event,
+                reason,
+                "lifecycle hook attempted to deny a non-blocking event"
+            );
+        }
+        HookResult::Error(error) => {
+            warn!(event = ?event, error, "lifecycle hook failed");
+        }
+    }
+}
+
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
     llm: Arc<dyn LlmProvider>,
@@ -201,6 +231,10 @@ pub struct SpawnTool {
     background_result_sender: Option<BackgroundResultSender>,
     /// Optional lifecycle bridge for durable child-session state.
     child_session_sender: Option<ChildSessionLifecycleSender>,
+    /// Inherited lifecycle hooks for spawned workers and background transitions.
+    hooks: Option<Arc<HookExecutor>>,
+    /// Template used to stamp parent/child session hook context.
+    hook_context_template: Option<HookContext>,
     /// Plugin directories to load into subagent registries.
     /// Subagents can use plugin tools (fm_tts, etc.) when listed in allowed_tools.
     plugin_dirs: Vec<PathBuf>,
@@ -235,6 +269,8 @@ impl SpawnTool {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -265,6 +301,8 @@ impl SpawnTool {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -285,6 +323,18 @@ impl SpawnTool {
     /// Set a child-session lifecycle sender for background workers.
     pub fn with_child_session_sender(mut self, sender: ChildSessionLifecycleSender) -> Self {
         self.child_session_sender = Some(sender);
+        self
+    }
+
+    /// Inherit lifecycle hooks from the parent session.
+    pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Set a hook context template for parent/child lifecycle events.
+    pub fn with_hook_context(mut self, ctx: HookContext) -> Self {
+        self.hook_context_template = Some(ctx);
         self
     }
 
@@ -1125,6 +1175,8 @@ impl Tool for SpawnTool {
             let worker_config = self.worker_config.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
+            let worker_hooks = self.hooks.clone();
+            let hook_context_template = self.hook_context_template.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -1198,6 +1250,17 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                if let Some(ref hooks) = worker_hooks {
+                    worker = worker.with_hooks(hooks.clone());
+                }
+                if let Some(ctx) = hook_context_template.as_ref().map(|ctx| HookContext {
+                    session_id: tracked_child_session_key
+                        .clone()
+                        .or_else(|| ctx.session_id.clone()),
+                    profile_id: ctx.profile_id.clone(),
+                }) {
+                    worker = worker.with_hook_context(ctx);
+                }
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
@@ -1247,6 +1310,40 @@ impl Tool for SpawnTool {
                     .iter()
                     .map(|path| path.to_string_lossy().to_string())
                     .collect::<Vec<_>>();
+                let workflow_kind = workflow_metadata
+                    .as_ref()
+                    .map(|workflow| workflow.workflow_kind.clone());
+                let workflow_phase = workflow_metadata
+                    .as_ref()
+                    .map(|workflow| workflow.current_phase.clone());
+                let verify_phase = workflow_phase
+                    .clone()
+                    .or_else(|| Some("verify_outputs".to_string()));
+
+                if matches!((&result, contract_failure.as_ref()), (Ok(task_result), None) if task_result.success)
+                {
+                    if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                        tracked_task_id.as_ref(),
+                        parent_session_key.as_ref(),
+                        tracked_child_session_key.as_ref(),
+                    ) {
+                        emit_lifecycle_hook(
+                            worker_hooks.as_ref(),
+                            HookPayload::on_spawn_verify(
+                                task_id.clone(),
+                                task_label.clone(),
+                                parent_session_key.clone(),
+                                child_session_key.clone(),
+                                workflow_kind.clone(),
+                                verify_phase.clone(),
+                                Some("terminal outputs resolved"),
+                                tracked_output_files.clone(),
+                                hook_context_template.as_ref(),
+                            ),
+                        )
+                        .await;
+                    }
+                }
 
                 if matches!(&result, Ok(task_result) if task_result.success) {
                     if let (Some(supervisor), Some(task_id), Some(workflow)) = (
@@ -1288,6 +1385,12 @@ impl Tool for SpawnTool {
                         }
                     }
                 }
+
+                let terminal_result_text = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(error)) => error.clone(),
+                    (Ok(task_result), None) => task_result.output.clone(),
+                    (Err(error), _) => error.to_string(),
+                };
 
                 if let (
                     Some(sender),
@@ -1399,6 +1502,55 @@ impl Tool for SpawnTool {
                                 },
                             );
                         }
+                    }
+                }
+
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                    tracked_child_session_key.as_ref(),
+                ) {
+                    match terminal_kind {
+                        ChildSessionLifecycleKind::Completed => {
+                            emit_lifecycle_hook(
+                                worker_hooks.as_ref(),
+                                HookPayload::on_spawn_complete(
+                                    task_id.clone(),
+                                    task_label.clone(),
+                                    parent_session_key.clone(),
+                                    child_session_key.clone(),
+                                    workflow_kind.clone(),
+                                    Some("deliver_result".to_string()),
+                                    Some(terminal_result_text.clone()),
+                                    tracked_output_files.clone(),
+                                    hook_context_template.as_ref(),
+                                ),
+                            )
+                            .await;
+                        }
+                        ChildSessionLifecycleKind::RetryableFailed
+                        | ChildSessionLifecycleKind::TerminalFailed => {
+                            let failure_action = child_session_failure_action(terminal_kind)
+                                .map(child_session_failure_action_label)
+                                .unwrap_or("escalate");
+                            emit_lifecycle_hook(
+                                worker_hooks.as_ref(),
+                                HookPayload::on_spawn_failure(
+                                    task_id.clone(),
+                                    task_label.clone(),
+                                    parent_session_key.clone(),
+                                    child_session_key.clone(),
+                                    workflow_kind.clone(),
+                                    workflow_phase.clone(),
+                                    terminal_result_text.clone(),
+                                    tracked_output_files.clone(),
+                                    failure_action,
+                                    hook_context_template.as_ref(),
+                                ),
+                            )
+                            .await;
+                        }
+                        ChildSessionLifecycleKind::Spawned => {}
                     }
                 }
 
@@ -1529,6 +1681,23 @@ impl Tool for SpawnTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HookConfig, HookEvent};
+
+    #[cfg(unix)]
+    fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
+                "sh".into(),
+                log_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn test_spawn_returns_immediately() {
@@ -1548,6 +1717,8 @@ mod tests {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -2122,6 +2293,84 @@ mod tests {
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(5),
                 "child-session lifecycle events did not arrive in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_background_spawn_emits_verify_and_complete_hooks() {
+        let memory = Arc::new(create_test_store().await);
+        let llm = Arc::new(MockProvider);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let temp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let ledger = temp.path().join("tasks.jsonl");
+        let hook_log = temp.path().join("spawn-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![
+            capture_hook(HookEvent::OnSpawnVerify, &hook_log),
+            capture_hook(HookEvent::OnSpawnComplete, &hook_log),
+        ]));
+
+        let tool = SpawnTool::with_context(
+            llm,
+            memory,
+            temp.path().to_path_buf(),
+            tx,
+            "api",
+            "test-chat",
+        )
+        .with_task_supervisor(supervisor, "api:test-session".to_string(), ledger)
+        .with_hooks(hooks)
+        .with_hook_context(HookContext {
+            session_id: Some("api:test-session".to_string()),
+            profile_id: Some("test-profile".to_string()),
+        });
+
+        let args = serde_json::json!({
+            "task": "Draft the report",
+            "mode": "background",
+            "allowed_tools": []
+        });
+        let result = tool.execute(&args).await.unwrap();
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let lines = std::fs::read_to_string(&hook_log)
+                .ok()
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .map(str::to_string)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if lines.len() >= 2 {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("\"event\":\"on_spawn_verify\""))
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("\"event\":\"on_spawn_complete\""))
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line.contains("\"session_id\":\"api:test-session\""))
+                );
+                return;
+            }
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "spawn lifecycle hooks did not arrive in time"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
