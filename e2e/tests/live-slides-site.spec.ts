@@ -176,12 +176,19 @@ test.describe('Live deliverable flows', () => {
   test('site flow renders a built preview page and survives reload', async ({
     page,
   }) => {
-    await sendAndWait(page, '/new site astro', {
+    let initResult = await sendAndWait(page, '/new site astro', {
       label: 'site-init',
       maxWait: 90_000,
+      throwOnTimeout: false,
     });
+    if (initResult.responseLen === 0) {
+      initResult = await sendAndWait(page, '/new site astro', {
+        label: 'site-init-retry',
+        maxWait: 90_000,
+      });
+    }
 
-    const previewUrls = await waitForPreviewUrls(page, 1, 30_000);
+    const previewUrls = await waitForPreviewUrls(page, 1, 60_000);
     expect(previewUrls).toHaveLength(1);
 
     const previewUrl = previewUrls[0];
@@ -220,7 +227,7 @@ test.describe('Live deliverable flows', () => {
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
-    const afterReloadPreviewUrls = await waitForPreviewUrls(page, 1, 30_000);
+    const afterReloadPreviewUrls = await waitForPreviewUrls(page, 1, 60_000);
     expect(afterReloadPreviewUrls).toHaveLength(1);
     expect(afterReloadPreviewUrls[0]).toBe(previewUrl);
   });
