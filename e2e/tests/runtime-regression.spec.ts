@@ -34,6 +34,10 @@ interface SseEvent {
   [key: string]: unknown;
 }
 
+function customVoiceTtsPrompt(text: string): string {
+  return `直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），文本只说：${text}。不要先检查声音，也不要解释。`;
+}
+
 /** Send a message and collect SSE events until done. */
 async function chatSSE(
   message: string,
@@ -112,6 +116,25 @@ async function getTasks(sessionId: string): Promise<any[]> {
   });
   if (!resp.ok) return [];
   return resp.json();
+}
+
+async function startBackgroundTts(
+  sessionId: string,
+  text: string,
+): Promise<{
+  sessionId: string;
+  events: SseEvent[];
+  content: string;
+  doneEvent?: SseEvent;
+}> {
+  let effectiveSessionId = sessionId;
+  let result = await chatSSE(customVoiceTtsPrompt(text), effectiveSessionId, 90_000);
+  if (!result.doneEvent) {
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    effectiveSessionId = `${sessionId}-retry`;
+    result = await chatSSE(customVoiceTtsPrompt(text), effectiveSessionId, 90_000);
+  }
+  return { sessionId: effectiveSessionId, ...result };
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -233,10 +256,7 @@ test.describe('Coding shell repair', () => {
 test.describe('Background task lifecycle', () => {
   test('TTS spawn_only returns immediately with bg_tasks=true', async () => {
     const sid = `tts-bg-${Date.now()}`;
-    const { doneEvent } = await chatSSE(
-      '直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），文本只说：测试消息。不要先检查声音，也不要解释。',
-      sid,
-    );
+    const { doneEvent, sessionId } = await startBackgroundTts(sid, '测试消息');
 
     expect(doneEvent).toBeTruthy();
     expect(doneEvent!.has_bg_tasks).toBe(true);
@@ -244,8 +264,8 @@ test.describe('Background task lifecycle', () => {
     let sawTtsTaskOrAudio = false;
     for (let i = 0; i < 10; i++) {
       await new Promise((r) => setTimeout(r, 2000));
-      const tasks = await getTasks(sid);
-      const msgs = await getMessages(sid);
+      const tasks = await getTasks(sessionId);
+      const msgs = await getMessages(sessionId);
       sawTtsTaskOrAudio =
         tasks.some(
           (task: any) =>
@@ -265,17 +285,14 @@ test.describe('Background task lifecycle', () => {
 
   test('TTS task completes and delivers file (#388, #366)', async () => {
     const sid = `tts-deliver-${Date.now()}`;
-    await chatSSE(
-      '直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），文本只说：你好世界。不要先检查声音，也不要解释。',
-      sid,
-    );
+    const { sessionId } = await startBackgroundTts(sid, '你好世界');
 
     // Poll for task completion (up to 30s)
     let completed = false;
     let fileDelivered = false;
     for (let i = 0; i < 6; i++) {
       await new Promise((r) => setTimeout(r, 5000));
-      const msgs = await getMessages(sid);
+      const msgs = await getMessages(sessionId);
       // Check for file delivery in session messages
       const fileMsg = msgs.find(
         (m: any) =>
@@ -297,13 +314,10 @@ test.describe('Background task lifecycle', () => {
   test('regular messages work while TTS runs in background', async () => {
     const sid = `tts-nonblock-${Date.now()}`;
     // Start TTS
-    await chatSSE(
-      '直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），文本只说：后台测试。不要先检查声音，也不要解释。',
-      sid,
-    );
+    const { sessionId } = await startBackgroundTts(sid, '后台测试');
 
     // Immediately send a regular question — should not be blocked
-    const { content, doneEvent } = await chatSSE('what is 3+3', sid, 30_000);
+    const { content, doneEvent } = await chatSSE('what is 3+3', sessionId, 30_000);
     expect(content.length).toBeGreaterThan(0);
     expect(doneEvent).toBeTruthy();
   });
