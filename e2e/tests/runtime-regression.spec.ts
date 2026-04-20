@@ -198,21 +198,66 @@ test.describe('SSE streaming', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// 2B. CODING SHELL REPAIR
+// ════════════════════════════════════════════════════════════════════
+
+test.describe('Coding shell repair', () => {
+  test('shell repair returns the recovered diff without timing out', async () => {
+    const sid = `shell-repair-${Date.now()}`;
+    const marker = `phase3-shell-${Date.now()}`;
+    const prompt = [
+      'Use shell tool only.',
+      `Create a temporary git repo at /tmp/${marker}.`,
+      'Inside it, create notes.txt with exactly two lines: alpha and beta.',
+      'Make exactly one edit: change beta to gamma.',
+      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
+      'Then recover by running the same diff from the repo root.',
+      'Return only the final unified diff, nothing else.',
+      'Do not start background work.',
+    ].join(' ');
+
+    const { content, doneEvent } = await chatSSE(prompt, sid, 90_000);
+    expect(doneEvent).toBeTruthy();
+    expect(content).toContain('diff --git');
+    expect(content).toContain('notes.txt');
+    expect(content).toContain('-beta');
+    expect(content).toContain('+gamma');
+    expect(content.length).toBeLessThan(4_000);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
 // 3. BACKGROUND TASK LIFECYCLE (TTS)
 // ════════════════════════════════════════════════════════════════════
 
 test.describe('Background task lifecycle', () => {
   test('TTS spawn_only returns immediately with bg_tasks=true', async () => {
     const sid = `tts-bg-${Date.now()}`;
-    const { doneEvent, events } = await chatSSE('用杨幂声音说：测试消息', sid);
+    const { doneEvent } = await chatSSE('用杨幂声音说：测试消息', sid);
 
     expect(doneEvent).toBeTruthy();
     expect(doneEvent!.has_bg_tasks).toBe(true);
 
-    // Should have called fm_tts
-    const toolEvents = events.filter((e) => e.type === 'tool_start' || e.type === 'tool_end');
-    const ttsTool = toolEvents.find((e) => e.tool === 'fm_tts');
-    expect(ttsTool).toBeTruthy();
+    let sawTtsTaskOrAudio = false;
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const tasks = await getTasks(sid);
+      const msgs = await getMessages(sid);
+      sawTtsTaskOrAudio =
+        tasks.some(
+          (task: any) =>
+            task.tool_name === 'fm_tts' ||
+            task.tool_name === 'Direct TTS' ||
+            task.child_session_key,
+        ) ||
+        msgs.some(
+          (m: any) =>
+            Array.isArray(m.media) && m.media.some((path: string) => /\.mp3$/i.test(path)),
+        );
+      if (sawTtsTaskOrAudio) break;
+    }
+
+    expect(sawTtsTaskOrAudio).toBe(true);
   });
 
   test('TTS task completes and delivers file (#388, #366)', async () => {

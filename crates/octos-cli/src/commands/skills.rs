@@ -107,9 +107,9 @@ pub struct SkillsCommand {
 pub enum SkillsSubcommand {
     /// List installed skills.
     List,
-    /// Install skills from GitHub (e.g. user/repo or user/repo/skill-name).
+    /// Install skills from GitHub shorthand, a full Git URL, or a local path.
     Install {
-        /// GitHub path: user/repo (all skills) or user/repo/skill-name (single skill).
+        /// Source: user/repo, user/repo/skill-name, full Git URL, or local path.
         /// Omit when using --all.
         repo: Option<String>,
         /// Install all packages from the registry.
@@ -180,7 +180,7 @@ impl Executable for SkillsCommand {
                     cmd_install(&skills_dir, &repo, force, &branch)
                 } else {
                     eyre::bail!(
-                        "Provide a repo path (e.g. user/repo) or use --all to install everything from the registry"
+                        "Provide a skill source (e.g. user/repo, https://host/org/repo.git, or ./path/to/skill) or use --all to install everything from the registry"
                     )
                 }
             }
@@ -257,60 +257,40 @@ pub fn list_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
     Ok(skills)
 }
 
-/// Install skills from a GitHub repo or local path (blocking).
+/// Install skills from GitHub shorthand, a full Git URL, or a local path (blocking).
 pub fn install_skill(
     skills_dir: &Path,
     repo: &str,
     force: bool,
     branch: &str,
 ) -> Result<InstallResult> {
-    // Detect local path: starts with /, ./, ../, or ~
-    let local_path = if repo.starts_with('/')
-        || repo.starts_with("./")
-        || repo.starts_with("../")
-        || repo.starts_with('~')
-    {
-        let expanded = if let Some(rest) = repo.strip_prefix("~/") {
-            dirs::home_dir().unwrap_or_default().join(rest)
-        } else {
-            PathBuf::from(repo)
-        };
-        let resolved = std::fs::canonicalize(&expanded)
-            .wrap_err_with(|| format!("Local path not found: {}", expanded.display()))?;
-        Some(resolved)
-    } else {
-        None
-    };
-
-    if let Some(src) = local_path {
-        return install_from_local(skills_dir, &src, force);
-    }
-
-    let spec = RepoSpec::parse(repo)?;
-
-    match install_via_git_result(skills_dir, &spec, force, branch) {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            let is_git_missing = e.to_string().contains("git not found");
-            if is_git_missing && spec.subdir.is_some() {
-                install_via_http(skills_dir, &spec, force, branch)?;
-                let name = spec
-                    .subdir
-                    .as_deref()
-                    .unwrap()
-                    .rsplit('/')
-                    .next()
-                    .unwrap()
-                    .to_string();
-                Ok(InstallResult {
-                    installed: vec![name],
-                    skipped: vec![],
-                    deps_installed: vec![],
-                })
-            } else {
-                Err(e)
+    match resolve_install_source(repo)? {
+        InstallSource::Local(src) => install_from_local(skills_dir, &src, force),
+        InstallSource::Repo(spec) => match install_via_git_result(skills_dir, &spec, force, branch)
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                let is_git_missing = e.to_string().contains("git not found");
+                if is_git_missing && spec.subdir.is_some() && spec.github_shorthand {
+                    install_via_http(skills_dir, &spec, force, branch)?;
+                    let name = spec
+                        .subdir
+                        .as_deref()
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    Ok(InstallResult {
+                        installed: vec![name],
+                        skipped: vec![],
+                        deps_installed: vec![],
+                    })
+                } else {
+                    Err(e)
+                }
             }
-        }
+        },
     }
 }
 
@@ -549,49 +529,147 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
 }
 
 /// Parsed repo specification.
+enum InstallSource {
+    Local(PathBuf),
+    Repo(RepoSpec),
+}
+
+fn looks_like_local_path(input: &str) -> bool {
+    input.starts_with('/')
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input == "."
+        || input == ".."
+        || input.starts_with('~')
+}
+
+fn looks_like_git_url(input: &str) -> bool {
+    input.contains("://") || is_scp_like_git_url(input)
+}
+
+fn is_scp_like_git_url(input: &str) -> bool {
+    if input.contains("://") || input.starts_with('/') {
+        return false;
+    }
+
+    let Some((user_host, path)) = input.split_once(':') else {
+        return false;
+    };
+
+    user_host.contains('@') && !path.is_empty() && !user_host.contains('/')
+}
+
+fn resolve_install_source(input: &str) -> Result<InstallSource> {
+    let input = input.trim();
+
+    if looks_like_local_path(input) {
+        let expanded = if let Some(rest) = input.strip_prefix("~/") {
+            dirs::home_dir().unwrap_or_default().join(rest)
+        } else {
+            PathBuf::from(input)
+        };
+        let resolved = std::fs::canonicalize(&expanded)
+            .wrap_err_with(|| format!("Local path not found: {}", expanded.display()))?;
+        return Ok(InstallSource::Local(resolved));
+    }
+
+    Ok(InstallSource::Repo(RepoSpec::parse(input)?))
+}
+
+fn repo_name_from_git_url(input: &str) -> Result<String> {
+    let trimmed = input
+        .trim()
+        .trim_end_matches('/')
+        .split(['#', '?'])
+        .next()
+        .unwrap_or_default();
+    let tail = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .ok_or_else(|| eyre::eyre!("Invalid Git URL: '{input}'"))?;
+    let repo_name = tail.strip_suffix(".git").unwrap_or(tail).trim();
+    if repo_name.is_empty() {
+        eyre::bail!("Invalid Git URL: '{input}'");
+    }
+    Ok(repo_name.to_string())
+}
+
+fn github_clone_url(user: &str, repo: &str) -> String {
+    // Use SSH if the user has configured git to rewrite GitHub HTTPS to SSH,
+    // or if SSH auth to github.com works (avoids credential prompts).
+    let https = format!("https://github.com/{user}/{repo}.git");
+    // Check if git config has an insteadOf rewrite for github HTTPS -> SSH
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["config", "--get", "url.git@github.com:.insteadOf"])
+        .output()
+    {
+        if output.status.success() {
+            return format!("git@github.com:{user}/{repo}.git");
+        }
+    }
+    https
+}
+
 struct RepoSpec {
-    /// GitHub user/org.
-    user: String,
-    /// Repository name.
-    repo: String,
+    /// Canonical repo source stored in .source for future updates.
+    source: String,
+    /// Original user-provided source, including any subdir suffix.
+    requested_source: String,
+    /// Clone URL passed to git.
+    clone_url: String,
+    /// Repository directory name after clone.
+    repo_name: String,
     /// Optional subdirectory within the repo (for single-skill install).
     subdir: Option<String>,
+    /// Whether this source is GitHub shorthand and supports raw HTTP fallback.
+    github_shorthand: bool,
+    /// GitHub owner for shorthand sources.
+    github_user: Option<String>,
 }
 
 impl RepoSpec {
     fn parse(input: &str) -> Result<Self> {
-        let segments: Vec<&str> = input.trim_matches('/').split('/').collect();
+        let trimmed = input.trim().trim_end_matches('/');
+
+        if looks_like_git_url(trimmed) {
+            return Ok(Self {
+                source: trimmed.to_string(),
+                requested_source: trimmed.to_string(),
+                clone_url: trimmed.to_string(),
+                repo_name: repo_name_from_git_url(trimmed)?,
+                subdir: None,
+                github_shorthand: false,
+                github_user: None,
+            });
+        }
+
+        let segments: Vec<&str> = trimmed
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
         match segments.len() {
             2 => Ok(Self {
-                user: segments[0].to_string(),
-                repo: segments[1].to_string(),
+                source: format!("{}/{}", segments[0], segments[1]),
+                requested_source: trimmed.to_string(),
+                clone_url: github_clone_url(segments[0], segments[1]),
+                repo_name: segments[1].to_string(),
                 subdir: None,
+                github_shorthand: true,
+                github_user: Some(segments[0].to_string()),
             }),
             3.. => Ok(Self {
-                user: segments[0].to_string(),
-                repo: segments[1].to_string(),
+                source: format!("{}/{}", segments[0], segments[1]),
+                requested_source: trimmed.to_string(),
+                clone_url: github_clone_url(segments[0], segments[1]),
+                repo_name: segments[1].to_string(),
                 subdir: Some(segments[2..].join("/")),
+                github_shorthand: true,
+                github_user: Some(segments[0].to_string()),
             }),
             _ => eyre::bail!(
-                "Invalid repo path: '{input}'. Expected user/repo or user/repo/skill-name"
+                "Invalid skill source: '{input}'. Expected user/repo, user/repo/skill-name, full Git URL, or local path"
             ),
         }
-    }
-
-    fn clone_url(&self) -> String {
-        // Use SSH if the user has configured git to rewrite GitHub HTTPS to SSH,
-        // or if SSH auth to github.com works (avoids credential prompts).
-        let https = format!("https://github.com/{}/{}.git", self.user, self.repo);
-        // Check if git config has an insteadOf rewrite for github HTTPS -> SSH
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["config", "--get", "url.git@github.com:.insteadOf"])
-            .output()
-        {
-            if output.status.success() {
-                return format!("git@github.com:{}/{}.git", self.user, self.repo);
-            }
-        }
-        https
     }
 }
 
@@ -725,17 +803,17 @@ fn install_via_git_result(
 ) -> Result<InstallResult> {
     // Clone to a temp directory
     let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
-    let clone_dir = tmp.path().join(&spec.repo);
+    let clone_dir = tmp.path().join(&spec.repo_name);
 
     println!(
         "Cloning {} (branch: {})...",
-        spec.clone_url().dimmed(),
+        spec.clone_url.dimmed(),
         branch.cyan()
     );
 
     let status = std::process::Command::new("git")
         .args(["clone", "--depth", "1", "--branch", branch])
-        .arg(spec.clone_url())
+        .arg(&spec.clone_url)
         .arg(&clone_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -744,9 +822,8 @@ fn install_via_git_result(
 
     if !status.success() {
         eyre::bail!(
-            "git clone failed. Check the repo path: {}/{}",
-            spec.user,
-            spec.repo
+            "git clone failed. Check the source: {}",
+            spec.requested_source
         );
     }
 
@@ -761,9 +838,8 @@ fn install_via_git_result(
         let src = clone_dir.join(subdir);
         if !src.is_dir() {
             eyre::bail!(
-                "Subdirectory '{subdir}' not found in {}/{}",
-                spec.user,
-                spec.repo
+                "Subdirectory '{subdir}' not found in {}",
+                spec.requested_source
             );
         }
 
@@ -821,20 +897,20 @@ fn install_via_git_result(
         // Whole-repo install: check if root is a single skill or multi-skill
         if clone_dir.join("SKILL.md").exists() {
             // Single-skill repo: install as repo_name/
-            let dest = skills_dir.join(&spec.repo);
+            let dest = skills_dir.join(&spec.repo_name);
             if dest.exists() && !force {
                 println!(
                     "  {} '{}' already exists (use --force to overwrite)",
                     "SKIP".yellow(),
-                    spec.repo
+                    spec.repo_name
                 );
-                skipped.push(spec.repo.clone());
+                skipped.push(spec.repo_name.clone());
             } else {
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
                 copy_dir_recursive(&clone_dir, &dest)?;
-                installed.push(spec.repo.clone());
+                installed.push(spec.repo_name.clone());
             }
         } else {
             // Multi-skill repo: copy all top-level directories
@@ -895,7 +971,7 @@ fn install_via_git_result(
 
 /// HTTP fallback: fetch a single SKILL.md (original behavior).
 fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &str) -> Result<()> {
-    let subdir = spec.subdir.as_deref().unwrap_or(&spec.repo);
+    let subdir = spec.subdir.as_deref().unwrap_or(&spec.repo_name);
     let name = subdir.rsplit('/').next().unwrap();
 
     let dest = skills_dir.join(name);
@@ -908,7 +984,8 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
 
     let url = format!(
         "https://raw.githubusercontent.com/{}/{}/{branch}/{subdir}/SKILL.md",
-        spec.user, spec.repo
+        github_user(spec)?,
+        spec.repo_name
     );
     println!("Fetching {}...", url.dimmed());
 
@@ -922,9 +999,9 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
 
     if !body.status().is_success() {
         eyre::bail!(
-            "Failed to fetch SKILL.md (HTTP {}). Check the repo path: {}",
+            "Failed to fetch SKILL.md (HTTP {}). Check the source: {}",
             body.status(),
-            spec.subdir.as_deref().unwrap_or("")
+            spec.requested_source
         );
     }
 
@@ -949,13 +1026,19 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
 /// Write source tracking info so we can update later.
 fn write_source_info(dest: &Path, spec: &RepoSpec, branch: &str) -> Result<()> {
     let info = SourceInfo {
-        repo: format!("{}/{}", spec.user, spec.repo),
+        repo: spec.source.clone(),
         subdir: spec.subdir.clone(),
         branch: branch.to_string(),
         installed_at: chrono::Utc::now().to_rfc3339(),
     };
     std::fs::write(dest.join(".source"), serde_json::to_string_pretty(&info)?)?;
     Ok(())
+}
+
+fn github_user(spec: &RepoSpec) -> Result<&str> {
+    spec.github_user
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("raw HTTP fallback only supports GitHub shorthand sources"))
 }
 
 /// Extract a frontmatter value from raw SKILL.md content (simple helper for display).
@@ -1572,4 +1655,87 @@ fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
     remove_skill(skills_dir, name)?;
     println!("{} Removed skill '{}'", "OK".green(), name.cyan());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_install_source_supports_github_shorthand() {
+        let source = resolve_install_source("octos-org/system-skills").unwrap();
+        let InstallSource::Repo(spec) = source else {
+            panic!("expected repo source");
+        };
+
+        assert_eq!(spec.source, "octos-org/system-skills");
+        assert_eq!(spec.requested_source, "octos-org/system-skills");
+        assert_eq!(spec.repo_name, "system-skills");
+        assert_eq!(spec.subdir, None);
+        assert!(spec.github_shorthand);
+    }
+
+    #[test]
+    fn resolve_install_source_tracks_subdir_separately() {
+        let source = resolve_install_source("octos-org/system-skills/custom-skill").unwrap();
+        let InstallSource::Repo(spec) = source else {
+            panic!("expected repo source");
+        };
+
+        assert_eq!(spec.source, "octos-org/system-skills");
+        assert_eq!(
+            spec.requested_source,
+            "octos-org/system-skills/custom-skill"
+        );
+        assert_eq!(spec.subdir.as_deref(), Some("custom-skill"));
+    }
+
+    #[test]
+    fn resolve_install_source_supports_full_git_url() {
+        let source =
+            resolve_install_source("https://gitlab.example.com/acme/custom-skills.git").unwrap();
+        let InstallSource::Repo(spec) = source else {
+            panic!("expected repo source");
+        };
+
+        assert_eq!(
+            spec.source,
+            "https://gitlab.example.com/acme/custom-skills.git"
+        );
+        assert_eq!(
+            spec.clone_url,
+            "https://gitlab.example.com/acme/custom-skills.git"
+        );
+        assert_eq!(spec.repo_name, "custom-skills");
+        assert_eq!(spec.subdir, None);
+        assert!(!spec.github_shorthand);
+    }
+
+    #[test]
+    fn resolve_install_source_supports_ssh_git_url() {
+        let source = resolve_install_source("git@github.com:octos-org/system-skills.git").unwrap();
+        let InstallSource::Repo(spec) = source else {
+            panic!("expected repo source");
+        };
+
+        assert_eq!(spec.source, "git@github.com:octos-org/system-skills.git");
+        assert_eq!(spec.repo_name, "system-skills");
+        assert_eq!(spec.subdir, None);
+        assert!(!spec.github_shorthand);
+    }
+
+    #[test]
+    fn resolve_install_source_supports_local_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("local-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# local").unwrap();
+
+        let source = resolve_install_source(&skill_dir.to_string_lossy()).unwrap();
+        let InstallSource::Local(path) = source else {
+            panic!("expected local source");
+        };
+
+        assert_eq!(path, std::fs::canonicalize(&skill_dir).unwrap());
+    }
 }

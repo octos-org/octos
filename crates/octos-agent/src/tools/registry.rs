@@ -84,6 +84,8 @@ pub struct ToolRegistry {
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
     /// Session key for tagging background tasks (set per-session).
     session_key: Option<String>,
+    /// Precomputed output directory hint for spawn_only tool messaging.
+    output_dir_hint: Option<String>,
 }
 
 impl Default for ToolRegistry {
@@ -110,6 +112,7 @@ impl ToolRegistry {
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_key: None,
+            output_dir_hint: None,
         }
     }
 
@@ -152,11 +155,20 @@ impl ToolRegistry {
             .get(name)
             .cloned()
             .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string());
-        // Include output dir from OCTOS_DATA_DIR so LLM can reference files if needed
-        let output_dir = std::env::var("OCTOS_DATA_DIR")
-            .map(|d| format!("{d}/skill-output/"))
-            .unwrap_or_else(|_| "skill-output/".to_string());
+        let output_dir = self
+            .output_dir_hint
+            .clone()
+            .unwrap_or_else(|| "skill-output/".to_string());
         format!("{base}\nOutput directory: {output_dir}")
+    }
+
+    /// Set the output directory hint included in spawn_only tool messages.
+    pub fn set_output_dir_hint(&mut self, output_dir: impl Into<String>) {
+        let mut output_dir = output_dir.into();
+        if !output_dir.ends_with('/') {
+            output_dir.push('/');
+        }
+        self.output_dir_hint = Some(output_dir);
     }
 
     /// Set background result sender for spawn_only task lifecycle notifications.
@@ -362,6 +374,7 @@ impl ToolRegistry {
             supervisor: self.supervisor.clone(),
             spawn_only_invoked: self.spawn_only_invoked.clone(),
             session_key: self.session_key.clone(),
+            output_dir_hint: self.output_dir_hint.clone(),
         }
     }
 
@@ -1179,5 +1192,16 @@ mod lifecycle_tests {
         assert!(active.contains(&"read_file".to_string()));
         assert!(active.contains(&"write_file".to_string()));
         assert!(active.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn spawn_only_message_uses_runtime_output_dir_hint() {
+        let mut reg = make_registry(5, 3);
+        reg.mark_spawn_only("mofa_slides", None);
+        reg.set_output_dir_hint("/tmp/octos-profile/skill-output");
+
+        let msg = reg.spawn_only_message("mofa_slides");
+
+        assert!(msg.contains("Output directory: /tmp/octos-profile/skill-output/"));
     }
 }

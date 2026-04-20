@@ -1423,47 +1423,72 @@ pub async fn operator_summary(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let mut metrics_texts = Vec::new();
+    let mut sources = Vec::new();
     if let Some(ref handle) = state.metrics_handle {
-        let rendered = handle.render();
-        if !rendered.trim().is_empty() {
-            metrics_texts.push(rendered);
-        }
+        sources.push(super::metrics::OperatorSummarySourceInput {
+            scope: "serve".to_string(),
+            profile_id: None,
+            scrape_status: "local".to_string(),
+            scrape_error: None,
+            api_port: None,
+            pid: None,
+            started_at: None,
+            uptime_secs: None,
+            metrics_text: Some(handle.render()),
+        });
     }
 
-    let statuses = pm.all_statuses().await;
+    let mut statuses = pm.all_statuses().await.into_iter().collect::<Vec<_>>();
+    statuses.sort_by(|left, right| left.0.cmp(&right.0));
     for (profile_id, status) in statuses {
-        if !status.running {
-            continue;
-        }
-        if let Some(port) = pm.api_port(&profile_id).await {
-            if let Some(rendered) = scrape_gateway_metrics(&state.http_client, port).await {
-                if !rendered.trim().is_empty() {
-                    metrics_texts.push(rendered);
+        let api_port = pm.api_port(&profile_id).await;
+        let (scrape_status, scrape_error, metrics_text) = match api_port {
+            Some(port) => match scrape_gateway_metrics(&state.http_client, port).await {
+                Ok(rendered) => {
+                    let scrape_status = if rendered.trim().is_empty() {
+                        "empty".to_string()
+                    } else {
+                        "scraped".to_string()
+                    };
+                    (scrape_status, None, Some(rendered))
                 }
-            }
-        }
+                Err(error) => ("failed".to_string(), Some(error), None),
+            },
+            None => ("missing_api_port".to_string(), None, None),
+        };
+
+        sources.push(super::metrics::OperatorSummarySourceInput {
+            scope: "gateway".to_string(),
+            profile_id: Some(profile_id),
+            scrape_status,
+            scrape_error,
+            api_port,
+            pid: status.pid,
+            started_at: status.started_at,
+            uptime_secs: status.uptime_secs,
+            metrics_text,
+        });
     }
 
-    Ok(Json(super::metrics::build_operator_summary_from_texts(
-        metrics_texts,
+    Ok(Json(super::metrics::build_operator_summary_from_sources(
+        sources,
     )))
 }
 
-async fn scrape_gateway_metrics(client: &reqwest::Client, port: u16) -> Option<String> {
+async fn scrape_gateway_metrics(client: &reqwest::Client, port: u16) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{port}/metrics");
     let response = client
         .get(url)
         .timeout(Duration::from_secs(2))
         .send()
         .await
-        .ok()?;
+        .map_err(|error| error.to_string())?;
 
     if !response.status().is_success() {
-        return None;
+        return Err(format!("http {}", response.status()));
     }
 
-    response.text().await.ok()
+    response.text().await.map_err(|error| error.to_string())
 }
 
 // ── Monitor control endpoints ────────────────────────────────────────
@@ -1540,6 +1565,7 @@ pub async fn list_profile_skills(
 
 #[derive(Deserialize)]
 pub struct InstallSkillRequest {
+    /// Skill source: GitHub shorthand, full Git URL, or local path.
     pub repo: String,
     #[serde(default)]
     pub force: bool,
@@ -1551,7 +1577,7 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
-/// POST /api/admin/profiles/:id/skills — install a skill from GitHub.
+/// POST /api/admin/profiles/:id/skills — install a skill from GitHub shorthand, a full Git URL, or a local path.
 pub async fn install_profile_skill(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

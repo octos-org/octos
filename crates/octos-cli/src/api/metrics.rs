@@ -41,120 +41,70 @@ struct ParsedMetricSample {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorSummaryCollection {
+    pub running_gateways: usize,
+    pub gateways_with_api_port: usize,
+    pub gateways_missing_api_port: usize,
+    pub scrape_failures: usize,
+    pub sources_observed: usize,
+    pub sources_with_metrics: usize,
+    pub sources_without_metrics: usize,
+    pub partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorSummarySource {
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub scrape_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrape_error: Option<String>,
+    pub available: bool,
+    pub sample_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<i64>,
+    pub totals: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OperatorSummary {
     pub available: bool,
+    pub collection: OperatorSummaryCollection,
     pub totals: BTreeMap<String, u64>,
     pub breakdowns: BTreeMap<String, Vec<Value>>,
+    pub sources: Vec<OperatorSummarySource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSummarySourceInput {
+    pub scope: String,
+    pub profile_id: Option<String>,
+    pub scrape_status: String,
+    pub scrape_error: Option<String>,
+    pub api_port: Option<u16>,
+    pub pid: Option<u32>,
+    pub started_at: Option<String>,
+    pub uptime_secs: Option<i64>,
+    pub metrics_text: Option<String>,
 }
 
 pub fn build_operator_summary(metrics_text: &str) -> OperatorSummary {
     let samples = parse_metric_samples(metrics_text);
-    let totals = BTreeMap::from([
-        (
-            "retries".to_string(),
-            total_for_metric(&samples, "octos_retry_total"),
-        ),
-        (
-            "timeouts".to_string(),
-            total_for_metric(&samples, "octos_timeout_total"),
-        ),
-        (
-            "duplicate_suppressions".to_string(),
-            total_for_metric(&samples, "octos_result_duplicate_suppressed_total"),
-        ),
-        (
-            "orphaned_child_sessions".to_string(),
-            total_for_metric(&samples, "octos_child_session_orphan_total"),
-        ),
-        (
-            "workflow_phase_transitions".to_string(),
-            total_for_metric(&samples, "octos_workflow_phase_transition_total"),
-        ),
-        (
-            "result_deliveries".to_string(),
-            total_for_metric(&samples, "octos_result_delivery_total"),
-        ),
-        (
-            "session_replays".to_string(),
-            total_for_metric(&samples, "octos_session_replay_total"),
-        ),
-        (
-            "session_persists".to_string(),
-            total_for_metric(&samples, "octos_session_persist_total"),
-        ),
-        (
-            "session_rewrites".to_string(),
-            total_for_metric(&samples, "octos_session_rewrite_total"),
-        ),
-        (
-            "child_session_lifecycle".to_string(),
-            total_for_metric(&samples, "octos_child_session_lifecycle_total"),
-        ),
-    ]);
-
-    let breakdowns = BTreeMap::from([
-        (
-            "retry_reasons".to_string(),
-            breakdown(&samples, "octos_retry_total", &["reason"]),
-        ),
-        (
-            "timeout_reasons".to_string(),
-            breakdown(&samples, "octos_timeout_total", &["reason"]),
-        ),
-        (
-            "duplicate_suppressions".to_string(),
-            breakdown(
-                &samples,
-                "octos_result_duplicate_suppressed_total",
-                &["surface", "reason"],
-            ),
-        ),
-        (
-            "child_session_orphans".to_string(),
-            breakdown(&samples, "octos_child_session_orphan_total", &["reason"]),
-        ),
-        (
-            "workflow_phase_transitions".to_string(),
-            breakdown(
-                &samples,
-                "octos_workflow_phase_transition_total",
-                &["workflow_kind", "from_phase", "to_phase"],
-            ),
-        ),
-        (
-            "result_delivery".to_string(),
-            breakdown(
-                &samples,
-                "octos_result_delivery_total",
-                &["path", "outcome", "kind"],
-            ),
-        ),
-        (
-            "session_replay".to_string(),
-            breakdown(&samples, "octos_session_replay_total", &["kind", "outcome"]),
-        ),
-        (
-            "session_persist".to_string(),
-            breakdown(&samples, "octos_session_persist_total", &["outcome"]),
-        ),
-        (
-            "session_rewrite".to_string(),
-            breakdown(&samples, "octos_session_rewrite_total", &["outcome"]),
-        ),
-        (
-            "child_session_lifecycle".to_string(),
-            breakdown(
-                &samples,
-                "octos_child_session_lifecycle_total",
-                &["kind", "outcome"],
-            ),
-        ),
-    ]);
+    let (available, totals, breakdowns) = build_operator_summary_parts(&samples);
 
     OperatorSummary {
-        available: !samples.is_empty(),
+        available,
+        collection: empty_collection(),
         totals,
         breakdowns,
+        sources: Vec::new(),
     }
 }
 
@@ -163,13 +113,224 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let combined = metrics_texts
+    let samples = metrics_texts
         .into_iter()
-        .map(|text| text.as_ref().trim().to_string())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    build_operator_summary(&combined)
+        .flat_map(|text| parse_metric_samples(text.as_ref()))
+        .collect::<Vec<_>>();
+    let (available, totals, breakdowns) = build_operator_summary_parts(&samples);
+
+    OperatorSummary {
+        available,
+        collection: empty_collection(),
+        totals,
+        breakdowns,
+        sources: Vec::new(),
+    }
+}
+
+pub fn build_operator_summary_from_sources<I>(sources: I) -> OperatorSummary
+where
+    I: IntoIterator<Item = OperatorSummarySourceInput>,
+{
+    let mut combined_samples = Vec::new();
+    let mut source_rows = Vec::new();
+    let mut running_gateways = 0;
+    let mut gateways_with_api_port = 0;
+    let mut gateways_missing_api_port = 0;
+    let mut scrape_failures = 0;
+
+    for source in sources {
+        let samples = source
+            .metrics_text
+            .as_deref()
+            .map(parse_metric_samples)
+            .unwrap_or_default();
+        let available = !samples.is_empty();
+        let totals = build_totals(&samples);
+
+        if source.scope == "gateway" {
+            running_gateways += 1;
+            if source.api_port.is_some() {
+                gateways_with_api_port += 1;
+            } else {
+                gateways_missing_api_port += 1;
+            }
+            if source.scrape_status == "failed" {
+                scrape_failures += 1;
+            }
+        }
+
+        combined_samples.extend(samples.iter().cloned());
+        source_rows.push(OperatorSummarySource {
+            scope: source.scope,
+            profile_id: source.profile_id,
+            scrape_status: source.scrape_status,
+            scrape_error: source.scrape_error,
+            available,
+            sample_count: samples.len(),
+            api_port: source.api_port,
+            pid: source.pid,
+            started_at: source.started_at,
+            uptime_secs: source.uptime_secs,
+            totals,
+        });
+    }
+
+    source_rows.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then_with(|| left.profile_id.cmp(&right.profile_id))
+            .then_with(|| left.api_port.cmp(&right.api_port))
+    });
+
+    let (available, totals, breakdowns) = build_operator_summary_parts(&combined_samples);
+    let sources_observed = source_rows.len();
+    let sources_with_metrics = source_rows.iter().filter(|source| source.available).count();
+    let sources_without_metrics = sources_observed.saturating_sub(sources_with_metrics);
+
+    OperatorSummary {
+        available,
+        collection: OperatorSummaryCollection {
+            running_gateways,
+            gateways_with_api_port,
+            gateways_missing_api_port,
+            scrape_failures,
+            sources_observed,
+            sources_with_metrics,
+            sources_without_metrics,
+            partial: gateways_missing_api_port > 0 || scrape_failures > 0,
+        },
+        totals,
+        breakdowns,
+        sources: source_rows,
+    }
+}
+
+fn empty_collection() -> OperatorSummaryCollection {
+    OperatorSummaryCollection {
+        running_gateways: 0,
+        gateways_with_api_port: 0,
+        gateways_missing_api_port: 0,
+        scrape_failures: 0,
+        sources_observed: 0,
+        sources_with_metrics: 0,
+        sources_without_metrics: 0,
+        partial: false,
+    }
+}
+
+fn build_operator_summary_parts(
+    samples: &[ParsedMetricSample],
+) -> (bool, BTreeMap<String, u64>, BTreeMap<String, Vec<Value>>) {
+    let totals = build_totals(samples);
+    let breakdowns = build_breakdowns(samples);
+    (!samples.is_empty(), totals, breakdowns)
+}
+
+fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        (
+            "retries".to_string(),
+            total_for_metric(samples, "octos_retry_total"),
+        ),
+        (
+            "timeouts".to_string(),
+            total_for_metric(samples, "octos_timeout_total"),
+        ),
+        (
+            "duplicate_suppressions".to_string(),
+            total_for_metric(samples, "octos_result_duplicate_suppressed_total"),
+        ),
+        (
+            "orphaned_child_sessions".to_string(),
+            total_for_metric(samples, "octos_child_session_orphan_total"),
+        ),
+        (
+            "workflow_phase_transitions".to_string(),
+            total_for_metric(samples, "octos_workflow_phase_transition_total"),
+        ),
+        (
+            "result_deliveries".to_string(),
+            total_for_metric(samples, "octos_result_delivery_total"),
+        ),
+        (
+            "session_replays".to_string(),
+            total_for_metric(samples, "octos_session_replay_total"),
+        ),
+        (
+            "session_persists".to_string(),
+            total_for_metric(samples, "octos_session_persist_total"),
+        ),
+        (
+            "session_rewrites".to_string(),
+            total_for_metric(samples, "octos_session_rewrite_total"),
+        ),
+        (
+            "child_session_lifecycle".to_string(),
+            total_for_metric(samples, "octos_child_session_lifecycle_total"),
+        ),
+    ])
+}
+
+fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Value>> {
+    BTreeMap::from([
+        (
+            "retry_reasons".to_string(),
+            breakdown(samples, "octos_retry_total", &["reason"]),
+        ),
+        (
+            "timeout_reasons".to_string(),
+            breakdown(samples, "octos_timeout_total", &["reason"]),
+        ),
+        (
+            "duplicate_suppressions".to_string(),
+            breakdown(
+                samples,
+                "octos_result_duplicate_suppressed_total",
+                &["surface", "reason"],
+            ),
+        ),
+        (
+            "child_session_orphans".to_string(),
+            breakdown(samples, "octos_child_session_orphan_total", &["reason"]),
+        ),
+        (
+            "workflow_phase_transitions".to_string(),
+            breakdown(
+                samples,
+                "octos_workflow_phase_transition_total",
+                &["workflow_kind", "from_phase", "to_phase"],
+            ),
+        ),
+        (
+            "result_delivery".to_string(),
+            breakdown(
+                samples,
+                "octos_result_delivery_total",
+                &["path", "outcome", "kind"],
+            ),
+        ),
+        (
+            "session_replay".to_string(),
+            breakdown(samples, "octos_session_replay_total", &["kind", "outcome"]),
+        ),
+        (
+            "session_persist".to_string(),
+            breakdown(samples, "octos_session_persist_total", &["outcome"]),
+        ),
+        (
+            "session_rewrite".to_string(),
+            breakdown(samples, "octos_session_rewrite_total", &["outcome"]),
+        ),
+        (
+            "child_session_lifecycle".to_string(),
+            breakdown(
+                samples,
+                "octos_child_session_lifecycle_total",
+                &["kind", "outcome"],
+            ),
+        ),
+    ])
 }
 
 fn total_for_metric(samples: &[ParsedMetricSample], metric: &str) -> u64 {
@@ -431,5 +592,87 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
         assert_eq!(summary.totals.get("session_persists"), Some(&5));
         assert_eq!(summary.totals.get("timeouts"), Some(&1));
         assert_eq!(summary.totals.get("session_replays"), Some(&4));
+    }
+
+    #[test]
+    fn operator_summary_tracks_source_collection_and_failures() {
+        let summary = build_operator_summary_from_sources([
+            OperatorSummarySourceInput {
+                scope: "serve".into(),
+                profile_id: None,
+                scrape_status: "local".into(),
+                scrape_error: None,
+                api_port: None,
+                pid: None,
+                started_at: None,
+                uptime_secs: None,
+                metrics_text: Some("octos_timeout_total{reason=\"session_turn\"} 2".into()),
+            },
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("alpha".into()),
+                scrape_status: "scraped".into(),
+                scrape_error: None,
+                api_port: Some(51001),
+                pid: Some(4242),
+                started_at: Some("2026-04-17T00:00:00Z".into()),
+                uptime_secs: Some(120),
+                metrics_text: Some(
+                    "octos_retry_total{reason=\"background_result_ack_timeout\"} 3".into(),
+                ),
+            },
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("beta".into()),
+                scrape_status: "failed".into(),
+                scrape_error: Some("http 503".into()),
+                api_port: Some(51002),
+                pid: Some(4343),
+                started_at: None,
+                uptime_secs: Some(45),
+                metrics_text: None,
+            },
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("gamma".into()),
+                scrape_status: "missing_api_port".into(),
+                scrape_error: None,
+                api_port: None,
+                pid: Some(4444),
+                started_at: None,
+                uptime_secs: Some(30),
+                metrics_text: None,
+            },
+        ]);
+
+        assert!(summary.available);
+        assert_eq!(summary.collection.running_gateways, 3);
+        assert_eq!(summary.collection.gateways_with_api_port, 2);
+        assert_eq!(summary.collection.gateways_missing_api_port, 1);
+        assert_eq!(summary.collection.scrape_failures, 1);
+        assert_eq!(summary.collection.sources_observed, 4);
+        assert_eq!(summary.collection.sources_with_metrics, 2);
+        assert_eq!(summary.collection.sources_without_metrics, 2);
+        assert!(summary.collection.partial);
+        assert_eq!(summary.totals.get("timeouts"), Some(&2));
+        assert_eq!(summary.totals.get("retries"), Some(&3));
+
+        let alpha = summary
+            .sources
+            .iter()
+            .find(|source| source.profile_id.as_deref() == Some("alpha"))
+            .unwrap();
+        assert_eq!(alpha.scrape_status, "scraped");
+        assert_eq!(alpha.sample_count, 1);
+        assert_eq!(alpha.totals.get("retries"), Some(&3));
+
+        let beta = summary
+            .sources
+            .iter()
+            .find(|source| source.profile_id.as_deref() == Some("beta"))
+            .unwrap();
+        assert_eq!(beta.scrape_status, "failed");
+        assert_eq!(beta.scrape_error.as_deref(), Some("http 503"));
+        assert!(!beta.available);
     }
 }
