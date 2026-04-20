@@ -57,12 +57,24 @@ run_suite() {
     extra_args=($PLAYWRIGHT_EXTRA_ARGS)
   fi
 
-  env \
-    OCTOS_TEST_URL="$base_url" \
-    OCTOS_AUTH_TOKEN="$AUTH_TOKEN" \
-    OCTOS_PROFILE="$PROFILE_ID" \
-    OCTOS_TEST_EMAIL="$TEST_EMAIL" \
-    npx playwright test "$@" --reporter=line --output="$output_dir" "${extra_args[@]}"
+  local cmd=(
+    env
+    OCTOS_TEST_URL="$base_url"
+    OCTOS_AUTH_TOKEN="$AUTH_TOKEN"
+    OCTOS_PROFILE="$PROFILE_ID"
+    OCTOS_TEST_EMAIL="$TEST_EMAIL"
+    npx
+    playwright
+    test
+    "$@"
+    --reporter=line
+    --output="$output_dir"
+  )
+  if [ "${#extra_args[@]}" -gt 0 ]; then
+    cmd+=("${extra_args[@]}")
+  fi
+
+  "${cmd[@]}"
 }
 
 SUITE="${1:-}"
