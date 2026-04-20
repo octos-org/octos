@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn site_workspace_policy_tracks_template_build_output() {
-        let policy = octos_agent::WorkspacePolicy::for_site_build_output("out");
+        let policy = crate::workflows::site_delivery::workspace_policy_for_template("nextjs-app");
         assert_eq!(
             policy.validation.on_completion,
             vec!["file_exists:out/index.html"]

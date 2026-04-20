@@ -2,7 +2,13 @@ use crate::workflow_runtime::workflow_families::SiteTemplate;
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
-use octos_agent::WorkspacePolicy;
+use octos_agent::{
+    ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
+    WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+    WorkspaceVersionControlProvider,
+};
+use octos_agent::workspace_policy::WorkspacePolicyWorkspace;
+use std::collections::BTreeMap;
 
 pub fn build_output_dir_for_template_kind(template: SiteTemplate) -> &'static str {
     template.output_dir()
@@ -13,7 +19,51 @@ pub fn build_output_dir_for_template(template: &str) -> &'static str {
 }
 
 pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePolicy {
-    WorkspacePolicy::for_site_build_output(build_output_dir_for_template_kind(template))
+    let build_output_dir = build_output_dir_for_template_kind(template);
+    WorkspacePolicy {
+        workspace: WorkspacePolicyWorkspace {
+            kind: WorkspacePolicyKind::Sites,
+        },
+        version_control: WorkspaceVersionControlPolicy {
+            provider: WorkspaceVersionControlProvider::Git,
+            auto_init: true,
+            trigger: WorkspaceSnapshotTrigger::TurnEnd,
+            fail_on_error: true,
+        },
+        tracking: WorkspaceTrackingPolicy {
+            ignore: vec![
+                "node_modules/**".into(),
+                "dist/**".into(),
+                "out/**".into(),
+                "docs/**".into(),
+                "build/**".into(),
+                ".astro/**".into(),
+                ".next/**".into(),
+                ".quarto/**".into(),
+                "*.log".into(),
+                ".DS_Store".into(),
+            ],
+        },
+        validation: ValidationPolicy {
+            on_turn_end: vec![
+                "file_exists:mofa-site-session.json".into(),
+                "file_exists:site-plan.json".into(),
+                "file_exists:optimized-prompt.md".into(),
+            ],
+            on_source_change: Vec::new(),
+            on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
+        },
+        artifacts: WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([
+                ("primary".into(), format!("{build_output_dir}/index.html")),
+                (
+                    "entrypoint".into(),
+                    format!("{build_output_dir}/index.html"),
+                ),
+            ]),
+        },
+        spawn_tasks: BTreeMap::new(),
+    }
 }
 
 pub fn workspace_policy_for_template(template: &str) -> WorkspacePolicy {
