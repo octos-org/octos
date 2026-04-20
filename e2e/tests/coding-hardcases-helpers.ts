@@ -107,17 +107,69 @@ export async function waitForSingleSettledTurn(page: Page, timeoutMs = 240_000) 
   throw new Error('Timed out waiting for a single settled coding turn');
 }
 
-export async function getActiveSessionId(page: Page): Promise<string> {
-  const sessionId = await page
-    .locator("[data-active='true']")
-    .first()
-    .getAttribute('data-session-id');
+async function fetchSessionIds(page: Page): Promise<string[]> {
+  return page.evaluate(async () => {
+    const token =
+      localStorage.getItem('octos_session_token') ||
+      localStorage.getItem('octos_auth_token') ||
+      '';
+    const profile = localStorage.getItem('selected_profile') || '';
+    const headers: Record<string, string> = {};
 
-  if (!sessionId) {
-    throw new Error('No active session id found in the sidebar');
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    if (profile) {
+      headers['X-Profile-Id'] = profile;
+    }
+
+    const resp = await fetch('/api/sessions', { headers });
+    if (!resp.ok) {
+      return [];
+    }
+    const sessions = await resp.json().catch(() => []);
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      return [];
+    }
+
+    return sessions
+      .map((session) => (typeof session?.id === 'string' ? session.id : null))
+      .filter((sessionId): sessionId is string => Boolean(sessionId));
+  });
+}
+
+export async function getActiveSessionId(
+  page: Page,
+  opts: { timeoutMs?: number; ignoreSessionIds?: string[] } = {},
+): Promise<string> {
+  const { timeoutMs = 15_000, ignoreSessionIds = [] } = opts;
+  const ignored = new Set(ignoreSessionIds);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (page.isClosed()) {
+      throw new Error('Page closed before the active session id could be resolved');
+    }
+
+    const activeSessionId = await page.evaluate(() => {
+      const active = document.querySelector<HTMLElement>("[data-session-id][data-active='true']");
+      return active?.dataset.sessionId || null;
+    }).catch(() => null);
+
+    if (activeSessionId && !ignored.has(activeSessionId)) {
+      return activeSessionId;
+    }
+
+    const sessionIds = await fetchSessionIds(page).catch(() => []);
+    const newestSessionId = sessionIds.find((sessionId) => !ignored.has(sessionId)) || null;
+    if (newestSessionId) {
+      return newestSessionId;
+    }
+
+    await page.waitForTimeout(500);
   }
 
-  return sessionId;
+  throw new Error('No active session id found in the sidebar or sessions API');
 }
 
 export async function getSessionTasks(page: Page, sessionId: string): Promise<SessionTask[]> {
