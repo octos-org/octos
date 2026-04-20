@@ -194,6 +194,73 @@ And the final result should include structured fields like:
 
 This gives developers and operators one shared truth.
 
+## Current Runtime Addendum
+
+Until the broader customer-facing schema is finalized, the current runtime
+follows these concrete Phase 3 conventions.
+
+### `BeforeSpawnVerify` Semantics
+
+`before_spawn_verify` is the blocking pre-delivery hook for successful
+background child sessions.
+
+It runs only after the runtime has:
+
+- received a successful child result
+- resolved candidate terminal `output_files`
+- identified the workflow/phase context for verification
+
+It runs before the runtime:
+
+- emits `on_spawn_verify`
+- marks the task ready
+- persists or delivers the terminal artifact set
+
+Hook behavior is:
+
+- allow: keep the runtime-selected `output_files`
+- modify: replace `output_files` by returning either a JSON string array or
+  `{"output_files":[...]}`
+- deny: fail verification and turn the child run into a terminal failure
+- hook error: log the hook failure and continue with the runtime-selected files
+
+### Primary Artifact Convention
+
+The harness contract should name one canonical end-user artifact under
+`artifacts.entries.primary`.
+
+That path is the source of truth for the primary artifact. Until every surface
+exposes an explicit `primary_artifact` field, clients should treat the
+contract's `primary` artifact, or the first terminal `output_files` entry when
+only runtime task data is available, as the primary artifact.
+
+First-party Phase 3 workflows currently follow this convention:
+
+- slides: `output/deck.pptx`
+- site: the published entrypoint such as `dist/index.html` or `out/index.html`
+- audio: the final rendered audio file
+
+Any additional terminal files should be treated as previews or secondary
+artifacts, not as competing primary outputs.
+
+### `lifecycle_state` API Field
+
+Task APIs expose both a low-level `status` and a user-facing
+`lifecycle_state`.
+
+`lifecycle_state` is the stable UX state machine:
+
+- `queued`: the task was registered but has not started execution yet
+- `running`: the child worker is actively executing
+- `verifying`: execution finished and the runtime is resolving, validating, or
+  delivering outputs
+- `ready`: the task reached terminal success and its outputs are ready for the
+  user-facing surface
+- `failed`: execution or verification failed
+
+Clients should drive progress UI from `lifecycle_state` and treat `status` as
+the lower-level supervisor record.
+
 ## Guarantees Octos Should Make
 
 For customer skills/apps, Octos should guarantee:

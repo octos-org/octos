@@ -2146,7 +2146,6 @@ mod tests {
                     "allowed_tools": ["mofa_slides"],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
-                        "deliver_media_only": false,
                         "forbid_intermediate_files": true,
                         "required_artifact_kind": "presentation"
                     }
