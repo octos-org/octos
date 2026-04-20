@@ -207,11 +207,11 @@ test.describe('Coding shell repair', () => {
     const marker = `phase3-shell-${Date.now()}`;
     const prompt = [
       'Use shell tool only.',
-      `Create a temporary git repo at /tmp/${marker}.`,
+      `Create a temporary git repo in a new subdirectory named ${marker} under the current working directory.`,
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
       'Make exactly one edit: change beta to gamma.',
-      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
-      'Then recover by running the same diff from the repo root.',
+      `Intentionally run \`git diff -- notes.txt\` from one directory above ${marker} once so it fails.`,
+      `Then recover by running the same diff from the ${marker} repo root.`,
       'Return only the final unified diff, nothing else.',
       'Do not start background work.',
     ].join(' ');
