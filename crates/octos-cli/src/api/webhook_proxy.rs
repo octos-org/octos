@@ -9,6 +9,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -16,6 +17,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use super::AppState;
+
+const WEBHOOK_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Proxy Feishu/Lark webhook events to the gateway's local webhook server.
 pub async fn feishu_webhook_proxy(
@@ -94,11 +97,33 @@ async fn proxy_to_gateway_with_bytes(
 
     let url = format!("http://127.0.0.1:{port}{upstream_path}");
 
+    proxy_webhook_to_url(
+        &state.http_client,
+        &profile_id,
+        &url,
+        &headers,
+        body_bytes,
+        WEBHOOK_UPSTREAM_TIMEOUT,
+    )
+    .await
+}
+
+async fn proxy_webhook_to_url(
+    http_client: &reqwest::Client,
+    profile_id: &str,
+    url: &str,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+    timeout: Duration,
+) -> Response {
     // Build upstream request preserving headers
-    let mut req = state.http_client.post(&url).body(body_bytes.to_vec());
+    let mut req = http_client
+        .post(url)
+        .timeout(timeout)
+        .body(body_bytes.to_vec());
 
     // Forward relevant headers
-    for (name, value) in &headers {
+    for (name, value) in headers {
         // Skip hop-by-hop headers
         let n = name.as_str();
         if matches!(
@@ -114,18 +139,7 @@ async fn proxy_to_gateway_with_bytes(
 
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(
-                profile = %profile_id,
-                url = %url,
-                error = %e,
-                "webhook proxy: upstream request failed"
-            );
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream request failed: {e}"),
-            );
-        }
+        Err(error) => return webhook_upstream_error_response(profile_id, url, timeout, error),
     };
 
     // Convert upstream response back to axum response
@@ -133,7 +147,9 @@ async fn proxy_to_gateway_with_bytes(
     let resp_headers = resp.headers().clone();
     let resp_body = match resp.bytes().await {
         Ok(b) => b,
-        Err(_) => return json_error(StatusCode::BAD_GATEWAY, "failed to read upstream response"),
+        Err(error) => {
+            return webhook_upstream_error_response(profile_id, url, timeout, error);
+        }
     };
 
     let mut response = (status, resp_body.to_vec()).into_response();
@@ -143,6 +159,36 @@ async fn proxy_to_gateway_with_bytes(
     }
 
     response
+}
+
+fn webhook_upstream_error_response(
+    profile_id: &str,
+    url: &str,
+    timeout: Duration,
+    error: reqwest::Error,
+) -> Response {
+    let (status, message) = if error.is_timeout() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("upstream request timed out after {:?}", timeout),
+        )
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("upstream request failed: {error}"),
+        )
+    };
+
+    tracing::error!(
+        profile = %profile_id,
+        url = %url,
+        timeout_ms = timeout.as_millis(),
+        is_timeout = error.is_timeout(),
+        error = %error,
+        "webhook proxy: upstream request failed"
+    );
+
+    json_error(status, &message)
 }
 
 /// Streaming SSE proxy for API channel requests.
@@ -388,7 +434,12 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sync_chat_response_from_sse;
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, StatusCode};
+
+    use super::{parse_sync_chat_response_from_sse, proxy_webhook_to_url};
 
     #[test]
     fn parse_sync_chat_response_from_sse_uses_done_metadata() {
@@ -428,5 +479,35 @@ data: {"type":"done","content":"","tokens_in":1,"tokens_out":2}
 
         let error = parse_sync_chat_response_from_sse(body).unwrap_err();
         assert!(error.contains("done event"));
+    }
+
+    #[tokio::test]
+    async fn proxy_webhook_to_url_times_out_hung_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let response = proxy_webhook_to_url(
+            &reqwest::Client::new(),
+            "test-profile",
+            &format!("http://{addr}/webhook/event"),
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"ok":true}"#),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "upstream request timed out after 50ms");
+
+        server.abort();
     }
 }
