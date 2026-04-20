@@ -16,6 +16,29 @@
 ./scripts/ci.sh --serial
 ```
 
+### Canonical Milestone Commands
+
+Use these as the source of truth for release-slice validation instead of ad hoc
+command lists.
+
+```bash
+# Canonical milestone CI suites
+./scripts/milestone-ci.sh hosted-fast
+./scripts/milestone-ci.sh workspace-all-features
+./scripts/milestone-ci.sh dashboard
+./scripts/milestone-ci.sh release-bundle
+
+# Canonical live milestone E2E suites
+npm --prefix e2e run test:milestone
+npm --prefix e2e run test:milestone:crew
+npm --prefix e2e run test:milestone:bot
+npm --prefix e2e run test:milestone:ocean
+```
+
+The E2E milestone runner installs Playwright dependencies on first use. Set
+`OCTOS_TEST_URL` for a shared base URL, or override `OCTOS_CREW_URL`,
+`OCTOS_BOT_URL`, and `OCTOS_OCEAN_URL` per suite.
+
 ---
 
 ## CI Pipeline
