@@ -281,10 +281,19 @@ impl PluginTool {
         };
         let found = match out_file.or(from_output) {
             Some(path) => {
-                if path.exists() {
-                    Some(path)
+                let resolved = if path.exists() {
+                    path
                 } else {
-                    Some(self.wait_for_output_file(path).await)
+                    self.wait_for_output_file(path).await
+                };
+                if resolved.exists() {
+                    Some(resolved)
+                } else {
+                    tracing::warn!(
+                        file = %resolved.display(),
+                        "auto-detected plugin output file was not created; skipping delivery"
+                    );
+                    None
                 }
             }
             None => None,
@@ -1169,6 +1178,45 @@ mod tests {
             output_abs.exists(),
             "generated deck should appear after fallback wait"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_fallback_skips_missing_generated_pptx() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output_rel = "slides/demo/output/deck.pptx";
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho 'Generated PPTX: slides/demo/output/deck.pptx'\n",
+        );
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides output".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.file_modified, None);
+        assert!(result.files_to_send.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

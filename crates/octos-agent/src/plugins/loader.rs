@@ -13,10 +13,20 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
-use super::manifest::PluginManifest;
+use super::manifest::{PluginManifest, PluginToolDef};
 use super::tool::PluginTool;
 
 const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
+const GENERATIVE_SKILL_ENV_ALLOWLIST: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "GEMINI_API_KEY",
+    "GEMINI_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_BASE_URL",
+    "DASHSCOPE_API_KEY",
+    "DASHSCOPE_BASE_URL",
+];
 
 /// Aggregated result from loading plugins across directories.
 #[derive(Debug, Default)]
@@ -285,11 +295,13 @@ impl PluginLoader {
             })
             .collect();
 
+        let plugin_name = manifest.name.clone();
         let tools: Vec<PluginTool> = manifest
             .tools
             .into_iter()
             .map(|def| {
-                let mut tool = PluginTool::new(manifest.name.clone(), def, verified_exe.clone())
+                let def = apply_builtin_env_allowlist(&plugin_name, def);
+                let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
@@ -307,6 +319,22 @@ impl PluginLoader {
 
         Ok((tools, extras))
     }
+}
+
+fn apply_builtin_env_allowlist(plugin_name: &str, mut def: PluginToolDef) -> PluginToolDef {
+    let envs = match (plugin_name, def.name.as_str()) {
+        ("mofa-slides", "mofa_slides") | ("mofa-infographic", "mofa_infographic") => {
+            GENERATIVE_SKILL_ENV_ALLOWLIST
+        }
+        _ => return def,
+    };
+
+    for env in envs {
+        if !def.env.iter().any(|existing| existing == env) {
+            def.env.push((*env).to_string());
+        }
+    }
+    def
 }
 
 /// Ensure a plugin directory has a runnable executable for manifests that
@@ -848,6 +876,42 @@ mod tests {
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert!(plugin_dir.join("main").exists());
+    }
+
+    #[test]
+    fn test_builtin_env_allowlist_augments_first_party_mofa_tools_only() {
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            spawn_only: false,
+            env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
+            spawn_only_message: None,
+        };
+
+        let augmented = apply_builtin_env_allowlist("mofa-slides", def);
+        assert!(augmented.env.iter().any(|env| env == "GEMINI_API_KEY"));
+        assert!(augmented.env.iter().any(|env| env == "DASHSCOPE_API_KEY"));
+        assert!(augmented.env.iter().any(|env| env == "OPENAI_BASE_URL"));
+        assert_eq!(
+            augmented
+                .env
+                .iter()
+                .filter(|env| env.as_str() == "GEMINI_API_KEY")
+                .count(),
+            1
+        );
+
+        let untrusted = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let untrusted = apply_builtin_env_allowlist("custom-plugin", untrusted);
+        assert!(untrusted.env.is_empty());
     }
 
     #[cfg(unix)]

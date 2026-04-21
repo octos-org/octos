@@ -29,7 +29,9 @@ use tracing::{info, warn};
 
 use super::build_system_prompt;
 use super::message_preprocessing;
-use super::profile_factory::{ProfileActorFactoryBuilder, build_plugin_env};
+use super::profile_factory::{
+    ProfileActorFactoryBuilder, build_plugin_env, profile_plugin_env, profile_search_provider_keys,
+};
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
 use crate::commands::chat::{self, create_embedder, resolve_provider_policy};
@@ -50,68 +52,6 @@ use crate::status_layers::StatusComposer;
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
-
-fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        "tavily" => Some("TAVILY_API_KEY"),
-        "perplexity" => Some("PERPLEXITY_API_KEY"),
-        "brave" => Some("BRAVE_API_KEY"),
-        "you" => Some("YDC_API_KEY"),
-        "serper" => Some("SERPER_API_KEY"),
-        _ => None,
-    }
-}
-
-fn profile_search_provider_keys(profile: &UserProfile) -> HashMap<String, String> {
-    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
-    profile
-        .config
-        .search
-        .as_ref()
-        .map(|search| {
-            search
-                .providers
-                .iter()
-                .filter_map(|(provider_id, provider)| {
-                    let source_key = provider.api_key_env.as_deref()?;
-                    let secret = resolved_env_vars
-                        .get(source_key)
-                        .cloned()
-                        .or_else(|| std::env::var(source_key).ok())?;
-                    Some((provider_id.clone(), secret))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn profile_plugin_env(profile: &UserProfile) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = profile_search_provider_keys(profile)
-        .into_iter()
-        .filter_map(|(provider_id, secret)| {
-            Some((
-                canonical_search_env(provider_id.as_str())?.to_string(),
-                secret,
-            ))
-        })
-        .collect();
-
-    if let Some(slides) = profile
-        .config
-        .apps
-        .as_ref()
-        .and_then(|apps| apps.slides.as_ref())
-    {
-        if let Some(template_dir) = slides.template_dir.as_ref() {
-            env.push(("PPT_TEMPLATE_DIR".into(), template_dir.clone()));
-        }
-        if let Some(default_theme) = slides.default_theme.as_ref() {
-            env.push(("PPT_DEFAULT_THEME".into(), default_theme.clone()));
-        }
-    }
-
-    env
-}
 
 fn discover_ominix_url() -> Option<String> {
     std::env::var("OMINIX_API_URL").ok().or_else(|| {
