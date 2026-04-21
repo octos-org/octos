@@ -19,6 +19,7 @@ use octos_bus::file_handle::{
     resolve_scoped_file_handle,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -365,15 +366,33 @@ async fn chat_streaming(
 
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let model = request_agent.llm_provider().model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(
+                        response.token_usage.input_tokens,
+                        response.token_usage.output_tokens,
+                    )
+                });
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    "session_cost": session_cost,
                 });
                 let _ = tx.send(done.to_string());
             }
@@ -2578,15 +2597,33 @@ async fn ws_standalone_agent(
                 }
 
                 let provider_metadata = response.provider_metadata.clone();
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let model = request_agent.llm_provider().model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(
+                        response.token_usage.input_tokens,
+                        response.token_usage.output_tokens,
+                    )
+                });
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    "session_cost": session_cost,
                 });
                 let _ = tx.send(done.to_string());
             }
