@@ -992,7 +992,7 @@ fn recover_shell_retry(
                 .then(|| {
                     shell_results
                         .iter()
-                        .find(|content| is_useful_shell_output(content))
+                        .find(|content| is_recoverable_non_diff_shell_output(content))
                 })
                 .flatten()
                 .map(|content| ShellRetryRecovery {
@@ -1081,6 +1081,25 @@ fn is_validation_like_shell_output(content: &str) -> bool {
         ]
         .iter()
         .any(|marker| content.contains(marker))
+}
+
+fn is_recoverable_non_diff_shell_output(content: &str) -> bool {
+    is_useful_shell_output(content) && content.lines().any(is_git_status_short_line)
+}
+
+fn is_git_status_short_line(line: &str) -> bool {
+    let line = line.trim_end();
+    let bytes = line.as_bytes();
+    if bytes.len() < 4 || !bytes[2].is_ascii_whitespace() {
+        return false;
+    }
+
+    let status = &line[..2];
+    let has_status = status.chars().any(|ch| ch != ' ');
+    let valid_status = status
+        .chars()
+        .all(|ch| matches!(ch, ' ' | 'M' | 'A' | 'D' | 'R' | 'C' | 'U' | '?' | '!'));
+    has_status && valid_status && !line[3..].trim().is_empty()
 }
 
 fn strip_success_exit_suffix(content: &str) -> String {
@@ -2044,6 +2063,107 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
         assert!(recovered.content.contains("src/lib.rs"));
         assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
+        let messages = vec![
+            Message::user("return the final diff"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "mkdir repo && cd repo && git init"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "Initialized empty Git repository in /tmp/repo/.git/\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cd repo && git commit -m initial"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "[master (root-commit) 1e19620] initial commit\n 1 file changed, 2 insertions(+)\n create mode 100644 notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "fatal: ambiguous argument 'notes.txt'\n\nExit code: 128".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "/tmp\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(recover_shell_retry(&messages, 4).is_none());
     }
 
     #[test]
