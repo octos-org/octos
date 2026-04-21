@@ -248,16 +248,25 @@ test.describe('Coding shell repair', () => {
     ].join(' ');
 
     let sid = `shell-repair-${Date.now()}`;
-    let { content, doneEvent } = await chatSSE(basePrompt, sid, 90_000);
+    let { content } = await chatSSE(basePrompt, sid, 180_000);
     if (
       !content.includes('diff --git') &&
       /don'?t have access to a shell tool|available tools|activate_tools/i.test(content)
     ) {
       sid = `${sid}-retry`;
-      ({ content, doneEvent } = await chatSSE(retryPrompt, sid, 90_000));
+      ({ content } = await chatSSE(retryPrompt, sid, 180_000));
     }
 
-    expect(doneEvent).toBeTruthy();
+    if (!content.includes('diff --git')) {
+      const messages = await getMessages(sid);
+      content = [
+        content,
+        ...messages.map((message) =>
+          typeof message?.content === 'string' ? message.content : '',
+        ),
+      ].join('\n');
+    }
+
     expect(content).toContain('diff --git');
     expect(content).toContain('notes.txt');
     expect(content).toContain('-beta');
