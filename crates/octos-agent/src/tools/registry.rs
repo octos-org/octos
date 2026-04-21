@@ -336,7 +336,9 @@ impl ToolRegistry {
     /// Create a new ToolRegistry by cloning all tools except the named exclusions.
     ///
     /// The new registry shares the same `Arc<dyn Tool>` instances (cheap).
-    /// Provider policy and context filter are also copied.
+    /// Provider policy and context filter are also copied. Runtime state that
+    /// is session-scoped stays fresh so cloned registries cannot leak task
+    /// status, result routing, or spawn-only flags across sessions.
     pub fn snapshot_excluding(&self, exclude: &[&str]) -> Self {
         let tools: HashMap<String, Arc<dyn Tool>> = self
             .tools
@@ -370,10 +372,10 @@ impl ToolRegistry {
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
-            background_result_sender: self.background_result_sender.clone(),
-            supervisor: self.supervisor.clone(),
-            spawn_only_invoked: self.spawn_only_invoked.clone(),
-            session_key: self.session_key.clone(),
+            background_result_sender: None,
+            supervisor: Arc::new(TaskSupervisor::new()),
+            spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
         }
     }
@@ -916,6 +918,38 @@ mod cwd_isolation_tests {
         assert!(
             rebound.get("write_file").is_some(),
             "write_file should be re-registered"
+        );
+    }
+
+    #[test]
+    fn test_rebind_cwd_isolates_session_runtime_state() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let mut registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
+        registry.set_session_key("api:base-session".to_string());
+        registry.mark_spawn_only_invoked();
+        let base_task = registry.register_task("deep_search", "call-base");
+
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+
+        assert!(
+            rebound.supervisor().get_task(&base_task).is_none(),
+            "rebound registry must not inherit another session's task ledger"
+        );
+        assert!(
+            !rebound.spawn_only_was_invoked(),
+            "spawn-only invocation state is per agent run/session"
+        );
+
+        let rebound_task = rebound.register_task("deep_search", "call-rebound");
+        let rebound_task = rebound
+            .supervisor()
+            .get_task(&rebound_task)
+            .expect("rebound task should be tracked");
+        assert!(
+            rebound_task.session_key.is_none(),
+            "session key must be supplied by the new session actor, not inherited"
         );
     }
 }
