@@ -165,20 +165,6 @@ fn message_has_presentation_media(message: &Message) -> bool {
         .any(|path| path_looks_like_presentation(path))
 }
 
-fn content_looks_like_committed_session_result(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with('✓')
-        || trimmed.starts_with('✗')
-        || trimmed.starts_with('✅')
-        || trimmed.starts_with('❌')
-}
-
-fn message_should_replay_as_session_result(message: &Message) -> bool {
-    message.role == MessageRole::Assistant
-        && (!message.media.is_empty()
-            || content_looks_like_committed_session_result(&message.content))
-}
-
 /// Request body for POST /chat.
 #[derive(Deserialize)]
 struct ChatRequest {
