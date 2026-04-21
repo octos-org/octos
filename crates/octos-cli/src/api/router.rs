@@ -162,6 +162,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/metrics",
             get(auth_handlers::my_provider_metrics),
         )
+        .route(
+            "/api/my/profile/skills",
+            get(auth_handlers::my_profile_skills),
+        )
+        .route(
+            "/api/my/profile/skills",
+            post(auth_handlers::install_my_profile_skill),
+        )
+        .route(
+            "/api/my/profile/skills/{name}",
+            delete(auth_handlers::remove_my_profile_skill),
+        )
         .route("/api/auth/me", get(auth_handlers::me))
         .route("/api/my/test-provider", post(admin::test_provider))
         .route("/api/my/provider-models", post(admin::provider_models))

@@ -845,6 +845,83 @@ pub async fn my_profile(
     }))
 }
 
+/// GET /api/my/profile/skills
+pub async fn my_profile_skills(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let skills = crate::commands::skills::list_skills(&skills_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "skills": skills })))
+}
+
+/// POST /api/my/profile/skills
+pub async fn install_my_profile_skill(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<super::admin::InstallSkillRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ensure_my_profile_skill_admin(&identity)?;
+
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::install_skill(&skills_dir, &req.repo, req.force, &req.branch)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "installed": result.installed,
+        "skipped": result.skipped,
+        "deps_installed": result.deps_installed,
+    })))
+}
+
+/// DELETE /api/my/profile/skills/:name
+pub async fn remove_my_profile_skill(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(name): Path<String>,
+) -> Result<Json<super::admin::ActionResponse>, (StatusCode, String)> {
+    ensure_my_profile_skill_admin(&identity)?;
+
+    let store = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let profile_id =
+        resolve_my_profile_id(&identity, store).map_err(|s| (s, "profile not found".into()))?;
+    let skills_dir = crate::commands::skills::resolve_profile_skills_dir(store, &profile_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    crate::commands::skills::remove_skill(&skills_dir, &name)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(super::admin::ActionResponse {
+        ok: true,
+        message: Some(format!("Removed skill: {name}")),
+    }))
+}
+
 /// PUT /api/my/profile
 pub async fn update_my_profile(
     State(state): State<Arc<AppState>>,
@@ -1768,6 +1845,20 @@ fn resolve_my_profile(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+fn ensure_my_profile_skill_admin(identity: &AuthIdentity) -> Result<(), (StatusCode, String)> {
+    match identity {
+        AuthIdentity::Admin => Ok(()),
+        AuthIdentity::User {
+            role: UserRole::Admin,
+            ..
+        } => Ok(()),
+        AuthIdentity::User { .. } => Err((
+            StatusCode::FORBIDDEN,
+            "skill installation requires admin access".into(),
+        )),
+    }
+}
+
 /// The fixed profile ID used for token-based admin authentication.
 /// This ensures the admin has its own separate profile, distinct from any user profiles.
 pub const ADMIN_PROFILE_ID: &str = "admin";
@@ -2274,6 +2365,65 @@ mod tests {
             err.1,
             "sub-accounts cannot change their own public subdomain"
         );
+    }
+
+    #[tokio::test]
+    async fn my_profile_skills_lists_current_user_skills() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        let skills_dir =
+            crate::commands::skills::resolve_profile_skills_dir(&profile_store, "alice").unwrap();
+        let skill_dir = skills_dir.join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Demo skill\n").unwrap();
+
+        let Json(resp) = my_profile_skills(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let skills = resp
+            .get("skills")
+            .and_then(|value| value.as_array())
+            .expect("skills array");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].get("name").and_then(|value| value.as_str()),
+            Some("demo-skill")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_my_profile_skill_rejects_non_admin_users() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        let err = install_my_profile_skill(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }),
+            Json(crate::api::admin::InstallSkillRequest {
+                repo: "octos-org/system-skills".into(),
+                force: false,
+                branch: "main".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

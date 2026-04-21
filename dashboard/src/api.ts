@@ -248,6 +248,20 @@ export const myApi = {
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
 
+  listProfileSkills: () =>
+    authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(
+      '/my/profile/skills',
+    ),
+
+  installProfileSkill: (data: { repo: string; force: boolean; branch: string }) =>
+    authedRequest<{ ok: boolean; installed: string[]; skipped: string[]; deps_installed: boolean }>(
+      '/my/profile/skills',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
+
+  removeProfileSkill: (name: string) =>
+    authedRequest<ActionResponse>(`/my/profile/skills/${name}`, { method: 'DELETE' }),
+
   testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string; models?: string[] }>('/my/test-provider', {
       method: 'POST',

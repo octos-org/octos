@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { api } from '../../api'
+import { api, myApi } from '../../api'
 
 interface SkillEntry {
   name: string
@@ -26,19 +26,21 @@ export default function SkillsPage() {
   // Removing state
   const [removing, setRemoving] = useState<string | null>(null)
 
-  const profileId = id || 'my'
+  const ownProfile = !id
 
   const fetchSkills = useCallback(async () => {
     try {
       setError(null)
-      const data = await api.listProfileSkills(profileId)
+      const data = ownProfile
+        ? await myApi.listProfileSkills()
+        : await api.listProfileSkills(id)
       setSkills(data.skills || [])
     } catch (e: any) {
       setError(e.message)
     } finally {
       setLoading(false)
     }
-  }, [profileId])
+  }, [id, ownProfile])
 
   useEffect(() => {
     fetchSkills()
@@ -49,11 +51,17 @@ export default function SkillsPage() {
     setInstalling(true)
     setInstallMsg(null)
     try {
-      const result = await api.installProfileSkill(profileId, {
-        repo: repo.trim(),
-        force: false,
-        branch,
-      })
+      const result = ownProfile
+        ? await myApi.installProfileSkill({
+            repo: repo.trim(),
+            force: false,
+            branch,
+          })
+        : await api.installProfileSkill(id, {
+            repo: repo.trim(),
+            force: false,
+            branch,
+          })
       const installed = result.installed || []
       const skipped = result.skipped || []
       const msgs: string[] = []
@@ -73,7 +81,11 @@ export default function SkillsPage() {
     if (!confirm(`Remove skill "${name}"?`)) return
     setRemoving(name)
     try {
-      await api.removeProfileSkill(profileId, name)
+      if (ownProfile) {
+        await myApi.removeProfileSkill(name)
+      } else {
+        await api.removeProfileSkill(id, name)
+      }
       fetchSkills()
     } catch (e: any) {
       setError(e.message)
