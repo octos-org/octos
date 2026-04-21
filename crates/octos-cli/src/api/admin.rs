@@ -2759,6 +2759,7 @@ pub async fn config_check(
 
     // Check which env vars are set (names only, not values)
     let env_var_names: Vec<String> = profile.config.env_vars.keys().cloned().collect();
+    let env_var_refs = collect_env_var_refs(&profile.config);
 
     // Check email config
     let email_status = if let Some(ref email) = profile.config.email {
@@ -2839,6 +2840,12 @@ pub async fn config_check(
         "channels": channels,
         "email": email_status,
         "env_vars": env_var_names,
+        "env_var_refs": env_var_refs,
+        "env_var_semantics": {
+            "provisioning": "user_supplied",
+            "unset_status": "awaiting_user_secret",
+            "note": "Clean installs do not pre-provision LLM or tool API keys."
+        },
         "installed_skills": installed_skills,
         "sessions_count": sessions_count,
         "has_cron_jobs": has_cron,
@@ -2848,6 +2855,149 @@ pub async fn config_check(
             "uptime_secs": status.uptime_secs,
         },
     })))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EnvVarReferenceStatus {
+    name: String,
+    surfaces: Vec<String>,
+    configured: bool,
+    status: &'static str,
+    provisioning: &'static str,
+}
+
+fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut insert_ref = |name: &str, surface: &str| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        refs.entry(trimmed.to_string())
+            .or_default()
+            .insert(surface.to_string());
+    };
+
+    if let Some(primary) = config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref())
+        .and_then(|selection| selection.route.as_ref())
+        .and_then(|route| route.api_key_env.as_deref())
+    {
+        insert_ref(primary, "llm");
+    }
+
+    if let Some(llm) = config.llm.as_ref() {
+        for fallback in &llm.fallbacks {
+            if let Some(api_key_env) = fallback
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.as_deref())
+            {
+                insert_ref(api_key_env, "llm");
+            }
+        }
+    }
+
+    if let Some(search) = config.search.as_ref() {
+        for provider in search.providers.values() {
+            if let Some(api_key_env) = provider.api_key_env.as_deref() {
+                insert_ref(api_key_env, "tools");
+            }
+        }
+    }
+
+    if let Some(email) = config.email.as_ref() {
+        if let Some(password_env) = email.password_env.as_deref() {
+            insert_ref(password_env, "tools");
+        }
+        if let Some(feishu_secret_env) = email.feishu_app_secret_env.as_deref() {
+            insert_ref(feishu_secret_env, "tools");
+        }
+    }
+
+    for channel in &config.channels {
+        match channel {
+            crate::profiles::ChannelCredentials::Telegram { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Discord { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Slack {
+                bot_token_env,
+                app_token_env,
+            } => {
+                insert_ref(bot_token_env, "channels");
+                insert_ref(app_token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Feishu {
+                app_id_env,
+                app_secret_env,
+                verification_token_env,
+                encrypt_key_env,
+                ..
+            } => {
+                insert_ref(app_id_env, "channels");
+                insert_ref(app_secret_env, "channels");
+                insert_ref(verification_token_env, "channels");
+                insert_ref(encrypt_key_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Email {
+                username_env,
+                password_env,
+                ..
+            } => {
+                insert_ref(username_env, "channels");
+                insert_ref(password_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Twilio {
+                account_sid_env,
+                auth_token_env,
+                ..
+            } => {
+                insert_ref(account_sid_env, "channels");
+                insert_ref(auth_token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WeComBot { secret_env, .. } => {
+                insert_ref(secret_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::QQBot {
+                client_secret_env, ..
+            } => {
+                insert_ref(client_secret_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WeChat { token_env, .. } => {
+                insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::WhatsApp { .. }
+            | crate::profiles::ChannelCredentials::Api { .. }
+            | crate::profiles::ChannelCredentials::Matrix { .. } => {}
+        }
+    }
+
+    refs.into_iter()
+        .map(|(name, surfaces)| {
+            let configured = config
+                .env_vars
+                .get(&name)
+                .is_some_and(|value| !value.trim().is_empty());
+            EnvVarReferenceStatus {
+                name,
+                surfaces: surfaces.into_iter().collect(),
+                configured,
+                status: if configured {
+                    "set"
+                } else {
+                    "awaiting_user_secret"
+                },
+                provisioning: "user_supplied",
+            }
+        })
+        .collect()
 }
 
 /// GET /api/admin/model-limits — returns model catalog (runtime source of truth).
@@ -4405,6 +4555,94 @@ mod tests {
         assert_eq!(default_search_api_env("you"), Some("YDC_API_KEY"));
         assert_eq!(default_search_api_env("serper"), Some("SERPER_API_KEY"));
         assert_eq!(default_search_api_env("unknown"), None);
+    }
+
+    #[test]
+    fn collect_env_var_refs_marks_unset_as_awaiting_user_secret() {
+        let config = crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("anthropic".into()),
+                    model_id: Some("claude-sonnet-4-20250514".into()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: vec![],
+            }),
+            search: Some(crate::profiles::SearchConfig {
+                providers: [(
+                    "tavily".into(),
+                    crate::profiles::SearchProviderConfig {
+                        api_key_env: Some("TAVILY_API_KEY".into()),
+                    },
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        };
+
+        let refs = collect_env_var_refs(&config);
+        let anthropic = refs
+            .iter()
+            .find(|entry| entry.name == "ANTHROPIC_API_KEY")
+            .expect("primary llm key should be listed");
+        assert!(!anthropic.configured);
+        assert_eq!(anthropic.status, "awaiting_user_secret");
+        assert_eq!(anthropic.provisioning, "user_supplied");
+        assert_eq!(anthropic.surfaces, vec!["llm".to_string()]);
+
+        let tavily = refs
+            .iter()
+            .find(|entry| entry.name == "TAVILY_API_KEY")
+            .expect("search tool key should be listed");
+        assert!(!tavily.configured);
+        assert_eq!(tavily.status, "awaiting_user_secret");
+        assert_eq!(tavily.surfaces, vec!["tools".to_string()]);
+    }
+
+    #[test]
+    fn collect_env_var_refs_marks_set_keys_and_merges_surfaces() {
+        let config = crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("moonshot".into()),
+                    model_id: Some("kimi-k2.5".into()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        api_key_env: Some("SHARED_API_KEY".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: vec![],
+            }),
+            search: Some(crate::profiles::SearchConfig {
+                providers: [(
+                    "tavily".into(),
+                    crate::profiles::SearchProviderConfig {
+                        api_key_env: Some("SHARED_API_KEY".into()),
+                    },
+                )]
+                .into(),
+            }),
+            env_vars: [("SHARED_API_KEY".to_string(), "sk-live-123".to_string())].into(),
+            ..Default::default()
+        };
+
+        let refs = collect_env_var_refs(&config);
+        let shared = refs
+            .iter()
+            .find(|entry| entry.name == "SHARED_API_KEY")
+            .expect("shared key should be listed once");
+        assert!(shared.configured);
+        assert_eq!(shared.status, "set");
+        assert_eq!(shared.provisioning, "user_supplied");
+        assert_eq!(
+            shared.surfaces,
+            vec!["llm".to_string(), "tools".to_string()]
+        );
     }
 
     #[test]
