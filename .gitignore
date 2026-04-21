@@ -64,6 +64,7 @@ scripts/deploy.sh
 !docs/OCTOS_HARNESS_M4_1A_LIVE_GATE.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
+!docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
