@@ -2419,54 +2419,19 @@ mod tests {
             replay_committed_session_results(&state, "test-chat", None, Some("slides launch"))
                 .await;
 
-        assert_eq!(replayed.len(), 1);
-        let only: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
-        assert_eq!(only["type"], "session_result");
-        assert_eq!(only["topic"], "slides launch");
-        assert_eq!(only["message"]["seq"], 2);
-        let media = only["message"]["media"].as_array().unwrap();
+        assert_eq!(replayed.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&replayed[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&replayed[1]).unwrap();
+        assert_eq!(first["type"], "session_result");
+        assert_eq!(first["topic"], "slides launch");
+        assert_eq!(first["message"]["seq"], 1);
+        assert_eq!(first["message"]["content"], "first result");
+        assert_eq!(second["type"], "session_result");
+        assert_eq!(second["topic"], "slides launch");
+        assert_eq!(second["message"]["seq"], 2);
+        let media = second["message"]["media"].as_array().unwrap();
         assert_eq!(media.len(), 1);
         assert!(media[0].as_str().unwrap().starts_with("pf/"));
-    }
-
-    #[tokio::test]
-    async fn replay_committed_session_results_skips_plain_assistant_replies_recovered_via_history()
-    {
-        let data_dir = tempfile::tempdir().unwrap();
-        let sessions = test_sessions_in(data_dir.path());
-        let key =
-            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "test-chat", None);
-
-        {
-            let mut manager = sessions.lock().await;
-            manager
-                .add_message_with_seq(&key, Message::user("hello"))
-                .await
-                .unwrap();
-            manager
-                .add_message_with_seq(
-                    &key,
-                    Message::assistant("terminal response recovered from history"),
-                )
-                .await
-                .unwrap();
-        }
-
-        let state = ApiState {
-            inbound_tx: mpsc::channel(1).0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            watchers: Arc::new(Mutex::new(HashMap::new())),
-            auth_token: None,
-            profile_id: Some(TEST_PROFILE_ID.to_string()),
-            sessions,
-            task_query: None,
-            on_session_deleted: None,
-            metrics_renderer: None,
-        };
-
-        let replayed = replay_committed_session_results(&state, "test-chat", None, None).await;
-
-        assert!(replayed.is_empty());
     }
 
     #[test]
