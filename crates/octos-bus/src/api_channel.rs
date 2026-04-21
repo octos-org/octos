@@ -1211,10 +1211,6 @@ fn task_list_has_active_tasks(tasks: &serde_json::Value) -> bool {
     })
 }
 
-fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
-    current_profile_api_session_key_with_topic(profile_id, chat_id, None)
-}
-
 fn current_profile_api_session_key_with_topic(
     profile_id: Option<&str>,
     chat_id: &str,
@@ -1569,24 +1565,30 @@ async fn handle_delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let mut sess = state.sessions.lock().await;
-    let mut cleared = false;
+    let mut deleted = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
-        if sess.clear(&candidate).await.is_ok() {
-            cleared = true;
-            // Notify the gateway runtime to stop the session actor so it doesn't
-            // serve stale context if new messages arrive for this session ID.
-            if let Some(ref cb) = state.on_session_deleted {
-                cb(&id);
+        if sess.load(&candidate).await.is_some() {
+            match sess.clear(&candidate).await {
+                Ok(()) => deleted = true,
+                Err(error) => tracing::error!(
+                    session_key = %candidate,
+                    error = %error,
+                    "delete session from gateway store failed"
+                ),
             }
-            return StatusCode::NO_CONTENT.into_response();
         }
     }
-    if cleared {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        // No session found — still return 204 (idempotent delete)
-        StatusCode::NO_CONTENT.into_response()
+    drop(sess);
+
+    if deleted {
+        // Notify the gateway runtime to stop the session actor so it doesn't
+        // serve stale context if new messages arrive for this session ID.
+        if let Some(ref cb) = state.on_session_deleted {
+            cb(&id);
+        }
     }
+    // No session found — still return 204 (idempotent delete).
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
@@ -2328,7 +2330,11 @@ mod tests {
     async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "test-chat");
+        let key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "test-chat",
+            None,
+        );
 
         {
             let mut manager = sessions.lock().await;
@@ -2541,7 +2547,11 @@ mod tests {
     async fn replay_committed_session_results_skips_empty_assistant_tool_trace_messages() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "tool-heavy-chat");
+        let key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "tool-heavy-chat",
+            None,
+        );
 
         {
             let mut manager = sessions.lock().await;
@@ -3501,6 +3511,49 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["seq"], 3);
         assert_eq!(messages[0]["content"], "four");
+    }
+
+    #[tokio::test]
+    async fn delete_session_checks_all_profile_candidates() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let id = "web-delete-fallback";
+        let main_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", id);
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&main_key, Message::user("hello")).await.unwrap();
+            assert!(sess.load(&main_key).await.is_some());
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}", delete(handle_delete_session))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions: sessions.clone(),
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let sess = sessions.lock().await;
+        assert!(sess.load(&main_key).await.is_none());
     }
 
     #[tokio::test]

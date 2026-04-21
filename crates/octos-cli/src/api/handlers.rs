@@ -162,13 +162,23 @@ fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String 
     routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(
+fn standalone_api_session_key_candidates(
     state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
-) -> SessionKey {
+) -> Vec<SessionKey> {
     let profile_id = api_profile_id_from_headers(state, headers);
-    SessionKey::with_profile(&profile_id, "api", session_id)
+    let mut candidates = vec![
+        SessionKey::with_profile(&profile_id, "api", session_id),
+        SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id),
+        SessionKey::new("api", session_id),
+    ];
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates
+}
+
+fn encode_api_session_path_id(id: &str) -> String {
+    octos_bus::session::encode_path_component(id)
 }
 
 pub async fn chat(
@@ -370,7 +380,8 @@ async fn chat_streaming(
                     .as_ref()
                     .map(|meta| meta.model.clone())
                     .or_else(|| {
-                        let model = request_agent.llm_provider().model_id();
+                        let provider = request_agent.llm_provider();
+                        let model = provider.model_id();
                         if model.is_empty() {
                             None
                         } else {
@@ -574,7 +585,8 @@ fn session_messages_proxy_path(
     since_seq: Option<usize>,
     topic: Option<&str>,
 ) -> String {
-    let mut path = format!("/sessions/{id}/messages?limit={limit}&offset={offset}");
+    let encoded_id = encode_api_session_path_id(id);
+    let mut path = format!("/sessions/{encoded_id}/messages?limit={limit}&offset={offset}");
     if let Some(source) = source {
         path.push_str("&source=");
         path.push_str(source);
@@ -668,7 +680,8 @@ pub async fn session_status(
 ) -> Response {
     // Proxy to gateway (session actors live there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/status");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/status");
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
@@ -688,7 +701,8 @@ pub async fn session_event_stream(
     axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
 ) -> Response {
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/events/stream");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/events/stream");
         append_since_seq_query(&mut path, params.since_seq);
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
@@ -716,7 +730,8 @@ pub async fn session_tasks(
 ) -> Response {
     // Proxy to gateway (task supervisor lives there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/tasks");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/tasks");
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
@@ -888,17 +903,24 @@ pub async fn delete_session(
 ) -> Response {
     // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
-        let key = standalone_api_session_key(&state, &headers, &id);
         let mut sess = sessions.lock().await;
-        if let Err(e) = sess.clear(&key).await {
-            tracing::error!(error = %e, "delete session from standalone store failed");
+        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.clear(&key).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "delete session from standalone store failed"
+                    );
+                }
+            }
         }
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
     // SessionManager (per-profile data dir), not just the serve process's store.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}");
+        let path = format!("/sessions/{}", encode_api_session_path_id(&id));
         let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
 
@@ -2601,7 +2623,8 @@ async fn ws_standalone_agent(
                     .as_ref()
                     .map(|meta| meta.model.clone())
                     .or_else(|| {
-                        let model = request_agent.llm_provider().model_id();
+                        let provider = request_agent.llm_provider();
+                        let model = provider.model_id();
                         if model.is_empty() {
                             None
                         } else {
@@ -2785,6 +2808,20 @@ mod tests {
                 .join("api%3Aslides-123")
                 .join("workspace")
         );
+    }
+
+    #[test]
+    fn encode_api_session_path_id_escapes_reserved_characters() {
+        assert_eq!(
+            encode_api_session_path_id("web-123#slides topic"),
+            "web-123%23slides%20topic"
+        );
+    }
+
+    #[test]
+    fn session_messages_proxy_path_encodes_session_id() {
+        let path = session_messages_proxy_path("web-123#slides", 25, 0, None, None, None);
+        assert!(path.starts_with("/sessions/web-123%23slides/messages?"));
     }
 
     #[test]
