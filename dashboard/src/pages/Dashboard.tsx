@@ -7,6 +7,19 @@ import { api } from '../api'
 import { useState, useMemo } from 'react'
 import type { ProfileResponse } from '../types'
 
+const HIDDEN_DASHBOARD_APP_IDS = new Set(['studio', 'slidesstudio'])
+
+function dashboardAppKey(value: string | null | undefined) {
+  return (value || '').toLowerCase().replace(/[\s_-]+/g, '')
+}
+
+function shouldShowDashboardApp(profile: ProfileResponse) {
+  return !(
+    HIDDEN_DASHBOARD_APP_IDS.has(dashboardAppKey(profile.id)) ||
+    HIDDEN_DASHBOARD_APP_IDS.has(dashboardAppKey(profile.name))
+  )
+}
+
 export default function Dashboard() {
   const { isAdmin } = useAuth()
   const { data, error, loading, refresh } = useOverview()
@@ -14,8 +27,8 @@ export default function Dashboard() {
   const [actionLoading, setActionLoading] = useState(false)
 
   // Partition profiles into parents and sub-accounts (must be before early returns)
-  const { parentProfiles, subAccountMap, totalSubAccounts } = useMemo(() => {
-    const all = data?.profiles || []
+  const { parentProfiles, subAccountMap, totalSubAccounts, visibleRunning, visibleStopped } = useMemo(() => {
+    const all = (data?.profiles || []).filter(shouldShowDashboardApp)
     const parents = all.filter(p => !p.parent_id)
     const map = new Map<string, ProfileResponse[]>()
     let subCount = 0
@@ -27,7 +40,13 @@ export default function Dashboard() {
         map.set(p.parent_id, subs)
       }
     }
-    return { parentProfiles: parents, subAccountMap: map, totalSubAccounts: subCount }
+    return {
+      parentProfiles: parents,
+      subAccountMap: map,
+      totalSubAccounts: subCount,
+      visibleRunning: all.filter(p => p.status.running).length,
+      visibleStopped: all.filter(p => !p.status.running).length,
+    }
   }, [data?.profiles])
 
   // Non-admins go straight to their profile
@@ -114,13 +133,13 @@ export default function Dashboard() {
             {totalSubAccounts > 0 && (
               <span className="text-gray-600 ml-1">({totalSubAccounts} sub-accounts)</span>
             )}
-            {data && data.running > 0 && (
-              <span className="text-green-400 ml-2">{data.running} running</span>
+            {visibleRunning > 0 && (
+              <span className="text-green-400 ml-2">{visibleRunning} running</span>
             )}
           </p>
         </div>
         <div className="flex gap-2">
-          {data && data.running > 0 && (
+          {visibleRunning > 0 && (
             <button
               onClick={handleStopAll}
               disabled={actionLoading}
@@ -129,7 +148,7 @@ export default function Dashboard() {
               Stop All
             </button>
           )}
-          {data && data.stopped > 0 && (
+          {visibleStopped > 0 && (
             <button
               onClick={handleStartAll}
               disabled={actionLoading}

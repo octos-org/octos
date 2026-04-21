@@ -3,13 +3,11 @@ import { useProfile } from '../../contexts/ProfileContext'
 import CategoryTabs from '../../components/CategoryTabs'
 import SaveFooter from '../../components/SaveFooter'
 import SearchApiTab from '../../components/tabs/SearchApiTab'
-import PptConfigTab from '../../components/tabs/PptConfigTab'
 import EmailTab from '../../components/tabs/EmailTab'
 import DeepCrawlTab from '../../components/tabs/DeepCrawlTab'
 
 const TABS = [
   { key: 'search', label: 'Search APIs' },
-  { key: 'ppt', label: 'PPT' },
   { key: 'email', label: 'Email' },
   { key: 'crawl', label: 'Deep Crawl' },
 ]
@@ -35,7 +33,6 @@ export default function ToolsPage() {
         </div>
         <div className="p-5">
           {activeTab === 'search' && <SearchApiTab config={config} onChange={setConfig} profileId={profileId} />}
-          {activeTab === 'ppt' && <PptConfigTab config={config} onChange={setConfig} />}
           {activeTab === 'email' && <EmailTab config={config} onChange={setConfig} />}
           {activeTab === 'crawl' && <DeepCrawlTab config={config} onChange={setConfig} />}
         </div>
