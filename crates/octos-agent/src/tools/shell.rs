@@ -13,6 +13,7 @@ use tokio::time::timeout;
 use super::{Tool, ToolResult};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -214,6 +215,7 @@ impl Tool for ShellTool {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, &self.cwd);
         apply_git_tool_env(&mut cmd, &input.command);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -403,6 +405,43 @@ mod tests {
         let cache = lines.next().unwrap_or_default();
         assert!(cache.contains("octos-frontend-tool-cache"));
         assert!(!cache.contains(".octos-tool-cache"));
+    }
+
+    #[test]
+    fn shell_does_not_expose_configured_api_key_to_env_or_echo() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("tools::shell::tests::child_shell_api_key_not_visible")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("OPENAI_API_KEY", "sk-octos-shell-regression")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child regression test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn child_shell_api_key_not_visible() {
+        let tool = ShellTool::new(std::env::temp_dir());
+        #[cfg(windows)]
+        let command = "if defined OPENAI_API_KEY (echo env=%OPENAI_API_KEY%) else (echo env_missing) & echo echo=%OPENAI_API_KEY%";
+        #[cfg(not(windows))]
+        let command = "if env | grep -q '^OPENAI_API_KEY='; then printf 'env=%s\\n' \"$OPENAI_API_KEY\"; else printf 'env_missing\\n'; fi; printf 'echo=%s\\n' \"$OPENAI_API_KEY\"";
+
+        let result = tool
+            .execute(&serde_json::json!({ "command": command }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "shell command failed: {}", result.output);
+        assert!(!result.output.contains("sk-octos-shell-regression"));
+        assert!(result.output.contains("env_missing"), "{}", result.output);
     }
 
     #[test]

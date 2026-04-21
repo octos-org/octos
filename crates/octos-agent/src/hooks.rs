@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
 use crate::sandbox::BLOCKED_ENV_VARS;
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
 /// Session-level context injected into hook payloads.
 /// Set by the caller (gateway/chat) before the agent loop starts.
@@ -704,6 +705,7 @@ impl HookExecutor {
         cmd.stderr(std::process::Stdio::piped());
 
         // Sanitize environment
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
         for var in BLOCKED_ENV_VARS {
             cmd.env_remove(var);
         }

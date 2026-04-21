@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::progress::ProgressEvent;
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
 
 use super::manifest::PluginToolDef;
@@ -25,6 +26,7 @@ pub struct PluginTool {
     /// Environment variables to strip from the plugin's environment.
     blocked_env: Vec<String>,
     /// Extra environment variables to inject into the plugin's environment.
+    /// Secret-like names require the tool manifest's explicit env allowlist.
     extra_env: Vec<(String, String)>,
     /// Working directory for plugin execution (created on first use).
     work_dir: Option<PathBuf>,
@@ -447,6 +449,9 @@ impl Tool for PluginTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
+        sanitize_command_env(&mut cmd, &env_allowlist);
+
         // Remove blocked environment variables
         for var in &self.blocked_env {
             cmd.env_remove(var);
@@ -454,7 +459,16 @@ impl Tool for PluginTool {
 
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
-            cmd.env(key, val);
+            if should_forward_env_name(key, &env_allowlist) {
+                cmd.env(key, val);
+            } else {
+                tracing::debug!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    env = %key,
+                    "skipping non-allowlisted secret environment variable for plugin tool"
+                );
+            }
         }
 
         // Set working directory so relative paths in tool args (e.g.
@@ -690,6 +704,7 @@ mod tests {
             description: desc.to_string(),
             input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         }
     }
@@ -771,6 +786,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -805,6 +821,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -851,6 +868,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -881,6 +899,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -907,6 +926,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -932,6 +952,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -998,6 +1019,56 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
+    async fn execute_does_not_expose_secret_extra_env_without_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("env_tool", "prints env");
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-regression".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "missing");
+        assert!(!result.output.contains("sk-octos-plugin-regression"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_exposes_secret_extra_env_with_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("env_tool", "prints env");
+        def.env.push("OPENAI_API_KEY".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-allowed".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "sk-octos-plugin-allowed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
     async fn execute_fallback_on_non_json_stdout() {
         // Script that outputs plain text (not JSON).
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1039,6 +1110,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -1078,6 +1150,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)

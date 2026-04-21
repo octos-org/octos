@@ -29,6 +29,7 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod steering;
+mod subprocess_env;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;

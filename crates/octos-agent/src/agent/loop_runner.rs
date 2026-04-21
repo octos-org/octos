@@ -1630,6 +1630,7 @@ printf '{"output":"voice saved","success":true}\n'
                 "required": ["name", "audio_path"]
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let plugin = PluginTool::new("mofa-fm".into(), def, script_path).with_extra_env(vec![(

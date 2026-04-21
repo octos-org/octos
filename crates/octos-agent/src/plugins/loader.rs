@@ -51,7 +51,9 @@ impl PluginLoader {
     /// - `manifest.json` — plugin metadata and tool definitions
     /// - An executable file (same name as directory, or `main`)
     ///
-    /// `extra_env` is injected into every plugin process (e.g. provider base URLs, API keys).
+    /// `extra_env` is injected into plugin processes. Secret-like entries
+    /// (API keys, passwords, tokens, secrets) are only injected when the tool
+    /// manifest explicitly allowlists that environment variable.
     ///
     /// Returns a `PluginLoadResult` with tool count and any resolved extras
     /// (MCP servers, hooks, prompt fragments).
