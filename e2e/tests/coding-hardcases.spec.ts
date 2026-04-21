@@ -43,8 +43,9 @@ import {
 const FANOUT_CHILD_SESSION_LIMIT = 3;
 
 function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
+  const replacement = returnToken ? `gamma-${returnToken}` : 'gamma';
   const tail = returnToken
-    ? `Return only the unified diff, then a final line exactly ${returnToken}.`
+    ? `Return only the unified diff, nothing else. The diff must contain ${returnToken}.`
     : 'Return only the unified diff, nothing else.';
 
   return [
@@ -55,7 +56,7 @@ function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
     'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
     'Run git add notes.txt so the file is tracked before editing it.',
-    'Make exactly one edit: change beta to gamma.',
+    `Make exactly one edit: change beta to ${replacement}.`,
     'Then run git diff -- notes.txt.',
     tail,
     'Do not explain tool availability.',
