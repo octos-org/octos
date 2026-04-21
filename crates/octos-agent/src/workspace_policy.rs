@@ -4,12 +4,26 @@ use std::path::{Path, PathBuf};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
+use crate::abi_schema::{
+    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported, default_workspace_policy_schema_version,
+};
 use crate::workspace_git::WorkspaceProjectKind;
 
 pub const WORKSPACE_POLICY_FILE: &str = ".octos-workspace.toml";
 
+/// Harness-facing workspace policy.
+///
+/// `schema_version` is the durable ABI version; see
+/// `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
+/// fields per version. Older policy files that omit the field are accepted
+/// as v1 on deserialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePolicy {
+    /// Durable ABI schema version for this policy. Defaults to
+    /// [`WORKSPACE_POLICY_SCHEMA_VERSION`] when absent so pre-versioned
+    /// policies continue to load.
+    #[serde(default = "default_workspace_policy_schema_version")]
+    pub schema_version: u32,
     pub workspace: WorkspacePolicyWorkspace,
     pub version_control: WorkspaceVersionControlPolicy,
     pub tracking: WorkspaceTrackingPolicy,
@@ -142,6 +156,7 @@ impl WorkspacePolicy {
     pub fn for_kind(kind: WorkspaceProjectKind) -> Self {
         match kind {
             WorkspaceProjectKind::Slides => Self {
+                schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
                 workspace: WorkspacePolicyWorkspace {
                     kind: WorkspacePolicyKind::Slides,
                 },
@@ -183,6 +198,7 @@ impl WorkspacePolicy {
                 spawn_tasks: BTreeMap::new(),
             },
             WorkspaceProjectKind::Sites => Self {
+                schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
                 workspace: WorkspacePolicyWorkspace {
                     kind: WorkspacePolicyKind::Sites,
                 },
@@ -248,6 +264,7 @@ impl WorkspacePolicy {
         spawn_tasks.insert("podcast_generate".into(), podcast_contract);
 
         Self {
+            schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
             workspace: WorkspacePolicyWorkspace {
                 kind: WorkspacePolicyKind::Session,
             },
@@ -304,6 +321,12 @@ pub fn read_workspace_policy(project_root: &Path) -> Result<Option<WorkspacePoli
         .wrap_err_with(|| format!("read workspace policy failed: {}", path.display()))?;
     let policy: WorkspacePolicy = toml::from_str(&raw)
         .wrap_err_with(|| format!("parse workspace policy failed: {}", path.display()))?;
+    check_supported(
+        "WorkspacePolicy",
+        policy.schema_version,
+        WORKSPACE_POLICY_SCHEMA_VERSION,
+    )
+    .wrap_err_with(|| format!("incompatible workspace policy: {}", path.display()))?;
     Ok(Some(policy))
 }
 
@@ -566,5 +589,66 @@ mod tests {
         assert!(
             upgrade_workspace_policy_if_legacy(&current, WorkspaceProjectKind::Slides).is_none()
         );
+    }
+
+    #[test]
+    fn should_stamp_current_schema_version_when_building_for_kind() {
+        let slides = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        let sites = WorkspacePolicy::for_kind(WorkspaceProjectKind::Sites);
+        let session = WorkspacePolicy::for_session();
+        assert_eq!(slides.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(sites.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(session.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn should_default_missing_schema_version_to_v1_when_loading_legacy_toml() {
+        // A TOML emitted before M4.6 — no `schema_version` line.
+        let legacy = r#"
+[workspace]
+kind = "slides"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = ["output/**"]
+"#;
+        let parsed: WorkspacePolicy = toml::from_str(legacy).expect("legacy policy should parse");
+        assert_eq!(parsed.schema_version, WORKSPACE_POLICY_SCHEMA_VERSION);
+        assert_eq!(parsed.workspace.kind, WorkspacePolicyKind::Slides);
+    }
+
+    #[test]
+    fn should_reject_future_schema_version_with_actionable_error() {
+        // A TOML that claims a version the harness cannot understand.
+        let future = format!(
+            r#"
+schema_version = {}
+
+[workspace]
+kind = "slides"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = []
+"#,
+            WORKSPACE_POLICY_SCHEMA_VERSION + 99
+        );
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(WORKSPACE_POLICY_FILE), future).unwrap();
+
+        let err = read_workspace_policy(temp.path()).expect_err("future version should fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("schema_version"));
+        assert!(rendered.contains("upgrade octos"));
     }
 }

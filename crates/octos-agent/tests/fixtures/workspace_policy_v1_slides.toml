@@ -1,0 +1,40 @@
+# Workspace policy fixture — M4.6 v1 shape for slides workspaces.
+# Any harness that advertises support for WorkspacePolicy v1 MUST parse this
+# file cleanly.
+schema_version = 1
+
+[workspace]
+kind = "slides"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = [
+    "history/**",
+    "output/**",
+    "skill-output/**",
+    "*.pptx",
+    "*.tmp",
+    ".DS_Store",
+]
+
+[validation]
+on_turn_end = [
+    "file_exists:script.js",
+    "file_exists:memory.md",
+    "file_exists:changelog.md",
+]
+on_source_change = []
+on_completion = [
+    "file_exists:output/deck.pptx",
+    "file_exists:output/**/slide-*.png",
+]
+
+[artifacts]
+primary = "output/deck.pptx"
+deck = "output/deck.pptx"
+previews = "output/**/slide-*.png"

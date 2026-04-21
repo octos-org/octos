@@ -21,6 +21,7 @@ pub fn build_output_dir_for_template(template: &str) -> &'static str {
 pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePolicy {
     let build_output_dir = build_output_dir_for_template_kind(template);
     WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
         workspace: WorkspacePolicyWorkspace {
             kind: WorkspacePolicyKind::Sites,
         },

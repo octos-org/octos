@@ -1,0 +1,8 @@
+{
+    "schema": "octos.harness.event.v1",
+    "schema_version": 1,
+    "event": {
+        "kind": "thinking",
+        "iteration": 3
+    }
+}
