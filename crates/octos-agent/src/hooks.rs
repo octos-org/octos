@@ -4,9 +4,11 @@
 //! Before-hooks can deny operations (exit code 1). Circuit breaker auto-disables
 //! hooks after consecutive failures.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -128,6 +130,14 @@ pub struct HookPayload {
     pub output_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_action: Option<String>,
+
+    /// Opaque integrator-supplied context (robotics, domain-specific sensors, etc).
+    /// Populated by a `HookPayloadEnricher` registered on `HookExecutor`.
+    /// Serialized form is truncated to `MAX_PAYLOAD_FIELD_BYTES`; if the rendered
+    /// JSON exceeds that limit the field is replaced with a `{"truncated": true}`
+    /// marker object so hook scripts always see valid JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_data: Option<serde_json::Value>,
 }
 
 /// Maximum byte length for arguments/result fields in hook payloads.
@@ -507,8 +517,32 @@ impl HookPayload {
             current_phase: None,
             output_files: Vec::new(),
             failure_action: None,
+            domain_data: None,
         }
     }
+}
+
+/// Synchronous extension point for integrators to attach opaque, domain-specific
+/// context to hook payloads before they are serialized to the hook process stdin.
+///
+/// Robotics integrators use this to attach live sensor telemetry (force/torque,
+/// workspace bounds, e-stop state) that their shell-based before-hooks then
+/// filter on. The core agent stays domain-agnostic: it does not introduce
+/// robot-specific `HookEvent` variants.
+///
+/// Invariants:
+/// - `enrich` runs on the Tokio runtime before payload serialization; keep it
+///   cheap and non-blocking. Expensive I/O must be done off-thread ahead of time
+///   and surfaced through an `Arc`-shared snapshot.
+/// - The populated `HookPayload.domain_data` is subject to truncation: anything
+///   whose rendered JSON exceeds `MAX_PAYLOAD_FIELD_BYTES` is replaced with
+///   a `{"truncated": true}` marker object.
+/// - Implementors MUST be `Send + Sync` so the executor can share them through
+///   `Arc`.
+pub trait HookPayloadEnricher: Send + Sync {
+    /// Mutate the payload in place. Typically sets `payload.domain_data` to a
+    /// JSON object describing the integrator's domain state for `event`.
+    fn enrich(&self, event: &HookEvent, payload: &mut HookPayload);
 }
 
 /// Result of running hooks for an event.
@@ -531,6 +565,8 @@ pub struct HookExecutor {
     /// Per-hook consecutive failure count.
     failures: Vec<AtomicU32>,
     failure_threshold: u32,
+    /// Optional domain-data enricher applied to payloads before serialization.
+    enricher: Option<Arc<dyn HookPayloadEnricher>>,
 }
 
 impl HookExecutor {
@@ -544,13 +580,46 @@ impl HookExecutor {
             hooks,
             failures,
             failure_threshold,
+            enricher: None,
         }
+    }
+
+    /// Attach a synchronous domain-data enricher. Additive: callers that do
+    /// not register an enricher see no payload change.
+    pub fn with_enricher(mut self, enricher: Arc<dyn HookPayloadEnricher>) -> Self {
+        self.enricher = Some(enricher);
+        self
     }
 
     /// Run all matching hooks for the given event sequentially.
     /// Returns `Deny` on the first before-hook that exits with 1.
     pub async fn run(&self, event: HookEvent, payload: &HookPayload) -> HookResult {
-        let payload_json = match serde_json::to_string(payload) {
+        // Apply the optional enricher before serialization so integrators can
+        // attach domain-specific telemetry (force/torque, workspace bounds,
+        // e-stop) that the hook script filters on.
+        let payload_owned;
+        let payload_ref: &HookPayload = if let Some(ref enricher) = self.enricher {
+            let mut enriched = payload.clone();
+            enricher.enrich(&event, &mut enriched);
+            if let Some(ref data) = enriched.domain_data {
+                // Truncate to MAX_PAYLOAD_FIELD_BYTES. Replace with a
+                // marker object so hook scripts always receive valid JSON.
+                let serialized = serde_json::to_string(data).unwrap_or_default();
+                if serialized.len() > MAX_PAYLOAD_FIELD_BYTES {
+                    enriched.domain_data = Some(serde_json::json!({"truncated": true}));
+                }
+                counter!(
+                    "octos_hook_domain_data_enriched_total",
+                    "event" => format!("{:?}", event)
+                )
+                .increment(1);
+            }
+            payload_owned = enriched;
+            &payload_owned
+        } else {
+            payload
+        };
+        let payload_json = match serde_json::to_string(payload_ref) {
             Ok(j) => j,
             Err(e) => return HookResult::Error(format!("failed to serialize payload: {e}")),
         };
@@ -566,7 +635,7 @@ impl HookExecutor {
             if matches!(event, HookEvent::BeforeToolCall | HookEvent::AfterToolCall)
                 && !hook.tool_filter.is_empty()
             {
-                let tool_name = payload.tool_name.as_deref().unwrap_or("");
+                let tool_name = payload_ref.tool_name.as_deref().unwrap_or("");
                 if !hook.tool_filter.iter().any(|f| f == tool_name) {
                     continue;
                 }
@@ -1090,6 +1159,7 @@ mod tests {
             current_phase: None,
             output_files: Vec::new(),
             failure_action: None,
+            domain_data: None,
         };
         let result = executor.run(HookEvent::AfterToolCall, &payload).await;
         // Hook should be skipped (circuit broken), not denied

@@ -43,7 +43,9 @@ pub use agent::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
-pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
+pub use hooks::{
+    HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
+};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
