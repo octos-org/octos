@@ -6,6 +6,8 @@ interface Props {
 }
 
 export default function EnvVarsEditor({ config, onChange }: Props) {
+  const referencedKeys = collectReferencedEnvKeys(config)
+
   const addEnvVar = () => {
     onChange({ ...config, env_vars: { ...config.env_vars, '': '' } })
   }
@@ -26,8 +28,30 @@ export default function EnvVarsEditor({ config, onChange }: Props) {
     <div className="space-y-4">
       <p className="text-xs text-gray-500">
         Raw environment variables passed to the gateway process. API keys configured in other tabs
-        appear here automatically.
+        appear here automatically. Unset keys are normal on clean installs and mean the secret
+        has not been provided by the user yet.
       </p>
+
+      {referencedKeys.length > 0 && (
+        <div className="rounded-lg border border-gray-700/50 bg-surface-dark/40 p-3 space-y-2">
+          <p className="text-xs text-gray-400">
+            Referenced secrets (LLM/tools/channels) are user-supplied. They are never pre-provisioned.
+          </p>
+          <div className="space-y-1.5">
+            {referencedKeys.map((envKey) => {
+              const configured = !!config.env_vars[envKey]?.trim()
+              return (
+                <div key={envKey} className="flex items-center justify-between text-xs">
+                  <span className="font-mono text-gray-300">{envKey}</span>
+                  <span className={configured ? 'text-green-400' : 'text-gray-500'}>
+                    {configured ? 'Set' : 'Awaiting user secret'}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {Object.entries(config.env_vars).map(([key, value], i) => (
         <div key={i} className="flex gap-2 items-start">
@@ -69,4 +93,44 @@ export default function EnvVarsEditor({ config, onChange }: Props) {
       </button>
     </div>
   )
+}
+
+function collectReferencedEnvKeys(config: ProfileConfig): string[] {
+  const refs = new Set<string>()
+  const add = (candidate: unknown) => {
+    if (typeof candidate !== 'string') return
+    const key = candidate.trim()
+    if (!key) return
+    refs.add(key)
+  }
+
+  add(config.llm?.primary?.route?.api_key_env)
+  for (const fb of config.llm?.fallbacks || []) {
+    add(fb.route?.api_key_env)
+  }
+
+  for (const provider of Object.values(config.search?.providers || {})) {
+    add(provider?.api_key_env)
+  }
+
+  add(config.email?.password_env)
+  add(config.email?.feishu_app_secret_env)
+
+  for (const channel of config.channels || []) {
+    add(channel?.token_env)
+    add(channel?.bot_token_env)
+    add(channel?.app_token_env)
+    add(channel?.app_id_env)
+    add(channel?.app_secret_env)
+    add(channel?.verification_token_env)
+    add(channel?.encrypt_key_env)
+    add(channel?.username_env)
+    add(channel?.password_env)
+    add(channel?.account_sid_env)
+    add(channel?.auth_token_env)
+    add(channel?.secret_env)
+    add(channel?.client_secret_env)
+  }
+
+  return [...refs].sort((a, b) => a.localeCompare(b))
 }
