@@ -3793,9 +3793,13 @@ name = "octos-plugin"
 version = "0.1.1"
 dependencies = [
  "eyre",
+ "metrics",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-test",
  "tracing",
  "which 7.0.3",
 ]
