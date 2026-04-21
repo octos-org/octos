@@ -125,6 +125,16 @@ function buildLongRepairPrompt(repoName: string, resumeMarker: string) {
   ].join(' ');
 }
 
+function buildConcurrentFilePrompt(fileName: string, token: string) {
+  return [
+    'Use write_file and read_file only.',
+    'Do not use shell, spawn, or background work.',
+    `Create ./${fileName} with exactly this content: ${token}`,
+    `Read ./${fileName} back.`,
+    `Return exactly ${token} and nothing else.`,
+  ].join(' ');
+}
+
 test.describe('Phase 3 coding hard cases', () => {
   test.describe.configure({ mode: 'serial' });
   test.setTimeout(600_000);
@@ -268,12 +278,12 @@ test.describe('Phase 3 coding hard cases', () => {
     try {
       const alphaToken = `ALPHA-CODE-${Date.now()}`;
       const betaToken = `BRAVO-CODE-${Date.now()}`;
-      const alphaPrompt = buildBoundedDiffPrompt(
-        uniqueRepoName('phase3-concurrent-alpha'),
+      const alphaPrompt = buildConcurrentFilePrompt(
+        `${uniqueRepoName('phase3-concurrent-alpha')}.txt`,
         alphaToken,
       );
-      const betaPrompt = buildBoundedDiffPrompt(
-        uniqueRepoName('phase3-concurrent-bravo'),
+      const betaPrompt = buildConcurrentFilePrompt(
+        `${uniqueRepoName('phase3-concurrent-bravo')}.txt`,
         betaToken,
       );
 
