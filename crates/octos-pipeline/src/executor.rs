@@ -3,10 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use eyre::{Result, WrapErr};
 use octos_agent::TokenTracker;
+use octos_agent::hooks::{HookContext, HookEvent, HookExecutor, HookPayload};
 use octos_agent::progress::ProgressEvent;
 use octos_agent::tools::TOOL_CTX;
 use octos_core::{Message, MessageRole, TokenUsage};
@@ -15,15 +17,107 @@ use octos_memory::EpisodeStore;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
 use crate::graph::{
-    HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge, PipelineGraph, PipelineNode,
+    DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
+    PipelineGraph, PipelineNode,
 };
 use crate::handler::{
     CodergenHandler, GateHandler, HandlerContext, HandlerRegistry, NoopHandler, ShellHandler,
 };
 use crate::parser::parse_dot;
 use crate::validate;
+
+/// Total count of pipeline deadline expirations, partitioned by action label.
+/// Layout: `[abort, skip, retry, escalate]`. Use [`deadline_exceeded_count`] to
+/// read a specific action's counter by name.
+pub static PIPELINE_DEADLINE_EXCEEDED_TOTAL: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Total count of mission checkpoints persisted to a `CheckpointStore`.
+pub static PIPELINE_CHECKPOINT_PERSISTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total count of pipeline runs that were resumed from a checkpoint (i.e., a
+/// store returned at least one `PersistedCheckpoint` at the start of `run`).
+pub static PIPELINE_CHECKPOINT_RESUMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn deadline_action_index(name: &str) -> usize {
+    match name {
+        "abort" => 0,
+        "skip" => 1,
+        "retry" => 2,
+        "escalate" => 3,
+        _ => 0,
+    }
+}
+
+/// Read the current `octos_pipeline_deadline_exceeded_total{action=<name>}`
+/// counter. Unknown names fall through to the `abort` bucket.
+pub fn deadline_exceeded_count(action_name: &str) -> u64 {
+    PIPELINE_DEADLINE_EXCEEDED_TOTAL[deadline_action_index(action_name)].load(Ordering::Relaxed)
+}
+
+fn record_deadline_exceeded(action: &DeadlineAction) {
+    PIPELINE_DEADLINE_EXCEEDED_TOTAL[deadline_action_index(action.name())]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Internal result of dispatching a single node. `Completed` carries the
+/// produced outcome; `Skipped` signals the deadline fired with
+/// `DeadlineAction::Skip` and the outer loop should synthesize a skipped
+/// outcome.
+enum DispatchOutcome {
+    Completed(NodeOutcome),
+    Skipped { label: String },
+}
+
+fn handler_kind_label(kind: &HandlerKind) -> &'static str {
+    match kind {
+        HandlerKind::Codergen => "codergen",
+        HandlerKind::Shell => "shell",
+        HandlerKind::Gate => "gate",
+        HandlerKind::Noop => "noop",
+        HandlerKind::Parallel => "parallel",
+        HandlerKind::DynamicParallel => "dynamic_parallel",
+    }
+}
+
+/// Skip-set derived from the checkpoint store for a fresh run.
+///
+/// Returns the set of node IDs that should be skipped because they (or nodes
+/// preceding them in completion order) were already recorded. On resume:
+/// * if the store yields at least one persisted snapshot, every `node_id`
+///   recorded in those snapshots goes into the skip set.
+/// * if the topological walk ever reaches one of those nodes, it is treated
+///   as completed and its outcome is synthesized as a `Pass` with empty
+///   content (downstream nodes still receive that empty input).
+fn build_resume_skip_set(store: Option<&Arc<dyn CheckpointStore>>) -> Result<HashSet<String>> {
+    let Some(store) = store else {
+        return Ok(HashSet::new());
+    };
+    let list = match store.list() {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(error = %e, "checkpoint store list failed; starting fresh");
+            return Ok(HashSet::new());
+        }
+    };
+    if list.is_empty() {
+        return Ok(HashSet::new());
+    }
+    PIPELINE_CHECKPOINT_RESUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let skip: HashSet<String> = list.into_iter().map(|c| c.node_id).collect();
+    info!(
+        skip_count = skip.len(),
+        "resuming pipeline from checkpoint store"
+    );
+    Ok(skip)
+}
 
 /// Result of a complete pipeline execution.
 #[derive(Debug, Clone)]
@@ -98,6 +192,16 @@ pub struct ExecutorConfig {
     /// Maximum number of parallel workers for fan-out stages (default 8).
     /// Prevents unbounded resource consumption under high parallelism.
     pub max_parallel_workers: usize,
+    /// Optional mission checkpoint store. When set, the executor:
+    /// * loads the latest `PersistedCheckpoint` at the start of a run and
+    ///   skips every node with id `<=` the recorded node in the pipeline's
+    ///   declaration order;
+    /// * persists one `PersistedCheckpoint` per `MissionCheckpoint`
+    ///   declaration after a node completes successfully.
+    pub checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Optional hook executor. Fired as `HookEvent::OnSpawnFailure` when a
+    /// node's `deadline_action == Escalate` trips.
+    pub hook_executor: Option<Arc<HookExecutor>>,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -518,6 +622,22 @@ impl PipelineExecutor {
         user_input: &str,
         variables: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PipelineResult> {
+        let handlers = self.build_handlers();
+        self.run_with_handlers(dot_content, user_input, variables, handlers)
+            .await
+    }
+
+    /// Run a pipeline from a DOT string using a caller-supplied handler
+    /// registry. Useful for tests that want to install a custom
+    /// `Handler` against a given `HandlerKind` without touching the
+    /// executor's default wiring.
+    pub async fn run_with_handlers(
+        &self,
+        dot_content: &str,
+        user_input: &str,
+        variables: &serde_json::Map<String, serde_json::Value>,
+        handlers: HandlerRegistry,
+    ) -> Result<PipelineResult> {
         // Parse and validate
         let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
 
@@ -568,9 +688,6 @@ impl PipelineExecutor {
                 .collect();
             eyre::bail!("pipeline validation failed:\n{}", errors.join("\n"));
         }
-
-        // Build handler registry
-        let handlers = self.build_handlers();
 
         // Find start node
         let start_node = validate::find_start_node(&graph)
@@ -667,6 +784,11 @@ impl PipelineExecutor {
         let mut total_tokens = TokenUsage::default();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
+        // Nodes to skip because they (and everything before them) are
+        // recorded in a persisted checkpoint. Synthesized outcomes for these
+        // nodes propagate through the graph so downstream handlers still run.
+        let resume_skip: HashSet<String> =
+            build_resume_skip_set(self.config.checkpoint_store.as_ref())?;
 
         info!(
             pipeline = %graph.id,
@@ -700,6 +822,48 @@ impl PipelineExecutor {
                         return Ok(PipelineResult {
                             output: outcome.content,
                             success: outcome.status == OutcomeStatus::Pass,
+                            token_usage: total_tokens,
+                            node_summaries: summaries,
+                            files_modified: vec![],
+                        });
+                    }
+                }
+            }
+
+            // Skip nodes marked completed by a persisted checkpoint. We
+            // synthesize a `Pass` outcome with empty content so downstream
+            // edge selection and input construction still work, but no
+            // handler runs.
+            if resume_skip.contains(&current_node_id) {
+                info!(
+                    node = %current_node_id,
+                    "skipping node (resume from checkpoint)"
+                );
+                let synth = NodeOutcome {
+                    node_id: current_node_id.clone(),
+                    status: OutcomeStatus::Pass,
+                    content: String::new(),
+                    token_usage: TokenUsage::default(),
+                    files_modified: vec![],
+                };
+                summaries.push(NodeSummary {
+                    node_id: current_node_id.clone(),
+                    label: node.label.as_deref().unwrap_or(&node.id).to_string(),
+                    model: node.model.clone(),
+                    token_usage: TokenUsage::default(),
+                    duration_ms: 0,
+                    success: true,
+                });
+                completed.insert(current_node_id.clone(), synth.clone());
+                match self.select_next_edge(graph, &current_node_id, &synth)? {
+                    Some(next) => {
+                        current_node_id = next;
+                        continue;
+                    }
+                    None => {
+                        return Ok(PipelineResult {
+                            output: synth.content,
+                            success: true,
                             token_usage: total_tokens,
                             node_summaries: summaries,
                             files_modified: vec![],
@@ -1271,10 +1435,59 @@ impl PipelineExecutor {
 
             let node_start = Instant::now();
 
-            // Execute with retries
-            let outcome = self
-                .execute_with_retries(handler, &node_with_prompt, &ctx, node.max_retries)
-                .await?;
+            // Execute with retries — and enforce the node's deadline when set.
+            let dispatch = self
+                .dispatch_node(handler, &node_with_prompt, &ctx, node.max_retries)
+                .await;
+
+            let outcome = match dispatch? {
+                DispatchOutcome::Completed(outcome) => outcome,
+                DispatchOutcome::Skipped { label } => {
+                    let duration_ms = node_start.elapsed().as_millis() as u64;
+                    info!(
+                        node = %node.id,
+                        duration_ms,
+                        "node skipped due to deadline_action=skip"
+                    );
+                    summaries.push(NodeSummary {
+                        node_id: node.id.clone(),
+                        label: label.clone(),
+                        model: node_with_prompt.model.clone(),
+                        token_usage: TokenUsage::default(),
+                        duration_ms,
+                        success: false,
+                    });
+                    let skipped = NodeOutcome {
+                        node_id: node.id.clone(),
+                        status: OutcomeStatus::Skipped,
+                        content: format!("Node '{}' skipped (deadline exceeded)", node.id),
+                        token_usage: TokenUsage::default(),
+                        files_modified: vec![],
+                    };
+                    completed.insert(current_node_id.clone(), skipped.clone());
+                    match self.select_next_edge(graph, &current_node_id, &skipped)? {
+                        Some(next_id) => {
+                            current_node_id = next_id;
+                            continue;
+                        }
+                        None => {
+                            let mut all_files: Vec<std::path::PathBuf> = Vec::new();
+                            for o in completed.values() {
+                                all_files.extend(o.files_modified.iter().cloned());
+                            }
+                            all_files.sort();
+                            all_files.dedup();
+                            return Ok(PipelineResult {
+                                output: skipped.content,
+                                success: false,
+                                token_usage: total_tokens,
+                                node_summaries: summaries,
+                                files_modified: all_files,
+                            });
+                        }
+                    }
+                }
+            };
 
             let duration_ms = node_start.elapsed().as_millis() as u64;
 
@@ -1311,6 +1524,35 @@ impl PipelineExecutor {
             });
 
             completed.insert(current_node_id.clone(), outcome.clone());
+
+            // Persist mission checkpoints declared on this node (if any) and
+            // the store is configured. Best-effort — a failed persist logs a
+            // warning but does not abort the run.
+            if outcome.status == OutcomeStatus::Pass
+                && !node.checkpoints.is_empty()
+                && let Some(store) = self.config.checkpoint_store.as_ref()
+            {
+                for decl in &node.checkpoints {
+                    let seq = PIPELINE_CHECKPOINT_PERSISTED_TOTAL.load(Ordering::Relaxed);
+                    let record =
+                        PersistedCheckpoint::from_declaration(&graph.id, &node.id, decl, seq);
+                    if let Err(e) = store.persist(&record) {
+                        warn!(
+                            node = %node.id,
+                            checkpoint = %decl.name,
+                            error = %e,
+                            "failed to persist mission checkpoint"
+                        );
+                    } else {
+                        PIPELINE_CHECKPOINT_PERSISTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            node = %node.id,
+                            checkpoint = %decl.name,
+                            "persisted mission checkpoint"
+                        );
+                    }
+                }
+            }
 
             // Check goal gate
             if node.goal_gate && outcome.status == OutcomeStatus::Pass {
@@ -1414,6 +1656,105 @@ impl PipelineExecutor {
             tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
         }
         unreachable!()
+    }
+
+    /// Execute a node, honoring both the generic `max_retries` and — when
+    /// `deadline_secs` is set — the `deadline_action` for timeouts.
+    async fn dispatch_node(
+        &self,
+        handler: &Arc<dyn crate::handler::Handler>,
+        node: &PipelineNode,
+        ctx: &HandlerContext,
+        max_retries: u32,
+    ) -> Result<DispatchOutcome> {
+        let Some(deadline_secs) = node.deadline_secs else {
+            let outcome = self
+                .execute_with_retries(handler, node, ctx, max_retries)
+                .await?;
+            return Ok(DispatchOutcome::Completed(outcome));
+        };
+
+        let deadline = Duration::from_secs_f64(deadline_secs);
+        let action = node.deadline_action.unwrap_or(DeadlineAction::Abort);
+        let label = node.label.as_deref().unwrap_or(&node.id).to_string();
+
+        // For Retry, we loop over attempts. For all others, a single timed run.
+        let max_attempts = match action {
+            DeadlineAction::Retry { max_attempts } => max_attempts.max(1),
+            _ => 1,
+        };
+
+        let mut last_err: Option<eyre::Report> = None;
+        for attempt in 0..max_attempts {
+            let fut = self.execute_with_retries(handler, node, ctx, max_retries);
+            match tokio::time::timeout(deadline, fut).await {
+                Ok(Ok(outcome)) => return Ok(DispatchOutcome::Completed(outcome)),
+                Ok(Err(e)) => {
+                    last_err = Some(e);
+                    if attempt + 1 >= max_attempts {
+                        break;
+                    }
+                }
+                Err(_timeout) => {
+                    record_deadline_exceeded(&action);
+                    warn!(
+                        node = %node.id,
+                        deadline_secs,
+                        attempt = attempt + 1,
+                        action = action.name(),
+                        "node deadline exceeded"
+                    );
+                    match action {
+                        DeadlineAction::Abort => {
+                            eyre::bail!(
+                                "node '{}' exceeded deadline of {}s (action=abort)",
+                                node.id,
+                                deadline_secs
+                            );
+                        }
+                        DeadlineAction::Skip => {
+                            return Ok(DispatchOutcome::Skipped { label });
+                        }
+                        DeadlineAction::Retry { .. } => {
+                            if attempt + 1 >= max_attempts {
+                                eyre::bail!(
+                                    "node '{}' exceeded deadline on all {} retry attempt(s)",
+                                    node.id,
+                                    max_attempts
+                                );
+                            }
+                            // else: fall through and try again
+                        }
+                        DeadlineAction::Escalate => {
+                            if let Some(hook) = self.config.hook_executor.as_ref() {
+                                let payload = HookPayload::on_spawn_failure(
+                                    node.id.clone(),
+                                    label.clone(),
+                                    String::new(),
+                                    String::new(),
+                                    Some("pipeline"),
+                                    Some(handler_kind_label(&node.handler)),
+                                    format!(
+                                        "deadline_exceeded: node '{}' deadline={}s",
+                                        node.id, deadline_secs
+                                    ),
+                                    Vec::new(),
+                                    "deadline_exceeded",
+                                    None::<&HookContext>,
+                                );
+                                let _ = hook.run(HookEvent::OnSpawnFailure, &payload).await;
+                            }
+                            eyre::bail!(
+                                "node '{}' exceeded deadline of {}s (action=escalate)",
+                                node.id,
+                                deadline_secs
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| eyre::eyre!("node '{}' failed all retry attempts", node.id)))
     }
 
     /// 5-step edge selection algorithm.
@@ -1595,6 +1936,8 @@ mod tests {
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
+            checkpoint_store: None,
+            hook_executor: None,
         }
     }
 
