@@ -54,6 +54,14 @@ interface Props {
   children: ReactNode
 }
 
+function normalizeProfileConfig(config: ProfileConfig): ProfileConfig {
+  // Backend no longer accepts legacy top-level `config.api_type`.
+  const { api_type: _legacyApiType, ...next } = (config as unknown as ProfileConfig & {
+    api_type?: unknown
+  })
+  return next as unknown as ProfileConfig
+}
+
 export function ProfileProvider({ children }: Props) {
   const { id } = useParams<{ id: string }>()
   const { user, isAdmin } = useAuth()
@@ -114,7 +122,7 @@ export function ProfileProvider({ children }: Props) {
     try {
       setLoading(true)
       const profile = await adapter.getProfile()
-      setConfig(profile.config)
+      setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
       setProfileEmail(profile.email || '')
@@ -135,6 +143,7 @@ export function ProfileProvider({ children }: Props) {
   const save = useCallback(async () => {
     try {
       setSaving(true)
+      const normalizedConfig = normalizeProfileConfig(config)
       const profile = await adapter.updateProfile({
         name: profileName,
         email: profileEmail || undefined,
@@ -143,9 +152,9 @@ export function ProfileProvider({ children }: Props) {
             ? publicSubdomain.trim()
             : null,
         enabled,
-        config,
+        config: normalizedConfig,
       })
-      setConfig(profile.config)
+      setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
       setPublicSubdomain(profile.public_subdomain || profile.id)

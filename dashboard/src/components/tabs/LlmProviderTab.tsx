@@ -9,7 +9,6 @@ import _PROVIDER_MODELS from '../../providers.json'
 
 const CUSTOM_FAMILY = '__custom_family__'
 const CUSTOM_MODEL = '__custom_model__'
-const CUSTOM_ROUTE = '__custom_route__'
 
 /** An API host that serves one or more models. Empty base_url = family default. */
 interface ModelEndpoint {
@@ -29,30 +28,20 @@ interface ModelEntry {
 const PROVIDER_MODELS = _PROVIDER_MODELS as Record<string, { env: string; models: ModelEntry[] }>
 const PROVIDER_FAMILIES = Object.keys(PROVIDER_MODELS)
 
+function findMatchingId(ids: string[], id: string | null | undefined): string | null {
+  if (!id) return null
+  const exact = ids.find((item) => item === id)
+  if (exact) return exact
+  const lower = id.toLowerCase()
+  return ids.find((item) => item.toLowerCase() === lower) || null
+}
+
 function isKnownProvider(provider: string | null | undefined): boolean {
   return !!provider && Object.prototype.hasOwnProperty.call(PROVIDER_MODELS, provider)
 }
 
 function providerRouteKey(provider: string | null | undefined, baseUrl?: string | null): string {
   return `${provider || ''}::${baseUrl || ''}`
-}
-
-function slugifyRoutePart(value: string | null | undefined): string {
-  return (value || '')
-    .trim()
-    .replace(/[^a-zA-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toUpperCase()
-}
-
-function defaultCustomRouteId(label: string | null | undefined): string {
-  const slug = slugifyRoutePart(label).toLowerCase()
-  return slug || 'custom'
-}
-
-function defaultCustomRouteApiKeyEnv(label: string | null | undefined): string {
-  const slug = slugifyRoutePart(label)
-  return `${slug || 'CUSTOM'}_API_KEY`
 }
 
 // Provider registry handles all providers natively — no mapping needed.
@@ -65,7 +54,9 @@ function getApiKeyEnvName(provider: string | null | undefined): string {
 /** Find a model entry in the family's catalogue by id. */
 function findModelEntry(provider: string | null | undefined, modelId: string | null | undefined): ModelEntry | undefined {
   if (!provider || !modelId) return undefined
-  return PROVIDER_MODELS[provider]?.models.find((m) => m.id === modelId)
+  const models = PROVIDER_MODELS[provider]?.models || []
+  const matchedId = findMatchingId(models.map((m) => m.id), modelId)
+  return matchedId ? models.find((m) => m.id === matchedId) : undefined
 }
 
 /** Find the endpoint in `model.endpoints` that matches (base_url, api_key_env). */
@@ -88,21 +79,19 @@ function getModelIds(provider: string, fetched?: Record<string, string[]>, baseU
   const staticIds = (PROVIDER_MODELS[provider]?.models || []).map((m) => m.id)
   const dynamicIds = fetched?.[providerRouteKey(provider, baseUrl)] || []
   // Merge: static first, then any dynamic models not already in static
-  const seen = new Set(staticIds)
+  const seen = new Set(staticIds.map((id) => id.toLowerCase()))
   const merged = [...staticIds]
   for (const id of dynamicIds) {
-    if (!seen.has(id)) {
+    if (!seen.has(id.toLowerCase())) {
       merged.push(id)
-      seen.add(id)
+      seen.add(id.toLowerCase())
     }
   }
   return merged
 }
 
 function getModelPricing(provider: string, modelId: string): ModelEntry | null {
-  const entry = PROVIDER_MODELS[provider]
-  if (!entry) return null
-  return entry.models.find((m) => m.id === modelId) || null
+  return findModelEntry(provider, modelId) || null
 }
 
 function formatPrice(p: ModelEntry): string {
@@ -133,46 +122,6 @@ function buildRouteFromEndpoint(
   }
 }
 
-function hasCustomRoute(
-  provider: string | null | undefined,
-  modelId: string | null | undefined,
-  route: LlmRouteConfig | null | undefined,
-): boolean {
-  if (!route) return false
-  const model = findModelEntry(provider, modelId)
-  if (findMatchingEndpoint(model, route)) return false
-  const defaultEnv = getApiKeyEnvName(provider)
-  const hasOnlyLegacyRouteAlias = !route.base_url
-    && !nullable(route.label)
-    && (!route.api_key_env || route.api_key_env === defaultEnv)
-  if (hasOnlyLegacyRouteAlias) return false
-  return !!(
-    route.base_url ||
-    route.label ||
-    route.route_id ||
-    (route.api_key_env && route.api_key_env !== defaultEnv)
-  )
-}
-
-function buildCustomRoute(
-  route: LlmRouteConfig | null | undefined,
-): LlmRouteConfig {
-  const previousLabel = nullable(route?.label)
-  const nextLabel = previousLabel || 'Custom route'
-  const previousEnv = nullable(route?.api_key_env)
-  const defaultPreviousEnv = defaultCustomRouteApiKeyEnv(previousLabel)
-  const nextEnv = previousEnv && previousEnv !== defaultPreviousEnv
-    ? previousEnv
-    : defaultCustomRouteApiKeyEnv(nextLabel)
-  return {
-    route_id: nullable(route?.route_id) || defaultCustomRouteId(nextLabel),
-    label: nextLabel,
-    base_url: nullable(route?.base_url),
-    api_key_env: nextEnv,
-    api_type: route?.api_type || null,
-  }
-}
-
 function buildRouteForModel(
   provider: string | null | undefined,
   modelId: string | null | undefined,
@@ -181,44 +130,7 @@ function buildRouteForModel(
   const model = findModelEntry(provider, modelId)
   const matched = findMatchingEndpoint(model, route)
   if (matched) return buildRouteFromEndpoint(provider, matched)
-  if (hasCustomRoute(provider, modelId, route)) return buildCustomRoute(route)
   return buildRouteFromEndpoint(provider, model?.endpoints?.[0])
-}
-
-function patchCustomRoute(
-  route: LlmRouteConfig | null | undefined,
-  patch: Partial<LlmRouteConfig>,
-): LlmRouteConfig {
-  const next = buildCustomRoute(route)
-  const previousLabel = nullable(next.label)
-  const label = nullable(
-    patch.label !== undefined ? patch.label : next.label,
-  ) || 'Custom route'
-  const envWasAuto = next.api_key_env === defaultCustomRouteApiKeyEnv(previousLabel)
-  const apiKeyEnv = nullable(
-    patch.api_key_env !== undefined
-      ? patch.api_key_env
-      : envWasAuto
-        ? defaultCustomRouteApiKeyEnv(label)
-        : next.api_key_env,
-  ) || defaultCustomRouteApiKeyEnv(label)
-  const routeId = nullable(
-    patch.route_id !== undefined
-      ? patch.route_id
-      : next.route_id === defaultCustomRouteId(previousLabel)
-        ? defaultCustomRouteId(label)
-        : next.route_id,
-  ) || defaultCustomRouteId(label)
-  return {
-    ...next,
-    ...patch,
-    route_id: routeId,
-    label,
-    api_key_env: apiKeyEnv,
-    base_url: nullable(
-      patch.base_url !== undefined ? patch.base_url : next.base_url,
-    ),
-  }
 }
 
 function getRouteLabel(
@@ -306,7 +218,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const primaryModel = primary.model_id || ''
   const primaryBaseUrl = primary.route?.base_url || ''
   const primaryRouteLabel = getRouteLabel(primaryProvider, primaryModel, primary.route)
-  const primaryHasCustomRoute = hasCustomRoute(primaryProvider, primaryModel, primary.route)
   const primaryEnv = primary.route?.api_key_env || getApiKeyEnvName(primaryProvider)
   const fallbacks = getFallbackSelections(config)
 
@@ -335,17 +246,11 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   }, [fetchedModels, profileId])
 
   useEffect(() => {
-    if (
-      primaryProvider &&
-      (!primaryHasCustomRoute || primaryBaseUrl)
-    ) {
+    if (primaryProvider) {
       fetchModelsForProvider(primaryProvider, primaryEnv, primaryBaseUrl)
     }
     for (const fb of fallbacks) {
-      if (
-        fb.family_id &&
-        (!hasCustomRoute(fb.family_id, fb.model_id, fb.route) || fb.route?.base_url)
-      ) {
+      if (fb.family_id) {
         fetchModelsForProvider(
           fb.family_id,
           fb.route?.api_key_env || getApiKeyEnvName(fb.family_id),
@@ -353,7 +258,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
         )
       }
     }
-  }, [fetchModelsForProvider, fallbacks, primaryBaseUrl, primaryEnv, primaryHasCustomRoute, primaryProvider])
+  }, [fetchModelsForProvider, fallbacks, primaryBaseUrl, primaryEnv, primaryProvider])
 
   const updateSelections = (
     nextPrimary: LlmModelSelectionConfig,
@@ -395,32 +300,12 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
 
   const changePrimaryRoute = (routeId: string) => {
     const modelEntry = findModelEntry(primaryProvider, primaryModel)
-    if (routeId === CUSTOM_ROUTE) {
-      updateSelections(
-        {
-          ...primary,
-          route: buildCustomRoute(primary.route),
-        },
-        fallbacks,
-      )
-      return
-    }
     const endpoint = modelEntry?.endpoints?.find((ep) => ep.id === routeId)
     if (!endpoint) return
     updateSelections(
       {
         ...primary,
         route: buildRouteFromEndpoint(primaryProvider, endpoint),
-      },
-      fallbacks,
-    )
-  }
-
-  const patchPrimaryCustomRoute = (patch: Partial<LlmRouteConfig>) => {
-    updateSelections(
-      {
-        ...primary,
-        route: patchCustomRoute(primary.route, patch),
       },
       fallbacks,
     )
@@ -511,25 +396,11 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const changeFallbackRoute = (idx: number, routeId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
-    if (routeId === CUSTOM_ROUTE) {
-      updateFallback(idx, {
-        route: buildCustomRoute(fb.route),
-      })
-      return
-    }
     const modelEntry = findModelEntry(fb.family_id, fb.model_id)
     const endpoint = modelEntry?.endpoints?.find((ep) => ep.id === routeId)
     if (!endpoint) return
     updateFallback(idx, {
       route: buildRouteFromEndpoint(fb.family_id, endpoint),
-    })
-  }
-
-  const patchFallbackCustomRoute = (idx: number, patch: Partial<LlmRouteConfig>) => {
-    const fb = fallbacks[idx]
-    if (!fb) return
-    updateFallback(idx, {
-      route: patchCustomRoute(fb.route, patch),
     })
   }
 
@@ -595,7 +466,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
     model: string,
     apiKeyEnv: string,
     baseUrl?: string | null,
-    requiresBaseUrl?: boolean,
   ) => {
     const apiKey = config.env_vars[apiKeyEnv] || ''
     if (!apiKey) {
@@ -606,8 +476,8 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
       setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'No model selected.', pricing: null } }))
       return
     }
-    if ((!isKnownProvider(provider) || requiresBaseUrl) && !baseUrl) {
-      setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'This custom route requires a Base URL.', pricing: null } }))
+    if (!isKnownProvider(provider) && !baseUrl) {
+      setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'Custom provider requires a Base URL.', pricing: null } }))
       return
     }
     setTestResults((s) => ({ ...s, [key]: { state: 'testing', error: '', pricing: null } }))
@@ -640,7 +510,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   return (
     <div className="space-y-6">
       <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-xs text-amber-400">
-        The stored schema is model family → model name → route. Pick the family first, then the model, then the official API, AutoDL, WiseModel, or a custom OpenAI-compatible route for that model.
+        The stored schema is model family → model name → route. Pick the family first, then the model, then the official API, AutoDL, or WiseModel route for that model.
       </div>
 
       {/* ── Primary Provider ── */}
@@ -677,7 +547,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
           modelId={primaryModel}
           route={primary.route}
           onRouteChange={changePrimaryRoute}
-          onCustomRouteChange={patchPrimaryCustomRoute}
         />
 
         <Field label="API Key" hint={primaryEnv ? `Stored as ${primaryEnv}` : undefined}>
@@ -698,7 +567,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
             primaryModel || '',
             primaryEnv,
             primary.route?.base_url,
-            hasCustomRoute(primaryProvider, primaryModel, primary.route),
           )}
         />
       </div>
@@ -791,7 +659,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
                 modelId={fbModel}
                 route={fb.route}
                 onRouteChange={(routeId) => changeFallbackRoute(idx, routeId)}
-                onCustomRouteChange={(patch) => patchFallbackCustomRoute(idx, patch)}
               />
 
               <Field label="API Key" hint={sharesPrimaryKey ? `Shared with primary (${fbEnv})` : `Stored as ${fbEnv}`}>
@@ -812,7 +679,6 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
                   fbModel || '',
                   fbEnv,
                   fb.route?.base_url,
-                  hasCustomRoute(fbProvider, fbModel, fb.route),
                 )}
               />
             </div>
@@ -904,60 +770,34 @@ function ProviderSelect({ provider, baseUrl, onProviderChange, onBaseUrlChange }
 }
 
 /** Render a per-model endpoint picker if the selected model has preconfigured routes. */
-function EndpointSelect({ provider, modelId, route, onRouteChange, onCustomRouteChange }: {
+function EndpointSelect({ provider, modelId, route, onRouteChange }: {
   provider: string
   modelId: string
   route: LlmRouteConfig | null | undefined
   onRouteChange: (routeId: string) => void
-  onCustomRouteChange: (patch: Partial<LlmRouteConfig>) => void
 }) {
   const model = findModelEntry(provider, modelId)
   const list = model?.endpoints ?? []
-  const isCustom = hasCustomRoute(provider, modelId, route)
-  if (list.length === 0 && !isCustom) return null
+  if (list.length === 0) return null
 
   const matched = findMatchingEndpoint(model, route)
-  const value = isCustom ? CUSTOM_ROUTE : (matched?.id ?? list[0]?.id ?? CUSTOM_ROUTE)
+  const value = matched?.id ?? list[0]?.id ?? ''
 
   return (
     <div className="space-y-3">
-      {list.length > 0 && (
-        <Field label="Route / API Provider" hint="The family and model stay fixed. This chooses the actual API host and credential set.">
-          <select
-            value={value}
-            onChange={(e) => onRouteChange(e.target.value)}
-            className="input"
-          >
-            {list.map((ep) => (
-              <option key={ep.id} value={ep.id}>
-                {ep.label}{ep.base_url ? ` — ${ep.base_url}` : ''}
-              </option>
-            ))}
-            <option value={CUSTOM_ROUTE}>Custom route…</option>
-          </select>
-        </Field>
-      )}
-
-      {(isCustom || list.length === 0) && (
-        <div className="space-y-3 rounded-lg border border-gray-700/40 bg-surface-dark/20 p-3">
-          <Field label="Route Name" hint="Name of the API provider route, such as AutoDL, WiseModel, or your own host.">
-            <input
-              value={route?.label || ''}
-              onChange={(e) => onCustomRouteChange({ label: e.target.value })}
-              placeholder="My custom route"
-              className="input text-xs font-mono"
-            />
-          </Field>
-          <Field label="Route Base URL" hint="OpenAI-compatible API URL for this route.">
-            <input
-              value={route?.base_url || ''}
-              onChange={(e) => onCustomRouteChange({ base_url: e.target.value })}
-              placeholder="https://example.com/v1"
-              className="input text-xs font-mono"
-            />
-          </Field>
-        </div>
-      )}
+      <Field label="Route / API Provider" hint="The family and model stay fixed. This chooses the actual API host and credential set.">
+        <select
+          value={value}
+          onChange={(e) => onRouteChange(e.target.value)}
+          className="input"
+        >
+          {list.map((ep) => (
+            <option key={ep.id} value={ep.id}>
+              {ep.label}{ep.base_url ? ` — ${ep.base_url}` : ''}
+            </option>
+          ))}
+        </select>
+      </Field>
     </div>
   )
 }
@@ -967,18 +807,21 @@ function ModelSelect({ provider, model, baseUrl, onModelChange, fetchedModels }:
   const staticModels = entry?.models || []
   const staticIds = staticModels.map((m) => m.id)
   // Merge static + dynamically fetched models
-  const dynamicIds = (fetchedModels?.[providerRouteKey(provider, baseUrl)] || []).filter((id) => !staticIds.includes(id))
+  const dynamicIds = (fetchedModels?.[providerRouteKey(provider, baseUrl)] || []).filter(
+    (id) => !staticIds.some((staticId) => staticId.toLowerCase() === id.toLowerCase()),
+  )
   const allIds = [...staticIds, ...dynamicIds]
-  const isCustom = model !== '' && !allIds.includes(model)
+  const canonicalModel = findMatchingId(allIds, model)
+  const isCustom = model !== '' && !canonicalModel
   const [customSelected, setCustomSelected] = useState(isCustom)
   useEffect(() => {
     if (isCustom) setCustomSelected(true)
-    else if (model && allIds.includes(model)) setCustomSelected(false)
-  }, [allIds, isCustom, model])
-  const pricing = staticModels.find((m) => m.id === model)
+    else if (canonicalModel) setCustomSelected(false)
+  }, [canonicalModel, isCustom])
+  const pricing = staticModels.find((m) => m.id === canonicalModel)
   const endpointSummary = formatEndpointSummary(pricing)
 
-  const selectValue = (isCustom || (customSelected && !model)) ? CUSTOM_MODEL : model
+  const selectValue = (isCustom || (customSelected && !model)) ? CUSTOM_MODEL : (canonicalModel || model)
 
   return (
     <Field label="Model Name">

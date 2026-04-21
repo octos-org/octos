@@ -115,11 +115,11 @@
   "deepseek": {
     "env": "DEEPSEEK_API_KEY",
     "models": [
-      { "id": "deepseek-chat", "input": 0.27, "output": 1.1, "max_output": 8192, "endpoints": [
-        { "id": "deepseek", "label": "Official API" },
+      { "id": "deepseek-chat", "input": 0.27, "output": 1.1, "max_output": 8192 },
+      { "id": "deepseek-reasoner", "input": 0.55, "output": 2.19, "max_output": 8192 },
+      { "id": "deepseek-v3.2", "input": 0.25, "output": 0.4, "max_output": 8192, "endpoints": [
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
-      ] },
-      { "id": "deepseek-reasoner", "input": 0.55, "output": 2.19, "max_output": 8192 }
+      ] }
     ]
   },
   "groq": {
@@ -140,6 +140,7 @@
         { "id": "moonshot", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
+      { "id": "kimi-k2.6", "input": 0.6, "output": 2.4, "max_output": 65535 },
       { "id": "kimi-k2-thinking", "input": 0.6, "output": 2.4, "max_output": 65535 },
       { "id": "kimi-k2-thinking-turbo", "input": 0.6, "output": 2.4, "max_output": 65535 },
       { "id": "kimi-k2-turbo-preview", "input": 0.6, "output": 2.4, "max_output": 65535 },
