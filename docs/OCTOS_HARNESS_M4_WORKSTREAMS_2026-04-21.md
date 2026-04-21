@@ -175,6 +175,36 @@ Deliverables:
   preserving stderr as human diagnostics
 - browser/API proof that progress survives session switching and reload
 - live mini fleet validation before closing the milestone
+- copyable non-Rust emitter helpers and fixtures:
+  - `examples/harness-event/python/emit_progress.py`
+  - `examples/harness-event/node/emit_progress.mjs`
+  - `examples/harness-event/fixtures/progress-event.jsonl`
+  - `scripts/test-harness-event-emitters.sh`
+
+Exact usage:
+
+```bash
+export OCTOS_EVENT_SINK="file:///tmp/octos-events.jsonl"
+python3 examples/harness-event/python/emit_progress.py \
+  --session-id sess-123 \
+  --task-id task-456 \
+  --workflow deep_research \
+  --phase fetching_sources \
+  --message "Fetching source 3/12" \
+  --progress 0.42
+
+node examples/harness-event/node/emit_progress.mjs \
+  --session-id sess-123 \
+  --task-id task-456 \
+  --workflow deep_research \
+  --phase fetching_sources \
+  --message "Fetching source 3/12" \
+  --progress 0.42
+```
+
+Missing `OCTOS_EVENT_SINK` is a no-op. The emitters only format and deliver the
+record; runtime validation, size checks, and rejection handling stay on the
+consumer side.
 
 Published workstreams:
 

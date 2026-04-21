@@ -1,0 +1,1 @@
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"sess-123","task_id":"task-456","workflow":"deep_research","phase":"fetching_sources","message":"Fetching source 3/12","progress":0.42}
