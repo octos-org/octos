@@ -327,46 +327,110 @@ fn handle_transcribe(input_json: &str) {
 
 // ── macOS Say fallback ──────────────────────────────────────────────
 
+fn say_voice_candidates(language: &str) -> &'static [&'static str] {
+    let normalized = language.trim().to_ascii_lowercase();
+    if normalized.contains("chinese") || normalized.starts_with("zh") {
+        &["Tingting", "Meijia", "Sinji"]
+    } else if normalized.contains("japanese") || normalized.starts_with("ja") {
+        &["Kyoko"]
+    } else if normalized.contains("korean") || normalized.starts_with("ko") {
+        &["Yuna"]
+    } else {
+        &[]
+    }
+}
+
+fn wav_payload_is_silent_bytes(bytes: &[u8]) -> bool {
+    bytes.len() <= 44 || bytes[44..].iter().all(|&b| b == 0)
+}
+
+fn wav_is_silent(path: &str) -> Result<bool, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Failed to inspect synthesized audio {path}: {e}"))?;
+    Ok(wav_payload_is_silent_bytes(&bytes))
+}
+
 /// Synthesize using macOS built-in `say` command.
-/// `say` auto-detects language from text and picks the appropriate voice.
+/// Uses a language-aware voice list so fallback audio is not silently empty.
 /// Outputs AIFF, then converts to WAV via macOS built-in `afconvert`.
-fn synthesize_with_say(text: &str, speed: Option<f32>, output_path: &str) -> Result<(), String> {
-    let aiff_path = format!("{output_path}.aiff");
+fn synthesize_with_say(
+    text: &str,
+    language: &str,
+    speed: Option<f32>,
+    output_path: &str,
+) -> Result<(), String> {
+    let candidate_voices = say_voice_candidates(language);
+    let attempts: Vec<Option<&str>> = if candidate_voices.is_empty() {
+        vec![None]
+    } else {
+        candidate_voices.iter().copied().map(Some).collect()
+    };
 
-    let mut cmd = std::process::Command::new("say");
-    cmd.arg("-o").arg(&aiff_path);
-    // Map speed factor (0.5-2.0) to words-per-minute (~175 WPM is normal)
-    if let Some(s) = speed {
-        let wpm = (175.0 * s).clamp(80.0, 400.0) as u32;
-        cmd.arg("-r").arg(wpm.to_string());
+    let mut last_error = None;
+    for voice in attempts {
+        let aiff_path = format!("{output_path}.aiff");
+
+        let mut cmd = std::process::Command::new("say");
+        cmd.arg("-o").arg(&aiff_path);
+        if let Some(voice) = voice {
+            cmd.arg("-v").arg(voice);
+        }
+        // Map speed factor (0.5-2.0) to words-per-minute (~175 WPM is normal)
+        if let Some(s) = speed {
+            let wpm = (175.0 * s).clamp(80.0, 400.0) as u32;
+            cmd.arg("-r").arg(wpm.to_string());
+        }
+        cmd.arg(text);
+
+        let status = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("`say` command failed: {e}"))?;
+
+        if !status.success() {
+            last_error = Some(format!("`say` exited with status {status}"));
+            let _ = std::fs::remove_file(&aiff_path);
+            continue;
+        }
+
+        // Convert AIFF to WAV using macOS built-in afconvert
+        let af_status = std::process::Command::new("afconvert")
+            .args(["-f", "WAVE", "-d", "LEI16@24000", &aiff_path, output_path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        // Clean up temp AIFF
+        let _ = std::fs::remove_file(&aiff_path);
+
+        match af_status {
+            Ok(s) if s.success() => match wav_is_silent(output_path) {
+                Ok(false) => return Ok(()),
+                Ok(true) => {
+                    last_error = Some(format!(
+                        "macOS Say voice '{}' produced silent audio",
+                        voice.unwrap_or("default")
+                    ));
+                    let _ = std::fs::remove_file(output_path);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    let _ = std::fs::remove_file(output_path);
+                }
+            },
+            Ok(s) => {
+                last_error = Some(format!("afconvert failed with status {s}"));
+                let _ = std::fs::remove_file(output_path);
+            }
+            Err(e) => {
+                last_error = Some(format!("afconvert failed: {e}"));
+                let _ = std::fs::remove_file(output_path);
+            }
+        }
     }
-    cmd.arg(text);
 
-    let status = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("`say` command failed: {e}"))?;
-
-    if !status.success() {
-        return Err(format!("`say` exited with status {status}"));
-    }
-
-    // Convert AIFF to WAV using macOS built-in afconvert
-    let af_status = std::process::Command::new("afconvert")
-        .args(["-f", "WAVE", "-d", "LEI16@24000", &aiff_path, output_path])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Clean up temp AIFF
-    let _ = std::fs::remove_file(&aiff_path);
-
-    match af_status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("afconvert failed with status {s}")),
-        Err(e) => Err(format!("afconvert failed: {e}")),
-    }
+    Err(last_error.unwrap_or_else(|| "macOS Say failed".to_string()))
 }
 
 // ── voice_synthesize ─────────────────────────────────────────────────
@@ -457,7 +521,7 @@ fn handle_synthesize(input_json: &str) {
     }
 
     // Fallback: macOS built-in `say` command
-    match synthesize_with_say(&input.text, input.speed, &output_path) {
+    match synthesize_with_say(&input.text, &language, input.speed, &output_path) {
         Ok(()) => {
             let size = std::fs::metadata(&output_path)
                 .map(|m| m.len())
@@ -474,6 +538,37 @@ fn handle_synthesize(input_json: &str) {
         Err(e) => fail(&format!(
             "TTS failed: ominix-api not available, macOS Say also failed: {e}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chinese_language_uses_chinese_voices() {
+        assert_eq!(
+            say_voice_candidates("Chinese"),
+            ["Tingting", "Meijia", "Sinji"]
+        );
+        assert_eq!(
+            say_voice_candidates("zh-CN"),
+            ["Tingting", "Meijia", "Sinji"]
+        );
+    }
+
+    #[test]
+    fn english_language_uses_default_say_voice() {
+        assert!(say_voice_candidates("english").is_empty());
+    }
+
+    #[test]
+    fn wav_silence_detection_checks_pcm_payload() {
+        let mut silent = vec![0u8; 44 + 8];
+        assert!(wav_payload_is_silent_bytes(&silent));
+
+        silent[44] = 1;
+        assert!(!wav_payload_is_silent_bytes(&silent));
     }
 }
 
