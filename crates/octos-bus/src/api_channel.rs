@@ -797,12 +797,12 @@ impl Channel for ApiChannel {
                     .unwrap_or(false);
                 if has_bg {
                     if let Some(query_fn) = self.task_query.as_ref() {
-                        let session_key = current_profile_api_session_key_with_topic(
+                        let tasks = query_tasks_for_session_candidates(
+                            query_fn.as_ref(),
                             self.profile_id.as_deref(),
                             &msg.chat_id,
                             topic,
                         );
-                        let tasks = query_fn(&session_key.0);
                         for event in build_bg_task_tool_start_events(&tasks) {
                             let _ = tx.send(event.to_string());
                         }
@@ -1234,29 +1234,51 @@ fn api_session_key_candidates(
     id: &str,
     topic: Option<&str>,
 ) -> Vec<SessionKey> {
-    let mut keys = Vec::with_capacity(3);
+    let mut keys = Vec::with_capacity(4);
+    let raw_id = api_chat_id_from_session_key(id).unwrap_or(id);
+
+    if raw_id != id && topic.filter(|value| !value.is_empty()).is_none() {
+        keys.push(SessionKey(id.to_string()));
+    }
 
     if let Some(topic) = topic.filter(|value| !value.is_empty()) {
         if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
-            keys.push(SessionKey::with_profile_topic(profile_id, "api", id, topic));
+            keys.push(SessionKey::with_profile_topic(
+                profile_id, "api", raw_id, topic,
+            ));
         }
         keys.push(SessionKey::with_profile_topic(
             MAIN_PROFILE_ID,
             "api",
-            id,
+            raw_id,
             topic,
         ));
-        keys.push(SessionKey::with_topic("api", id, topic));
+        keys.push(SessionKey::with_topic("api", raw_id, topic));
     } else {
         if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
-            keys.push(SessionKey::with_profile(profile_id, "api", id));
+            keys.push(SessionKey::with_profile(profile_id, "api", raw_id));
         }
-        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", id));
-        keys.push(SessionKey::new("api", id));
+        keys.push(SessionKey::with_profile(MAIN_PROFILE_ID, "api", raw_id));
+        keys.push(SessionKey::new("api", raw_id));
     }
 
     keys.dedup_by(|left, right| left.0 == right.0);
     keys
+}
+
+fn query_tasks_for_session_candidates(
+    query_fn: &TaskQueryFn,
+    profile_id: Option<&str>,
+    id: &str,
+    topic: Option<&str>,
+) -> serde_json::Value {
+    for session_key in api_session_key_candidates(profile_id, id, topic) {
+        let tasks = query_fn(&session_key.0);
+        if tasks.as_array().is_some_and(|entries| !entries.is_empty()) {
+            return tasks;
+        }
+    }
+    serde_json::json!([])
 }
 
 fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
@@ -1374,15 +1396,18 @@ async fn replay_task_status_events(state: &ApiState, id: &str, topic: Option<&st
         return Vec::new();
     };
 
-    let session_key =
-        current_profile_api_session_key_with_topic(state.profile_id.as_deref(), id, topic);
-    let events: Vec<String> = query_fn(&session_key.0)
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|task| build_task_status_event(task, topic).to_string())
-        .collect();
+    let events: Vec<String> = query_tasks_for_session_candidates(
+        query_fn.as_ref(),
+        state.profile_id.as_deref(),
+        id,
+        topic,
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+    .into_iter()
+    .map(|task| build_task_status_event(task, topic).to_string())
+    .collect();
     if events.is_empty() {
         record_replay("task_status", "empty", 1);
     } else {
@@ -1446,12 +1471,12 @@ async fn handle_session_status(
         pending.contains_key(&id)
     };
     let has_bg_tasks = state.task_query.as_ref().is_some_and(|query_fn| {
-        let session_key = current_profile_api_session_key_with_topic(
+        task_list_has_active_tasks(&query_tasks_for_session_candidates(
+            query_fn.as_ref(),
             state.profile_id.as_deref(),
             &id,
             params.topic.as_deref(),
-        );
-        task_list_has_active_tasks(&query_fn(&session_key.0))
+        ))
     });
     Json(serde_json::json!({
         "active": active,
@@ -1471,12 +1496,12 @@ async fn handle_session_tasks(
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
-    let session_key = current_profile_api_session_key_with_topic(
+    let tasks = query_tasks_for_session_candidates(
+        query_fn.as_ref(),
         state.profile_id.as_deref(),
         &id,
         params.topic.as_deref(),
     );
-    let tasks = query_fn(&session_key.0);
     Json(tasks).into_response()
 }
 
@@ -2018,6 +2043,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_status_accepts_profiled_api_session_ids() {
+        let app = Router::new()
+            .route("/sessions/{id}/status", get(handle_session_status))
+            .route("/sessions/{id}/tasks", get(handle_session_tasks))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: Some(Arc::new(|session_key| {
+                    if session_key == "dspfac:api:web-profiled" {
+                        serde_json::json!([
+                            { "id": "task-1", "tool_name": "Deep research", "status": "running" }
+                        ])
+                    } else {
+                        serde_json::json!([])
+                    }
+                })),
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/dspfac:api:web-profiled/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload
+                .get("has_bg_tasks")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        let tasks = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/dspfac:api:web-profiled/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tasks.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(tasks.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.as_array().map(Vec::len), Some(1));
+        assert_eq!(payload[0]["tool_name"], "Deep research");
+    }
+
     #[test]
     fn message_info_from_history_message_hides_absolute_paths() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -2174,6 +2264,16 @@ mod tests {
         assert_eq!(keys[0].0, "dspfac--newsbot:api:web-123");
         assert_eq!(keys[1].0, "_main:api:web-123");
         assert_eq!(keys[2].0, "api:web-123");
+    }
+
+    #[test]
+    fn api_session_key_candidates_do_not_double_prefix_profiled_ids() {
+        let keys = api_session_key_candidates(Some("dspfac"), "dspfac:api:web-123", None);
+        let rendered = keys.iter().map(|key| key.0.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "dspfac:api:web-123");
+        assert!(rendered.contains(&"api:web-123"));
+        assert!(!rendered.contains(&"dspfac:api:dspfac:api:web-123"));
     }
 
     #[test]
