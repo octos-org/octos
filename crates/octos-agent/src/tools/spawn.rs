@@ -2993,6 +2993,7 @@ PY
     #[test]
     fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
         let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success: false,
             output: "Token budget exceeded (120 of 100).".to_string(),
             files_modified: vec![],

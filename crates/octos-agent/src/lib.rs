@@ -7,6 +7,7 @@
 //! - Progress reporting for real-time updates
 //! - Integration with codex sandboxing (when enabled)
 
+pub mod abi_schema;
 mod agent;
 pub mod behaviour;
 pub mod bootstrap;
@@ -38,6 +39,10 @@ pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
 
+pub use abi_schema::{
+    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION,
+    UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+};
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
     DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, TASK_REPORTER,

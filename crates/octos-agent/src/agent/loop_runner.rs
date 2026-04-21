@@ -581,6 +581,7 @@ impl Agent {
                     turn.record_budget_stop(&stop);
                     self.report_budget_stop(&stop, turn.iteration());
                     return Ok(TaskResult {
+                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                         success: false,
                         output: stop.message(),
                         files_modified,
@@ -772,6 +773,7 @@ impl Agent {
     ) -> TaskResult {
         let success = response.stop_reason != StopReason::MaxTokens;
         TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
             output: response.content.clone().unwrap_or_default(),
             files_modified,

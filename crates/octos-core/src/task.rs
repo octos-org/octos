@@ -122,9 +122,25 @@ pub struct GitState {
     pub head_commit: Option<String>,
 }
 
+/// Current durable ABI schema version for [`TaskResult`].
+///
+/// See `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
+/// fields per version and the deprecation rules. The harness also exposes
+/// this constant as `octos_agent::TASK_RESULT_SCHEMA_VERSION`.
+pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
+
+fn default_task_result_schema_version() -> u32 {
+    TASK_RESULT_SCHEMA_VERSION
+}
+
 /// Result of task execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
+    /// Durable ABI schema version for this result. Defaults to
+    /// [`TASK_RESULT_SCHEMA_VERSION`] when absent so consumers of older
+    /// payloads continue to parse.
+    #[serde(default = "default_task_result_schema_version")]
+    pub schema_version: u32,
     /// Whether the task succeeded.
     pub success: bool,
     /// Output or summary.
@@ -326,6 +342,7 @@ mod tests {
     #[test]
     fn test_task_result_serde() {
         let result = TaskResult {
+            schema_version: TASK_RESULT_SCHEMA_VERSION,
             success: true,
             output: "all tests pass".to_string(),
             files_modified: vec![PathBuf::from("src/main.rs")],
@@ -346,6 +363,22 @@ mod tests {
             vec![PathBuf::from("output/report.md")]
         );
         assert_eq!(parsed.token_usage.input_tokens, 100);
+        assert_eq!(parsed.schema_version, TASK_RESULT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn should_default_missing_task_result_schema_version_to_v1() {
+        // TaskResult JSON emitted before M4.6 — no schema_version line.
+        let legacy = r#"{
+            "success": true,
+            "output": "ok",
+            "files_modified": [],
+            "subtasks": [],
+            "token_usage": {"input_tokens": 0, "output_tokens": 0}
+        }"#;
+        let parsed: TaskResult = serde_json::from_str(legacy).expect("legacy result parses");
+        assert_eq!(parsed.schema_version, TASK_RESULT_SCHEMA_VERSION);
+        assert!(parsed.success);
     }
 
     #[test]

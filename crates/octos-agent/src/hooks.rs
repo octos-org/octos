@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
+use crate::abi_schema::{HOOK_PAYLOAD_SCHEMA_VERSION, default_hook_payload_schema_version};
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
@@ -58,8 +59,18 @@ fn default_timeout_ms() -> u64 {
 }
 
 /// Payload sent to hook process as JSON on stdin.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `schema_version` is the durable ABI version. Hook consumers can branch on
+/// it before reading schema-specific fields; see
+/// `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
+/// field list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookPayload {
+    /// Durable ABI schema version for this payload. Defaults to
+    /// [`HOOK_PAYLOAD_SCHEMA_VERSION`] when absent so consumers that replay a
+    /// pre-versioned stream continue to parse.
+    #[serde(default = "default_hook_payload_schema_version")]
+    pub schema_version: u32,
     pub event: HookEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -477,6 +488,7 @@ impl HookPayload {
 
     fn empty(event: HookEvent) -> Self {
         Self {
+            schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event,
             tool_name: None,
             arguments: None,
@@ -863,6 +875,44 @@ mod tests {
     }
 
     #[test]
+    fn should_stamp_current_schema_version_on_every_constructor() {
+        let payloads = vec![
+            HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None),
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None),
+            HookPayload::before_llm("gpt-4", 0, 1, None),
+            HookPayload::on_resume(None),
+            HookPayload::on_turn_end("done", None),
+        ];
+        for p in payloads {
+            assert_eq!(p.schema_version, HOOK_PAYLOAD_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn should_default_missing_schema_version_to_v1_on_deserialize() {
+        // A payload emitted before M4.6 would have no schema_version field.
+        let legacy = r#"{
+            "event": "after_tool_call",
+            "tool_name": "shell",
+            "tool_id": "tc1",
+            "success": true,
+            "duration_ms": 12
+        }"#;
+        let parsed: HookPayload = serde_json::from_str(legacy).expect("legacy payload parses");
+        assert_eq!(parsed.schema_version, HOOK_PAYLOAD_SCHEMA_VERSION);
+        assert_eq!(parsed.event, HookEvent::AfterToolCall);
+        assert_eq!(parsed.tool_name.as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn should_include_schema_version_field_in_serialized_payload() {
+        let payload =
+            HookPayload::before_tool("shell", serde_json::json!({"command": "ls"}), "tc1", None);
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"schema_version\":1"));
+    }
+
+    #[test]
     fn test_payload_constructors() {
         let before_llm = HookPayload::before_llm("gpt-4", 10, 3, None);
         assert_eq!(before_llm.event, HookEvent::BeforeLlmCall);
@@ -1061,6 +1111,7 @@ mod tests {
         executor.failures[0].store(3, Ordering::Relaxed);
 
         let payload = HookPayload {
+            schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event: HookEvent::AfterToolCall,
             tool_name: Some("test".into()),
             arguments: None,

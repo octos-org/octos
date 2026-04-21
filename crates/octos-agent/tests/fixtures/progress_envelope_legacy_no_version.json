@@ -1,0 +1,6 @@
+{
+    "event": {
+        "kind": "task_started",
+        "task_id": "task-legacy"
+    }
+}

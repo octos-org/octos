@@ -5,8 +5,57 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
+use crate::abi_schema::PROGRESS_EVENT_SCHEMA_VERSION;
+
+/// Canonical schema identifier for harness progress events on the wire.
+///
+/// Producers that emit progress envelopes into the structured event transport
+/// MUST use this string; consumers can branch on it to identify supported
+/// payload shapes. See `docs/OCTOS_HARNESS_ABI_VERSIONING.md`.
+pub const HARNESS_PROGRESS_EVENT_SCHEMA: &str = "octos.harness.event.v1";
+
+/// Versioned wrapper for a [`ProgressEvent`] when it is serialized onto the
+/// transport. This is the durable ABI consumers should branch on — the raw
+/// enum variants are an implementation detail that may grow between minor
+/// versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressEventEnvelope {
+    /// Canonical schema identifier (see [`HARNESS_PROGRESS_EVENT_SCHEMA`]).
+    #[serde(default = "default_progress_event_schema_name")]
+    pub schema: String,
+    /// Numeric schema version companion to `schema`. Defaults to
+    /// [`PROGRESS_EVENT_SCHEMA_VERSION`] when absent so older replayed
+    /// streams remain parseable.
+    #[serde(default = "default_progress_event_schema_version")]
+    pub schema_version: u32,
+    /// The event payload.
+    pub event: ProgressEvent,
+}
+
+fn default_progress_event_schema_name() -> String {
+    HARNESS_PROGRESS_EVENT_SCHEMA.to_string()
+}
+
+fn default_progress_event_schema_version() -> u32 {
+    PROGRESS_EVENT_SCHEMA_VERSION
+}
+
+impl ProgressEventEnvelope {
+    /// Wrap an event with the current harness progress schema.
+    pub fn wrap(event: ProgressEvent) -> Self {
+        Self {
+            schema: HARNESS_PROGRESS_EVENT_SCHEMA.to_string(),
+            schema_version: PROGRESS_EVENT_SCHEMA_VERSION,
+            event,
+        }
+    }
+}
+
 /// Events emitted during agent execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// Agent started working on task.
     TaskStarted { task_id: String },

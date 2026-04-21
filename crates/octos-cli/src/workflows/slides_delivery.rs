@@ -43,6 +43,7 @@ pub fn build() -> WorkflowInstance {
 
 pub fn workspace_policy() -> WorkspacePolicy {
     WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
         workspace: WorkspacePolicyWorkspace {
             kind: WorkspacePolicyKind::Slides,
         },
