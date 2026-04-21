@@ -57,7 +57,9 @@ pub use harness_events::{
     HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
     MAX_HARNESS_EVENT_LINE_BYTES,
 };
-pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
+pub use hooks::{
+    HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
+};
 pub use mcp::{McpClient, McpServerConfig};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{PluginLoadResult, PluginLoader};
