@@ -59,6 +59,8 @@ struct Input {
     #[serde(default)]
     every_seconds: Option<i64>,
     #[serde(default)]
+    after_seconds: Option<i64>,
+    #[serde(default)]
     cron_expr: Option<String>,
     #[serde(default)]
     at_ms: Option<i64>,
@@ -94,6 +96,8 @@ impl Tool for CronTool {
          parameter (IANA name like 'America/Los_Angeles', 'Asia/Shanghai') so the user's \
          local time is interpreted correctly. Always set timezone when the user specifies \
          a local time. \
+         For relative one-time reminders (e.g. 'in 10 minutes'), prefer 'after_seconds' \
+         to avoid timestamp math errors. \
          Use 'every_seconds' for recurring reminders, not 'at_ms'. \
          To remove jobs, use 'name' for fuzzy matching (preferred) or 'job_id' for exact match."
     }
@@ -114,6 +118,10 @@ impl Tool for CronTool {
                 "every_seconds": {
                     "type": "integer",
                     "description": "Interval in seconds for recurring jobs"
+                },
+                "after_seconds": {
+                    "type": "integer",
+                    "description": "One-time delay from now in seconds (preferred for relative reminders like 'in 10 minutes')"
                 },
                 "cron_expr": {
                     "type": "string",
@@ -194,16 +202,38 @@ impl CronTool {
                 CronSchedule::Every { every_ms: s * 1000 },
                 format!("every {s}s"),
             )
+        } else if let Some(s) = input.after_seconds {
+            if s <= 0 {
+                return Ok(ToolResult {
+                    output: "'after_seconds' must be a positive integer.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let at_ms = now_ms.saturating_add(s.saturating_mul(1000));
+            (
+                CronSchedule::At { at_ms },
+                format!("once in {s}s (at {at_ms})"),
+            )
         } else if let Some(expr) = input.cron_expr {
             (
                 CronSchedule::Cron { expr: expr.clone() },
                 format!("cron: {expr}"),
             )
         } else if let Some(at) = input.at_ms {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if at <= now_ms {
+                return Ok(ToolResult {
+                    output: "'at_ms' must be a future Unix timestamp in milliseconds. For relative reminders, use 'after_seconds'.".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             (CronSchedule::At { at_ms: at }, format!("once at {at}"))
         } else {
             return Ok(ToolResult {
-                output: "One of 'every_seconds', 'cron_expr', or 'at_ms' is required for 'add'."
+                output: "One of 'every_seconds', 'after_seconds', 'cron_expr', or 'at_ms' is required for 'add'."
                     .into(),
                 success: false,
                 ..Default::default()
@@ -270,12 +300,14 @@ impl CronTool {
                 CronSchedule::Every { every_ms } => format!("every {}s", every_ms / 1000),
                 CronSchedule::Cron { expr } => format!("cron: {expr}"),
             };
+            let timezone = job.timezone.as_deref().unwrap_or("UTC(default)");
             out.push_str(&format!(
-                "{}. [{}] {} — {} (msg: \"{}\")\n",
+                "{}. [{}] {} — {} [tz: {}] (msg: \"{}\")\n",
                 i + 1,
                 job.id,
                 job.name,
                 schedule_desc,
+                timezone,
                 truncate(&job.payload.message, 60),
             ));
         }
@@ -437,6 +469,7 @@ mod tests {
         assert!(list.success);
         assert!(list.output.contains("status-check"));
         assert!(list.output.contains("every 300s"));
+        assert!(list.output.contains("UTC(default)"));
     }
 
     #[tokio::test]
@@ -471,5 +504,58 @@ mod tests {
             .unwrap();
         assert!(remove.success);
         assert!(remove.output.contains("Removed"));
+    }
+
+    #[tokio::test]
+    async fn test_add_after_seconds_uses_current_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+        let tool = CronTool::new(service.clone());
+
+        let before = chrono::Utc::now().timestamp_millis();
+        let add = tool
+            .execute(&serde_json::json!({
+                "action": "add",
+                "message": "drink water",
+                "after_seconds": 600,
+                "name": "relative"
+            }))
+            .await
+            .unwrap();
+        let after = chrono::Utc::now().timestamp_millis();
+        assert!(add.success);
+
+        let jobs = service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        let at_ms = match jobs[0].schedule {
+            CronSchedule::At { at_ms } => at_ms,
+            _ => panic!("expected one-time schedule"),
+        };
+
+        let lower = before + 600_000;
+        let upper = after + 600_000 + 2_000;
+        assert!(
+            at_ms >= lower && at_ms <= upper,
+            "at_ms out of range: {at_ms}, expected [{lower}, {upper}]"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_past_at_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+        let tool = CronTool::new(service);
+
+        let past = chrono::Utc::now().timestamp_millis() - 1;
+        let add = tool
+            .execute(&serde_json::json!({
+                "action": "add",
+                "message": "past",
+                "at_ms": past
+            }))
+            .await
+            .unwrap();
+        assert!(!add.success);
+        assert!(add.output.contains("future Unix timestamp"));
     }
 }

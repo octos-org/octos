@@ -1,8 +1,24 @@
 //! Detection of repetitive output and retriable responses.
 
+use std::sync::LazyLock;
+
+use octos_core::ToolCall;
 use octos_llm::{ChatResponse, StopReason};
+use regex::Regex;
 
 use super::Agent;
+
+static INVOKE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<invoke\b(?P<attrs>[^>]*)>(?P<body>.*?)</invoke\s*>"#).unwrap()
+});
+static INVOKE_SELF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<invoke\b(?P<attrs>[^>]*)/\s*>"#).unwrap());
+static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)\b(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)')"#,
+    )
+    .unwrap()
+});
 
 impl Agent {
     /// Check if an LLM response is empty or abnormal and should be retried.
@@ -17,8 +33,40 @@ impl Agent {
         let is_empty = response.content.as_ref().is_none_or(|c| c.is_empty())
             && response.tool_calls.is_empty()
             && !has_reasoning;
+        let is_abnormal_tool_use =
+            response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty();
         let is_filtered = response.stop_reason == StopReason::ContentFiltered;
-        is_empty || is_filtered
+        is_empty || is_filtered || is_abnormal_tool_use
+    }
+
+    /// Normalize inline XML-style invocations into structured tool calls.
+    ///
+    /// Some providers emit text like `<invoke name="cron">{...}</invoke>`
+    /// instead of native tool-call payloads. We recover those into `tool_calls`
+    /// and strip the raw markup from assistant-visible content.
+    pub(super) fn normalize_inline_invokes(response: &mut ChatResponse) {
+        let Some(content) = response.content.clone() else {
+            if response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty() {
+                response.stop_reason = StopReason::EndTurn;
+            }
+            return;
+        };
+
+        let (cleaned, parsed_calls) = extract_inline_invokes(&content);
+        if !parsed_calls.is_empty() && response.tool_calls.is_empty() {
+            response.tool_calls = parsed_calls;
+            response.stop_reason = StopReason::ToolUse;
+        } else if response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty() {
+            // Guard against provider/tool-call parser mismatches causing loops.
+            response.stop_reason = StopReason::EndTurn;
+        }
+
+        let cleaned = cleaned.trim().to_string();
+        response.content = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        };
     }
 
     /// Detect if text content is stuck in a repetitive loop.
@@ -67,10 +115,106 @@ impl Agent {
     }
 }
 
+fn extract_inline_invokes(content: &str) -> (String, Vec<ToolCall>) {
+    let mut cleaned = content.to_string();
+    let mut calls: Vec<ToolCall> = Vec::new();
+
+    for caps in INVOKE_TAG_RE.captures_iter(content) {
+        let attrs = caps.name("attrs").map(|m| m.as_str()).unwrap_or("");
+        let body = caps.name("body").map(|m| m.as_str()).unwrap_or("");
+        if let Some(call) = build_tool_call_from_invoke(attrs, body, calls.len()) {
+            calls.push(call);
+        }
+    }
+    for caps in INVOKE_SELF_RE.captures_iter(content) {
+        let attrs = caps.name("attrs").map(|m| m.as_str()).unwrap_or("");
+        if let Some(call) = build_tool_call_from_invoke(attrs, "", calls.len()) {
+            calls.push(call);
+        }
+    }
+
+    cleaned = INVOKE_TAG_RE.replace_all(&cleaned, "").to_string();
+    cleaned = INVOKE_SELF_RE.replace_all(&cleaned, "").to_string();
+
+    (cleaned, calls)
+}
+
+fn build_tool_call_from_invoke(attrs: &str, body: &str, idx: usize) -> Option<ToolCall> {
+    let attr_map = parse_attrs(attrs);
+    let name = attr_map.get("name")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let raw_args = attr_map
+        .get("arguments")
+        .or_else(|| attr_map.get("args"))
+        .or_else(|| attr_map.get("json"))
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| body.trim());
+
+    let raw_args = strip_code_fence(raw_args.trim());
+    let arguments = if raw_args.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(raw_args)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_args.into()))
+    };
+
+    Some(ToolCall {
+        id: format!("call_inline_{}_{}", idx, sanitize_tool_name(name)),
+        name: name.to_string(),
+        arguments,
+        metadata: None,
+    })
+}
+
+fn parse_attrs(attrs: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for caps in ATTR_RE.captures_iter(attrs) {
+        let key = caps
+            .name("key")
+            .map(|m| m.as_str().to_ascii_lowercase())
+            .unwrap_or_default();
+        let value = caps
+            .name("dq")
+            .or_else(|| caps.name("sq"))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        out.insert(key, value);
+    }
+    out
+}
+
+fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn strip_code_fence(input: &str) -> &str {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+    let without_open = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    without_open
+        .trim()
+        .strip_suffix("```")
+        .unwrap_or(without_open.trim())
+        .trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octos_core::ToolCall;
     use octos_llm::{ChatResponse, StopReason, TokenUsage as LlmTokenUsage};
 
     fn make_response(
@@ -144,6 +288,53 @@ mod tests {
         // Even with partial content, content_filtered should retry
         let r2 = make_response_with_stop(Some("partial"), vec![], 10, StopReason::ContentFiltered);
         assert!(Agent::is_retriable_response(&r2));
+    }
+
+    #[test]
+    fn should_retry_when_stop_reason_tooluse_but_no_calls() {
+        let r = make_response_with_stop(Some("thinking"), vec![], 5, StopReason::ToolUse);
+        assert!(Agent::is_retriable_response(&r));
+    }
+
+    #[test]
+    fn should_normalize_inline_invoke_block_into_tool_call() {
+        let mut r = make_response_with_stop(
+            Some("<invoke name=\"cron\">{\"action\":\"list\"}</invoke>"),
+            vec![],
+            10,
+            StopReason::EndTurn,
+        );
+        Agent::normalize_inline_invokes(&mut r);
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].name, "cron");
+        assert_eq!(r.tool_calls[0].arguments["action"], "list");
+        assert!(r.content.is_none());
+    }
+
+    #[test]
+    fn should_normalize_inline_invoke_self_closing_with_args_attr() {
+        let mut r = make_response_with_stop(
+            Some("before <invoke name=\"cron\" args='{\"action\":\"list\"}' /> after"),
+            vec![],
+            10,
+            StopReason::EndTurn,
+        );
+        Agent::normalize_inline_invokes(&mut r);
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].name, "cron");
+        assert_eq!(r.tool_calls[0].arguments["action"], "list");
+        assert_eq!(r.content.as_deref(), Some("before  after"));
+    }
+
+    #[test]
+    fn should_downgrade_empty_tooluse_to_endturn_after_normalization() {
+        let mut r = make_response_with_stop(Some("plain text"), vec![], 10, StopReason::ToolUse);
+        Agent::normalize_inline_invokes(&mut r);
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.content.as_deref(), Some("plain text"));
     }
 
     // ---------- Agent::is_repetitive_output ----------

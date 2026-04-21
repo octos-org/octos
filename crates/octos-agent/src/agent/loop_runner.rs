@@ -24,10 +24,10 @@ use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
-fn split_tool_calls<'a>(
-    tool_calls: &'a [octos_core::ToolCall],
+fn split_tool_calls(
+    tool_calls: &[octos_core::ToolCall],
     batch_size: usize,
-) -> Vec<&'a [octos_core::ToolCall]> {
+) -> Vec<&[octos_core::ToolCall]> {
     debug_assert!(batch_size > 0);
     tool_calls.chunks(batch_size).collect()
 }
@@ -286,7 +286,7 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
-                    let (response, streamed) = match self
+                    let (mut response, streamed) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
@@ -321,6 +321,7 @@ impl Agent {
                         }
                         Err(e) => return Err(e),
                     };
+                    Self::normalize_inline_invokes(&mut response);
                     self.reporter().report(ProgressEvent::Response {
                         content: response.content.clone().unwrap_or_default(),
                         iteration,
@@ -586,7 +587,7 @@ impl Agent {
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
-                let (response, _streamed) = self
+                let (mut response, _streamed) = self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -596,6 +597,7 @@ impl Agent {
                         &mut turn,
                     )
                     .await?;
+                Self::normalize_inline_invokes(&mut response);
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
                 let tool_names: Vec<&str> = response
@@ -943,6 +945,11 @@ fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> 
     shell_results
         .iter()
         .find(|content| is_diff_like_shell_output(content))
+        .or_else(|| {
+            shell_results
+                .iter()
+                .find(|content| is_useful_shell_output(content))
+        })
         .map(|content| strip_success_exit_suffix(content))
         .or_else(|| {
             (failed_shells >= 2)
