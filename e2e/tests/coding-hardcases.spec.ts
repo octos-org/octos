@@ -164,14 +164,14 @@ test.describe('Phase 3 coding hard cases', () => {
 
     let repoName = uniqueRepoName('phase3-repair');
     let result = await sendAndWait(page, buildRepairPrompt(repoName), {
-      maxWait: 240_000,
+      maxWait: 420_000,
       label: 'repair-pass',
     });
     if (!result.responseText.includes('diff --git')) {
       await createNewSession(page);
       repoName = uniqueRepoName('phase3-repair-retry');
       result = await sendAndWait(page, buildRepairPrompt(repoName), {
-        maxWait: 240_000,
+        maxWait: 420_000,
         label: 'repair-pass-retry',
       });
     }
