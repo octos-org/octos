@@ -1148,15 +1148,7 @@ fn resolve_saved_search_key(
         "profile store not configured".into(),
     ))?;
 
-    let profile_id: String = match identity {
-        Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
-        Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            super::auth_handlers::ADMIN_PROFILE_ID.into()
-        }
-        None => {
-            return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
-        }
-    };
+    let profile_id = resolve_test_search_profile_id(identity, req.profile_id.as_deref())?;
 
     let profile = ps
         .get(&profile_id)
@@ -1175,6 +1167,42 @@ pub struct TestSearchRequest {
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Optional profile id whose saved env vars should be used.
+    ///
+    /// Admin dashboard pages use this when testing a non-admin profile. Regular
+    /// users may only reference their own profile or child profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+fn resolve_test_search_profile_id(
+    identity: &Option<axum::Extension<super::router::AuthIdentity>>,
+    requested_profile_id: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let requested_profile_id = requested_profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+
+    match identity {
+        Some(axum::Extension(super::router::AuthIdentity::Admin)) => Ok(requested_profile_id
+            .unwrap_or(super::auth_handlers::ADMIN_PROFILE_ID)
+            .to_string()),
+        Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => {
+            let Some(requested) = requested_profile_id else {
+                return Ok(id.clone());
+            };
+            let child_prefix = format!("{id}--");
+            if requested == id || requested.starts_with(&child_prefix) {
+                Ok(requested.to_string())
+            } else {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "cannot test search keys for another profile".into(),
+                ))
+            }
+        }
+        None => Err((StatusCode::UNAUTHORIZED, "not authenticated".into())),
+    }
 }
 
 #[derive(Serialize)]
@@ -4555,6 +4583,30 @@ mod tests {
         assert_eq!(default_search_api_env("you"), Some("YDC_API_KEY"));
         assert_eq!(default_search_api_env("serper"), Some("SERPER_API_KEY"));
         assert_eq!(default_search_api_env("unknown"), None);
+    }
+
+    #[test]
+    fn test_search_profile_id_allows_admin_to_target_profile() {
+        let identity = Some(axum::Extension(crate::api::router::AuthIdentity::Admin));
+        let profile_id = resolve_test_search_profile_id(&identity, Some("dspfac")).unwrap();
+        assert_eq!(profile_id, "dspfac");
+    }
+
+    #[test]
+    fn test_search_profile_id_limits_user_to_own_tree() {
+        let identity = Some(axum::Extension(crate::api::router::AuthIdentity::User {
+            id: "dspfac".into(),
+            role: crate::user_store::UserRole::User,
+        }));
+
+        let own = resolve_test_search_profile_id(&identity, None).unwrap();
+        assert_eq!(own, "dspfac");
+
+        let child = resolve_test_search_profile_id(&identity, Some("dspfac--bot")).unwrap();
+        assert_eq!(child, "dspfac--bot");
+
+        let other = resolve_test_search_profile_id(&identity, Some("other")).unwrap_err();
+        assert_eq!(other.0, StatusCode::FORBIDDEN);
     }
 
     #[test]

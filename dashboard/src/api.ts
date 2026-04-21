@@ -292,7 +292,7 @@ export const myApi = {
       body: JSON.stringify(data),
     }),
 
-  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string }) =>
+  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string; profile_id?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-search', {
       method: 'POST',
       body: JSON.stringify(data),
