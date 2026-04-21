@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use metrics::counter;
-use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind};
+use octos_core::{AgentId, InboundMessage, Task, TaskContext, TaskKind, TaskResult};
 use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -588,6 +589,29 @@ fn workflow_artifact_matches_kind(path: &Path, kind: &str) -> bool {
     }
 }
 
+fn workflow_terminal_artifact_kind(workflow: Option<&WorkflowMetadata>) -> Option<&str> {
+    workflow?
+        .terminal_output
+        .as_ref()
+        .map(|policy| policy.required_artifact_kind.as_str())
+        .filter(|kind| !kind.is_empty())
+}
+
+fn task_result_has_terminal_artifact_candidate(
+    task_result: &TaskResult,
+    workflow: Option<&WorkflowMetadata>,
+) -> bool {
+    let Some(required_kind) = workflow_terminal_artifact_kind(workflow) else {
+        return true;
+    };
+
+    task_result
+        .files_to_send
+        .iter()
+        .chain(task_result.files_modified.iter())
+        .any(|path| workflow_artifact_matches_kind(path, required_kind))
+}
+
 fn select_preferred_terminal_output(
     files: &[PathBuf],
     required_artifact_kind: &str,
@@ -639,7 +663,12 @@ fn select_workflow_terminal_files(
 ) -> Option<Vec<PathBuf>> {
     let policy = workflow?.terminal_output.as_ref()?;
     let mut candidates = if policy.forbid_intermediate_files {
-        files_to_send.to_vec()
+        let explicit = files_to_send.to_vec();
+        if explicit.is_empty() {
+            files_modified.to_vec()
+        } else {
+            explicit
+        }
     } else {
         files_to_send
             .iter()
@@ -669,6 +698,93 @@ fn workflow_uses_contract_terminal_delivery(workflow: &WorkflowMetadata) -> bool
             .map(|policy| policy.required_artifact_kind.as_str()),
         Some("presentation" | "site")
     )
+}
+
+fn workflow_is_research_podcast(workflow: Option<&WorkflowMetadata>) -> bool {
+    workflow.is_some_and(|workflow| workflow.workflow_kind == "research_podcast")
+}
+
+fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
+    let header_re = Regex::new(r"\[[^\]\r\n]+?\s+-\s*[^\],\r\n]+,\s*[^\]\r\n]+\]").ok()?;
+    let matches = header_re.find_iter(task_desc).collect::<Vec<_>>();
+    if matches.len() < 2 {
+        return None;
+    }
+
+    let mut script_lines = Vec::new();
+    for (index, header_match) in matches.iter().enumerate() {
+        let text_start = header_match.end();
+        let text_end = matches
+            .get(index + 1)
+            .map(|next| next.start())
+            .unwrap_or(task_desc.len());
+        let dialogue = task_desc[text_start..text_end].trim();
+        if dialogue.is_empty() {
+            continue;
+        }
+        script_lines.push(format!(
+            "{} {}",
+            header_match.as_str().trim(),
+            dialogue.replace('\n', " ").trim()
+        ));
+    }
+
+    (script_lines.len() >= 2).then(|| script_lines.join("\n"))
+}
+
+async fn maybe_generate_inline_research_podcast(
+    tools: &ToolRegistry,
+    workflow: Option<&WorkflowMetadata>,
+    task_desc: &str,
+    task_result: &mut TaskResult,
+) {
+    if !workflow_is_research_podcast(workflow)
+        || !task_result.success
+        || task_result_has_terminal_artifact_candidate(task_result, workflow)
+    {
+        return;
+    }
+
+    let Some(script) = extract_inline_podcast_script(task_desc) else {
+        return;
+    };
+
+    warn!(
+        workflow = "research_podcast",
+        "worker completed without audio; invoking podcast_generate directly from inline script"
+    );
+    match tools
+        .execute("podcast_generate", &serde_json::json!({ "script": script }))
+        .await
+    {
+        Ok(tool_result) if tool_result.success => {
+            if let Some(path) = tool_result.file_modified.clone() {
+                task_result.files_modified.push(path);
+            }
+            task_result
+                .files_to_send
+                .extend(tool_result.files_to_send.clone());
+            let existing = task_result.output.trim();
+            task_result.output = if existing.is_empty() {
+                tool_result.output
+            } else {
+                format!("{existing}\n\n{}", tool_result.output)
+            };
+        }
+        Ok(tool_result) => {
+            task_result.success = false;
+            task_result.output = format!(
+                "research_podcast completed without audio, and direct podcast_generate failed: {}",
+                tool_result.output
+            );
+        }
+        Err(error) => {
+            task_result.success = false;
+            task_result.output = format!(
+                "research_podcast completed without audio, and direct podcast_generate errored: {error}"
+            );
+        }
+    }
 }
 
 fn build_subagent_tool_policy(
@@ -835,17 +951,27 @@ fn resolve_background_terminal_files(
             .ok_or_else(|| "workspace contract returned no terminal files".to_string());
     }
 
-    Ok(
-        select_workflow_terminal_files(files_to_send, files_modified, workflow).unwrap_or_else(
-            || {
-                files_to_send
-                    .iter()
-                    .chain(files_modified.iter())
-                    .cloned()
-                    .collect()
-            },
-        ),
-    )
+    let terminal_files = select_workflow_terminal_files(files_to_send, files_modified, workflow)
+        .unwrap_or_else(|| {
+            files_to_send
+                .iter()
+                .chain(files_modified.iter())
+                .cloned()
+                .collect()
+        });
+
+    if terminal_files.is_empty()
+        && let Some(required_kind) = workflow_terminal_artifact_kind(workflow)
+    {
+        let workflow_kind = workflow
+            .map(|workflow| workflow.workflow_kind.as_str())
+            .unwrap_or("workflow");
+        return Err(format!(
+            "{workflow_kind} completed without required {required_kind} terminal artifact"
+        ));
+    }
+
+    Ok(terminal_files)
 }
 
 fn format_workspace_contract_failure(status: &WorkspaceContractStatus) -> String {
@@ -1159,10 +1285,11 @@ impl Tool for SpawnTool {
             let mut tools = ToolRegistry::with_builtins(&self.working_dir);
             // Load plugin tools so subagents can use fm_tts, etc.
             if !self.plugin_dirs.is_empty() {
-                let _ = crate::plugins::PluginLoader::load_into(
+                let _ = crate::plugins::PluginLoader::load_into_with_work_dir(
                     &mut tools,
                     &self.plugin_dirs,
                     &self.plugin_extra_env,
+                    Some(&self.working_dir),
                 );
             }
             for factory in &self.child_tool_factories {
@@ -1314,10 +1441,11 @@ impl Tool for SpawnTool {
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.
                 if !plugin_dirs.is_empty() {
-                    let _ = crate::plugins::PluginLoader::load_into(
+                    let _ = crate::plugins::PluginLoader::load_into_with_work_dir(
                         &mut tools,
                         &plugin_dirs,
                         &plugin_extra_env,
+                        Some(&working_dir),
                     );
                 }
                 for factory in &child_tool_factories {
@@ -1367,10 +1495,19 @@ impl Tool for SpawnTool {
                     },
                 );
 
-                let result = match availability_check {
+                let mut result = match availability_check {
                     Ok(()) => worker.run_task(&subtask).await,
                     Err(error) => Err(error),
                 };
+                if let Ok(task_result) = result.as_mut() {
+                    maybe_generate_inline_research_podcast(
+                        worker.tool_registry(),
+                        workflow_metadata.as_ref(),
+                        &task_desc,
+                        task_result,
+                    )
+                    .await;
+                }
                 let mut contract_failure = match &result {
                     Ok(task_result) if task_result.success => resolve_background_terminal_files(
                         &working_dir,
@@ -2226,6 +2363,50 @@ mod tests {
     }
 
     #[test]
+    fn workflow_terminal_output_accepts_audio_from_modified_files_when_explicit_send_missing() {
+        let workflow = WorkflowMetadata {
+            workflow_kind: "research_podcast".to_string(),
+            current_phase: "generate_audio".to_string(),
+            allowed_tools: vec!["podcast_generate".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "audio".to_string(),
+            }),
+        };
+
+        let files_modified = vec![
+            PathBuf::from("/tmp/podcast_script.md"),
+            PathBuf::from("/tmp/podcast_full_final.mp3"),
+        ];
+
+        let selected =
+            select_workflow_terminal_files(&[], &files_modified, Some(&workflow)).unwrap();
+
+        assert_eq!(selected, vec![PathBuf::from("/tmp/podcast_full_final.mp3")]);
+    }
+
+    #[test]
+    fn workflow_terminal_output_requires_required_audio_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflow = WorkflowMetadata {
+            workflow_kind: "research_podcast".to_string(),
+            current_phase: "deliver_result".to_string(),
+            allowed_tools: vec!["podcast_generate".to_string()],
+            terminal_output: Some(WorkflowTerminalOutputPolicy {
+                deliver_final_artifact_only: true,
+                forbid_intermediate_files: true,
+                required_artifact_kind: "audio".to_string(),
+            }),
+        };
+
+        let error = resolve_background_terminal_files(temp.path(), &[], &[], Some(&workflow))
+            .expect_err("research_podcast must not complete without audio");
+
+        assert!(error.contains("required audio terminal artifact"));
+    }
+
+    #[test]
     fn workflow_terminal_output_prefers_final_presentation_and_skips_scratch_files() {
         let workflow = WorkflowMetadata {
             workflow_kind: "slides".to_string(),
@@ -2343,6 +2524,69 @@ mod tests {
         }
     }
 
+    fn write_mock_podcast_plugin(root: &std::path::Path, script_seen: &std::path::Path) -> PathBuf {
+        let plugin_root = root.join("plugins");
+        let plugin_dir = plugin_root.join("mofa-podcast");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "mofa-podcast",
+  "version": "0.0.0-test",
+  "tools": [
+    {
+      "name": "podcast_generate",
+      "spawn_only": true,
+      "description": "mock podcast generator",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "script": { "type": "string" }
+        }
+      }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let main = plugin_dir.join("main");
+        std::fs::write(
+            &main,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+INPUT="$(cat)"
+SCRIPT_SEEN="{script_seen}"
+OCTOS_PLUGIN_INPUT="$INPUT" SCRIPT_SEEN="$SCRIPT_SEEN" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ.get("OCTOS_PLUGIN_INPUT") or "{{}}")
+with open(os.environ["SCRIPT_SEEN"], "w", encoding="utf-8") as handle:
+    handle.write(str(payload.get("script") or ""))
+
+base = os.environ.get("OCTOS_WORK_DIR") or os.getcwd()
+out_dir = os.path.join(base, "skill-output", "mofa-podcast")
+os.makedirs(out_dir, exist_ok=True)
+out = os.path.join(out_dir, "podcast_full_test.mp3")
+with open(out, "wb") as handle:
+    handle.write(b"0" * 8192)
+
+print(json.dumps({{"output": f"Podcast generated successfully: {{out}}", "success": True, "files_to_send": [out]}}))
+PY
+"#,
+                script_seen = script_seen.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        plugin_root
+    }
+
     #[tokio::test]
     async fn test_sync_spawn_registers_child_tool_factory_before_preflight() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
@@ -2442,26 +2686,44 @@ mod tests {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
         let temp = tempfile::tempdir().unwrap();
         let ledger = temp.path().join("tasks.jsonl");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script_seen = temp.path().join("script_seen.md");
+        let plugin_root = write_mock_podcast_plugin(temp.path(), &script_seen);
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::<BackgroundResultPayload>::new()));
+        let payloads_for_sender = Arc::clone(&payloads);
+        let sender: BackgroundResultSender = Arc::new(move |payload| {
+            let payloads_for_sender = Arc::clone(&payloads_for_sender);
+            Box::pin(async move {
+                payloads_for_sender
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(payload);
+                true
+            })
+        });
         let supervisor = Arc::new(TaskSupervisor::new());
         supervisor.enable_persistence(&ledger).unwrap();
         let tool = SpawnTool::new(
             Arc::new(MockProvider),
             Arc::new(create_test_store().await),
-            PathBuf::from("/tmp"),
+            workspace.clone(),
             in_tx,
         )
-        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone());
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone())
+        .with_background_result_sender(sender)
+        .with_plugin_dirs(vec![plugin_root], vec![]);
 
         let result = tool
             .execute(&serde_json::json!({
-                "task": "Produce a short podcast",
+                "task": "Produce a short podcast. Script: [杨幂 - clone:yangmi, professional] 大家好。 [窦文涛 - clone:douwentao, professional] 这里是测试播客。",
                 "label": "Research podcast",
                 "mode": "background",
-                "allowed_tools": [],
+                "allowed_tools": ["podcast_generate"],
                 "workflow": {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
-                    "allowed_tools": [],
+                    "allowed_tools": ["podcast_generate"],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "forbid_intermediate_files": true,
@@ -2479,6 +2741,9 @@ mod tests {
             let tasks = supervisor.get_tasks_for_session("api:test-session");
             if let Some(task) = tasks.first() {
                 if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    assert_eq!(task.output_files.len(), 1);
+                    assert!(task.output_files[0].ends_with(".mp3"));
+                    assert!(PathBuf::from(&task.output_files[0]).starts_with(&workspace));
                     break;
                 }
             }
@@ -2510,6 +2775,18 @@ mod tests {
             detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
                 && detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
         }));
+
+        let script =
+            std::fs::read_to_string(&script_seen).expect("podcast_generate should receive script");
+        assert!(script.contains("大家好"));
+
+        let payloads = payloads.lock().unwrap_or_else(|error| error.into_inner());
+        let media = payloads
+            .iter()
+            .flat_map(|payload| payload.media.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(media.len(), 1);
+        assert!(media[0].ends_with(".mp3"));
     }
 
     #[tokio::test]
