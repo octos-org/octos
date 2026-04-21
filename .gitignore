@@ -56,6 +56,7 @@ scripts/deploy.sh
 !docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
+!docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
