@@ -15,7 +15,7 @@ const TABS = [
 ]
 
 export default function ToolsPage() {
-  const { config, setConfig, save, saving, loading } = useProfile()
+  const { profileId, config, setConfig, save, saving, loading } = useProfile()
   const [activeTab, setActiveTab] = useState('search')
 
   if (loading) {
@@ -34,7 +34,7 @@ export default function ToolsPage() {
           <CategoryTabs tabs={TABS} activeTab={activeTab} onTabChange={setActiveTab} />
         </div>
         <div className="p-5">
-          {activeTab === 'search' && <SearchApiTab config={config} onChange={setConfig} />}
+          {activeTab === 'search' && <SearchApiTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'ppt' && <PptConfigTab config={config} onChange={setConfig} />}
           {activeTab === 'email' && <EmailTab config={config} onChange={setConfig} />}
           {activeTab === 'crawl' && <DeepCrawlTab config={config} onChange={setConfig} />}

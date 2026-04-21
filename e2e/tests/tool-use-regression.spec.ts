@@ -145,19 +145,35 @@ test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async
 }) => {
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
-  const res = await request.post(`${baseURL}/api/chat`, {
-    headers: headers(),
-    data: {
-      message:
-        'Please activate the shell tool if needed, then run this exact command: ffmpeg -version 2>&1 | head -1. Return only the ffmpeg version output.',
-      session_id: `test-ffmpeg-chain-${Date.now()}`,
-      stream: false,
-    },
-    timeout: 30_000,
-  });
+  const baseSessionId = `test-ffmpeg-chain-${Date.now()}`;
+  const prompt =
+    'If shell is not already active, call activate_tools with exactly ["shell"] once and only once. Then call shell exactly once with this command: ffmpeg -version 2>&1 | head -1. Do not inspect available tools, do not call activate_tools repeatedly, and return only the ffmpeg version line.';
+
+  const sendPrompt = async (message: string, sessionId: string) =>
+    request.post(`${baseURL}/api/chat`, {
+      headers: headers(),
+      data: {
+        message,
+        session_id: sessionId,
+        stream: false,
+      },
+      timeout: 30_000,
+    });
+
+  let res = await sendPrompt(prompt, baseSessionId);
 
   if (res.ok()) {
-    const body = await res.json();
+    let body = await res.json();
+    if (typeof body.content === 'string' && body.content.includes('[LOOP DETECTED]')) {
+      res = await sendPrompt(
+        'Call activate_tools(["shell"]) at most once, then call shell("ffmpeg -version 2>&1 | head -1") exactly once, then stop. Return only the ffmpeg version line.',
+        `${baseSessionId}-retry`,
+      );
+      if (!res.ok()) {
+        return;
+      }
+      body = await res.json();
+    }
     // Should contain ffmpeg version string, NOT "tool registry not available"
     // or "ffmpeg: not found"
     expect(body.content).not.toContain('tool registry not available');

@@ -27,6 +27,35 @@ export interface FallbackModel {
   api_type?: string | null
 }
 
+export interface ModelHints {
+  uses_completion_tokens?: boolean
+  fixed_temperature?: boolean
+  lacks_vision?: boolean
+  merge_system_messages?: boolean
+}
+
+export interface LlmRouteConfig {
+  route_id?: string | null
+  label?: string | null
+  base_url?: string | null
+  api_key_env?: string | null
+  api_type?: string | null
+}
+
+export interface LlmModelSelectionConfig {
+  family_id?: string | null
+  model_id?: string | null
+  route?: LlmRouteConfig | null
+  model_hints?: ModelHints | null
+  cost_per_m?: number | null
+  strong?: boolean | null
+}
+
+export interface LlmProfileConfig {
+  primary?: LlmModelSelectionConfig | null
+  fallbacks?: LlmModelSelectionConfig[]
+}
+
 export interface EmailSettings {
   provider: string
   smtp_host?: string | null
@@ -56,18 +85,40 @@ export interface DockerConfig {
 
 export interface SandboxConfig {
   enabled?: boolean
-  mode?: 'auto' | 'macos' | 'docker' | 'bwrap'
+  mode?: 'auto' | 'macos' | 'docker' | 'bwrap' | 'appcontainer'
   allow_network?: boolean
   docker?: DockerConfig
 }
 
-export interface ProfileConfig {
-  provider?: string | null
-  model?: string | null
-  base_url?: string | null
+export type SearchProviderId = 'tavily' | 'perplexity' | 'brave' | 'you' | 'serper'
+
+export interface SearchProviderConfig {
   api_key_env?: string | null
-  api_type?: string | null
-  fallback_models?: FallbackModel[]
+}
+
+export interface SearchConfig {
+  providers?: Partial<Record<SearchProviderId, SearchProviderConfig>> | null
+}
+
+export interface DeepCrawlConfig {
+  page_settle_ms?: number | null
+  max_output_chars?: number | null
+}
+
+export interface SlidesAppConfig {
+  template_dir?: string | null
+  default_theme?: string | null
+}
+
+export interface AppsConfig {
+  slides?: SlidesAppConfig | null
+}
+
+export interface ProfileConfig {
+  llm?: LlmProfileConfig | null
+  search?: SearchConfig | null
+  deep_crawl?: DeepCrawlConfig | null
+  apps?: AppsConfig | null
   channels: ChannelCredentials[]
   gateway: GatewaySettings
   email?: EmailSettings | null
@@ -151,12 +202,6 @@ export const CHANNEL_LABELS: Record<ChannelType, string> = {
   feishu: 'FS',
   email: 'EM',
 }
-
-export const PROVIDERS = [
-  'anthropic', 'openai', 'gemini', 'r9s', 'openrouter', 'deepseek',
-  'groq', 'moonshot', 'dashscope', 'minimax', 'zhipu', 'zai',
-  'nvidia', 'ollama', 'vllm',
-] as const
 
 // ── User & Auth types ───────────────────────────────────────────────
 

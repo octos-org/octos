@@ -1,6 +1,6 @@
 //! Spawn tool for background subagent execution.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -15,8 +15,11 @@ use tracing::{info, warn};
 
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::task_supervisor::TaskSupervisor;
-use crate::workspace_git::{WorkspaceArtifactStatus, WorkspaceContractStatus};
-use crate::{Agent, AgentConfig};
+use crate::workspace_git::{
+    WorkspaceContractStatus, WorkspaceProjectKind,
+    resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
+};
+use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
 
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
@@ -74,7 +77,6 @@ pub struct ChildSessionLifecyclePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkflowTerminalOutputPolicy {
     deliver_final_artifact_only: bool,
-    deliver_media_only: bool,
     forbid_intermediate_files: bool,
     required_artifact_kind: String,
 }
@@ -141,6 +143,13 @@ fn child_session_failure_action(
     }
 }
 
+fn child_session_failure_action_label(action: ChildSessionFailureAction) -> &'static str {
+    match action {
+        ChildSessionFailureAction::Retry => "retry",
+        ChildSessionFailureAction::Escalate => "escalate",
+    }
+}
+
 fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'static str) {
     counter!(
         "octos_child_session_lifecycle_total",
@@ -148,6 +157,16 @@ fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'st
         "outcome" => outcome.to_string()
     )
     .increment(1);
+}
+
+async fn dispatch_child_session_lifecycle(
+    sender: Option<&ChildSessionLifecycleSender>,
+    payload: ChildSessionLifecyclePayload,
+) -> bool {
+    match sender {
+        Some(sender) => sender(payload).await,
+        None => false,
+    }
 }
 
 fn background_result_kind_label(kind: BackgroundResultKind) -> &'static str {
@@ -180,6 +199,87 @@ fn record_retry(reason: &'static str) {
     counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
 }
 
+async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPayload) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let event = payload.event;
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => {}
+        HookResult::Modified(_) => {
+            warn!(event = ?event, "lifecycle hook attempted to modify payload; ignoring");
+        }
+        HookResult::Deny(reason) => {
+            warn!(
+                event = ?event,
+                reason,
+                "lifecycle hook attempted to deny a non-blocking event"
+            );
+        }
+        HookResult::Error(error) => {
+            warn!(event = ?event, error, "lifecycle hook failed");
+        }
+    }
+}
+
+fn parse_modified_spawn_verify_output_files(
+    modified: serde_json::Value,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let files = match modified {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut object) => object
+            .remove("output_files")
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| {
+                "before_spawn_verify hook must return {\"output_files\": [...]} or a JSON string array"
+                    .to_string()
+            })?,
+        _ => {
+            return Err(
+                "before_spawn_verify hook must return {\"output_files\": [...]} or a JSON string array"
+                    .to_string(),
+            )
+        }
+    };
+
+    files
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(path) => Ok(PathBuf::from(path)),
+            _ => Err("before_spawn_verify output_files entries must be strings".to_string()),
+        })
+        .collect()
+}
+
+async fn run_before_spawn_verify_hook(
+    hooks: Option<&Arc<HookExecutor>>,
+    payload: HookPayload,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let default_files = payload
+        .output_files
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let Some(hooks) = hooks else {
+        return Ok(default_files);
+    };
+    let event = payload.event;
+
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => Ok(default_files),
+        HookResult::Modified(modified) => parse_modified_spawn_verify_output_files(modified),
+        HookResult::Deny(reason) => Err(reason),
+        HookResult::Error(error) => {
+            warn!(
+                event = ?event,
+                error,
+                "pre-verify lifecycle hook failed; continuing with runtime output files"
+            );
+            Ok(default_files)
+        }
+    }
+}
+
 /// Tool that spawns background worker agents for long-running tasks.
 pub struct SpawnTool {
     llm: Arc<dyn LlmProvider>,
@@ -198,6 +298,10 @@ pub struct SpawnTool {
     background_result_sender: Option<BackgroundResultSender>,
     /// Optional lifecycle bridge for durable child-session state.
     child_session_sender: Option<ChildSessionLifecycleSender>,
+    /// Inherited lifecycle hooks for spawned workers and background transitions.
+    hooks: Option<Arc<HookExecutor>>,
+    /// Template used to stamp parent/child session hook context.
+    hook_context_template: Option<HookContext>,
     /// Plugin directories to load into subagent registries.
     /// Subagents can use plugin tools (fm_tts, etc.) when listed in allowed_tools.
     plugin_dirs: Vec<PathBuf>,
@@ -232,6 +336,8 @@ impl SpawnTool {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -262,6 +368,8 @@ impl SpawnTool {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -282,6 +390,18 @@ impl SpawnTool {
     /// Set a child-session lifecycle sender for background workers.
     pub fn with_child_session_sender(mut self, sender: ChildSessionLifecycleSender) -> Self {
         self.child_session_sender = Some(sender);
+        self
+    }
+
+    /// Inherit lifecycle hooks from the parent session.
+    pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Set a hook context template for parent/child lifecycle events.
+    pub fn with_hook_context(mut self, ctx: HookContext) -> Self {
+        self.hook_context_template = Some(ctx);
         self
     }
 
@@ -425,7 +545,7 @@ fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
     serde_json::to_string(workflow).ok()
 }
 
-fn workflow_artifact_matches_kind(path: &PathBuf, kind: &str) -> bool {
+fn workflow_artifact_matches_kind(path: &Path, kind: &str) -> bool {
     match kind {
         "audio" => matches!(
             path.extension()
@@ -557,54 +677,163 @@ fn build_subagent_tool_policy(
     }
 }
 
-fn contract_artifact_priority(required_artifact_kind: &str) -> &'static [&'static str] {
-    match required_artifact_kind {
-        "presentation" => &["deck"],
-        "site" => &["entrypoint"],
-        _ => &[],
+fn ensure_subagent_tools_available(
+    tools: &ToolRegistry,
+    allowed_tools: &[String],
+) -> std::result::Result<(), String> {
+    for tool_name in allowed_tools {
+        tools.activate(tool_name);
+    }
+
+    let missing = allowed_tools
+        .iter()
+        .filter(|tool_name| tools.get(tool_name).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "required tool(s) not available on this host: {}",
+            missing.join(", ")
+        ))
     }
 }
 
-fn preferred_contract_basename(artifact: &WorkspaceArtifactStatus) -> Option<&'static str> {
-    match artifact.name.as_str() {
-        "deck" => Some("deck.pptx"),
-        "entrypoint" => Some("index.html"),
+const PRIMARY_CONTRACT_ARTIFACT: &str = "primary";
+
+fn workflow_contract_kind_label(kind: WorkspaceProjectKind) -> &'static str {
+    match kind {
+        WorkspaceProjectKind::Slides => "slides",
+        WorkspaceProjectKind::Sites => "site",
+    }
+}
+
+fn workflow_contract_project_kind(workflow: &WorkflowMetadata) -> Option<WorkspaceProjectKind> {
+    match workflow
+        .terminal_output
+        .as_ref()
+        .map(|policy| policy.required_artifact_kind.as_str())
+    {
+        Some("presentation") => Some(WorkspaceProjectKind::Slides),
+        Some("site") => Some(WorkspaceProjectKind::Sites),
         _ => None,
     }
 }
 
-fn most_recent_contract_match(
-    workspace_root: &std::path::Path,
-    artifact: &WorkspaceArtifactStatus,
-) -> Option<PathBuf> {
-    let mut candidates = artifact
-        .matches
-        .iter()
-        .map(|relative| workspace_root.join(relative))
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
+fn normalize_observed_path(base_dir: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
 
-    if let Some(preferred) = preferred_contract_basename(artifact) {
-        let exact = candidates
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.eq_ignore_ascii_case(preferred))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            candidates = exact;
+fn is_matching_workspace_root(path: &std::path::Path, expected_kind: WorkspaceProjectKind) -> bool {
+    if !crate::workspace_policy_path(path).is_file() {
+        return false;
+    }
+
+    matches!(
+        (
+            expected_kind,
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+        ),
+        (WorkspaceProjectKind::Slides, Some("slides"))
+            | (WorkspaceProjectKind::Sites, Some("sites"))
+    )
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn resolve_contract_workspace_root(
+    working_dir: &std::path::Path,
+    files_to_send: &[PathBuf],
+    files_modified: &[PathBuf],
+    workflow: &WorkflowMetadata,
+) -> std::result::Result<PathBuf, String> {
+    let expected_kind = workflow_contract_project_kind(workflow).ok_or_else(|| {
+        "workflow contract root resolution requires a contract-owned artifact kind".to_string()
+    })?;
+    let kind_label = workflow_contract_kind_label(expected_kind);
+
+    let mut ancestry_candidates = Vec::new();
+    for path in files_to_send.iter().chain(files_modified.iter()) {
+        let observed = normalize_observed_path(working_dir, path);
+        for ancestor in observed.ancestors() {
+            if is_matching_workspace_root(ancestor, expected_kind) {
+                push_unique_path(&mut ancestry_candidates, ancestor.to_path_buf());
+                break;
+            }
         }
     }
 
-    candidates.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    })
+    match ancestry_candidates.as_slice() {
+        [single] => return Ok(single.clone()),
+        [] => {}
+        _ => {
+            return Err(format!(
+                "multiple {kind_label} workspace contracts matched observed output paths"
+            ));
+        }
+    }
+
+    if is_matching_workspace_root(working_dir, expected_kind) {
+        return Ok(working_dir.to_path_buf());
+    }
+
+    let matching_roots = crate::list_workspace_repos(working_dir)
+        .map_err(|error| format!("workspace contract discovery failed: {error}"))?
+        .into_iter()
+        .filter(|repo| repo.kind == expected_kind)
+        .map(|repo| repo.root)
+        .collect::<Vec<_>>();
+
+    match matching_roots.as_slice() {
+        [single] => Ok(single.clone()),
+        [] => Err(format!(
+            "no {kind_label} workspace contract found beneath {}",
+            working_dir.display()
+        )),
+        _ => Err(format!(
+            "multiple {kind_label} workspace contracts found beneath {}; unable to choose a terminal artifact root deterministically",
+            working_dir.display()
+        )),
+    }
+}
+
+fn resolve_background_terminal_files(
+    working_dir: &std::path::Path,
+    files_to_send: &[PathBuf],
+    files_modified: &[PathBuf],
+    workflow: Option<&WorkflowMetadata>,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    if let Some(workflow) =
+        workflow.filter(|workflow| workflow_uses_contract_terminal_delivery(workflow))
+    {
+        let workspace_root =
+            resolve_contract_workspace_root(working_dir, files_to_send, files_modified, workflow)?;
+        return resolve_contract_terminal_files(&workspace_root, Some(workflow))?
+            .ok_or_else(|| "workspace contract returned no terminal files".to_string());
+    }
+
+    Ok(
+        select_workflow_terminal_files(files_to_send, files_modified, workflow).unwrap_or_else(
+            || {
+                files_to_send
+                    .iter()
+                    .chain(files_modified.iter())
+                    .cloned()
+                    .collect()
+            },
+        ),
+    )
 }
 
 fn format_workspace_contract_failure(status: &WorkspaceContractStatus) -> String {
@@ -675,45 +904,60 @@ fn resolve_contract_terminal_files(
         .as_ref()
         .ok_or_else(|| "workflow terminal output policy missing".to_string())?;
     let mut selected = Vec::new();
-    let mut matched_named_artifact = false;
+    let primary_declared = status
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == PRIMARY_CONTRACT_ARTIFACT);
+    let primary_ready = status
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == PRIMARY_CONTRACT_ARTIFACT && artifact.present);
 
-    for artifact_name in contract_artifact_priority(&terminal_output.required_artifact_kind) {
-        if let Some(artifact) = status
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.name == *artifact_name && artifact.present)
-        {
-            matched_named_artifact = true;
-            if terminal_output.deliver_final_artifact_only {
-                if let Some(path) = most_recent_contract_match(workspace_root, artifact) {
-                    return Ok(Some(vec![path]));
-                }
-            } else {
-                selected.extend(
-                    artifact
-                        .matches
-                        .iter()
-                        .map(|relative| workspace_root.join(relative))
-                        .filter(|path| path.is_file()),
-                );
-            }
+    if terminal_output.deliver_final_artifact_only {
+        if !primary_declared {
+            return Err(format!(
+                "workspace contract for {} is ready but does not declare a '{}' artifact",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            ));
         }
+
+        if !primary_ready {
+            return Err(format!(
+                "workspace contract for {} is ready but its '{}' artifact is missing",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            ));
+        }
+
+        let path = resolve_preferred_workspace_contract_artifact_path(
+            workspace_root,
+            PRIMARY_CONTRACT_ARTIFACT,
+        )
+        .map_err(|error| format!("workspace contract resolution failed: {error}"))?;
+        return path.map(|path| Some(vec![path])).ok_or_else(|| {
+            format!(
+                "workspace contract for {} is ready but the '{}' artifact could not be resolved",
+                status.repo_label, PRIMARY_CONTRACT_ARTIFACT
+            )
+        });
     }
+
+    for artifact in status.artifacts.iter().filter(|artifact| artifact.present) {
+        selected.extend(
+            resolve_workspace_contract_artifact_paths(workspace_root, &artifact.name)
+                .map_err(|error| format!("workspace contract resolution failed: {error}"))?,
+        );
+    }
+
+    selected.sort();
+    selected.dedup();
 
     if !selected.is_empty() {
         return Ok(Some(selected));
     }
 
-    if matched_named_artifact {
-        return Err(format!(
-            "workspace contract for {} is ready but the declared terminal artifact could not be resolved",
-            status.repo_label
-        ));
-    }
-
     Err(format!(
-        "workspace contract for {} is ready but has no declared terminal artifact for '{}'",
-        status.repo_label, terminal_output.required_artifact_kind
+        "workspace contract for {} is ready but has no resolved artifact paths",
+        status.repo_label
     ))
 }
 async fn deliver_background_result(
@@ -857,7 +1101,6 @@ impl Tool for SpawnTool {
                             "description": "Runtime-owned final output policy for workflow families.",
                             "properties": {
                                 "deliver_final_artifact_only": { "type": "boolean" },
-                                "deliver_media_only": { "type": "boolean" },
                                 "forbid_intermediate_files": { "type": "boolean" },
                                 "required_artifact_kind": { "type": "string" }
                             }
@@ -913,6 +1156,8 @@ impl Tool for SpawnTool {
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
+            ensure_subagent_tools_available(&tools, &allowed_tools)
+                .map_err(|error| eyre::eyre!(error))?;
             let policy = build_subagent_tool_policy(allowed_tools, workflow.as_ref());
             tools.apply_policy(&policy);
             if let Some(ref pp) = self.provider_policy {
@@ -1001,6 +1246,8 @@ impl Tool for SpawnTool {
             let worker_config = self.worker_config.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
+            let worker_hooks = self.hooks.clone();
+            let hook_context_template = self.hook_context_template.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -1016,34 +1263,31 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                if let (
-                    Some(sender),
-                    Some(task_id),
-                    Some(parent_session_key),
-                    Some(child_session_key),
-                ) = (
-                    child_session_sender.as_ref(),
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
                     tracked_task_id.as_ref(),
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
                 ) {
-                    let joined = sender(ChildSessionLifecyclePayload {
-                        kind: ChildSessionLifecycleKind::Spawned,
-                        task_id: task_id.clone(),
-                        task_label: task_label.clone(),
-                        instruction: task_desc.clone(),
-                        parent_session_key: parent_session_key.clone(),
-                        child_session_key: child_session_key.clone(),
-                        workflow_kind: workflow_metadata
-                            .as_ref()
-                            .map(|workflow| workflow.workflow_kind.clone()),
-                        current_phase: workflow_metadata
-                            .as_ref()
-                            .map(|workflow| workflow.current_phase.clone()),
-                        output_files: Vec::new(),
-                        failure_action: None,
-                        error: None,
-                    })
+                    let joined = dispatch_child_session_lifecycle(
+                        child_session_sender.as_ref(),
+                        ChildSessionLifecyclePayload {
+                            kind: ChildSessionLifecycleKind::Spawned,
+                            task_id: task_id.clone(),
+                            task_label: task_label.clone(),
+                            instruction: task_desc.clone(),
+                            parent_session_key: parent_session_key.clone(),
+                            child_session_key: child_session_key.clone(),
+                            workflow_kind: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.workflow_kind.clone()),
+                            current_phase: workflow_metadata
+                                .as_ref()
+                                .map(|workflow| workflow.current_phase.clone()),
+                            output_files: Vec::new(),
+                            failure_action: None,
+                            error: None,
+                        },
+                    )
                     .await;
                     record_child_session_lifecycle(
                         ChildSessionLifecycleKind::Spawned,
@@ -1063,6 +1307,8 @@ impl Tool for SpawnTool {
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
                 tools.clear_spawn_only();
+                let availability_check = ensure_subagent_tools_available(&tools, &allowed_tools)
+                    .map_err(|error| eyre::eyre!(error));
                 let policy = build_subagent_tool_policy(allowed_tools, workflow_metadata.as_ref());
                 tools.apply_policy(&policy);
                 if let Some(pp) = provider_policy {
@@ -1072,6 +1318,17 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                if let Some(ref hooks) = worker_hooks {
+                    worker = worker.with_hooks(hooks.clone());
+                }
+                if let Some(ctx) = hook_context_template.as_ref().map(|ctx| HookContext {
+                    session_id: tracked_child_session_key
+                        .clone()
+                        .or_else(|| ctx.session_id.clone()),
+                    profile_id: ctx.profile_id.clone(),
+                }) {
+                    worker = worker.with_hook_context(ctx);
+                }
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
@@ -1086,31 +1343,115 @@ impl Tool for SpawnTool {
                         files: vec![],
                     },
                     TaskContext {
-                        working_dir,
+                        working_dir: working_dir.clone(),
                         ..Default::default()
                     },
                 );
 
-                let result = worker.run_task(&subtask).await;
-                let tracked_output_files = match &result {
-                    Ok(task_result) => select_workflow_terminal_files(
+                let result = match availability_check {
+                    Ok(()) => worker.run_task(&subtask).await,
+                    Err(error) => Err(error),
+                };
+                let mut contract_failure = match &result {
+                    Ok(task_result) if task_result.success => resolve_background_terminal_files(
+                        &working_dir,
                         &task_result.files_to_send,
                         &task_result.files_modified,
                         workflow_metadata.as_ref(),
                     )
-                    .unwrap_or_else(|| {
-                        task_result
-                            .files_to_send
-                            .iter()
-                            .chain(task_result.files_modified.iter())
-                            .cloned()
-                            .collect()
-                    })
-                    .into_iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
+                    .err(),
+                    _ => None,
                 };
+                let mut terminal_files = match (&result, contract_failure.as_ref()) {
+                    (Ok(task_result), None) if task_result.success => {
+                        resolve_background_terminal_files(
+                            &working_dir,
+                            &task_result.files_to_send,
+                            &task_result.files_modified,
+                            workflow_metadata.as_ref(),
+                        )
+                        .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                let workflow_kind = workflow_metadata
+                    .as_ref()
+                    .map(|workflow| workflow.workflow_kind.clone());
+                let workflow_phase = workflow_metadata
+                    .as_ref()
+                    .map(|workflow| workflow.current_phase.clone());
+                let verify_phase = workflow_phase
+                    .clone()
+                    .or_else(|| Some("verify_outputs".to_string()));
+
+                if matches!((&result, contract_failure.as_ref()), (Ok(task_result), None) if task_result.success)
+                {
+                    if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                        tracked_task_id.as_ref(),
+                        parent_session_key.as_ref(),
+                        tracked_child_session_key.as_ref(),
+                    ) {
+                        let before_verify_payload = HookPayload::before_spawn_verify(
+                            task_id.clone(),
+                            task_label.clone(),
+                            parent_session_key.clone(),
+                            child_session_key.clone(),
+                            workflow_kind.clone(),
+                            verify_phase.clone(),
+                            Some("candidate terminal outputs resolved"),
+                            terminal_files
+                                .iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect(),
+                            hook_context_template.as_ref(),
+                        );
+                        match run_before_spawn_verify_hook(
+                            worker_hooks.as_ref(),
+                            before_verify_payload,
+                        )
+                        .await
+                        {
+                            Ok(modified_files) => {
+                                terminal_files = modified_files;
+                            }
+                            Err(reason) => {
+                                contract_failure =
+                                    Some(format!("spawn verify denied by hook: {reason}"));
+                                terminal_files.clear();
+                            }
+                        }
+                    }
+                }
+
+                let tracked_output_files = terminal_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
+
+                if matches!((&result, contract_failure.as_ref()), (Ok(task_result), None) if task_result.success)
+                {
+                    if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                        tracked_task_id.as_ref(),
+                        parent_session_key.as_ref(),
+                        tracked_child_session_key.as_ref(),
+                    ) {
+                        emit_lifecycle_hook(
+                            worker_hooks.as_ref(),
+                            HookPayload::on_spawn_verify(
+                                task_id.clone(),
+                                task_label.clone(),
+                                parent_session_key.clone(),
+                                child_session_key.clone(),
+                                workflow_kind.clone(),
+                                verify_phase.clone(),
+                                Some("terminal outputs resolved"),
+                                tracked_output_files.clone(),
+                                hook_context_template.as_ref(),
+                            ),
+                        )
+                        .await;
+                    }
+                }
 
                 if matches!(&result, Ok(task_result) if task_result.success) {
                     if let (Some(supervisor), Some(task_id), Some(workflow)) = (
@@ -1128,37 +1469,61 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                let terminal_kind = classify_child_session_lifecycle_kind(&result);
+                let terminal_kind = if contract_failure.is_some() {
+                    ChildSessionLifecycleKind::TerminalFailed
+                } else {
+                    classify_child_session_lifecycle_kind(&result)
+                };
 
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
-                    match &result {
-                        Ok(task_result) if task_result.success => {
+                    match (&result, contract_failure.as_ref()) {
+                        (Ok(task_result), None) if task_result.success => {
                             supervisor.mark_completed(task_id, tracked_output_files.clone());
                         }
-                        Ok(task_result) => {
+                        (Ok(_), Some(error)) => {
+                            supervisor.mark_failed(task_id, error.clone());
+                        }
+                        (Ok(task_result), None) => {
                             supervisor.mark_failed(task_id, task_result.output.clone());
                         }
-                        Err(error) => {
+                        (Err(error), _) => {
                             supervisor.mark_failed(task_id, error.to_string());
                         }
                     }
                 }
 
-                if let (
-                    Some(sender),
-                    Some(task_id),
-                    Some(parent_session_key),
-                    Some(child_session_key),
-                ) = (
-                    child_session_sender.as_ref(),
+                let terminal_result_text = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(error)) => error.clone(),
+                    (Ok(task_result), None) => task_result.output.clone(),
+                    (Err(error), _) => error.to_string(),
+                };
+
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
                     tracked_task_id.as_ref(),
                     parent_session_key.as_ref(),
                     tracked_child_session_key.as_ref(),
                 ) {
-                    let payload = match &result {
-                        Ok(task_result) if task_result.success => ChildSessionLifecyclePayload {
+                    let payload = match (&result, contract_failure.as_ref()) {
+                        (Ok(task_result), None) if task_result.success => {
+                            ChildSessionLifecyclePayload {
+                                kind: terminal_kind,
+                                task_id: task_id.clone(),
+                                task_label: task_label.clone(),
+                                instruction: task_desc.clone(),
+                                parent_session_key: parent_session_key.clone(),
+                                child_session_key: child_session_key.clone(),
+                                workflow_kind: workflow_metadata
+                                    .as_ref()
+                                    .map(|workflow| workflow.workflow_kind.clone()),
+                                current_phase: Some("deliver_result".to_string()),
+                                output_files: tracked_output_files.clone(),
+                                failure_action: child_session_failure_action(terminal_kind),
+                                error: None,
+                            }
+                        }
+                        (Ok(_), Some(error)) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -1171,9 +1536,9 @@ impl Tool for SpawnTool {
                             current_phase: Some("deliver_result".to_string()),
                             output_files: tracked_output_files.clone(),
                             failure_action: child_session_failure_action(terminal_kind),
-                            error: None,
+                            error: Some(error.clone()),
                         },
-                        Ok(task_result) => ChildSessionLifecyclePayload {
+                        (Ok(task_result), None) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -1190,7 +1555,7 @@ impl Tool for SpawnTool {
                             failure_action: child_session_failure_action(terminal_kind),
                             error: Some(task_result.output.clone()),
                         },
-                        Err(error) => ChildSessionLifecyclePayload {
+                        (Err(error), _) => ChildSessionLifecyclePayload {
                             kind: terminal_kind,
                             task_id: task_id.clone(),
                             task_label: task_label.clone(),
@@ -1208,7 +1573,9 @@ impl Tool for SpawnTool {
                             error: Some(error.to_string()),
                         },
                     };
-                    let joined = sender(payload).await;
+                    let joined =
+                        dispatch_child_session_lifecycle(child_session_sender.as_ref(), payload)
+                            .await;
                     record_child_session_lifecycle(
                         terminal_kind,
                         if joined { "dispatched" } else { "not_joined" },
@@ -1242,30 +1609,81 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                let content = match &result {
-                    Ok(r) => format!(
+                if let (Some(task_id), Some(parent_session_key), Some(child_session_key)) = (
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                    tracked_child_session_key.as_ref(),
+                ) {
+                    match terminal_kind {
+                        ChildSessionLifecycleKind::Completed => {
+                            emit_lifecycle_hook(
+                                worker_hooks.as_ref(),
+                                HookPayload::on_spawn_complete(
+                                    task_id.clone(),
+                                    task_label.clone(),
+                                    parent_session_key.clone(),
+                                    child_session_key.clone(),
+                                    workflow_kind.clone(),
+                                    Some("deliver_result".to_string()),
+                                    Some(terminal_result_text.clone()),
+                                    tracked_output_files.clone(),
+                                    hook_context_template.as_ref(),
+                                ),
+                            )
+                            .await;
+                        }
+                        ChildSessionLifecycleKind::RetryableFailed
+                        | ChildSessionLifecycleKind::TerminalFailed => {
+                            let failure_action = child_session_failure_action(terminal_kind)
+                                .map(child_session_failure_action_label)
+                                .unwrap_or("escalate");
+                            emit_lifecycle_hook(
+                                worker_hooks.as_ref(),
+                                HookPayload::on_spawn_failure(
+                                    task_id.clone(),
+                                    task_label.clone(),
+                                    parent_session_key.clone(),
+                                    child_session_key.clone(),
+                                    workflow_kind.clone(),
+                                    workflow_phase.clone(),
+                                    terminal_result_text.clone(),
+                                    tracked_output_files.clone(),
+                                    failure_action,
+                                    hook_context_template.as_ref(),
+                                ),
+                            )
+                            .await;
+                        }
+                        ChildSessionLifecycleKind::Spawned => {}
+                    }
+                }
+
+                let content = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(error)) => format!("Status: FAILED\nError: {error}"),
+                    (Ok(r), None) => format!(
                         "Status: {}\n\n{}",
                         if r.success { "SUCCESS" } else { "FAILED" },
                         r.output
                     ),
-                    Err(e) => format!("Status: FAILED\nError: {e}"),
+                    (Err(e), _) => format!("Status: FAILED\nError: {e}"),
                 };
-                let (result_kind, result_media) = match &result {
-                    Ok(r) if r.success => {
-                        let workflow_media = select_workflow_terminal_files(
-                            &r.files_to_send,
-                            &r.files_modified,
-                            workflow_metadata.as_ref(),
-                        )
-                        .unwrap_or_default();
-                        if !workflow_media.is_empty() {
+                let (result_kind, result_media) = match (&result, contract_failure.as_ref()) {
+                    (Ok(_), Some(_)) => {
+                        record_terminal_result_reason(
+                            BackgroundResultKind::Report,
+                            "workspace_contract_failure",
+                        );
+                        (BackgroundResultKind::Report, Vec::new())
+                    }
+                    (Ok(r), None) if r.success => {
+                        if !terminal_files.is_empty() {
                             record_terminal_result_reason(
                                 BackgroundResultKind::Notification,
                                 "workflow_terminal_artifact",
                             );
                             (
                                 BackgroundResultKind::Notification,
-                                workflow_media
+                                terminal_files
                                     .into_iter()
                                     .map(|path| path.to_string_lossy().to_string())
                                     .collect::<Vec<_>>(),
@@ -1367,6 +1785,39 @@ impl Tool for SpawnTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HookConfig, HookEvent};
+
+    #[cfg(unix)]
+    fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
+                "sh".into(),
+                log_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    fn rewrite_output_files_hook(replacement_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event: HookEvent::BeforeSpawnVerify,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"cat >/dev/null; printf '{"output_files":["%s"]}\n' "$1"; exit 2"#.into(),
+                "sh".into(),
+                replacement_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn test_spawn_returns_immediately() {
@@ -1386,6 +1837,8 @@ mod tests {
             worker_prompt: None,
             background_result_sender: None,
             child_session_sender: None,
+            hooks: None,
+            hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_supervisor: None,
@@ -1449,6 +1902,282 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_background_spawn_uses_contract_selected_slides_artifact_for_persistence() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        std::fs::create_dir_all(repo_root.join("output")).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(ShellThenEndProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger.clone());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Acknowledge the request and stop.",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["shell"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["shell"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Completed {
+                    assert_eq!(
+                        task.output_files,
+                        vec![
+                            repo_root
+                                .join("output/deck.pptx")
+                                .to_string_lossy()
+                                .to_string()
+                        ]
+                    );
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger).unwrap();
+        let tasks = restored.get_tasks_for_session("api:test-session");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].status,
+            crate::task_supervisor::TaskStatus::Completed
+        );
+        assert_eq!(
+            tasks[0].output_files,
+            vec![
+                repo_root
+                    .join("output/deck.pptx")
+                    .to_string_lossy()
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_before_spawn_verify_hook_can_replace_output_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let replacement = temp.path().join("final-reviewed.pptx");
+        std::fs::write(&replacement, "reviewed").unwrap();
+
+        let hooks = Arc::new(HookExecutor::new(vec![rewrite_output_files_hook(
+            &replacement,
+        )]));
+        let payload = HookPayload::before_spawn_verify(
+            "task-1",
+            "Slides deliverable",
+            "api:test-session",
+            "api:test-session:child",
+            Some("slides"),
+            Some("verify_outputs"),
+            Some("candidate terminal outputs resolved"),
+            vec!["/tmp/original-deck.pptx".to_string()],
+            Some(&HookContext {
+                session_id: Some("api:test-session".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+        );
+
+        let modified_files = run_before_spawn_verify_hook(Some(&hooks), payload)
+            .await
+            .unwrap();
+
+        assert_eq!(modified_files, vec![replacement]);
+    }
+
+    #[tokio::test]
+    async fn test_background_spawn_fails_when_contract_owned_workflow_is_not_ready() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let tool = SpawnTool::new(
+            Arc::new(ShellThenEndProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger);
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Acknowledge the request and stop.",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["shell"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["shell"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Failed {
+                    let error = task.error.as_deref().unwrap_or_default();
+                    assert!(error.contains("workspace contract"), "{error}");
+                    return;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn task did not fail in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_background_spawn_emits_failure_hook_for_contract_failure() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("slides/demo");
+        let ledger = temp.path().join("tasks.jsonl");
+        let hook_log = temp.path().join("spawn-failure-hooks.jsonl");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        crate::write_workspace_policy(
+            &repo_root,
+            &crate::WorkspacePolicy::for_kind(crate::WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        supervisor.enable_persistence(&ledger).unwrap();
+        let hooks = Arc::new(HookExecutor::new(vec![capture_hook(
+            HookEvent::OnSpawnFailure,
+            &hook_log,
+        )]));
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            temp.path().to_path_buf(),
+            in_tx,
+        )
+        .with_task_supervisor(supervisor.clone(), "api:test-session", ledger)
+        .with_hooks(hooks)
+        .with_hook_context(HookContext {
+            session_id: Some("api:test-session".to_string()),
+            profile_id: Some("test-profile".to_string()),
+        });
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Build the deck",
+                "label": "Slides deliverable",
+                "mode": "background",
+                "allowed_tools": ["mofa_slides"],
+                "workflow": {
+                    "workflow_kind": "slides",
+                    "current_phase": "design",
+                    "allowed_tools": ["mofa_slides"],
+                    "terminal_output": {
+                        "deliver_final_artifact_only": true,
+                        "forbid_intermediate_files": true,
+                        "required_artifact_kind": "presentation"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let tasks = supervisor.get_tasks_for_session("api:test-session");
+            let hook_lines = std::fs::read_to_string(&hook_log).unwrap_or_default();
+            if let Some(task) = tasks.first() {
+                if task.status == crate::task_supervisor::TaskStatus::Failed
+                    && hook_lines.contains("\"event\":\"on_spawn_failure\"")
+                {
+                    assert!(hook_lines.contains("\"failure_action\":\"escalate\""));
+                    assert!(hook_lines.contains("\"workflow_kind\":\"slides\""));
+                    assert!(hook_lines.contains("\"result\":\""));
+                    return;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "background spawn failure hook did not arrive in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[test]
     fn workflow_terminal_output_prefers_final_audio_and_skips_intermediates() {
         let workflow = WorkflowMetadata {
@@ -1457,7 +2186,6 @@ mod tests {
             allowed_tools: vec!["podcast_generate".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: true,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "audio".to_string(),
             }),
@@ -1485,7 +2213,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -1511,7 +2238,6 @@ mod tests {
             allowed_tools: vec!["shell".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
@@ -1537,7 +2263,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string(), "send_file".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -1547,6 +2272,28 @@ mod tests {
 
         assert!(policy.deny.contains(&"spawn".to_string()));
         assert!(policy.deny.contains(&"send_file".to_string()));
+    }
+
+    #[test]
+    fn subagent_tool_preflight_activates_deferred_allowed_tool() {
+        let mut tools = ToolRegistry::with_builtins("/tmp");
+        tools.defer(["shell".to_string()]);
+        assert!(tools.specs().iter().all(|spec| spec.name != "shell"));
+
+        ensure_subagent_tools_available(&tools, &[String::from("shell")]).unwrap();
+
+        assert!(tools.specs().iter().any(|spec| spec.name == "shell"));
+    }
+
+    #[test]
+    fn subagent_tool_preflight_reports_missing_allowed_tool() {
+        let tools = ToolRegistry::with_builtins("/tmp");
+
+        let error = ensure_subagent_tools_available(&tools, &[String::from("podcast_generate")])
+            .unwrap_err();
+
+        assert!(error.contains("required tool(s) not available on this host"));
+        assert!(error.contains("podcast_generate"));
     }
 
     #[test]
@@ -1573,7 +2320,6 @@ mod tests {
             allowed_tools: vec!["mofa_slides".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
@@ -1606,7 +2352,6 @@ mod tests {
             allowed_tools: vec!["shell".to_string()],
             terminal_output: Some(WorkflowTerminalOutputPolicy {
                 deliver_final_artifact_only: true,
-                deliver_media_only: false,
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
@@ -1636,14 +2381,13 @@ mod tests {
                 "task": "Produce a short podcast",
                 "label": "Research podcast",
                 "mode": "background",
-                "allowed_tools": ["podcast_generate"],
+                "allowed_tools": [],
                 "workflow": {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
-                    "allowed_tools": ["podcast_generate"],
+                    "allowed_tools": [],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
-                        "deliver_media_only": true,
                         "forbid_intermediate_files": true,
                         "required_artifact_kind": "audio"
                     }
@@ -1782,6 +2526,84 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_background_spawn_emits_verify_and_complete_hooks() {
+        let memory = Arc::new(create_test_store().await);
+        let llm = Arc::new(MockProvider);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let temp = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let ledger = temp.path().join("tasks.jsonl");
+        let hook_log = temp.path().join("spawn-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![
+            capture_hook(HookEvent::OnSpawnVerify, &hook_log),
+            capture_hook(HookEvent::OnSpawnComplete, &hook_log),
+        ]));
+
+        let tool = SpawnTool::with_context(
+            llm,
+            memory,
+            temp.path().to_path_buf(),
+            tx,
+            "api",
+            "test-chat",
+        )
+        .with_task_supervisor(supervisor, "api:test-session".to_string(), ledger)
+        .with_hooks(hooks)
+        .with_hook_context(HookContext {
+            session_id: Some("api:test-session".to_string()),
+            profile_id: Some("test-profile".to_string()),
+        });
+
+        let args = serde_json::json!({
+            "task": "Draft the report",
+            "mode": "background",
+            "allowed_tools": []
+        });
+        let result = tool.execute(&args).await.unwrap();
+        assert!(result.success);
+
+        let started = std::time::Instant::now();
+        loop {
+            let lines = std::fs::read_to_string(&hook_log)
+                .ok()
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .map(str::to_string)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if lines.len() >= 2 {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("\"event\":\"on_spawn_verify\""))
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("\"event\":\"on_spawn_complete\""))
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| line.contains("\"session_id\":\"api:test-session\""))
+                );
+                return;
+            }
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "spawn lifecycle hooks did not arrive in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[test]
     fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
         let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
@@ -1815,8 +2637,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn child_session_lifecycle_dispatch_defaults_to_not_joined_without_sender() {
+        let joined = dispatch_child_session_lifecycle(
+            None,
+            ChildSessionLifecyclePayload {
+                kind: ChildSessionLifecycleKind::Spawned,
+                task_id: "task-123".to_string(),
+                task_label: "Child task".to_string(),
+                instruction: "Do work".to_string(),
+                parent_session_key: "api:parent".to_string(),
+                child_session_key: "api:parent#child-task-123".to_string(),
+                workflow_kind: Some("deep_research".to_string()),
+                current_phase: Some("execute".to_string()),
+                output_files: Vec::new(),
+                failure_action: None,
+                error: None,
+            },
+        )
+        .await;
+
+        assert!(!joined);
+    }
+
     // Minimal mock provider for testing
     struct MockProvider;
+
+    struct ShellThenEndProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait]
     impl LlmProvider for MockProvider {
@@ -1836,6 +2685,52 @@ mod tests {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ShellThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({
+                            "command": "printf ready",
+                        }),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+
+            Ok(octos_llm::ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
                 provider_index: None,
             })
         }

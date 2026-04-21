@@ -6,10 +6,16 @@ import { api, myApi, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
 import type { ProfileConfig, ProcessStatus, PurgeReport } from '../types'
 
 const defaultConfig: ProfileConfig = {
-  provider: 'anthropic',
-  model: 'claude-sonnet-4-20250514',
-  api_key_env: 'ANTHROPIC_API_KEY',
-  fallback_models: [],
+  llm: {
+    primary: {
+      family_id: 'anthropic',
+      model_id: 'claude-sonnet-4-20250514',
+      route: {
+        api_key_env: 'ANTHROPIC_API_KEY',
+      },
+    },
+    fallbacks: [],
+  },
   channels: [],
   gateway: { max_history: 50 },
   env_vars: {},
@@ -46,6 +52,14 @@ const ProfileContext = createContext<ProfileContextValue | null>(null)
 
 interface Props {
   children: ReactNode
+}
+
+function normalizeProfileConfig(config: ProfileConfig): ProfileConfig {
+  // Backend no longer accepts legacy top-level `config.api_type`.
+  const { api_type: _legacyApiType, ...next } = (config as unknown as ProfileConfig & {
+    api_type?: unknown
+  })
+  return next as unknown as ProfileConfig
 }
 
 export function ProfileProvider({ children }: Props) {
@@ -108,7 +122,7 @@ export function ProfileProvider({ children }: Props) {
     try {
       setLoading(true)
       const profile = await adapter.getProfile()
-      setConfig(profile.config)
+      setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
       setProfileEmail(profile.email || '')
@@ -129,6 +143,7 @@ export function ProfileProvider({ children }: Props) {
   const save = useCallback(async () => {
     try {
       setSaving(true)
+      const normalizedConfig = normalizeProfileConfig(config)
       const profile = await adapter.updateProfile({
         name: profileName,
         email: profileEmail || undefined,
@@ -137,9 +152,9 @@ export function ProfileProvider({ children }: Props) {
             ? publicSubdomain.trim()
             : null,
         enabled,
-        config,
+        config: normalizedConfig,
       })
-      setConfig(profile.config)
+      setConfig(normalizeProfileConfig(profile.config))
       setStatus(profile.status)
       setProfileName(profile.name)
       setPublicSubdomain(profile.public_subdomain || profile.id)

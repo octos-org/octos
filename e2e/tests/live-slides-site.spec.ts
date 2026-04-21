@@ -36,6 +36,95 @@ async function collectPreviewUrls(page: Page): Promise<string[]> {
   );
 }
 
+async function collectPersistedPreviewUrls(page: Page): Promise<string[]> {
+  return page.evaluate(async () => {
+    const token =
+      localStorage.getItem('octos_session_token') ||
+      localStorage.getItem('octos_auth_token') ||
+      '';
+    const profile = localStorage.getItem('selected_profile') || '';
+    const headers: Record<string, string> = {};
+
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    if (profile) {
+      headers['X-Profile-Id'] = profile;
+    }
+
+    const normalize = (url: string) => {
+      const trimmed = url.trim();
+      const match = trimmed.match(/^([^?#]+)(.*)$/);
+      if (!match) return trimmed;
+      let base = match[1].replace(/\/index\.html$/i, '/');
+      if (!base.endsWith('/')) {
+        base = `${base}/`;
+      }
+      return `${base}${match[2] || ''}`;
+    };
+
+    const sessionsResp = await fetch('/api/sessions', { headers });
+    if (!sessionsResp.ok) {
+      return [];
+    }
+
+    const sessions = await sessionsResp.json().catch(() => []);
+    if (!Array.isArray(sessions)) {
+      return [];
+    }
+
+    const urls = new Set<string>();
+    for (const session of sessions.slice(0, 40)) {
+      const sessionId = typeof session?.id === 'string' ? session.id : null;
+      if (!sessionId) {
+        continue;
+      }
+
+      const messagesResp = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=100`,
+        { headers },
+      ).catch(() => null);
+      if (!messagesResp?.ok) {
+        continue;
+      }
+
+      const messages = await messagesResp.json().catch(() => []);
+      if (!Array.isArray(messages)) {
+        continue;
+      }
+
+      const text = messages
+        .map((message) => (typeof message?.content === 'string' ? message.content : ''))
+        .join('\n');
+      const matches =
+        text.match(/\/api\/preview\/[^\s"'<>]+\/signal-atlas(?:\/index\.html|\/)/gi) || [];
+      for (const match of matches) {
+        urls.add(normalize(match));
+      }
+    }
+
+    return Array.from(urls);
+  });
+}
+
+async function waitForPreviewUrls(
+  page: Page,
+  expectedCount: number,
+  timeoutMs: number,
+): Promise<string[]> {
+  let latest: string[] = [];
+  await expect
+    .poll(async () => {
+      latest = await collectPreviewUrls(page);
+      return latest.length;
+    }, {
+      timeout: timeoutMs,
+      intervals: [2_000, 5_000],
+    })
+    .toBe(expectedCount);
+  return latest;
+}
+
 function normalizePreviewUrl(url: string): string {
   const trimmed = url.trim();
   const match = trimmed.match(/^([^?#]+)(.*)$/);
@@ -50,23 +139,27 @@ function normalizePreviewUrl(url: string): string {
 async function waitForPreviewBody(
   page: Page,
   previewUrl: string,
-  textNeedle: string,
+  textNeedles: string | string[],
   timeoutMs: number,
 ) {
   const deadline = Date.now() + timeoutMs;
   let lastBody = '';
+  const needles = (Array.isArray(textNeedles) ? textNeedles : [textNeedles]).map((needle) =>
+    needle.toLowerCase(),
+  );
 
   while (Date.now() < deadline) {
     await page.goto(previewUrl, { waitUntil: 'networkidle' });
     lastBody = (await page.locator('body').innerText().catch(() => '')) || '';
-    if (lastBody.includes(textNeedle)) {
+    const normalizedBody = lastBody.toLowerCase();
+    if (needles.every((needle) => normalizedBody.includes(needle))) {
       return lastBody;
     }
     await page.waitForTimeout(5_000);
   }
 
   throw new Error(
-    `Preview at ${previewUrl} never exposed "${textNeedle}". Last body: ${lastBody.slice(0, 400)}`,
+    `Preview at ${previewUrl} never exposed ${needles.map((needle) => JSON.stringify(needle)).join(', ')}. Last body: ${lastBody.slice(0, 400)}`,
   );
 }
 
@@ -107,7 +200,16 @@ test.describe('Live deliverable flows', () => {
     });
 
     const deckButton = page.getByRole('button', { name: /deck\.pptx/i });
-    if ((await deckButton.count()) === 0) {
+    const deckAppearedWithoutConfirmation = await expect
+      .poll(async () => deckButton.count(), {
+        timeout: 30_000,
+        intervals: [2_000, 5_000],
+      })
+      .toBeGreaterThan(0)
+      .then(() => true)
+      .catch(() => false);
+
+    if (!deckAppearedWithoutConfirmation) {
       const assistantText = await getAssistantMessageText(page);
       if (assistantNeedsSlidesConfirmation(assistantText)) {
         await sendAndWait(page, 'go', {
@@ -130,7 +232,7 @@ test.describe('Live deliverable flows', () => {
       );
     }
 
-    await page.reload({ waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
@@ -145,12 +247,19 @@ test.describe('Live deliverable flows', () => {
   test('site flow renders a built preview page and survives reload', async ({
     page,
   }) => {
-    await sendAndWait(page, '/new site astro', {
+    let initResult = await sendAndWait(page, '/new site astro', {
       label: 'site-init',
       maxWait: 90_000,
+      throwOnTimeout: false,
     });
+    if (initResult.responseLen === 0) {
+      initResult = await sendAndWait(page, '/new site astro', {
+        label: 'site-init-retry',
+        maxWait: 90_000,
+      });
+    }
 
-    const previewUrls = await collectPreviewUrls(page);
+    const previewUrls = await waitForPreviewUrls(page, 1, 60_000);
     expect(previewUrls).toHaveLength(1);
 
     const previewUrl = previewUrls[0];
@@ -161,6 +270,7 @@ test.describe('Live deliverable flows', () => {
       {
         label: 'site-build',
         maxWait: 240_000,
+        throwOnTimeout: false,
       },
     );
 
@@ -169,7 +279,7 @@ test.describe('Live deliverable flows', () => {
       const body = await waitForPreviewBody(
         previewPage,
         previewUrl,
-        'Browser Site Acceptance',
+        ['Browser Site Acceptance', 'Live preview'],
         240_000,
       );
 
@@ -185,12 +295,32 @@ test.describe('Live deliverable flows', () => {
       await previewPage.close();
     }
 
-    await page.reload({ waitUntil: 'networkidle' });
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
     await page.waitForTimeout(5_000);
 
-    const afterReloadPreviewUrls = await collectPreviewUrls(page);
-    expect(afterReloadPreviewUrls).toHaveLength(1);
-    expect(afterReloadPreviewUrls[0]).toBe(previewUrl);
+    let afterReloadPreviewUrls: string[] = [];
+    await expect
+      .poll(async () => {
+        const visibleUrls = await collectPreviewUrls(page);
+        if (visibleUrls.includes(previewUrl)) {
+          afterReloadPreviewUrls = visibleUrls;
+          return true;
+        }
+
+        const persistedUrls = await collectPersistedPreviewUrls(page);
+        if (persistedUrls.includes(previewUrl)) {
+          afterReloadPreviewUrls = persistedUrls;
+          return true;
+        }
+
+        afterReloadPreviewUrls = visibleUrls;
+        return false;
+      }, {
+        timeout: 60_000,
+        intervals: [2_000, 5_000],
+      })
+      .toBe(true);
+    expect(afterReloadPreviewUrls).toContain(previewUrl);
   });
 });

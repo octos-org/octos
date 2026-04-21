@@ -1,6 +1,7 @@
 //! Admin commands for tenant, tunnel, and operator management.
 
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -322,10 +323,16 @@ fn fetch_operator_summary(base_url: &str, auth_token: Option<&str>) -> Result<se
 }
 
 fn print_operator_summary(base_url: &str, summary: &serde_json::Value) {
-    println!("{}", "octos Operator Summary".cyan().bold());
-    println!("{}", "═".repeat(60));
-    println!("{}: {}", "Base URL".green(), base_url);
-    println!(
+    print!("{}", render_operator_summary(base_url, summary));
+}
+
+fn render_operator_summary(base_url: &str, summary: &serde_json::Value) -> String {
+    let mut output = String::new();
+    writeln!(&mut output, "{}", "octos Operator Summary".cyan().bold()).unwrap();
+    writeln!(&mut output, "{}", "═".repeat(60)).unwrap();
+    writeln!(&mut output, "{}: {}", "Base URL".green(), base_url).unwrap();
+    writeln!(
+        &mut output,
         "{}: {}",
         "Metrics".green(),
         if summary
@@ -337,28 +344,170 @@ fn print_operator_summary(base_url: &str, summary: &serde_json::Value) {
         } else {
             "no samples yet".yellow().to_string()
         }
-    );
-    println!();
+    )
+    .unwrap();
 
-    println!("{}", "Totals".cyan().bold());
-    println!("{}", "─".repeat(60).dimmed());
+    render_collection_section(&mut output, summary);
+    render_source_activity_section(&mut output, summary);
+    render_totals_section(&mut output, summary);
+    render_breakdown_section(&mut output, summary, "retry_reasons", "Retry Reasons");
+    render_breakdown_section(&mut output, summary, "timeout_reasons", "Timeout Reasons");
+    render_breakdown_section(
+        &mut output,
+        summary,
+        "duplicate_suppressions",
+        "Duplicate Suppressions",
+    );
+    render_breakdown_section(
+        &mut output,
+        summary,
+        "child_session_orphans",
+        "Child Session Orphans",
+    );
+    render_breakdown_section(
+        &mut output,
+        summary,
+        "workflow_phase_transitions",
+        "Workflow Phase Transitions",
+    );
+    render_breakdown_section(&mut output, summary, "result_delivery", "Result Delivery");
+    render_breakdown_section(&mut output, summary, "session_replay", "Session Replay");
+    output
+}
+
+fn render_collection_section(output: &mut String, summary: &serde_json::Value) {
+    let Some(collection) = summary
+        .get("collection")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    output.push('\n');
+    writeln!(output, "{}", "Coverage".cyan().bold()).unwrap();
+    writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
+    for (label, key) in [
+        ("running-gateways", "running_gateways"),
+        ("gateways-with-api-port", "gateways_with_api_port"),
+        ("gateways-missing-api-port", "gateways_missing_api_port"),
+        ("scrape-failures", "scrape_failures"),
+        ("sources-observed", "sources_observed"),
+        ("sources-with-metrics", "sources_with_metrics"),
+        ("sources-without-metrics", "sources_without_metrics"),
+    ] {
+        let value = collection
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        writeln!(output, "  {:<28} {}", label, value).unwrap();
+    }
+
+    let partial = collection
+        .get("partial")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    writeln!(
+        output,
+        "  {:<28} {}",
+        "collection",
+        if partial {
+            "partial".yellow().to_string()
+        } else {
+            "complete".green().to_string()
+        }
+    )
+    .unwrap();
+}
+
+fn render_source_activity_section(output: &mut String, summary: &serde_json::Value) {
+    let Some(rows) = summary.get("sources").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    output.push('\n');
+    writeln!(output, "{}", "Runtime Sources".cyan().bold()).unwrap();
+    writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
+
+    for row in rows {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        let scope = object
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let label = match object.get("profile_id").and_then(serde_json::Value::as_str) {
+            Some(profile_id) => format!("{scope}:{profile_id}"),
+            None => scope.to_string(),
+        };
+        let scrape_status = object
+            .get("scrape_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let sample_count = object
+            .get("sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let pid = object
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let api_port = object
+            .get("api_port")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let uptime = object
+            .get("uptime_secs")
+            .and_then(serde_json::Value::as_i64)
+            .map(format_uptime)
+            .unwrap_or_else(|| "-".to_string());
+        let totals = object
+            .get("totals")
+            .and_then(serde_json::Value::as_object)
+            .map(render_source_totals)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "no operator counters".to_string());
+
+        writeln!(
+            output,
+            "  {:<24} pid={} api={} scrape={} samples={} uptime={} {}",
+            label, pid, api_port, scrape_status, sample_count, uptime, totals
+        )
+        .unwrap();
+
+        if let Some(error) = object
+            .get("scrape_error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|error| !error.is_empty())
+        {
+            writeln!(output, "  {:<24} error={}", "", error).unwrap();
+        }
+    }
+}
+
+fn render_totals_section(output: &mut String, summary: &serde_json::Value) {
+    output.push('\n');
+    writeln!(output, "{}", "Totals".cyan().bold()).unwrap();
+    writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
     if let Some(totals) = summary.get("totals").and_then(serde_json::Value::as_object) {
         for (key, value) in totals {
             let count = value.as_u64().unwrap_or(0);
-            println!("  {:<28} {}", key.replace('_', "-"), count);
+            writeln!(output, "  {:<28} {}", key.replace('_', "-"), count).unwrap();
         }
     }
-
-    print_breakdown_section(summary, "retry_reasons", "Retry Reasons");
-    print_breakdown_section(summary, "timeout_reasons", "Timeout Reasons");
-    print_breakdown_section(summary, "duplicate_suppressions", "Duplicate Suppressions");
-    print_breakdown_section(summary, "child_session_orphans", "Child Session Orphans");
-    print_breakdown_section(summary, "workflow_phase_transitions", "Workflow Phase Transitions");
-    print_breakdown_section(summary, "result_delivery", "Result Delivery");
-    print_breakdown_section(summary, "session_replay", "Session Replay");
 }
 
-fn print_breakdown_section(summary: &serde_json::Value, key: &str, title: &str) {
+fn render_breakdown_section(
+    output: &mut String,
+    summary: &serde_json::Value,
+    key: &str,
+    title: &str,
+) {
     let Some(rows) = summary
         .get("breakdowns")
         .and_then(|value| value.get(key))
@@ -371,9 +520,9 @@ fn print_breakdown_section(summary: &serde_json::Value, key: &str, title: &str) 
         return;
     }
 
-    println!();
-    println!("{}", title.cyan().bold());
-    println!("{}", "─".repeat(60).dimmed());
+    output.push('\n');
+    writeln!(output, "{}", title.cyan().bold()).unwrap();
+    writeln!(output, "{}", "─".repeat(60).dimmed()).unwrap();
 
     for row in rows {
         let Some(object) = row.as_object() else {
@@ -389,8 +538,34 @@ fn print_breakdown_section(summary: &serde_json::Value, key: &str, title: &str) 
             .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or("unknown")))
             .collect::<Vec<_>>()
             .join(", ");
-        println!("  {:<48} {}", dims, count);
+        writeln!(output, "  {:<48} {}", dims, count).unwrap();
     }
+}
+
+fn render_source_totals(totals: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut active = totals
+        .iter()
+        .filter_map(|(name, value)| {
+            let count = value.as_u64().unwrap_or(0);
+            (count > 0).then(|| format!("{}={count}", name.replace('_', "-")))
+        })
+        .collect::<Vec<_>>();
+    active.sort();
+    active.join(", ")
+}
+
+fn format_uptime(uptime_secs: i64) -> String {
+    if uptime_secs < 60 {
+        return format!("{uptime_secs}s");
+    }
+    let minutes = uptime_secs / 60;
+    let seconds = uptime_secs % 60;
+    if minutes < 60 {
+        return format!("{minutes}m{seconds:02}s");
+    }
+    let hours = minutes / 60;
+    let rem_minutes = minutes % 60;
+    format!("{hours}h{rem_minutes:02}m")
 }
 
 #[cfg(test)]
@@ -399,13 +574,19 @@ mod tests {
 
     #[test]
     fn base_url_prefers_cli_then_env_then_default() {
-        assert_eq!(resolve_base_url(Some("https://example.com".into())), "https://example.com");
+        assert_eq!(
+            resolve_base_url(Some("https://example.com".into())),
+            "https://example.com"
+        );
         assert_eq!(resolve_base_url(None), "http://127.0.0.1:3000");
     }
 
     #[test]
     fn auth_token_filters_blank_values() {
-        assert_eq!(resolve_auth_token(Some("token".into())), Some("token".into()));
+        assert_eq!(
+            resolve_auth_token(Some("token".into())),
+            Some("token".into())
+        );
         assert_eq!(resolve_auth_token(Some("   ".into())), None);
     }
 
@@ -424,5 +605,75 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         run_reset_token(dir.path()).unwrap();
         assert!(!AdminTokenStore::new(dir.path()).exists());
+    }
+
+    #[test]
+    fn render_operator_summary_includes_collection_and_sources() {
+        let summary = serde_json::json!({
+            "available": true,
+            "collection": {
+                "running_gateways": 2,
+                "gateways_with_api_port": 1,
+                "gateways_missing_api_port": 1,
+                "scrape_failures": 1,
+                "sources_observed": 3,
+                "sources_with_metrics": 2,
+                "sources_without_metrics": 1,
+                "partial": true
+            },
+            "sources": [
+                {
+                    "scope": "serve",
+                    "scrape_status": "local",
+                    "available": true,
+                    "sample_count": 5,
+                    "totals": {
+                        "retries": 0,
+                        "timeouts": 1
+                    }
+                },
+                {
+                    "scope": "gateway",
+                    "profile_id": "alpha",
+                    "scrape_status": "failed",
+                    "scrape_error": "http 503",
+                    "available": false,
+                    "sample_count": 0,
+                    "api_port": 51001,
+                    "pid": 4242,
+                    "uptime_secs": 125,
+                    "totals": {
+                        "retries": 0,
+                        "timeouts": 0
+                    }
+                }
+            ],
+            "totals": {
+                "retries": 3,
+                "timeouts": 1
+            },
+            "breakdowns": {
+                "retry_reasons": [
+                    {"reason": "background_result_ack_timeout", "count": 3}
+                ]
+            }
+        });
+
+        let rendered = render_operator_summary("http://127.0.0.1:3000", &summary);
+
+        assert!(rendered.contains("Coverage"));
+        assert!(rendered.contains("Runtime Sources"));
+        assert!(rendered.contains("gateway:alpha"));
+        assert!(rendered.contains("error=http 503"));
+        assert!(rendered.contains("collection"));
+        assert!(rendered.contains("partial"));
+        assert!(rendered.contains("timeouts=1"));
+    }
+
+    #[test]
+    fn format_uptime_uses_short_human_units() {
+        assert_eq!(format_uptime(42), "42s");
+        assert_eq!(format_uptime(125), "2m05s");
+        assert_eq!(format_uptime(3665), "1h01m");
     }
 }

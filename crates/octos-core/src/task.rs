@@ -341,7 +341,10 @@ mod tests {
         let parsed: TaskResult = serde_json::from_str(&json).unwrap();
         assert!(parsed.success);
         assert_eq!(parsed.output, "all tests pass");
-        assert_eq!(parsed.files_to_send, vec![PathBuf::from("output/report.md")]);
+        assert_eq!(
+            parsed.files_to_send,
+            vec![PathBuf::from("output/report.md")]
+        );
         assert_eq!(parsed.token_usage.input_tokens, 100);
     }
 

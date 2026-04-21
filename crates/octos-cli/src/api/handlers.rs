@@ -1,7 +1,7 @@
 //! API request handlers.
 
-use std::convert::Infallible;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -19,6 +19,7 @@ use octos_bus::file_handle::{
     resolve_scoped_file_handle,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -161,13 +162,23 @@ fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String 
     routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key(
+fn standalone_api_session_key_candidates(
     state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
-) -> SessionKey {
+) -> Vec<SessionKey> {
     let profile_id = api_profile_id_from_headers(state, headers);
-    SessionKey::with_profile(&profile_id, "api", session_id)
+    let mut candidates = vec![
+        SessionKey::with_profile(&profile_id, "api", session_id),
+        SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id),
+        SessionKey::new("api", session_id),
+    ];
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates
+}
+
+fn encode_api_session_path_id(id: &str) -> String {
+    octos_bus::session::encode_path_component(id)
 }
 
 pub async fn chat(
@@ -189,6 +200,7 @@ pub async fn chat(
             req.topic.as_deref(),
             &req.media,
             req.attach_only,
+            req.stream,
         )
         .await;
     }
@@ -364,15 +376,34 @@ async fn chat_streaming(
 
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let provider = request_agent.llm_provider();
+                        let model = provider.model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(
+                        response.token_usage.input_tokens,
+                        response.token_usage.output_tokens,
+                    )
+                });
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    "session_cost": session_cost,
                 });
                 let _ = tx.send(done.to_string());
             }
@@ -554,7 +585,8 @@ fn session_messages_proxy_path(
     since_seq: Option<usize>,
     topic: Option<&str>,
 ) -> String {
-    let mut path = format!("/sessions/{id}/messages?limit={limit}&offset={offset}");
+    let encoded_id = encode_api_session_path_id(id);
+    let mut path = format!("/sessions/{encoded_id}/messages?limit={limit}&offset={offset}");
     if let Some(source) = source {
         path.push_str("&source=");
         path.push_str(source);
@@ -648,7 +680,8 @@ pub async fn session_status(
 ) -> Response {
     // Proxy to gateway (session actors live there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/status");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/status");
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
@@ -668,7 +701,8 @@ pub async fn session_event_stream(
     axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
 ) -> Response {
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/events/stream");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/events/stream");
         append_since_seq_query(&mut path, params.since_seq);
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
@@ -679,9 +713,12 @@ pub async fn session_event_stream(
         "topic": params.topic,
     })
     .to_string();
-    let stream =
-        futures::stream::iter(vec![Ok::<Event, Infallible>(Event::default().data(replay_complete))]);
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
+        Event::default().data(replay_complete),
+    )]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.
@@ -693,7 +730,8 @@ pub async fn session_tasks(
 ) -> Response {
     // Proxy to gateway (task supervisor lives there)
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let mut path = format!("/sessions/{id}/tasks");
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/tasks");
         append_topic_query(&mut path, params.topic.as_deref());
         return super::webhook_proxy::api_get_proxy(&state, port, &path).await;
     }
@@ -865,17 +903,24 @@ pub async fn delete_session(
 ) -> Response {
     // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
-        let key = standalone_api_session_key(&state, &headers, &id);
         let mut sess = sessions.lock().await;
-        if let Err(e) = sess.clear(&key).await {
-            tracing::error!(error = %e, "delete session from standalone store failed");
+        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.clear(&key).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "delete session from standalone store failed"
+                    );
+                }
+            }
         }
     }
 
     // Also proxy delete to gateway — sessions may live in the gateway's
     // SessionManager (per-profile data dir), not just the serve process's store.
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/sessions/{id}");
+        let path = format!("/sessions/{}", encode_api_session_path_id(&id));
         let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
 
@@ -1574,6 +1619,31 @@ fn site_build_needed(project_dir: &std::path::Path, output_dir: &std::path::Path
     }
 }
 
+fn site_build_cache_dir(project_dir: &std::path::Path) -> std::path::PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let project_key = project_dir
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let preferred = std::env::temp_dir()
+        .join("octos-site-build-npm-cache")
+        .join(user)
+        .join(project_key);
+    let _ = std::fs::create_dir_all(&preferred);
+    preferred
+}
+
+fn apply_site_build_env(command: &mut std::process::Command, project_dir: &std::path::Path) {
+    let cache_dir = site_build_cache_dir(project_dir);
+    command
+        .env("ASTRO_TELEMETRY_DISABLED", "1")
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir);
+}
+
 fn run_build_command(command: &mut std::process::Command, label: &str) -> Result<(), String> {
     let output = command
         .output()
@@ -1631,10 +1701,12 @@ fn ensure_site_build_output(
             if !project_dir.join("node_modules").exists() {
                 let mut install = std::process::Command::new("npm");
                 install.current_dir(project_dir).arg("install");
+                apply_site_build_env(&mut install, project_dir);
                 run_build_command(&mut install, "npm install")?;
             }
             let mut build = std::process::Command::new("npm");
             build.current_dir(project_dir).arg("run").arg("build");
+            apply_site_build_env(&mut build, project_dir);
             run_build_command(&mut build, "npm run build")?;
         }
         other => return Err(format!("unsupported site template: {other}")),
@@ -2547,15 +2619,34 @@ async fn ws_standalone_agent(
                 }
 
                 let provider_metadata = response.provider_metadata.clone();
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let provider = request_agent.llm_provider();
+                        let model = provider.model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(
+                        response.token_usage.input_tokens,
+                        response.token_usage.output_tokens,
+                    )
+                });
                 let done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
+                    "session_cost": session_cost,
                 });
                 let _ = tx.send(done.to_string());
             }
@@ -2716,6 +2807,33 @@ mod tests {
             base.join("users")
                 .join("api%3Aslides-123")
                 .join("workspace")
+        );
+    }
+
+    #[test]
+    fn encode_api_session_path_id_escapes_reserved_characters() {
+        assert_eq!(
+            encode_api_session_path_id("web-123#slides topic"),
+            "web-123%23slides%20topic"
+        );
+    }
+
+    #[test]
+    fn session_messages_proxy_path_encodes_session_id() {
+        let path = session_messages_proxy_path("web-123#slides", 25, 0, None, None, None);
+        assert!(path.starts_with("/sessions/web-123%23slides/messages?"));
+    }
+
+    #[test]
+    fn site_build_cache_dir_prefers_project_local_cache() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let cache_dir = site_build_cache_dir(project_dir.path());
+
+        assert!(cache_dir.starts_with(std::env::temp_dir()));
+        assert!(
+            cache_dir
+                .to_string_lossy()
+                .contains("octos-site-build-npm-cache")
         );
     }
 

@@ -695,7 +695,9 @@ fn maybe_install_binary(dir: &std::path::Path) {
                 serde_json::from_str::<crate::plugins::manifest::PluginManifest>(&manifest_str)
             {
                 if let Some(info) = manifest.binaries.get(&key) {
-                    if let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref()) {
+                    if !info.url.trim().is_empty()
+                        && let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref())
+                    {
                         return;
                     }
                 }
@@ -703,10 +705,17 @@ fn maybe_install_binary(dir: &std::path::Path) {
         }
     }
 
+    // For script-based skills, create a runnable wrapper before any network lookup.
+    if !has_cargo && let Ok(true) = crate::plugins::loader::ensure_plugin_executable(dir) {
+        return;
+    }
+
     // Try 2: download from skill registry (audited builds)
     if let Some(binaries) = lookup_registry_binaries(&dir_name) {
         if let Some(info) = binaries.get(&key) {
-            if let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref()) {
+            if !info.url.trim().is_empty()
+                && let Ok(true) = download_binary(dir, &info.url, info.sha256.as_deref())
+            {
                 return;
             }
         }
@@ -714,6 +723,7 @@ fn maybe_install_binary(dir: &std::path::Path) {
 
     // Try 3: cargo build if Cargo.toml exists
     if !has_cargo {
+        let _ = crate::plugins::loader::ensure_plugin_executable(dir);
         return;
     }
     let status = std::process::Command::new("cargo")
@@ -749,10 +759,19 @@ fn maybe_install_binary(dir: &std::path::Path) {
             }
         }
     }
+
+    // Final fallback: create a lazy launcher so the loader has an executable.
+    let _ = crate::plugins::loader::ensure_plugin_executable(dir);
 }
 
 fn platform_key() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    // Rust reports macOS as "macos", while skill manifests/registry
+    // conventionally publish Apple binaries under "darwin-*".
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{os}-{}", std::env::consts::ARCH)
 }
 
 #[derive(serde::Deserialize)]
@@ -883,6 +902,7 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn tool_metadata() {
@@ -972,5 +992,155 @@ mod tests {
         assert_eq!(extract_fm_value(content, "version"), Some("1.2.3".into()));
         assert_eq!(extract_fm_value(content, "author"), Some("test".into()));
         assert_eq!(extract_fm_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn platform_key_matches_manifest_convention() {
+        let key = platform_key();
+        #[cfg(target_os = "macos")]
+        assert_eq!(key, format!("darwin-{}", std::env::consts::ARCH));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            key,
+            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_wrapper(skill_dir: &std::path::Path, tool: &str, input_json: &str) -> (i32, String) {
+        let mut child = std::process::Command::new(skill_dir.join("main"))
+            .arg(tool)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input_json.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maybe_install_binary_generates_mofa_publish_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-publish");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
+  "name":"mofa-publish",
+  "version":"0.1.0",
+  "tools":[{"name":"mofa_publish","description":"deploy"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/publish_site.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"publish:$*\"\n",
+        )
+        .unwrap();
+
+        maybe_install_binary(&skill_dir);
+        assert!(skill_dir.join("main").exists());
+
+        let (status, stdout) = run_wrapper(
+            &skill_dir,
+            "mofa_publish",
+            r#"{"site_dir":"./docs","slug":"demo","setup_ci":true}"#,
+        );
+        assert_eq!(status, 0);
+        assert!(stdout.contains("publish:"));
+        assert!(stdout.contains("--site-dir ./docs"));
+        assert!(stdout.contains("--slug demo"));
+        assert!(stdout.contains("--setup-ci"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maybe_install_binary_generates_mofa_site_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-site");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
+  "name":"mofa-site",
+  "version":"0.1.0",
+  "tools":[{"name":"mofa_site","description":"site"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/bootstrap_quarto_lesson.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"quarto:$*\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/bootstrap_template.sh"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho \"template:$*\"\n",
+        )
+        .unwrap();
+
+        maybe_install_binary(&skill_dir);
+        assert!(skill_dir.join("main").exists());
+
+        let (status_quarto, stdout_quarto) = run_wrapper(
+            &skill_dir,
+            "mofa_site",
+            r#"{"content_dir":"./content","title":"Lesson"}"#,
+        );
+        assert_eq!(status_quarto, 0);
+        assert!(stdout_quarto.contains("quarto:"));
+        assert!(stdout_quarto.contains("--out-dir ./content/site"));
+        assert!(stdout_quarto.contains("--title Lesson"));
+
+        let (status_template, stdout_template) = run_wrapper(
+            &skill_dir,
+            "mofa_site",
+            r#"{"content_dir":"./content","template":"nextjs-app","title":"Forum"}"#,
+        );
+        assert_eq!(status_template, 0);
+        assert!(stdout_template.contains("template:"));
+        assert!(stdout_template.contains("--template nextjs-app"));
+        assert!(stdout_template.contains("--site-name Forum"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maybe_install_binary_generates_lazy_cargo_wrapper_for_mofa_podcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-podcast");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
+  "name":"mofa-podcast",
+  "version":"0.4.5",
+  "tools":[{"name":"podcast_generate","description":"podcast"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("Cargo.toml"),
+            r#"[package]
+name = "mofa-podcast"
+version = "0.4.5"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        maybe_install_binary(&skill_dir);
+        let wrapper = std::fs::read_to_string(skill_dir.join("main")).unwrap();
+        assert!(wrapper.contains("cargo build --release"));
+        assert!(wrapper.contains("target/release/mofa-podcast"));
     }
 }

@@ -148,6 +148,7 @@ WORKFLOW (follow in order):
 
 RULES:
 - ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
+- In slides sessions, `mofa_slides` is already active. Call it directly. Do not call `activate_tools(["mofa_slides"])`.
 - BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
 - ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
 - AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
@@ -1036,7 +1037,7 @@ mod tests {
 
     #[test]
     fn site_workspace_policy_tracks_template_build_output() {
-        let policy = octos_agent::WorkspacePolicy::for_site_build_output("out");
+        let policy = crate::workflows::site_delivery::workspace_policy_for_template("nextjs-app");
         assert_eq!(
             policy.validation.on_completion,
             vec!["file_exists:out/index.html"]

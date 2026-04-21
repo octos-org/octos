@@ -98,7 +98,7 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
-let profile = format!(
+        let profile = format!(
             r#"(version 1)
 (deny default)
 (allow process-exec)

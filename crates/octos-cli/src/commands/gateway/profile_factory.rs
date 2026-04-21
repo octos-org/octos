@@ -4,6 +4,7 @@
 //! Matrix child bot), this builder constructs a dedicated [`ActorFactory`] with
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -27,6 +28,68 @@ use crate::session_actor::{
     ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
     SnapshotToolRegistryFactory, ToolRegistryFactory,
 };
+
+fn profile_search_provider_keys(profile: &crate::profiles::UserProfile) -> HashMap<String, String> {
+    let resolved_env_vars = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+    profile
+        .config
+        .search
+        .as_ref()
+        .map(|search| {
+            search
+                .providers
+                .iter()
+                .filter_map(|(provider_id, provider)| {
+                    let source_key = provider.api_key_env.as_deref()?;
+                    let secret = resolved_env_vars
+                        .get(source_key)
+                        .cloned()
+                        .or_else(|| std::env::var(source_key).ok())?;
+                    Some((provider_id.clone(), secret))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn discover_ominix_url() -> Option<String> {
+    std::env::var("OMINIX_API_URL").ok().or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
+        std::fs::read_to_string(discovery)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn push_runtime_plugin_env(
+    plugin_env: &mut Vec<(String, String)>,
+    data_dir: &std::path::Path,
+    octos_home: &std::path::Path,
+    profile_id: &str,
+    ominix_url: Option<&str>,
+) {
+    plugin_env.push((
+        "OCTOS_DATA_DIR".to_string(),
+        data_dir.to_string_lossy().to_string(),
+    ));
+    plugin_env.push((
+        "OCTOS_HOME".to_string(),
+        octos_home.to_string_lossy().to_string(),
+    ));
+    plugin_env.push(("OCTOS_PROFILE_ID".to_string(), profile_id.to_string()));
+    plugin_env.push((
+        "OCTOS_VOICE_DIR".to_string(),
+        data_dir
+            .join("voice_profiles")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    if let Some(ominix_url) = ominix_url {
+        plugin_env.push(("OMINIX_API_URL".to_string(), ominix_url.to_string()));
+    }
+}
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
 /// (full LLM, provider name, adaptive router, strong-only LLM for slides)
@@ -357,6 +420,12 @@ impl ProfileActorFactoryBuilder {
             }
             let sandbox = octos_agent::create_sandbox(&sandbox_config);
             let mut tools = ToolRegistry::with_builtins_and_sandbox(&profile_data_dir, sandbox);
+            tools.set_output_dir_hint(
+                profile_data_dir
+                    .join("skill-output")
+                    .to_string_lossy()
+                    .to_string(),
+            );
             tools.inject_tool_config(self.tool_config.clone());
             if let Some(secs) = effective_profile.config.gateway.browser_timeout_secs {
                 tools.register(
@@ -375,17 +444,13 @@ impl ProfileActorFactoryBuilder {
             // Load plugins
             let plugin_work_dir = profile_data_dir.join("skill-output");
             let mut plugin_env = build_plugin_env(&profile_config, &provider_name);
-            plugin_env.push((
-                "OCTOS_DATA_DIR".to_string(),
-                profile_data_dir.to_string_lossy().to_string(),
-            ));
-            plugin_env.push((
-                "OCTOS_VOICE_DIR".to_string(),
-                profile_data_dir
-                    .join("voice_profiles")
-                    .to_string_lossy()
-                    .to_string(),
-            ));
+            push_runtime_plugin_env(
+                &mut plugin_env,
+                &profile_data_dir,
+                &self.project_dir,
+                profile_id,
+                discover_ominix_url().as_deref(),
+            );
             let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
@@ -412,10 +477,19 @@ impl ProfileActorFactoryBuilder {
             }
             actor_plugin_dirs = plugin_dirs.clone();
             actor_plugin_env = plugin_env;
+            let search_provider_keys = profile_search_provider_keys(&effective_profile);
+            if !search_provider_keys.is_empty() {
+                tools.register(
+                    octos_agent::WebSearchTool::new()
+                        .with_config(self.tool_config.clone())
+                        .with_provider_keys(search_provider_keys.clone()),
+                );
+            }
 
-            tools.register(octos_agent::DeepSearchTool::new(
-                profile_data_dir.join("research"),
-            ));
+            tools.register(
+                octos_agent::DeepSearchTool::new(profile_data_dir.join("research"))
+                    .with_provider_keys(search_provider_keys),
+            );
             tools.register(octos_agent::SynthesizeResearchTool::new(
                 llm.clone(),
                 profile_data_dir.clone(),

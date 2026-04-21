@@ -18,6 +18,197 @@ use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, SseBroadcaster, build_router, init_metrics};
 use crate::config::Config;
 
+fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
+    if !email.provider.eq_ignore_ascii_case("smtp") {
+        return false;
+    }
+
+    let host = email
+        .smtp_host
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let username = email.username.as_deref().map(str::trim).unwrap_or_default();
+    let from_address = email
+        .from_address
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    !host.is_empty() && !username.is_empty() && !from_address.is_empty()
+}
+
+fn profile_dashboard_auth_priority(profile: &crate::profiles::UserProfile) -> (u8, bool, &str) {
+    let tier = if profile.id == crate::api::auth_handlers::ADMIN_PROFILE_ID {
+        0
+    } else if profile.config.admin_mode {
+        1
+    } else if profile.enabled && profile.parent_id.is_none() {
+        2
+    } else if profile.enabled {
+        3
+    } else {
+        4
+    };
+    let usable_email = profile
+        .config
+        .email
+        .as_ref()
+        .is_some_and(smtp_email_is_usable);
+    (tier, !usable_email, &profile.id)
+}
+
+fn preferred_dashboard_auth_profiles(
+    profile_store: &crate::profiles::ProfileStore,
+) -> Vec<crate::profiles::UserProfile> {
+    let mut profiles = profile_store.list().unwrap_or_default();
+    profiles.sort_by(|a, b| {
+        profile_dashboard_auth_priority(a).cmp(&profile_dashboard_auth_priority(b))
+    });
+    profiles
+}
+
+fn derive_dashboard_auth_from_profile(
+    profile: &crate::profiles::UserProfile,
+) -> Option<(crate::otp::DashboardAuthConfig, Option<String>)> {
+    let email = profile.config.email.as_ref()?;
+    if !smtp_email_is_usable(email) {
+        return None;
+    }
+
+    let host = email.smtp_host.as_ref()?.trim();
+    let username = email.username.as_ref()?.trim();
+    let from_address = email.from_address.as_ref()?.trim();
+    let password = resolve_profile_email_secret(email, &profile.config.env_vars);
+    let password_env = email
+        .password_env
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("SMTP_PASSWORD")
+        .to_string();
+
+    Some((
+        crate::otp::DashboardAuthConfig {
+            smtp: crate::otp::SmtpConfig {
+                host: host.to_string(),
+                port: email.smtp_port.unwrap_or(465),
+                username: username.to_string(),
+                password_env,
+                from_address: from_address.to_string(),
+            },
+            session_expiry_hours: 24,
+            allow_self_registration: false,
+            static_tokens: Vec::new(),
+        },
+        password,
+    ))
+}
+
+fn derive_dashboard_auth_from_profiles(
+    profile_store: &crate::profiles::ProfileStore,
+) -> Option<(crate::otp::DashboardAuthConfig, Option<String>)> {
+    for profile in preferred_dashboard_auth_profiles(profile_store) {
+        if let Some(derived) = derive_dashboard_auth_from_profile(&profile) {
+            tracing::info!(profile = %profile.id, "derived dashboard_auth.smtp from profile email tool config");
+            return Some(derived);
+        }
+    }
+    None
+}
+
+fn resolve_profile_email_secret(
+    email: &crate::profiles::EmailSettings,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(password) = email.password.as_ref().filter(|value| !value.is_empty()) {
+        return Some(password.clone());
+    }
+
+    let password_env = email
+        .password_env
+        .as_ref()
+        .filter(|value| !value.is_empty())?;
+    let value = env_vars.get(password_env)?;
+    if value == crate::auth::keychain::KEYCHAIN_MARKER {
+        crate::auth::keychain::get_secret(password_env)
+            .ok()
+            .flatten()
+            .filter(|secret| !secret.is_empty())
+    } else if value.is_empty() {
+        None
+    } else {
+        Some(value.clone())
+    }
+}
+
+fn profile_email_matches_dashboard_smtp(
+    email: &crate::profiles::EmailSettings,
+    smtp: &crate::otp::SmtpConfig,
+) -> bool {
+    email.provider.eq_ignore_ascii_case("smtp")
+        && email
+            .smtp_host
+            .as_deref()
+            .is_some_and(|host| host == smtp.host)
+        && email
+            .username
+            .as_deref()
+            .is_some_and(|username| username == smtp.username)
+        && email
+            .from_address
+            .as_deref()
+            .is_some_and(|from_address| from_address == smtp.from_address)
+}
+
+fn resolve_dashboard_auth_smtp_password(
+    profile_store: &crate::profiles::ProfileStore,
+    auth_config: &crate::otp::DashboardAuthConfig,
+) -> Option<String> {
+    if std::env::var(&auth_config.smtp.password_env).is_ok() {
+        return None;
+    }
+
+    for profile in preferred_dashboard_auth_profiles(profile_store) {
+        if let Some(email) = profile.config.email.as_ref() {
+            if profile_email_matches_dashboard_smtp(email, &auth_config.smtp) {
+                if let Some(secret) = resolve_profile_email_secret(email, &profile.config.env_vars)
+                {
+                    tracing::info!(
+                        profile = %profile.id,
+                        "SMTP password resolved from matching profile email tool config"
+                    );
+                    return Some(secret);
+                }
+            }
+        }
+    }
+
+    let profiles_for_smtp = profile_store.list().unwrap_or_default();
+    for profile in &profiles_for_smtp {
+        if let Some(password) = profile.config.env_vars.get(&auth_config.smtp.password_env) {
+            if password == crate::auth::keychain::KEYCHAIN_MARKER {
+                if let Ok(Some(secret)) =
+                    crate::auth::keychain::get_secret(&auth_config.smtp.password_env)
+                {
+                    tracing::info!(
+                        var = %auth_config.smtp.password_env,
+                        "SMTP password resolved from keychain"
+                    );
+                    return Some(secret);
+                }
+            } else if !password.is_empty() {
+                tracing::info!(
+                    var = %auth_config.smtp.password_env,
+                    profile = %profile.id,
+                    "SMTP password resolved from profile env_vars"
+                );
+                return Some(password.clone());
+            }
+        }
+    }
+
+    None
+}
+
 /// Start the REST API server.
 #[derive(Debug, Args)]
 pub struct ServeCommand {
@@ -164,45 +355,39 @@ impl ServeCommand {
                 .wrap_err("failed to open login allowlist store")?,
         );
         let auth_manager = {
-            let auth_config = config.dashboard_auth.clone();
-            if auth_config.is_none() {
-                tracing::warn!(
-                    "no dashboard_auth.smtp configured — OTP codes will be logged to console only"
-                );
-            }
+            let (auth_config, derived_profile_password) = match config.dashboard_auth.clone() {
+                Some(auth) => (Some(auth), None),
+                None => {
+                    let derived = derive_dashboard_auth_from_profiles(&profile_store);
+                    if derived.is_some() {
+                        tracing::info!(
+                            "derived dashboard_auth.smtp from a profile email tool config"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "no dashboard_auth.smtp configured and no usable profile SMTP email tool found — OTP codes will be logged to console only"
+                        );
+                    }
+                    match derived {
+                        Some((auth, password)) => (Some(auth), password),
+                        None => (None, None),
+                    }
+                }
+            };
             let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
                 .with_sessions_path(data_dir.join("auth_sessions.json"));
 
-            // Resolve SMTP password from profile env_vars as fallback
+            if let Some(password) = derived_profile_password {
+                mgr = mgr.with_smtp_password(password);
+            }
+
+            // Resolve SMTP password from profile email config / env_vars as fallback
             // (covers nohup startup where LaunchAgent env vars aren't available)
             if let Some(ref auth_cfg) = auth_config {
-                let pw_env = &auth_cfg.smtp.password_env;
-                if std::env::var(pw_env).is_err() {
-                    let profiles_for_smtp = profile_store.list().unwrap_or_default();
-                    for p in &profiles_for_smtp {
-                        if let Some(pw) = p.config.env_vars.get(pw_env) {
-                            if pw == crate::auth::keychain::KEYCHAIN_MARKER {
-                                // Resolve from keychain
-                                if let Ok(Some(secret)) = crate::auth::keychain::get_secret(pw_env)
-                                {
-                                    tracing::info!(
-                                        var = %pw_env,
-                                        "SMTP password resolved from keychain"
-                                    );
-                                    mgr = mgr.with_smtp_password(secret);
-                                    break;
-                                }
-                            } else if !pw.is_empty() {
-                                tracing::info!(
-                                    var = %pw_env,
-                                    profile = %p.id,
-                                    "SMTP password resolved from profile env_vars"
-                                );
-                                mgr = mgr.with_smtp_password(pw.clone());
-                                break;
-                            }
-                        }
-                    }
+                if let Some(password) =
+                    resolve_dashboard_auth_smtp_password(&profile_store, auth_cfg)
+                {
+                    mgr = mgr.with_smtp_password(password);
                 }
             }
 
@@ -284,7 +469,7 @@ impl ServeCommand {
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
-                    if p.config.provider.is_none() && p.config.model.is_none() {
+                    if !p.config.has_llm_selection() {
                         tracing::warn!(
                             profile = %p.id,
                             "skipping auto-start: no LLM provider configured"
@@ -715,5 +900,230 @@ mod tests {
         };
 
         assert_eq!(config.mode, crate::config::DeploymentMode::Cloud);
+    }
+
+    #[test]
+    fn derives_dashboard_auth_from_admin_profile_email_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&crate::profiles::UserProfile {
+                id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
+                name: "Admin".into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig {
+                    email: Some(crate::profiles::EmailSettings {
+                        provider: "smtp".into(),
+                        smtp_host: Some("smtp.example.com".into()),
+                        smtp_port: Some(587),
+                        username: Some("admin@example.com".into()),
+                        password_env: Some("SMTP_PASSWORD".into()),
+                        password: None,
+                        from_address: Some("admin@example.com".into()),
+                        feishu_app_id: None,
+                        feishu_app_secret_env: None,
+                        feishu_app_secret: None,
+                        feishu_from_address: None,
+                        feishu_region: None,
+                    }),
+                    env_vars: std::collections::HashMap::from([(
+                        "SMTP_PASSWORD".into(),
+                        "secret".into(),
+                    )]),
+                    ..Default::default()
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let (auth, password) = derive_dashboard_auth_from_profiles(&store)
+            .expect("dashboard auth should derive from admin profile");
+        assert_eq!(auth.smtp.host, "smtp.example.com");
+        assert_eq!(auth.smtp.port, 587);
+        assert_eq!(auth.smtp.username, "admin@example.com");
+        assert_eq!(auth.smtp.password_env, "SMTP_PASSWORD");
+        assert_eq!(auth.smtp.from_address, "admin@example.com");
+        assert_eq!(password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn dashboard_smtp_password_prefers_matching_admin_profile_email_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&crate::profiles::UserProfile {
+                id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
+                name: "Admin".into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig {
+                    email: Some(crate::profiles::EmailSettings {
+                        provider: "smtp".into(),
+                        smtp_host: Some("smtp.example.com".into()),
+                        smtp_port: Some(465),
+                        username: Some("admin@example.com".into()),
+                        password_env: Some("IGNORED_ENV".into()),
+                        password: Some("secret".into()),
+                        from_address: Some("admin@example.com".into()),
+                        feishu_app_id: None,
+                        feishu_app_secret_env: None,
+                        feishu_app_secret: None,
+                        feishu_from_address: None,
+                        feishu_region: None,
+                    }),
+                    ..Default::default()
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let auth = crate::otp::DashboardAuthConfig {
+            smtp: crate::otp::SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 465,
+                username: "admin@example.com".into(),
+                password_env: "SMTP_PASSWORD".into(),
+                from_address: "admin@example.com".into(),
+            },
+            session_expiry_hours: 24,
+            allow_self_registration: false,
+            static_tokens: Vec::new(),
+        };
+
+        let password = resolve_dashboard_auth_smtp_password(&store, &auth);
+        assert_eq!(password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn derives_dashboard_auth_from_first_usable_non_admin_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&crate::profiles::UserProfile {
+                id: crate::api::auth_handlers::ADMIN_PROFILE_ID.into(),
+                name: "Admin".into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig {
+                    email: Some(crate::profiles::EmailSettings {
+                        provider: "smtp".into(),
+                        smtp_host: Some(String::new()),
+                        smtp_port: Some(465),
+                        username: Some(String::new()),
+                        password_env: Some("SMTP_PASSWORD".into()),
+                        password: None,
+                        from_address: Some(String::new()),
+                        feishu_app_id: None,
+                        feishu_app_secret_env: None,
+                        feishu_app_secret: None,
+                        feishu_from_address: None,
+                        feishu_region: None,
+                    }),
+                    ..Default::default()
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        store
+            .save(&crate::profiles::UserProfile {
+                id: "dspfac".into(),
+                name: "DSPFAC".into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig {
+                    email: Some(crate::profiles::EmailSettings {
+                        provider: "smtp".into(),
+                        smtp_host: Some("smtp.gmail.com".into()),
+                        smtp_port: Some(465),
+                        username: Some("dspfac@gmail.com".into()),
+                        password_env: Some("SMTP_PASSWORD".into()),
+                        password: Some("app-password".into()),
+                        from_address: Some("dspfac@gmail.com".into()),
+                        feishu_app_id: None,
+                        feishu_app_secret_env: None,
+                        feishu_app_secret: None,
+                        feishu_from_address: None,
+                        feishu_region: None,
+                    }),
+                    ..Default::default()
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let (auth, password) = derive_dashboard_auth_from_profiles(&store)
+            .expect("dashboard auth should derive from usable profile");
+        assert_eq!(auth.smtp.host, "smtp.gmail.com");
+        assert_eq!(auth.smtp.username, "dspfac@gmail.com");
+        assert_eq!(auth.smtp.from_address, "dspfac@gmail.com");
+        assert_eq!(password.as_deref(), Some("app-password"));
+    }
+
+    #[test]
+    fn dashboard_smtp_password_prefers_matching_non_admin_profile_email_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::profiles::ProfileStore::open(dir.path()).unwrap();
+        store
+            .save(&crate::profiles::UserProfile {
+                id: "dspfac".into(),
+                name: "DSPFAC".into(),
+                enabled: true,
+                data_dir: None,
+                parent_id: None,
+                public_subdomain: None,
+                config: crate::profiles::ProfileConfig {
+                    email: Some(crate::profiles::EmailSettings {
+                        provider: "smtp".into(),
+                        smtp_host: Some("smtp.gmail.com".into()),
+                        smtp_port: Some(587),
+                        username: Some("dspfac@gmail.com".into()),
+                        password_env: Some("eqepkfbyfymwfhnv".into()),
+                        password: Some("app-password".into()),
+                        from_address: Some("dspfac@gmail.com".into()),
+                        feishu_app_id: None,
+                        feishu_app_secret_env: None,
+                        feishu_app_secret: None,
+                        feishu_from_address: None,
+                        feishu_region: None,
+                    }),
+                    env_vars: std::collections::HashMap::from([(
+                        "SMTP_PASSWORD".into(),
+                        crate::auth::keychain::KEYCHAIN_MARKER.into(),
+                    )]),
+                    ..Default::default()
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let auth = crate::otp::DashboardAuthConfig {
+            smtp: crate::otp::SmtpConfig {
+                host: "smtp.gmail.com".into(),
+                port: 465,
+                username: "dspfac@gmail.com".into(),
+                password_env: "SMTP_PASSWORD".into(),
+                from_address: "dspfac@gmail.com".into(),
+            },
+            session_expiry_hours: 24,
+            allow_self_registration: false,
+            static_tokens: Vec::new(),
+        };
+
+        let password = resolve_dashboard_auth_smtp_password(&store, &auth);
+        assert_eq!(password.as_deref(), Some("app-password"));
     }
 }

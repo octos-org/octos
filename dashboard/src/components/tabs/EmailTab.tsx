@@ -51,7 +51,7 @@ export default function EmailTab({ config, onChange }: Props) {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium text-gray-300">Send Email Tool</p>
-          <p className="text-xs text-gray-500">Allow the agent to send emails.</p>
+          <p className="text-xs text-gray-500">Allow the agent to send emails. On the admin profile, SMTP settings here also back dashboard OTP login email when a separate dashboard SMTP config is not set.</p>
         </div>
         <button
           onClick={toggleEnabled}

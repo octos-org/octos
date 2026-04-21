@@ -18,6 +18,19 @@ import type {
 
 const BASE = '/api/admin'
 
+export interface SkillRegistryPackage {
+  name: string
+  description: string
+  repo: string
+  version: string | null
+  author: string | null
+  license: string | null
+  skills: string[]
+  requires: string[]
+  provides_tools: boolean
+  tags: string[]
+}
+
 function getHeaders(): HeadersInit {
   const headers: HeadersInit = { 'Content-Type': 'application/json' }
   const token = localStorage.getItem('octos_session_token')
@@ -302,6 +315,25 @@ export const myApi = {
   providerMetrics: () =>
     authedRequest<SharedMetrics | null>('/my/profile/metrics'),
 
+  listProfileSkills: () =>
+    authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(
+      '/my/profile/skills',
+    ),
+
+  listProfileSkillRegistry: (query?: string) =>
+    authedRequest<{ packages: SkillRegistryPackage[] }>(
+      `/my/profile/skills/registry${query ? `?q=${encodeURIComponent(query)}` : ''}`,
+    ),
+
+  installProfileSkill: (data: { repo: string; force: boolean; branch: string }) =>
+    authedRequest<{ ok: boolean; installed: string[]; skipped: string[]; deps_installed: boolean }>(
+      '/my/profile/skills',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
+
+  removeProfileSkill: (name: string) =>
+    authedRequest<ActionResponse>(`/my/profile/skills/${name}`, { method: 'DELETE' }),
+
   testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string; models?: string[] }>('/my/test-provider', {
       method: 'POST',
@@ -314,7 +346,7 @@ export const myApi = {
       body: JSON.stringify(data),
     }),
 
-  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string }) =>
+  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string; profile_id?: string }) =>
     authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-search', {
       method: 'POST',
       body: JSON.stringify(data),

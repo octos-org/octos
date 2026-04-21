@@ -1,10 +1,14 @@
 import { useState, useEffect, useCallback } from 'react'
-import type { ProfileConfig, FallbackModel } from '../../types'
-import { PROVIDERS } from '../../types'
+import type {
+  ProfileConfig,
+  LlmModelSelectionConfig,
+  LlmRouteConfig,
+} from '../../types'
 import { myApi } from '../../api'
 import _PROVIDER_MODELS from '../../providers.json'
 
-const CUSTOM_PROVIDER = '__custom__'
+const CUSTOM_FAMILY = '__custom_family__'
+const CUSTOM_MODEL = '__custom_model__'
 
 /** An API host that serves one or more models. Empty base_url = family default. */
 interface ModelEndpoint {
@@ -12,10 +16,6 @@ interface ModelEndpoint {
   label: string
   base_url?: string
   api_key_env?: string
-}
-
-function isKnownProvider(provider: string | null | undefined): boolean {
-  return !!provider && (PROVIDERS as readonly string[]).includes(provider)
 }
 
 interface ModelEntry {
@@ -26,6 +26,23 @@ interface ModelEntry {
 }
 
 const PROVIDER_MODELS = _PROVIDER_MODELS as Record<string, { env: string; models: ModelEntry[] }>
+const PROVIDER_FAMILIES = Object.keys(PROVIDER_MODELS)
+
+function findMatchingId(ids: string[], id: string | null | undefined): string | null {
+  if (!id) return null
+  const exact = ids.find((item) => item === id)
+  if (exact) return exact
+  const lower = id.toLowerCase()
+  return ids.find((item) => item.toLowerCase() === lower) || null
+}
+
+function isKnownProvider(provider: string | null | undefined): boolean {
+  return !!provider && Object.prototype.hasOwnProperty.call(PROVIDER_MODELS, provider)
+}
+
+function providerRouteKey(provider: string | null | undefined, baseUrl?: string | null): string {
+  return `${provider || ''}::${baseUrl || ''}`
+}
 
 // Provider registry handles all providers natively — no mapping needed.
 
@@ -37,37 +54,44 @@ function getApiKeyEnvName(provider: string | null | undefined): string {
 /** Find a model entry in the family's catalogue by id. */
 function findModelEntry(provider: string | null | undefined, modelId: string | null | undefined): ModelEntry | undefined {
   if (!provider || !modelId) return undefined
-  return PROVIDER_MODELS[provider]?.models.find((m) => m.id === modelId)
+  const models = PROVIDER_MODELS[provider]?.models || []
+  const matchedId = findMatchingId(models.map((m) => m.id), modelId)
+  return matchedId ? models.find((m) => m.id === matchedId) : undefined
 }
 
 /** Find the endpoint in `model.endpoints` that matches (base_url, api_key_env). */
-function findMatchingEndpoint(model: ModelEntry | undefined, baseUrl: string | null | undefined, apiKeyEnv: string | null | undefined): ModelEndpoint | undefined {
+function findMatchingEndpoint(
+  model: ModelEntry | undefined,
+  route: LlmRouteConfig | null | undefined,
+): ModelEndpoint | undefined {
   if (!model?.endpoints) return undefined
+  if (route?.route_id) {
+    const byId = model.endpoints.find((e) => e.id === route.route_id)
+    if (byId) return byId
+  }
   return model.endpoints.find((e) =>
-    (e.base_url || '') === (baseUrl || '') &&
-    (!e.api_key_env || e.api_key_env === apiKeyEnv)
+    (e.base_url || '') === (route?.base_url || '') &&
+    (!e.api_key_env || e.api_key_env === route?.api_key_env)
   )
 }
 
-function getModelIds(provider: string, fetched?: Record<string, string[]>): string[] {
+function getModelIds(provider: string, fetched?: Record<string, string[]>, baseUrl?: string | null): string[] {
   const staticIds = (PROVIDER_MODELS[provider]?.models || []).map((m) => m.id)
-  const dynamicIds = fetched?.[provider] || []
+  const dynamicIds = fetched?.[providerRouteKey(provider, baseUrl)] || []
   // Merge: static first, then any dynamic models not already in static
-  const seen = new Set(staticIds)
+  const seen = new Set(staticIds.map((id) => id.toLowerCase()))
   const merged = [...staticIds]
   for (const id of dynamicIds) {
-    if (!seen.has(id)) {
+    if (!seen.has(id.toLowerCase())) {
       merged.push(id)
-      seen.add(id)
+      seen.add(id.toLowerCase())
     }
   }
   return merged
 }
 
 function getModelPricing(provider: string, modelId: string): ModelEntry | null {
-  const entry = PROVIDER_MODELS[provider]
-  if (!entry) return null
-  return entry.models.find((m) => m.id === modelId) || null
+  return findModelEntry(provider, modelId) || null
 }
 
 function formatPrice(p: ModelEntry): string {
@@ -75,14 +99,96 @@ function formatPrice(p: ModelEntry): string {
   return `$${p.input}/M in, $${p.output}/M out`
 }
 
+function formatEndpointSummary(model: ModelEntry | undefined): string | null {
+  const endpoints = model?.endpoints || []
+  if (endpoints.length === 0) return null
+  return endpoints.map((ep) => ep.label).join(', ')
+}
+
+function nullable(value: string | null | undefined): string | null {
+  return value && value.length > 0 ? value : null
+}
+
+function buildRouteFromEndpoint(
+  provider: string | null | undefined,
+  endpoint: ModelEndpoint | undefined,
+): LlmRouteConfig {
+  return {
+    route_id: endpoint?.id || null,
+    label: endpoint?.label || (provider ? 'Official API' : null),
+    base_url: nullable(endpoint?.base_url),
+    api_key_env: nullable(endpoint?.api_key_env || getApiKeyEnvName(provider)),
+    api_type: null,
+  }
+}
+
+function buildRouteForModel(
+  provider: string | null | undefined,
+  modelId: string | null | undefined,
+  route: LlmRouteConfig | null | undefined,
+): LlmRouteConfig {
+  const model = findModelEntry(provider, modelId)
+  const matched = findMatchingEndpoint(model, route)
+  if (matched) return buildRouteFromEndpoint(provider, matched)
+  return buildRouteFromEndpoint(provider, model?.endpoints?.[0])
+}
+
+function getRouteLabel(
+  provider: string | null | undefined,
+  modelId: string | null | undefined,
+  route: LlmRouteConfig | null | undefined,
+): string {
+  const model = findModelEntry(provider, modelId)
+  return (
+    findMatchingEndpoint(model, route)?.label ||
+    nullable(route?.label) ||
+    'Official API'
+  )
+}
+
+function getPrimarySelection(config: ProfileConfig): LlmModelSelectionConfig {
+  return (
+    config.llm?.primary || {
+      family_id: 'anthropic',
+      model_id: 'claude-sonnet-4-20250514',
+      route: {
+        route_id: null,
+        label: null,
+        base_url: null,
+        api_key_env: 'ANTHROPIC_API_KEY',
+        api_type: null,
+      },
+    }
+  )
+}
+
+function getFallbackSelections(config: ProfileConfig): LlmModelSelectionConfig[] {
+  return config.llm?.fallbacks || []
+}
+
+function applySelections(
+  config: ProfileConfig,
+  primary: LlmModelSelectionConfig,
+  fallbacks: LlmModelSelectionConfig[],
+): ProfileConfig {
+  return {
+    ...config,
+    llm: {
+      primary,
+      fallbacks,
+    },
+  }
+}
+
 /** Generate a unique env var name for a fallback, avoiding collisions. */
-function getFallbackEnvName(provider: string, index: number, allFallbacks: FallbackModel[], primaryEnv: string): string {
+function getFallbackEnvName(provider: string, index: number, allFallbacks: LlmModelSelectionConfig[], primaryEnv: string): string {
   const baseEnv = getApiKeyEnvName(provider)
   if (!baseEnv) return `FALLBACK_${index}_API_KEY`
   // Check if primary or another fallback already uses this env name
   const usedByPrimary = primaryEnv === baseEnv
   const usedByEarlierFallback = allFallbacks.some(
-    (fb, i) => i < index && (fb.api_key_env || getApiKeyEnvName(fb.provider)) === baseEnv
+    (fb, i) =>
+      i < index && ((fb.route?.api_key_env) || getApiKeyEnvName(fb.family_id)) === baseEnv
   )
   // If no collision, use the base name (allows sharing keys between primary and fallback intentionally)
   if (!usedByPrimary && !usedByEarlierFallback) return baseEnv
@@ -107,19 +213,22 @@ interface TestResult {
 }
 
 export default function LlmProviderTab({ config, onChange, profileId }: Props) {
-  // Prefer the explicitly configured api_key_env — it reflects endpoint choice
-  // (e.g., AUTODL_API_KEY when moonshot is routed through AutoDL).
-  const primaryEnv = config.api_key_env || getApiKeyEnvName(config.provider)
-  const fallbacks = config.fallback_models || []
+  const primary = getPrimarySelection(config)
+  const primaryProvider = primary.family_id || ''
+  const primaryModel = primary.model_id || ''
+  const primaryBaseUrl = primary.route?.base_url || ''
+  const primaryRouteLabel = getRouteLabel(primaryProvider, primaryModel, primary.route)
+  const primaryEnv = primary.route?.api_key_env || getApiKeyEnvName(primaryProvider)
+  const fallbacks = getFallbackSelections(config)
 
   // Test results keyed by index (-1 = primary)
   const [testResults, setTestResults] = useState<Record<number, TestResult>>({})
-  // Dynamic models fetched from provider APIs (keyed by provider name)
+  // Dynamic models fetched from provider APIs, keyed by provider family + route.
   const [fetchedModels, setFetchedModels] = useState<Record<string, string[]>>({})
 
-  // Auto-fetch model lists from all configured providers on mount
   const fetchModelsForProvider = useCallback(async (provider: string, apiKeyEnv?: string | null, baseUrl?: string | null) => {
-    if (!provider || fetchedModels[provider]) return
+    const routeKey = providerRouteKey(provider, baseUrl)
+    if (!provider || fetchedModels[routeKey]) return
     try {
       const models = await myApi.fetchProviderModels({
         provider,
@@ -129,63 +238,77 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
         profile_id: profileId,
       })
       if (models.length > 0) {
-        setFetchedModels((s) => ({ ...s, [provider]: models }))
+        setFetchedModels((s) => ({ ...s, [routeKey]: models }))
       }
     } catch {
       // silently ignore — provider may not support /v1/models
     }
-  }, [fetchedModels])
+  }, [fetchedModels, profileId])
 
   useEffect(() => {
-    // Fetch for primary provider
-    if (config.provider) {
-      fetchModelsForProvider(config.provider, config.api_key_env, config.base_url)
+    if (primaryProvider) {
+      fetchModelsForProvider(primaryProvider, primaryEnv, primaryBaseUrl)
     }
-    // Fetch for each fallback provider
     for (const fb of fallbacks) {
-      if (fb.provider) {
-        fetchModelsForProvider(fb.provider, fb.api_key_env, fb.base_url)
+      if (fb.family_id) {
+        fetchModelsForProvider(
+          fb.family_id,
+          fb.route?.api_key_env || getApiKeyEnvName(fb.family_id),
+          fb.route?.base_url,
+        )
       }
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchModelsForProvider, fallbacks, primaryBaseUrl, primaryEnv, primaryProvider])
+
+  const updateSelections = (
+    nextPrimary: LlmModelSelectionConfig,
+    nextFallbacks: LlmModelSelectionConfig[],
+  ) => {
+    onChange(applySelections(config, nextPrimary, nextFallbacks))
+  }
 
   const updateConfig = (patch: Partial<ProfileConfig>) => {
-    onChange({ ...config, ...patch })
+    onChange({ ...applySelections(config, primary, fallbacks), ...patch })
   }
 
   /** Change primary provider — updates provider, model, and api_key_env together.
-   * Picks the first model and its first endpoint (if any) as defaults. */
+   * Picks the first model and its first route (if any) as defaults. */
   const changePrimaryProvider = (provider: string | null) => {
     const modelId = getModelIds(provider || '', fetchedModels)[0] || null
-    const modelEntry = findModelEntry(provider, modelId)
-    const ep = modelEntry?.endpoints?.[0]
-    const envName = ep?.api_key_env || getApiKeyEnvName(provider)
-    updateConfig({
-      provider,
-      model: modelId,
-      api_key_env: envName,
-      base_url: ep?.base_url ?? (isKnownProvider(provider) ? null : config.base_url ?? null),
-    })
+    updateSelections(
+      {
+        ...primary,
+        family_id: provider,
+        model_id: modelId,
+        route: buildRouteForModel(provider, modelId, null),
+      },
+      fallbacks,
+    )
   }
 
-  /** Change primary model — picks the model's first endpoint (if any) for base_url/api_key_env. */
+  /** Change primary model while preserving the current custom or matching route when possible. */
   const changePrimaryModel = (modelId: string) => {
-    const modelEntry = findModelEntry(config.provider, modelId)
-    const ep = modelEntry?.endpoints?.[0]
-    const envName = ep?.api_key_env || getApiKeyEnvName(config.provider)
-    updateConfig({
-      model: modelId,
-      api_key_env: envName,
-      base_url: ep?.base_url ?? null,
-    })
+    updateSelections(
+      {
+        ...primary,
+        model_id: modelId,
+        route: buildRouteForModel(primaryProvider, modelId, null),
+      },
+      fallbacks,
+    )
   }
 
-  /** Switch the endpoint (host) for the currently selected model. */
-  const changePrimaryEndpoint = (ep: ModelEndpoint) => {
-    updateConfig({
-      base_url: ep.base_url ?? null,
-      api_key_env: ep.api_key_env || getApiKeyEnvName(config.provider),
-    })
+  const changePrimaryRoute = (routeId: string) => {
+    const modelEntry = findModelEntry(primaryProvider, primaryModel)
+    const endpoint = modelEntry?.endpoints?.find((ep) => ep.id === routeId)
+    if (!endpoint) return
+    updateSelections(
+      {
+        ...primary,
+        route: buildRouteFromEndpoint(primaryProvider, endpoint),
+      },
+      fallbacks,
+    )
   }
 
   /** Change primary API key value. */
@@ -196,18 +319,40 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
     } else {
       delete newEnvVars[primaryEnv]
     }
-    updateConfig({ api_key_env: primaryEnv, env_vars: newEnvVars })
+    updateConfig({
+      env_vars: newEnvVars,
+      llm: {
+        primary: {
+          ...primary,
+          route: {
+            ...(primary.route || {}),
+            api_key_env: primaryEnv,
+          },
+        },
+        fallbacks,
+      },
+    })
   }
 
-  const setFallbacks = (fbs: FallbackModel[]) => {
-    updateConfig({ fallback_models: fbs })
+  const setFallbacks = (fbs: LlmModelSelectionConfig[]) => {
+    updateSelections(primary, fbs)
   }
 
   const addFallback = () => {
     const provider = 'deepseek'
     const models = getModelIds(provider, fetchedModels)
     const env = getFallbackEnvName(provider, 0, fallbacks, primaryEnv)
-    setFallbacks([{ provider, model: models[0] || null, api_key_env: env }, ...fallbacks])
+    setFallbacks([{
+      family_id: provider,
+      model_id: models[0] || null,
+      route: {
+        route_id: null,
+        label: null,
+        base_url: null,
+        api_key_env: env,
+        api_type: null,
+      },
+    }, ...fallbacks])
     // Scroll to the new fallback after render
     setTimeout(() => document.getElementById('fallback-0')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100)
   }
@@ -215,38 +360,47 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   /** Change fallback provider — updates provider, model, and api_key_env together. */
   const changeFallbackProvider = (idx: number, provider: string) => {
     const modelId = getModelIds(provider, fetchedModels)[0] || null
-    const modelEntry = findModelEntry(provider, modelId)
-    const ep = modelEntry?.endpoints?.[0]
-    const envName = ep?.api_key_env || getFallbackEnvName(provider, idx, fallbacks, primaryEnv)
-    const current = fallbacks[idx]?.base_url ?? null
+    const nextRoute = buildRouteForModel(provider, modelId, null)
+    const envName = nextRoute.api_key_env || getFallbackEnvName(provider, idx, fallbacks, primaryEnv)
     updateFallback(idx, {
-      provider,
-      model: modelId,
-      api_key_env: envName,
-      base_url: ep?.base_url ?? (isKnownProvider(provider) ? null : current),
+      family_id: provider,
+      model_id: modelId,
+      route: {
+        route_id: nextRoute.route_id,
+        label: nextRoute.label,
+        api_key_env: envName,
+        base_url: nextRoute.base_url,
+        api_type: null,
+      },
     })
   }
 
-  /** Change fallback model — apply first endpoint defaults. */
+  /** Change fallback model while preserving the current custom or matching route when possible. */
   const changeFallbackModel = (idx: number, modelId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
-    const modelEntry = findModelEntry(fb.provider, modelId)
-    const ep = modelEntry?.endpoints?.[0]
-    const envName = ep?.api_key_env || getFallbackEnvName(fb.provider, idx, fallbacks, primaryEnv)
+    const nextRoute = buildRouteForModel(fb.family_id, modelId, null)
+    const envName = nextRoute.api_key_env || getFallbackEnvName(fb.family_id || '', idx, fallbacks, primaryEnv)
     updateFallback(idx, {
-      model: modelId,
-      api_key_env: envName,
-      base_url: ep?.base_url ?? null,
+      model_id: modelId,
+      route: {
+        route_id: nextRoute.route_id,
+        label: nextRoute.label,
+        api_key_env: envName,
+        base_url: nextRoute.base_url,
+        api_type: null,
+      },
     })
   }
 
-  const changeFallbackEndpoint = (idx: number, ep: ModelEndpoint) => {
+  const changeFallbackRoute = (idx: number, routeId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
+    const modelEntry = findModelEntry(fb.family_id, fb.model_id)
+    const endpoint = modelEntry?.endpoints?.find((ep) => ep.id === routeId)
+    if (!endpoint) return
     updateFallback(idx, {
-      base_url: ep.base_url ?? null,
-      api_key_env: ep.api_key_env || getFallbackEnvName(fb.provider, idx, fallbacks, primaryEnv),
+      route: buildRouteFromEndpoint(fb.family_id, endpoint),
     })
   }
 
@@ -277,9 +431,9 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
     })
   }
 
-  const updateFallback = (idx: number, patch: Partial<FallbackModel>) => {
+  const updateFallback = (idx: number, patch: Partial<LlmModelSelectionConfig>) => {
     const updated = fallbacks.map((fb, i) => (i === idx ? { ...fb, ...patch } : fb))
-    updateConfig({ fallback_models: updated })
+    updateSelections(primary, updated)
   }
 
   const updateFallbackEnvVar = (idx: number, fbEnv: string, value: string) => {
@@ -289,11 +443,30 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
     } else {
       delete newEnvVars[fbEnv]
     }
-    const updated = fallbacks.map((fb, i) => (i === idx ? { ...fb, api_key_env: fbEnv } : fb))
-    updateConfig({ env_vars: newEnvVars, fallback_models: updated })
+    const updated = fallbacks.map((fb, i) => (
+      i === idx
+        ? {
+            ...fb,
+            route: {
+              ...(fb.route || {}),
+              api_key_env: fbEnv,
+            },
+          }
+        : fb
+    ))
+    onChange({
+      ...applySelections(config, primary, updated),
+      env_vars: newEnvVars,
+    })
   }
 
-  const doTest = async (key: number, provider: string, model: string, apiKeyEnv: string, baseUrl?: string | null) => {
+  const doTest = async (
+    key: number,
+    provider: string,
+    model: string,
+    apiKeyEnv: string,
+    baseUrl?: string | null,
+  ) => {
     const apiKey = config.env_vars[apiKeyEnv] || ''
     if (!apiKey) {
       setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'No API key configured.', pricing: null } }))
@@ -320,13 +493,13 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
         base_url: baseUrl || undefined,
       })
       const pricing = getModelPricing(provider, model)
-      if (res.ok) {
-        setTestResults((s) => ({ ...s, [key]: { state: 'success', error: '', pricing } }))
-        // Store dynamically fetched models from the provider
-        if (res.models && res.models.length > 0) {
-          setFetchedModels((s) => ({ ...s, [provider]: res.models! }))
-        }
-      } else {
+        if (res.ok) {
+          setTestResults((s) => ({ ...s, [key]: { state: 'success', error: '', pricing } }))
+          // Store dynamically fetched models from the provider
+          if (res.models && res.models.length > 0) {
+            setFetchedModels((s) => ({ ...s, [providerRouteKey(provider, baseUrl)]: res.models! }))
+          }
+        } else {
         setTestResults((s) => ({ ...s, [key]: { state: 'error', error: res.error || 'Unknown error', pricing: null } }))
       }
     } catch (e: unknown) {
@@ -337,33 +510,43 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   return (
     <div className="space-y-6">
       <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-xs text-amber-400">
-        LLM provider is required to start the gateway. Configure a primary provider and optional fallbacks for automatic failover.
+        The stored schema is model family → model name → route. Pick the family first, then the model, then the official API, AutoDL, or WiseModel route for that model.
       </div>
 
       {/* ── Primary Provider ── */}
       <div className="bg-surface-dark/30 rounded-lg p-4 border border-gray-700/50 space-y-4">
-        <h3 className="text-sm font-semibold text-gray-200">Primary Provider</h3>
+        <h3 className="text-sm font-semibold text-gray-200">Primary LLM</h3>
 
         <ProviderSelect
-          provider={config.provider || ''}
-          baseUrl={config.base_url || ''}
+          provider={primaryProvider}
+          baseUrl={primaryBaseUrl}
           onProviderChange={(p) => changePrimaryProvider(p)}
-          onBaseUrlChange={(url) => updateConfig({ base_url: url || null })}
+          onBaseUrlChange={(url) => updateSelections(
+            {
+              ...primary,
+              route: {
+                ...(primary.route || {}),
+                base_url: url || null,
+                api_key_env: primary.route?.api_key_env || primaryEnv,
+              },
+            },
+            fallbacks,
+          )}
         />
 
         <ModelSelect
-          provider={config.provider || ''}
-          model={config.model || ''}
+          provider={primaryProvider}
+          model={primaryModel}
           onModelChange={(model) => changePrimaryModel(model)}
+          baseUrl={primary.route?.base_url}
           fetchedModels={fetchedModels}
         />
 
         <EndpointSelect
-          provider={config.provider || ''}
-          modelId={config.model || ''}
-          baseUrl={config.base_url}
-          apiKeyEnv={config.api_key_env}
-          onChange={changePrimaryEndpoint}
+          provider={primaryProvider}
+          modelId={primaryModel}
+          route={primary.route}
+          onRouteChange={changePrimaryRoute}
         />
 
         <Field label="API Key" hint={primaryEnv ? `Stored as ${primaryEnv}` : undefined}>
@@ -371,14 +554,20 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
             type="password"
             value={config.env_vars[primaryEnv] || ''}
             onChange={(e) => changePrimaryKey(e.target.value)}
-            placeholder={`Paste your ${config.provider || 'anthropic'} API key`}
+            placeholder={`Paste your ${primaryRouteLabel.toLowerCase()} key`}
             className="input font-mono text-xs"
           />
         </Field>
 
         <TestButton
           result={testResults[-1] || null}
-          onTest={() => doTest(-1, config.provider || 'anthropic', config.model || '', primaryEnv, config.base_url)}
+          onTest={() => doTest(
+            -1,
+            primaryProvider || 'anthropic',
+            primaryModel || '',
+            primaryEnv,
+            primary.route?.base_url,
+          )}
         />
       </div>
 
@@ -402,7 +591,9 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
         )}
 
         {fallbacks.map((fb, idx) => {
-          const fbEnv = fb.api_key_env || getApiKeyEnvName(fb.provider)
+          const fbProvider = fb.family_id || ''
+          const fbModel = fb.model_id || ''
+          const fbEnv = fb.route?.api_key_env || getApiKeyEnvName(fbProvider)
           const sharesPrimaryKey = fbEnv === primaryEnv
           return (
             <div
@@ -443,25 +634,31 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
               </div>
 
               <ProviderSelect
-                provider={fb.provider}
-                baseUrl={fb.base_url || ''}
+                provider={fbProvider}
+                baseUrl={fb.route?.base_url || ''}
                 onProviderChange={(p) => changeFallbackProvider(idx, p || '')}
-                onBaseUrlChange={(url) => updateFallback(idx, { base_url: url || null })}
+                onBaseUrlChange={(url) => updateFallback(idx, {
+                  route: {
+                    ...(fb.route || {}),
+                    base_url: url || null,
+                    api_key_env: fbEnv,
+                  },
+                })}
               />
 
               <ModelSelect
-                provider={fb.provider}
-                model={fb.model || ''}
+                provider={fbProvider}
+                model={fbModel}
                 onModelChange={(model) => changeFallbackModel(idx, model)}
+                baseUrl={fb.route?.base_url}
                 fetchedModels={fetchedModels}
               />
 
               <EndpointSelect
-                provider={fb.provider}
-                modelId={fb.model || ''}
-                baseUrl={fb.base_url}
-                apiKeyEnv={fb.api_key_env}
-                onChange={(ep) => changeFallbackEndpoint(idx, ep)}
+                provider={fbProvider}
+                modelId={fbModel}
+                route={fb.route}
+                onRouteChange={(routeId) => changeFallbackRoute(idx, routeId)}
               />
 
               <Field label="API Key" hint={sharesPrimaryKey ? `Shared with primary (${fbEnv})` : `Stored as ${fbEnv}`}>
@@ -469,14 +666,20 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
                   type="password"
                   value={config.env_vars[fbEnv] || ''}
                   onChange={(e) => updateFallbackEnvVar(idx, fbEnv, e.target.value)}
-                  placeholder={sharesPrimaryKey ? 'Using primary API key' : `Paste your ${fb.provider} API key`}
+                  placeholder={sharesPrimaryKey ? 'Using primary API key' : `Paste your ${getRouteLabel(fbProvider, fbModel, fb.route).toLowerCase()} key`}
                   className="input font-mono text-xs"
                 />
               </Field>
 
               <TestButton
                 result={testResults[idx] || null}
-                onTest={() => doTest(idx, fb.provider, fb.model || '', fbEnv, fb.base_url)}
+                onTest={() => doTest(
+                  idx,
+                  fbProvider,
+                  fbModel || '',
+                  fbEnv,
+                  fb.route?.base_url,
+                )}
               />
             </div>
           )
@@ -502,43 +705,57 @@ function ProviderSelect({ provider, baseUrl, onProviderChange, onBaseUrlChange }
 }) {
   const known = isKnownProvider(provider)
   const isFullyCustom = !!provider && !known
-  const selectValue = !provider ? '' : known ? provider : CUSTOM_PROVIDER
+  const [customSelected, setCustomSelected] = useState(isFullyCustom)
+
+  useEffect(() => {
+    if (isFullyCustom) setCustomSelected(true)
+  }, [isFullyCustom])
+
+  const selectValue = customSelected && !provider
+    ? CUSTOM_FAMILY
+    : !provider
+      ? ''
+      : known
+        ? provider
+        : CUSTOM_FAMILY
 
   return (
     <>
-      <Field label="Provider">
+      <Field label="Model Family">
         <select
           value={selectValue}
           onChange={(e) => {
             const v = e.target.value
-            if (v === CUSTOM_PROVIDER) {
+            if (v === CUSTOM_FAMILY) {
+              setCustomSelected(true)
               onProviderChange('')
             } else {
+              setCustomSelected(false)
               onProviderChange(v || null)
             }
           }}
           className="input"
         >
-          {!provider && <option value="">Select a provider...</option>}
-          {PROVIDERS.map((p) => (
+          {!provider && <option value="">Select a model family...</option>}
+          {PROVIDER_FAMILIES.map((p) => (
             <option key={p} value={p}>{p}</option>
           ))}
-          <option value={CUSTOM_PROVIDER}>
-            {isFullyCustom ? `Custom: ${provider}` : 'Custom API endpoint…'}
+          <option value={CUSTOM_FAMILY}>
+            {isFullyCustom ? `Custom family: ${provider}` : 'Custom model family…'}
           </option>
         </select>
       </Field>
-      {(isFullyCustom || selectValue === CUSTOM_PROVIDER) && (
+      {(isFullyCustom || customSelected) && (
         <>
-          <Field label="Provider name" hint="Free-form label used as the provider identifier and to derive the default API key env var.">
+          <Field label="Family ID" hint="Only use this when the model family is not in the built-in catalog.">
             <input
               value={provider}
               onChange={(e) => onProviderChange(e.target.value)}
-              placeholder="my-endpoint"
+              placeholder="my-family"
               className="input text-xs font-mono"
             />
           </Field>
-          <Field label="Base URL" hint="OpenAI-compatible endpoint URL.">
+          <Field label="Base URL" hint="Default OpenAI-compatible API URL for this custom family.">
             <input
               value={baseUrl}
               onChange={(e) => onBaseUrlChange(e.target.value)}
@@ -552,60 +769,71 @@ function ProviderSelect({ provider, baseUrl, onProviderChange, onBaseUrlChange }
   )
 }
 
-/** Render a per-model endpoint picker if the selected model has multiple endpoints. */
-function EndpointSelect({ provider, modelId, baseUrl, apiKeyEnv, onChange }: {
+/** Render a per-model endpoint picker if the selected model has preconfigured routes. */
+function EndpointSelect({ provider, modelId, route, onRouteChange }: {
   provider: string
   modelId: string
-  baseUrl: string | null | undefined
-  apiKeyEnv: string | null | undefined
-  onChange: (ep: ModelEndpoint) => void
+  route: LlmRouteConfig | null | undefined
+  onRouteChange: (routeId: string) => void
 }) {
   const model = findModelEntry(provider, modelId)
   const list = model?.endpoints ?? []
   if (list.length === 0) return null
 
-  const matched = findMatchingEndpoint(model, baseUrl, apiKeyEnv)
-  const value = matched?.id ?? list[0].id
+  const matched = findMatchingEndpoint(model, route)
+  const value = matched?.id ?? list[0]?.id ?? ''
 
   return (
-    <Field label="API endpoint" hint="Different hosts serving this model. Each has its own API key.">
-      <select
-        value={value}
-        onChange={(e) => {
-          const picked = list.find((x) => x.id === e.target.value)
-          if (picked) onChange(picked)
-        }}
-        className="input"
-      >
-        {list.map((ep) => (
-          <option key={ep.id} value={ep.id}>
-            {ep.label}{ep.base_url ? ` — ${ep.base_url}` : ''}
-          </option>
-        ))}
-      </select>
-    </Field>
+    <div className="space-y-3">
+      <Field label="Route / API Provider" hint="The family and model stay fixed. This chooses the actual API host and credential set.">
+        <select
+          value={value}
+          onChange={(e) => onRouteChange(e.target.value)}
+          className="input"
+        >
+          {list.map((ep) => (
+            <option key={ep.id} value={ep.id}>
+              {ep.label}{ep.base_url ? ` — ${ep.base_url}` : ''}
+            </option>
+          ))}
+        </select>
+      </Field>
+    </div>
   )
 }
 
-function ModelSelect({ provider, model, onModelChange, fetchedModels }: { provider: string; model: string; onModelChange: (m: string) => void; fetchedModels?: Record<string, string[]> }) {
+function ModelSelect({ provider, model, baseUrl, onModelChange, fetchedModels }: { provider: string; model: string; baseUrl?: string | null; onModelChange: (m: string) => void; fetchedModels?: Record<string, string[]> }) {
   const entry = PROVIDER_MODELS[provider || '']
   const staticModels = entry?.models || []
   const staticIds = staticModels.map((m) => m.id)
   // Merge static + dynamically fetched models
-  const dynamicIds = (fetchedModels?.[provider] || []).filter((id) => !staticIds.includes(id))
+  const dynamicIds = (fetchedModels?.[providerRouteKey(provider, baseUrl)] || []).filter(
+    (id) => !staticIds.some((staticId) => staticId.toLowerCase() === id.toLowerCase()),
+  )
   const allIds = [...staticIds, ...dynamicIds]
-  const isCustom = model !== '' && !allIds.includes(model)
-  const pricing = staticModels.find((m) => m.id === model)
+  const canonicalModel = findMatchingId(allIds, model)
+  const isCustom = model !== '' && !canonicalModel
+  const [customSelected, setCustomSelected] = useState(isCustom)
+  useEffect(() => {
+    if (isCustom) setCustomSelected(true)
+    else if (canonicalModel) setCustomSelected(false)
+  }, [canonicalModel, isCustom])
+  const pricing = staticModels.find((m) => m.id === canonicalModel)
+  const endpointSummary = formatEndpointSummary(pricing)
+
+  const selectValue = (isCustom || (customSelected && !model)) ? CUSTOM_MODEL : (canonicalModel || model)
 
   return (
-    <Field label="Model">
+    <Field label="Model Name">
       <div className="space-y-2">
         <select
-          value={isCustom ? '__custom__' : model}
+          value={selectValue}
           onChange={(e) => {
-            if (e.target.value === '__custom__') {
+            if (e.target.value === CUSTOM_MODEL) {
+              setCustomSelected(true)
               onModelChange('')
             } else {
+              setCustomSelected(false)
               onModelChange(e.target.value)
             }
           }}
@@ -613,21 +841,22 @@ function ModelSelect({ provider, model, onModelChange, fetchedModels }: { provid
         >
           {!model && <option value="">Select a model...</option>}
           {staticModels.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id} — {m.input === 0 && m.output === 0 ? 'Free' : `$${m.input}/$${m.output} per 1M tokens`}
-            </option>
+            <option key={m.id} value={m.id}>{m.id}</option>
           ))}
           {dynamicIds.length > 0 && <option disabled>── fetched from API ──</option>}
           {dynamicIds.map((id) => (
             <option key={id} value={id}>{id}</option>
           ))}
-          <option value="__custom__">{isCustom ? `Custom: ${model}` : 'Custom model...'}</option>
+          <option value={CUSTOM_MODEL}>{isCustom ? `Custom: ${model}` : 'Custom model…'}</option>
         </select>
-        {(isCustom || (!model && allIds.length === 0)) && (
+        {(isCustom || customSelected || (!model && allIds.length === 0)) && (
           <input
             value={model}
-            onChange={(e) => onModelChange(e.target.value)}
-            placeholder="Enter model name"
+            onChange={(e) => {
+              setCustomSelected(true)
+              onModelChange(e.target.value)
+            }}
+            placeholder="Enter the exact model ID"
             className="input text-xs font-mono"
             autoFocus
           />
@@ -635,6 +864,11 @@ function ModelSelect({ provider, model, onModelChange, fetchedModels }: { provid
         {pricing && pricing.input > 0 && (
           <p className="text-xs text-gray-500">
             {formatPrice(pricing)}
+          </p>
+        )}
+        {endpointSummary && (
+          <p className="text-xs text-gray-500">
+            Built-in routes: {endpointSummary}
           </p>
         )}
       </div>

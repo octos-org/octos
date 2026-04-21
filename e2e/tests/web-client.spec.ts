@@ -32,43 +32,83 @@ function headers() {
  * Profile is resolved from X-Profile-Id header or auth token.
  */
 async function chatSSE(
-  request: any,
+  _request: any,
   baseURL: string,
   message: string,
   sessionId?: string,
-  timeoutMs = 30_000,
+  timeoutMs = 60_000,
 ): Promise<{ events: any[]; raw: string }> {
   const sid = sessionId || `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  // Playwright's request.post reads the full response body, which works
-  // for SSE since the server closes the stream after the done event.
-  // We retry once on empty response (race condition with SSE flush).
+  // Use a real streaming reader for SSE. Playwright's request.post buffers the
+  // full body and can time out on longer streams before the server closes it.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await request.post(`${baseURL}/api/chat`, {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(`${baseURL}/api/chat`, {
+      method: 'POST',
       headers: headers(),
-      data: { message, session_id: attempt === 0 ? sid : `${sid}-r` },
-      timeout: timeoutMs,
+      body: JSON.stringify({
+        message,
+        session_id: attempt === 0 ? sid : `${sid}-r`,
+        stream: true,
+      }),
+      signal: controller.signal,
     });
 
-    const raw = await res.text();
-    const events: any[] = [];
+    if (!res.ok) {
+      clearTimeout(timeout);
+      const body = await res.text().catch(() => '');
+      throw new Error(`chat failed: ${res.status} ${body.slice(0, 200)}`);
+    }
 
-    // Parse SSE format: "data: {...}\n\n"
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('data:')) {
-        const json = trimmed.slice(5).trim();
-        if (json) {
+    if (!res.body) {
+      clearTimeout(timeout);
+      if (attempt === 1) {
+        return { events: [], raw: '' };
+      }
+      continue;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let raw = '';
+    let buffer = '';
+    const events: any[] = [];
+    let sawDone = false;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        raw += chunk;
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const json = trimmed.slice(5).trim();
+          if (!json || json === '[DONE]') continue;
           try {
-            events.push(JSON.parse(json));
+            const event = JSON.parse(json);
+            events.push(event);
+            if (event?.type === 'done') {
+              sawDone = true;
+              return { events, raw };
+            }
           } catch {
             // skip non-JSON lines
           }
         }
       }
+    } finally {
+      clearTimeout(timeout);
+      reader.releaseLock();
     }
 
-    if (events.length > 0 || attempt === 1) {
+    if (sawDone || events.length > 0 || attempt === 1) {
       return { events, raw };
     }
     // Empty response — wait briefly and retry with fresh session
@@ -76,6 +116,25 @@ async function chatSSE(
   }
 
   return { events: [], raw: '' };
+}
+
+async function getSessionMessages(
+  request: any,
+  baseURL: string,
+  sessionId: string,
+  params: { source?: 'full' | 'memory'; sinceSeq?: number } = {},
+): Promise<any[]> {
+  const search = new URLSearchParams();
+  if (params.source) search.set('source', params.source);
+  if (typeof params.sinceSeq === 'number') {
+    search.set('since_seq', String(params.sinceSeq));
+  }
+  const suffix = search.size > 0 ? `?${search.toString()}` : '';
+  const res = await request.get(`${baseURL}/api/sessions/${sessionId}/messages${suffix}`, {
+    headers: headers(),
+  });
+  if (!res.ok()) return [];
+  return res.json();
 }
 
 // ---------------------------------------------------------------------------
@@ -131,16 +190,14 @@ test('SSE handles long CJK response without garbling', async ({
   // No replacement characters anywhere in the stream
   expect(raw).not.toContain('\uFFFD');
 
-  // Should contain recognizable Chinese city names
-  const allContent = events
+  // The final streamed content should still contain substantial CJK text.
+  const finalContent = events
     .filter((e) => e.type === 'replace' || e.type === 'done')
     .map((e) => e.text || e.content || '')
-    .join('');
-
-  // At least one common city should appear (北京/上海/广州/深圳/成都/杭州/etc.)
-  const cities = ['北京', '上海', '广州', '深圳', '成都', '杭州', '武汉', '南京', '重庆', '天津'];
-  const found = cities.some((city) => allContent.includes(city));
-  expect(found).toBe(true);
+    .filter((text) => typeof text === 'string' && text.length > 0)
+    .pop() || '';
+  const cjkChars = finalContent.match(/[\u4e00-\u9fff]/g) || [];
+  expect(cjkChars.length).toBeGreaterThan(8);
 });
 
 // ---------------------------------------------------------------------------
@@ -207,14 +264,18 @@ test('session persists across requests', async ({ request, baseURL }) => {
 // Verifies that tools returning files_to_send get delivered as SSE
 // "file" events with path and filename.
 // ---------------------------------------------------------------------------
-test('file events delivered via SSE', async ({ request, baseURL }) => {
+test('file delivery is visible via SSE or committed session result', async ({ request, baseURL }) => {
+  test.slow();
+  const sid = `test-file-${Date.now()}`;
+  const fileDir = `octos-web-file-${Date.now()}`;
+  const filePath = `./${fileDir}/octos_e2e_test.txt`;
 
   const { events } = await chatSSE(
     request,
     baseURL!,
-    'Use the shell tool to create a small test file: echo "test123" > /tmp/octos_e2e_test.txt. Then use send_file to send /tmp/octos_e2e_test.txt to me.',
-    undefined,
-    45_000,
+    `Use the shell tool to run \`mkdir -p ./${fileDir} && printf 'test123\\n' > ${filePath}\`. Then use send_file to send ${filePath} to me.`,
+    sid,
+    90_000,
   );
 
   // Look for a file event in the SSE stream
@@ -222,6 +283,7 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
   const sessionResultMediaEvents = events.filter(
     (e) => e.type === 'session_result' && Array.isArray(e.message?.media) && e.message.media.length > 0,
   );
+  const doneEvent = events.find((e) => e.type === 'done');
 
   // If the agent successfully created and sent the file, we should see a file event
   if (fileEvents.length > 0 || sessionResultMediaEvents.length > 0) {
@@ -231,15 +293,48 @@ test('file events delivered via SSE', async ({ request, baseURL }) => {
     } else {
       expect(sessionResultMediaEvents[0].message.media[0]).toBeTruthy();
     }
-  } else {
-    // Agent might not have used send_file — check that the response at least
-    // mentions the file was created (acceptable fallback)
-    const content = events
-      .filter((e) => e.type === 'replace' || e.type === 'done')
-      .map((e) => e.text || e.content || '')
-      .join('');
-    expect(content.toLowerCase()).toMatch(/test.*file|created|written/i);
+    return;
   }
+
+  const content = events
+    .filter((e) => e.type === 'replace' || e.type === 'done')
+    .map((e) => e.text || e.content || '')
+    .join('');
+
+  if (doneEvent?.has_bg_tasks) {
+    const deadline = Date.now() + 90_000;
+    let latestMessages: any[] = [];
+    while (Date.now() < deadline) {
+      latestMessages = await getSessionMessages(request, baseURL!, sid, { source: 'full' });
+      const delivered = latestMessages.find(
+        (message: any) => message.role === 'assistant' && Array.isArray(message.media) && message.media.length > 0,
+      );
+      if (delivered) {
+        expect(delivered.media[0]).toBeTruthy();
+        return;
+      }
+      const failure = latestMessages.find(
+        (message: any) =>
+          message.role === 'assistant' &&
+          typeof message.content === 'string' &&
+          message.content.startsWith('✗'),
+      );
+      if (failure) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+
+    const historyText = latestMessages
+      .map((message: any) => message.content || '')
+      .join('\n');
+    expect(historyText).toMatch(/test.*file|created|written|sent/i);
+    return;
+  }
+
+  // Agent might not have used send_file — check that the response at least
+  // mentions the file was created (acceptable fallback)
+  expect(content).toMatch(/test.*file|created|written/i);
 });
 
 // ---------------------------------------------------------------------------

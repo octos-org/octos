@@ -28,6 +28,14 @@ const SEARCH_PROVIDERS = [
     link: 'https://brave.com/search/api/',
   },
   {
+    id: 'serper',
+    key: 'SERPER_API_KEY',
+    label: 'Serper',
+    placeholder: '',
+    description: 'Google SERP API for web, news, and local search',
+    link: 'https://serper.dev/',
+  },
+  {
     id: 'you',
     key: 'YDC_API_KEY',
     label: 'You.com',
@@ -40,6 +48,7 @@ const SEARCH_PROVIDERS = [
 interface Props {
   config: ProfileConfig
   onChange: (config: ProfileConfig) => void
+  profileId?: string
 }
 
 type TestState = 'idle' | 'testing' | 'success' | 'error'
@@ -49,7 +58,7 @@ interface TestResult {
   error: string
 }
 
-export default function SearchApiTab({ config, onChange }: Props) {
+export default function SearchApiTab({ config, onChange, profileId }: Props) {
   const [testResults, setTestResults] = useState<Record<string, TestResult>>({})
 
   const updateEnv = (key: string, value: string) => {
@@ -73,6 +82,7 @@ export default function SearchApiTab({ config, onChange }: Props) {
         provider: providerId,
         api_key: isMasked ? undefined : apiKey,
         api_key_env: isMasked ? envKey : undefined,
+        profile_id: profileId,
       })
 
       if (res.ok) {

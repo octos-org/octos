@@ -92,7 +92,6 @@ pub struct WorkflowLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTerminalOutput {
     pub deliver_final_artifact_only: bool,
-    pub deliver_media_only: bool,
     pub forbid_intermediate_files: bool,
     pub required_artifact_kind: String,
 }

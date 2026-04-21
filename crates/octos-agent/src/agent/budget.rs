@@ -275,10 +275,7 @@ mod tests {
             &activity,
         );
 
-        assert!(
-            stop.is_none(),
-            "recent progress should keep the loop alive"
-        );
+        assert!(stop.is_none(), "recent progress should keep the loop alive");
     }
 
     #[tokio::test]
@@ -307,12 +304,7 @@ mod tests {
         let activity = super::super::activity::LoopActivityState::new(Instant::now());
         activity.set_last_activity_at(Instant::now() - Duration::from_secs(301));
 
-        let stop = agent.check_budget(
-            1,
-            Instant::now(),
-            &TokenUsage::default(),
-            &activity,
-        );
+        let stop = agent.check_budget(1, Instant::now(), &TokenUsage::default(), &activity);
 
         assert!(matches!(
             stop,
@@ -337,6 +329,7 @@ mod tests {
                 ..Default::default()
             },
             files_modified: vec![],
+            files_to_send: vec![],
             streamed: false,
             messages: vec![],
         };

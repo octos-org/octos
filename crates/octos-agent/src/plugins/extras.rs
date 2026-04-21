@@ -131,6 +131,12 @@ fn resolve_hook(def: &SkillHookDef, skill_dir: &Path) -> Option<HookConfig> {
         "after_tool_call" => HookEvent::AfterToolCall,
         "before_llm_call" => HookEvent::BeforeLlmCall,
         "after_llm_call" => HookEvent::AfterLlmCall,
+        "on_resume" => HookEvent::OnResume,
+        "on_turn_end" => HookEvent::OnTurnEnd,
+        "before_spawn_verify" => HookEvent::BeforeSpawnVerify,
+        "on_spawn_verify" => HookEvent::OnSpawnVerify,
+        "on_spawn_complete" => HookEvent::OnSpawnComplete,
+        "on_spawn_failure" => HookEvent::OnSpawnFailure,
         _ => return None,
     };
 
@@ -232,6 +238,12 @@ mod tests {
             ("after_tool_call", ()),
             ("before_llm_call", ()),
             ("after_llm_call", ()),
+            ("on_resume", ()),
+            ("on_turn_end", ()),
+            ("before_spawn_verify", ()),
+            ("on_spawn_verify", ()),
+            ("on_spawn_complete", ()),
+            ("on_spawn_failure", ()),
         ] {
             let def = SkillHookDef {
                 event: event_str.into(),

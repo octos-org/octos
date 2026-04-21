@@ -6,6 +6,10 @@
   "scripts": {
     "test": "npx playwright test",
     "test:headed": "npx playwright test --headed",
+    "test:milestone": "./scripts/milestone-suite.sh all",
+    "test:milestone:crew": "./scripts/milestone-suite.sh crew-core",
+    "test:milestone:bot": "./scripts/milestone-suite.sh bot-runtime",
+    "test:milestone:ocean": "./scripts/milestone-suite.sh ocean-deliverables",
     "test:live:smoke": "npx playwright test tests/live-browser.spec.ts",
     "test:live:slides-site": "npx playwright test tests/live-slides-site.spec.ts",
     "test:live:capabilities": "npx playwright test tests/refactor-capabilities.spec.ts",
