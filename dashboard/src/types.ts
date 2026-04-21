@@ -90,7 +90,7 @@ export interface SandboxConfig {
   docker?: DockerConfig
 }
 
-export type SearchProviderId = 'tavily' | 'perplexity' | 'brave' | 'you'
+export type SearchProviderId = 'tavily' | 'perplexity' | 'brave' | 'you' | 'serper'
 
 export interface SearchProviderConfig {
   api_key_env?: string | null
