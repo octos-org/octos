@@ -1,0 +1,89 @@
+#!/usr/bin/env sh
+# Compatibility fixture skill for the Octos harness compat gate.
+#
+# Protocol:
+#   argv[1] = tool name (currently only "summarize_text")
+#   stdin   = JSON with {"input_path": "...", "output_path": "..."}
+#   stdout  = JSON with {"output", "success", "files_to_send"}
+#
+# Secret handling:
+#   COMPAT_SUMMARY_TOKEN is allowlisted in manifest.json tools[].env.
+#   The skill only reports whether the secret is *present* — it NEVER
+#   writes the secret value to stdout, stderr, or disk.
+
+set -eu
+
+TOOL="${1:-unknown}"
+
+fail() {
+    # $1 = message; no secret values
+    printf '{"output":%s,"success":false}\n' "$(python3 -c 'import sys,json;print(json.dumps(sys.argv[1]))' "$1")"
+    exit 1
+}
+
+emit() {
+    # $1 = message, $2 = output_path
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+print(json.dumps({
+    "output": sys.argv[1],
+    "success": True,
+    "files_to_send": [sys.argv[2]],
+}))
+PY
+}
+
+if [ "$TOOL" != "summarize_text" ]; then
+    fail "Unknown tool '$TOOL'. Expected: summarize_text"
+fi
+
+INPUT_JSON="$(cat)"
+
+INPUT_PATH="$(printf '%s' "$INPUT_JSON" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("input_path",""))')"
+OUTPUT_PATH="$(printf '%s' "$INPUT_JSON" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("output_path",""))')"
+
+if [ -z "$INPUT_PATH" ]; then
+    fail "Missing required field: input_path"
+fi
+if [ -z "$OUTPUT_PATH" ]; then
+    fail "Missing required field: output_path"
+fi
+if [ ! -f "$INPUT_PATH" ]; then
+    fail "Input file not found: $INPUT_PATH"
+fi
+
+# Read the input and produce a compact summary: first 5 lines plus total
+# line/char counts. No secret value is ever interpolated here.
+SUMMARY_BODY="$(python3 - "$INPUT_PATH" <<'PY'
+import sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    text = fh.read()
+lines = text.splitlines()
+head = "\n".join(lines[:5])
+print(f"# Compat Summary\n")
+print(f"- source: {path}")
+print(f"- lines: {len(lines)}")
+print(f"- chars: {len(text)}")
+print()
+print("## First lines")
+print(head if head else "(empty)")
+PY
+)"
+
+# Record whether the allowlisted env var was delivered. Never print its value.
+if [ -n "${COMPAT_SUMMARY_TOKEN:-}" ]; then
+    SECRET_FLAG="declared"
+else
+    SECRET_FLAG="absent"
+fi
+
+# Write summary
+mkdir -p "$(dirname "$OUTPUT_PATH")"
+{
+    printf '%s\n' "$SUMMARY_BODY"
+    printf '\n## Secret declaration\n'
+    printf -- '- COMPAT_SUMMARY_TOKEN: %s\n' "$SECRET_FLAG"
+} >"$OUTPUT_PATH"
+
+emit "Summary written to $OUTPUT_PATH (secret=$SECRET_FLAG)" "$OUTPUT_PATH"

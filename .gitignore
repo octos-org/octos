@@ -62,6 +62,7 @@ scripts/deploy.sh
 !docs/OCTOS_HARNESS_ABI_VERSIONING.md
 !docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md
 !docs/OCTOS_HARNESS_M4_1A_LIVE_GATE.md
+!docs/OCTOS_HARNESS_SKILL_COMPAT.md
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 !docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
@@ -78,4 +79,8 @@ scripts/deploy.sh
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md
+# Harness M4.4 compat-gate fixture (SKILL.md + manifest.json must be tracked)
+!e2e/fixtures/compat-test-skill/SKILL.md
+!e2e/fixtures/compat-test-skill/manifest.json
+!e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
