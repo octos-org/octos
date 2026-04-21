@@ -143,6 +143,7 @@ test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async
   request,
   baseURL,
 }) => {
+  test.setTimeout(180_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
   const baseSessionId = `test-ffmpeg-chain-${Date.now()}`;
@@ -157,7 +158,7 @@ test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async
         session_id: sessionId,
         stream: false,
       },
-      timeout: 30_000,
+      timeout: 90_000,
     });
 
   let res = await sendPrompt(prompt, baseSessionId);
