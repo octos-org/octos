@@ -1346,6 +1346,10 @@ async fn snapshot_session_disk_loader(
     }
 }
 
+fn assistant_message_has_displayable_content(message: &Message) -> bool {
+    !message.content.trim().is_empty() || !message.media.is_empty()
+}
+
 async fn replay_task_status_events(state: &ApiState, id: &str, topic: Option<&str>) -> Vec<String> {
     let Some(ref query_fn) = state.task_query else {
         record_replay("task_status", "disabled", 1);
@@ -1389,7 +1393,8 @@ async fn replay_committed_session_results(
                 .enumerate()
                 .filter(|(seq, message)| {
                     since_seq.is_none_or(|since| *seq > since)
-                        && message_should_replay_as_session_result(message)
+                        && message.role == MessageRole::Assistant
+                        && assistant_message_has_displayable_content(message)
                 })
                 .map(|(seq, message)| {
                     build_session_result_event_from_message(
@@ -1510,7 +1515,11 @@ async fn handle_session_messages(
                     .messages
                     .iter()
                     .enumerate()
-                    .filter(|(seq, _)| params.since_seq.is_none_or(|since| *seq > since))
+                    .filter(|(seq, message)| {
+                        params.since_seq.is_none_or(|since| *seq > since)
+                            && (message.role != MessageRole::Assistant
+                                || assistant_message_has_displayable_content(message))
+                    })
                     .skip(offset)
                     .take(limit)
                     .map(|(seq, message)| {
@@ -1534,6 +1543,10 @@ async fn handle_session_messages(
                 .filter(|(seq, _)| {
                     let absolute_seq = base_seq + *seq;
                     params.since_seq.is_none_or(|since| absolute_seq > since)
+                })
+                .filter(|(_, message)| {
+                    message.role != MessageRole::Assistant
+                        || assistant_message_has_displayable_content(message)
                 })
                 .skip(offset)
                 .take(limit)
@@ -1841,6 +1854,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("octos-bus-tests-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         test_sessions_in(&dir)
+    }
+
+    fn assistant_tool_call_message(tool_name: &str, arguments: serde_json::Value) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![octos_core::ToolCall {
+                id: format!("call-{tool_name}"),
+                name: tool_name.to_string(),
+                arguments,
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        }
     }
 
     #[test]
@@ -2504,6 +2534,164 @@ mod tests {
         assert_eq!(session_result_seq_from_payload(&payload), Some(3));
         assert_eq!(session_result_seq_from_payload(&no_seq), None);
         assert_eq!(session_result_seq_from_payload("{not-json"), None);
+    }
+
+    #[tokio::test]
+    async fn replay_committed_session_results_skips_empty_assistant_tool_trace_messages() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "tool-heavy-chat");
+
+        {
+            let mut manager = sessions.lock().await;
+            manager
+                .add_message_with_seq(&key, Message::user("查一下他的背景 John Ternus"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "deep_search",
+                        serde_json::json!({"query": "John Ternus 背景"}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "get_time",
+                        serde_json::json!({
+                            "timezone": "America/Los_Angeles",
+                            "current_date": "2026-04-20"
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "activate_tools",
+                        serde_json::json!({"tools": ["cron"]}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("John Ternus is Apple's SVP of hardware engineering."),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("你有哪些定时任务"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("提醒我 10 分钟后喝水，我在 PDT 时区"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "get_time",
+                        serde_json::json!({"timezone": "America/Los_Angeles"}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "activate_tools",
+                        serde_json::json!({"tools": ["cron"]}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message(
+                        "cron",
+                        serde_json::json!({"action": "add", "in_minutes": 10}),
+                    ),
+                )
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(&key, Message::user("记住我的时区"))
+                .await
+                .unwrap();
+            manager
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant("好的，已记住你的时区为 PDT（America/Los_Angeles）。"),
+                )
+                .await
+                .unwrap();
+            // Trailing empty tool-trace assistant message previously could overwrite
+            // the visible final answer in client reconciliation.
+            manager
+                .add_message_with_seq(
+                    &key,
+                    assistant_tool_call_message("cron", serde_json::json!({"action": "list"})),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed =
+            replay_committed_session_results(&state, "tool-heavy-chat", None, None).await;
+
+        assert_eq!(replayed.len(), 2);
+        for event in &replayed {
+            let parsed: serde_json::Value = serde_json::from_str(event).unwrap();
+            let content = parsed["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            assert!(!content.is_empty());
+        }
+        let last: serde_json::Value = serde_json::from_str(replayed.last().unwrap()).unwrap();
+        assert_eq!(
+            last["message"]["content"],
+            "好的，已记住你的时区为 PDT（America/Los_Angeles）。"
+        );
     }
 
     #[tokio::test]
