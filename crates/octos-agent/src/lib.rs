@@ -18,6 +18,7 @@ pub mod exec_env;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod permissions;
 pub mod plugins;
 pub mod policy;
 pub mod progress;
@@ -45,6 +46,7 @@ pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
 pub use mcp::{McpClient, McpServerConfig};
+pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
@@ -60,10 +62,11 @@ pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    ReadFileTool, RecallMemoryTool, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool,
-    SynthesizeResearchTool, TakePhotoTool, Tool, ToolConfigStore, ToolPolicy, ToolRegistry,
-    ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
-    admin::{AdminApiContext, register_admin_api_tools},
+    PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
+    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
+    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
+    WebSearchTool, WriteFileTool, admin::{AdminApiContext, register_admin_api_tools},
+    install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use workspace_git::{

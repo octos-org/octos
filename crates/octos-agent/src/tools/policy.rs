@@ -1,6 +1,27 @@
 //! Tool policy system with allow/deny lists, groups, and wildcards.
 
+use metrics::counter;
 use serde::{Deserialize, Serialize};
+
+use super::robot_groups;
+
+/// Outcome of `ToolPolicy::evaluate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecision {
+    /// Tool is permitted.
+    Allow,
+    /// Tool is denied. `reason` is the metric label emitted for observability.
+    Deny { reason: &'static str },
+}
+
+/// Metric counter name for policy denials.
+pub const POLICY_DENIAL_COUNTER: &str = "octos_tool_policy_denial_total";
+
+/// Deny reason label used when a robot-tier group gates a tool.
+pub const ROBOT_TIER_GATE_REASON: &str = "robot_tier_gate";
+
+/// Deny reason label used for a non-robot policy deny.
+pub const GENERIC_DENY_REASON: &str = "policy_deny";
 
 /// Tool policy with allow/deny lists and tag-based filtering. Deny always wins over allow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -20,26 +41,51 @@ pub struct ToolPolicy {
 impl ToolPolicy {
     /// Check if a tool name is permitted by this policy (name-based only).
     pub fn is_allowed(&self, tool_name: &str) -> bool {
-        // Deny checked first (deny-wins semantics)
+        matches!(self.evaluate(tool_name), PolicyDecision::Allow)
+    }
+
+    /// Full evaluation that returns an allow / deny decision plus a metric
+    /// label on deny. Emits `octos_tool_policy_denial_total` with
+    /// `reason="robot_tier_gate"` when the deny was driven by a
+    /// `group:robot:*` entry, otherwise `reason="policy_deny"`.
+    pub fn evaluate(&self, tool_name: &str) -> PolicyDecision {
+        // Deny-wins: explicit deny entries take precedence.
         for entry in &self.deny {
             if entry_matches(entry, tool_name) {
-                return false;
+                let reason = if entry_is_robot_group(entry) {
+                    ROBOT_TIER_GATE_REASON
+                } else {
+                    GENERIC_DENY_REASON
+                };
+                counter!(POLICY_DENIAL_COUNTER, "reason" => reason).increment(1);
+                return PolicyDecision::Deny { reason };
             }
         }
 
-        // Empty allow list = allow everything not denied
+        // Empty allow list = allow everything not denied.
         if self.allow.is_empty() {
-            return true;
+            return PolicyDecision::Allow;
         }
 
-        // Check allow list
         for entry in &self.allow {
             if entry_matches(entry, tool_name) {
-                return true;
+                return PolicyDecision::Allow;
             }
         }
 
-        false
+        // Tool wasn't matched by any allow entry. If the allow list contains
+        // robot-tier groups AND the tool is registered in a robot tier, the
+        // gate is a robot-tier gate — that's the case robotic integrators
+        // care about observing.
+        let reason = if self.allow.iter().any(|entry| entry_is_robot_group(entry))
+            && robot_groups::tool_has_tier(tool_name)
+        {
+            ROBOT_TIER_GATE_REASON
+        } else {
+            GENERIC_DENY_REASON
+        };
+        counter!(POLICY_DENIAL_COUNTER, "reason" => reason).increment(1);
+        PolicyDecision::Deny { reason }
     }
 
     /// Check if a tool is permitted by both name policy and tag requirements.
@@ -74,7 +120,12 @@ impl ToolPolicy {
 
 /// Check if a policy entry (group, wildcard, or exact name) matches a tool name.
 fn entry_matches(entry: &str, tool_name: &str) -> bool {
-    // Group expansion
+    // Robot-tier groups resolve through the dynamic registry so integrators
+    // register tool-to-tier mappings at runtime.
+    if entry_is_robot_group(entry) {
+        return robot_groups::group_covers_tool(entry, tool_name);
+    }
+    // Static named groups (group:fs, group:runtime, ...)
     if let Some(tools) = expand_group(entry) {
         return tools.contains(&tool_name);
     }
@@ -84,6 +135,10 @@ fn entry_matches(entry: &str, tool_name: &str) -> bool {
     }
     // Exact match
     entry == tool_name
+}
+
+fn entry_is_robot_group(entry: &str) -> bool {
+    robot_groups::parse_group_name(entry).is_some()
 }
 
 /// Metadata about a tool group, used by the `activate_tools` tool to present
