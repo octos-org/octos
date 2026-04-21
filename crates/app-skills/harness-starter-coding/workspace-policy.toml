@@ -1,0 +1,34 @@
+# Example workspace policy for harness-starter-coding.
+#
+# Copy to `.octos-workspace.toml` at the workspace root.
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = ["tmp/**", ".DS_Store"]
+
+[validation]
+on_turn_end = []
+on_source_change = []
+on_completion = ["file_exists:patches/*.diff"]
+
+[artifacts]
+primary = "patches/*.diff"
+preview = "patches/*.files.txt"
+
+[spawn_tasks.propose_patch]
+artifacts = ["primary", "preview"]
+on_verify = [
+    "file_exists:$primary",
+    "file_size_min:$primary:64",
+    "file_exists:$preview",
+]
+on_deliver = []
+on_failure = ["notify_user:Patch proposal failed"]
