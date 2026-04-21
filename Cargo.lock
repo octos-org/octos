@@ -2353,6 +2353,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-starter-audio"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-coding"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-generic"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-report"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

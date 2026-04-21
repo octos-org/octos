@@ -1,0 +1,24 @@
+{
+  "name": "harness-starter-generic",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Minimal starter for a single-artifact harnessed custom app. Writes a text file under output/ and lets the workspace contract deliver it.",
+  "timeout_secs": 30,
+  "tools": [
+    {
+      "name": "produce_artifact",
+      "description": "Produce a single text artifact under output/. The workspace policy primary = \"output/artifact-*.txt\" resolves the delivered file.",
+      "spawn_only": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Free-text label recorded inside the artifact; also used to derive the filename."
+          }
+        },
+        "required": ["label"]
+      }
+    }
+  ]
+}
