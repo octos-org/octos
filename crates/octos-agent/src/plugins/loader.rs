@@ -258,14 +258,16 @@ impl PluginLoader {
             ".{}_verified",
             executable.file_name().unwrap_or_default().to_string_lossy()
         ));
-        // Remove existing verified file first (it has 0o500 perms and can't be overwritten)
+        // Remove existing verified file first so we can refresh the copy on restart.
         let _ = std::fs::remove_file(&verified_exe);
         std::fs::write(&verified_exe, &exe_bytes)
             .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o500))?;
+            // Keep the verified copy executable by the runtime user even when
+            // the skill directory itself is root-owned.
+            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o755))?;
         }
 
         // Collect env vars to filter out
@@ -990,5 +992,44 @@ edition = "2021"
         assert!(stdout.contains("--site-dir ./docs"));
         assert!(stdout.contains("--slug demo"));
         assert!(stdout.contains("--setup-ci"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verified_executable_is_world_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("perm-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+  "name": "perm-plugin",
+  "version": "0.1.0",
+  "tools": [{"name": "perm_tool", "description": "perm"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("perm-plugin"),
+            "#!/usr/bin/env bash\nset -euo pipefail\necho '{\"output\":\"ok\",\"success\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            plugin_dir.join("perm-plugin"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+
+        let verified = plugin_dir.join(".perm-plugin_verified");
+        let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }
