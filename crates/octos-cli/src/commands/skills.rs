@@ -42,7 +42,7 @@ struct BinaryInfo {
 }
 
 /// A skill package entry in the registry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RegistryEntry {
     /// Package name.
     name: String,
@@ -75,6 +75,40 @@ struct RegistryEntry {
     /// Searchable tags.
     #[serde(default)]
     tags: Vec<String>,
+}
+
+/// Public skill package metadata exposed to API consumers.
+#[cfg(feature = "api")]
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryPackage {
+    pub name: String,
+    pub description: String,
+    pub repo: String,
+    pub version: Option<String>,
+    pub author: Option<String>,
+    pub license: Option<String>,
+    pub skills: Vec<String>,
+    pub requires: Vec<String>,
+    pub provides_tools: bool,
+    pub tags: Vec<String>,
+}
+
+#[cfg(feature = "api")]
+impl From<RegistryEntry> for RegistryPackage {
+    fn from(value: RegistryEntry) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            repo: value.repo,
+            version: value.version,
+            author: value.author,
+            license: value.license,
+            skills: value.skills,
+            requires: value.requires,
+            provides_tools: value.provides_tools,
+            tags: value.tags,
+        }
+    }
 }
 
 /// Source tracking info written to .source during install.
@@ -439,36 +473,8 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
 }
 
 fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
-    let entries: Vec<RegistryEntry> = if let Some(url) = registry_url {
-        reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .wrap_err("failed to create HTTP client")?
-            .get(url)
-            .send()
-            .wrap_err_with(|| format!("failed to fetch registry from {url}"))?
-            .error_for_status()
-            .wrap_err("registry request failed")?
-            .json()
-            .wrap_err("failed to parse registry JSON")?
-    } else {
-        fetch_registry()?
-    };
-
-    // Filter by query if provided (match against name, description, tags, skills).
-    let query_lower = query.map(|q| q.to_lowercase());
-    let filtered: Vec<&RegistryEntry> = entries
-        .iter()
-        .filter(|e| {
-            let Some(q) = &query_lower else {
-                return true;
-            };
-            e.name.to_lowercase().contains(q)
-                || e.description.to_lowercase().contains(q)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(q))
-                || e.skills.iter().any(|s| s.to_lowercase().contains(q))
-        })
-        .collect();
+    let entries = fetch_registry_from(registry_url)?;
+    let filtered = filter_registry_entries(&entries, query);
 
     println!("{}", "Available Skill Packages".cyan().bold());
     println!("{}", "=".repeat(50));
@@ -710,17 +716,57 @@ fn cmd_install(skills_dir: &Path, repo: &str, force: bool, branch: &str) -> Resu
 }
 
 fn fetch_registry() -> Result<Vec<RegistryEntry>> {
+    fetch_registry_from(None)
+}
+
+fn fetch_registry_from(registry_url: Option<&str>) -> Result<Vec<RegistryEntry>> {
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .wrap_err("failed to create HTTP client")?
-        .get(DEFAULT_REGISTRY_URL)
+        .get(url)
         .send()
-        .wrap_err_with(|| format!("failed to fetch registry from {DEFAULT_REGISTRY_URL}"))?
+        .wrap_err_with(|| format!("failed to fetch registry from {url}"))?
         .error_for_status()
         .wrap_err("registry request failed")?
         .json()
         .wrap_err("failed to parse registry JSON")
+}
+
+fn filter_registry_entries<'a>(
+    entries: &'a [RegistryEntry],
+    query: Option<&str>,
+) -> Vec<&'a RegistryEntry> {
+    let query_lower = query
+        .map(|q| q.trim().to_lowercase())
+        .filter(|q| !q.is_empty());
+    entries
+        .iter()
+        .filter(|e| {
+            let Some(q) = &query_lower else {
+                return true;
+            };
+            e.name.to_lowercase().contains(q)
+                || e.description.to_lowercase().contains(q)
+                || e.tags.iter().any(|t| t.to_lowercase().contains(q))
+                || e.skills.iter().any(|s| s.to_lowercase().contains(q))
+        })
+        .collect()
+}
+
+/// Search available skill packages from the registry.
+#[cfg(feature = "api")]
+pub fn search_registry(
+    query: Option<&str>,
+    registry_url: Option<&str>,
+) -> Result<Vec<RegistryPackage>> {
+    let entries = fetch_registry_from(registry_url)?;
+    Ok(filter_registry_entries(&entries, query)
+        .into_iter()
+        .cloned()
+        .map(RegistryPackage::from)
+        .collect())
 }
 
 fn cmd_install_all(skills_dir: &Path, force: bool, branch: &str) -> Result<()> {
@@ -1737,5 +1783,48 @@ mod tests {
         };
 
         assert_eq!(path, std::fs::canonicalize(&skill_dir).unwrap());
+    }
+
+    #[test]
+    fn filter_registry_entries_matches_name_description_tags_and_skills() {
+        let entries = vec![
+            RegistryEntry {
+                name: "mofa-slides".into(),
+                description: "Slides generation".into(),
+                repo: "mofa-org/mofa-slides".into(),
+                version: Some("1.0.0".into()),
+                author: None,
+                license: None,
+                skills: vec!["slides".into(), "presentation".into()],
+                requires: vec![],
+                provides_tools: true,
+                binaries: std::collections::HashMap::new(),
+                tags: vec!["ppt".into()],
+            },
+            RegistryEntry {
+                name: "mofa-site".into(),
+                description: "Website builder".into(),
+                repo: "mofa-org/mofa-site".into(),
+                version: Some("1.0.0".into()),
+                author: None,
+                license: None,
+                skills: vec!["site".into()],
+                requires: vec![],
+                provides_tools: true,
+                binaries: std::collections::HashMap::new(),
+                tags: vec!["web".into()],
+            },
+        ];
+
+        let by_name = filter_registry_entries(&entries, Some("slides"));
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "mofa-slides");
+
+        let by_tag = filter_registry_entries(&entries, Some("web"));
+        assert_eq!(by_tag.len(), 1);
+        assert_eq!(by_tag[0].name, "mofa-site");
+
+        let by_empty = filter_registry_entries(&entries, Some("   "));
+        assert_eq!(by_empty.len(), 2);
     }
 }

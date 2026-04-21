@@ -167,6 +167,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_profile_skills),
         )
         .route(
+            "/api/my/profile/skills/registry",
+            get(auth_handlers::my_profile_skill_registry),
+        )
+        .route(
             "/api/my/profile/skills",
             post(auth_handlers::install_my_profile_skill),
         )

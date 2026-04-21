@@ -18,6 +18,19 @@ import type {
 
 const BASE = '/api/admin'
 
+export interface SkillRegistryPackage {
+  name: string
+  description: string
+  repo: string
+  version: string | null
+  author: string | null
+  license: string | null
+  skills: string[]
+  requires: string[]
+  provides_tools: boolean
+  tags: string[]
+}
+
 function getHeaders(): HeadersInit {
   const headers: HeadersInit = { 'Content-Type': 'application/json' }
   const token = localStorage.getItem('octos_session_token')
@@ -251,6 +264,11 @@ export const myApi = {
   listProfileSkills: () =>
     authedRequest<{ skills: { name: string; version: string | null; tool_count: number; source_repo: string | null }[] }>(
       '/my/profile/skills',
+    ),
+
+  listProfileSkillRegistry: (query?: string) =>
+    authedRequest<{ packages: SkillRegistryPackage[] }>(
+      `/my/profile/skills/registry${query ? `?q=${encodeURIComponent(query)}` : ''}`,
     ),
 
   installProfileSkill: (data: { repo: string; force: boolean; branch: string }) =>
