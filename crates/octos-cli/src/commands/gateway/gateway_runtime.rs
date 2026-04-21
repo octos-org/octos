@@ -57,6 +57,7 @@ fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
         "perplexity" => Some("PERPLEXITY_API_KEY"),
         "brave" => Some("BRAVE_API_KEY"),
         "you" => Some("YDC_API_KEY"),
+        "serper" => Some("SERPER_API_KEY"),
         _ => None,
     }
 }

@@ -28,6 +28,14 @@ const SEARCH_PROVIDERS = [
     link: 'https://brave.com/search/api/',
   },
   {
+    id: 'serper',
+    defaultEnvKey: 'SERPER_API_KEY',
+    label: 'Serper',
+    placeholder: '',
+    description: 'Google SERP API for web, news, and local search',
+    link: 'https://serper.dev/',
+  },
+  {
     id: 'you',
     key: 'YDC_API_KEY',
     label: 'You.com',

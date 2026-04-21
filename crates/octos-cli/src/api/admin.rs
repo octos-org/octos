@@ -1042,6 +1042,27 @@ pub async fn test_search(
                 Err(format!("You.com API error ({status}): {body}"))
             }
         }
+        "serper" => {
+            let body = serde_json::json!({
+                "q": query,
+                "num": 1,
+            });
+            let resp = client
+                .post("https://google.serper.dev/search")
+                .header("X-API-KEY", &api_key)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                Ok("Serper Search API connected successfully".to_string())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("Serper API error ({status}): {body}"))
+            }
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1064,13 +1085,56 @@ pub async fn test_search(
     }
 }
 
+fn default_search_api_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "tavily" => Some("TAVILY_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "brave" => Some("BRAVE_API_KEY"),
+        "you" => Some("YDC_API_KEY"),
+        "serper" => Some("SERPER_API_KEY"),
+        _ => None,
+    }
+}
+
+fn resolve_profile_secret_with_keychain<F>(
+    env_name: &str,
+    stored_value: Option<&str>,
+    mut keychain_lookup: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let secret = match stored_value {
+        Some(value) if value == crate::auth::KEYCHAIN_MARKER => keychain_lookup(env_name),
+        Some(value) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => None,
+    };
+
+    secret
+        .or_else(|| std::env::var(env_name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_profile_secret(env_name: &str, stored_value: Option<&str>) -> Option<String> {
+    resolve_profile_secret_with_keychain(env_name, stored_value, |name| {
+        crate::auth::keychain::get_secret(name).ok().flatten()
+    })
+}
+
 fn resolve_saved_search_key(
     state: &AppState,
     identity: &Option<axum::Extension<super::router::AuthIdentity>>,
     req: &TestSearchRequest,
 ) -> Result<String, (StatusCode, String)> {
-    let env_name = match &req.api_key_env {
-        Some(name) if !name.is_empty() => name,
+    let env_name = match req
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| default_search_api_env(req.provider.as_str()))
+    {
+        Some(name) => name,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1099,17 +1163,13 @@ fn resolve_saved_search_key(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
-    Ok(profile
-        .config
-        .env_vars
-        .get(env_name)
-        .cloned()
-        .unwrap_or_default())
+    let stored = profile.config.env_vars.get(env_name).map(String::as_str);
+    Ok(resolve_profile_secret(env_name, stored).unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 pub struct TestSearchRequest {
-    /// Search provider: "perplexity", "brave", "you"
+    /// Search provider: "tavily", "perplexity", "brave", "you", "serper"
     pub provider: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -4332,6 +4392,39 @@ mod tests {
         let result = admin_shell(Json(req)).await.unwrap();
         assert!(result.timed_out);
         assert_eq!(result.exit_code, -1);
+    }
+
+    #[test]
+    fn default_search_api_env_supports_serper() {
+        assert_eq!(default_search_api_env("tavily"), Some("TAVILY_API_KEY"));
+        assert_eq!(
+            default_search_api_env("perplexity"),
+            Some("PERPLEXITY_API_KEY")
+        );
+        assert_eq!(default_search_api_env("brave"), Some("BRAVE_API_KEY"));
+        assert_eq!(default_search_api_env("you"), Some("YDC_API_KEY"));
+        assert_eq!(default_search_api_env("serper"), Some("SERPER_API_KEY"));
+        assert_eq!(default_search_api_env("unknown"), None);
+    }
+
+    #[test]
+    fn resolve_profile_secret_uses_keychain_value_when_marker_present() {
+        let secret = resolve_profile_secret_with_keychain(
+            "TAVILY_API_KEY",
+            Some(crate::auth::KEYCHAIN_MARKER),
+            |_| Some("tvly-real-secret".to_string()),
+        );
+        assert_eq!(secret.as_deref(), Some("tvly-real-secret"));
+    }
+
+    #[test]
+    fn resolve_profile_secret_uses_plaintext_value_without_keychain_lookup() {
+        let secret = resolve_profile_secret_with_keychain(
+            "PERPLEXITY_API_KEY",
+            Some("pplx-real-secret"),
+            |_| None,
+        );
+        assert_eq!(secret.as_deref(), Some("pplx-real-secret"));
     }
 }
 
