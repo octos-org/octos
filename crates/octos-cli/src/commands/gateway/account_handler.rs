@@ -346,9 +346,10 @@ fn handle_account_update(
                     "macos" => octos_agent::SandboxMode::Macos,
                     "docker" => octos_agent::SandboxMode::Docker,
                     "bwrap" => octos_agent::SandboxMode::Bwrap,
+                    "appcontainer" => octos_agent::SandboxMode::AppContainer,
                     _ => {
                         return format!(
-                            "Invalid sandbox mode: {val}\nValid modes: auto, macos, docker, bwrap"
+                            "Invalid sandbox mode: {val}\nValid modes: auto, macos, docker, bwrap, appcontainer"
                         );
                     }
                 };
@@ -386,5 +387,87 @@ fn handle_account_update(
             msg
         }
         Err(e) => format!("Error saving: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
+    use super::handle_account_command;
+    use crate::profiles::{GatewaySettings, ProfileConfig, ProfileStore, UserProfile};
+
+    fn create_store_with_sub_account() -> (tempfile::TempDir, Arc<ProfileStore>, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(ProfileStore::open(dir.path()).expect("profile store"));
+
+        let now = Utc::now();
+        let parent = UserProfile {
+            id: "parent".to_string(),
+            name: "Parent".to_string(),
+            public_subdomain: Some("parent".to_string()),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.save(&parent).expect("save parent");
+
+        let sub = store
+            .create_sub_account(
+                "parent",
+                "child",
+                "child",
+                "Child",
+                vec![],
+                GatewaySettings::default(),
+            )
+            .expect("create sub-account");
+
+        (dir, store, sub.id)
+    }
+
+    #[tokio::test]
+    async fn account_update_persists_appcontainer_sandbox_mode() {
+        let (_dir, store, sub_id) = create_store_with_sub_account();
+        let profile_store = Some(store.clone());
+
+        let response = handle_account_command(
+            &format!("update {sub_id} sandbox=true sandbox-mode=appcontainer"),
+            Some("parent"),
+            &profile_store,
+        )
+        .await;
+
+        assert!(
+            response.contains("Updated sub-account"),
+            "unexpected response: {response}"
+        );
+
+        let updated = store.get(&sub_id).expect("load sub").expect("sub exists");
+        assert_eq!(
+            updated.config.sandbox.mode,
+            octos_agent::SandboxMode::AppContainer
+        );
+        assert!(updated.config.sandbox.enabled);
+    }
+
+    #[tokio::test]
+    async fn account_update_invalid_mode_message_lists_appcontainer() {
+        let (_dir, store, sub_id) = create_store_with_sub_account();
+        let profile_store = Some(store);
+
+        let response = handle_account_command(
+            &format!("update {sub_id} sandbox-mode=invalid"),
+            Some("parent"),
+            &profile_store,
+        )
+        .await;
+
+        assert!(response.contains("Valid modes: auto, macos, docker, bwrap, appcontainer"));
     }
 }
