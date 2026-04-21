@@ -14,6 +14,7 @@ use super::{Tool, ToolResult};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
+use crate::tools::TOOL_CTX;
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -129,6 +130,14 @@ fn apply_git_tool_env(cmd: &mut tokio::process::Command, command: &str) {
     }
 }
 
+fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command) {
+    if let Ok(ctx) = TOOL_CTX.try_with(|ctx| ctx.clone())
+        && let Some(sink) = ctx.harness_event_sink
+    {
+        cmd.env("OCTOS_EVENT_SINK", sink);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ShellInput {
     command: String,
@@ -216,6 +225,7 @@ impl Tool for ShellTool {
         apply_frontend_tool_env(&mut cmd, &self.cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        apply_harness_event_sink_env(&mut cmd);
 
         let child = match cmd.spawn() {
             Ok(c) => c,

@@ -70,6 +70,7 @@ impl Agent {
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
                 let attachment_ctx = turn_attachment_ctx.clone();
+                let harness_event_sink = self.harness_event_sink.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -153,6 +154,7 @@ impl Agent {
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
+                                harness_event_sink: harness_event_sink.clone(),
                                 attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
                                 audio_attachment_paths: bg_attachment_ctx
                                     .audio_attachment_paths
@@ -475,6 +477,7 @@ impl Agent {
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        harness_event_sink: harness_event_sink.clone(),
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),

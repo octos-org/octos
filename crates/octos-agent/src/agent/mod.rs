@@ -147,6 +147,8 @@ pub struct Agent {
     pub(super) hooks: Option<Arc<HookExecutor>>,
     /// Session-level context for hook payloads.
     pub(super) hook_context: std::sync::Mutex<Option<HookContext>>,
+    /// Local harness event sink path shared with child tools in this agent.
+    pub(super) harness_event_sink: Option<String>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
     /// Optional per-session runtime limits for tool rounds and per-tool calls.
@@ -176,6 +178,7 @@ impl Agent {
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
+            harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
@@ -203,6 +206,7 @@ impl Agent {
             reporter: RwLock::new(Arc::new(SilentReporter)),
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
+            harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
@@ -283,6 +287,12 @@ impl Agent {
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+        self
+    }
+
+    /// Set the local harness event sink path for child tools.
+    pub fn with_harness_event_sink(mut self, sink_path: impl Into<String>) -> Self {
+        self.harness_event_sink = Some(sink_path.into());
         self
     }
 

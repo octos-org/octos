@@ -466,6 +466,8 @@ impl Tool for PluginTool {
             cmd.env_remove(var);
         }
 
+        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
+
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
             if should_forward_env_name(key, &env_allowlist) {
@@ -475,9 +477,16 @@ impl Tool for PluginTool {
                     plugin = %self.plugin_name,
                     tool = %self.tool_def.name,
                     env = %key,
-                    "skipping non-allowlisted secret environment variable for plugin tool"
+                "skipping non-allowlisted secret environment variable for plugin tool"
                 );
             }
+        }
+
+        if let Some(sink) = ctx
+            .as_ref()
+            .and_then(|ctx| ctx.harness_event_sink.as_deref())
+        {
+            cmd.env("OCTOS_EVENT_SINK", sink);
         }
 
         // Set working directory so relative paths in tool args (e.g.
@@ -496,7 +505,6 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
-        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
         let effective_args = self.prepare_effective_args(args, ctx.as_ref());
 
         let mut child = cmd.spawn().wrap_err_with(|| {
@@ -968,6 +976,7 @@ mod tests {
         let ctx = ToolContext {
             tool_id: "tool-1".to_string(),
             reporter: Arc::new(SilentReporter),
+            harness_event_sink: None,
             attachment_paths: vec![
                 "/workspace/voice.ogg".to_string(),
                 "/workspace/report.pdf".to_string(),
@@ -1024,6 +1033,91 @@ mod tests {
             "output should contain echoed input, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_structured_progress_event_updates_task_supervisor() {
+        use crate::task_supervisor::TaskSupervisor;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("structured_tool", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let script_path = dir.path().join("script.sh");
+        let event_json = json!({
+            "schema": "octos.harness.event.v1",
+            "kind": "progress",
+            "session_id": "api:session",
+            "task_id": task_id.clone(),
+            "workflow": "deep_research",
+            "phase": "fetching_sources",
+            "message": "Fetching source 3/12",
+            "progress": 0.42
+        })
+        .to_string();
+        write_test_script(
+            &script_path,
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}' >> \"$OCTOS_EVENT_SINK\"\nprintf '{{\"output\":\"ok\",\"success\":true}}'\n",
+                event_json
+            ),
+        );
+
+        let def = make_tool_def("structured_tool", "writes harness events");
+        let tool = PluginTool::new("test-plugin".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5));
+
+        let sink = crate::harness_events::HarnessEventSink::new(
+            supervisor.clone(),
+            task_id.clone(),
+            "api:session",
+        )
+        .expect("create sink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let ctx = ToolContext {
+            tool_id: "tool-1".to_string(),
+            reporter: Arc::new(SilentReporter),
+            harness_event_sink: Some(sink.path().display().to_string()),
+            attachment_paths: vec![],
+            audio_attachment_paths: vec![],
+            file_attachment_paths: vec![],
+        };
+
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({})))
+            .await
+            .expect("tool execution should succeed");
+        assert!(result.success);
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("callback should fire")
+            .expect("task snapshot should be sent");
+
+        let detail: serde_json::Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetching_sources");
+        assert_eq!(detail["progress_message"], "Fetching source 3/12");
+        assert_eq!(updated.status, crate::task_supervisor::TaskStatus::Running);
+        assert_eq!(
+            updated.lifecycle_state(),
+            crate::task_supervisor::TaskLifecycleState::Running
+        );
+
+        let task = supervisor.get_task(&task_id).expect("task missing");
+        let task_detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(task_detail["current_phase"], "fetching_sources");
+        assert_eq!(task_detail["progress_message"], "Fetching source 3/12");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
