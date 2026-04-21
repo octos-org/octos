@@ -29,7 +29,7 @@ const SEARCH_PROVIDERS = [
   },
   {
     id: 'serper',
-    defaultEnvKey: 'SERPER_API_KEY',
+    key: 'SERPER_API_KEY',
     label: 'Serper',
     placeholder: '',
     description: 'Google SERP API for web, news, and local search',
