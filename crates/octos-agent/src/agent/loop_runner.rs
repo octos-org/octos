@@ -300,7 +300,7 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
-                    let (response, streamed) = match self
+                    let (mut response, streamed) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
@@ -335,6 +335,7 @@ impl Agent {
                         }
                         Err(e) => return Err(e),
                     };
+                    Self::normalize_inline_invokes(&mut response);
                     self.reporter().report(ProgressEvent::Response {
                         content: response.content.clone().unwrap_or_default(),
                         iteration,
@@ -608,7 +609,7 @@ impl Agent {
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
-                let (response, _streamed) = self
+                let (mut response, _streamed) = self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -618,6 +619,7 @@ impl Agent {
                         &mut turn,
                     )
                     .await?;
+                Self::normalize_inline_invokes(&mut response);
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
                 let tool_names: Vec<&str> = response

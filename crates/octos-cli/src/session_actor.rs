@@ -157,15 +157,16 @@ fn finalize_assistant_content(
     user_workspace: &Path,
     content: &str,
 ) -> String {
+    let content = strip_invoke_tags(content).trim().to_string();
     let is_site = session_key
         .topic()
         .is_some_and(|topic| topic == "site" || topic.starts_with("site "));
     if !is_site || content.trim().is_empty() || content.contains("/api/preview/") {
-        return content.to_string();
+        return content;
     }
 
     let Some(preview_url) = site_preview_url_for_session(session_key, user_workspace) else {
-        return content.to_string();
+        return content;
     };
 
     format!("{content}\n\nPreview URL: {preview_url}")
@@ -1585,8 +1586,8 @@ impl ActorFactory {
 
         // Defer rarely-used per-session tools to keep active tool count low
         // for providers that choke on many tools (e.g. Dashscope).
-        // Keep run_pipeline active — it's a core research tool.
-        tools.defer(["spawn".to_string(), "cron".to_string()]);
+        // Keep cron active so reminder flows don't require activate_tools.
+        tools.defer(["spawn".to_string()]);
 
         // For slides sessions, auto-activate media tools and use primary model
         // (bypasses adaptive router which may pick a weak model).
@@ -4585,11 +4586,49 @@ fn strip_think_tags(s: &str) -> String {
             break;
         }
     }
+    result = strip_invoke_tags(&result);
     // Collapse runs of 3+ newlines (left behind after stripping) to double newline
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
     result.trim().to_string()
+}
+
+/// Strip inline XML-style tool invocation markup:
+/// `<invoke name="tool">...</invoke>` and self-closing `<invoke ... />`.
+fn strip_invoke_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+
+    loop {
+        let Some(start) = rest.find("<invoke") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let from_tag = &rest[start..];
+
+        let Some(open_end) = from_tag.find('>') else {
+            out.push_str(from_tag);
+            break;
+        };
+        let open_tag = &from_tag[..=open_end];
+        let after_open = &from_tag[open_end + 1..];
+
+        if open_tag.trim_end().ends_with("/>") {
+            rest = after_open;
+            continue;
+        }
+
+        if let Some(close_rel) = after_open.find("</invoke>") {
+            rest = &after_open[close_rel + "</invoke>".len()..];
+        } else {
+            // Unclosed invoke tag: drop the remainder to avoid leaking tool markup.
+            break;
+        }
+    }
+
+    out
 }
 
 /// Format token count with K suffix for readability (e.g. 22173 → "22.2K").
@@ -4662,6 +4701,18 @@ mod tests {
             "beforeafter"
         );
         assert_eq!(strip_think_tags("<think>unclosed"), "");
+        assert_eq!(
+            strip_think_tags("ok <invoke name=\"cron\">{\"action\":\"list\"}</invoke> done"),
+            "ok  done"
+        );
+    }
+
+    #[test]
+    fn test_strip_invoke_tags_self_closing() {
+        assert_eq!(
+            strip_invoke_tags("a<invoke name=\"cron\" args='{}' />b"),
+            "ab"
+        );
     }
 
     #[test]
@@ -5468,6 +5519,86 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    async fn setup_actor_for_cron_regression(
+        agent_provider: Arc<dyn LlmProvider>,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<octos_bus::CronService>,
+    ) {
+        let _session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let (cron_tx, _cron_rx) = mpsc::channel(64);
+        let cron_service = Arc::new(octos_bus::CronService::new(
+            dir.path().join("cron.json"),
+            cron_tx,
+        ));
+        let cron_tool = Arc::new(CronTool::with_context(cron_service.clone(), "cli", "test"));
+        tools.register_arc(cron_tool.clone());
+
+        let agent = Agent::new(
+            AgentId::new("test-cron-regression"),
+            agent_provider,
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 6,
+            ..Default::default()
+        });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: Some(cron_tool),
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, cron_service)
+    }
+
     /// Build a minimal SessionActor with speculative mode + adaptive router.
     ///
     /// `agent_provider` is used by the Agent for primary calls.
@@ -5562,6 +5693,127 @@ mod tests {
     /// - After 1s, send an overflow message
     /// - The overflow should be served via serve_overflow while the slow call continues
     /// - Both responses should arrive
+    #[tokio::test]
+    async fn test_cron_timezone_reset_regression_chinese_transcript() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = Arc::new(DelayedMockProvider::new(
+            "cron-regression",
+            vec![
+                (
+                    Duration::ZERO,
+                    make_response("好的，我记住了，你的时区是 PDT。"),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response(
+                        "<invoke name=\"cron\">{\"action\":\"add\",\"message\":\"10分钟后提醒喝水\",\"after_seconds\":600,\"name\":\"drink-water\",\"timezone\":\"America/Los_Angeles\"}</invoke>",
+                    ),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("已设置好，10分钟后提醒你喝水。"),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("<invoke name=\"cron\">{\"action\":\"list\"}</invoke>"),
+                ),
+                (Duration::ZERO, make_response("当前已有提醒任务。")),
+                (
+                    Duration::ZERO,
+                    make_response(
+                        "<invoke name=\"cron\">{\"action\":\"add\",\"message\":\"10分钟后提醒站起来活动\",\"after_seconds\":600,\"name\":\"stand-up\",\"timezone\":\"America/Los_Angeles\"}</invoke>",
+                    ),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("重置后也已设置，10分钟后提醒你站起来活动。"),
+                ),
+            ],
+        ));
+
+        let (tx, mut rx, handle, cron_service) =
+            setup_actor_for_cron_regression(provider.clone(), &dir).await;
+
+        tx.send(make_inbound("把我的时区记成PDT")).await.unwrap();
+        let r1 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!r1.content.contains("<invoke"));
+        assert!(r1.content.contains("PDT"));
+
+        let before_first_add = chrono::Utc::now().timestamp_millis();
+        tx.send(make_inbound("10分钟后提醒我喝水")).await.unwrap();
+        let r2 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_first_add = chrono::Utc::now().timestamp_millis();
+        assert!(!r2.content.contains("<invoke"));
+        assert!(r2.content.contains("10分钟"));
+
+        let jobs = cron_service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "drink-water");
+        assert_eq!(jobs[0].timezone.as_deref(), Some("America/Los_Angeles"));
+        let first_at_ms = match jobs[0].schedule {
+            octos_bus::CronSchedule::At { at_ms } => at_ms,
+            _ => panic!("expected one-time reminder"),
+        };
+        assert!(
+            first_at_ms >= before_first_add + 600_000 && first_at_ms <= after_first_add + 603_000,
+            "first at_ms out of expected range: {}",
+            first_at_ms
+        );
+
+        tx.send(make_inbound("列出提醒")).await.unwrap();
+        let r3 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!r3.content.contains("<invoke"));
+        assert!(r3.content.contains("提醒"));
+
+        tx.send(make_inbound("/reset")).await.unwrap();
+        let reset_reply = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reset_reply.content.contains("history cleared"));
+
+        let before_second_add = chrono::Utc::now().timestamp_millis();
+        tx.send(make_inbound("重置后，再过10分钟提醒我站起来活动"))
+            .await
+            .unwrap();
+        let r4 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_second_add = chrono::Utc::now().timestamp_millis();
+        assert!(!r4.content.contains("<invoke"));
+        assert!(r4.content.contains("重置后"));
+
+        let jobs = cron_service.list_jobs();
+        assert_eq!(jobs.len(), 2);
+        let second = jobs.iter().find(|j| j.name == "stand-up").unwrap();
+        let second_at_ms = match second.schedule {
+            octos_bus::CronSchedule::At { at_ms } => at_ms,
+            _ => panic!("expected one-time reminder"),
+        };
+        assert!(second_at_ms > first_at_ms);
+        assert!(
+            second_at_ms >= before_second_add + 600_000
+                && second_at_ms <= after_second_add + 603_000,
+            "second at_ms out of expected range: {}",
+            second_at_ms
+        );
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 7);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     #[tokio::test]
     async fn test_speculative_overflow_concurrent() {
         let dir = tempfile::TempDir::new().unwrap();
