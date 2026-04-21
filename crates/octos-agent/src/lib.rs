@@ -36,6 +36,7 @@ mod subprocess_env;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
+pub mod validators;
 pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
@@ -88,6 +89,10 @@ pub use tools::{
     install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
+pub use validators::{
+    VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorInvocation, ValidatorLedger, ValidatorOutcome,
+    ValidatorPhase, ValidatorRunner, ValidatorStatus, run_workspace_validators,
+};
 pub use workspace_git::{
     WorkspaceArtifactStatus, WorkspaceCheckStatus, WorkspaceContractStatus, WorkspaceProjectKind,
     WorkspaceValidationFailure, WorkspaceValidationPhase, commit_all_if_dirty,
@@ -96,11 +101,11 @@ pub use workspace_git::{
     snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    ValidationPolicy, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
-    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
-    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
-    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
-    write_workspace_policy,
+    ValidationPolicy, Validator, ValidatorPhaseKind, ValidatorSpec, WORKSPACE_POLICY_FILE,
+    WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
+    WorkspaceVersionControlProvider, read_workspace_policy, upgrade_workspace_policy_if_legacy,
+    workspace_policy_path, write_workspace_policy,
 };
 
 #[cfg(test)]

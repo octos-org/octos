@@ -53,6 +53,7 @@ pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePo
             ],
             on_source_change: Vec::new(),
             on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
+            validators: Vec::new(),
         },
         artifacts: WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([

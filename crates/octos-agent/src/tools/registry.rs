@@ -239,6 +239,19 @@ impl ToolRegistry {
         self.invalidate_cache();
     }
 
+    /// Return the names of every registered tool.
+    ///
+    /// Used by the validator runner's lightweight dispatcher to capture a
+    /// snapshot of available tools without cloning the full registry.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    /// Return a handle to a tool by name, if it exists.
+    pub fn get_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
     pub fn specs(&self) -> Vec<ToolSpec> {

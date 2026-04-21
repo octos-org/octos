@@ -277,6 +277,18 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "realtime_heartbeat_stalls".to_string(),
             total_for_metric(samples, "octos_realtime_heartbeat_stalls_total"),
         ),
+        (
+            "workspace_validator_runs".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_total"),
+        ),
+        (
+            "workspace_validator_required_failures".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_required_failed_total"),
+        ),
+        (
+            "workspace_validator_optional_warnings".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
+        ),
     ])
 }
 
@@ -336,6 +348,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 samples,
                 "octos_child_session_lifecycle_total",
                 &["kind", "outcome"],
+            ),
+        ),
+        (
+            "workspace_validator_runs".to_string(),
+            breakdown(
+                samples,
+                "octos_workspace_validator_total",
+                &["status", "phase", "kind", "required"],
             ),
         ),
     ])

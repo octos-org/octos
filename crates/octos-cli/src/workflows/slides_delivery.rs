@@ -74,6 +74,7 @@ pub fn workspace_policy() -> WorkspacePolicy {
                 "file_exists:output/deck.pptx".into(),
                 "file_exists:output/**/slide-*.png".into(),
             ],
+            validators: Vec::new(),
         },
         artifacts: WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([
