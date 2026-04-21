@@ -1260,8 +1260,24 @@ fn api_session_key_candidates(
 }
 
 fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
-    id.strip_prefix("api:")
-        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
+    let chat_id = id
+        .strip_prefix("api:")
+        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))?;
+    if is_internal_api_chat_id(chat_id) {
+        None
+    } else {
+        Some(chat_id)
+    }
+}
+
+fn is_internal_api_chat_id(chat_id: &str) -> bool {
+    chat_id
+        .split_once('#')
+        .is_some_and(|(_, topic)| is_internal_session_topic(topic))
+}
+
+fn is_internal_session_topic(topic: &str) -> bool {
+    topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
 }
 
 fn response_path_for_session_file(data_dir: &Path, path: &Path) -> Option<String> {
@@ -2170,6 +2186,22 @@ mod tests {
             Some("web-123")
         );
         assert_eq!(api_chat_id_from_session_key("api:web-123"), Some("web-123"));
+    }
+
+    #[test]
+    fn api_chat_id_from_session_key_hides_internal_runtime_topics() {
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#child-task-1"),
+            None
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#default.tasks"),
+            None
+        );
+        assert_eq!(
+            api_chat_id_from_session_key("dspfac:api:web-123#research"),
+            Some("web-123#research")
+        );
     }
 
     #[test]
@@ -3376,6 +3408,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_hides_internal_child_and_task_ledger_sessions() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let parent = SessionKey::with_profile("dspfac", "api", "web-123");
+        let child = SessionKey::with_profile_topic("dspfac", "api", "web-123", "child-task-1");
+        let task_ledger =
+            SessionKey::with_profile_topic("dspfac", "api", "web-123", "default.tasks");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&parent, Message::user("parent"))
+                .await
+                .unwrap();
+            sess.add_message(&child, Message::user("child"))
+                .await
+                .unwrap();
+            sess.add_message(&task_ledger, Message::user("task ledger"))
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route("/sessions", get(handle_list_sessions))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions,
+                profile_id: Some("dspfac".into()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["web-123"]);
+    }
+
+    #[tokio::test]
     async fn session_messages_full_source_reads_from_disk_snapshot() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
@@ -3536,6 +3625,51 @@ mod tests {
 
         let sess = sessions.lock().await;
         assert!(sess.load(&main_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_session_accepts_listed_topic_session_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let id = "web-delete-topic";
+        let topic_key = SessionKey::with_profile_topic(TEST_PROFILE_ID, "api", id, "research");
+
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("hello"))
+                .await
+                .unwrap();
+            assert!(sess.load(&topic_key).await.is_some());
+        }
+
+        let app = Router::new()
+            .route("/sessions/{id}", delete(handle_delete_session))
+            .with_state(ApiState {
+                inbound_tx: mpsc::channel(1).0,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                sessions: sessions.clone(),
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/sessions/web-delete-topic%23research")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let fresh = SessionManager::open(data_dir.path()).unwrap();
+        assert!(fresh.load(&topic_key).await.is_none());
     }
 
     #[tokio::test]

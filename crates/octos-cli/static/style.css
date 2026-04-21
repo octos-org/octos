@@ -56,18 +56,40 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Sego
 
 #session-list { list-style: none; padding: 8px; }
 #session-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 12px;
   border-radius: var(--radius);
   cursor: pointer;
   font-size: 13px;
   color: var(--text-dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   margin-bottom: 2px;
 }
 #session-list li:hover { background: var(--surface2); color: var(--text); }
 #session-list li.active { background: var(--surface2); color: var(--accent); font-weight: 600; }
+.session-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-delete {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+}
+.session-delete:hover {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fca5a5;
+}
 
 /* Chat */
 #chat {

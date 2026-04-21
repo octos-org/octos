@@ -91,10 +91,26 @@
         sessionListEl.innerHTML = "";
         data.forEach(function (s) {
           var li = document.createElement("li");
-          li.textContent = s.id + " (" + s.message_count + ")";
           li.dataset.id = s.id;
+          li.dataset.sessionId = s.id;
+          li.dataset.active = s.id === currentSession ? "true" : "false";
           if (s.id === currentSession) li.className = "active";
           li.addEventListener("click", function () { selectSession(s.id); });
+          var title = document.createElement("span");
+          title.className = "session-title";
+          title.textContent = s.id + " (" + s.message_count + ")";
+          var del = document.createElement("button");
+          del.type = "button";
+          del.className = "session-delete";
+          del.setAttribute("data-testid", "session-delete-button");
+          del.title = "Delete session";
+          del.textContent = "x";
+          del.addEventListener("click", function (e) {
+            e.stopPropagation();
+            deleteSession(s.id);
+          });
+          li.appendChild(title);
+          li.appendChild(del);
           sessionListEl.appendChild(li);
         });
       })
@@ -105,6 +121,23 @@
     currentSession = id;
     loadSessions();
     loadHistory(id);
+  }
+
+  function deleteSession(id) {
+    if (!id || !window.confirm("Delete session \"" + id + "\"?")) return;
+    fetch("/api/sessions/" + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: headers(),
+    })
+      .then(function (r) {
+        if (r.status === 401) { showAuth(); return; }
+        if (id === currentSession) {
+          currentSession = "default";
+          messagesEl.innerHTML = "";
+        }
+        loadSessions();
+      })
+      .catch(function () {});
   }
 
   function loadHistory(id) {
