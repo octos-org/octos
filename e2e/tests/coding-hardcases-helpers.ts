@@ -145,7 +145,7 @@ export async function waitForSingleSettledTurn(page: Page, timeoutMs = 240_000) 
   throw new Error('Timed out waiting for a single settled coding turn');
 }
 
-async function fetchSessionIds(page: Page): Promise<string[]> {
+export async function fetchSessionIds(page: Page): Promise<string[]> {
   return page.evaluate(async () => {
     const token =
       localStorage.getItem('octos_session_token') ||
