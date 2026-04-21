@@ -1262,7 +1262,8 @@ fn api_session_key_candidates(
 fn api_chat_id_from_session_key(id: &str) -> Option<&str> {
     let chat_id = id
         .strip_prefix("api:")
-        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))?;
+        .or_else(|| id.split_once(":api:").map(|(_, chat_id)| chat_id))
+        .or_else(|| (!id.contains(':')).then_some(id))?;
     if is_internal_api_chat_id(chat_id) {
         None
     } else {
@@ -2198,10 +2199,16 @@ mod tests {
             api_chat_id_from_session_key("dspfac:api:web-123#default.tasks"),
             None
         );
+        assert_eq!(api_chat_id_from_session_key("web-123#default.tasks"), None);
         assert_eq!(
             api_chat_id_from_session_key("dspfac:api:web-123#research"),
             Some("web-123#research")
         );
+        assert_eq!(
+            api_chat_id_from_session_key("web-123#research"),
+            Some("web-123#research")
+        );
+        assert_eq!(api_chat_id_from_session_key("telegram:123"), None);
     }
 
     #[test]
@@ -3415,6 +3422,8 @@ mod tests {
         let child = SessionKey::with_profile_topic("dspfac", "api", "web-123", "child-task-1");
         let task_ledger =
             SessionKey::with_profile_topic("dspfac", "api", "web-123", "default.tasks");
+        let raw_parent = SessionKey("web-raw".to_string());
+        let raw_task_ledger = SessionKey("web-raw#default.tasks".to_string());
         {
             let mut sess = sessions.lock().await;
             sess.add_message(&parent, Message::user("parent"))
@@ -3424,6 +3433,12 @@ mod tests {
                 .await
                 .unwrap();
             sess.add_message(&task_ledger, Message::user("task ledger"))
+                .await
+                .unwrap();
+            sess.add_message(&raw_parent, Message::user("raw parent"))
+                .await
+                .unwrap();
+            sess.add_message(&raw_task_ledger, Message::user("raw task ledger"))
                 .await
                 .unwrap();
         }
@@ -3461,7 +3476,7 @@ mod tests {
             .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
             .collect();
 
-        assert_eq!(ids, vec!["web-123"]);
+        assert_eq!(ids, vec!["web-123", "web-raw"]);
     }
 
     #[tokio::test]
