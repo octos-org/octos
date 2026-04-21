@@ -17,6 +17,8 @@ use crate::progress::ProgressReporter;
 pub struct ToolContext {
     pub tool_id: String,
     pub reporter: Arc<dyn ProgressReporter>,
+    /// Local newline-delimited JSON sink for structured harness progress.
+    pub harness_event_sink: Option<String>,
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,

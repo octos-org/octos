@@ -15,6 +15,7 @@ pub mod bundled_app_skills;
 mod compaction;
 pub mod event_bus;
 pub mod exec_env;
+pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
@@ -44,6 +45,12 @@ pub use agent::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use harness_events::{
+    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
+    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
+    HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
+    MAX_HARNESS_EVENT_LINE_BYTES,
+};
 pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::{PluginLoadResult, PluginLoader};

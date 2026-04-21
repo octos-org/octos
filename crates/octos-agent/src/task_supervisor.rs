@@ -20,6 +20,8 @@ use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::harness_events::{HarnessEvent, HarnessEventPayload};
+
 const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
 
 /// Lifecycle status of a background task.
@@ -537,6 +539,60 @@ impl TaskSupervisor {
         }
     }
 
+    /// Apply a structured harness event to a tracked task.
+    pub fn apply_harness_event(
+        &self,
+        task_id: &str,
+        event: &HarnessEvent,
+    ) -> Result<(), &'static str> {
+        let snapshot = self.get_task(task_id).ok_or("unknown task")?;
+        let (workflow_kind, current_phase) = workflow_labels(snapshot.runtime_detail.as_deref());
+        let runtime_detail =
+            event.runtime_detail_value(workflow_kind.as_deref(), current_phase.as_deref());
+
+        match &event.payload {
+            HarnessEventPayload::Progress { .. }
+            | HarnessEventPayload::Phase { .. }
+            | HarnessEventPayload::Retry { .. } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::Artifact { .. } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::DeliveringOutputs,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::ValidatorResult { data } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::VerifyingOutputs,
+                    Some(runtime_detail.to_string()),
+                );
+                if !data.passed {
+                    let message = data.message.clone().unwrap_or_else(|| {
+                        "validator rejected structured harness event".to_string()
+                    });
+                    self.mark_failed(task_id, message);
+                }
+            }
+            HarnessEventPayload::Failure { data } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::Failed,
+                    Some(runtime_detail.to_string()),
+                );
+                self.mark_failed(task_id, data.message.clone());
+            }
+        }
+
+        Ok(())
+    }
+
     fn persist_snapshot_by_id(&self, task_id: &str) {
         let snapshot = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -745,6 +801,44 @@ mod tests {
         assert_eq!(task.lifecycle_state(), TaskLifecycleState::Ready);
         assert!(task.completed_at.is_some());
         assert_eq!(task.output_files, vec!["output.mp3"]);
+    }
+
+    #[test]
+    fn should_apply_harness_progress_event_and_notify() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("deep_search", "call-9", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let event = crate::harness_events::HarnessEvent::progress(
+            "api:session",
+            id.clone(),
+            Some("deep_research"),
+            "fetching_sources",
+            Some("Fetching source 3/12"),
+            Some(0.42),
+        );
+
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetching_sources");
+        assert_eq!(detail["progress_message"], "Fetching source 3/12");
+        let progress = detail["progress"].as_f64().unwrap();
+        assert!((progress - 0.42).abs() < 0.0001);
+
+        let notified = rx.try_recv().expect("callback should fire");
+        let notified_detail: serde_json::Value =
+            serde_json::from_str(notified.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(notified_detail["current_phase"], "fetching_sources");
+        assert_eq!(notified.lifecycle_state(), TaskLifecycleState::Running);
     }
 
     #[test]
