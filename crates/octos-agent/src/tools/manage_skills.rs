@@ -752,7 +752,13 @@ fn maybe_install_binary(dir: &std::path::Path) {
 }
 
 fn platform_key() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    // Rust reports macOS as "macos", while skill manifests/registry
+    // conventionally publish Apple binaries under "darwin-*".
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{os}-{}", std::env::consts::ARCH)
 }
 
 #[derive(serde::Deserialize)]
@@ -972,5 +978,17 @@ mod tests {
         assert_eq!(extract_fm_value(content, "version"), Some("1.2.3".into()));
         assert_eq!(extract_fm_value(content, "author"), Some("test".into()));
         assert_eq!(extract_fm_value(content, "missing"), None);
+    }
+
+    #[test]
+    fn platform_key_matches_manifest_convention() {
+        let key = platform_key();
+        #[cfg(target_os = "macos")]
+        assert_eq!(key, format!("darwin-{}", std::env::consts::ARCH));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            key,
+            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
     }
 }
