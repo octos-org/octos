@@ -137,8 +137,8 @@ Contract decision:
 - the event transport is language-neutral; Rust, Python, JavaScript, shell, and
   opaque binaries all use the same sink contract
 - the sink is addressed as a transport URI; local transports are mandatory,
-  distributed pub/sub transports such as Zenoh are optional adapters behind the
-  same ABI
+  distributed pub/sub transports are long-term evolution, not M4.1A blocking
+  scope
 
 Required event shape:
 
@@ -162,7 +162,6 @@ Deliverables:
 - transport abstraction for `OCTOS_EVENT_SINK`:
   - required: local file/JSONL or Unix-domain socket transport
   - optional: stdio/fd transport for sandboxed children
-  - future adapter: Zenoh or another pub/sub backend for distributed hosts
 - language-neutral event emitter helpers:
   - Rust `tracing`/helper crate
   - Python helper package or copyable single-file emitter
@@ -185,16 +184,15 @@ Published workstreams:
 - `#473`: UI/API parent-visible progress replay
 - `#474`: Release gate and mini fleet validation
 - `#475`: Non-Rust bridge for Python and JavaScript emitters
-- `#476`: Optional Zenoh/pub-sub transport evaluation
 
 Transport policy:
 
 - M4.1A must not require a network broker for same-host child progress.
-- Pub/sub backends are acceptable only if they implement the same
-  `octos.harness.event.v1` schema and feed the same durable parent
-  `task_status` path.
-- Zenoh is a good candidate for later distributed/robotics event fanout, but it
-  should not block the local reliability fix for mini1 deep research.
+- Pub/sub backends are long-term evolution only. They are acceptable later only
+  if they implement the same `octos.harness.event.v1` schema and feed the same
+  durable parent `task_status` path.
+- Zenoh is tracked separately as `#476` and must not block the local reliability
+  fix for mini1 deep research.
 
 Agent ownership model:
 
