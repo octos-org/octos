@@ -816,6 +816,7 @@ impl Channel for ApiChannel {
                     "endpoint": msg.metadata.get("endpoint").cloned().unwrap_or(serde_json::Value::Null),
                     "tokens_in": msg.metadata.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
                     "tokens_out": msg.metadata.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "session_cost": msg.metadata.get("session_cost").cloned().unwrap_or(serde_json::Value::Null),
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
                     "has_bg_tasks": has_bg,
                 });
@@ -2757,6 +2758,7 @@ mod tests {
                 "endpoint": "autodl.art",
                 "tokens_in": 123,
                 "tokens_out": 456,
+                "session_cost": 0.0228,
             }),
         };
         ch.send(&msg).await.unwrap();
@@ -2771,6 +2773,7 @@ mod tests {
         assert_eq!(parsed["endpoint"], "autodl.art");
         assert_eq!(parsed["tokens_in"], 123);
         assert_eq!(parsed["tokens_out"], 456);
+        assert_eq!(parsed["session_cost"], 0.0228);
 
         // Sender was removed — next recv returns None
         assert!(matches!(

@@ -38,7 +38,7 @@ use octos_core::{
 };
 use octos_llm::{
     AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
-    ResponsivenessObserver,
+    ResponsivenessObserver, pricing::model_pricing,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
@@ -3580,14 +3580,29 @@ impl SessionActor {
                     .unwrap_or_else(|| {
                         format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
                     });
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let model = self.agent.model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
+                });
                 serde_json::json!({
                     "_completion": true,
                     "model": model_label,
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
+                    "session_cost": session_cost,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
                     "has_bg_tasks": had_bg_tasks,
                     "bg_tasks": bg_task_details,
