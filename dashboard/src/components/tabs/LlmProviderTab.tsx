@@ -995,11 +995,7 @@ function ModelSelect({ provider, model, baseUrl, onModelChange, fetchedModels }:
         >
           {!model && <option value="">Select a model...</option>}
           {staticModels.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-              {m.endpoints?.length ? ` — routes: ${m.endpoints.map((ep) => ep.label).join(', ')}` : ''}
-              {m.input === 0 && m.output === 0 ? ' — Free' : ` — $${m.input}/$${m.output} per 1M tokens`}
-            </option>
+            <option key={m.id} value={m.id}>{m.id}</option>
           ))}
           {dynamicIds.length > 0 && <option disabled>── fetched from API ──</option>}
           {dynamicIds.map((id) => (
