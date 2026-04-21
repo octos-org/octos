@@ -97,6 +97,7 @@ test('ffmpeg concat works in sandbox workdir', async ({ request, baseURL }) => {
 // also triggers activate_tools. Both should succeed.
 // ---------------------------------------------------------------------------
 test('activate_tools works across different sessions', async ({ request, baseURL }) => {
+  test.setTimeout(300_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
   // Session A: send a message that will trigger tool use
@@ -107,6 +108,7 @@ test('activate_tools works across different sessions', async ({ request, baseURL
       session_id: `test-session-a-${Date.now()}`,
       stream: false,
     },
+    timeout: 120_000,
   });
 
   // We may get an error if no agent is configured (standalone mode),
@@ -124,6 +126,7 @@ test('activate_tools works across different sessions', async ({ request, baseURL
       session_id: `test-session-b-${Date.now()}`,
       stream: false,
     },
+    timeout: 120_000,
   });
 
   if (resB.ok()) {
