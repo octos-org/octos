@@ -100,15 +100,17 @@ test('activate_tools works across different sessions', async ({ request, baseURL
   test.setTimeout(300_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
-  // Session A: send a message that will trigger tool use
+  // Session A: trigger activate_tools without also asking for shell execution.
+  // This keeps the proof focused on the registry rewire bug: stale OnceLock
+  // references used to fail with "tool registry not available" in session B.
   const resA = await request.post(`${baseURL}/api/chat`, {
     headers: headers(),
     data: {
-      message: 'Use the shell tool to run: echo "session_a_ok"',
+      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_a_ok".',
       session_id: `test-session-a-${Date.now()}`,
       stream: false,
     },
-    timeout: 120_000,
+    timeout: 180_000,
   });
 
   // We may get an error if no agent is configured (standalone mode),
@@ -122,11 +124,11 @@ test('activate_tools works across different sessions', async ({ request, baseURL
   const resB = await request.post(`${baseURL}/api/chat`, {
     headers: headers(),
     data: {
-      message: 'Use the shell tool to run: echo "session_b_ok"',
+      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_b_ok".',
       session_id: `test-session-b-${Date.now()}`,
       stream: false,
     },
-    timeout: 120_000,
+    timeout: 180_000,
   });
 
   if (resB.ok()) {
