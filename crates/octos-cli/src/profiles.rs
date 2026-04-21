@@ -63,6 +63,9 @@ pub struct ProfileConfig {
     /// First-party app configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<AppsConfig>,
+    /// Robotics runtime configuration (heartbeat + sensor context injection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robot: Option<RobotConfig>,
     /// Channel configurations.
     #[serde(default)]
     pub channels: Vec<ChannelCredentials>,
@@ -137,6 +140,20 @@ pub struct SlidesAppConfig {
     pub default_theme: Option<String>,
 }
 
+/// Robotics-oriented profile configuration.
+///
+/// Currently only hosts the realtime heartbeat + sensor injection contract
+/// added in RP05. Future robotics knobs (e-stop topic, safe-hold behavior)
+/// should nest under this struct so a single `robot: null` patch can strip
+/// all robotics integration in one step.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RobotConfig {
+    /// Realtime heartbeat + sensor-context-injection contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<octos_agent::RealtimeConfig>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum PatchField<T> {
     #[default]
@@ -181,6 +198,8 @@ pub struct ProfileConfigPatch {
     pub deep_crawl: PatchField<DeepCrawlConfig>,
     #[serde(default)]
     pub apps: PatchField<AppsConfig>,
+    #[serde(default)]
+    pub robot: PatchField<RobotConfig>,
     #[serde(default)]
     pub channels: Option<Vec<ChannelCredentials>>,
     #[serde(default)]
@@ -390,6 +409,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.apps = None,
             PatchField::Value(apps) => self.apps = Some(apps),
+        }
+        match patch.robot {
+            PatchField::Absent => {}
+            PatchField::Clear => self.robot = None,
+            PatchField::Value(robot) => self.robot = Some(robot),
         }
         if let Some(channels) = patch.channels {
             self.channels = channels;
@@ -1431,6 +1455,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     if oc.apps != nc.apps {
         restart_fields.push("apps".into());
     }
+    if oc.robot != nc.robot {
+        restart_fields.push("robot".into());
+    }
     if oc.channels != nc.channels {
         restart_fields.push("channels".into());
     }
@@ -2219,6 +2246,47 @@ mod tests {
                 assert!(fields.contains(&"apps".into()));
             }
             other => panic!("expected RestartRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn should_classify_realtime_config_as_restart_required() {
+        let base = UserProfile {
+            id: "rp05-diff".into(),
+            name: "RP05".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                robot: Some(RobotConfig {
+                    realtime: Some(octos_agent::RealtimeConfig {
+                        enabled: false,
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut changed = base.clone();
+        changed.config.robot = Some(RobotConfig {
+            realtime: Some(octos_agent::RealtimeConfig {
+                enabled: true,
+                heartbeat_timeout_ms: 250,
+                ..Default::default()
+            }),
+        });
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(
+                    fields.iter().any(|f| f == "robot"),
+                    "expected `robot` in restart-required fields, got {fields:?}",
+                );
+            }
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 

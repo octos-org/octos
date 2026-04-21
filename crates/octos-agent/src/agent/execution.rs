@@ -23,6 +23,26 @@ fn should_auto_send_tool_files(
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
 }
 
+/// Produce the composite system-prompt text (worker prompt + realtime sensor
+/// summary) used at the top of every agent turn. Centralizing this in
+/// `execution.rs` keeps the message-building policy in a single location so
+/// the conversation loop and task loop compose the same prompt.
+///
+/// Returns the prompt text the caller should paste into the first system
+/// `Message`. When no realtime controller is attached this is byte-identical
+/// to the stored system prompt.
+pub(super) fn compose_system_prompt(agent: &Agent) -> String {
+    let mut content = agent.system_prompt_snapshot();
+    if let Some(summary) = agent.realtime_sensor_summary() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&summary);
+    }
+    content
+}
+
 impl Agent {
     pub(super) async fn execute_tools(
         &self,
