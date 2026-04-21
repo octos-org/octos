@@ -315,6 +315,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
         .route("/api/admin/operator/summary", get(admin::operator_summary))
+        .route("/api/admin/operator/tasks", get(admin::operator_tasks))
         // Monitor control
         .route("/api/admin/monitor/status", get(admin::monitor_status))
         .route("/api/admin/monitor/watchdog", post(admin::toggle_watchdog))

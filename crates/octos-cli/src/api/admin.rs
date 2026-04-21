@@ -1610,6 +1610,187 @@ async fn scrape_gateway_metrics(client: &reqwest::Client, port: u16) -> Result<S
     response.text().await.map_err(|error| error.to_string())
 }
 
+// ── Operator harness task aggregation (`M4.5`) ───────────────────────
+
+/// Upper bound on sessions scanned per gateway. Bounded to keep fan-out
+/// predictable even on profiles with thousands of sessions.
+const MAX_SESSIONS_PER_GATEWAY: usize = 32;
+
+/// GET /api/admin/operator/tasks — aggregate active harness background tasks
+/// from every running gateway. The dashboard consumes this to render the
+/// operator harness view with lifecycle state, child session, artifacts,
+/// validator outcome, retries, and failure cause per task.
+pub async fn operator_tasks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<super::metrics::OperatorTasksResponse>, StatusCode> {
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut statuses = pm.all_statuses().await.into_iter().collect::<Vec<_>>();
+    statuses.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut inputs: Vec<super::metrics::OperatorTaskInput> = Vec::new();
+    let mut sources: Vec<super::metrics::OperatorTaskSource> = Vec::new();
+
+    for (profile_id, _status) in statuses {
+        let api_port = pm.api_port(&profile_id).await;
+        let Some(port) = api_port else {
+            sources.push(super::metrics::OperatorTaskSource {
+                profile_id: profile_id.clone(),
+                status: "missing_api_port".into(),
+                error: None,
+                api_port: None,
+                session_count: 0,
+                task_count: 0,
+            });
+            continue;
+        };
+
+        match scrape_gateway_tasks(&state.http_client, port).await {
+            Ok((session_count, task_rows)) => {
+                let task_count = task_rows.len();
+                inputs.extend(
+                    task_rows
+                        .into_iter()
+                        .map(|row| task_row_to_input(&profile_id, row)),
+                );
+                sources.push(super::metrics::OperatorTaskSource {
+                    profile_id: profile_id.clone(),
+                    status: "ok".into(),
+                    error: None,
+                    api_port: Some(port),
+                    session_count,
+                    task_count,
+                });
+            }
+            Err(error) => {
+                sources.push(super::metrics::OperatorTaskSource {
+                    profile_id: profile_id.clone(),
+                    status: "failed".into(),
+                    error: Some(error),
+                    api_port: Some(port),
+                    session_count: 0,
+                    task_count: 0,
+                });
+            }
+        }
+    }
+
+    Ok(Json(super::metrics::build_operator_tasks_response(
+        inputs,
+        sources,
+        chrono::Utc::now(),
+        super::metrics::DEFAULT_TASK_STALE_SECS,
+    )))
+}
+
+/// Scrape background tasks from one gateway via its API channel.
+///
+/// Calls `GET /sessions` to enumerate sessions then fans out to
+/// `GET /sessions/<id>/tasks` for each. Returns (session_count, task_rows).
+async fn scrape_gateway_tasks(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<(usize, Vec<serde_json::Value>), String> {
+    let sessions_url = format!("http://127.0.0.1:{port}/sessions");
+    let response = client
+        .get(sessions_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("sessions http {}", response.status()));
+    }
+
+    let sessions: Vec<serde_json::Value> = response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let session_count = sessions.len();
+
+    let mut tasks = Vec::new();
+    for session in sessions.into_iter().take(MAX_SESSIONS_PER_GATEWAY) {
+        let Some(id) = session.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let encoded = octos_bus::session::encode_path_component(id);
+        let tasks_url = format!("http://127.0.0.1:{port}/sessions/{encoded}/tasks");
+        let resp = match client
+            .get(tasks_url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(rows) = resp.json::<Vec<serde_json::Value>>().await else {
+            continue;
+        };
+        tasks.extend(rows);
+    }
+
+    Ok((session_count, tasks))
+}
+
+fn task_row_to_input(
+    profile_id: &str,
+    row: serde_json::Value,
+) -> super::metrics::OperatorTaskInput {
+    let s = |value: &serde_json::Value, key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let session_key_full = s(&row, "session_key")
+        .or_else(|| s(&row, "parent_session_key"))
+        .unwrap_or_default();
+    // session_key looks like "profile:api:session_id". Extract the last segment.
+    let session_id = session_key_full
+        .rsplit_once(':')
+        .map(|(_prefix, tail)| tail.to_string())
+        .unwrap_or_else(|| session_key_full.clone());
+
+    let output_files = row
+        .get("output_files")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    super::metrics::OperatorTaskInput {
+        profile_id: profile_id.to_string(),
+        session_id,
+        task_id: s(&row, "id").unwrap_or_default(),
+        tool_name: s(&row, "tool_name").unwrap_or_default(),
+        lifecycle_state: s(&row, "lifecycle_state").unwrap_or_else(|| "unknown".into()),
+        runtime_state: s(&row, "runtime_state"),
+        workflow_kind: s(&row, "workflow_kind"),
+        current_phase: s(&row, "current_phase"),
+        child_session_key: s(&row, "child_session_key"),
+        child_terminal_state: s(&row, "child_terminal_state"),
+        child_join_state: s(&row, "child_join_state"),
+        child_failure_action: s(&row, "child_failure_action"),
+        output_files,
+        error: s(&row, "error"),
+        started_at: s(&row, "started_at"),
+        updated_at: s(&row, "updated_at"),
+        completed_at: s(&row, "completed_at"),
+    }
+}
+
 // ── Monitor control endpoints ────────────────────────────────────────
 
 /// GET /api/admin/monitor/status — returns watchdog/alerts status.
@@ -4715,6 +4896,71 @@ mod tests {
             |_| None,
         );
         assert_eq!(secret.as_deref(), Some("pplx-real-secret"));
+    }
+
+    #[test]
+    fn task_row_to_input_extracts_harness_fields() {
+        let row = serde_json::json!({
+            "id": "task-abc",
+            "tool_name": "podcast_generate",
+            "lifecycle_state": "verifying",
+            "runtime_state": "verifying_outputs",
+            "workflow_kind": "research_podcast",
+            "current_phase": "verify_contract",
+            "child_session_key": "alpha:api:session-1#child-123",
+            "child_terminal_state": "terminal_failed",
+            "child_join_state": "joined",
+            "child_failure_action": "escalate",
+            "output_files": ["pf/audio.mp3", "pf/transcript.txt"],
+            "error": "validator deny",
+            "started_at": "2026-04-19T12:00:00Z",
+            "updated_at": "2026-04-19T12:05:00Z",
+            "completed_at": null,
+            "session_key": "alpha:api:session-1",
+            "parent_session_key": "alpha:api:session-1",
+        });
+
+        let input = task_row_to_input("alpha", row);
+        assert_eq!(input.profile_id, "alpha");
+        assert_eq!(input.session_id, "session-1");
+        assert_eq!(input.task_id, "task-abc");
+        assert_eq!(input.tool_name, "podcast_generate");
+        assert_eq!(input.lifecycle_state, "verifying");
+        assert_eq!(input.runtime_state.as_deref(), Some("verifying_outputs"));
+        assert_eq!(input.workflow_kind.as_deref(), Some("research_podcast"));
+        assert_eq!(input.current_phase.as_deref(), Some("verify_contract"));
+        assert_eq!(
+            input.child_session_key.as_deref(),
+            Some("alpha:api:session-1#child-123")
+        );
+        assert_eq!(
+            input.child_terminal_state.as_deref(),
+            Some("terminal_failed")
+        );
+        assert_eq!(input.child_join_state.as_deref(), Some("joined"));
+        assert_eq!(input.child_failure_action.as_deref(), Some("escalate"));
+        assert_eq!(
+            input.output_files,
+            vec!["pf/audio.mp3".to_string(), "pf/transcript.txt".into()]
+        );
+        assert_eq!(input.error.as_deref(), Some("validator deny"));
+        assert_eq!(input.started_at.as_deref(), Some("2026-04-19T12:00:00Z"));
+        assert_eq!(input.updated_at.as_deref(), Some("2026-04-19T12:05:00Z"));
+        assert!(input.completed_at.is_none());
+    }
+
+    #[test]
+    fn task_row_to_input_fills_sensible_defaults_when_fields_missing() {
+        let row = serde_json::json!({
+            "id": "task-1",
+        });
+        let input = task_row_to_input("beta", row);
+        assert_eq!(input.profile_id, "beta");
+        assert_eq!(input.task_id, "task-1");
+        assert_eq!(input.tool_name, "");
+        assert_eq!(input.lifecycle_state, "unknown");
+        assert!(input.output_files.is_empty());
+        assert!(input.runtime_state.is_none());
     }
 }
 
