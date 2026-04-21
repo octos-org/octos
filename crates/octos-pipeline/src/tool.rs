@@ -244,6 +244,8 @@ impl Tool for RunPipelineTool {
             status_bridge,
             shutdown: shutdown.clone(),
             max_parallel_workers: 8,
+            checkpoint_store: None,
+            hook_executor: None,
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
