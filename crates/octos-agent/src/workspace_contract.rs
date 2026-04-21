@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glob::glob;
@@ -8,8 +9,13 @@ use crate::behaviour::{
 };
 use crate::task_supervisor::{TaskRuntimeState, TaskSupervisor};
 use crate::tools::ToolRegistry;
+use crate::validators::{
+    ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner, ValidatorStatus,
+};
+use crate::workspace_git::open_workspace_validator_ledger;
 use crate::workspace_policy::{
-    WorkspacePolicy, WorkspacePolicyKind, WorkspaceSpawnTaskPolicy, read_workspace_policy,
+    Validator, ValidatorPhaseKind, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSpawnTaskPolicy,
+    read_workspace_policy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +117,32 @@ pub async fn enforce_spawn_task_contract(
             Some(&resolved_artifacts),
         );
         return SpawnTaskContractResult::Failed { error, notify_user };
+    }
+
+    // Run declarative validators (harness M4.3). Required failures block
+    // terminal success via the same gating pathway as a missing-artifact
+    // failure above — we treat a required validator failure as a hard contract
+    // error and return Failed without entering the delivery phase. Optional
+    // failures surface as warning counters through the ledger.
+    match run_declared_validators(
+        tools,
+        workspace_root,
+        &policy.validation.validators,
+        tool_name,
+        ValidatorPhase::Completion,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            run_failure_actions(
+                workspace_root,
+                supervisor,
+                &task_policy.on_failure,
+                Some(&resolved_artifacts),
+            );
+            return SpawnTaskContractResult::Failed { error, notify_user };
+        }
     }
 
     set_runtime_state(
@@ -412,6 +444,83 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
     WorkspacePolicy::for_session()
         .spawn_tasks
         .contains_key(tool_name)
+}
+
+/// Run declared typed validators for a workspace contract gate.
+///
+/// Persists every outcome to the workspace ledger (for replay). Returns
+/// `Err(reason)` if any required validator fails — the caller treats this as
+/// a contract-gate failure, matching the behaviour of a missing declared
+/// artifact.
+pub async fn run_declared_validators(
+    tools: &ToolRegistry,
+    workspace_root: &Path,
+    validators: &[Validator],
+    repo_label_hint: &str,
+    phase: ValidatorPhase,
+) -> Result<Vec<ValidatorOutcome>, String> {
+    if validators.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scoped: Vec<Validator> = validators
+        .iter()
+        .filter(|v| match phase {
+            ValidatorPhase::TurnEnd => v.phase == ValidatorPhaseKind::TurnEnd,
+            ValidatorPhase::Completion => v.phase == ValidatorPhaseKind::Completion,
+        })
+        .cloned()
+        .collect();
+    if scoped.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ledger = match open_workspace_validator_ledger(workspace_root) {
+        Ok(ledger) => Some(ledger),
+        Err(err) => {
+            tracing::warn!(
+                workspace = %workspace_root.display(),
+                error = %err,
+                "failed to open validator ledger; continuing without replay persistence"
+            );
+            None
+        }
+    };
+
+    let runner = build_validator_runner(tools, workspace_root);
+    let runner = match ledger {
+        Some(ledger) => runner.with_ledger(ledger),
+        None => runner,
+    };
+
+    let invocation = ValidatorInvocation {
+        phase,
+        workspace_root: workspace_root.to_path_buf(),
+        repo_label: repo_label_hint.to_string(),
+    };
+
+    let outcomes = runner.run_all(&invocation, &scoped).await;
+    let failures: Vec<&ValidatorOutcome> = outcomes
+        .iter()
+        .filter(|o| o.required && o.status != ValidatorStatus::Pass)
+        .collect();
+    if !failures.is_empty() {
+        let joined = failures
+            .iter()
+            .map(|o| format!("{}: {}", o.validator_id, o.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("required validator failure: {joined}"));
+    }
+    Ok(outcomes)
+}
+
+fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> ValidatorRunner {
+    // Capture a lightweight snapshot of tool handles for the validator runner.
+    // Avoids cloning the full registry and its LRU bookkeeping.
+    let dispatcher: Arc<dyn crate::validators::ValidatorToolDispatcher> =
+        Arc::new(crate::validators::MapToolDispatcher::from_registry(tools));
+    ValidatorRunner::with_dispatcher(dispatcher, workspace_root)
 }
 
 #[cfg(test)]
