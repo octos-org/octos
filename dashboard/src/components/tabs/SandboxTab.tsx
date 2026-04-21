@@ -5,16 +5,31 @@ interface Props {
   onChange: (config: ProfileConfig) => void
 }
 
-const MODES = [
-  { value: 'auto', label: 'Auto', desc: 'macOS sandbox-exec on Mac, Docker on Linux' },
+type SandboxModeValue = NonNullable<SandboxConfig['mode']>
+
+const ALL_MODES: Array<{ value: SandboxModeValue; label: string; desc: string }> = [
+  { value: 'auto', label: 'Auto', desc: 'macOS sandbox-exec on Mac, Docker on Linux, AppContainer on Windows' },
   { value: 'macos', label: 'macOS (sandbox-exec)', desc: 'Kernel-level SBPL, ~6ms overhead' },
   { value: 'docker', label: 'Docker', desc: 'Container isolation, ~130-700ms overhead' },
   { value: 'bwrap', label: 'Bubblewrap (Linux)', desc: 'Lightweight Linux namespace isolation' },
+  { value: 'appcontainer', label: 'Windows AppContainer', desc: 'Windows process isolation via AppContainer profile' },
 ]
+
+function isWindowsClient(): boolean {
+  const userAgentPlatform = (navigator as Navigator & { userAgentData?: { platform?: string } })
+    .userAgentData?.platform
+  const platform = (userAgentPlatform ?? navigator.platform ?? '').toLowerCase()
+  return platform.includes('win')
+}
 
 export default function SandboxTab({ config, onChange }: Props) {
   const sandbox = config.sandbox ?? { enabled: false, mode: 'auto', allow_network: true }
   const docker = sandbox.docker ?? {}
+  const currentMode = sandbox.mode ?? 'auto'
+  const shouldShowAppContainer = currentMode === 'appcontainer' || isWindowsClient()
+  const modes = shouldShowAppContainer
+    ? ALL_MODES
+    : ALL_MODES.filter((mode) => mode.value !== 'appcontainer')
 
   const updateSandbox = (updates: Partial<SandboxConfig>) => {
     onChange({ ...config, sandbox: { ...sandbox, ...updates } })
@@ -52,16 +67,16 @@ export default function SandboxTab({ config, onChange }: Props) {
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-1.5">Sandbox Mode</label>
             <select
-              value={sandbox.mode ?? 'auto'}
+              value={currentMode}
               onChange={(e) => updateSandbox({ mode: e.target.value as SandboxConfig['mode'] })}
               className="input max-w-[300px]"
             >
-              {MODES.map((m) => (
+              {modes.map((m) => (
                 <option key={m.value} value={m.value}>{m.label}</option>
               ))}
             </select>
             <p className="text-[10px] text-gray-600 mt-1">
-              {MODES.find((m) => m.value === (sandbox.mode ?? 'auto'))?.desc}
+              {ALL_MODES.find((m) => m.value === currentMode)?.desc}
             </p>
           </div>
 

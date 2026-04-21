@@ -369,6 +369,7 @@ mod tests {
             (SandboxMode::Bwrap, "\"bwrap\""),
             (SandboxMode::Macos, "\"macos\""),
             (SandboxMode::Docker, "\"docker\""),
+            (SandboxMode::AppContainer, "\"appcontainer\""),
             (SandboxMode::None, "\"none\""),
         ];
         for (mode, expected_json) in &modes {

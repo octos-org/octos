@@ -85,7 +85,7 @@ export interface DockerConfig {
 
 export interface SandboxConfig {
   enabled?: boolean
-  mode?: 'auto' | 'macos' | 'docker' | 'bwrap'
+  mode?: 'auto' | 'macos' | 'docker' | 'bwrap' | 'appcontainer'
   allow_network?: boolean
   docker?: DockerConfig
 }
