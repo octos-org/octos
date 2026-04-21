@@ -115,6 +115,104 @@ Acceptance:
   truth
 - no duplicate child sessions or cross-session progress bleed
 
+#### M4.1A: Structured Progress Contract
+
+GitHub milestone:
+<https://github.com/octos-org/octos/milestone/1>
+
+Trigger:
+
+- mini1 validation of the first deep-research progress patch still replayed only
+  the initial `task_status`; no later phase updates appeared after 15s or 45s.
+
+Contract decision:
+
+- stderr is diagnostics only
+- stdout remains the tool/plugin result channel where applicable
+- runtime progress must be emitted as structured `octos.harness.event.v1`
+  records
+- structured progress must update durable parent `task_status`
+- browser progress UI must consume the same replayable backend truth as the
+  task API
+- the event transport is language-neutral; Rust, Python, JavaScript, shell, and
+  opaque binaries all use the same sink contract
+- the sink is addressed as a transport URI; local transports are mandatory,
+  distributed pub/sub transports such as Zenoh are optional adapters behind the
+  same ABI
+
+Required event shape:
+
+```json
+{
+  "schema": "octos.harness.event.v1",
+  "kind": "progress",
+  "session_id": "...",
+  "task_id": "...",
+  "workflow": "deep_research",
+  "phase": "fetching_sources",
+  "message": "Fetching source 3/12",
+  "progress": 0.42
+}
+```
+
+Deliverables:
+
+- typed progress event ABI with schema versioning and field limits
+- runtime-provided `OCTOS_EVENT_SINK` for child tools/workflows
+- transport abstraction for `OCTOS_EVENT_SINK`:
+  - required: local file/JSONL or Unix-domain socket transport
+  - optional: stdio/fd transport for sandboxed children
+  - future adapter: Zenoh or another pub/sub backend for distributed hosts
+- language-neutral event emitter helpers:
+  - Rust `tracing`/helper crate
+  - Python helper package or copyable single-file emitter
+  - JavaScript/Node helper package or copyable single-file emitter
+  - CLI fallback: `octos-event emit --kind progress --phase ...`
+- bounded runtime consumer that bridges structured events into task supervisor
+  `runtime_detail`
+- `TaskStatusChanged` emission and session-event replay for every accepted
+  structured progress update
+- deep-search migration from stderr-only progress to structured events while
+  preserving stderr as human diagnostics
+- browser/API proof that progress survives session switching and reload
+- live mini fleet validation before closing the milestone
+
+Published workstreams:
+
+- `#470`: Core ABI for structured progress events
+- `#471`: Runtime event sink to durable `task_status`
+- `#472`: Deep-search structured progress emission
+- `#473`: UI/API parent-visible progress replay
+- `#474`: Release gate and mini fleet validation
+- `#475`: Non-Rust bridge for Python and JavaScript emitters
+- `#476`: Optional Zenoh/pub-sub transport evaluation
+
+Transport policy:
+
+- M4.1A must not require a network broker for same-host child progress.
+- Pub/sub backends are acceptable only if they implement the same
+  `octos.harness.event.v1` schema and feed the same durable parent
+  `task_status` path.
+- Zenoh is a good candidate for later distributed/robotics event fanout, but it
+  should not block the local reliability fix for mini1 deep research.
+
+Agent ownership model:
+
+- ABI agent owns event types, schema tests, and docs only.
+- Runtime agent owns child process environment injection, sink consumption,
+  task supervisor updates, and replay tests.
+- Deep-search agent owns only `crates/app-skills/deep-search` emission changes.
+- Non-Rust bridge agent owns Python/JavaScript emitter helpers and compatibility
+  fixtures.
+- UI/API agent owns chat header/replay behavior and browser regression tests.
+- Release agent owns deploy/test evidence across mini1, mini2, mini3, and mini5.
+
+Merge rule:
+
+- land `#470` first, then stack `#471` and `#472`; `#473` can proceed against
+  the API contract in parallel, and `#474` closes only after one integrated SHA
+  is deployed and verified.
+
 ### M4.2: Developer Contract Docs And Starters
 
 Goal:
