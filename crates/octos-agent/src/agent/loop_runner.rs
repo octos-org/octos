@@ -197,16 +197,13 @@ impl Agent {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
 
+                // Build the system prompt via the shared helper in
+                // execution.rs so conversation + task loops compose the same
+                // prompt. This is where realtime sensor summary gets appended
+                // once per turn (bounded by `sensor_budget_tokens`).
                 let mut messages = vec![Message {
                     role: MessageRole::System,
-                    content: self
-                        .system_prompt
-                        .read()
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("system prompt lock was poisoned, recovering");
-                            e.into_inner()
-                        })
-                        .clone(),
+                    content: super::execution::compose_system_prompt(self),
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
@@ -268,6 +265,11 @@ impl Agent {
                     }
 
                     let iteration = turn.advance_iteration();
+                    // Realtime heartbeat: beat first, then abort the iteration
+                    // with a typed error if the controller reports stalled.
+                    // A None controller / disabled config is a no-op so the
+                    // 830+ existing tests see identical behavior.
+                    self.beat_heartbeat(iteration)?;
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -591,6 +593,9 @@ impl Agent {
 
                 let iteration = turn.advance_iteration();
                 let iter_start = Instant::now();
+                // Realtime heartbeat beat + stall check (no-op when realtime
+                // is disabled or unattached).
+                self.beat_heartbeat(iteration)?;
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 

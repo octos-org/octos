@@ -269,6 +269,14 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "child_session_lifecycle".to_string(),
             total_for_metric(samples, "octos_child_session_lifecycle_total"),
         ),
+        (
+            "realtime_heartbeat_beats".to_string(),
+            total_for_metric(samples, "octos_realtime_heartbeat_beats_total"),
+        ),
+        (
+            "realtime_heartbeat_stalls".to_string(),
+            total_for_metric(samples, "octos_realtime_heartbeat_stalls_total"),
+        ),
     ])
 }
 
