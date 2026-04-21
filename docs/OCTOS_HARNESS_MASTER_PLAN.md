@@ -98,6 +98,7 @@ The current tracked control docs are:
 - `docs/OCTOS_RUNTIME_PHASE3_CONTRACT.md`
 - `docs/OCTOS_RUNTIME_PHASE2.md`
 - `docs/OCTOS_RUNTIME_PHASE3.md`
+- `docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md`
 
 ## Hard Rules
 
@@ -112,15 +113,45 @@ The current tracked control docs are:
 
 ## Current Status
 
-Completed release slice:
+Completed harness implementation slice:
 
 - canary background artifact/reload reliability for slides/site/background flows
+- coding/debugging loop hardening
+- hard-case live acceptance coverage
+- workspace policy v1
+- generic lifecycle hooks
+- completion gating
+- policy-driven artifact truth and delivery
+- deterministic spawn-only lifecycle states
+- first-party slides/sites harness templates
+- first-party slides/sites contract ownership moved out of kernel paths
 
-Not yet complete:
+Closed implementation issues:
 
-- full Phase 3 issue set
-- full harness formalization
-- broader coding hard-case acceptance
+- `#414`
+- `#415`
+- `#433`
+- `#434`
+- `#435`
+- `#436`
+- `#437`
+- `#438`
+- `#439`
+- `#441`
 
-The next work should follow the Phase 3 contract, not restart exploratory
-refactoring.
+Still-open program controls:
+
+- `#412`: broad Phase 3 umbrella
+- `#413`: canary soak and regression triage
+- `#416`: operator dashboard beyond the current summary/runtime data
+
+Remaining gap:
+
+- the harness runtime exists and first-party flows prove it, but the
+  developer-facing custom app platform still needs progress ABI productization,
+  starter apps, validator runner tooling, third-party compatibility gates,
+  operator dashboard coverage, and explicit ABI versioning.
+
+The next work should follow
+`docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md`, not restart exploratory
+refactoring or reopen completed Phase 3 implementation issues.
