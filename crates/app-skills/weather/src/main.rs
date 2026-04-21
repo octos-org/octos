@@ -3,8 +3,10 @@
 //! Protocol: `./main <tool_name>` with JSON on stdin, JSON on stdout.
 
 use std::io::Read;
+use std::thread::sleep;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -96,10 +98,42 @@ fn fail(msg: &str) -> ! {
 
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(4))
+        .connect_timeout(Duration::from_secs(2))
         .build()
         .expect("failed to build HTTP client")
+}
+
+fn get_json_with_retries<T>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    label: &str,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    const ATTEMPTS: usize = 3;
+    let mut last_error = None;
+
+    for attempt in 1..=ATTEMPTS {
+        match client.get(url).send().and_then(|r| r.error_for_status()) {
+            Ok(response) => match response.json::<T>() {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    last_error = Some(format!("Failed to parse {label} response: {error}"));
+                }
+            },
+            Err(error) => {
+                last_error = Some(format!("{label} request failed: {error}"));
+            }
+        }
+
+        if attempt < ATTEMPTS {
+            sleep(Duration::from_millis(200 * attempt as u64));
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| format!("{label} request failed")))
 }
 
 /// Geocode a city name to coordinates.
@@ -123,16 +157,13 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
             format!("https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=5&language={lang}")
         };
 
-        if let Ok(r) = client.get(&url).send() {
-            if let Ok(geo) = r.json::<GeoResult>() {
-                if let Some(mut results) = geo.results {
-                    if !results.is_empty() {
-                        // Pick the most populated result (avoids returning tiny hamlets)
-                        results.sort_by(|a, b| {
-                            b.population.unwrap_or(0).cmp(&a.population.unwrap_or(0))
-                        });
-                        return results.into_iter().next().unwrap();
-                    }
+        if let Ok(geo) = get_json_with_retries::<GeoResult>(client, &url, "Geocoding") {
+            if let Some(mut results) = geo.results {
+                if !results.is_empty() {
+                    // Pick the most populated result (avoids returning tiny hamlets)
+                    results
+                        .sort_by(|a, b| b.population.unwrap_or(0).cmp(&a.population.unwrap_or(0)));
+                    return results.into_iter().next().unwrap();
                 }
             }
         }
@@ -206,12 +237,9 @@ fn handle_get_weather(input_json: &str) {
         location.timezone.as_deref().unwrap_or("auto")
     );
 
-    let weather: WeatherResponse = match client.get(&weather_url).send() {
-        Ok(r) => match r.json() {
-            Ok(v) => v,
-            Err(e) => fail(&format!("Failed to parse weather response: {e}")),
-        },
-        Err(e) => fail(&format!("Weather request failed: {e}")),
+    let weather: WeatherResponse = match get_json_with_retries(&client, &weather_url, "Weather") {
+        Ok(v) => v,
+        Err(error) => fail(&error),
     };
 
     let current = match weather.current {
@@ -288,12 +316,9 @@ fn handle_get_forecast(input_json: &str) {
         location.timezone.as_deref().unwrap_or("auto")
     );
 
-    let resp: ForecastResponse = match client.get(&url).send() {
-        Ok(r) => match r.json() {
-            Ok(v) => v,
-            Err(e) => fail(&format!("Failed to parse forecast response: {e}")),
-        },
-        Err(e) => fail(&format!("Forecast request failed: {e}")),
+    let resp: ForecastResponse = match get_json_with_retries(&client, &url, "Forecast") {
+        Ok(v) => v,
+        Err(error) => fail(&error),
     };
 
     let daily = match resp.daily {
