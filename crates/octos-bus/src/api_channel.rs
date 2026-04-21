@@ -2448,7 +2448,8 @@ mod tests {
     {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "test-chat");
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "test-chat", None);
 
         {
             let mut manager = sessions.lock().await;
@@ -3398,7 +3399,8 @@ mod tests {
     async fn session_messages_full_source_reads_from_disk_snapshot() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "web-history");
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "web-history", None);
 
         {
             let mut manager = sessions.lock().await;
@@ -3454,7 +3456,8 @@ mod tests {
     async fn session_messages_default_source_returns_recent_window_with_absolute_seq() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key(Some(TEST_PROFILE_ID), "web-history");
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "web-history", None);
 
         {
             let mut manager = sessions.lock().await;
