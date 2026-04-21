@@ -10,7 +10,6 @@ import _PROVIDER_MODELS from '../../providers.json'
 const CUSTOM_FAMILY = '__custom_family__'
 const CUSTOM_MODEL = '__custom_model__'
 const CUSTOM_ROUTE = '__custom_route__'
-const OFFICIAL_ROUTE_ID = 'official'
 
 /** An API host that serves one or more models. Empty base_url = family default. */
 interface ModelEndpoint {
@@ -126,7 +125,7 @@ function buildRouteFromEndpoint(
   endpoint: ModelEndpoint | undefined,
 ): LlmRouteConfig {
   return {
-    route_id: endpoint?.id || (provider ? OFFICIAL_ROUTE_ID : null),
+    route_id: endpoint?.id || null,
     label: endpoint?.label || (provider ? 'Official API' : null),
     base_url: nullable(endpoint?.base_url),
     api_key_env: nullable(endpoint?.api_key_env || getApiKeyEnvName(provider)),
@@ -143,10 +142,14 @@ function hasCustomRoute(
   const model = findModelEntry(provider, modelId)
   if (findMatchingEndpoint(model, route)) return false
   const defaultEnv = getApiKeyEnvName(provider)
+  const hasOnlyLegacyRouteAlias = !route.base_url
+    && !nullable(route.label)
+    && (!route.api_key_env || route.api_key_env === defaultEnv)
+  if (hasOnlyLegacyRouteAlias) return false
   return !!(
     route.base_url ||
     route.label ||
-    (route.route_id && route.route_id !== OFFICIAL_ROUTE_ID) ||
+    route.route_id ||
     (route.api_key_env && route.api_key_env !== defaultEnv)
   )
 }
@@ -237,8 +240,8 @@ function getPrimarySelection(config: ProfileConfig): LlmModelSelectionConfig {
       family_id: 'anthropic',
       model_id: 'claude-sonnet-4-20250514',
       route: {
-        route_id: OFFICIAL_ROUTE_ID,
-        label: 'Official API',
+        route_id: null,
+        label: null,
         base_url: null,
         api_key_env: 'ANTHROPIC_API_KEY',
         api_type: null,
@@ -384,7 +387,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
       {
         ...primary,
         model_id: modelId,
-        route: buildRouteForModel(primaryProvider, modelId, primary.route),
+        route: buildRouteForModel(primaryProvider, modelId, null),
       },
       fallbacks,
     )
@@ -458,8 +461,8 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
       family_id: provider,
       model_id: models[0] || null,
       route: {
-        route_id: OFFICIAL_ROUTE_ID,
-        label: 'Official API',
+        route_id: null,
+        label: null,
         base_url: null,
         api_key_env: env,
         api_type: null,
@@ -491,7 +494,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const changeFallbackModel = (idx: number, modelId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
-    const nextRoute = buildRouteForModel(fb.family_id, modelId, fb.route)
+    const nextRoute = buildRouteForModel(fb.family_id, modelId, null)
     const envName = nextRoute.api_key_env || getFallbackEnvName(fb.family_id || '', idx, fallbacks, primaryEnv)
     updateFallback(idx, {
       model_id: modelId,

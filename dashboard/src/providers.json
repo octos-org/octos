@@ -116,7 +116,7 @@
     "env": "DEEPSEEK_API_KEY",
     "models": [
       { "id": "deepseek-chat", "input": 0.27, "output": 1.1, "max_output": 8192, "endpoints": [
-        { "id": "official", "label": "Official API" },
+        { "id": "deepseek", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
       { "id": "deepseek-reasoner", "input": 0.55, "output": 2.19, "max_output": 8192 }
@@ -137,7 +137,7 @@
     "env": "MOONSHOT_API_KEY",
     "models": [
       { "id": "kimi-k2.5", "input": 0.6, "output": 2.4, "max_output": 65535, "endpoints": [
-        { "id": "official", "label": "Official API" },
+        { "id": "moonshot", "label": "Official API" },
         { "id": "autodl", "label": "AutoDL", "base_url": "https://www.autodl.art/api/v1", "api_key_env": "AUTODL_API_KEY" }
       ] },
       { "id": "kimi-k2-thinking", "input": 0.6, "output": 2.4, "max_output": 65535 },
@@ -169,7 +169,7 @@
       { "id": "MiniMax-M2.7", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.5", "input": 0.5, "output": 2.0, "max_output": 16384 },
       { "id": "MiniMax-M2.5-highspeed", "input": 0.5, "output": 2.0, "max_output": 16384, "endpoints": [
-        { "id": "official", "label": "Official API" },
+        { "id": "minimax", "label": "Official API" },
         { "id": "wisemodel", "label": "WiseModel", "base_url": "https://open.ospreyai.cn/v1", "api_key_env": "WISEMODEL_API_KEY" }
       ] },
       { "id": "MiniMax-M2.1", "input": 0.5, "output": 2.0, "max_output": 16384 },
