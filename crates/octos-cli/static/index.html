@@ -16,10 +16,12 @@
       <ul id="session-list"></ul>
     </aside>
     <main id="chat">
+      <div id="task-status" aria-live="polite"></div>
       <div id="messages"></div>
       <form id="chat-form">
-        <textarea id="input" placeholder="Type a message..." rows="2"></textarea>
-        <button type="submit">Send</button>
+        <textarea id="input" data-testid="chat-input" placeholder="Type a message..." rows="2"></textarea>
+        <button id="send-button" type="submit" data-testid="send-button">Send</button>
+        <button id="cancel-button" type="button" data-testid="cancel-button" class="hidden">Cancel</button>
       </form>
     </main>
     <footer id="status-bar">
