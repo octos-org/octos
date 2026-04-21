@@ -2,28 +2,22 @@ import { useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import WizardNav from '../components/WizardNav'
+import StepOverview from './wizard/StepOverview'
 import StepLlmProvider from './wizard/StepLlmProvider'
-import StepEmail from './wizard/StepEmail'
-import StepChannel from './wizard/StepChannel'
-import StepDeployMode from './wizard/StepDeployMode'
-import StepFinish from './wizard/StepFinish'
+import StepCreateProfile from './wizard/StepCreateProfile'
 
-const TOTAL_STEPS = 5
+const TOTAL_STEPS = 3
 
 function renderStep(step: number) {
   switch (step) {
     case 0:
-      return <StepLlmProvider />
+      return <StepOverview />
     case 1:
-      return <StepEmail />
-    case 2:
-      return <StepChannel />
-    case 3:
-      return <StepDeployMode />
-    case 4:
-      return <StepFinish />
-    default:
       return <StepLlmProvider />
+    case 2:
+      return <StepCreateProfile />
+    default:
+      return <StepOverview />
   }
 }
 
@@ -81,6 +75,7 @@ export default function SetupWizard() {
           onSkipStep={() => goToStep(step + 1)}
           onSkipWizard={handleSkipWizard}
           onFinish={handleFinish}
+          stepOwnsPrimary={step === TOTAL_STEPS - 1}
         />
       </div>
     </div>

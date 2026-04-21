@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../../api'
+import providersData from '../../providers.json'
 
 type ProviderChoice = {
   id: string
@@ -8,11 +9,16 @@ type ProviderChoice = {
   needsBaseUrl?: boolean
 }
 
+const LOCAL_PROVIDERS = new Set(['ollama', 'vllm'])
+
 const PROVIDERS: ProviderChoice[] = [
-  { id: 'anthropic', label: 'Anthropic', defaultModel: 'claude-sonnet-4-6' },
-  { id: 'openai', label: 'OpenAI', defaultModel: 'gpt-5.1' },
-  { id: 'gemini', label: 'Gemini', defaultModel: 'gemini-2.5-flash' },
-  { id: 'openrouter', label: 'OpenRouter', defaultModel: 'anthropic/claude-sonnet-4-6' },
+  ...Object.entries(providersData as Record<string, { models: { id: string }[] }>)
+    .map(([id, data]) => ({
+      id,
+      label: id.charAt(0).toUpperCase() + id.slice(1),
+      defaultModel: data.models?.[0]?.id ?? '',
+      needsBaseUrl: LOCAL_PROVIDERS.has(id),
+    })),
   { id: 'openai-compatible', label: 'OpenAI-compatible', defaultModel: 'gpt-4o-mini', needsBaseUrl: true },
 ]
 

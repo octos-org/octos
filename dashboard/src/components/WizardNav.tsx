@@ -6,6 +6,8 @@ type Props = {
   onSkipStep: () => void
   onSkipWizard: () => void
   onFinish: () => void
+  /** When true, the step renders its own finish/next CTAs; nav shows only Back + Skip wizard. */
+  stepOwnsPrimary?: boolean
 }
 
 export default function WizardNav({
@@ -16,6 +18,7 @@ export default function WizardNav({
   onSkipStep,
   onSkipWizard,
   onFinish,
+  stepOwnsPrimary = false,
 }: Props) {
   const isFirst = step <= 0
   const isLast = step >= totalSteps - 1
@@ -31,14 +34,16 @@ export default function WizardNav({
         >
           Back
         </button>
-        <button
-          type="button"
-          onClick={onSkipStep}
-          disabled={isLast}
-          className="px-3 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          Skip this step
-        </button>
+        {!stepOwnsPrimary && (
+          <button
+            type="button"
+            onClick={onSkipStep}
+            disabled={isLast}
+            className="px-3 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Skip this step
+          </button>
+        )}
       </div>
 
       <div className="flex gap-2">
@@ -49,22 +54,24 @@ export default function WizardNav({
         >
           Skip wizard
         </button>
-        {isLast ? (
-          <button
-            type="button"
-            onClick={onFinish}
-            className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
-          >
-            Finish
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={onNext}
-            className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
-          >
-            Next
-          </button>
+        {!stepOwnsPrimary && (
+          isLast ? (
+            <button
+              type="button"
+              onClick={onFinish}
+              className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
+            >
+              Finish
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onNext}
+              className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
+            >
+              Next
+            </button>
+          )
         )}
       </div>
     </div>
