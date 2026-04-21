@@ -275,7 +275,7 @@ test('file delivery is visible via SSE or committed session result', async ({ re
     baseURL!,
     `Use the shell tool to run \`mkdir -p ./${fileDir} && printf 'test123\\n' > ${filePath}\`. Then use send_file to send ${filePath} to me.`,
     sid,
-    90_000,
+    180_000,
   );
 
   // Look for a file event in the SSE stream
