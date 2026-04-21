@@ -184,7 +184,11 @@ pub use registry::ToolRegistry;
 
 // Tool policy
 pub mod policy;
-pub use policy::ToolPolicy;
+pub use policy::{PolicyDecision, ToolPolicy};
+
+// Robot safety-tier groups consulted by ToolPolicy evaluation.
+pub mod robot_groups;
+pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_registry};
 
 // Shared SSRF protection
 pub mod ssrf;

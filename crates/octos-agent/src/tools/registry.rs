@@ -560,8 +560,8 @@ impl ToolRegistry {
     /// have access to.
     pub async fn execute(&self, name: &str, args: &serde_json::Value) -> Result<ToolResult> {
         if let Some(ref policy) = self.provider_policy {
-            if !policy.is_allowed(name) {
-                eyre::bail!("tool '{}' denied by provider policy", name);
+            if let policy::PolicyDecision::Deny { reason } = policy.evaluate(name) {
+                eyre::bail!("tool '{}' denied by provider policy ({})", name, reason);
             }
         }
 
