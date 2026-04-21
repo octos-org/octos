@@ -1,0 +1,29 @@
+{
+  "name": "compat-test-skill",
+  "version": "1.0.0",
+  "author": "octos-harness-compat",
+  "description": "Summarize a text file into a compact report artifact (third-party compatibility fixture)",
+  "timeout_secs": 15,
+  "requires_network": false,
+  "tools": [
+    {
+      "name": "summarize_text",
+      "description": "Read a text file and write a compact summary. Returns the summary file as a deliverable artifact.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "input_path": {
+            "type": "string",
+            "description": "Absolute path of the source text file."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Absolute path where the summary file will be written."
+          }
+        },
+        "required": ["input_path", "output_path"]
+      },
+      "env": ["COMPAT_SUMMARY_TOKEN"]
+    }
+  ]
+}
