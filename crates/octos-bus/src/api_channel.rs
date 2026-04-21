@@ -499,12 +499,22 @@ fn build_bg_task_tool_start_events(tasks: &serde_json::Value) -> Vec<serde_json:
                 Some("spawned" | "running")
             )
         })
-        .filter_map(compatibility_tool_name_for_task)
-        .filter(|tool_name| seen.insert((*tool_name).to_string()))
-        .map(|tool_name| {
+        .filter_map(|task| {
+            compatibility_tool_name_for_task(task).map(|tool_name| {
+                let tool_call_id = task
+                    .get("tool_call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (tool_name, tool_call_id)
+            })
+        })
+        .filter(|(tool_name, _)| seen.insert((*tool_name).to_string()))
+        .map(|(tool_name, tool_call_id)| {
             serde_json::json!({
                 "type": "tool_start",
                 "tool": tool_name,
+                "tool_call_id": tool_call_id,
             })
         })
         .collect()
@@ -630,6 +640,11 @@ impl Channel for ApiChannel {
             } else {
                 msg.media.clone()
             };
+            let tool_call_id = msg
+                .metadata
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
 
             // File message — persist to session history AND send SSE event.
             let committed_message = if !history_already_persisted {
@@ -642,7 +657,7 @@ impl Channel for ApiChannel {
                     content: msg.content.clone(),
                     media: persisted_media.clone(),
                     tool_calls: None,
-                    tool_call_id: None,
+                    tool_call_id: tool_call_id.clone(),
                     reasoning_content: None,
                     timestamp: chrono::Utc::now(),
                 };
@@ -1159,6 +1174,8 @@ struct MessageInfo {
     role: String,
     content: String,
     timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     media: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1290,6 +1307,7 @@ fn message_info_from_history_message(
         role: message.role.to_string(),
         content: sanitize_message_file_markers(&message.content, data_dir),
         timestamp: message.timestamp.to_rfc3339(),
+        tool_call_id: message.tool_call_id.clone(),
         media: message
             .media
             .iter()
@@ -2217,7 +2235,7 @@ mod tests {
     #[test]
     fn build_bg_task_tool_start_events_adds_tts_compatibility_event() {
         let tasks = serde_json::json!([
-            { "id": "task-1", "tool_name": "Direct TTS", "status": "running" },
+            { "id": "task-1", "tool_name": "Direct TTS", "tool_call_id": "call_tts_1", "status": "running" },
             { "id": "task-2", "tool_name": "Direct TTS", "status": "spawned" },
             { "id": "task-3", "tool_name": "Research Podcast", "status": "running" }
         ]);
@@ -2227,6 +2245,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "tool_start");
         assert_eq!(events[0]["tool"], "fm_tts");
+        assert_eq!(events[0]["tool_call_id"], "call_tts_1");
     }
 
     #[tokio::test]
@@ -2822,7 +2841,12 @@ mod tests {
         )
         .with_task_query(Arc::new(|_| {
             serde_json::json!([
-                { "id": "task-1", "tool_name": "Direct TTS", "status": "running" }
+                {
+                    "id": "task-1",
+                    "tool_name": "Direct TTS",
+                    "tool_call_id": "call_tts_1",
+                    "status": "running"
+                }
             ])
         }));
         let (tx, mut rx) = new_sse_channel();
@@ -2846,6 +2870,7 @@ mod tests {
 
         assert_eq!(first["type"], "tool_start");
         assert_eq!(first["tool"], "fm_tts");
+        assert_eq!(first["tool_call_id"], "call_tts_1");
         assert_eq!(second["type"], "done");
         assert_eq!(second["has_bg_tasks"], true);
     }
@@ -2920,7 +2945,7 @@ mod tests {
             content: "Generated report".into(),
             reply_to: None,
             media: vec![source.to_string_lossy().to_string()],
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({"tool_call_id": "call_report_1"}),
         };
         ch.send(&msg).await.unwrap();
 
@@ -2938,6 +2963,10 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .contains("Generated report")
+        );
+        assert_eq!(
+            message.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_report_1")
         );
         let media = message
             .get("media")

@@ -1515,6 +1515,11 @@ impl ActorFactory {
         if let Some(ref ctx) = session_hook_context {
             spawn_tool = spawn_tool.with_hook_context(ctx.clone());
         }
+        if let Some(ref pipeline_factory) = self.pipeline_factory {
+            let pipeline_factory = pipeline_factory.clone();
+            spawn_tool =
+                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+        }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
         let bg_tx = tx.clone();

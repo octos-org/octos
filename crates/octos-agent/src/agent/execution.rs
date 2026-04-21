@@ -47,6 +47,10 @@ impl Agent {
             "executing tools in parallel"
         );
 
+        let turn_attachment_ctx = TURN_ATTACHMENT_CTX
+            .try_with(|ctx| ctx.clone())
+            .unwrap_or_default();
+
         // Spawn each tool as a separate tokio task so that if the agent-level
         // timeout fires, the tasks keep running and can perform their own cleanup
         // (e.g., browser tool kills Chrome, spawn tool finishes gracefully).
@@ -65,6 +69,7 @@ impl Agent {
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
+                let attachment_ctx = turn_attachment_ctx.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -139,21 +144,22 @@ impl Agent {
                         tools.mark_spawn_only_invoked();
                         let bg_supervisor = tools.supervisor();
                         let bg_reporter = reporter.clone();
+                        let bg_attachment_ctx = attachment_ctx.clone();
                         tokio::spawn(async move {
                             bg_supervisor.mark_running(&task_id);
                             let bg_started_at = std::time::SystemTime::now();
 
                             // Helper to create TOOL_CTX for plugin stderr progress streaming
-                            let attachment_ctx =
-                                TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
-                                attachment_paths: attachment_ctx.attachment_paths.clone(),
-                                audio_attachment_paths: attachment_ctx
+                                attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
+                                audio_attachment_paths: bg_attachment_ctx
                                     .audio_attachment_paths
                                     .clone(),
-                                file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                                file_attachment_paths: bg_attachment_ctx
+                                    .file_attachment_paths
+                                    .clone(),
                             };
 
                             let mut result = TOOL_CTX
@@ -466,8 +472,6 @@ impl Agent {
                         );
                     }
 
-                    let attachment_ctx =
-                        TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),

@@ -31,6 +31,8 @@ pub type ChildSessionLifecycleSender = Arc<
     dyn Fn(ChildSessionLifecyclePayload) -> futures::future::BoxFuture<'static, bool> + Send + Sync,
 >;
 
+pub type ChildToolFactory = Arc<dyn Fn() -> Arc<dyn Tool> + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundResultKind {
     Notification,
@@ -307,6 +309,8 @@ pub struct SpawnTool {
     plugin_dirs: Vec<PathBuf>,
     /// Extra environment variables for plugin processes.
     plugin_extra_env: Vec<(String, String)>,
+    /// Additional per-child tools that cannot live in octos-agent builtins.
+    child_tool_factories: Vec<ChildToolFactory>,
     /// Shared task supervisor so background subagents show up in task tracking.
     task_supervisor: Option<Arc<TaskSupervisor>>,
     /// Owning session key for tracked background subagents.
@@ -340,6 +344,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
             task_ledger_path: None,
@@ -372,6 +377,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
             task_ledger_path: None,
@@ -431,6 +437,12 @@ impl SpawnTool {
     ) -> Self {
         self.plugin_dirs = dirs;
         self.plugin_extra_env = extra_env;
+        self
+    }
+
+    /// Add a factory for tools that must be instantiated per child worker.
+    pub fn with_child_tool_factory(mut self, factory: ChildToolFactory) -> Self {
+        self.child_tool_factories.push(factory);
         self
     }
 
@@ -1153,6 +1165,9 @@ impl Tool for SpawnTool {
                     &self.plugin_extra_env,
                 );
             }
+            for factory in &self.child_tool_factories {
+                tools.register_arc(factory());
+            }
             // In subagent context, spawn_only tools should be regular tools —
             // the subagent IS the background, so no need to auto-background again.
             tools.clear_spawn_only();
@@ -1242,6 +1257,7 @@ impl Tool for SpawnTool {
             let task_label = label.clone();
             let plugin_dirs = self.plugin_dirs.clone();
             let plugin_extra_env = self.plugin_extra_env.clone();
+            let child_tool_factories = self.child_tool_factories.clone();
             let task_supervisor = self.task_supervisor.clone();
             let worker_config = self.worker_config.clone();
             let workflow_metadata = workflow.clone();
@@ -1303,6 +1319,9 @@ impl Tool for SpawnTool {
                         &plugin_dirs,
                         &plugin_extra_env,
                     );
+                }
+                for factory in &child_tool_factories {
+                    tools.register_arc(factory());
                 }
                 // In subagent context, spawn_only tools should be regular tools —
                 // the subagent IS the background, so no need to auto-background again.
@@ -1841,6 +1860,7 @@ mod tests {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            child_tool_factories: Vec::new(),
             task_supervisor: None,
             session_key: None,
             task_ledger_path: None,
@@ -2294,6 +2314,62 @@ mod tests {
 
         assert!(error.contains("required tool(s) not available on this host"));
         assert!(error.contains("podcast_generate"));
+    }
+
+    struct StaticTestTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for StaticTestTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test child tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                output: "ok".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_spawn_registers_child_tool_factory_before_preflight() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(|| {
+            Arc::new(StaticTestTool {
+                name: "run_pipeline",
+            })
+        }));
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Use the injected pipeline tool if needed",
+                "label": "Deep research",
+                "mode": "sync",
+                "allowed_tools": ["run_pipeline"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "done");
     }
 
     #[test]

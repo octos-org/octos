@@ -56,11 +56,25 @@ impl ProgressReporter for ChannelReporter {
 
 pub(crate) fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
     match event {
-        ProgressEvent::ToolStarted { name, .. } => {
-            serde_json::json!({"type": "tool_start", "tool": name})
+        ProgressEvent::ToolStarted { name, tool_id } => {
+            serde_json::json!({
+                "type": "tool_start",
+                "tool": name,
+                "tool_call_id": tool_id,
+            })
         }
-        ProgressEvent::ToolCompleted { name, success, .. } => {
-            serde_json::json!({"type": "tool_end", "tool": name, "success": success})
+        ProgressEvent::ToolCompleted {
+            name,
+            tool_id,
+            success,
+            ..
+        } => {
+            serde_json::json!({
+                "type": "tool_end",
+                "tool": name,
+                "tool_call_id": tool_id,
+                "success": success,
+            })
         }
         ProgressEvent::ToolProgress { name, message, .. } => {
             serde_json::json!({"type": "tool_progress", "tool": name, "message": message})
@@ -111,6 +125,7 @@ mod tests {
         let json = event_to_json(&event);
         assert_eq!(json["type"], "tool_start");
         assert_eq!(json["tool"], "shell");
+        assert_eq!(json["tool_call_id"], "t1");
     }
 
     #[test]
@@ -125,6 +140,7 @@ mod tests {
         let json = event_to_json(&event);
         assert_eq!(json["type"], "tool_end");
         assert_eq!(json["tool"], "read_file");
+        assert_eq!(json["tool_call_id"], "t2");
         assert_eq!(json["success"], true);
     }
 

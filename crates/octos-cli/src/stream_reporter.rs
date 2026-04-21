@@ -62,19 +62,35 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::StreamDone { iteration } => {
                 StreamProgressEvent::StreamDone { iteration }
             }
-            ProgressEvent::ToolStarted { ref name, .. } => {
+            ProgressEvent::ToolStarted {
+                ref name,
+                ref tool_id,
+            } => {
                 // Also send raw SSE for web client status indicators
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({"type": "tool_start", "tool": name}).to_string(),
+                    json: serde_json::json!({
+                        "type": "tool_start",
+                        "tool": name,
+                        "tool_call_id": tool_id,
+                    })
+                    .to_string(),
                 });
                 StreamProgressEvent::ToolStarted { name: name.clone() }
             }
             ProgressEvent::ToolCompleted {
-                ref name, success, ..
+                ref name,
+                ref tool_id,
+                success,
+                ..
             } => {
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({"type": "tool_end", "tool": name, "success": success})
-                        .to_string(),
+                    json: serde_json::json!({
+                        "type": "tool_end",
+                        "tool": name,
+                        "tool_call_id": tool_id,
+                        "success": success,
+                    })
+                    .to_string(),
                 });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
