@@ -147,7 +147,11 @@ export default function HomePage() {
   }
 
   const channels = config.channels || []
-  const needsSetup = !config.provider && !config.model
+  const primaryLlm = config.llm?.primary
+  const providerLabel = primaryLlm?.family_id || 'anthropic'
+  const modelLabel = primaryLlm?.model_id || 'default'
+  const fallbackCount = config.llm?.fallbacks?.length || 0
+  const needsSetup = !primaryLlm?.family_id && !primaryLlm?.model_id
 
   return (
     <div>
@@ -197,13 +201,13 @@ export default function HomePage() {
                 </dd>
               </div>
             )}
-            <InfoRow label="Provider" value={config.provider || 'anthropic'} />
-            <InfoRow label="Model" value={config.model || 'default'} />
+            <InfoRow label="Provider" value={providerLabel} />
+            <InfoRow label="Model" value={modelLabel} />
             <InfoRow
               label="Channels"
               value={channels.length > 0 ? channels.map((c) => c.type).join(', ') : 'None'}
             />
-            <InfoRow label="Fallbacks" value={String(config.fallback_models?.length || 0)} />
+            <InfoRow label="Fallbacks" value={String(fallbackCount)} />
           </dl>
 
           {channels.length > 0 && (

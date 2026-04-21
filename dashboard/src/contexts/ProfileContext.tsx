@@ -6,10 +6,16 @@ import { api, myApi, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
 import type { ProfileConfig, ProcessStatus, PurgeReport } from '../types'
 
 const defaultConfig: ProfileConfig = {
-  provider: 'anthropic',
-  model: 'claude-sonnet-4-20250514',
-  api_key_env: 'ANTHROPIC_API_KEY',
-  fallback_models: [],
+  llm: {
+    primary: {
+      family_id: 'anthropic',
+      model_id: 'claude-sonnet-4-20250514',
+      route: {
+        api_key_env: 'ANTHROPIC_API_KEY',
+      },
+    },
+    fallbacks: [],
+  },
   channels: [],
   gateway: { max_history: 50 },
   env_vars: {},
