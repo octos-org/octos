@@ -2330,11 +2330,8 @@ mod tests {
     async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
-        let key = current_profile_api_session_key_with_topic(
-            Some(TEST_PROFILE_ID),
-            "test-chat",
-            None,
-        );
+        let key =
+            current_profile_api_session_key_with_topic(Some(TEST_PROFILE_ID), "test-chat", None);
 
         {
             let mut manager = sessions.lock().await;
@@ -3522,7 +3519,9 @@ mod tests {
 
         {
             let mut sess = sessions.lock().await;
-            sess.add_message(&main_key, Message::user("hello")).await.unwrap();
+            sess.add_message(&main_key, Message::user("hello"))
+                .await
+                .unwrap();
             assert!(sess.load(&main_key).await.is_some());
         }
 

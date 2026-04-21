@@ -23,7 +23,11 @@ fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
         return false;
     }
 
-    let host = email.smtp_host.as_deref().map(str::trim).unwrap_or_default();
+    let host = email
+        .smtp_host
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
     let username = email.username.as_deref().map(str::trim).unwrap_or_default();
     let from_address = email
         .from_address
@@ -57,7 +61,9 @@ fn preferred_dashboard_auth_profiles(
     profile_store: &crate::profiles::ProfileStore,
 ) -> Vec<crate::profiles::UserProfile> {
     let mut profiles = profile_store.list().unwrap_or_default();
-    profiles.sort_by(|a, b| profile_dashboard_auth_priority(a).cmp(&profile_dashboard_auth_priority(b)));
+    profiles.sort_by(|a, b| {
+        profile_dashboard_auth_priority(a).cmp(&profile_dashboard_auth_priority(b))
+    });
     profiles
 }
 
@@ -164,7 +170,8 @@ fn resolve_dashboard_auth_smtp_password(
     for profile in preferred_dashboard_auth_profiles(profile_store) {
         if let Some(email) = profile.config.email.as_ref() {
             if profile_email_matches_dashboard_smtp(email, &auth_config.smtp) {
-                if let Some(secret) = resolve_profile_email_secret(email, &profile.config.env_vars) {
+                if let Some(secret) = resolve_profile_email_secret(email, &profile.config.env_vars)
+                {
                     tracing::info!(
                         profile = %profile.id,
                         "SMTP password resolved from matching profile email tool config"
