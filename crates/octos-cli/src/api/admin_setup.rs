@@ -4,6 +4,7 @@
 //! `BootstrapGate` and `SetupRotateToken` page. All routes live under
 //! `/api/admin/...` and are gated by the admin auth middleware.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use crate::admin_token_store::AdminTokenRecord;
 use crate::setup_state_store::SetupState;
+use crate::smtp_secret_store::SmtpSecretStore;
 
 #[derive(Serialize)]
 pub struct TokenStatus {
@@ -195,6 +197,407 @@ fn validate_token_strength(t: &str) -> Result<(), (StatusCode, Json<ErrorBody>)>
         ));
     }
     Ok(())
+}
+
+// ------------------------- SMTP configuration ----------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SmtpSettings {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub from_address: String,
+    /// Whether `smtp_secret.json` currently holds a password. The password
+    /// itself is never returned by the API.
+    pub password_configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmtpSettingsBody {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub from_address: String,
+    /// Optional — when `Some` and non-empty, overwrites `smtp_secret.json`.
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SmtpTestBody {
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SmtpTestResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Derive the data directory from the admin-token store, which always lives
+/// at `{data_dir}/admin_token.json`.
+fn data_dir_from_state(state: &AppState) -> Option<PathBuf> {
+    state
+        .admin_token_store
+        .path()
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+fn require_config_path(state: &AppState) -> Result<PathBuf, (StatusCode, Json<ErrorBody>)> {
+    match &state.config_path {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let data_dir = data_dir_from_state(state).ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "no_data_dir",
+                    message: "server has no resolvable data directory".into(),
+                }),
+            ))?;
+            Ok(crate::config::Config::data_dir_config_path(&data_dir))
+        }
+    }
+}
+
+struct SmtpFromConfig {
+    host: String,
+    port: u16,
+    username: String,
+    from_address: String,
+}
+
+fn read_smtp_from_config(
+    state: &AppState,
+) -> Result<SmtpFromConfig, (StatusCode, Json<ErrorBody>)> {
+    let path = require_config_path(state)?;
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SmtpFromConfig {
+                host: String::new(),
+                port: 465,
+                username: String::new(),
+                from_address: String::new(),
+            });
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "read_failed",
+                    message: e.to_string(),
+                }),
+            ));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                code: "parse_failed",
+                message: e.to_string(),
+            }),
+        )
+    })?;
+    let smtp = value
+        .get("dashboard_auth")
+        .and_then(|v| v.get("smtp"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let host = smtp
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let port = smtp.get("port").and_then(|v| v.as_u64()).unwrap_or(465) as u16;
+    let username = smtp
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let from_address = smtp
+        .get("from_address")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(SmtpFromConfig {
+        host,
+        port,
+        username,
+        from_address,
+    })
+}
+
+/// GET `/api/admin/smtp` — current SMTP settings plus whether the password
+/// file is populated. The password itself is never returned.
+pub async fn get_smtp(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SmtpSettings>, (StatusCode, Json<ErrorBody>)> {
+    let cfg = read_smtp_from_config(&state)?;
+    let password_configured = data_dir_from_state(&state)
+        .map(|dir| SmtpSecretStore::new(&dir).exists())
+        .unwrap_or(false);
+    Ok(Json(SmtpSettings {
+        host: cfg.host,
+        port: cfg.port,
+        username: cfg.username,
+        from_address: cfg.from_address,
+        password_configured,
+    }))
+}
+
+fn validate_smtp_body(body: &SmtpSettingsBody) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if body.host.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "invalid_host",
+                message: "host must not be empty".into(),
+            }),
+        ));
+    }
+    if body.port == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "invalid_port",
+                message: "port must be greater than 0".into(),
+            }),
+        ));
+    }
+    if !body.from_address.contains('@') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "invalid_from_address",
+                message: "from_address must contain '@'".into(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// POST `/api/admin/smtp` — persist the SMTP block into `config.json` and,
+/// optionally, a fresh password into `smtp_secret.json`. Returns 204.
+pub async fn post_smtp(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SmtpSettingsBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    validate_smtp_body(&body)?;
+
+    if let Some(ref pw) = body.password {
+        if !pw.is_empty() {
+            let data_dir = data_dir_from_state(&state).ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "no_data_dir",
+                    message: "server has no resolvable data directory".into(),
+                }),
+            ))?;
+            SmtpSecretStore::new(&data_dir).save(pw).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        code: "save_failed",
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+        }
+    }
+
+    let path = require_config_path(&state)?;
+    crate::config::write_mutation(&path, |value| {
+        let obj = value.as_object_mut().ok_or_else(|| {
+            eyre::eyre!("config.json root is not a JSON object")
+        })?;
+        let auth = obj
+            .entry("dashboard_auth".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let auth_obj = auth
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("dashboard_auth is not an object"))?;
+        let smtp = auth_obj
+            .entry("smtp".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let smtp_obj = smtp
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("dashboard_auth.smtp is not an object"))?;
+        smtp_obj.insert("host".into(), serde_json::json!(body.host));
+        smtp_obj.insert("port".into(), serde_json::json!(body.port));
+        smtp_obj.insert("username".into(), serde_json::json!(body.username));
+        smtp_obj.insert("from_address".into(), serde_json::json!(body.from_address));
+        // Backfill `password_env` when it is missing so lettre can still find
+        // a fallback env var if `smtp_secret.json` is ever removed.
+        smtp_obj
+            .entry("password_env".to_string())
+            .or_insert_with(|| serde_json::json!("SMTP_PASSWORD"));
+        Ok(())
+    })
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                code: "save_failed",
+                message: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST `/api/admin/smtp/test` — send a diagnostic email to the caller.
+pub async fn post_smtp_test(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SmtpTestBody>,
+) -> Json<SmtpTestResult> {
+    if !body.to.contains('@') {
+        return Json(SmtpTestResult {
+            ok: false,
+            message: None,
+            error: Some("recipient address must contain '@'".into()),
+        });
+    }
+    let Some(ref auth_mgr) = state.auth_manager else {
+        return Json(SmtpTestResult {
+            ok: false,
+            message: None,
+            error: Some(
+                "SMTP is not configured on the server (no dashboard_auth.smtp block)".into(),
+            ),
+        });
+    };
+    match auth_mgr
+        .send_html_email(
+            &body.to,
+            "octos SMTP test",
+            "<p>Your octos SMTP settings are working.</p>",
+        )
+        .await
+    {
+        Ok(true) => Json(SmtpTestResult {
+            ok: true,
+            message: Some(format!("test email sent to {}", body.to)),
+            error: None,
+        }),
+        Ok(false) => Json(SmtpTestResult {
+            ok: false,
+            message: None,
+            error: Some("SMTP not configured on the server".into()),
+        }),
+        Err(e) => Json(SmtpTestResult {
+            ok: false,
+            message: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+// ------------------------- Deployment mode -------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeploymentModeBody {
+    pub mode: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeploymentModeDetection {
+    pub detected: String,
+}
+
+fn valid_mode(m: &str) -> bool {
+    matches!(m, "local" | "tenant" | "cloud")
+}
+
+/// GET `/api/admin/deployment-mode` — read the current mode from `config.json`.
+pub async fn get_deployment_mode(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DeploymentModeBody>, (StatusCode, Json<ErrorBody>)> {
+    let path = require_config_path(&state)?;
+    let mode = if path.exists() {
+        let body = std::fs::read_to_string(&path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "read_failed",
+                    message: e.to_string(),
+                }),
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "parse_failed",
+                    message: e.to_string(),
+                }),
+            )
+        })?;
+        value
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local")
+            .to_string()
+    } else {
+        "local".to_string()
+    };
+    Ok(Json(DeploymentModeBody { mode }))
+}
+
+/// POST `/api/admin/deployment-mode` — persist the mode into `config.json`.
+pub async fn post_deployment_mode(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeploymentModeBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    if !valid_mode(&body.mode) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "invalid_mode",
+                message: "mode must be one of: local, tenant, cloud".into(),
+            }),
+        ));
+    }
+    let path = require_config_path(&state)?;
+    let mode = body.mode.clone();
+    crate::config::write_mutation(&path, move |value| {
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("config.json root is not a JSON object"))?;
+        obj.insert("mode".into(), serde_json::json!(mode));
+        Ok(())
+    })
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                code: "save_failed",
+                message: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET `/api/admin/deployment-mode/detect` — heuristic detection.
+pub async fn get_deployment_mode_detect(
+    State(state): State<Arc<AppState>>,
+) -> Json<DeploymentModeDetection> {
+    let detected = if std::env::var("TUNNEL_DOMAIN").is_ok() {
+        "cloud"
+    } else {
+        let frpc_exists = data_dir_from_state(&state)
+            .map(|dir| dir.join("frpc.toml").exists())
+            .unwrap_or(false);
+        if frpc_exists { "tenant" } else { "local" }
+    };
+    Json(DeploymentModeDetection {
+        detected: detected.into(),
+    })
 }
 
 #[cfg(test)]
@@ -381,5 +784,274 @@ mod tests {
         let err = rotate_token(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert_eq!(err.1.code, "already_rotated");
+    }
+
+    // ----- SMTP endpoints -----
+
+    fn smtp_state(dir: &std::path::Path) -> Arc<AppState> {
+        Arc::new(AppState {
+            admin_token_store: Arc::new(AdminTokenStore::new(dir)),
+            setup_state_store: Arc::new(SetupStateStore::new(dir)),
+            config_path: Some(dir.join("config.json")),
+            ..AppState::empty_for_tests()
+        })
+    }
+
+    #[tokio::test]
+    async fn get_smtp_returns_defaults_when_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let Json(s) = get_smtp(State(state)).await.unwrap();
+        assert_eq!(s.host, "");
+        assert_eq!(s.port, 465);
+        assert_eq!(s.username, "");
+        assert_eq!(s.from_address, "");
+        assert!(!s.password_configured);
+    }
+
+    #[tokio::test]
+    async fn post_smtp_writes_settings_and_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let body = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: "octos".into(),
+            from_address: "noreply@example.com".into(),
+            password: Some("hunter2".into()),
+        };
+        let status = post_smtp(State(state.clone()), Json(body)).await.unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let Json(s) = get_smtp(State(state)).await.unwrap();
+        assert_eq!(s.host, "smtp.example.com");
+        assert_eq!(s.port, 587);
+        assert_eq!(s.username, "octos");
+        assert_eq!(s.from_address, "noreply@example.com");
+        assert!(s.password_configured);
+
+        let pw = SmtpSecretStore::new(dir.path()).load().unwrap().unwrap();
+        assert_eq!(pw, "hunter2");
+
+        // password_env should be backfilled when missing.
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["dashboard_auth"]["smtp"]["password_env"], "SMTP_PASSWORD");
+    }
+
+    #[tokio::test]
+    async fn post_smtp_leaves_password_alone_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        // Pre-populate the password store.
+        SmtpSecretStore::new(dir.path())
+            .save("pre-existing")
+            .unwrap();
+
+        let body = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: "octos".into(),
+            from_address: "noreply@example.com".into(),
+            password: None,
+        };
+        post_smtp(State(state.clone()), Json(body)).await.unwrap();
+
+        let pw = SmtpSecretStore::new(dir.path()).load().unwrap().unwrap();
+        assert_eq!(pw, "pre-existing");
+
+        let body2 = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: "octos".into(),
+            from_address: "noreply@example.com".into(),
+            password: Some(String::new()),
+        };
+        post_smtp(State(state), Json(body2)).await.unwrap();
+        let pw = SmtpSecretStore::new(dir.path()).load().unwrap().unwrap();
+        assert_eq!(pw, "pre-existing");
+    }
+
+    #[tokio::test]
+    async fn post_smtp_rejects_invalid_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let body = SmtpSettingsBody {
+            host: "".into(),
+            port: 465,
+            username: "u".into(),
+            from_address: "a@b".into(),
+            password: None,
+        };
+        let err = post_smtp(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "invalid_host");
+    }
+
+    #[tokio::test]
+    async fn post_smtp_rejects_zero_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let body = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 0,
+            username: "u".into(),
+            from_address: "a@b".into(),
+            password: None,
+        };
+        let err = post_smtp(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "invalid_port");
+    }
+
+    #[tokio::test]
+    async fn post_smtp_rejects_from_without_at_sign() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let body = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 465,
+            username: "u".into(),
+            from_address: "not-an-email".into(),
+            password: None,
+        };
+        let err = post_smtp(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "invalid_from_address");
+    }
+
+    #[tokio::test]
+    async fn post_smtp_preserves_unrelated_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "mode":"tenant",
+                "some_other":{"keep":"me"},
+                "dashboard_auth":{
+                    "smtp":{"password_env":"CUSTOM_PW_ENV","host":"old"},
+                    "session_expiry_hours":48
+                }
+            }"#,
+        )
+        .unwrap();
+        let state = smtp_state(dir.path());
+
+        let body = SmtpSettingsBody {
+            host: "smtp.new".into(),
+            port: 587,
+            username: "u".into(),
+            from_address: "a@b.com".into(),
+            password: None,
+        };
+        post_smtp(State(state), Json(body)).await.unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mode"], "tenant");
+        assert_eq!(parsed["some_other"]["keep"], "me");
+        assert_eq!(parsed["dashboard_auth"]["session_expiry_hours"], 48);
+        assert_eq!(parsed["dashboard_auth"]["smtp"]["host"], "smtp.new");
+        // password_env should remain untouched (backcompat).
+        assert_eq!(
+            parsed["dashboard_auth"]["smtp"]["password_env"],
+            "CUSTOM_PW_ENV"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_smtp_test_rejects_invalid_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let Json(result) =
+            post_smtp_test(State(state), Json(SmtpTestBody { to: "bad".into() })).await;
+        assert!(!result.ok);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn post_smtp_test_reports_missing_auth_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let Json(result) = post_smtp_test(
+            State(state),
+            Json(SmtpTestBody {
+                to: "x@example.com".into(),
+            }),
+        )
+        .await;
+        assert!(!result.ok);
+        assert!(result.error.is_some());
+    }
+
+    // ----- Deployment-mode endpoints -----
+
+    #[tokio::test]
+    async fn get_deployment_mode_defaults_to_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let Json(body) = get_deployment_mode(State(state)).await.unwrap();
+        assert_eq!(body.mode, "local");
+    }
+
+    #[tokio::test]
+    async fn post_deployment_mode_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        for mode in ["local", "tenant", "cloud"] {
+            let status = post_deployment_mode(
+                State(state.clone()),
+                Json(DeploymentModeBody {
+                    mode: mode.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let Json(body) = get_deployment_mode(State(state.clone())).await.unwrap();
+            assert_eq!(body.mode, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_deployment_mode_rejects_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+        let err = post_deployment_mode(
+            State(state),
+            Json(DeploymentModeBody {
+                mode: "mainframe".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "invalid_mode");
+    }
+
+    #[tokio::test]
+    async fn detect_deployment_mode_returns_tenant_when_frpc_exists() {
+        // TUNNEL_DOMAIN must not be set for this test.
+        // SAFETY: test-only manipulation; Rust test runners may run tests in
+        // parallel, but this env var isn't consulted elsewhere in this file.
+        let prev = std::env::var("TUNNEL_DOMAIN").ok();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("TUNNEL_DOMAIN");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("frpc.toml"), b"[common]\n").unwrap();
+        let state = smtp_state(dir.path());
+        let Json(body) = get_deployment_mode_detect(State(state)).await;
+        assert_eq!(body.detected, "tenant");
+
+        // Restore.
+        if let Some(v) = prev {
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TUNNEL_DOMAIN", v);
+            }
+        }
     }
 }

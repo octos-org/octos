@@ -236,6 +236,33 @@ export const api = {
 
   skipSetup: () => requestNoContent('/setup/skip', { method: 'POST' }),
 
+  // SMTP configuration (used by the setup wizard and future Settings pages)
+  getSmtp: () => request<SmtpSettings>('/smtp'),
+
+  saveSmtp: (data: SmtpSettingsBody) =>
+    requestNoContent('/smtp', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  testSmtp: (to: string) =>
+    request<SmtpTestResult>('/smtp/test', {
+      method: 'POST',
+      body: JSON.stringify({ to }),
+    }),
+
+  // Deployment mode (local / tenant / cloud)
+  getDeploymentMode: () => request<DeploymentModeBody>('/deployment-mode'),
+
+  saveDeploymentMode: (mode: DeploymentMode) =>
+    requestNoContent('/deployment-mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
+
+  detectDeploymentMode: () =>
+    request<DeploymentModeDetection>('/deployment-mode/detect'),
+
   testProvider: (data: {
     provider: string
     model: string
@@ -258,6 +285,37 @@ export type SetupState = {
   wizard_skipped: boolean
   wizard_last_step_reached: number
 }
+
+// ── SMTP + deployment-mode types ───────────────────────────────────
+
+export type SmtpSettings = {
+  host: string
+  port: number
+  username: string
+  from_address: string
+  password_configured: boolean
+}
+
+export type SmtpSettingsBody = {
+  host: string
+  port: number
+  username: string
+  from_address: string
+  /** Leave undefined / empty to keep the existing password. */
+  password?: string
+}
+
+export type SmtpTestResult = {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+export type DeploymentMode = 'local' | 'tenant' | 'cloud'
+
+export type DeploymentModeBody = { mode: DeploymentMode }
+
+export type DeploymentModeDetection = { detected: DeploymentMode }
 
 // ── Auth API (public) ───────────────────────────────────────────────
 

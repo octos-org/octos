@@ -272,6 +272,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(admin_setup::post_setup_complete),
         )
         .route("/api/admin/setup/skip", post(admin_setup::post_setup_skip))
+        // SMTP configuration
+        .route("/api/admin/smtp", get(admin_setup::get_smtp))
+        .route("/api/admin/smtp", post(admin_setup::post_smtp))
+        .route("/api/admin/smtp/test", post(admin_setup::post_smtp_test))
+        // Deployment mode
+        .route(
+            "/api/admin/deployment-mode",
+            get(admin_setup::get_deployment_mode),
+        )
+        .route(
+            "/api/admin/deployment-mode",
+            post(admin_setup::post_deployment_mode),
+        )
+        .route(
+            "/api/admin/deployment-mode/detect",
+            get(admin_setup::get_deployment_mode_detect),
+        )
         // Sub-account management
         .route(
             "/api/admin/profiles/{id}/accounts",
