@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ChatConfig;
+use crate::content_classifier::{ClassificationDecision, ContentClassifier};
 use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
@@ -536,6 +537,14 @@ pub struct AdaptiveStatus {
 /// switches that happen inside `chat_stream()` failover.
 pub type StatusCallback = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Callback invoked once per chat turn with a content classifier decision.
+/// Wired by the agent layer to emit `octos.harness.event.v1 { kind: "routing.decision" }`
+/// events and to bump the `octos_routing_decision_total` counter.
+///
+/// Invariant: this callback fires *before* the router picks a lane, so the
+/// decision is observable even when the subsequent lane selection fails.
+pub type RoutingDecisionCallback = Arc<dyn Fn(&ClassificationDecision) + Send + Sync>;
+
 pub struct AdaptiveRouter {
     slots: Vec<AdaptiveSlot>,
     config: AdaptiveConfig,
@@ -558,6 +567,12 @@ pub struct AdaptiveRouter {
     /// Id of the credential currently in use per slot. Updated at acquire
     /// time so failure notifications can identify the right credential.
     current_credential_ids: Mutex<Vec<Option<String>>>,
+    /// Content classifier that biases lane selection. `None` means "disabled"
+    /// (router behaves as before — invariant #2 of issue #493). RwLock
+    /// mirrors the status callback pattern so runtime toggles are safe.
+    classifier: RwLock<Option<Arc<ContentClassifier>>>,
+    /// Observer fired with the classifier decision on each chat entry.
+    decision_callback: RwLock<Option<RoutingDecisionCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -613,6 +628,8 @@ impl AdaptiveRouter {
             status_callback: RwLock::new(None),
             credential_pools: RwLock::new(vec![None; slot_count]),
             current_credential_ids: Mutex::new(vec![None; slot_count]),
+            classifier: RwLock::new(None),
+            decision_callback: RwLock::new(None),
         }
     }
 
@@ -761,6 +778,37 @@ impl AdaptiveRouter {
     pub fn set_qos_ranking(&self, enabled: bool) {
         self.qos_ranking.store(enabled, Ordering::Relaxed);
         info!(enabled, "QoS quality ranking toggled");
+    }
+
+    /// Install the content classifier (M6.6). `None` disables — the router
+    /// then behaves as if the classifier contract did not exist.
+    ///
+    /// Wiring for credential-pool-aware lane selection (M6.5) consumes the
+    /// classifier's tier through `classify_turn()`. Until M6.5 lands the
+    /// tier is emitted as an event + counter only.
+    pub fn set_content_classifier(&self, classifier: Option<Arc<ContentClassifier>>) {
+        *self.classifier.write().unwrap() = classifier;
+    }
+
+    /// Install the routing-decision observer. The agent wires this to emit
+    /// the `routing.decision` harness event and bump the metric counter.
+    pub fn set_routing_decision_callback(&self, cb: Option<RoutingDecisionCallback>) {
+        *self.decision_callback.write().unwrap() = cb;
+    }
+
+    /// Classify the latest user turn and notify observers.
+    ///
+    /// Returns the decision so callers (and future M6.5 credential-pool lane
+    /// selection) can act on it. Returns `None` when no classifier is
+    /// attached, letting the router stay on its existing code path.
+    pub fn classify_turn(&self, messages: &[Message]) -> Option<ClassificationDecision> {
+        let classifier = self.classifier.read().unwrap().clone()?;
+        let input = latest_user_text(messages);
+        let decision = classifier.classify(&input);
+        if let Some(cb) = self.decision_callback.read().unwrap().as_ref() {
+            cb(&decision);
+        }
+        Some(decision)
     }
 
     /// Pre-seed metrics from benchmark baseline data so the router starts
@@ -1487,6 +1535,12 @@ impl LlmProvider for AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        // Invariant #5 of issue #493: classify BEFORE selecting a lane so the
+        // decision is observable even if lane selection fails. M6.5 will
+        // consume the returned tier for credential-pool-aware selection;
+        // today the downstream router code path remains unchanged so
+        // `enabled: false` configs see identical behavior (invariant #2).
+        let _classifier_decision = self.classify_turn(messages);
         let mode = self.mode();
         let (start_idx, is_probe) = self.select_provider();
 
@@ -1561,6 +1615,8 @@ impl LlmProvider for AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        // Classify the turn before lane selection (see invariant #5 above).
+        let _classifier_decision = self.classify_turn(messages);
         let (start_idx, _is_probe) = self.select_provider();
 
         match self
@@ -1666,6 +1722,26 @@ fn now_epoch_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+/// Extract the text of the most recent user message, or fall back to the last
+/// message of any role. Returns an empty string if `messages` is empty.
+///
+/// The classifier runs against the "latest user turn" — this is the stable
+/// definition of that input. Keeping it centralized means the router and
+/// any future M6.5 credential-pool integration agree on the same slice.
+fn latest_user_text(messages: &[Message]) -> String {
+    if let Some(msg) = messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, octos_core::MessageRole::User))
+    {
+        return msg.content.clone();
+    }
+    messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

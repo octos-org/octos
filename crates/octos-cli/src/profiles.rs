@@ -100,6 +100,10 @@ pub struct ProfileConfig {
     /// tokens with persistent cooldowns and rotation strategies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_pool: Option<CredentialPoolConfig>,
+    /// Content-classified smart routing configuration (M6.6).
+    /// Missing config defaults to `enabled: false` (invariant #3 of issue #493).
+    #[serde(default)]
+    pub content_routing: Option<octos_llm::RoutingConfig>,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -296,6 +300,8 @@ pub struct ProfileConfigPatch {
     pub adaptive_routing: PatchField<crate::config::AdaptiveRoutingConfig>,
     #[serde(default)]
     pub credential_pool: PatchField<CredentialPoolConfig>,
+    #[serde(default)]
+    pub content_routing: PatchField<octos_llm::RoutingConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -527,6 +533,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.credential_pool = None,
             PatchField::Value(credential_pool) => self.credential_pool = Some(credential_pool),
+        }
+        match patch.content_routing {
+            PatchField::Absent => {}
+            PatchField::Clear => self.content_routing = None,
+            PatchField::Value(content_routing) => self.content_routing = Some(content_routing),
         }
 
         self.normalize_llm_contract();
