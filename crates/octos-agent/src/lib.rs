@@ -47,7 +47,8 @@ pub use abi_schema::{
     COMPACTION_POLICY_SCHEMA_VERSION, CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION,
     HARNESS_ERROR_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
     SESSION_SUMMARY_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
-    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported, default_credential_pool_config_schema_version,
+    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    default_credential_pool_config_schema_version,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
