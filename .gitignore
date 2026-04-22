@@ -66,6 +66,10 @@ scripts/deploy.sh
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 !docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
+!docs/OCTOS_COMPETITIVE_LANDSCAPE_2026-04-22.md
+!docs/OCTOS_PROTOCOL_STRATEGY_2026-04-22.md
+!docs/OCTOS_SWARM_POSITIONING_2026-04-22.md
+!docs/OCTOS_AGENT_CHAT_PATTERN_2026-04-22.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
