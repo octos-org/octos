@@ -71,6 +71,7 @@ scripts/deploy.sh
 !docs/OCTOS_SWARM_POSITIONING_2026-04-22.md
 !docs/OCTOS_AGENT_CHAT_PATTERN_2026-04-22.md
 !docs/OCTOS_CODING_HARDENING_M6_PLAN_2026-04-22.md
+!docs/OCTOS_SWARM_ORCHESTRATOR_M7_PLAN_2026-04-22.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
