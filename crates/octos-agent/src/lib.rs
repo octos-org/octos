@@ -44,9 +44,10 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    COMPACTION_POLICY_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION,
-    PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
-    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    COMPACTION_POLICY_SCHEMA_VERSION, CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION,
+    HARNESS_ERROR_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported, default_credential_pool_config_schema_version,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -61,10 +62,11 @@ pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{
-    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
-    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
-    HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
-    MAX_HARNESS_EVENT_LINE_BYTES,
+    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCredentialRotationEvent,
+    HarnessCredentialRotationSink, HarnessEvent, HarnessEventError, HarnessEventPayload,
+    HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent, HarnessProgressEvent,
+    HarnessRetryEvent, HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    emit_registered_credential_rotation_event,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,

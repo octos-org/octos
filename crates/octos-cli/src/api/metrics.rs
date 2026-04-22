@@ -297,6 +297,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "compaction_preservation_violations".to_string(),
             total_for_metric(samples, "octos_compaction_preservation_violations_total"),
         ),
+        (
+            "credential_rotations".to_string(),
+            total_for_metric(samples, "octos_llm_credential_rotation_total"),
+        ),
     ])
 }
 
@@ -380,6 +384,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 samples,
                 "octos_compaction_preservation_violations_total",
                 &["phase"],
+            ),
+        ),
+        (
+            "credential_rotations".to_string(),
+            breakdown(
+                samples,
+                "octos_llm_credential_rotation_total",
+                &["reason", "strategy"],
             ),
         ),
     ])
@@ -882,6 +894,33 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         let summary = build_operator_summary("");
         assert!(!summary.available);
         assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn should_surface_credential_rotation_metrics() {
+        let metrics = r#"
+# TYPE octos_llm_credential_rotation_total counter
+octos_llm_credential_rotation_total{reason="initial_acquire",strategy="round_robin"} 4
+octos_llm_credential_rotation_total{reason="rate_limit_cooldown",strategy="round_robin"} 2
+octos_llm_credential_rotation_total{reason="auth_failure",strategy="fill_first"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert!(summary.available);
+        assert_eq!(summary.totals.get("credential_rotations"), Some(&7));
+        let rows = summary.breakdowns.get("credential_rotations").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().any(|r| r["reason"] == "initial_acquire"
+                && r["strategy"] == "round_robin"
+                && r["count"] == 4),
+            "missing initial_acquire row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["reason"] == "auth_failure"
+                && r["strategy"] == "fill_first"
+                && r["count"] == 1),
+            "missing auth_failure row: {rows:?}"
+        );
     }
 
     #[test]
