@@ -44,8 +44,8 @@ pub mod workspace_policy;
 
 pub use abi_schema::{
     COMPACTION_POLICY_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
-    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
-    check_supported,
+    SESSION_SUMMARY_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
+    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,

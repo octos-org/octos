@@ -1,12 +1,13 @@
 //! Harness ABI schema versioning.
 //!
-//! The harness exposes four durable types to external app skills and
+//! The harness exposes five durable types to external app skills and
 //! integrations:
 //!
 //! - [`WorkspacePolicy`](crate::workspace_policy::WorkspacePolicy)
 //! - [`HookPayload`](crate::hooks::HookPayload)
 //! - [`ProgressEvent`](crate::progress::ProgressEvent) (emitted shape)
 //! - [`TaskResult`](octos_core::TaskResult)
+//! - [`SessionSummary`](octos_core::SessionSummary) (harness M6.4)
 //!
 //! Each serialized instance carries a numeric `schema_version` (v1 is the
 //! current shape). Missing versions default to v1 for backward compatibility
@@ -42,6 +43,17 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for `SessionSummary` (harness M6.4).
+///
+/// Carries the typed LLM-iterative compaction summary: goal, constraints,
+/// progress, decisions (with turn index + rationale), files, and next steps.
+/// Persisted instances include this field so iterative refinement can detect
+/// legacy payloads and reject future versions with a typed error.
+///
+/// Re-exports [`octos_core::SESSION_SUMMARY_SCHEMA_VERSION`] so callers can
+/// take the value from either crate interchangeably.
+pub const SESSION_SUMMARY_SCHEMA_VERSION: u32 = octos_core::SESSION_SUMMARY_SCHEMA_VERSION;
 
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
