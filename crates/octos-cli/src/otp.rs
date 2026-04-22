@@ -88,7 +88,7 @@ pub struct TestEmail {
 pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
     sessions: RwLock<HashMap<String, ActiveSession>>,
-    smtp_config: Option<SmtpConfig>,
+    smtp_config: RwLock<Option<SmtpConfig>>,
     /// Pre-resolved SMTP password (from profile env_vars or keychain).
     /// Used as fallback when the process environment doesn't have the password.
     smtp_password: Option<String>,
@@ -120,7 +120,7 @@ impl AuthManager {
         Self {
             pending_otps: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
-            smtp_config,
+            smtp_config: RwLock::new(smtp_config),
             smtp_password: None,
             session_expiry_hours,
             allow_self_registration,
@@ -250,13 +250,20 @@ impl AuthManager {
     /// Returns `Ok(true)` when an email was sent, `Ok(false)` when SMTP is not
     /// configured and the email was intentionally skipped.
     pub async fn send_html_email(&self, email: &str, subject: &str, html: &str) -> Result<bool> {
-        let Some(ref smtp) = self.smtp_config else {
+        let smtp = self.smtp_config.read().await.clone();
+        let Some(smtp) = smtp else {
             tracing::warn!(email = %email, subject = %subject, "email skipped — no SMTP configured");
             return Ok(false);
         };
 
-        self.deliver_html_email(smtp, email, subject, html).await?;
+        self.deliver_html_email(&smtp, email, subject, html).await?;
         Ok(true)
+    }
+
+    /// Replace the in-memory SMTP config (used by the admin settings endpoint
+    /// after writing new values to disk). Pass `None` to clear.
+    pub async fn set_smtp_config(&self, cfg: Option<SmtpConfig>) {
+        *self.smtp_config.write().await = cfg;
     }
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
@@ -286,13 +293,14 @@ impl AuthManager {
             return Ok(false);
         }
 
-        if let Some(ref smtp) = self.smtp_config {
+        let smtp = self.smtp_config.read().await.clone();
+        if let Some(smtp) = smtp {
             let code = {
                 let otps = self.pending_otps.read().await;
                 otps.get(&otp_key).map(|otp| otp.code.clone())
             };
             if let Some(code) = code {
-                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                if let Err(e) = self.send_otp_email(&smtp, &email_lower, &code).await {
                     let mut otps = self.pending_otps.write().await;
                     otps.remove(&otp_key);
                     return Err(e);
@@ -332,13 +340,14 @@ impl AuthManager {
             return Ok(false);
         }
 
-        if let Some(ref smtp) = self.smtp_config {
+        let smtp = self.smtp_config.read().await.clone();
+        if let Some(smtp) = smtp {
             let code = {
                 let otps = self.pending_otps.read().await;
                 otps.get(&otp_key).map(|otp| otp.code.clone())
             };
             if let Some(code) = code {
-                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                if let Err(e) = self.send_otp_email(&smtp, &email_lower, &code).await {
                     let mut otps = self.pending_otps.write().await;
                     otps.remove(&otp_key);
                     return Err(e);

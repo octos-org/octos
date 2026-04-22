@@ -447,6 +447,21 @@ pub async fn post_smtp(
             }),
         )
     })?;
+
+    // Refresh the in-memory SMTP config so the test endpoint and subsequent OTP
+    // sends pick up the new values without a server restart.
+    if let Some(ref auth_mgr) = state.auth_manager {
+        auth_mgr
+            .set_smtp_config(Some(crate::otp::SmtpConfig {
+                host: body.host.clone(),
+                port: body.port,
+                username: body.username.clone(),
+                password_env: "SMTP_PASSWORD".to_string(),
+                from_address: body.from_address.clone(),
+            }))
+            .await;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
