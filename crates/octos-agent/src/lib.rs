@@ -42,8 +42,9 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION,
-    UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -59,8 +60,8 @@ pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironm
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
-    HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
-    MAX_HARNESS_EVENT_LINE_BYTES,
+    HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
+    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
@@ -80,14 +81,18 @@ pub use task_supervisor::{
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
-    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
-    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool,
+    DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DeepSearchTool, DiffEditTool, DispatchOutcome, DispatchRequest,
+    DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool,
+    ManageSkillsTool, McpAgentBackend, McpAgentBackendConfig, MessageTool, PolicyDecision,
+    ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendFileTool, SharedBackend,
+    ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, TakePhotoTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
     WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
-    install_robot_registry,
+    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    install_robot_registry, record_dispatch,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{

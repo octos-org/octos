@@ -588,6 +588,19 @@ impl TaskSupervisor {
                 );
                 self.mark_failed(task_id, data.message.clone());
             }
+            HarnessEventPayload::SubAgentDispatch { .. } => {
+                // Dispatch events are observational — they record the fact
+                // that a task was shipped off to an MCP-backed sub-agent
+                // without mutating the task's terminal state. The outer
+                // spawn lifecycle still decides when the task completes or
+                // fails; we just attach the structured detail so operators
+                // can see which backend is servicing the task.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
         }
 
         Ok(())

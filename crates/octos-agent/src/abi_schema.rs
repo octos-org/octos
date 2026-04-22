@@ -35,6 +35,15 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::SubAgentDispatch`](crate::harness_events::HarnessEventPayload::SubAgentDispatch)
+/// event and its nested
+/// [`HarnessSubAgentDispatchEvent`](crate::harness_events::HarnessSubAgentDispatchEvent)
+/// payload emitted when the harness dispatches work to an MCP-exposed
+/// sub-agent. Callers MUST validate the version on deserialization via
+/// [`check_supported`] before using any v1-specific fields.
+pub const SUB_AGENT_DISPATCH_SCHEMA_VERSION: u32 = 1;
+
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
 ///
@@ -137,5 +146,22 @@ mod tests {
             default_hook_payload_schema_version(),
             HOOK_PAYLOAD_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn sub_agent_dispatch_schema_version_is_registered_at_v1() {
+        assert_eq!(SUB_AGENT_DISPATCH_SCHEMA_VERSION, 1);
+        assert!(
+            check_supported(
+                "SubAgentDispatch",
+                SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+                SUB_AGENT_DISPATCH_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+        let err = check_supported("SubAgentDispatch", 99, SUB_AGENT_DISPATCH_SCHEMA_VERSION)
+            .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "SubAgentDispatch");
+        assert_eq!(err.found, 99);
     }
 }

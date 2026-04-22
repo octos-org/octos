@@ -201,6 +201,7 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod list_dir;
 pub mod manage_skills;
+pub mod mcp_agent;
 pub mod message;
 pub mod read_file;
 pub mod recall_memory;
@@ -238,6 +239,13 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
+pub use mcp_agent::{
+    DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchOutcome, DispatchRequest, DispatchResponse,
+    HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend, StdioMcpAgent,
+    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    record_dispatch,
+};
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use recall_memory::RecallMemoryTool;
