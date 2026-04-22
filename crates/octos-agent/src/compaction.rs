@@ -814,12 +814,10 @@ impl CompactionRunner {
 }
 
 fn default_summarizer_for(kind: CompactionSummarizerKind) -> Arc<dyn Summarizer> {
-    match kind {
-        CompactionSummarizerKind::Extractive | CompactionSummarizerKind::LlmIterative => {
-            // LLM-iterative lands in M6.4; fall back to extractive until then.
-            Arc::new(ExtractiveSummarizer::new())
-        }
-    }
+    // Delegate to the summarizer module so provider-aware wiring
+    // (`default_summarizer_for_with_provider`) and the plain extractive
+    // default live in one place.
+    crate::summarizer::default_summarizer_for(kind)
 }
 
 fn matches_artifact(haystack: &str, artifact: &PreservedArtifact) -> bool {
