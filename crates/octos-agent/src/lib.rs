@@ -13,7 +13,7 @@ pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
-mod compaction;
+pub mod compaction;
 pub mod event_bus;
 pub mod exec_env;
 pub mod harness_events;
@@ -33,6 +33,7 @@ pub mod session;
 pub mod skills;
 pub mod steering;
 mod subprocess_env;
+pub mod summarizer;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -42,8 +43,9 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION,
-    UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    COMPACTION_POLICY_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -75,6 +77,7 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
 };
@@ -102,11 +105,12 @@ pub use workspace_git::{
     snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    ValidationPolicy, Validator, ValidatorPhaseKind, ValidatorSpec, WORKSPACE_POLICY_FILE,
-    WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
-    WorkspaceVersionControlProvider, read_workspace_policy, upgrade_workspace_policy_if_legacy,
-    workspace_policy_path, write_workspace_policy,
+    CompactionPolicy, CompactionSummarizerKind, ValidationPolicy, Validator, ValidatorPhaseKind,
+    ValidatorSpec, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
+    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
+    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
+    write_workspace_policy,
 };
 
 #[cfg(test)]

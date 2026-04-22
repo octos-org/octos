@@ -285,7 +285,18 @@ impl Agent {
                     }
 
                     let tools_spec = self.tools.specs();
+                    // Harness M6.3: run preflight compaction before the first
+                    // LLM call when a compaction policy is wired and the
+                    // context already exceeds the declared threshold.
+                    if iteration == 1 {
+                        self.maybe_run_preflight_compaction(&mut messages);
+                    }
                     prepare_conversation_messages(self, &mut messages, &mut turn);
+                    // Harness M6.3: post-prep compaction pass so the declarative
+                    // runner sees the final shape of the conversation (after
+                    // tool-pair repair + system-message normalization). This
+                    // also feeds the validator rail on subsequent iterations.
+                    self.maybe_run_turn_compaction(&mut messages, iteration);
                     let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {

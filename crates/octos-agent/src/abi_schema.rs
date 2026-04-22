@@ -25,6 +25,14 @@ use std::fmt;
 /// Current schema version for `WorkspacePolicy`.
 pub const WORKSPACE_POLICY_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for `CompactionPolicy` (harness M6.3).
+///
+/// Carries the declarative compaction contract: token budget, preserved
+/// artifacts/invariants, preflight threshold, tool-result pruning policy, and
+/// the summarizer flavour. Persisted instances include this field so durable
+/// policy files replay across harness upgrades.
+pub const COMPACTION_POLICY_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `HookPayload`.
 pub const HOOK_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 
@@ -91,6 +99,12 @@ pub(crate) fn default_workspace_policy_schema_version() -> u32 {
 /// Default schema version for `HookPayload` deserialization.
 pub(crate) fn default_hook_payload_schema_version() -> u32 {
     HOOK_PAYLOAD_SCHEMA_VERSION
+}
+
+/// Default schema version for `CompactionPolicy` deserialization. Applied when
+/// an older workspace-policy file omits the nested `schema_version` line.
+pub(crate) fn default_compaction_policy_schema_version() -> u32 {
+    COMPACTION_POLICY_SCHEMA_VERSION
 }
 
 #[cfg(test)]
