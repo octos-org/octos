@@ -300,7 +300,7 @@ async fn run_deep_search(
             _ => 10,
         };
         let mut ranked: Vec<(String, u32)> = link_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         let chase_urls: Vec<String> = ranked
             .into_iter()
             .take(chase_limit)
@@ -372,7 +372,7 @@ async fn run_deep_search(
         };
 
         let mut ranked_domains: Vec<(String, Vec<String>)> = domain_links.into_iter().collect();
-        ranked_domains.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        ranked_domains.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
 
         let to_crawl: Vec<String> = ranked_domains
             .into_iter()
@@ -657,7 +657,7 @@ async fn web_search(
         };
     }
 
-    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    successful.sort_by_key(|entry| std::cmp::Reverse(entry.1.output.len()));
     let mut primary = successful.remove(0);
 
     // Append runner-up if it has substantial unique content
@@ -748,7 +748,7 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
         };
     }
 
-    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    successful.sort_by_key(|entry| std::cmp::Reverse(entry.1.output.len()));
     let mut primary = successful.remove(0);
     for (name, other) in &successful {
         if other.output.len() > 100 {

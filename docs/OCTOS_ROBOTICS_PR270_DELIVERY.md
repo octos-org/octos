@@ -111,7 +111,7 @@ Files from PR `#270` that are **explicitly rejected** from reuse:
 - `crates/octos-agent/src/recorder.rs` (BlackBoxRecorder) — redundant vs `TaskLifecycleState` + `after_tool_call` hooks
 - `crates/octos-agent/src/hooks.rs` robot `HookEvent` variants — superseded by `BeforeSpawnVerify` + domain payload (RP03)
 - `crates/octos-pipeline/src/graph.rs` `Invariant` struct + 5 new `HandlerKind` variants — unparsed / undispatched
-- `typos.toml` allowlist additions (`bre`, `reques`) — mask real typos; if needed, use `extend-identifiers`
+- `typos.toml` allowlist additions for short typo tokens — mask real typos; if needed, use `extend-identifiers`
 - `examples/slam-nav-sim/` entire directory — 7,631 LOC including Python reimplementation of octos internals; move to separate repo
 - `crates/octos-cli/static/admin/*` bundle swaps — no source changes
 - `crates/octos-dora-mcp/src/lib.rs` duplicate `SafetyTier` — use `octos_agent::permissions::SafetyTier`
