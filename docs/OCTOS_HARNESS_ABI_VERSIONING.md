@@ -34,10 +34,13 @@ use octos_agent::{
 use octos_core::TASK_RESULT_SCHEMA_VERSION;
 ```
 
-Progress events on the wire are identified by both a string schema name,
-`octos.harness.event.v1`, and the numeric `schema_version`. The string is
+Legacy agent progress envelopes are identified by both a string schema name,
+`octos.agent.progress.event.v1`, and the numeric `schema_version`. The string is
 the stable identifier consumers should branch on; the number communicates
-minor evolution within that schema family.
+minor evolution within that schema family. This legacy envelope is distinct
+from the M4 harness event sink ABI (`octos.harness.event.v1`), which carries
+typed task/session-scoped events such as `progress`, `phase`, and
+`validator_result`.
 
 ## Compatibility rules
 
@@ -118,7 +121,7 @@ Experimental:
 
 Stable:
 
-- `schema` (fixed string `octos.harness.event.v1`)
+- `schema` (fixed string `octos.agent.progress.event.v1`)
 - `schema_version`
 - `event.kind` discriminator and the variants: `task_started`, `thinking`,
   `response`, `tool_started`, `tool_completed`, `file_modified`,
@@ -134,6 +137,25 @@ Experimental:
 - `llm_status`, `stream_chunk`, `stream_done`, `stream_retry`,
   `tool_progress` — currently in flight with M4.1 and may pick up
   additional fields within v1.
+
+### Harness event sink v1
+
+Stable:
+
+- `schema` (fixed string `octos.harness.event.v1`)
+- `kind` values `progress` and `phase`
+- `session_id`, `task_id`, optional `workflow`, optional `message`
+- `phase`
+- `progress` on `kind=progress`; legacy producers may send `progress_fraction`
+  and the runtime aliases it to `progress`.
+- `schema_version` on `kind=validator_result`, currently `1`.
+
+Reserved:
+
+- `artifact`, `validator_result`, `retry`, and `failure` are parsed and
+  validated by the runtime. First-party producers are still being rolled out,
+  so external consumers should treat these as reserved ABI surfaces unless
+  they explicitly opt into M5-era contracts.
 
 ### `TaskResult` v1
 

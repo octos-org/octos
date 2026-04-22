@@ -6,7 +6,6 @@
 //! Quick rank (stability only): `cargo test -p octos-llm --test tool_benchmark stability -- --ignored --nocapture`
 //! Full suite: `cargo test -p octos-llm --test tool_benchmark full_benchmark -- --ignored --nocapture`
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use octos_llm::anthropic::AnthropicProvider;
@@ -587,7 +586,7 @@ async fn test_stability_at_tool_count(
     attempts: usize,
 ) -> StabilityResult {
     let tools = generate_tools(tool_count);
-    let tool_specs: Vec<ToolSpec> = tools.iter().cloned().collect();
+    let tool_specs: Vec<ToolSpec> = tools.to_vec();
     let config = ChatConfig::default();
 
     let messages = vec![octos_core::Message {
@@ -659,7 +658,7 @@ async fn test_stability_at_tool_count(
 
 async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
     let tools = generate_tools(15);
-    let tool_specs: Vec<ToolSpec> = tools.iter().cloned().collect();
+    let tool_specs: Vec<ToolSpec> = tools.to_vec();
     let config = ChatConfig::default();
 
     // Tool selection tests: query → expected tool
@@ -785,7 +784,7 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
 
 async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
     let tools = generate_tools(15);
-    let tool_specs: Vec<ToolSpec> = tools.iter().cloned().collect();
+    let tool_specs: Vec<ToolSpec> = tools.to_vec();
     let config = ChatConfig::default();
 
     // Parallel tool calls: ask for 3 things at once

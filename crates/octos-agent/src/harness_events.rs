@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::task_supervisor::TaskSupervisor;
+use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
 
 pub const HARNESS_EVENT_SCHEMA_V1: &str = "octos.harness.event.v1";
 pub const OCTOS_EVENT_SINK_ENV: &str = "OCTOS_EVENT_SINK";
@@ -31,6 +32,10 @@ const MAX_TASK_ID_BYTES: usize = 128;
 const MAX_WORKFLOW_BYTES: usize = 128;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
+
+fn default_validator_result_schema_version() -> u32 {
+    VALIDATOR_RESULT_SCHEMA_VERSION
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessEventError(String);
@@ -215,6 +220,8 @@ pub struct HarnessArtifactEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessValidatorResultEvent {
+    #[serde(default = "default_validator_result_schema_version")]
+    pub schema_version: u32,
     pub session_id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +361,12 @@ impl HarnessEvent {
                 }
             }
             HarnessEventPayload::ValidatorResult { data } => {
+                if data.schema_version > VALIDATOR_RESULT_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported validator result schema_version {} (max supported: {})",
+                        data.schema_version, VALIDATOR_RESULT_SCHEMA_VERSION
+                    )));
+                }
                 validate_common_ids(&data.session_id, &data.task_id)?;
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
@@ -440,6 +453,7 @@ impl HarnessEvent {
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
                 serde_json::json!({
                     "schema": self.schema,
+                    "schema_version": data.schema_version,
                     "kind": "validator_result",
                     "session_id": data.session_id,
                     "task_id": data.task_id,
@@ -832,6 +846,27 @@ mod tests {
         let parsed = HarnessEvent::from_json_line(&raw.to_string()).unwrap();
         let detail = parsed.runtime_detail_value(None, None);
         assert_eq!(detail["progress"], 0.25);
+    }
+
+    #[test]
+    fn validator_result_event_defaults_and_reports_schema_version() {
+        let raw = serde_json::json!({
+            "schema": "octos.harness.event.v1",
+            "kind": "validator_result",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "workflow": "coding",
+            "phase": "verify",
+            "validator": "cargo-test",
+            "passed": true,
+            "message": "ok"
+        });
+
+        let parsed = HarnessEvent::from_json_line(&raw.to_string()).unwrap();
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["schema_version"], VALIDATOR_RESULT_SCHEMA_VERSION);
+        assert_eq!(detail["validator"], "cargo-test");
+        assert_eq!(detail["passed"], true);
     }
 
     #[test]

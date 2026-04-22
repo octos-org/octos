@@ -28,8 +28,8 @@ pub const WORKSPACE_POLICY_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `HookPayload`.
 pub const HOOK_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 
-/// Current schema version for `ProgressEvent` (and its serialized envelope
-/// at `octos.harness.event.v1`).
+/// Current schema version for `ProgressEvent` and its legacy serialized
+/// envelope at `octos.agent.progress.event.v1`.
 pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// Current schema version for `TaskResult`.

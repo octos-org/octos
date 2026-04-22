@@ -14,7 +14,7 @@ use crate::abi_schema::PROGRESS_EVENT_SCHEMA_VERSION;
 /// Producers that emit progress envelopes into the structured event transport
 /// MUST use this string; consumers can branch on it to identify supported
 /// payload shapes. See `docs/OCTOS_HARNESS_ABI_VERSIONING.md`.
-pub const HARNESS_PROGRESS_EVENT_SCHEMA: &str = "octos.harness.event.v1";
+pub const HARNESS_PROGRESS_EVENT_SCHEMA: &str = "octos.agent.progress.event.v1";
 
 /// Versioned wrapper for a [`ProgressEvent`] when it is serialized onto the
 /// transport. This is the durable ABI consumers should branch on — the raw

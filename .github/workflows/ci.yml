@@ -70,10 +70,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
+
+      - name: API feature tests
+        run: cargo test -p octos-cli --features api api::auth_handlers
 
       - name: QoS adaptive/runtime catalog regressions
         run: |

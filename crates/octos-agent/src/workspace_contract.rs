@@ -853,7 +853,7 @@ mod tests {
             &ToolRegistry::with_builtins(temp.path()),
             "bundle_generate",
             "tool-call-6",
-            &[report.clone()],
+            std::slice::from_ref(&report),
             UNIX_EPOCH,
             None,
         )

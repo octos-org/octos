@@ -217,7 +217,7 @@ mod tests {
     fn test_hash_detects_change() {
         let dir = TempDir::new().unwrap();
         let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
-        let bufs1 = ConfigWatcher::read_files(&[path.clone()]);
+        let bufs1 = ConfigWatcher::read_files(std::slice::from_ref(&path));
         let hash1 = ConfigWatcher::hash_buffers(&bufs1);
 
         std::fs::write(&path, r#"{"provider": "openai"}"#).unwrap();
@@ -233,7 +233,7 @@ mod tests {
     fn test_no_change_same_hash() {
         let dir = TempDir::new().unwrap();
         let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
-        let bufs1 = ConfigWatcher::read_files(&[path.clone()]);
+        let bufs1 = ConfigWatcher::read_files(std::slice::from_ref(&path));
         let hash1 = ConfigWatcher::hash_buffers(&bufs1);
         let bufs2 = ConfigWatcher::read_files(&[path]);
         let hash2 = ConfigWatcher::hash_buffers(&bufs2);
@@ -309,14 +309,12 @@ mod tests {
 
         let change = rx.borrow().clone();
         // Should NOT trigger RestartRequired for provider-only change
-        match change {
-            Some(ConfigChange::RestartRequired(fields)) => {
-                panic!(
-                    "provider change should not require restart, got fields: {:?}",
-                    fields
-                );
-            }
-            _ => {} // None or HotReload is fine
+        // None or HotReload is fine; provider-only changes must not restart.
+        if let Some(ConfigChange::RestartRequired(fields)) = change {
+            panic!(
+                "provider change should not require restart, got fields: {:?}",
+                fields
+            );
         }
     }
 }

@@ -1839,7 +1839,7 @@ mod tests {
         let p95 = samples.p95();
         // Buffer is 64 slots, so we have values 37..100
         // p95 of 37..100 = ceil(64*0.95) = 61st value = 97
-        assert!(p95 >= 90_000 && p95 <= 100_000, "p95 was {}", p95 / 1000);
+        assert!((90_000..=100_000).contains(&p95), "p95 was {}", p95 / 1000);
     }
 
     #[tokio::test]

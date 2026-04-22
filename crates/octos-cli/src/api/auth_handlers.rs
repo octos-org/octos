@@ -90,6 +90,21 @@ fn resolve_routed_profile_id_candidate(state: &AppState, candidate: &str) -> Opt
         .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
 }
 
+fn resolve_trusted_local_profile_id_candidate(state: &AppState, candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    resolve_routed_profile_id_candidate(state, candidate).or_else(|| {
+        state
+            .profile_store
+            .as_ref()
+            .and_then(|store| store.get(candidate).ok().flatten())
+            .map(|profile| profile.id)
+    })
+}
+
 fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let host = request_host(headers)?;
     if is_local_request_host(&host) {
@@ -115,7 +130,7 @@ fn trusted_auth_scope_profile_id(state: &AppState, headers: &HeaderMap) -> Optio
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|candidate| resolve_routed_profile_id_candidate(state, candidate))
+        .and_then(|candidate| resolve_trusted_local_profile_id_candidate(state, candidate))
 }
 
 fn resolve_scoped_login_user(
@@ -2459,6 +2474,7 @@ mod tests {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
         user_store
             .save(&User {
@@ -2473,7 +2489,7 @@ mod tests {
 
         let Json(resp) = send_code(
             State(Arc::new(state)),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(SendCodeRequest {
                 email: "wrong@example.com".into(),
             }),
@@ -2581,6 +2597,7 @@ mod tests {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
         profile_store.save(&child).unwrap();
         user_store
             .save(&User {
@@ -2597,7 +2614,7 @@ mod tests {
 
         let Json(send_resp) = send_code(
             State(state.clone()),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(SendCodeRequest {
                 email: "assistant@example.com".into(),
             }),
@@ -2620,7 +2637,7 @@ mod tests {
 
         let Json(verify_resp) = verify(
             State(state),
-            scoped_host_headers("tenant--assistant.example.test"),
+            scoped_host_headers("assistant.example.test"),
             Json(VerifyRequest {
                 email: "assistant@example.com".into(),
                 code,

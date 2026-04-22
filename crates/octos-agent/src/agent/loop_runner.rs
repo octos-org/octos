@@ -1552,7 +1552,7 @@ mod tests {
         let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
 
         let result = agent.process_message("do work", &[], vec![]).await.unwrap();
-        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
             vec![

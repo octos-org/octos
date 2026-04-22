@@ -3,7 +3,6 @@ use std::time::Duration;
 
 const MAX_RSS_ITEMS: usize = 30;
 const HN_TOP_STORIES: usize = 30;
-const MAX_SOURCE_CHARS: usize = 12_000;
 const MAX_ARTICLE_CHARS: usize = 8_000;
 
 fn decode_xml_entities(s: &str) -> String {

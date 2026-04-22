@@ -5929,7 +5929,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
 
         // ── Phase 1: Warm-up (5 fast messages to establish baseline) ──
@@ -6068,11 +6068,8 @@ mod tests {
         // Collect responses — should get 2 (both overflow and primary)
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => responses.push(msg.content),
-                _ => break,
-            }
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            responses.push(msg.content);
         }
 
         assert_eq!(
@@ -6120,7 +6117,7 @@ mod tests {
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-a", vec![]));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-b", vec![]));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
 
         // Warm-up
@@ -6475,9 +6472,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            contents
-                .iter()
-                .any(|content| *content == "[User sent attachments]"),
+            contents.contains(&"[User sent attachments]"),
             "generic attachment placeholder missing from history: {:?}",
             contents
         );
@@ -6516,7 +6511,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Collect, None, false, &dir).await;
 
         // Send first message → starts 2s processing
@@ -6558,7 +6553,7 @@ mod tests {
                 .collect();
             // First user msg: "first message"
             assert!(
-                user_messages.iter().any(|m| *m == "first message"),
+                user_messages.contains(&"first message"),
                 "first message not found: {:?}",
                 user_messages
             );
@@ -6590,7 +6585,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Steer, None, false, &dir).await;
 
         // Send first message → goes through 500ms coalescing delay, then starts 2s processing
@@ -6667,7 +6662,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         // Send 3 messages
@@ -6765,18 +6760,14 @@ mod tests {
             };
             tx.send(make_inbound(&label)).await.unwrap();
             // Collect all available responses (may be 1 or 2 if "⚡" arrived)
-            loop {
-                match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-                    Ok(Some(msg)) => {
-                        let is_notification = msg.content.contains("⚡");
-                        all_responses.push(msg.content);
-                        if !is_notification {
-                            break; // Got the actual reply, move to next message
-                        }
-                        // If it was the notification, keep reading for the reply
-                    }
-                    _ => break,
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await
+            {
+                let is_notification = msg.content.contains("⚡");
+                all_responses.push(msg.content);
+                if !is_notification {
+                    break; // Got the actual reply, move to next message
                 }
+                // If it was the notification, keep reading for the reply
             }
         }
 

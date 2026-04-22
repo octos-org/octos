@@ -294,6 +294,6 @@ fn should_wrap_progress_event_in_current_envelope() {
     assert_eq!(envelope.schema, HARNESS_PROGRESS_EVENT_SCHEMA);
     assert_eq!(envelope.schema_version, PROGRESS_EVENT_SCHEMA_VERSION);
     let json = serde_json::to_string(&envelope).expect("serialize envelope");
-    assert!(json.contains("\"schema\":\"octos.harness.event.v1\""));
+    assert!(json.contains("\"schema\":\"octos.agent.progress.event.v1\""));
     assert!(json.contains("\"schema_version\":1"));
 }
