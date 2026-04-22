@@ -12,7 +12,9 @@ use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
+use super::budget::BudgetStop;
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
+use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
@@ -99,6 +101,133 @@ impl Agent {
             .and_then(|ctx| ctx.session_id)
             .unwrap_or_else(|| "unknown".to_string());
         (session_id, "agent".to_string())
+    }
+
+    /// Shell-spiral dispatch (M6.2, issue #489). Routes the existing shell
+    /// retry recovery through the [`LoopRetryState`] state machine so
+    /// operators see one coherent retry ledger and the spiral bucket is
+    /// bounded. Returns the recovered shell output when the detector finds a
+    /// stable response, or `None` when no spiral is in progress.
+    ///
+    /// Behavior preserved from the pre-M6.2 free-standing
+    /// `recover_shell_retry` call site: identical detection input produces
+    /// identical content bytes — the only new side effects are
+    ///   1. an increment on `octos_loop_retry_total{variant="shell_spiral",decision="escalate"}`, and
+    ///   2. a `HarnessEventPayload::Retry` event written to the harness sink.
+    pub(crate) fn dispatch_shell_retry_recovery(
+        &self,
+        messages: &[Message],
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> Option<String> {
+        let recovery = recover_shell_retry(messages, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+        let decision = retry_state.observe_shell_spiral();
+        tracing::warn!(
+            recovery_kind = ?recovery.kind,
+            decision = %decision,
+            "shell spiral detected; routing through LoopRetryState"
+        );
+
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                SHELL_SPIRAL_VARIANT,
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write shell-spiral retry event");
+            }
+        }
+        Some(recovery.content)
+    }
+
+    /// Classify an error escaping the loop and drive it through the
+    /// [`LoopRetryState`] state machine (M6.2). Returns the bucketed
+    /// [`LoopDecision`] for the caller to act on. Also emits a typed
+    /// `HarnessEventPayload::Retry` event to the harness sink.
+    ///
+    /// This does NOT replace [`Self::classify_loop_error`]: the error event
+    /// still gets emitted, metrics still update, and the caller still owns
+    /// the decision of whether to return `Err(report)` after the state
+    /// machine has been driven.
+    #[allow(dead_code)]
+    pub(crate) fn dispatch_loop_error(
+        &self,
+        error: &HarnessError,
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> LoopDecision {
+        let decision = retry_state.observe(error);
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                error.variant_name(),
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write harness retry event");
+            }
+        }
+        decision
+    }
+
+    /// Budget grace-call dispatch (M6.2). When the loop hits a hard iteration
+    /// or token budget, this asks the retry state machine whether to grant
+    /// one free iteration past budget. Only `MaxIterations` and `MaxTokens`
+    /// stops are eligible — `Shutdown`, `ActivityTimeout`, and
+    /// `IdleProgressTimeout` are always hard stops so stalled loops and
+    /// operator shutdowns terminate immediately.
+    ///
+    /// Returns `true` iff a grace call was granted; the caller should skip
+    /// its budget-stop return path and proceed with one more iteration.
+    pub(super) fn try_budget_grace_call(
+        &self,
+        stop: &BudgetStop,
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> bool {
+        if !matches!(
+            stop,
+            BudgetStop::MaxIterations | BudgetStop::MaxTokens { .. }
+        ) {
+            return false;
+        }
+        let decision = retry_state.observe_budget_exhaustion();
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                "budget_exhaustion",
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write budget-grace retry event");
+            }
+        }
+        match decision {
+            LoopDecision::Grace => {
+                tracing::warn!(
+                    iteration,
+                    "budget exhausted; granting one grace call via LoopRetryState"
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     fn enforce_session_limits_on_tool_calls(
@@ -300,22 +429,33 @@ impl Agent {
                 let mut files_modified = Vec::new();
                 let mut files_to_send = Vec::new();
                 let mut turn = LoopTurnState::new(Instant::now());
+                // M6.2: per-turn retry-bucket state machine. Lives alongside
+                // `LoopTurnState` rather than inside it so the file boundary
+                // from issue #489 stays exact.
+                let mut retry_state = LoopRetryState::new();
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
-                        turn.record_budget_stop(&stop);
-                        // Skip system prompt + history; return only new messages
-                        return Ok(ConversationResponse {
-                            content: stop.message(),
-                            reasoning_content: None,
-                            provider_metadata: None,
-                            token_usage: turn.total_usage().clone(),
-                            files_modified,
-                            files_to_send,
-                            streamed: false,
-                            messages: LoopTurnState::new_messages(&messages, history.len()),
-                        });
+                        let stop_iteration = turn.iteration();
+                        if !self.try_budget_grace_call(
+                            &stop,
+                            &mut retry_state,
+                            stop_iteration,
+                        ) {
+                            turn.record_budget_stop(&stop);
+                            // Skip system prompt + history; return only new messages
+                            return Ok(ConversationResponse {
+                                content: stop.message(),
+                                reasoning_content: None,
+                                provider_metadata: None,
+                                token_usage: turn.total_usage().clone(),
+                                files_modified,
+                                files_to_send,
+                                streamed: false,
+                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                            });
+                        }
                     }
 
                     let iteration = turn.advance_iteration();
@@ -458,17 +598,20 @@ impl Agent {
                                 if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
                                 {
                                     warn!("loop detected — breaking agent loop");
-                                    if let Some(recovery) = recover_shell_retry(
-                                        &messages,
-                                        SHELL_RETRY_RECOVERY_THRESHOLD,
-                                    ) {
+                                    let spiral_iteration = turn.iteration();
+                                    if let Some(recovered_content) = self
+                                        .dispatch_shell_retry_recovery(
+                                            &messages,
+                                            &mut retry_state,
+                                            spiral_iteration,
+                                        )
+                                    {
                                         warn!(
-                                            recovery_kind = ?recovery.kind,
                                             "loop detected after repeated shell attempts; returning recovered shell output"
                                         );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
-                                            content: recovery.content,
+                                            content: recovered_content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -505,6 +648,7 @@ impl Agent {
                                     &mut files_modified,
                                     Some(&mut files_to_send),
                                     &mut turn,
+                                    &mut retry_state,
                                     tracker,
                                 )
                                 .await
@@ -513,17 +657,18 @@ impl Agent {
                                 return Err(e);
                             }
 
-                            if let Some(recovery) = recover_shell_retry(
+                            let spiral_iteration = turn.iteration();
+                            if let Some(recovered_content) = self.dispatch_shell_retry_recovery(
                                 &messages,
-                                SHELL_RETRY_RECOVERY_THRESHOLD,
+                                &mut retry_state,
+                                spiral_iteration,
                             ) {
                                 warn!(
-                                    recovery_kind = ?recovery.kind,
                                     "ending turn after repeated shell attempts with recovered shell output"
                                 );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
-                                    content: recovery.content,
+                                    content: recovered_content,
                                     reasoning_content: None,
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(
@@ -646,21 +791,32 @@ impl Agent {
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            // M6.2: per-run retry-bucket state machine. Same instance lives
+            // across all iterations of the task loop so bucket counters
+            // accumulate the way operators expect.
+            let mut retry_state = LoopRetryState::new();
             let config = self.chat_config();
 
             loop {
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
-                    turn.record_budget_stop(&stop);
-                    self.report_budget_stop(&stop, turn.iteration());
-                    return Ok(TaskResult {
-                        schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
-                        success: false,
-                        output: stop.message(),
-                        files_modified,
-                        files_to_send,
-                        subtasks: Vec::new(),
-                        token_usage: turn.total_usage().clone(),
-                    });
+                    let stop_iteration = turn.iteration();
+                    if !self.try_budget_grace_call(
+                        &stop,
+                        &mut retry_state,
+                        stop_iteration,
+                    ) {
+                        turn.record_budget_stop(&stop);
+                        self.report_budget_stop(&stop, stop_iteration);
+                        return Ok(TaskResult {
+                            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                            success: false,
+                            output: stop.message(),
+                            files_modified,
+                            files_to_send,
+                            subtasks: Vec::new(),
+                            token_usage: turn.total_usage().clone(),
+                        });
+                    }
                 }
 
                 let iteration = turn.advance_iteration();
@@ -802,6 +958,7 @@ impl Agent {
                                 &mut files_modified,
                                 Some(&mut files_to_send),
                                 &mut turn,
+                                &mut retry_state,
                                 None,
                             )
                             .await
@@ -875,6 +1032,7 @@ impl Agent {
     }
 
     /// Execute tool calls from an LLM response and accumulate results.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tool_use(
         &self,
         response: &ChatResponse,
@@ -882,6 +1040,7 @@ impl Agent {
         files_modified: &mut Vec<PathBuf>,
         files_to_send: Option<&mut Vec<PathBuf>>,
         turn: &mut LoopTurnState,
+        retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
@@ -960,12 +1119,25 @@ impl Agent {
             tool_tokens.output_tokens += batch_tokens.output_tokens;
         }
 
-        messages.extend(merge_tool_messages_in_order(
+        let merged = merge_tool_messages_in_order(
             &response,
             &limited_response,
             tool_messages,
             blocked_messages,
-        ));
+        );
+
+        // M6.2: record a productive-tool-call signal per merged Tool message
+        // so the `LoopRetryState` grace-call path sees the loop making progress.
+        // A tool message counts as productive when it is neither an error
+        // ("Error:" prefix), a panic, a timeout, nor a hook/session-limit
+        // block — i.e. the tool produced output the LLM can act on.
+        for message in &merged {
+            if message.role == MessageRole::Tool && is_productive_tool_message(&message.content) {
+                retry_state.record_productive_tool_call();
+            }
+        }
+
+        messages.extend(merged);
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
@@ -973,6 +1145,47 @@ impl Agent {
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
         Ok(())
     }
+}
+
+/// Classify a tool-result `content` string as productive for the M6.2
+/// grace-call gating.
+///
+/// A productive result is a tool message whose body carries strong evidence
+/// that the underlying tool actually accomplished useful work: either it
+/// ended with an explicit success exit code or it returned a substantive
+/// output block that is not one of the well-known error/denial conventions.
+/// We apply a conservative lower bound (128 bytes of substantive output or
+/// an explicit "Exit code: 0" marker) so that failure messages — which
+/// `ToolResult { success: false }` tools tend to emit as short diagnostic
+/// strings — do not accidentally keep a stalled loop alive past budget.
+fn is_productive_tool_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Never productive: explicit error/denial conventions.
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("[HOOK DENIED]")
+        || trimmed.starts_with("[SESSION LIMIT]")
+        || trimmed.starts_with("[SHELL RETRY LIMIT]")
+        || trimmed.starts_with("Path outside working directory")
+        || trimmed.starts_with("(no output)")
+        || trimmed.starts_with("File not found")
+        || (trimmed.starts_with("Tool '")
+            && (trimmed.contains("panicked") || trimmed.contains("timed out")))
+    {
+        return false;
+    }
+
+    // Positive: explicit shell success exit code.
+    if trimmed.contains("\nExit code: 0") || trimmed.ends_with("Exit code: 0") {
+        return true;
+    }
+
+    // Conservative fallback: require a substantive body. Short failure
+    // messages like "File too large..." or "Symlinks are not allowed" fall
+    // under this bound so they never inflate the productive counter.
+    trimmed.len() >= 128 && !trimmed.to_ascii_lowercase().contains("failed to")
 }
 
 fn check_per_tool_limit(
@@ -2562,5 +2775,53 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
         assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
         assert!(recovered.content.contains("could not find Cargo.toml"));
+    }
+
+    // ── is_productive_tool_message (M6.2) ───────────────────────────────
+
+    #[test]
+    fn productive_message_rejects_known_failure_prefixes() {
+        assert!(!is_productive_tool_message("Error: boom"));
+        assert!(!is_productive_tool_message("[HOOK DENIED] blocked"));
+        assert!(!is_productive_tool_message("[SESSION LIMIT] cap"));
+        assert!(!is_productive_tool_message("[SHELL RETRY LIMIT] stop"));
+        assert!(!is_productive_tool_message(
+            "Path outside working directory: /etc/passwd"
+        ));
+        assert!(!is_productive_tool_message("(no output)"));
+        assert!(!is_productive_tool_message("File not found: missing.txt"));
+        assert!(!is_productive_tool_message(
+            "Tool 'shell' panicked: bad state"
+        ));
+        assert!(!is_productive_tool_message(
+            "Tool 'shell' timed out after 30 seconds"
+        ));
+    }
+
+    #[test]
+    fn productive_message_accepts_shell_success_exit() {
+        assert!(is_productive_tool_message("hello\n\nExit code: 0"));
+        assert!(is_productive_tool_message("short body\nExit code: 0"));
+    }
+
+    #[test]
+    fn productive_message_requires_substantive_output() {
+        // Short output without an explicit success marker is conservatively
+        // treated as non-productive so transient failure messages do not keep
+        // a stalled loop alive past budget.
+        assert!(!is_productive_tool_message("ok"));
+        assert!(!is_productive_tool_message("Done."));
+
+        // Long output that isn't a failure passes the fallback bar.
+        let long = "line ".repeat(40); // ~200 bytes
+        assert!(is_productive_tool_message(&long));
+    }
+
+    #[test]
+    fn productive_message_rejects_failed_to_prefix_in_long_body() {
+        // Long outputs that still contain "failed to" are excluded so
+        // large error payloads do not accidentally count as productive.
+        let body = "failed to resolve target: ".to_string() + &"x".repeat(200);
+        assert!(!is_productive_tool_message(&body));
     }
 }

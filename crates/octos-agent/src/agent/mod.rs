@@ -8,6 +8,7 @@ mod execution;
 mod llm_call;
 mod loop_compaction;
 mod loop_runner;
+pub mod loop_state;
 mod memory;
 mod message_repair;
 pub mod realtime;
