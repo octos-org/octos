@@ -241,6 +241,28 @@ Merge rule:
   the API contract in parallel, and `#474` closes only after one integrated SHA
   is deployed and verified.
 
+### M4 Full Merge Tree Contract Deliverables
+
+The integration merge tree for `harness-m4/integration` is complete only when
+all contract deliverables below are present on one integrated SHA.
+
+- M4.1A (`#470`-`#475`): structured progress ABI, runtime sink bridge to durable
+  `task_status`, deep-search emitter migration, UI/API replay parity, live gate
+  evidence, and non-Rust emitter bridge (Python/Node plus fixtures).
+- M4.2 (`#465`): developer contract docs and starter flows for report, audio,
+  coding assistant, and generic custom app paths.
+- M4.3 (`#466`): declarative validator runner with durable typed outcomes and
+  completion gating on required validators.
+- M4.4 (`#467`): third-party skill compatibility live gate covering
+  install-run-reload-remove with cleanup assertions.
+- M4.5 (`#468`): operator dashboard surface for lifecycle, phase, artifact,
+  validator, retry/timeout/failure and stale-task diagnosis.
+- M4.6 (`#469`): explicit harness ABI versioning with compatibility fixtures,
+  migration/deprecation policy, and published stability boundaries.
+- Robotics RP family: included in the integration merge tree for compatibility
+  and visibility, but release-blocked under a separate robotics safety scope.
+  Harness M4 close does not waive robotics-specific safety validation.
+
 ### M4.2: Developer Contract Docs And Starters
 
 Goal:
@@ -255,6 +277,14 @@ Acceptance:
   expectations
 - examples run through the same harness path as first-party apps
 
+Deliverables:
+
+- publish/update developer contract docs for workspace policy, hooks, artifacts,
+  validators, and lifecycle semantics
+- ship runnable starter policies and smoke paths for report/audio/coding/custom
+  flows
+- provide copyable starter scaffolds that do not require runtime code edits
+
 ### M4.3: Declarative Validator Runner
 
 Goal:
@@ -267,6 +297,13 @@ Acceptance:
 - validator output records status, reason, duration, and evidence path
 - completion cannot report ready when a required validator fails
 - validator results replay through task APIs and operator surfaces
+
+Deliverables:
+
+- declarative validator execution engine wired to workspace policy
+- durable validator result persistence with typed status and evidence references
+- enforcement in delivery/completion path for required validator failures
+- replay support through session/task APIs and operator-facing surfaces
 
 ### M4.4: Third-Party Skill Compatibility Gate
 
@@ -282,6 +319,13 @@ Acceptance:
 - app-specific delivery works without modifying core runtime code
 - sandbox, secret, and executable expectations are documented and enforced
 
+Deliverables:
+
+- reproducible live gate for skill install-run-reload-remove lifecycle
+- artifact/binary/state cleanup assertions with actionable failure diagnostics
+- documented and enforced sandbox/secret/executable constraints for third-party
+  skills
+
 ### M4.5: Operator Harness Dashboard
 
 Goal:
@@ -295,6 +339,13 @@ Acceptance:
 - stale/zombie task and missing-artifact conditions are visible
 - dashboard and CLI summary read the same backend truth
 
+Deliverables:
+
+- operator dashboard panel backed by the same canonical task summary state as
+  CLI/operator APIs
+- visible lifecycle/phase/artifact/validator/retry/timeout/failure telemetry
+- explicit stale/zombie and missing-artifact diagnostics for incident response
+
 ### M4.6: Harness ABI Versioning
 
 Goal:
@@ -307,6 +358,13 @@ Acceptance:
   explicit schema versions
 - compatibility tests cover old policy files and old hook payload shapes
 - docs describe the compatibility promise and deprecation process
+
+Deliverables:
+
+- schema-version fields and constants across all external harness contract
+  payload families
+- compatibility test fixtures for legacy payloads and forward-version rejections
+- published migration/deprecation policy for future schema evolution
 
 ## Detailed Workstream Issues
 
@@ -430,11 +488,15 @@ Acceptance:
 
 M4 is complete only when all of these pass:
 
-- canonical Rust/workspace CI
+- `cargo fmt --all -- --check`
+- `cargo check --workspace`
+- `cargo test --workspace`
+- GitHub CI required checks green on `harness-m4/integration`
 - dashboard/web build and lint
 - milestone live browser suites on mini1, mini2, mini3, and mini5
 - live deep research progress replay test
 - live custom skill install-run-reload-remove test
+- mini live validation pass on integration SHA before release promotion
 - written closure note in each M4 workstream issue
 
 ## Control Rule

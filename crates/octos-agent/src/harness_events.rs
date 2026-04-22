@@ -474,12 +474,12 @@ fn validate_optional_message(message: Option<&str>) -> HarnessResult<()> {
 }
 
 fn validate_progress(progress: Option<f32>) -> HarnessResult<()> {
-    if let Some(progress) = progress
-        && !(0.0..=1.0).contains(&progress)
-    {
-        return Err(HarnessEventError(format!(
-            "progress must be between 0.0 and 1.0, got {progress}"
-        )));
+    if let Some(progress) = progress {
+        if !(0.0..=1.0).contains(&progress) {
+            return Err(HarnessEventError(format!(
+                "progress must be between 0.0 and 1.0, got {progress}"
+            )));
+        }
     }
     Ok(())
 }

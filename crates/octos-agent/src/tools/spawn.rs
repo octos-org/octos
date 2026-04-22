@@ -961,15 +961,15 @@ fn resolve_background_terminal_files(
                 .collect()
         });
 
-    if terminal_files.is_empty()
-        && let Some(required_kind) = workflow_terminal_artifact_kind(workflow)
-    {
-        let workflow_kind = workflow
-            .map(|workflow| workflow.workflow_kind.as_str())
-            .unwrap_or("workflow");
-        return Err(format!(
-            "{workflow_kind} completed without required {required_kind} terminal artifact"
-        ));
+    if terminal_files.is_empty() {
+        if let Some(required_kind) = workflow_terminal_artifact_kind(workflow) {
+            let workflow_kind = workflow
+                .map(|workflow| workflow.workflow_kind.as_str())
+                .unwrap_or("workflow");
+            return Err(format!(
+                "{workflow_kind} completed without required {required_kind} terminal artifact"
+            ));
+        }
     }
 
     Ok(terminal_files)

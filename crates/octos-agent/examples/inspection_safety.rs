@@ -17,9 +17,9 @@
 //! ```
 
 use octos_agent::permissions::SafetyTier;
+use octos_agent::tools::ToolPolicy;
 use octos_agent::tools::policy::PolicyDecision;
 use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
-use octos_agent::tools::ToolPolicy;
 
 fn main() -> eyre::Result<()> {
     // Step 1: the robot integrator declares which tools sit at which tier.
@@ -71,7 +71,10 @@ fn main() -> eyre::Result<()> {
 
     println!("\nSummary: {allowed} allowed, {denied} denied");
     assert_eq!(allowed, 2, "camera_capture and valve_slow_turn must pass");
-    assert_eq!(denied, 2, "full_actuation and emergency_override must be gated");
+    assert_eq!(
+        denied, 2,
+        "full_actuation and emergency_override must be gated"
+    );
 
     println!("\nInspection safety demo complete.");
     Ok(())

@@ -95,9 +95,7 @@ impl RobotToolRegistry {
     /// True if `tool_name` is at `tier` or lower (i.e. permitted at `tier`).
     pub fn matches_group(&self, group: &str, tool_name: &str) -> bool {
         match parse_group_name(group) {
-            Some(tier) => self
-                .tier_of(tool_name)
-                .is_some_and(|actual| actual <= tier),
+            Some(tier) => self.tier_of(tool_name).is_some_and(|actual| actual <= tier),
             None => false,
         }
     }
@@ -194,7 +192,10 @@ mod tests {
         assert_eq!(observe, vec!["camera_read".to_string()]);
 
         let safe = reg.tools_for_tier(SafetyTier::SafeMotion);
-        assert_eq!(safe, vec!["camera_read".to_string(), "slow_move".to_string()]);
+        assert_eq!(
+            safe,
+            vec!["camera_read".to_string(), "slow_move".to_string()]
+        );
 
         let full = reg.tools_for_tier(SafetyTier::FullActuation);
         assert_eq!(full.len(), 3);
@@ -226,6 +227,9 @@ mod tests {
         assert_eq!(reg.tier_of("arm"), Some(SafetyTier::Observe));
         reg.insert("arm", SafetyTier::FullActuation);
         assert_eq!(reg.tier_of("arm"), Some(SafetyTier::FullActuation));
-        assert_eq!(reg.tools_for_tier(SafetyTier::Observe), Vec::<String>::new());
+        assert_eq!(
+            reg.tools_for_tier(SafetyTier::Observe),
+            Vec::<String>::new()
+        );
     }
 }

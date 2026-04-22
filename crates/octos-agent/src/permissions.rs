@@ -98,7 +98,10 @@ mod tests {
 
     #[test]
     fn should_parse_canonical_names_when_from_str_called() {
-        assert_eq!("observe".parse::<SafetyTier>().unwrap(), SafetyTier::Observe);
+        assert_eq!(
+            "observe".parse::<SafetyTier>().unwrap(),
+            SafetyTier::Observe
+        );
         assert_eq!(
             "safe_motion".parse::<SafetyTier>().unwrap(),
             SafetyTier::SafeMotion

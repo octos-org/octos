@@ -85,7 +85,8 @@ pub use tools::{
     PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
     SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool, admin::{AdminApiContext, register_admin_api_tools},
+    WebSearchTool, WriteFileTool,
+    admin::{AdminApiContext, register_admin_api_tools},
     install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};

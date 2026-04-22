@@ -8,9 +8,9 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use octos_agent::permissions::SafetyTier;
+use octos_agent::tools::ToolPolicy;
 use octos_agent::tools::policy::PolicyDecision;
 use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
-use octos_agent::tools::ToolPolicy;
 
 /// The robot-group registry is process-wide state. Serialize tests that
 /// mutate it so they don't race against each other.
@@ -44,7 +44,9 @@ fn should_deny_safe_motion_tool_when_policy_allows_only_observe() {
 
     match policy.evaluate("slow_move") {
         PolicyDecision::Deny { reason } => assert_eq!(reason, "robot_tier_gate"),
-        PolicyDecision::Allow => panic!("slow_move (safe_motion) must be denied under observe-only policy"),
+        PolicyDecision::Allow => {
+            panic!("slow_move (safe_motion) must be denied under observe-only policy")
+        }
     }
     assert!(policy.evaluate("camera_read") == PolicyDecision::Allow);
 }

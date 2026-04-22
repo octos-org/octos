@@ -120,18 +120,18 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style"
-                && let Some(style) = value.as_str()
-            {
-                if self.tool_def.name.starts_with("mofa_")
-                    && let Some(normalized) = normalize_mofa_style_name(style)
-                {
-                    rewritten.insert(key.clone(), serde_json::Value::String(normalized));
-                    continue;
-                }
-                if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
-                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
-                    continue;
+            if key == "style" {
+                if let Some(style) = value.as_str() {
+                    if self.tool_def.name.starts_with("mofa_") {
+                        if let Some(normalized) = normalize_mofa_style_name(style) {
+                            rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                            continue;
+                        }
+                    }
+                    if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
+                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                        continue;
+                    }
                 }
             }
             if key == "slides" {
@@ -183,13 +183,15 @@ impl PluginTool {
                 .unwrap_or(false);
             if !has_audio_path
                 && input_schema_has_property(&self.tool_def.input_schema, "audio_path")
-                && let Some(ctx) = ctx
-                && ctx.audio_attachment_paths.len() == 1
             {
-                obj.insert(
-                    "audio_path".into(),
-                    serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.audio_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "audio_path".into(),
+                            serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
 
             let has_file_path = obj
@@ -197,15 +199,16 @@ impl PluginTool {
                 .and_then(|value| value.as_str())
                 .map(|value| !value.is_empty())
                 .unwrap_or(false);
-            if !has_file_path
-                && input_schema_has_property(&self.tool_def.input_schema, "file_path")
-                && let Some(ctx) = ctx
-                && ctx.file_attachment_paths.len() == 1
+            if !has_file_path && input_schema_has_property(&self.tool_def.input_schema, "file_path")
             {
-                obj.insert(
-                    "file_path".into(),
-                    serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.file_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "file_path".into(),
+                            serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
         }
 

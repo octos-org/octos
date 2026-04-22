@@ -162,6 +162,10 @@ label, so repeated runs do not collide.
 
 - [ ] `validate-m4-1a-live.sh` exits 0 on mini1
 - [ ] `validate-m4-1a-live.sh` exits 0 on mini3
+- [ ] `cargo fmt --all -- --check` is green
+- [ ] `cargo check --workspace` is green
+- [ ] `cargo test --workspace` is green
+- [ ] GitHub CI required checks are green on `harness-m4/integration`
 - [ ] `cargo clippy --workspace` is clean
 - [ ] No new `unsafe` blocks
 - [ ] PR comment links to the `diagnostic.json` (empty or `null`) captured

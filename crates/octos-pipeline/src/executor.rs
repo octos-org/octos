@@ -1528,28 +1528,27 @@ impl PipelineExecutor {
             // Persist mission checkpoints declared on this node (if any) and
             // the store is configured. Best-effort — a failed persist logs a
             // warning but does not abort the run.
-            if outcome.status == OutcomeStatus::Pass
-                && !node.checkpoints.is_empty()
-                && let Some(store) = self.config.checkpoint_store.as_ref()
-            {
-                for decl in &node.checkpoints {
-                    let seq = PIPELINE_CHECKPOINT_PERSISTED_TOTAL.load(Ordering::Relaxed);
-                    let record =
-                        PersistedCheckpoint::from_declaration(&graph.id, &node.id, decl, seq);
-                    if let Err(e) = store.persist(&record) {
-                        warn!(
-                            node = %node.id,
-                            checkpoint = %decl.name,
-                            error = %e,
-                            "failed to persist mission checkpoint"
-                        );
-                    } else {
-                        PIPELINE_CHECKPOINT_PERSISTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            node = %node.id,
-                            checkpoint = %decl.name,
-                            "persisted mission checkpoint"
-                        );
+            if outcome.status == OutcomeStatus::Pass && !node.checkpoints.is_empty() {
+                if let Some(store) = self.config.checkpoint_store.as_ref() {
+                    for decl in &node.checkpoints {
+                        let seq = PIPELINE_CHECKPOINT_PERSISTED_TOTAL.load(Ordering::Relaxed);
+                        let record =
+                            PersistedCheckpoint::from_declaration(&graph.id, &node.id, decl, seq);
+                        if let Err(e) = store.persist(&record) {
+                            warn!(
+                                node = %node.id,
+                                checkpoint = %decl.name,
+                                error = %e,
+                                "failed to persist mission checkpoint"
+                            );
+                        } else {
+                            PIPELINE_CHECKPOINT_PERSISTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                node = %node.id,
+                                checkpoint = %decl.name,
+                                "persisted mission checkpoint"
+                            );
+                        }
                     }
                 }
             }
