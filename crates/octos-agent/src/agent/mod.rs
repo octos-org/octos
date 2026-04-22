@@ -162,6 +162,15 @@ pub struct Agent {
     /// robotics operators. Absent by default -- the agent loop behaves exactly
     /// as before when this is `None`.
     pub(super) realtime: Option<Arc<RealtimeController>>,
+    /// Harness M6.3 compaction contract. When present, the loop performs
+    /// preflight compaction before the first LLM call, swaps the summarizer
+    /// flavour declared in policy, prunes old tool results to typed
+    /// placeholders, and gates post-compaction artifact preservation. Absent
+    /// = legacy extractive path behaves exactly as before M6.3.
+    pub(super) compaction_runner: Option<Arc<crate::compaction::CompactionRunner>>,
+    /// Workspace policy associated with the compaction runner (used by the
+    /// post-compaction validator rail to resolve preserved artifacts).
+    pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
 }
 
 impl Agent {
@@ -190,6 +199,8 @@ impl Agent {
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
             realtime: None,
+            compaction_runner: None,
+            compaction_workspace: None,
         }
     }
 
@@ -219,6 +230,8 @@ impl Agent {
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
             realtime: None,
+            compaction_runner: None,
+            compaction_workspace: None,
         }
     }
 
@@ -324,6 +337,36 @@ impl Agent {
     /// reach through this to inspect heartbeat state.
     pub fn realtime_controller(&self) -> Option<Arc<RealtimeController>> {
         self.realtime.clone()
+    }
+
+    /// Wire the declarative compaction runner (harness M6.3). Optional — when
+    /// absent, the loop falls back to the legacy extractive trim path.
+    pub fn with_compaction_runner(
+        mut self,
+        runner: Arc<crate::compaction::CompactionRunner>,
+    ) -> Self {
+        self.compaction_runner = Some(runner);
+        self
+    }
+
+    /// Attach the workspace policy that backs the compaction runner. Used by
+    /// the post-compaction validator rail to resolve declared artifact names.
+    pub fn with_compaction_workspace(
+        mut self,
+        workspace: crate::workspace_policy::WorkspacePolicy,
+    ) -> Self {
+        self.compaction_workspace = Some(workspace);
+        self
+    }
+
+    /// Access the attached compaction runner, if any.
+    pub fn compaction_runner(&self) -> Option<Arc<crate::compaction::CompactionRunner>> {
+        self.compaction_runner.clone()
+    }
+
+    /// Access the attached workspace policy used for compaction gating.
+    pub fn compaction_workspace(&self) -> Option<&crate::workspace_policy::WorkspacePolicy> {
+        self.compaction_workspace.as_ref()
     }
 
     /// Beat the heartbeat once (if a realtime controller is attached) and
