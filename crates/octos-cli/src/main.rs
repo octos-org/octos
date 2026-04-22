@@ -30,6 +30,7 @@ mod qos_catalog;
 pub mod session_actor;
 pub mod setup_state_store;
 pub mod skills_scope;
+pub mod smtp_secret_store;
 pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;

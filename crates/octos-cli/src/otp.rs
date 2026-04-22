@@ -26,6 +26,11 @@ pub struct SmtpConfig {
     /// SMTP username.
     pub username: String,
     /// Env var name holding the SMTP password.
+    ///
+    /// Deprecated: the SMTP password is now read first from
+    /// `{data_dir}/smtp_secret.json` (via [`crate::smtp_secret_store::SmtpSecretStore`]).
+    /// This env var remains as a backwards-compatible fallback when the file
+    /// store is absent. New installs should not depend on it.
     pub password_env: String,
     /// Sender email address.
     pub from_address: String,
@@ -94,6 +99,8 @@ pub struct AuthManager {
     user_store: Arc<UserStore>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
+    /// Data directory used to load the SMTP password from `smtp_secret.json`.
+    data_dir: Option<PathBuf>,
     #[cfg(test)]
     sent_emails: RwLock<Vec<TestEmail>>,
 }
@@ -120,9 +127,17 @@ impl AuthManager {
             static_tokens,
             user_store,
             sessions_path: None,
+            data_dir: None,
             #[cfg(test)]
             sent_emails: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Attach a data directory so the manager can resolve the SMTP password
+    /// from `{data_dir}/smtp_secret.json` in preference to the env var.
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
     }
 
     /// Set an explicit SMTP password (e.g. resolved from profile env_vars).
@@ -581,12 +596,22 @@ impl AuthManager {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-        let password = std::env::var(&smtp.password_env)
-            .ok()
+        let password = self
+            .data_dir
+            .as_deref()
+            .and_then(|dir| {
+                crate::smtp_secret_store::SmtpSecretStore::new(dir)
+                    .load()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "failed to read smtp_secret.json; falling back to env var");
+                        None
+                    })
+            })
+            .or_else(|| std::env::var(&smtp.password_env).ok())
             .or_else(|| self.smtp_password.clone())
             .ok_or_else(|| {
                 eyre::eyre!(
-                    "SMTP password not found in env var '{}' or profile env_vars",
+                    "SMTP password not found in smtp_secret.json, env var '{}', or profile env_vars",
                     smtp.password_env,
                 )
             })?;

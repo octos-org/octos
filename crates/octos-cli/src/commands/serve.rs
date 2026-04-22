@@ -375,7 +375,8 @@ impl ServeCommand {
                 }
             };
             let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
-                .with_sessions_path(data_dir.join("auth_sessions.json"));
+                .with_sessions_path(data_dir.join("auth_sessions.json"))
+                .with_data_dir(data_dir.clone());
 
             if let Some(password) = derived_profile_password {
                 mgr = mgr.with_smtp_password(password);
