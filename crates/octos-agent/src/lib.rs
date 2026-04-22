@@ -16,6 +16,7 @@ pub mod bundled_app_skills;
 mod compaction;
 pub mod event_bus;
 pub mod exec_env;
+pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
@@ -56,6 +57,7 @@ pub use agent::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use harness_errors::HarnessError;
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
@@ -80,14 +82,15 @@ pub use task_supervisor::{
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
-    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
-    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DELEGATED_DENY_GROUP,
+    DELEGATION_METRIC, DeepSearchTool, DelegateTool, DelegationEvent, DelegationOutcome,
+    DepthBudget, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MAX_DEPTH,
+    ManageSkillsTool, MessageTool, PolicyDecision, ReadFileTool, RecallMemoryTool,
+    RobotToolRegistry, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool,
+    TakePhotoTool, Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult,
+    TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
-    install_robot_registry,
+    build_delegated_child_policy, install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{
