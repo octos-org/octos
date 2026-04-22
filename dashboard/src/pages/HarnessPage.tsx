@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import HarnessTaskTable, { LIFECYCLE_ORDER } from '../components/HarnessTaskTable'
 import {
+  CompactionPanel,
+  CredentialPoolPanel,
+  DelegationTreeStub,
+  RetryBucketPanel,
+  RoutingDecisionPanel,
+} from '../components/CodingLoopPanel'
+import {
+  compactionViolationTotal,
+  credentialRotationTotal,
   harnessApi,
   harnessErrorRows,
   harnessErrorTotal,
+  loopRetryBuckets,
+  loopRetryTotal,
+  routingDecisionSummary,
+  taskHasLoopWarning,
   type HarnessLifecycleState,
   type HarnessTasksResponse,
   type OperatorSummaryResponse,
@@ -17,6 +30,7 @@ interface DerivedFilter {
   stale: boolean
   missingArtifact: boolean
   validatorFailed: boolean
+  loopWarnings: boolean
 }
 
 function formatTimestamp(iso: string | null | undefined): string {
@@ -79,6 +93,7 @@ export default function HarnessPage() {
     stale: false,
     missingArtifact: false,
     validatorFailed: false,
+    loopWarnings: false,
   })
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -132,9 +147,20 @@ export default function HarnessPage() {
       if (derivedFilter.stale && !task.derived.stale) return false
       if (derivedFilter.missingArtifact && !task.derived.missing_artifact) return false
       if (derivedFilter.validatorFailed && !task.derived.validator_failed) return false
+      if (derivedFilter.loopWarnings && !taskHasLoopWarning(task)) return false
       return true
     })
   }, [tasksResp, lifecycleFilter, derivedFilter])
+
+  const loopWarningCount = useMemo(
+    () => (tasksResp?.tasks ?? []).filter(taskHasLoopWarning).length,
+    [tasksResp],
+  )
+
+  const retryExhaustingCount = useMemo(
+    () => loopRetryBuckets(summary).filter((b) => b.exhausted_share > 0.5).length,
+    [summary],
+  )
 
   const totals = tasksResp?.totals_by_lifecycle ?? {}
   const summaryTotals = summary?.totals ?? {}
@@ -267,6 +293,51 @@ export default function HarnessPage() {
         />
       </div>
 
+      {/* M6 coding-loop health cards — aggregated counters per panel */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3" data-testid="loop-health-counts">
+        <CountCard
+          label="Loop warnings"
+          value={loopWarningCount}
+          testId="count-loop-warnings"
+          tone={loopWarningCount > 0 ? 'warn' : 'ok'}
+          highlight={loopWarningCount > 0}
+          onClick={() =>
+            setDerivedFilter((d) => ({ ...d, loopWarnings: !d.loopWarnings }))
+          }
+          active={derivedFilter.loopWarnings}
+        />
+        <CountCard
+          label="Retry decisions"
+          value={loopRetryTotal(summary)}
+          testId="count-retry-decisions"
+          tone={retryExhaustingCount > 0 ? 'danger' : 'default'}
+          highlight={retryExhaustingCount > 0}
+        />
+        <CountCard
+          label="Compaction viol."
+          value={compactionViolationTotal(summary)}
+          testId="count-compaction-violations"
+          tone={compactionViolationTotal(summary) > 0 ? 'danger' : 'ok'}
+          highlight={compactionViolationTotal(summary) > 0}
+        />
+        <CountCard
+          label="Credential rotations"
+          value={credentialRotationTotal(summary)}
+          testId="count-credential-rotations"
+          tone="default"
+        />
+        <CountCard
+          label="Cheap share"
+          value={
+            routingDecisionSummary(summary).total > 0
+              ? `${(routingDecisionSummary(summary).cheap_share * 100).toFixed(0)}%`
+              : '—'
+          }
+          testId="count-routing-cheap-share"
+          tone="accent"
+        />
+      </div>
+
       {/* M6.1 — harness error taxonomy breakdown */}
       {harnessErrorRows(summary).length > 0 && (
         <div
@@ -313,6 +384,17 @@ export default function HarnessPage() {
           </table>
         </div>
       )}
+
+      {/* M6 coding-loop health panels */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4" data-testid="loop-health-panels">
+        <RetryBucketPanel summary={summary} />
+        <CompactionPanel summary={summary} />
+        <CredentialPoolPanel summary={summary} />
+        <RoutingDecisionPanel summary={summary} />
+      </div>
+
+      {/* Delegation tree (M6.7) stub. Replaced with real data when M6.7 merges. */}
+      <DelegationTreeStub />
 
       {tasksError && (
         <div

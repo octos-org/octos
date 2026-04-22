@@ -150,6 +150,245 @@ export function harnessErrorTotal(summary: OperatorSummaryResponse | null): numb
   return summary?.totals.loop_errors ?? 0
 }
 
+/**
+ * M6.2 — loop retry bucket decisions.
+ *
+ * Counter `octos_loop_retry_total{variant, decision}` — `variant` is the
+ * `HarnessError::variant_name()` (plus the synthetic `shell_spiral` bucket),
+ * `decision` is `LoopDecision::as_str()` (one of
+ * `continue | rotate_and_retry | compact_and_retry | escalate | exhausted |
+ * grace`). Every observation is bounded by `LoopRetryLimits` — an
+ * `exhausted` row means that bucket ran past its hard limit.
+ */
+export interface LoopRetryBreakdownRow extends OperatorSummaryBreakdownRow {
+  variant: string
+  decision: string
+}
+
+export function loopRetryRows(
+  summary: OperatorSummaryResponse | null,
+): LoopRetryBreakdownRow[] {
+  const rows = summary?.breakdowns.loop_retries ?? []
+  return rows as LoopRetryBreakdownRow[]
+}
+
+export function loopRetryTotal(summary: OperatorSummaryResponse | null): number {
+  return summary?.totals.loop_retries ?? 0
+}
+
+/**
+ * Per-variant aggregation suitable for the "bucket state" panel: sum every
+ * decision for a given variant, then surface how many of those observations
+ * ended in `exhausted`. Variants whose `exhausted_share` exceeds 0.5 should
+ * be flagged in the UI (invariant from #495).
+ */
+export interface LoopRetryBucketSummary {
+  variant: string
+  total: number
+  exhausted: number
+  escalate: number
+  continue_count: number
+  rotate: number
+  compact: number
+  grace: number
+  exhausted_share: number
+}
+
+export function loopRetryBuckets(
+  summary: OperatorSummaryResponse | null,
+): LoopRetryBucketSummary[] {
+  const acc = new Map<string, LoopRetryBucketSummary>()
+  for (const row of loopRetryRows(summary)) {
+    const variant = row.variant ?? 'unknown'
+    const count = Number(row.count ?? 0)
+    const bucket = acc.get(variant) ?? {
+      variant,
+      total: 0,
+      exhausted: 0,
+      escalate: 0,
+      continue_count: 0,
+      rotate: 0,
+      compact: 0,
+      grace: 0,
+      exhausted_share: 0,
+    }
+    bucket.total += count
+    switch (row.decision) {
+      case 'exhausted':
+        bucket.exhausted += count
+        break
+      case 'escalate':
+        bucket.escalate += count
+        break
+      case 'continue':
+        bucket.continue_count += count
+        break
+      case 'rotate_and_retry':
+        bucket.rotate += count
+        break
+      case 'compact_and_retry':
+        bucket.compact += count
+        break
+      case 'grace':
+        bucket.grace += count
+        break
+      default:
+        break
+    }
+    acc.set(variant, bucket)
+  }
+  const out = Array.from(acc.values()).map((b) => ({
+    ...b,
+    exhausted_share: b.total > 0 ? b.exhausted / b.total : 0,
+  }))
+  out.sort((a, b) => b.exhausted_share - a.exhausted_share || b.total - a.total)
+  return out
+}
+
+/**
+ * M6.3 — compaction preservation violations.
+ *
+ * Counter `octos_compaction_preservation_violations_total{phase}` counts
+ * cases where the compaction policy dropped or mutated messages that the
+ * workspace contract required to be preserved verbatim. A non-zero total is
+ * always a bug signal.
+ */
+export interface CompactionViolationRow extends OperatorSummaryBreakdownRow {
+  phase: string
+}
+
+export function compactionViolationRows(
+  summary: OperatorSummaryResponse | null,
+): CompactionViolationRow[] {
+  const rows = summary?.breakdowns.compaction_preservation_violations ?? []
+  return rows as CompactionViolationRow[]
+}
+
+export function compactionViolationTotal(
+  summary: OperatorSummaryResponse | null,
+): number {
+  return summary?.totals.compaction_preservation_violations ?? 0
+}
+
+/**
+ * M6.5 — credential pool rotations.
+ *
+ * Counter `octos_llm_credential_rotation_total{reason, strategy}`. The
+ * dashboard surfaces the reason/strategy mix and the total count, which is a
+ * rough proxy for how often the pool cycles credentials (auth failures,
+ * cooldowns, manual releases).
+ */
+export interface CredentialRotationRow extends OperatorSummaryBreakdownRow {
+  reason: string
+  strategy: string
+}
+
+export function credentialRotationRows(
+  summary: OperatorSummaryResponse | null,
+): CredentialRotationRow[] {
+  const rows = summary?.breakdowns.credential_rotations ?? []
+  return rows as CredentialRotationRow[]
+}
+
+export function credentialRotationTotal(
+  summary: OperatorSummaryResponse | null,
+): number {
+  return summary?.totals.credential_rotations ?? 0
+}
+
+/**
+ * Rotation counts broken down purely by reason. Useful for the
+ * "active / cooldown" readout on the credential pool card.
+ */
+export interface CredentialReasonSummary {
+  reason: string
+  count: number
+}
+
+export function credentialRotationsByReason(
+  summary: OperatorSummaryResponse | null,
+): CredentialReasonSummary[] {
+  const acc = new Map<string, number>()
+  for (const row of credentialRotationRows(summary)) {
+    const reason = row.reason ?? 'unknown'
+    acc.set(reason, (acc.get(reason) ?? 0) + Number(row.count ?? 0))
+  }
+  return Array.from(acc.entries())
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+}
+
+/**
+ * M6.6 — content-classified smart routing decisions.
+ *
+ * Counter `octos_routing_decision_total{tier, lane}`. `tier` is
+ * `cheap | strong`, `lane` is an optional pool-aware hint set by M6.5.
+ * A `cheap_share` close to 1.0 means the router offloaded most chat turns
+ * to the cheap tier; anything near 0 flags the router as falling back to
+ * the strong tier too aggressively.
+ */
+export interface RoutingDecisionRow extends OperatorSummaryBreakdownRow {
+  tier: string
+  lane: string
+}
+
+export function routingDecisionRows(
+  summary: OperatorSummaryResponse | null,
+): RoutingDecisionRow[] {
+  const rows = summary?.breakdowns.routing_decisions ?? []
+  return rows as RoutingDecisionRow[]
+}
+
+export function routingDecisionTotal(
+  summary: OperatorSummaryResponse | null,
+): number {
+  return summary?.totals.routing_decisions ?? 0
+}
+
+export interface RoutingDecisionSummary {
+  cheap: number
+  strong: number
+  other: number
+  total: number
+  cheap_share: number
+}
+
+export function routingDecisionSummary(
+  summary: OperatorSummaryResponse | null,
+): RoutingDecisionSummary {
+  let cheap = 0
+  let strong = 0
+  let other = 0
+  for (const row of routingDecisionRows(summary)) {
+    const count = Number(row.count ?? 0)
+    if (row.tier === 'cheap') cheap += count
+    else if (row.tier === 'strong') strong += count
+    else other += count
+  }
+  const total = cheap + strong + other
+  return {
+    cheap,
+    strong,
+    other,
+    total,
+    cheap_share: total > 0 ? cheap / total : 0,
+  }
+}
+
+/**
+ * True when at least one signal on the task row matches the "loop warning"
+ * filter (stale runtime, missing artifact, validator failure, or a harness
+ * error recorded on `task.error`). Used for the
+ * "show only sessions with loop warnings" filter on the dashboard.
+ */
+export function taskHasLoopWarning(task: HarnessTaskView): boolean {
+  if (task.derived.stale) return true
+  if (task.derived.missing_artifact) return true
+  if (task.derived.validator_failed) return true
+  if (task.error && task.error.trim().length > 0) return true
+  return false
+}
+
 function authHeaders(): HeadersInit {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token =
