@@ -305,6 +305,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "routing_decisions".to_string(),
             total_for_metric(samples, "octos_routing_decision_total"),
         ),
+        (
+            "loop_retries".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_RETRY_TOTAL),
+        ),
     ])
 }
 
@@ -401,6 +405,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
         (
             "routing_decisions".to_string(),
             breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
+        ),
+        (
+            "loop_retries".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_RETRY_TOTAL,
+                &["variant", "decision"],
+            ),
         ),
     ])
 }
