@@ -21,7 +21,6 @@
 //! ```
 
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -182,8 +181,13 @@ exit 0
 fn write_exec(path: &std::path::Path, contents: &str) -> eyre::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(contents.as_bytes())?;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
     Ok(())
 }
