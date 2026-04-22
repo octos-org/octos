@@ -8,6 +8,7 @@
 
 pub mod adaptive;
 mod config;
+pub mod content_classifier;
 pub mod context;
 mod context_override;
 pub mod embedding;
@@ -44,6 +45,10 @@ pub use adaptive::{
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
+pub use content_classifier::{
+    ClassificationDecision, ContentClassifier, HarnessRoutingDecisionPayload, ModelTier,
+    RoutingConfig,
+};
 pub use context_override::ContextWindowOverride;
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
 pub use error::{LlmError, LlmErrorKind};

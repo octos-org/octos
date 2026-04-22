@@ -35,6 +35,14 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the `routing.decision` harness event payload
+/// introduced in M6.6 (content-classified smart model routing).
+///
+/// The `kind`, `tier`, and `reasons` fields are stable. `lane` and
+/// `input_chars` are additive experimental fields today; bumping this
+/// version is only required when renaming or removing a stable field.
+pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
+
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
 ///
