@@ -1,5 +1,5 @@
-{"schema":"octos.harness.event.v1","kind":"progress","workflow":"deep_research","phase":"search","message":"Searching: \"rust async\"","progress_fraction":0.25}
-{"schema":"octos.harness.event.v1","kind":"progress","workflow":"deep_research","phase":"fetch","message":"Fetching 4 pages in parallel..."}
-{"schema":"octos.harness.event.v1","kind":"progress","workflow":"deep_research","phase":"synthesize","message":"Synthesizing report..."}
-{"schema":"octos.harness.event.v1","kind":"progress","workflow":"deep_research","phase":"report_build","message":"Building report..."}
-{"schema":"octos.harness.event.v1","kind":"progress","workflow":"deep_research","phase":"completion","message":"Deep search complete","progress_fraction":1.0}
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"api:session","task_id":"task-1","workflow":"deep_research","phase":"search","message":"Searching: \"rust async\"","progress":0.25}
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"api:session","task_id":"task-1","workflow":"deep_research","phase":"fetch","message":"Fetching 4 pages in parallel..."}
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"api:session","task_id":"task-1","workflow":"deep_research","phase":"synthesize","message":"Synthesizing report..."}
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"api:session","task_id":"task-1","workflow":"deep_research","phase":"report_build","message":"Building report..."}
+{"schema":"octos.harness.event.v1","kind":"progress","session_id":"api:session","task_id":"task-1","workflow":"deep_research","phase":"completion","message":"Deep search complete","progress":1.0}

@@ -9,6 +9,10 @@ use eyre::{Result, WrapErr};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::harness_events::{
+    OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
+    OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context,
+};
 use crate::progress::ProgressEvent;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
@@ -489,7 +493,13 @@ impl Tool for PluginTool {
             .as_ref()
             .and_then(|ctx| ctx.harness_event_sink.as_deref())
         {
-            cmd.env("OCTOS_EVENT_SINK", sink);
+            cmd.env(OCTOS_EVENT_SINK_ENV, sink);
+            if let Some(context) = lookup_event_sink_context(sink) {
+                cmd.env(OCTOS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_TASK_ID_ENV, &context.task_id);
+                cmd.env(OCTOS_HARNESS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_HARNESS_TASK_ID_ENV, &context.task_id);
+            }
         }
 
         // Set working directory so relative paths in tool args (e.g.
@@ -1050,23 +1060,9 @@ mod tests {
         supervisor.mark_running(&task_id);
 
         let script_path = dir.path().join("script.sh");
-        let event_json = json!({
-            "schema": "octos.harness.event.v1",
-            "kind": "progress",
-            "session_id": "api:session",
-            "task_id": task_id.clone(),
-            "workflow": "deep_research",
-            "phase": "fetching_sources",
-            "message": "Fetching source 3/12",
-            "progress": 0.42
-        })
-        .to_string();
         write_test_script(
             &script_path,
-            &format!(
-                "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}' >> \"$OCTOS_EVENT_SINK\"\nprintf '{{\"output\":\"ok\",\"success\":true}}'\n",
-                event_json
-            ),
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"schema\":\"octos.harness.event.v1\",\"kind\":\"progress\",\"session_id\":\"%s\",\"task_id\":\"%s\",\"workflow\":\"deep_research\",\"phase\":\"fetching_sources\",\"message\":\"Fetching source 3/12\",\"progress\":0.42}\\n' \"$OCTOS_SESSION_ID\" \"$OCTOS_TASK_ID\" >> \"$OCTOS_EVENT_SINK\"\nprintf '{\"output\":\"ok\",\"success\":true}'\n",
         );
 
         let def = make_tool_def("structured_tool", "writes harness events");

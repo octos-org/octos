@@ -4952,6 +4952,51 @@ mod tests {
     }
 
     #[test]
+    fn session_task_query_store_exposes_harness_progress_runtime_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "deep_search",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        let event = octos_agent::HarnessEvent::progress(
+            "api:session",
+            task_id.clone(),
+            Some("deep_research"),
+            "fetch",
+            Some("Fetching 4 pages"),
+            Some(0.4),
+        );
+        supervisor.apply_harness_event(&task_id, &event).unwrap();
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], task_id);
+        assert_eq!(tasks[0]["session_key"], "api:session");
+        assert_eq!(tasks[0]["workflow_kind"], "deep_research");
+        assert_eq!(tasks[0]["current_phase"], "fetch");
+        assert_eq!(tasks[0]["runtime_detail"]["session_id"], "api:session");
+        assert_eq!(tasks[0]["runtime_detail"]["task_id"], task_id);
+        assert_eq!(
+            tasks[0]["runtime_detail"]["progress_message"],
+            "Fetching 4 pages"
+        );
+        assert_eq!(tasks[0]["runtime_detail"]["progress"], 0.4);
+    }
+
+    #[test]
     fn session_task_query_store_projects_verifying_lifecycle_state() {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().join("profile-data");

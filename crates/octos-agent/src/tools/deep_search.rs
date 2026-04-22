@@ -12,6 +12,9 @@ use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::harness_events::emit_registered_progress_event;
+use crate::tools::TOOL_CTX;
+
 use super::web_search::WebSearchTool;
 use super::{Tool, ToolResult};
 
@@ -106,6 +109,11 @@ impl Tool for DeepSearchTool {
         let max_chars = input.max_chars_per_page.clamp(1000, 200_000);
 
         // Step 1: Search
+        emit_deep_research_progress(
+            "search",
+            &format!("Searching: \"{}\"", input.query),
+            Some(0.1),
+        );
         let search_args = serde_json::json!({
             "query": input.query,
             "count": count
@@ -120,6 +128,7 @@ impl Tool for DeepSearchTool {
         let urls = extract_urls(&search_result.output);
 
         if urls.is_empty() {
+            emit_deep_research_progress("completion", "Deep search complete", Some(1.0));
             return Ok(search_result);
         }
 
@@ -131,6 +140,11 @@ impl Tool for DeepSearchTool {
             .wrap_err("failed to create research directory")?;
 
         // Step 2: Parallel fetch all URLs
+        emit_deep_research_progress(
+            "fetch",
+            &format!("Fetching {} pages in parallel...", urls.len()),
+            Some(0.4),
+        );
         let fetches: Vec<_> = urls
             .iter()
             .map(|url| self.fetch_page(url, max_chars))
@@ -146,6 +160,7 @@ impl Tool for DeepSearchTool {
 
         // Step 4: Save full content to disk, return truncated preview inline
         // This keeps the LLM context small while full data is on disk.
+        emit_deep_research_progress("report_build", "Building research index...", Some(0.8));
         const INLINE_CHARS_PER_PAGE: usize = 3000;
 
         let mut output = search_result.output;
@@ -192,11 +207,20 @@ impl Tool for DeepSearchTool {
             saved_files.join("\n")
         ));
 
+        emit_deep_research_progress("completion", "Deep search complete", Some(1.0));
+
         Ok(ToolResult {
             output,
             success: true,
             ..Default::default()
         })
+    }
+}
+
+fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>) {
+    if let Ok(Some(sink)) = TOOL_CTX.try_with(|ctx| ctx.harness_event_sink.clone()) {
+        let _ =
+            emit_registered_progress_event(sink, Some("deep_research"), phase, message, progress);
     }
 }
 

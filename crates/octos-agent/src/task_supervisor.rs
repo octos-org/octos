@@ -842,6 +842,44 @@ mod tests {
     }
 
     #[test]
+    fn should_persist_harness_progress_event_for_replay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+        let id =
+            supervisor.register_with_lineage("deep_search", "call-9", Some("api:session"), None);
+        supervisor.mark_running(&id);
+
+        let event = crate::harness_events::HarnessEvent::progress(
+            "api:session",
+            id.clone(),
+            Some("deep_research"),
+            "fetch",
+            Some("Fetching 4 pages"),
+            Some(0.4),
+        );
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+        let task = restored.get_task(&id).expect("restored task missing");
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            detail["schema"],
+            crate::harness_events::HARNESS_EVENT_SCHEMA_V1
+        );
+        assert_eq!(detail["session_id"], "api:session");
+        assert_eq!(detail["task_id"], id);
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetch");
+        assert_eq!(detail["progress_message"], "Fetching 4 pages");
+        assert_eq!(task.status, TaskStatus::Running);
+    }
+
+    #[test]
     fn should_persist_child_session_outcome_state() {
         let supervisor = TaskSupervisor::new();
         let id = supervisor.register("tts", "call-7", Some("api:session"));

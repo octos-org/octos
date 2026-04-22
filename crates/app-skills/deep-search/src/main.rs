@@ -1998,7 +1998,7 @@ fn progress(step: usize, total: usize, msg: &str) {
     let progress_fraction = if total == 0 {
         None
     } else {
-        Some(step as f64 / total as f64)
+        Some((step as f64 / total as f64).min(0.95))
     };
     emit_progress_event(ProgressPhase::Search, msg, progress_fraction);
 }
@@ -2037,37 +2037,72 @@ impl ProgressPhase {
 struct HarnessProgressEvent<'a> {
     schema: &'static str,
     kind: &'static str,
+    session_id: &'a str,
+    task_id: &'a str,
     workflow: &'static str,
     phase: &'a str,
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    progress_fraction: Option<f64>,
+    progress: Option<f64>,
+}
+
+struct HarnessContext {
+    sink: PathBuf,
+    session_id: String,
+    task_id: String,
 }
 
 fn emit_progress_event(phase: ProgressPhase, message: &str, progress_fraction: Option<f64>) {
+    let Some(context) = harness_context_from_env() else {
+        return;
+    };
+
     let event = HarnessProgressEvent {
         schema: "octos.harness.event.v1",
         kind: "progress",
+        session_id: &context.session_id,
+        task_id: &context.task_id,
         workflow: "deep_research",
         phase: phase.as_str(),
         message,
-        progress_fraction,
+        progress: progress_fraction,
     };
 
-    let Some(raw_sink) = std::env::var_os("OCTOS_EVENT_SINK") else {
-        return;
-    };
-    if raw_sink.is_empty() {
-        return;
-    }
-
-    let sink_path = PathBuf::from(raw_sink);
-    if let Err(err) = write_progress_event_to_sink(&sink_path, &event) {
+    if let Err(err) = write_progress_event_to_sink(&context.sink, &event) {
         eprintln!(
             "[progress] failed to write structured event to {}: {err}",
-            sink_path.display()
+            context.sink.display()
         );
     }
+}
+
+fn harness_context_from_env() -> Option<HarnessContext> {
+    let raw_sink = std::env::var_os("OCTOS_EVENT_SINK")?;
+    if raw_sink.is_empty() {
+        return None;
+    }
+    let session_id = std::env::var("OCTOS_HARNESS_SESSION_ID")
+        .or_else(|_| std::env::var("OCTOS_SESSION_ID"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let task_id = std::env::var("OCTOS_HARNESS_TASK_ID")
+        .or_else(|_| std::env::var("OCTOS_TASK_ID"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+
+    Some(HarnessContext {
+        sink: sink_path_from_env_value(raw_sink),
+        session_id,
+        task_id,
+    })
+}
+
+fn sink_path_from_env_value(raw_sink: std::ffi::OsString) -> PathBuf {
+    let raw = raw_sink.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix("file://") {
+        return PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest));
+    }
+    PathBuf::from(raw_sink)
 }
 
 fn write_progress_event_to_sink(
@@ -2245,42 +2280,52 @@ mod tests {
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
                 kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
                 workflow: "deep_research",
                 phase: "search",
                 message: "Searching: \"rust async\"",
-                progress_fraction: Some(0.25),
+                progress: Some(0.25),
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
                 kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
                 workflow: "deep_research",
                 phase: "fetch",
                 message: "Fetching 4 pages in parallel...",
-                progress_fraction: None,
+                progress: None,
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
                 kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
                 workflow: "deep_research",
                 phase: "synthesize",
                 message: "Synthesizing report...",
-                progress_fraction: None,
+                progress: None,
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
                 kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
                 workflow: "deep_research",
                 phase: "report_build",
                 message: "Building report...",
-                progress_fraction: None,
+                progress: None,
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
                 kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
                 workflow: "deep_research",
                 phase: "completion",
                 message: "Deep search complete",
-                progress_fraction: Some(1.0),
+                progress: Some(1.0),
             },
         ];
 

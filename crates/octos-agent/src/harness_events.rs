@@ -5,9 +5,10 @@
 //! folds them into durable task snapshots.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,11 @@ use tracing::warn;
 use crate::task_supervisor::TaskSupervisor;
 
 pub const HARNESS_EVENT_SCHEMA_V1: &str = "octos.harness.event.v1";
+pub const OCTOS_EVENT_SINK_ENV: &str = "OCTOS_EVENT_SINK";
+pub const OCTOS_SESSION_ID_ENV: &str = "OCTOS_SESSION_ID";
+pub const OCTOS_TASK_ID_ENV: &str = "OCTOS_TASK_ID";
+pub const OCTOS_HARNESS_SESSION_ID_ENV: &str = "OCTOS_HARNESS_SESSION_ID";
+pub const OCTOS_HARNESS_TASK_ID_ENV: &str = "OCTOS_HARNESS_TASK_ID";
 pub const MAX_HARNESS_EVENT_LINE_BYTES: usize = 16 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_TASK_ID_BYTES: usize = 128;
@@ -38,6 +44,89 @@ impl std::fmt::Display for HarnessEventError {
 impl std::error::Error for HarnessEventError {}
 
 type HarnessResult<T> = std::result::Result<T, HarnessEventError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessEventSinkContext {
+    pub session_id: String,
+    pub task_id: String,
+}
+
+static SINK_CONTEXTS: OnceLock<Mutex<HashMap<String, HarnessEventSinkContext>>> = OnceLock::new();
+
+fn sink_contexts() -> &'static Mutex<HashMap<String, HarnessEventSinkContext>> {
+    SINK_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sink_path_from_raw(raw_sink: &str) -> PathBuf {
+    if let Some(rest) = raw_sink.strip_prefix("file://") {
+        return PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest));
+    }
+    PathBuf::from(raw_sink)
+}
+
+fn sink_key_from_raw(raw_sink: &str) -> String {
+    sink_path_from_raw(raw_sink).display().to_string()
+}
+
+fn sink_key(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn register_sink_context(sink: String, context: HarnessEventSinkContext) {
+    let mut contexts = sink_contexts().lock().unwrap_or_else(|e| e.into_inner());
+    contexts.insert(sink, context);
+}
+
+fn unregister_sink_context(sink: &str) {
+    let mut contexts = sink_contexts().lock().unwrap_or_else(|e| e.into_inner());
+    contexts.remove(sink);
+}
+
+pub fn lookup_event_sink_context(raw_sink: impl AsRef<str>) -> Option<HarnessEventSinkContext> {
+    let raw_sink = raw_sink.as_ref();
+    let contexts = sink_contexts().lock().unwrap_or_else(|e| e.into_inner());
+    contexts
+        .get(raw_sink)
+        .cloned()
+        .or_else(|| contexts.get(&sink_key_from_raw(raw_sink)).cloned())
+}
+
+pub fn write_event_to_sink(raw_sink: impl AsRef<str>, event: &HarnessEvent) -> std::io::Result<()> {
+    event
+        .validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let path = sink_path_from_raw(raw_sink.as_ref());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let json = serde_json::to_string(event)
+        .map_err(|error| std::io::Error::other(format!("serialize harness event: {error}")))?;
+    writeln!(file, "{json}")?;
+    file.flush()
+}
+
+pub fn emit_registered_progress_event(
+    raw_sink: impl AsRef<str>,
+    workflow: Option<&str>,
+    phase: &str,
+    message: &str,
+    progress: Option<f64>,
+) -> bool {
+    let raw_sink = raw_sink.as_ref();
+    let Some(context) = lookup_event_sink_context(raw_sink) else {
+        return false;
+    };
+    let event = HarnessEvent::progress(
+        context.session_id,
+        context.task_id,
+        workflow.map(ToOwned::to_owned),
+        phase.to_string(),
+        Some(message.to_string()),
+        progress,
+    );
+    write_event_to_sink(raw_sink, &event).is_ok()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessEvent {
@@ -84,8 +173,12 @@ pub struct HarnessProgressEvent {
     pub phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<f32>,
+    #[serde(
+        default,
+        alias = "progress_fraction",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub progress: Option<f64>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -174,7 +267,7 @@ impl HarnessEvent {
         workflow: Option<impl Into<String>>,
         phase: impl Into<String>,
         message: Option<impl Into<String>>,
-        progress: Option<f32>,
+        progress: Option<f64>,
     ) -> Self {
         Self {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
@@ -473,7 +566,7 @@ fn validate_optional_message(message: Option<&str>) -> HarnessResult<()> {
     Ok(())
 }
 
-fn validate_progress(progress: Option<f32>) -> HarnessResult<()> {
+fn validate_progress(progress: Option<f64>) -> HarnessResult<()> {
     if let Some(progress) = progress {
         if !(0.0..=1.0).contains(&progress) {
             return Err(HarnessEventError(format!(
@@ -508,6 +601,7 @@ fn is_valid_phase_name(phase: &str) -> bool {
 /// Local sink that feeds structured child events into a task supervisor.
 pub struct HarnessEventSink {
     sink_file: tempfile::NamedTempFile,
+    sink_key: String,
     stop: Arc<AtomicBool>,
     reader: JoinHandle<()>,
 }
@@ -520,8 +614,16 @@ impl HarnessEventSink {
     ) -> std::io::Result<Self> {
         let sink_file = tempfile::NamedTempFile::new()?;
         let path = sink_file.path().to_path_buf();
+        let sink_key = sink_key(&path);
         let task_id = task_id.into();
         let session_id = session_id.into();
+        register_sink_context(
+            sink_key.clone(),
+            HarnessEventSinkContext {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+            },
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
 
@@ -535,6 +637,7 @@ impl HarnessEventSink {
 
         Ok(Self {
             sink_file,
+            sink_key,
             stop,
             reader,
         })
@@ -547,6 +650,7 @@ impl HarnessEventSink {
 
 impl Drop for HarnessEventSink {
     fn drop(&mut self) {
+        unregister_sink_context(&self.sink_key);
         self.stop.store(true, Ordering::Release);
         self.reader.abort();
     }
@@ -713,6 +817,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_progress_fraction_alias() {
+        let raw = serde_json::json!({
+            "schema": "octos.harness.event.v1",
+            "kind": "progress",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "workflow": "deep_research",
+            "phase": "search",
+            "message": "Searching",
+            "progress_fraction": 0.25
+        });
+
+        let parsed = HarnessEvent::from_json_line(&raw.to_string()).unwrap();
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["progress"], 0.25);
+    }
+
+    #[test]
     fn rejects_oversized_fields_and_invalid_phases() {
         let oversized = HarnessEvent::progress(
             "session-1",
@@ -733,5 +855,73 @@ mod tests {
             Some(0.42),
         );
         assert!(invalid_phase.validate().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sink_reader_ignores_mismatched_task_or_session() {
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
+        let other_task_id = supervisor.register("deep_search", "call-2", Some("api:session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_running(&other_task_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let sink = HarnessEventSink::new(supervisor.clone(), task_id.clone(), "api:session")
+            .expect("create sink");
+        let wrong_task = HarnessEvent::progress(
+            "api:session",
+            other_task_id.clone(),
+            Some("deep_research"),
+            "search",
+            Some("wrong task"),
+            Some(0.2),
+        );
+        let wrong_session = HarnessEvent::progress(
+            "api:other",
+            task_id.clone(),
+            Some("deep_research"),
+            "search",
+            Some("wrong session"),
+            Some(0.3),
+        );
+        let correct = HarnessEvent::progress(
+            "api:session",
+            task_id.clone(),
+            Some("deep_research"),
+            "fetch",
+            Some("Fetching 4 pages"),
+            Some(0.4),
+        );
+
+        write_event_to_sink(sink.path().display().to_string(), &wrong_task).unwrap();
+        write_event_to_sink(sink.path().display().to_string(), &wrong_session).unwrap();
+        write_event_to_sink(sink.path().display().to_string(), &correct).unwrap();
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let task = rx.recv().await.expect("task update");
+                if task.id == task_id && task.runtime_detail.is_some() {
+                    break task;
+                }
+            }
+        })
+        .await
+        .expect("correct event should update task");
+
+        let detail: Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["task_id"], task_id);
+        assert_eq!(detail["session_id"], "api:session");
+        assert_eq!(detail["current_phase"], "fetch");
+        assert_eq!(detail["progress_message"], "Fetching 4 pages");
+
+        let other = supervisor
+            .get_task(&other_task_id)
+            .expect("other task missing");
+        assert!(other.runtime_detail.is_none());
     }
 }
