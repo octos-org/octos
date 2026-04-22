@@ -1398,11 +1398,9 @@ fn extract_text_bodies(xml: &str) -> Vec<Vec<String>> {
                 }
                 depth -= 1;
             }
-            Ok(Event::Text(ref e)) => {
-                if in_text {
-                    if let Ok(text) = e.unescape() {
-                        current_para.push_str(&text);
-                    }
+            Ok(Event::Text(ref e)) if in_text => {
+                if let Ok(text) = e.unescape() {
+                    current_para.push_str(&text);
                 }
             }
             _ => {}
@@ -1446,11 +1444,9 @@ fn extract_docx_paragraphs(xml: &str) -> Vec<String> {
                     in_para = false;
                 }
             }
-            Ok(Event::Text(ref e)) => {
-                if in_text {
-                    if let Ok(text) = e.unescape() {
-                        current_para.push_str(&text);
-                    }
+            Ok(Event::Text(ref e)) if in_text => {
+                if let Ok(text) = e.unescape() {
+                    current_para.push_str(&text);
                 }
             }
             _ => {}
@@ -1493,11 +1489,9 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
                     in_si = false;
                 }
             }
-            Ok(Event::Text(ref e)) => {
-                if in_t {
-                    if let Ok(text) = e.unescape() {
-                        current.push_str(&text);
-                    }
+            Ok(Event::Text(ref e)) if in_t => {
+                if let Ok(text) = e.unescape() {
+                    current.push_str(&text);
                 }
             }
             _ => {}
@@ -1600,11 +1594,9 @@ fn extract_xlsx_rows(xml: &str, shared_strings: &[String]) -> Vec<Vec<String>> {
                     in_row = false;
                 }
             }
-            Ok(Event::Text(ref e)) => {
-                if in_value {
-                    if let Ok(text) = e.unescape() {
-                        current_value.push_str(&text);
-                    }
+            Ok(Event::Text(ref e)) if in_value => {
+                if let Ok(text) = e.unescape() {
+                    current_value.push_str(&text);
                 }
             }
             _ => {}

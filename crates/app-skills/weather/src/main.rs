@@ -161,8 +161,7 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
             if let Some(mut results) = geo.results {
                 if !results.is_empty() {
                     // Pick the most populated result (avoids returning tiny hamlets)
-                    results
-                        .sort_by(|a, b| b.population.unwrap_or(0).cmp(&a.population.unwrap_or(0)));
+                    results.sort_by_key(|result| std::cmp::Reverse(result.population.unwrap_or(0)));
                     return results.into_iter().next().unwrap();
                 }
             }
