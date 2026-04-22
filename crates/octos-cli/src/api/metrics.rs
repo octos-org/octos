@@ -289,6 +289,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "workspace_validator_optional_warnings".to_string(),
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+        ),
     ])
 }
 
@@ -356,6 +360,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 samples,
                 "octos_workspace_validator_total",
                 &["status", "phase", "kind", "required"],
+            ),
+        ),
+        (
+            "loop_errors".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
             ),
         ),
     ])

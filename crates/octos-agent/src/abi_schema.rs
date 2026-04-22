@@ -35,6 +35,10 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for `HarnessError` events (M6.1, issue #488).
+/// Emitted as part of `octos.harness.event.v1` with `kind: "error"`.
+pub const HARNESS_ERROR_SCHEMA_VERSION: u32 = 1;
+
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
 ///
