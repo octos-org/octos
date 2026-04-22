@@ -71,7 +71,7 @@ export default function StepDeploymentMode({ onModeSaved }: Props) {
   return (
     <div className="space-y-4">
       <div>
-        <h2 className="text-lg font-semibold text-white mb-1">Deployment mode</h2>
+        <h2 className="text-lg font-semibold text-white mb-1">Deployment Mode</h2>
         <p className="text-sm text-gray-400">
           Choose how this node runs. Your selection is saved immediately.
         </p>

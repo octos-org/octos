@@ -69,7 +69,7 @@ export default function StepLlmProvider() {
   return (
     <div className="space-y-4">
       <div>
-        <h2 className="text-lg font-semibold text-white mb-1">LLM provider</h2>
+        <h2 className="text-lg font-semibold text-white mb-1">LLM Provider</h2>
         <p className="text-sm text-gray-400">
           Pick a default model provider and verify that your API key works.
         </p>
@@ -131,7 +131,7 @@ export default function StepLlmProvider() {
           disabled={!canTest || test.kind === 'loading'}
           className="px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          {test.kind === 'loading' ? 'Testing…' : 'Test connection'}
+          {test.kind === 'loading' ? 'Testing…' : 'Test Connection'}
         </button>
         {test.kind === 'ok' && (
           <span className="text-sm text-green-400">✓ {test.message}</span>

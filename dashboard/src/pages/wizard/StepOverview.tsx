@@ -2,7 +2,7 @@ export default function StepOverview() {
   return (
     <div className="space-y-4">
       <div>
-        <h2 className="text-lg font-semibold text-white mb-1">What's next</h2>
+        <h2 className="text-lg font-semibold text-white mb-1">What's Next</h2>
         <p className="text-sm text-gray-400">
           A few quick steps and you'll have a working agent with login emails
           and the right deployment mode for your host.

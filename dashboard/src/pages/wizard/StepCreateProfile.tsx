@@ -19,7 +19,7 @@ export default function StepCreateProfile() {
   return (
     <div className="space-y-4">
       <div>
-        <h2 className="text-lg font-semibold text-white mb-1">Create your first profile</h2>
+        <h2 className="text-lg font-semibold text-white mb-1">Create Your First Profile</h2>
         <p className="text-sm text-gray-400">
           Your provider is set. A profile ties together the LLM, messaging channels, tools, and skills the assistant will use.
         </p>
@@ -37,7 +37,7 @@ export default function StepCreateProfile() {
           onClick={() => finishWith('/profiles/new')}
           className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-50"
         >
-          {working === 'create' ? 'Opening…' : 'Create profile →'}
+          {working === 'create' ? 'Opening…' : 'Create Profile →'}
         </button>
         <button
           type="button"
@@ -45,7 +45,7 @@ export default function StepCreateProfile() {
           onClick={() => finishWith('/')}
           className="w-full px-4 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-50"
         >
-          {working === 'skip' ? 'Finishing…' : 'I\'ll do this later'}
+          {working === 'skip' ? 'Finishing…' : 'I\'ll Do This Later'}
         </button>
       </div>
     </div>

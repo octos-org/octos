@@ -58,7 +58,7 @@ export default function SetupRotateToken() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-background px-4">
       <div className="w-full max-w-lg bg-surface border border-gray-700/50 rounded-xl p-8 shadow-xl">
-        <h1 className="text-xl font-bold text-white mb-2">Rotate admin token</h1>
+        <h1 className="text-xl font-bold text-white mb-2">Rotate Admin Token</h1>
         <p className="text-sm text-gray-400 mb-6">
           Replace the bootstrap token with a persistent hashed admin token. This is
           required before you can access the dashboard.
@@ -108,7 +108,7 @@ export default function SetupRotateToken() {
               disabled={loading || !value}
               className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {loading ? 'Rotating…' : 'Rotate token'}
+              {loading ? 'Submitting…' : 'Submit'}
             </button>
           </form>
         )}
