@@ -122,6 +122,34 @@ export interface OperatorSummaryResponse {
   sources: OperatorSummarySource[]
 }
 
+/**
+ * M6.1 — structured harness error taxonomy.
+ *
+ * Counter name is `octos_loop_error_total` and rolls up to the
+ * `loop_errors` key in `OperatorSummaryResponse.totals` and
+ * `OperatorSummaryResponse.breakdowns`. `variant` names match
+ * `HarnessError::variant_name()` in Rust (snake_case identifiers such as
+ * `rate_limited`, `context_overflow`, `delegate_depth_exceeded`).
+ * `recovery` names match `RecoveryHint::as_str()`
+ * (`backoff_retry`, `switch_provider`, `compact_context`, `fail_fast`,
+ * `bug`).
+ */
+export interface HarnessErrorBreakdownRow extends OperatorSummaryBreakdownRow {
+  variant: string
+  recovery: string
+}
+
+export function harnessErrorRows(
+  summary: OperatorSummaryResponse | null,
+): HarnessErrorBreakdownRow[] {
+  const rows = summary?.breakdowns.loop_errors ?? []
+  return rows as HarnessErrorBreakdownRow[]
+}
+
+export function harnessErrorTotal(summary: OperatorSummaryResponse | null): number {
+  return summary?.totals.loop_errors ?? 0
+}
+
 function authHeaders(): HeadersInit {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token =

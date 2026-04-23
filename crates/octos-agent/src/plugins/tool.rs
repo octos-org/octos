@@ -5,13 +5,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::harness_errors::HarnessError;
 use crate::harness_events::{
     OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
-    OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context,
+    OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context, write_event_to_sink,
 };
 use crate::progress::ProgressEvent;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
@@ -90,6 +91,30 @@ impl PluginTool {
             extra_env: self.extra_env.clone(),
             work_dir: Some(work_dir),
             timeout: self.timeout,
+        }
+    }
+
+    /// Record a `HarnessError` for this plugin tool: increments the
+    /// `octos_loop_error_total{variant, recovery}` counter and writes a
+    /// structured error event to the harness event sink (if one is wired
+    /// via `ToolContext`). Keeps plugin error paths consistent with the
+    /// in-process error boundary in `execution.rs`.
+    fn emit_plugin_error(&self, ctx: Option<&ToolContext>, classified: &HarnessError) {
+        classified.record_metric();
+        let Some(sink) = ctx.and_then(|c| c.harness_event_sink.as_deref()) else {
+            return;
+        };
+        let Some(sink_ctx) = lookup_event_sink_context(sink) else {
+            return;
+        };
+        let event = classified.to_event(sink_ctx.session_id, sink_ctx.task_id, None, None);
+        if let Err(error) = write_event_to_sink(sink, &event) {
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                error = %error,
+                "failed to write plugin error event to harness sink"
+            );
         }
     }
 
@@ -520,13 +545,22 @@ impl Tool for PluginTool {
 
         let effective_args = self.prepare_effective_args(args, ctx.as_ref());
 
-        let mut child = cmd.spawn().wrap_err_with(|| {
-            format!(
-                "failed to spawn plugin '{}' executable: {}",
-                self.plugin_name,
-                self.executable.display()
-            )
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!(
+                    "failed to spawn plugin '{}' executable: {}: {err}",
+                    self.plugin_name,
+                    self.executable.display()
+                );
+                let classified = HarnessError::PluginSpawn {
+                    plugin_name: self.plugin_name.clone(),
+                    message: message.clone(),
+                };
+                self.emit_plugin_error(ctx.as_ref(), &classified);
+                return Err(eyre::Report::new(err).wrap_err(message));
+            }
+        };
 
         let child_pid = child.id().unwrap_or(0);
         tracing::info!(
@@ -549,12 +583,16 @@ impl Tool for PluginTool {
 
         // Spawn stderr reader: streams lines as ToolProgress events
         let tool_name = self.tool_def.name.clone();
+        // Clone ctx for the stderr reader so we can still consult the
+        // original after the reader task is spawned (needed for
+        // `emit_plugin_error` on spawn/timeout/protocol failures).
+        let stderr_ctx = ctx.clone();
         let stderr_task = tokio::spawn(async move {
             let mut collected = String::new();
             if let Some(stderr) = stderr_handle {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref ctx) = ctx {
+                    if let Some(ref ctx) = stderr_ctx {
                         ctx.reporter.report(ProgressEvent::ToolProgress {
                             name: tool_name.clone(),
                             tool_id: ctx.tool_id.clone(),
@@ -600,11 +638,16 @@ impl Tool for PluginTool {
             {
                 Ok((Ok(status), stdout_bytes, stderr_text)) => (status, stdout_bytes, stderr_text),
                 Ok((Err(e), _, _)) => {
-                    return Err(eyre::eyre!(
+                    let message = format!(
                         "plugin '{}' tool '{}' execution failed: {e}",
-                        self.plugin_name,
-                        self.tool_def.name
-                    ));
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginProtocol {
+                        plugin_name: self.plugin_name.clone(),
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
                 Err(_) => {
                     // Timeout — kill the child process
@@ -624,12 +667,18 @@ impl Tool for PluginTool {
                             .args(["/F", "/T", "/PID", &child_pid.to_string()])
                             .status();
                     }
-                    return Err(eyre::eyre!(
-                        "plugin '{}' tool '{}' timed out after {}s",
-                        self.plugin_name,
-                        self.tool_def.name,
-                        self.timeout.as_secs()
-                    ));
+                    let timeout_secs = self.timeout.as_secs();
+                    let message = format!(
+                        "plugin '{}' tool '{}' timed out after {timeout_secs}s",
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginTimeout {
+                        plugin_name: self.plugin_name.clone(),
+                        timeout_secs,
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
             };
         let stdout = String::from_utf8_lossy(&stdout_bytes);
