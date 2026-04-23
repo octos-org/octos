@@ -18,7 +18,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::abi_schema::{
-    COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+    COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
+    SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
 };
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
@@ -44,6 +45,10 @@ fn default_validator_result_schema_version() -> u32 {
 
 fn default_sub_agent_dispatch_schema_version() -> u32 {
     SUB_AGENT_DISPATCH_SCHEMA_VERSION
+}
+
+fn default_swarm_dispatch_schema_version() -> u32 {
+    SWARM_DISPATCH_SCHEMA_VERSION
 }
 
 fn default_cost_attribution_schema_version() -> u32 {
@@ -243,6 +248,10 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessSubAgentDispatchEvent,
     },
+    SwarmDispatch {
+        #[serde(flatten)]
+        data: HarnessSwarmDispatchEvent,
+    },
     CostAttribution {
         #[serde(flatten)]
         data: HarnessCostAttributionEvent,
@@ -360,6 +369,49 @@ pub struct HarnessFailureEvent {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Typed payload emitted when the `octos-swarm` primitive dispatches a
+/// batch of contracts to MCP-backed sub-agents. Supervisors consume
+/// these events to render live swarm state and drive re-dispatch on
+/// partial failure.
+///
+/// The schema is versioned so downstream tooling can reject unknown
+/// variants instead of silently dropping fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessSwarmDispatchEvent {
+    #[serde(default = "default_swarm_dispatch_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Stable dispatch identifier — persists across process restart so
+    /// the primitive can reload state and resume.
+    pub dispatch_id: String,
+    /// Topology label: `"parallel"` / `"sequential"` / `"pipeline"` /
+    /// `"fanout"`. Stable metric cardinality.
+    pub topology: String,
+    /// Aggregate outcome label: `"success"` / `"partial"` / `"failed"` /
+    /// `"aborted"`.
+    pub outcome: String,
+    /// Number of sub-contracts issued at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_subtasks: Option<u32>,
+    /// How many of them reached a successful terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_subtasks: Option<u32>,
+    /// Retry round index (0 = first round). Bounded by the primitive's
+    /// MAX_RETRY_ROUNDS constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_round: Option<u32>,
+    /// Optional human-readable error message for non-success outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -528,6 +580,17 @@ impl HarnessEvent {
         Self {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
             payload: HarnessEventPayload::SubAgentDispatch { data },
+        }
+    }
+
+    /// Convenience builder for a `SwarmDispatch` event. Takes a
+    /// pre-populated [`HarnessSwarmDispatchEvent`] so callers pay the
+    /// construction cost once and this helper stays below clippy's
+    /// argument limit.
+    pub fn swarm_dispatch(data: HarnessSwarmDispatchEvent) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::SwarmDispatch { data },
         }
     }
 
@@ -735,6 +798,21 @@ impl HarnessEvent {
                 validate_bounded("sub-agent backend", &data.backend, MAX_MESSAGE_BYTES)?;
                 validate_bounded("sub-agent endpoint", &data.endpoint, MAX_MESSAGE_BYTES)?;
                 validate_bounded("sub-agent outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
+                validate_optional_message(data.message.as_deref())?;
+            }
+            HarnessEventPayload::SwarmDispatch { data } => {
+                if data.schema_version > SWARM_DISPATCH_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported swarm dispatch schema_version {} (max supported: {})",
+                        data.schema_version, SWARM_DISPATCH_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("swarm dispatch_id", &data.dispatch_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("swarm topology", &data.topology, MAX_MESSAGE_BYTES)?;
+                validate_bounded("swarm outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
                 validate_optional_message(data.message.as_deref())?;
             }
             HarnessEventPayload::CostAttribution { data } => {
@@ -945,6 +1023,28 @@ impl HarnessEvent {
                     "message": data.message,
                 })
             }
+            HarnessEventPayload::SwarmDispatch { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "swarm_dispatch",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "dispatch_id": data.dispatch_id,
+                    "topology": data.topology,
+                    "outcome": data.outcome,
+                    "total_subtasks": data.total_subtasks,
+                    "completed_subtasks": data.completed_subtasks,
+                    "retry_round": data.retry_round,
+                    "message": data.message,
+                })
+            }
             HarnessEventPayload::CostAttribution { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -1028,6 +1128,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => &data.session_id,
             HarnessEventPayload::McpServerCall { data } => &data.session_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.session_id,
+            HarnessEventPayload::SwarmDispatch { data } => &data.session_id,
             HarnessEventPayload::CostAttribution { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
@@ -1045,6 +1146,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => &data.task_id,
             HarnessEventPayload::McpServerCall { data } => &data.task_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.task_id,
+            HarnessEventPayload::SwarmDispatch { data } => &data.task_id,
             HarnessEventPayload::CostAttribution { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
@@ -1062,6 +1164,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.workflow.as_deref(),
+            HarnessEventPayload::SwarmDispatch { data } => data.workflow.as_deref(),
             HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
@@ -1079,6 +1182,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.phase.as_deref(),
+            HarnessEventPayload::SwarmDispatch { data } => data.phase.as_deref(),
             HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,

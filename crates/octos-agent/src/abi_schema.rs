@@ -63,6 +63,16 @@ pub const SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const SUB_AGENT_DISPATCH_SCHEMA_VERSION: u32 = 1;
 
 /// Current schema version for the typed
+/// [`HarnessEventPayload::SwarmDispatch`](crate::harness_events::HarnessEventPayload::SwarmDispatch)
+/// event and its nested
+/// [`HarnessSwarmDispatchEvent`](crate::harness_events::HarnessSwarmDispatchEvent)
+/// payload emitted when the `octos-swarm` primitive fans out a batch of
+/// contracts to sub-agents. Callers MUST validate the version on
+/// deserialization via [`check_supported`] before using any v1-specific
+/// fields.
+pub const SWARM_DISPATCH_SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for the typed
 /// [`HarnessEventPayload::CostAttribution`](crate::harness_events::HarnessEventPayload::CostAttribution)
 /// event and its nested
 /// [`HarnessCostAttributionEvent`](crate::harness_events::HarnessCostAttributionEvent)
@@ -264,6 +274,23 @@ mod tests {
         let err = check_supported("SubAgentDispatch", 99, SUB_AGENT_DISPATCH_SCHEMA_VERSION)
             .expect_err("future version should be rejected");
         assert_eq!(err.kind, "SubAgentDispatch");
+        assert_eq!(err.found, 99);
+    }
+
+    #[test]
+    fn swarm_dispatch_schema_version_is_registered_at_v1() {
+        assert_eq!(SWARM_DISPATCH_SCHEMA_VERSION, 1);
+        assert!(
+            check_supported(
+                "SwarmDispatch",
+                SWARM_DISPATCH_SCHEMA_VERSION,
+                SWARM_DISPATCH_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+        let err = check_supported("SwarmDispatch", 99, SWARM_DISPATCH_SCHEMA_VERSION)
+            .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "SwarmDispatch");
         assert_eq!(err.found, 99);
     }
 
