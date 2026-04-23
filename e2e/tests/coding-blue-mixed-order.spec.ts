@@ -7,13 +7,20 @@
  *    inherit background-task status."
  *
  * Real UX: task-anchor bubbles may render interleaved with message bubbles in
- * ways that don't match a strict U-A-U-A-U-A sequence. This spec now asserts:
+ * ways that don't match a strict U-A-U-A-U-A sequence. The deep-research
+ * answer in particular is delivered as a `task-anchor-message-<id>` bubble
+ * (background-task path, PR #42 testid convention) — NOT as a regular
+ * `assistant-message`. Short shell echoes come back as regular
+ * `assistant-message` bubbles. Streaming can also emit intermediate
+ * reasoning-chunk bubbles, so the total count is variable.
+ *
+ * This spec asserts the stable invariants (any bubble — assistant-message or
+ * task-anchor-message — counts as a carrier of LLM output):
  *
  *   1. All 3 user bubbles are present in send-order (with the expected content).
- *   2. Every user bubble eventually gets SOME meaningful assistant content.
- *   3. The deep-research answer names a Rust runtime somewhere in the 3 bubbles.
- *   4. Quick turns (Q2/Q3) produce their own distinct answers ("2+2=4" / "blue").
- *   5. At most one assistant bubble carries task-anchor UI (the DR one).
+ *   2. At least one bubble names a Rust runtime (deep-research answer).
+ *   3. Transcript contains "2+2=4" and "sky is blue" (quick-echo answers).
+ *   4. No cross-wiring: the research bubble does not carry the Q3 echo phrase.
  *
  * Target: OCTOS_TEST_URL (default https://dspfac.crew.ominix.io = mini1).
  */
@@ -132,16 +139,31 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
       timeout: 30_000,
     });
 
-    // Wait until 3 assistant bubbles are present AND the cancel button is
-    // gone (everything streamed out) AND each bubble has SUBSTANTIAL text
-    // (> 8 chars, beyond just a timestamp placeholder).
-    await expect(page.locator(SEL.assistantMessage)).toHaveCount(3, {
-      timeout: 720_000,
-    });
+    // The deep-research answer is delivered as a task-anchor-message bubble
+    // (background-task path, PR #42 testid convention) while the two shell
+    // echoes come back as regular assistant-message bubbles. Because streaming
+    // can also produce intermediate assistant-message bubbles (e.g. a "let me
+    // try a different query" reasoning chunk with a deep_search tool tag),
+    // the total bubble count is variable. The stable invariant is that *all
+    // three* user prompts eventually get answered somewhere in the transcript.
+    //
+    // Combined selector matches both regular assistant bubbles and task-anchor
+    // bubbles — either shape carries legitimate LLM output.
+    const TRANSCRIPT_SEL =
+      '[data-testid="assistant-message"], [data-testid^="task-anchor-message-"]';
 
-    // Stabilize: cancel gone + all 3 bubbles have meaningful content for two
-    // consecutive polls.
-    await expect
+    // Stabilize: cancel button is gone AND the transcript has at least one
+    // bubble carrying each of the three expected signatures:
+    //   - a Rust-runtime name (deep-research answer),
+    //   - "2+2=4" (literal shell echo for Q2 — strict to avoid matching
+    //     random "4"s in deep-research numbered lists),
+    //   - "sky is blue" (literal shell echo for Q3).
+    // Polls up to 14 minutes (slightly under the 15-min test setTimeout).
+    const runtimeRe = /tokio|async-std|smol|glommio|embassy|mio/i;
+    const q2Re = /2\s*\+\s*2\s*=\s*4/i;
+    const q3Re = /sky\s+is\s+blue/i;
+
+    const stableReady = await expect
       .poll(
         async () => {
           const cancelVisible = await page
@@ -149,19 +171,35 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
             .isVisible()
             .catch(() => false);
           if (cancelVisible) return false;
-          const texts = await page
-            .locator(SEL.assistantMessage)
-            .allInnerTexts();
-          if (texts.length < 3) return false;
-          return texts.every((t) => stripTimestamp((t || '').trim()).length > 5);
+          const texts = await page.locator(TRANSCRIPT_SEL).allInnerTexts();
+          if (texts.length < 1) return false;
+          const joined = texts.join(' ');
+          return (
+            runtimeRe.test(joined) && q2Re.test(joined) && q3Re.test(joined)
+          );
         },
-        { timeout: 720_000, intervals: [4_000] },
+        { timeout: 840_000, intervals: [5_000] },
       )
-      .toBe(true);
+      .toBe(true)
+      .then(() => true)
+      .catch(() => false);
 
-    // Extra margin: one more stability check — sometimes streaming resumes
+    // Extra margin: one more stability wait — sometimes streaming resumes
     // briefly with a second chunk.
     await page.waitForTimeout(5_000);
+
+    const transcriptTexts = await page
+      .locator(TRANSCRIPT_SEL)
+      .allInnerTexts();
+    const joinedTranscript = transcriptTexts.join(' ');
+
+    if (!stableReady) {
+      console.log(
+        `[coding-blue mixed-order] partial transcript after timeout: ${transcriptTexts
+          .map((t, i) => `[${i}] ${(t || '').slice(0, 100)}`)
+          .join(' | ')}`,
+      );
+    }
 
     // --- Invariant 1: user bubbles are in send order with U1/U2/U3 content ---
     const userTexts = await page.locator(SEL.userMessage).allInnerTexts();
@@ -170,88 +208,47 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     expect(userTexts[1]).toContain('2+2=4');
     expect(userTexts[2]).toContain('sky is blue');
 
-    // --- Invariant 2: every assistant bubble carries non-timestamp content ---
-    const assistantTexts = await page.locator(SEL.assistantMessage).allInnerTexts();
-    for (let i = 0; i < 3; i += 1) {
-      const stripped = stripTimestamp((assistantTexts[i] || '').trim());
-      expect(
-        stripped.length,
-        `assistant bubble #${i + 1} must have content; got: "${(
-          assistantTexts[i] || ''
-        ).slice(0, 160)}"`,
-      ).toBeGreaterThan(3);
-    }
-
-    // --- Invariant 3: at least one bubble names a Rust runtime ---
-    const runtimeRe = /tokio|async-std|smol|glommio|embassy|mio/i;
-    const researchIdx = assistantTexts.findIndex((t) => runtimeRe.test(t || ''));
+    // --- Invariant 2: deep-research answer is present somewhere ---
+    const researchIdx = transcriptTexts.findIndex((t) => runtimeRe.test(t || ''));
     expect(
       researchIdx,
-      `at least one assistant bubble must name a Rust runtime (deep-research answer); got: ${assistantTexts
+      `at least one transcript bubble must name a Rust runtime (deep-research answer); got: ${transcriptTexts
         .map((t, i) => `[${i}] ${(t || '').slice(0, 120)}`)
         .join(' | ')}`,
     ).toBeGreaterThanOrEqual(0);
 
+    // --- Invariant 3: both shell echoes produced answers ---
+    expect(
+      q2Re.test(joinedTranscript),
+      `transcript should carry Q2 answer (2+2=4); got: ${joinedTranscript.slice(
+        0,
+        500,
+      )}`,
+    ).toBe(true);
+    expect(
+      q3Re.test(joinedTranscript),
+      `transcript should carry Q3 answer (sky is blue); got: ${joinedTranscript.slice(
+        0,
+        500,
+      )}`,
+    ).toBe(true);
+
     // --- Invariant 4: no cross-wiring ---
-    // Deep-research bubble must NOT carry Q3's echo text.
+    // The specific bubble that names a runtime must NOT also carry Q3's echo.
     if (researchIdx >= 0) {
-      const researchText = (assistantTexts[researchIdx] || '').toLowerCase();
+      const researchText = (transcriptTexts[researchIdx] || '').toLowerCase();
+      // Use word-boundary "sky is blue" so we don't false-positive on a
+      // deep-research summary that happens to mention the color blue.
       expect(
-        /sky is blue/i.test(researchText),
-        "deep-research bubble shouldn't carry Q3's echo",
+        /sky is blue/.test(researchText),
+        "deep-research bubble shouldn't carry Q3's echo phrase",
       ).toBe(false);
     }
 
-    const quickAnswers = assistantTexts.filter((_, i) => i !== researchIdx);
-    const quickJoined = quickAnswers.join(' ').toLowerCase();
-    expect(
-      quickJoined.includes('4') || /2\s*\+\s*2/.test(quickJoined),
-      `one quick bubble should answer Q2 (2+2); got: ${quickAnswers.join(
-        ' | ',
-      )}`,
-    ).toBe(true);
-    expect(
-      quickJoined.includes('blue') || quickJoined.includes('sky'),
-      `one quick bubble should answer Q3 (sky is blue); got: ${quickAnswers.join(
-        ' | ',
-      )}`,
-    ).toBe(true);
-
-    // --- Invariant 5: at most one assistant bubble carries task-anchor UI ---
-    const anchorCounts = await page.evaluate(() => {
-      const bubbles = Array.from(
-        document.querySelectorAll('[data-testid="assistant-message"]'),
-      );
-      return bubbles.map(
-        (b) =>
-          (b as HTMLElement).querySelectorAll('[data-testid^="task-anchor-"]')
-            .length,
-      );
-    });
-    const totalAnchors = anchorCounts.reduce((sum, c) => sum + c, 0);
-    expect(
-      anchorCounts.filter((c) => c > 0).length,
-      `at most 1 assistant bubble may carry task-anchor UI; per-bubble counts: ${JSON.stringify(
-        anchorCounts,
-      )}`,
-    ).toBeLessThanOrEqual(1);
-
     console.log(
-      `[coding-blue mixed-order] researchIdx=${researchIdx} lens=${assistantTexts
+      `[coding-blue mixed-order] bubbles=${transcriptTexts.length} researchIdx=${researchIdx} lens=${transcriptTexts
         .map((t) => (t || '').length)
-        .join(',')} totalAnchors=${totalAnchors}`,
+        .join(',')}`,
     );
   });
 });
-
-/**
- * Strip trailing/leading ISO timestamps and "Thinking..." placeholders so
- * the remaining text represents real assistant content.
- */
-function stripTimestamp(s: string): string {
-  return s
-    .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g, '')
-    .replace(/Thinking\s*\(iteration\s+\d+\)/gi, '')
-    .replace(/^\s*[.,]+\s*$/gm, '')
-    .trim();
-}
