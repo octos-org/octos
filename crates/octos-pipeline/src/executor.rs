@@ -17,6 +17,8 @@ use octos_memory::EpisodeStore;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use octos_agent::cost_ledger::{CostAttributionEvent, ReservationHandle};
+
 use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
 use crate::context::PipelineContext;
@@ -29,6 +31,54 @@ use crate::handler::{
 };
 use crate::parser::parse_dot;
 use crate::validate;
+
+/// Minimum projected USD per LLM-call node when no model-specific rate
+/// is available. Keeps the reservation path live for unknown models so
+/// budget-policy breaches surface on every dispatch rather than slipping
+/// through a silent `0.0` projection.
+const MIN_PER_NODE_PROJECTED_USD: f64 = 0.001;
+
+/// Default pipeline-level projection when the caller leaves
+/// [`PipelineContext::pipeline_projected_usd`] unset. One cent keeps
+/// the reservation path alive without pre-committing a noticeable
+/// budget.
+const DEFAULT_PIPELINE_PROJECTED_USD: f64 = 0.01;
+
+/// Default pipeline contract id when [`PipelineContext::contract_id`]
+/// is empty. Chosen to match the operator rollup key used elsewhere in
+/// the harness for background pipelines.
+const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
+
+/// Returns `true` when the handler kind triggers one or more LLM calls
+/// inside the node and therefore participates in cost reservation.
+///
+/// * `Codergen`: one sub-agent run (many LLM calls inside the loop).
+/// * `DynamicParallel`: one planner call + N worker calls; the
+///   reservation is sized using the node's declared model so it covers
+///   both phases.
+///
+/// `Shell`, `Gate`, `Noop`, and `Parallel` do not issue LLM calls
+/// directly — `Parallel` fan-outs target `Codergen` nodes which each
+/// reserve independently when traversal reaches them.
+fn handler_kind_reserves(kind: &HandlerKind) -> bool {
+    matches!(kind, HandlerKind::Codergen | HandlerKind::DynamicParallel)
+}
+
+/// Project a per-node USD cost for reservation purposes.
+///
+/// Uses the declared model's token pricing with a fixed 2k-in / 2k-out
+/// estimate when the model is known. Falls back to
+/// [`MIN_PER_NODE_PROJECTED_USD`] for unknown models so the reservation
+/// path still fires (and budget breaches still surface).
+fn project_node_usd(model: Option<&str>) -> f64 {
+    let Some(model) = model else {
+        return MIN_PER_NODE_PROJECTED_USD;
+    };
+    match octos_agent::cost_ledger::project_cost_usd(model, 2_000, 2_000) {
+        Some(cost) if cost > 0.0 => cost,
+        _ => MIN_PER_NODE_PROJECTED_USD,
+    }
+}
 
 /// Total count of pipeline deadline expirations, partitioned by action label.
 /// Layout: `[abort, skip, retry, escalate]`. Use [`deadline_exceeded_count`] to
@@ -736,6 +786,16 @@ impl PipelineExecutor {
 
         let pipeline_start = Instant::now();
 
+        // coding-blue FA-7: reserve pipeline-level cost ledger budget
+        // up front when a CostAccountant was threaded in. The handle is
+        // held for the duration of execution — on success we commit
+        // with the cumulative token attribution, on failure (bail!) the
+        // handle is dropped and auto-refunds.
+        let pipeline_reservation = self
+            .reserve_pipeline_budget(&graph.id)
+            .await
+            .wrap_err("pipeline cost reservation failed")?;
+
         // Execute graph
         let result = self
             .execute_graph(&graph, &handlers, &start_node, user_input, variables)
@@ -745,6 +805,14 @@ impl PipelineExecutor {
         let total_ms = pipeline_start.elapsed().as_millis() as u64;
         match &result {
             Ok(r) => {
+                // Commit the pipeline-level reservation with the real
+                // cumulative token attribution. A commit error is
+                // logged but does not fail the pipeline — the reservation
+                // drops and auto-refunds so the ledger invariant holds.
+                if let Some(handle) = pipeline_reservation.as_ref() {
+                    self.commit_pipeline_reservation(handle, &graph.id, &r.token_usage)
+                        .await;
+                }
                 let node_results: Vec<String> = r
                     .node_summaries
                     .iter()
@@ -768,6 +836,10 @@ impl PipelineExecutor {
                 );
             }
             Err(e) => {
+                // Drop pipeline reservation — ReservationHandle::Drop
+                // auto-refunds when the handle is dropped uncommitted,
+                // so we don't need to do anything beyond exiting scope.
+                drop(pipeline_reservation);
                 tracing::error!(
                     duration_ms = total_ms,
                     error = %e,
@@ -777,6 +849,137 @@ impl PipelineExecutor {
         }
 
         result
+    }
+
+    /// Reserve the pipeline-level projection against the configured
+    /// `CostAccountant`. Returns:
+    /// * `Ok(None)` when no accountant is configured (legacy path).
+    /// * `Ok(Some(handle))` on a successful reservation.
+    /// * `Err` when the accountant exists but the reservation is
+    ///   rejected by the budget policy — the pipeline aborts before
+    ///   running any node, so per-node spend never starts.
+    async fn reserve_pipeline_budget(&self, graph_id: &str) -> Result<Option<ReservationHandle>> {
+        let Some(accountant) = self.config.workspace_context.cost_accountant.as_ref() else {
+            return Ok(None);
+        };
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let projected_usd = self.pipeline_projected_usd();
+        let handle = accountant
+            .reserve(&contract_id, projected_usd)
+            .await
+            .map_err(|breach| eyre::eyre!("cost budget breach: {breach}"))?;
+        info!(
+            contract_id = %contract_id,
+            projected_usd,
+            "pipeline cost reservation opened"
+        );
+        Ok(Some(handle))
+    }
+
+    /// Commit the pipeline-level reservation with the cumulative token
+    /// attribution. Errors are logged (not propagated) because the
+    /// reservation auto-refunds on drop — double-counting a ledger row
+    /// would be worse than a missed attribution.
+    async fn commit_pipeline_reservation(
+        &self,
+        handle: &ReservationHandle,
+        graph_id: &str,
+        usage: &TokenUsage,
+    ) {
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let actual_cost = octos_agent::cost_ledger::project_cost_usd(
+            "pipeline-aggregate",
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .unwrap_or(0.0);
+        let event = CostAttributionEvent::new(
+            contract_id.clone(),
+            contract_id.clone(),
+            format!("pipeline-{graph_id}"),
+            "pipeline-aggregate",
+            usage.input_tokens,
+            usage.output_tokens,
+            actual_cost,
+        );
+        if let Err(error) = handle.commit(event).await {
+            tracing::warn!(
+                contract_id = %contract_id,
+                error = %error,
+                "pipeline cost reservation commit failed; handle auto-refunds"
+            );
+        } else {
+            info!(
+                contract_id = %contract_id,
+                tokens_in = usage.input_tokens,
+                tokens_out = usage.output_tokens,
+                "pipeline cost reservation committed"
+            );
+        }
+    }
+
+    /// Resolve the contract id used for cost-ledger rollups. Falls back
+    /// to the pipeline graph id when the caller left the field empty
+    /// so the ledger still attributes spend to a stable key.
+    fn pipeline_contract_id(&self, graph_id: &str) -> String {
+        let explicit = self.config.workspace_context.contract_id.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        if !graph_id.is_empty() {
+            return graph_id.to_string();
+        }
+        DEFAULT_PIPELINE_CONTRACT_ID.to_string()
+    }
+
+    /// Resolve the pipeline-level projected USD used for the opening
+    /// reservation. Falls back to
+    /// [`DEFAULT_PIPELINE_PROJECTED_USD`] when the caller leaves the
+    /// field unset so the reservation path still surfaces breaches.
+    fn pipeline_projected_usd(&self) -> f64 {
+        let declared = self.config.workspace_context.pipeline_projected_usd;
+        if declared > 0.0 {
+            declared
+        } else {
+            DEFAULT_PIPELINE_PROJECTED_USD
+        }
+    }
+
+    /// Reserve sub-budget for a single LLM-call node. Returns:
+    /// * `Ok(None)` when no accountant is configured OR the handler
+    ///   kind does not participate in reservation.
+    /// * `Ok(Some(handle))` on a successful per-node reservation. The
+    ///   handle is held for the duration of the node's dispatch; on
+    ///   failure we drop it (auto-refund), on success we also drop it
+    ///   since the pipeline-level handle records the cumulative spend.
+    /// * `Err` when the accountant exists but the reservation is
+    ///   rejected — the caller should treat this as a terminal error.
+    async fn reserve_node_budget(
+        &self,
+        graph_id: &str,
+        node: &PipelineNode,
+    ) -> Result<Option<ReservationHandle>> {
+        let Some(accountant) = self.config.workspace_context.cost_accountant.as_ref() else {
+            return Ok(None);
+        };
+        if !handler_kind_reserves(&node.handler) {
+            return Ok(None);
+        }
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let projected_usd = project_node_usd(node.model.as_deref());
+        let handle = accountant
+            .reserve(&contract_id, projected_usd)
+            .await
+            .map_err(|breach| {
+                eyre::eyre!("cost budget breach reserving node '{}': {breach}", node.id)
+            })?;
+        info!(
+            contract_id = %contract_id,
+            node = %node.id,
+            projected_usd,
+            "per-node cost reservation opened"
+        );
+        Ok(Some(handle))
     }
 
     fn build_handlers(&self) -> HandlerRegistry {
@@ -983,6 +1186,12 @@ impl PipelineExecutor {
                     self.config.max_parallel_workers,
                 ));
                 let mut futures = Vec::new();
+                // coding-blue FA-7: collect per-target reservations so
+                // they drop together when the fan-out finishes. A
+                // rejected reservation aborts the whole fan-out before
+                // any worker dispatches, which keeps the concurrent
+                // branches from racing past the budget.
+                let mut fanout_reservations: Vec<ReservationHandle> = Vec::new();
                 for target_id in &targets {
                     let target_node = graph
                         .nodes
@@ -1006,6 +1215,17 @@ impl PipelineExecutor {
                     }
                     if target_with_prompt.model.is_none() {
                         target_with_prompt.model = graph.default_model.clone();
+                    }
+
+                    // Reserve budget for each LLM-call branch before
+                    // dispatching. If any branch's reservation fails,
+                    // bail — but first drop the handles collected so
+                    // far so they auto-refund.
+                    if let Some(handle) = self
+                        .reserve_node_budget(&graph.id, &target_with_prompt)
+                        .await?
+                    {
+                        fanout_reservations.push(handle);
                     }
 
                     let ctx = HandlerContext {
@@ -1045,6 +1265,12 @@ impl PipelineExecutor {
                 }
 
                 let results = futures::future::join_all(futures).await;
+
+                // Drop all per-branch reservations — the pipeline-level
+                // handle commits with the cumulative attribution, so
+                // per-branch handles only gated the dispatch-time
+                // budget projection.
+                drop(fanout_reservations);
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
                     process_worker_results(
@@ -1307,6 +1533,10 @@ impl PipelineExecutor {
                 let total_workers = synthetic_nodes.len();
                 let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut futures = Vec::new();
+                // coding-blue FA-7: same fan-out reservation pattern as
+                // the static Parallel branch — reserve per-worker up
+                // front, release en bloc when the fan-out completes.
+                let mut dp_reservations: Vec<ReservationHandle> = Vec::new();
                 for (task_id, mut synth_node) in synthetic_nodes {
                     // Apply variable substitution to synthetic prompt
                     if let Some(prompt) = synth_node.prompt.take() {
@@ -1317,6 +1547,10 @@ impl PipelineExecutor {
                             resolved = resolved.replace(&placeholder, value);
                         }
                         synth_node.prompt = Some(resolved.trim_end().to_string());
+                    }
+
+                    if let Some(handle) = self.reserve_node_budget(&graph.id, &synth_node).await? {
+                        dp_reservations.push(handle);
                     }
 
                     let ctx = HandlerContext {
@@ -1346,6 +1580,7 @@ impl PipelineExecutor {
                 }
 
                 let results = futures::future::join_all(futures).await;
+                drop(dp_reservations);
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
                     process_worker_results(
@@ -1488,10 +1723,29 @@ impl PipelineExecutor {
 
             let node_start = Instant::now();
 
+            // coding-blue FA-7: reserve per-node budget before dispatch
+            // on LLM-call nodes. A rejected reservation aborts the
+            // pipeline before the sub-agent is built; on dispatch
+            // failure the handle drops (Drop auto-refunds). Conditional
+            // branches that never reach this line never reserve, which
+            // is the design invariant for "unreached branches don't
+            // count against the pipeline budget".
+            let node_reservation = self
+                .reserve_node_budget(&graph.id, &node_with_prompt)
+                .await?;
+
             // Execute with retries — and enforce the node's deadline when set.
             let dispatch = self
                 .dispatch_node(handler, &node_with_prompt, &ctx, node.max_retries)
                 .await;
+
+            // The per-node reservation is scoped to the dispatch — on
+            // node failure we want the handle to drop (auto-refund). On
+            // success the pipeline-level handle records the cumulative
+            // attribution, so we let the per-node handle drop too. The
+            // reservation table correctly tracks outstanding budget
+            // during the pipeline lifetime without double-committing.
+            drop(node_reservation);
 
             let outcome = match dispatch? {
                 DispatchOutcome::Completed(outcome) => outcome,

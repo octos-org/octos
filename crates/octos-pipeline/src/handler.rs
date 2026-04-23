@@ -206,10 +206,7 @@ impl CodergenHandler {
     /// routes through the same Agent provider that serves the node.
     ///
     /// [`CompactionRunner::with_provider`]: octos_agent::compaction::CompactionRunner::with_provider
-    pub fn with_compaction_llm_provider(
-        mut self,
-        provider: Option<Arc<dyn LlmProvider>>,
-    ) -> Self {
+    pub fn with_compaction_llm_provider(mut self, provider: Option<Arc<dyn LlmProvider>>) -> Self {
         self.compaction_llm_provider = provider;
         self
     }
@@ -400,12 +397,16 @@ impl Handler for CodergenHandler {
             .ok()
             .flatten();
 
-        let mut worker =
-            octos_agent::Agent::new(worker_id.clone(), provider.clone(), tools, self.memory.clone())
-                .with_config(config)
-                .with_system_prompt(system_prompt)
-                .with_shutdown(self.shutdown.clone())
-                .with_reporter(reporter);
+        let mut worker = octos_agent::Agent::new(
+            worker_id.clone(),
+            provider.clone(),
+            tools,
+            self.memory.clone(),
+        )
+        .with_config(config)
+        .with_system_prompt(system_prompt)
+        .with_shutdown(self.shutdown.clone())
+        .with_reporter(reporter);
         if let Some(sink) = inherited_harness_sink {
             worker = worker.with_harness_event_sink(sink);
         }
