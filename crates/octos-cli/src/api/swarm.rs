@@ -686,10 +686,15 @@ pub async fn cost_attributions(
 ///   Matrix directly.
 ///
 /// The body's `reviewer` field is cross-checked against the authenticated
-/// caller: a non-admin user cannot submit a decision under somebody else's
-/// id (prevents Alice from acking as Bob). Admin callers can set any
-/// `reviewer` string — the field then doubles as an impersonation record
-/// for audit (e.g. an on-call admin filing a decision on behalf of a PM).
+/// caller. Only bootstrap / rotated admin tokens — i.e. callers who
+/// authenticate as [`AuthIdentity::Admin`](super::router::AuthIdentity::Admin)
+/// — may submit a `reviewer` string different from their own id. Every
+/// caller identified as [`AuthIdentity::User`](super::router::AuthIdentity::User)
+/// (regardless of the user's [`UserRole`](crate::user_store::UserRole) —
+/// including `UserRole::Admin` rows) MUST submit under their own id.
+/// Admin-token callers can set any `reviewer` string — the field then
+/// doubles as an impersonation record for audit (e.g. an on-call admin
+/// filing a decision on behalf of a PM).
 pub async fn submit_review(
     State(state): State<Arc<AppState>>,
     Path(dispatch_id): Path<String>,
@@ -715,8 +720,13 @@ pub async fn submit_review(
     }
 
     // Cross-check `reviewer` against the authenticated caller.
-    // - Admin: any `reviewer` string is allowed (audit-by-impersonation).
-    // - User: the body's `reviewer` must match the user's id exactly.
+    // - [`AuthIdentity::Admin`] (bootstrap / rotated admin tokens): any
+    //   `reviewer` string is allowed (audit-by-impersonation).
+    // - [`AuthIdentity::User`]: the body's `reviewer` MUST match the
+    //   user's id exactly. This applies to every user row regardless of
+    //   [`UserRole`] — a `UserRole::Admin` user still cannot submit
+    //   under another user's id; only the bootstrap-token variant has
+    //   that bypass.
     // - No identity (middleware not active, e.g. unauthenticated serve
     //   mode): skip the check — there is nothing to compare against.
     if let Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) = identity.as_ref() {
@@ -1327,11 +1337,15 @@ mod tests {
         );
     }
 
-    /// F-019: a user-role caller may only submit a review under their own
-    /// id. Forging another user's id must surface as 403
-    /// `reviewer_identity_mismatch` before any event is emitted.
+    /// F-019: a caller identified as [`AuthIdentity::User`] may only
+    /// submit a review under their own id — regardless of whether the
+    /// user row carries [`UserRole::Admin`] or [`UserRole::User`]. Only
+    /// bootstrap / rotated admin tokens (i.e. [`AuthIdentity::Admin`])
+    /// may forge a different reviewer. Forging as a user variant must
+    /// surface as 403 `reviewer_identity_mismatch` before any event is
+    /// emitted.
     #[tokio::test]
-    async fn should_reject_forged_reviewer_for_non_admin_caller() {
+    async fn should_reject_forged_reviewer_for_user_variant_caller() {
         use crate::api::router::AuthIdentity;
         use crate::user_store::UserRole;
         use octos_swarm::{AggregateArtifact, SubtaskOutcome, SwarmOutcomeKind, SwarmResult};
