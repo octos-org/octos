@@ -18,6 +18,9 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use octos_agent::cost_ledger::{CostAttributionEvent, ReservationHandle};
+use octos_agent::validators::ValidatorPhase;
+use octos_agent::workspace_contract::run_declared_validators;
+use octos_agent::workspace_policy::Validator as WorkspaceValidator;
 
 use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
@@ -797,21 +800,54 @@ impl PipelineExecutor {
             .wrap_err("pipeline cost reservation failed")?;
 
         // Execute graph
-        let result = self
+        let mut result = self
             .execute_graph(&graph, &handlers, &start_node, user_input, variables)
             .await;
+
+        // coding-blue FA-7: pipeline-terminal validators. The gate
+        // runs only on a successful pipeline (failure results already
+        // carry their own reason). On validator failure we rewrite the
+        // PipelineResult with `success = false` and a reason-tagged
+        // output so the caller sees a structured terminal error, then
+        // drop the reservation (auto-refund) without committing.
+        let mut validators_failed_reason: Option<String> = None;
+        if let Ok(ref r) = result {
+            if r.success {
+                if let Err(reason) = self.run_terminal_validators(&graph.id).await {
+                    warn!(
+                        pipeline = %graph.id,
+                        reason = %reason,
+                        "pipeline-terminal validator rejected result"
+                    );
+                    validators_failed_reason = Some(reason);
+                }
+            }
+        }
+        if let Some(reason) = validators_failed_reason {
+            if let Ok(ref mut r) = result {
+                r.success = false;
+                r.output = format!(
+                    "Pipeline validator rejected completion: {reason}\n\n{}",
+                    r.output
+                );
+            }
+        }
 
         // ── Pipeline end: log summary ──
         let total_ms = pipeline_start.elapsed().as_millis() as u64;
         match &result {
             Ok(r) => {
                 // Commit the pipeline-level reservation with the real
-                // cumulative token attribution. A commit error is
-                // logged but does not fail the pipeline — the reservation
-                // drops and auto-refunds so the ledger invariant holds.
-                if let Some(handle) = pipeline_reservation.as_ref() {
-                    self.commit_pipeline_reservation(handle, &graph.id, &r.token_usage)
-                        .await;
+                // cumulative token attribution only when the pipeline
+                // succeeded (including the terminal validator gate).
+                // On a terminal validator rejection the reservation
+                // is dropped unchanged at scope exit — ReservationHandle
+                // Drop auto-refunds, preserving the ledger invariant.
+                if r.success {
+                    if let Some(handle) = pipeline_reservation.as_ref() {
+                        self.commit_pipeline_reservation(handle, &graph.id, &r.token_usage)
+                            .await;
+                    }
                 }
                 let node_results: Vec<String> = r
                     .node_summaries
@@ -943,6 +979,126 @@ impl PipelineExecutor {
         } else {
             DEFAULT_PIPELINE_PROJECTED_USD
         }
+    }
+
+    /// Run the declared completion-phase validators for the pipeline
+    /// terminal gate. Returns `Ok(())` when either no workspace policy
+    /// is installed OR every required validator passes. A required
+    /// failure maps to `Err(reason)`; callers demote the pipeline
+    /// result to `success=false` and refund the reservation.
+    ///
+    /// The `workspace_root` defaults to the executor's `working_dir`
+    /// when the policy doesn't specify one — this mirrors the
+    /// spawn/delegate/swarm pattern established by FA-2 (commits
+    /// 40c307f6, fd7ed734, a7e041c6, f27eeb90).
+    async fn run_terminal_validators(&self, _graph_id: &str) -> Result<(), String> {
+        let ws_ctx = &self.config.workspace_context;
+        let Some(policy) = ws_ctx.policy.as_ref() else {
+            return Ok(());
+        };
+        if policy.validation.validators.is_empty() && policy.validation.on_completion.is_empty() {
+            return Ok(());
+        }
+
+        // `on_completion` holds the legacy action-string checks
+        // (e.g. `file_exists:output/deck.pptx`). Typed validators live
+        // in `validation.validators`. Both need to pass at terminal.
+        let legacy_failures = self.evaluate_on_completion_actions(&policy.validation.on_completion);
+        if let Some(reason) = legacy_failures {
+            return Err(reason);
+        }
+
+        if !policy.validation.validators.is_empty() {
+            // Build a workspace-scoped ToolRegistry for the validator
+            // runner — it only needs the workspace root for file
+            // existence + the registered tools for tool_call
+            // validators. Matches the spawn-agent-mcp pattern.
+            let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+            run_declared_validators(
+                &registry,
+                &self.config.working_dir,
+                &policy.validation.validators,
+                "pipeline",
+                ValidatorPhase::Completion,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate legacy `on_completion: ["file_exists:..."]` action
+    /// strings against the working directory. Returns `Some(reason)`
+    /// when any required check fails.
+    fn evaluate_on_completion_actions(&self, actions: &[String]) -> Option<String> {
+        let mut failures = Vec::new();
+        for action in actions {
+            if let Some(spec) = action.strip_prefix("file_exists:") {
+                // Support both concrete paths and globs via the
+                // glob::glob API.
+                let abs_pattern = if std::path::Path::new(spec).is_absolute() {
+                    spec.to_string()
+                } else {
+                    self.config
+                        .working_dir
+                        .join(spec)
+                        .to_string_lossy()
+                        .to_string()
+                };
+                let any_match = match glob::glob(&abs_pattern) {
+                    Ok(entries) => entries.filter_map(Result::ok).any(|p| p.exists()),
+                    Err(_) => false,
+                };
+                if !any_match {
+                    failures.push(action.clone());
+                }
+            } else {
+                // Unknown action form — accept for forward-compat but
+                // log a warning so operators notice legacy strings we
+                // didn't port.
+                warn!(
+                    action = %action,
+                    "on_completion action form not recognized by pipeline executor"
+                );
+            }
+        }
+        if failures.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "pipeline completion validator failed: {}",
+                failures.join(", ")
+            ))
+        }
+    }
+
+    /// Run per-node validators declared in
+    /// [`PipelineContext::validators_by_node`] for `node_id`. Returns
+    /// `Ok(())` when no override is installed for that node OR every
+    /// required validator passes.
+    async fn run_node_validators(&self, node_id: &str) -> Result<(), String> {
+        let ws_ctx = &self.config.workspace_context;
+        let Some(validators) = ws_ctx.validators_by_node.get(node_id) else {
+            return Ok(());
+        };
+        if validators.is_empty() {
+            return Ok(());
+        }
+        // Per-node validators target the completion phase — the node
+        // has finished producing its artifact before we evaluate. A
+        // separate turn-end phase isn't meaningful inside pipeline
+        // execution.
+        let scoped: Vec<WorkspaceValidator> = validators.to_vec();
+        let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+        run_declared_validators(
+            &registry,
+            &self.config.working_dir,
+            &scoped,
+            &format!("pipeline-node-{node_id}"),
+            ValidatorPhase::Completion,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Reserve sub-budget for a single LLM-call node. Returns:
@@ -1747,7 +1903,7 @@ impl PipelineExecutor {
             // during the pipeline lifetime without double-committing.
             drop(node_reservation);
 
-            let outcome = match dispatch? {
+            let mut outcome = match dispatch? {
                 DispatchOutcome::Completed(outcome) => outcome,
                 DispatchOutcome::Skipped { label } => {
                     let duration_ms = node_start.elapsed().as_millis() as u64;
@@ -1813,6 +1969,26 @@ impl PipelineExecutor {
                 output_chars = outcome.content.len(),
                 "node completed"
             );
+
+            // coding-blue FA-7: per-node validators. When the pipeline
+            // context has a `validators_by_node` override for this
+            // node, run it now against the working directory. A
+            // required-validator failure demotes the node outcome to
+            // `Error`, which both records a fail summary and triggers
+            // the existing Error-handling branch below (pipeline stops,
+            // returns success=false).
+            if outcome.status == OutcomeStatus::Pass {
+                if let Err(reason) = self.run_node_validators(&node.id).await {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "per-node validator rejected outcome"
+                    );
+                    outcome.status = OutcomeStatus::Error;
+                    outcome.content =
+                        format!("Pipeline node validator rejected '{}': {reason}", node.id);
+                }
+            }
 
             // Record tokens and feed to status bridge
             total_tokens.input_tokens += outcome.token_usage.input_tokens;

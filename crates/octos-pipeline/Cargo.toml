@@ -20,6 +20,7 @@ futures = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
+glob = { workspace = true }
 
 [lints]
 workspace = true
