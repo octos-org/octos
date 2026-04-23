@@ -4,6 +4,7 @@ use octos_core::{Message, MessageRole};
 use tracing::{info, warn};
 
 use super::Agent;
+use crate::compaction::CompactionPhase;
 
 impl Agent {
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
@@ -74,6 +75,96 @@ impl Agent {
             budget
         );
         true
+    }
+
+    /// Run preflight compaction before the first LLM call if the wired
+    /// policy declares a threshold and the conversation already exceeds it.
+    ///
+    /// No-op when no [`crate::compaction::CompactionRunner`] is attached,
+    /// which preserves legacy extractive behaviour for every existing caller.
+    pub(super) fn maybe_run_preflight_compaction(&self, messages: &mut Vec<Message>) {
+        let Some(runner) = self.compaction_runner.as_ref() else {
+            return;
+        };
+        if runner.needs_preflight(messages).is_none() {
+            return;
+        }
+        let outcome = runner.run(messages, CompactionPhase::Preflight);
+        info!(
+            phase = "preflight",
+            performed = outcome.performed,
+            messages_dropped = outcome.messages_dropped,
+            tool_results_replaced = outcome.tool_results_replaced,
+            tokens_before = outcome.tokens_before,
+            tokens_after = outcome.tokens_after,
+            summarizer = outcome.summarizer_kind,
+            "harness M6.3 compaction preflight fired"
+        );
+        self.enforce_preservation(messages, CompactionPhase::Preflight);
+    }
+
+    /// Run declarative compaction per-iteration (after M0 message prep). Only
+    /// active when a [`crate::compaction::CompactionRunner`] is wired; a
+    /// no-op otherwise so every caller that does not wire the contract keeps
+    /// the existing behaviour byte-for-byte.
+    pub(super) fn maybe_run_turn_compaction(&self, messages: &mut Vec<Message>, iteration: u32) {
+        let Some(runner) = self.compaction_runner.as_ref() else {
+            return;
+        };
+        // Skip the very first iteration when the preflight path already ran
+        // — preflight emits its own events and enforces preservation.
+        if iteration == 1 {
+            return;
+        }
+        let outcome = runner.run(messages, CompactionPhase::TurnEnd);
+        if outcome.performed {
+            info!(
+                phase = "turn_end",
+                iteration,
+                messages_dropped = outcome.messages_dropped,
+                tool_results_replaced = outcome.tool_results_replaced,
+                tokens_before = outcome.tokens_before,
+                tokens_after = outcome.tokens_after,
+                summarizer = outcome.summarizer_kind,
+                "harness M6.3 compaction per-turn pass"
+            );
+            self.enforce_preservation(messages, CompactionPhase::TurnEnd);
+        }
+    }
+
+    /// Run the post-compaction validator rail against the declared
+    /// `preserved_artifacts` + `preserved_invariants`. Failures emit a warning
+    /// so operators can surface a typed block upstream; the current loop does
+    /// not abort mid-turn because M0 guarantees the legacy extractive path
+    /// would have been a no-op for the same inputs.
+    fn enforce_preservation(&self, messages: &[Message], phase: CompactionPhase) {
+        let Some(runner) = self.compaction_runner.as_ref() else {
+            return;
+        };
+        let Some(workspace) = self.compaction_workspace.as_ref() else {
+            return;
+        };
+        match runner.check_preserved(messages, workspace) {
+            Ok(ledger) => {
+                if !ledger.all_preserved() {
+                    let missing: Vec<&str> = ledger.missing.iter().map(|art| art.name()).collect();
+                    warn!(
+                        phase = phase.as_str(),
+                        missing_count = missing.len(),
+                        missing = %missing.join(","),
+                        "harness M6.3 compaction validator: declared artifacts/invariants were dropped"
+                    );
+                    metrics::counter!(
+                        "octos_compaction_preservation_violations_total",
+                        "phase" => phase.as_str().to_string(),
+                    )
+                    .increment(missing.len() as u64);
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "harness M6.3 compaction validator failed");
+            }
+        }
     }
 
     /// Simple truncation fallback when even recent messages exceed budget.

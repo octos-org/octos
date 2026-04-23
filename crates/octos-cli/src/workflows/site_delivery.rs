@@ -65,6 +65,7 @@ pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePo
             ]),
         },
         spawn_tasks: BTreeMap::new(),
+        compaction: None,
     }
 }
 
