@@ -10,12 +10,10 @@
  * ways that don't match a strict U-A-U-A-U-A sequence. This spec now asserts:
  *
  *   1. All 3 user bubbles are present in send-order (with the expected content).
- *   2. Every user bubble eventually gets SOME assistant content (some path).
- *   3. Q2 and Q3 answers are short and distinct from the deep-research answer.
- *   4. No cross-wiring: the deep-research content doesn't appear inside the
- *      quick answers, and vice versa.
- *   5. Quick-turn assistant bubbles (A2/A3) must not carry a task-anchor
- *      spinner — they're one-shot shell echoes, not background tasks.
+ *   2. Every user bubble eventually gets SOME meaningful assistant content.
+ *   3. The deep-research answer names a Rust runtime somewhere in the 3 bubbles.
+ *   4. Quick turns (Q2/Q3) produce their own distinct answers ("2+2=4" / "blue").
+ *   5. At most one assistant bubble carries task-anchor UI (the DR one).
  *
  * Target: OCTOS_TEST_URL (default https://dspfac.crew.ominix.io = mini1).
  */
@@ -66,6 +64,15 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
+    // Fresh session — bloated history on live minis slows deep-research
+    // past the test timeout.
+    const newChat = page.locator(SEL.newChatButton);
+    if (await newChat.isVisible().catch(() => false)) {
+      await newChat.click();
+      await page.waitForSelector(SEL.chatInput);
+      await page.waitForTimeout(1_000);
+    }
+
     const input = page.locator(SEL.chatInput);
     const send = page.locator(SEL.sendButton);
 
@@ -83,10 +90,8 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     );
     expect(sessionId, 'session id must exist').toBeTruthy();
 
-    // Give U1 time to START — either a task-anchor appears in the DOM,
-    // OR the /tasks endpoint shows a running task, OR the cancel button
-    // becomes visible (streaming started). Any of those mean we can safely
-    // interleave without racing the first send.
+    // Wait until U1 has STARTED (cancel button visible OR task-anchor appears
+    // OR /tasks shows running). Any of those = safe to interleave.
     const startDeadline = Date.now() + 60_000;
     let started = false;
     while (Date.now() < startDeadline) {
@@ -127,25 +132,36 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
       timeout: 30_000,
     });
 
-    // Wait until 3 assistant bubbles are present (one per prompt) AND each
-    // has some non-empty text. Deep-research is slowest — allow 12 min.
+    // Wait until 3 assistant bubbles are present AND the cancel button is
+    // gone (everything streamed out) AND each bubble has SUBSTANTIAL text
+    // (> 8 chars, beyond just a timestamp placeholder).
     await expect(page.locator(SEL.assistantMessage)).toHaveCount(3, {
       timeout: 720_000,
     });
 
-    await page.waitForFunction(
-      () => {
-        const bubbles = Array.from(
-          document.querySelectorAll('[data-testid="assistant-message"]'),
-        );
-        if (bubbles.length < 3) return false;
-        return bubbles.every(
-          (b) => ((b as HTMLElement).innerText || '').trim().length > 3,
-        );
-      },
-      undefined,
-      { timeout: 720_000 },
-    );
+    // Stabilize: cancel gone + all 3 bubbles have meaningful content for two
+    // consecutive polls.
+    await expect
+      .poll(
+        async () => {
+          const cancelVisible = await page
+            .locator(SEL.cancelButton)
+            .isVisible()
+            .catch(() => false);
+          if (cancelVisible) return false;
+          const texts = await page
+            .locator(SEL.assistantMessage)
+            .allInnerTexts();
+          if (texts.length < 3) return false;
+          return texts.every((t) => stripTimestamp((t || '').trim()).length > 5);
+        },
+        { timeout: 720_000, intervals: [4_000] },
+      )
+      .toBe(true);
+
+    // Extra margin: one more stability check — sometimes streaming resumes
+    // briefly with a second chunk.
+    await page.waitForTimeout(5_000);
 
     // --- Invariant 1: user bubbles are in send order with U1/U2/U3 content ---
     const userTexts = await page.locator(SEL.userMessage).allInnerTexts();
@@ -154,20 +170,19 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     expect(userTexts[1]).toContain('2+2=4');
     expect(userTexts[2]).toContain('sky is blue');
 
-    // --- Invariant 2: every assistant bubble carries content ---
+    // --- Invariant 2: every assistant bubble carries non-timestamp content ---
     const assistantTexts = await page.locator(SEL.assistantMessage).allInnerTexts();
     for (let i = 0; i < 3; i += 1) {
+      const stripped = stripTimestamp((assistantTexts[i] || '').trim());
       expect(
-        (assistantTexts[i] || '').trim().length,
-        `assistant bubble #${i + 1} must have content`,
+        stripped.length,
+        `assistant bubble #${i + 1} must have content; got: "${(
+          assistantTexts[i] || ''
+        ).slice(0, 160)}"`,
       ).toBeGreaterThan(3);
     }
 
-    // --- Invariant 3: find the deep-research answer somewhere in the 3 ---
-    //
-    // Real UX may or may not render A1 at index 0 — task-anchor buckets +
-    // streaming order can place the deep-research bubble anywhere. Find it
-    // by content (Rust runtime names).
+    // --- Invariant 3: at least one bubble names a Rust runtime ---
     const runtimeRe = /tokio|async-std|smol|glommio|embassy|mio/i;
     const researchIdx = assistantTexts.findIndex((t) => runtimeRe.test(t || ''));
     expect(
@@ -178,33 +193,23 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     ).toBeGreaterThanOrEqual(0);
 
     // --- Invariant 4: no cross-wiring ---
-    //
-    // The deep-research bubble must NOT carry the quick-turn markers
-    // ("sky is blue" / "2+2"), AND the quick-turn bubbles must NOT carry
-    // more than one Rust runtime name (catches accidental re-use of the
-    // deep-research text in a quick answer).
+    // Deep-research bubble must NOT carry Q3's echo text.
     if (researchIdx >= 0) {
       const researchText = (assistantTexts[researchIdx] || '').toLowerCase();
-      // The research bubble may or may not echo the markers verbatim —
-      // deep_search often summarizes. We only guard against the exact quick
-      // echoes appearing inside it.
       expect(
         /sky is blue/i.test(researchText),
         "deep-research bubble shouldn't carry Q3's echo",
       ).toBe(false);
     }
 
-    // Count quick bubbles that match the short-answer signatures.
     const quickAnswers = assistantTexts.filter((_, i) => i !== researchIdx);
     const quickJoined = quickAnswers.join(' ').toLowerCase();
-    // At least one of the two quick bubbles should contain '2+2' / '4'.
     expect(
       quickJoined.includes('4') || /2\s*\+\s*2/.test(quickJoined),
       `one quick bubble should answer Q2 (2+2); got: ${quickAnswers.join(
         ' | ',
       )}`,
     ).toBe(true);
-    // And one should contain 'blue' or 'sky'.
     expect(
       quickJoined.includes('blue') || quickJoined.includes('sky'),
       `one quick bubble should answer Q3 (sky is blue); got: ${quickAnswers.join(
@@ -212,13 +217,7 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
       )}`,
     ).toBe(true);
 
-    // --- Invariant 5: quick-turn bubbles must not carry task-anchor UI ---
-    //
-    // Task-anchor testids were added by PR #42 for long-running tasks only.
-    // We can't reliably know which index is A2 vs A3 in the real UX, so we
-    // scan all assistant bubbles, skip the research one, and assert that at
-    // most one anchor exists across all assistant bubbles (belonging to the
-    // deep-research turn).
+    // --- Invariant 5: at most one assistant bubble carries task-anchor UI ---
     const anchorCounts = await page.evaluate(() => {
       const bubbles = Array.from(
         document.querySelectorAll('[data-testid="assistant-message"]'),
@@ -230,8 +229,6 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
       );
     });
     const totalAnchors = anchorCounts.reduce((sum, c) => sum + c, 0);
-    // At most one assistant bubble should carry anchor UI (the deep-research
-    // one). If zero, the system streamed inline — also fine.
     expect(
       anchorCounts.filter((c) => c > 0).length,
       `at most 1 assistant bubble may carry task-anchor UI; per-bubble counts: ${JSON.stringify(
@@ -246,3 +243,15 @@ test.describe('coding-blue mixed long-running + one-shot ordering (live mini1)',
     );
   });
 });
+
+/**
+ * Strip trailing/leading ISO timestamps and "Thinking..." placeholders so
+ * the remaining text represents real assistant content.
+ */
+function stripTimestamp(s: string): string {
+  return s
+    .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g, '')
+    .replace(/Thinking\s*\(iteration\s+\d+\)/gi, '')
+    .replace(/^\s*[.,]+\s*$/gm, '')
+    .trim();
+}

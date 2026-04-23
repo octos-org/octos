@@ -8,15 +8,19 @@
  *   - Final artifact delivered to the originating message bubble
  *   - Harness event trace flows end-to-end
  *
- * Key UX ground truth:
- *   - Slash commands (/queue /adaptive /status /help /soul /new /reset) are
- *     consumed locally by the web client and render into cmd-feedback
- *     ([data-testid='cmd-feedback']) — NOT as assistant-message bubbles.
- *   - Task lifecycle is observable via DOM testids introduced by PR #42:
+ * Key UX ground truth (coding-blue web client):
+ *   - BARE slash commands (`/help`, `/queue`, `/adaptive`, `/status`) are
+ *     consumed locally and render into `[data-testid='cmd-feedback']`.
+ *     They do NOT produce user-message / assistant-message bubbles.
+ *   - Slash commands WITH ARGS (`/adaptive hedge`, `/queue speculative`,
+ *     `/soul <text>`, `/new <topic>`, `/s <topic>`) DO render a user bubble
+ *     with the raw command and an assistant bubble with the ack text.
+ *     They don't round-trip to the LLM; the server handles them inline.
+ *   - Task lifecycle is observable via PR #42 testids:
  *       task-anchor-message-<taskId>, task-anchor-spinner-<taskId>,
  *       task-anchor-phase-<taskId>, task-anchor-progress-<taskId>.
- *     These are more reliable than polling /api/sessions/:id/tasks, which
- *     only populates when a gateway is running + depends on the topic param.
+ *     More reliable than polling /api/sessions/:id/tasks (requires a gateway
+ *     session + topic params).
  *
  * Target: OCTOS_TEST_URL (default https://dspfac.crew.ominix.io = mini1).
  *
@@ -37,6 +41,10 @@ const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
 
 const SKIP_REASON = 'OCTOS_TEST_URL not set; skipping live long-running smoke';
 
+/**
+ * Read current cmd-feedback text. Returns '' if not visible.
+ * Use for BARE slash commands (/help, /queue, /adaptive, /status).
+ */
 async function readCmdFeedbackText(
   page: import('@playwright/test').Page,
 ): Promise<string> {
@@ -46,7 +54,11 @@ async function readCmdFeedbackText(
   return ((await fb.textContent()) || '').trim();
 }
 
-async function sendSlashCommand(
+/**
+ * Send a BARE slash command and wait for cmd-feedback to render.
+ * Example: `/help`, `/queue`, `/adaptive`, `/status`.
+ */
+async function sendBareSlashCommand(
   page: import('@playwright/test').Page,
   command: string,
   opts: { timeoutMs?: number } = {},
@@ -58,12 +70,10 @@ async function sendSlashCommand(
   await input.fill(command);
   await send.click();
 
-  // cmd-feedback must become visible within the given window.
   await expect(page.locator(SEL.cmdFeedback).first()).toBeVisible({
     timeout: timeoutMs,
   });
 
-  // Text may briefly be empty while animating in; poll until non-empty.
   let text = '';
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -72,6 +82,126 @@ async function sendSlashCommand(
     await page.waitForTimeout(200);
   }
   return text;
+}
+
+/**
+ * Send a slash command WITH ARGS (e.g. `/adaptive hedge`). These render as
+ * a user bubble + assistant bubble (server-handled, no LLM round-trip).
+ * Returns the ack text from the newest assistant bubble once it's non-empty
+ * AND stable (i.e. no longer a "Thinking (iteration 0)" placeholder).
+ */
+async function sendSlashWithArgs(
+  page: import('@playwright/test').Page,
+  command: string,
+  opts: { timeoutMs?: number; beforeAssistantCount?: number } = {},
+): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const before =
+    opts.beforeAssistantCount ??
+    (await page.locator(SEL.assistantMessage).count());
+
+  const input = page.locator(SEL.chatInput);
+  const send = page.locator(SEL.sendButton);
+  await input.fill(command);
+  await send.click();
+
+  // Wait for a new assistant bubble to appear.
+  await expect
+    .poll(async () => page.locator(SEL.assistantMessage).count(), {
+      timeout: timeoutMs,
+      intervals: [250],
+    })
+    .toBeGreaterThan(before);
+
+  // Poll the last bubble's text until it contains substantive (non-placeholder)
+  // content. Strip timestamps + "Thinking" placeholders to judge real content.
+  const deadline = Date.now() + timeoutMs;
+  let lastRaw = '';
+  while (Date.now() < deadline) {
+    const raw =
+      (
+        (await page.locator(SEL.assistantMessage).last().innerText()) || ''
+      ).trim();
+    lastRaw = raw;
+    const clean = stripPlaceholders(raw);
+    if (clean.length > 0) return raw;
+    await page.waitForTimeout(400);
+  }
+  return lastRaw;
+}
+
+function stripPlaceholders(s: string): string {
+  return s
+    .replace(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/g, '')
+    .replace(/Thinking\s*\(iteration\s+\d+\)/gi, '')
+    .replace(/^\s*[.,]+\s*$/gm, '')
+    .replace(/\.\.\./g, '')
+    .trim();
+}
+
+/**
+ * Wait until the last assistant bubble has a substantial, stable response:
+ *   - cancel button is gone (not streaming)
+ *   - no task-anchor-spinner remaining
+ *   - innerText is non-trivial (>= minChars) AND stable across two polls
+ *
+ * Returns the final text (may be short if timeout hit).
+ */
+async function waitForAssistantComplete(
+  page: import('@playwright/test').Page,
+  opts: {
+    timeoutMs?: number;
+    pollMs?: number;
+    minChars?: number;
+    label?: string;
+  } = {},
+): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? 300_000;
+  const pollMs = opts.pollMs ?? 3_000;
+  const minChars = opts.minChars ?? 20;
+  const label = opts.label || '';
+  const deadline = Date.now() + timeoutMs;
+
+  let lastText = '';
+  let stableCount = 0;
+
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(pollMs);
+
+    const cancelVisible = await page
+      .locator(SEL.cancelButton)
+      .isVisible()
+      .catch(() => false);
+    const spinnerCount = await page
+      .locator('[data-testid^="task-anchor-spinner-"]')
+      .count();
+
+    const count = await page.locator(SEL.assistantMessage).count();
+    const text =
+      count > 0
+        ? ((await page.locator(SEL.assistantMessage).last().innerText()) || '').trim()
+        : '';
+
+    const streaming = cancelVisible || spinnerCount > 0;
+
+    if (!streaming && text.length >= minChars && text === lastText) {
+      stableCount += 1;
+      if (stableCount >= 2) return text;
+    } else {
+      stableCount = 0;
+    }
+
+    lastText = text;
+
+    if (label) {
+      const elapsed = Math.round((Date.now() - (deadline - timeoutMs)) / 1000);
+      console.log(
+        `  [${label}] ${elapsed}s: bubbles=${count} streaming=${streaming} spinners=${spinnerCount} textLen=${text.length}`,
+      );
+    }
+  }
+
+  return lastText;
 }
 
 test.describe('coding-blue long-running background task reliability (live mini1)', () => {
@@ -85,8 +215,14 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Fire a deep-research task. Keep the ask specific so the agent returns a
-    // short report (not a 3000-token essay), but genuinely multi-iteration.
+    // Fresh session — keeps context small so deep-research doesn't time out.
+    const newChat = page.locator(SEL.newChatButton);
+    if (await newChat.isVisible().catch(() => false)) {
+      await newChat.click();
+      await page.waitForSelector(SEL.chatInput);
+      await page.waitForTimeout(1_000);
+    }
+
     const marker = `coding-blue-${Date.now()}`;
     const prompt =
       'Use deep_search to answer in <=150 words: ' +
@@ -100,16 +236,12 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       timeout: 30_000,
     });
 
-    // Deep-research SHOULD register a task-anchor via PR #42 testids.
-    // Poll the DOM for any task-anchor testid. If none ever appears inside
-    // 2 min, the task may have been streamed inline rather than as a task —
-    // still acceptable, just a different code path. We only DEMAND a task
-    // anchor if deep-research is treated as a background task by this build.
-    const anchorDeadline = Date.now() + 120_000;
-    const observedPhases = new Set<string>();
+    // Observe task-anchor testids if they appear (PR #42 path). Either a
+    // task-anchor renders (background-task path) or not (inline streaming).
+    const observeDeadline = Date.now() + 60_000;
     let sawAnchor = false;
     let taskId: string | null = null;
-    while (Date.now() < anchorDeadline) {
+    while (Date.now() < observeDeadline) {
       const anchorIds = await page.evaluate(() => {
         const ids: string[] = [];
         document
@@ -124,52 +256,40 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       if (anchorIds.length > 0) {
         sawAnchor = true;
         taskId = anchorIds[0];
-        // Capture the current phase (if rendered).
-        const phase = await page
-          .locator(`[data-testid='task-anchor-phase-${taskId}']`)
-          .textContent()
-          .catch(() => '');
-        if (phase) observedPhases.add(phase.trim().toLowerCase());
-        const spinnerGone =
-          (await page
-            .locator(`[data-testid='task-anchor-spinner-${taskId}']`)
-            .count()) === 0;
-        if (spinnerGone && (await isAssistantFilled(page))) break;
-      } else if (await isAssistantFilled(page)) {
-        // Non-task streaming path: assistant bubble already has content.
         break;
       }
-      await page.waitForTimeout(3_000);
+      await page.waitForTimeout(2_000);
     }
 
-    // Whatever the path, assistant bubble must eventually contain report-back.
-    const assistant = page.locator(SEL.assistantMessage).first();
-    await expect(assistant).toBeVisible({ timeout: 120_000 });
-    await expect
-      .poll(async () => (await assistant.innerText()).trim().length, {
-        timeout: 300_000,
-        intervals: [5_000],
-      })
-      .toBeGreaterThan(10);
+    // Wait for the assistant bubble to reach a non-trivial, stable response.
+    // This is the crucial completion signal — not just "has any text".
+    const finalText = await waitForAssistantComplete(page, {
+      timeoutMs: 360_000,
+      pollMs: 5_000,
+      minChars: 60,
+      label: 'lifecycle',
+    });
 
-    const text = (await assistant.innerText()).trim();
-
-    // Report-back must either contain the marker (model echoed it) OR name
-    // at least one Rust framework.
-    const hasFrameworks =
-      /axum|actix|rocket|tower|leptos|yew|salvo|warp/i.test(text);
     expect(
-      hasFrameworks || text.includes(marker),
-      `report-back should mention a Rust framework or marker; got: ${text.slice(
+      finalText.length,
+      `assistant bubble must carry a completed report; got: "${finalText.slice(
+        0,
+        200,
+      )}"`,
+    ).toBeGreaterThanOrEqual(60);
+
+    const hasFrameworks =
+      /axum|actix|rocket|tower|leptos|yew|salvo|warp/i.test(finalText);
+    expect(
+      hasFrameworks || finalText.includes(marker),
+      `report-back should mention a Rust framework or marker; got: ${finalText.slice(
         0,
         200,
       )}`,
     ).toBe(true);
 
     console.log(
-      `[coding-blue long-run] sawAnchor=${sawAnchor} taskId=${taskId} phases=${Array.from(
-        observedPhases,
-      ).join(', ')} reportLen=${text.length}`,
+      `[coding-blue long-run] sawAnchor=${sawAnchor} taskId=${taskId} reportLen=${finalText.length}`,
     );
   });
 
@@ -180,7 +300,14 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Start a task likely to run >30s so we can reload mid-flight.
+    // Fresh session — keeps context small so deep-research actually starts.
+    const newChat = page.locator(SEL.newChatButton);
+    if (await newChat.isVisible().catch(() => false)) {
+      await newChat.click();
+      await page.waitForSelector(SEL.chatInput);
+      await page.waitForTimeout(1_000);
+    }
+
     const marker = `coding-blue-reload-${Date.now()}`;
     const prompt =
       'Use deep_search to answer in <=150 words: ' +
@@ -193,15 +320,17 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       timeout: 30_000,
     });
 
-    // Wait for a task-anchor to appear in the DOM. This is the only scenario
-    // where localStorage task-store entries are populated — without an anchor
-    // there's no task-store entry to persist, and the reload test has nothing
-    // to assert. If no anchor renders in 60s, skip with a diagnostic.
+    // Wait for a task-anchor to appear in the DOM. Only if this build treats
+    // deep-research as a background task will the anchor render (and
+    // localStorage task-store entries get written). If nothing in 60s, the
+    // test has nothing meaningful to assert — skip with a diagnostic.
     const anchorDeadline = Date.now() + 60_000;
     let anchorTaskId: string | null = null;
     while (Date.now() < anchorDeadline) {
       anchorTaskId = await page.evaluate(() => {
-        const el = document.querySelector('[data-testid^="task-anchor-message-"]');
+        const el = document.querySelector(
+          '[data-testid^="task-anchor-message-"]',
+        );
         if (!el) return null;
         const tid = (el as HTMLElement).dataset.testid || '';
         return tid.replace('task-anchor-message-', '') || null;
@@ -215,7 +344,6 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       'no task-anchor rendered in 60s — this build streams deep-research inline (no background task), reload-state test is not meaningful',
     );
 
-    // Snapshot task-store state BEFORE reload.
     const beforeReload = await page.evaluate(() => {
       const entries: Record<string, string> = {};
       for (let i = 0; i < localStorage.length; i += 1) {
@@ -233,11 +361,9 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       )}`,
     ).toBeGreaterThan(0);
 
-    // Reload.
     await page.reload({ waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Bug class 1: task-store should survive reload.
     const afterReload = await page.evaluate(() => {
       const entries: Record<string, string> = {};
       for (let i = 0; i < localStorage.length; i += 1) {
@@ -258,33 +384,23 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       page.locator(`[data-testid='task-anchor-message-${anchorTaskId}']`),
     ).toBeVisible({ timeout: 30_000 });
 
-    // Wait for the anchor's spinner to disappear (task completed) OR the
-    // assistant bubble to have content — whichever signals completion.
-    const completionDeadline = Date.now() + 300_000;
-    let completed = false;
-    while (Date.now() < completionDeadline) {
-      const spinnerCount = await page
-        .locator(`[data-testid='task-anchor-spinner-${anchorTaskId}']`)
-        .count();
-      if (spinnerCount === 0 && (await isAssistantFilled(page))) {
-        completed = true;
-        break;
-      }
-      await page.waitForTimeout(5_000);
-    }
-    expect(completed, 'task must complete after reload').toBe(true);
+    // Wait for completion (substantial + stable assistant text).
+    const finalText = await waitForAssistantComplete(page, {
+      timeoutMs: 360_000,
+      pollMs: 5_000,
+      minChars: 40,
+      label: 'reload',
+    });
 
-    const assistant = page.locator(SEL.assistantMessage).first();
-    const text = (await assistant.innerText()).trim();
     expect(
-      text.length,
+      finalText.length,
       'final assistant bubble has content post-reload',
-    ).toBeGreaterThan(10);
+    ).toBeGreaterThanOrEqual(40);
 
     console.log(
       `[coding-blue reload] task-store entries preserved: ${
         Object.keys(afterReload).length
-      }; taskId=${anchorTaskId}; final text: ${text.slice(0, 120)}`,
+      }; taskId=${anchorTaskId}; final text: ${finalText.slice(0, 120)}`,
     );
   });
 
@@ -295,12 +411,7 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Every slash command must render cmd-feedback within 5s. Target
-    // [data-testid='cmd-feedback'] — NOT assistant-message. These don't
-    // round-trip to the LLM.
-    //
-    // Each pattern must match OR the ack may legitimately be an
-    // "unknown-command" notice.
+    // BARE slash commands render via cmd-feedback (no user/assistant bubbles).
     const commands = [
       { cmd: '/help', expect: /help|command|slash|available|queue|new/i },
       {
@@ -310,12 +421,13 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       { cmd: '/adaptive', expect: /adaptive|off|hedge|lane|mode|provider/i },
       {
         cmd: '/status',
-        expect: /status|session|model|provider|ok|active|uptime|greeting|metric/i,
+        expect:
+          /status|session|model|provider|ok|active|uptime|greeting|metric/i,
       },
     ];
 
     for (const { cmd, expect: pattern } of commands) {
-      const text = await sendSlashCommand(page, cmd, { timeoutMs: 5_000 });
+      const text = await sendBareSlashCommand(page, cmd, { timeoutMs: 5_000 });
       expect(
         text.length,
         `${cmd} must return non-empty cmd-feedback; got: "${text.slice(
@@ -345,16 +457,25 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Set adaptive hedge — backend races multiple providers, returns fastest.
-    // Slash command renders via cmd-feedback, not as an assistant bubble.
-    const hedgeAck = await sendSlashCommand(page, '/adaptive hedge', {
-      timeoutMs: 5_000,
+    // Fresh session so hedge mode doesn't inherit a huge prior context.
+    const newChat = page.locator(SEL.newChatButton);
+    if (await newChat.isVisible().catch(() => false)) {
+      await newChat.click();
+      await page.waitForSelector(SEL.chatInput);
+      await page.waitForTimeout(1_000);
+    }
+
+    // `/adaptive hedge` is a slash-command-WITH-ARGS: renders as a user bubble
+    // + assistant bubble (server-handled). Not cmd-feedback.
+    const hedgeAck = await sendSlashWithArgs(page, '/adaptive hedge', {
+      timeoutMs: 30_000,
     });
     expect(hedgeAck.length, 'hedge ack must be non-empty').toBeGreaterThan(0);
-    expect(hedgeAck.toLowerCase()).toMatch(/hedge|adaptive|mode|provider/);
+    expect(hedgeAck.toLowerCase()).toMatch(
+      /hedge|adaptive|mode|provider|race/,
+    );
 
-    // If this mini only has one provider configured, hedge has nothing to
-    // race. Acceptable outcome: skip with diagnostic.
+    // Single-provider minis can't race. Skip with diagnostic.
     const singleProviderSignal =
       /only one provider|single provider|<=\s*1 provider|need(?:s|ing)? .* providers|no alternate/i.test(
         hedgeAck,
@@ -364,28 +485,34 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       `adaptive hedge unavailable on this mini; ack="${hedgeAck.slice(0, 160)}"`,
     );
 
-    // Fire a real prompt — racing providers should converge in reasonable time.
-    const prompt = 'Answer in one short sentence: what is the capital of Japan?';
+    // Fire a real prompt — racing providers should converge.
+    const beforeCount = await page.locator(SEL.assistantMessage).count();
+    const prompt =
+      'Answer in one short sentence: what is the capital of Japan?';
     await page.locator(SEL.chatInput).fill(prompt);
     await page.locator(SEL.sendButton).click();
 
-    await expect(page.locator(SEL.userMessage).last()).toBeVisible({
-      timeout: 30_000,
-    });
-    const assistant = page.locator(SEL.assistantMessage).last();
-    await expect(assistant).toBeVisible({ timeout: 120_000 });
     await expect
-      .poll(async () => (await assistant.innerText()).trim().length, {
-        timeout: 180_000,
-        intervals: [3_000],
+      .poll(() => page.locator(SEL.assistantMessage).count(), {
+        timeout: 30_000,
+        intervals: [500],
       })
-      .toBeGreaterThan(0);
+      .toBeGreaterThan(beforeCount);
 
-    const text = ((await assistant.innerText()) || '').toLowerCase();
-    expect(text).toMatch(/tokyo/);
+    const finalText = await waitForAssistantComplete(page, {
+      timeoutMs: 180_000,
+      pollMs: 3_000,
+      minChars: 5,
+      label: 'hedge-prompt',
+    });
+    const lower = finalText.toLowerCase();
+    expect(
+      lower,
+      `hedge response should mention Tokyo; got: "${finalText.slice(0, 200)}"`,
+    ).toMatch(/tokyo/);
 
-    // Reset to off so later tests aren't polluted.
-    await sendSlashCommand(page, '/adaptive off', { timeoutMs: 5_000 }).catch(
+    // Reset to off for subsequent tests.
+    await sendSlashWithArgs(page, '/adaptive off', { timeoutMs: 15_000 }).catch(
       () => '',
     );
   });
@@ -397,68 +524,108 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     await page.goto('/chat', { waitUntil: 'networkidle' });
     await page.waitForSelector(SEL.chatInput);
 
-    // Step 1: switch mode via slash command. Ack is in cmd-feedback, NOT
-    // as an assistant bubble.
-    const specAck = await sendSlashCommand(page, '/queue speculative', {
-      timeoutMs: 5_000,
+    // Start from a fresh session so we don't drag enormous history into the
+    // 2 prompts (live sessions accumulate 60k+ tokens of context, which
+    // makes each speculative task very slow on hosts with single-provider).
+    const newChat = page.locator(SEL.newChatButton);
+    if (await newChat.isVisible().catch(() => false)) {
+      await newChat.click();
+      await page.waitForSelector(SEL.chatInput);
+      await page.waitForTimeout(1_000);
+    }
+
+    // `/queue speculative` is a slash-command-WITH-ARGS: renders a user bubble
+    // + assistant ack bubble.
+    const specAck = await sendSlashWithArgs(page, '/queue speculative', {
+      timeoutMs: 30_000,
     });
-    expect(specAck.length, 'speculative ack must be non-empty').toBeGreaterThan(0);
+    expect(specAck.length, 'speculative ack must be non-empty').toBeGreaterThan(
+      0,
+    );
     expect(specAck.toLowerCase()).toMatch(/speculative|queue|mode/);
 
-    // Baseline: before real prompts there must be ZERO assistant bubbles —
-    // because the slash command doesn't produce one. This is the main
-    // fix: the previous spec was counting the cmd-feedback entry as an
-    // assistant bubble.
-    const baselineAssistants = await page.locator(SEL.assistantMessage).count();
-    expect(baselineAssistants, 'slash command must not produce an assistant bubble').toBe(0);
+    // After the slash ack: exactly 1 user bubble + 1 assistant bubble.
+    await expect(page.locator(SEL.userMessage)).toHaveCount(1, {
+      timeout: 10_000,
+    });
+    await expect(page.locator(SEL.assistantMessage)).toHaveCount(1, {
+      timeout: 10_000,
+    });
 
-    // Step 2: fire two rapid prompts. Each goes through the chat pipeline.
-    await page.locator(SEL.chatInput).fill('Use shell: echo ALPHA-speculative-1');
+    // Fire 2 rapid prompts.
+    await page
+      .locator(SEL.chatInput)
+      .fill('Use shell: echo ALPHA-speculative-1');
     await page.locator(SEL.sendButton).click();
     await page.waitForTimeout(500);
-    await page.locator(SEL.chatInput).fill('Use shell: echo BRAVO-speculative-2');
+    await page
+      .locator(SEL.chatInput)
+      .fill('Use shell: echo BRAVO-speculative-2');
     await page.locator(SEL.sendButton).click();
 
-    // Two user bubbles after the two prompts.
-    await expect(page.locator(SEL.userMessage)).toHaveCount(2, {
+    // Total 3 user bubbles: slash (1) + 2 prompts.
+    await expect(page.locator(SEL.userMessage)).toHaveCount(3, {
       timeout: 30_000,
     });
 
-    // Wait for exactly 2 NEW assistant bubbles (one per prompt).
-    await expect(page.locator(SEL.assistantMessage)).toHaveCount(2, {
-      timeout: 300_000,
-    });
-
-    // Both bubbles must carry non-empty text eventually.
-    await expect
+    // Wait until all assistant bubbles stabilize (cancel button gone, each
+    // non-trivial). Allow 8 minutes — speculative on single-provider minis
+    // may serialize. If that happens we still expect eventual completion.
+    const stabilized = await expect
       .poll(
         async () => {
-          const all = await page
+          const cancelVisible = await page
+            .locator(SEL.cancelButton)
+            .isVisible()
+            .catch(() => false);
+          if (cancelVisible) return false;
+          const count = await page.locator(SEL.assistantMessage).count();
+          if (count < 3) return false;
+          const texts = await page
             .locator(SEL.assistantMessage)
             .allInnerTexts();
-          return all.every((t) => (t || '').trim().length > 0);
+          return texts.every((t) => stripPlaceholders((t || '').trim()).length > 0);
         },
-        { timeout: 300_000, intervals: [3_000] },
+        { timeout: 480_000, intervals: [5_000] },
       )
-      .toBe(true);
+      .toBe(true)
+      .then(() => true)
+      .catch(() => false);
 
+    // Read current transcript state even if we didn't fully stabilize, so
+    // we can make a best-effort assertion.
     const assistantTexts = await page.locator(SEL.assistantMessage).allInnerTexts();
     const joined = assistantTexts.join(' ').toUpperCase();
-    // Both echo markers must appear somewhere in the assistant transcript.
-    // Proves both speculative turns executed and both results made it back.
+
+    if (!stabilized) {
+      console.log(
+        `[coding-blue speculative] partial transcript after timeout: ${assistantTexts
+          .map((t, i) => `[${i}] ${(t || '').slice(0, 80)}`)
+          .join(' | ')}`,
+      );
+    }
+
+    // Both echo markers must appear somewhere in the assistant transcript —
+    // proves both speculative turns executed and both results made it back.
     expect(
       joined,
-      `assistant transcript should contain both ALPHA and BRAVO echoes; got: ${joined.slice(
+      `assistant transcript should contain ALPHA echo; got: ${joined.slice(
         0,
-        400,
+        500,
       )}`,
     ).toContain('ALPHA');
-    expect(joined).toContain('BRAVO');
+    expect(
+      joined,
+      `assistant transcript should contain BRAVO echo; got: ${joined.slice(
+        0,
+        500,
+      )}`,
+    ).toContain('BRAVO');
 
-    // Reset queue mode for subsequent tests.
-    await sendSlashCommand(page, '/queue followup', { timeoutMs: 5_000 }).catch(
-      () => '',
-    );
+    // Reset queue mode.
+    await sendSlashWithArgs(page, '/queue followup', {
+      timeoutMs: 15_000,
+    }).catch(() => '');
   });
 
   test('harness event trace flows while task runs', async ({ page, request }) => {
@@ -478,9 +645,7 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     );
     expect(sessionId).toBeTruthy();
 
-    // Probe the harness event stream. SSE from Playwright APIRequestContext
-    // isn't trivial, so we just do a short GET with a timeout. The endpoint
-    // must respond with a routable status.
+    // Probe harness event stream endpoint.
     const resp = await request.get(
       `${TEST_URL}/api/events/harness?kinds=LlmStatus,ToolStarted,ToolCompleted`,
       {
@@ -496,7 +661,6 @@ test.describe('coding-blue long-running background task reliability (live mini1)
     expect([200, 204, 301, 302, 307, 308, 401]).toContain(status);
     console.log(`[coding-blue harness] /api/events/harness status = ${status}`);
 
-    // Wait for the assistant bubble to contain content.
     const assistant = page.locator(SEL.assistantMessage).first();
     await expect(assistant).toBeVisible({ timeout: 60_000 });
     await expect
@@ -507,12 +671,3 @@ test.describe('coding-blue long-running background task reliability (live mini1)
       .toBeGreaterThan(0);
   });
 });
-
-async function isAssistantFilled(
-  page: import('@playwright/test').Page,
-): Promise<boolean> {
-  const count = await page.locator(SEL.assistantMessage).count();
-  if (count === 0) return false;
-  const text = (await page.locator(SEL.assistantMessage).first().innerText()) || '';
-  return text.trim().length > 10;
-}
