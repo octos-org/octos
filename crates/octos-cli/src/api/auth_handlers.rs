@@ -2180,12 +2180,8 @@ mod tests {
             broadcaster: Arc::new(crate::api::SseBroadcaster::new(8)),
             started_at: chrono::Utc::now(),
             auth_token: Some("bootstrap-token".into()),
-            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(
-                dir.path(),
-            )),
-            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(
-                dir.path(),
-            )),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: Some(profile_store.clone()),
             process_manager: None,
