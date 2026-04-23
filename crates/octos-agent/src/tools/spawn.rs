@@ -1677,25 +1677,86 @@ impl Tool for SpawnTool {
                 }
             }
 
+            // Review A F-004: for the agent_mcp dispatch path the child
+            // session runs inside the remote backend and never touches the
+            // parent's ValidatorRunner. Before, the parent trusted the
+            // remote `SUCCESS` label — if the remote skipped its own
+            // contract-gate, the parent happily forwarded a non-validated
+            // artifact. Running the declared completion-phase validators
+            // here, against the parent's workspace root, restores the
+            // invariant: any required validator failure demotes the
+            // response to a typed failure before it leaves the tool.
+            let mut mcp_success = success;
+            let mut mcp_output_override: Option<String> = None;
+            if mcp_success {
+                if let Ok(Some(policy)) =
+                    crate::workspace_policy::read_workspace_policy(&self.working_dir)
+                {
+                    if !policy.validation.validators.is_empty() {
+                        let registry_for_validators =
+                            ToolRegistry::with_builtins(&self.working_dir);
+                        if let Err(reason) = crate::workspace_contract::run_declared_validators(
+                            &registry_for_validators,
+                            &self.working_dir,
+                            &policy.validation.validators,
+                            "spawn-agent-mcp",
+                            crate::validators::ValidatorPhase::Completion,
+                        )
+                        .await
+                        {
+                            mcp_success = false;
+                            mcp_output_override = Some(format!(
+                                "Status: FAILED\nremote_agent_mcp: completion validator rejected child artifact: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+
             return Ok(ToolResult {
-                output: if success {
-                    format!("Status: SUCCESS\n\n{}", response.output)
+                output: mcp_output_override.unwrap_or_else(|| {
+                    if mcp_success {
+                        format!("Status: SUCCESS\n\n{}", response.output)
+                    } else {
+                        format!(
+                            "Status: FAILED\n{}",
+                            response
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| response.output.clone())
+                        )
+                    }
+                }),
+                success: mcp_success,
+                files_to_send: if mcp_success {
+                    files_to_send
                 } else {
-                    format!(
-                        "Status: FAILED\n{}",
-                        response
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| response.output.clone())
-                    )
+                    Vec::new()
                 },
-                success,
-                files_to_send,
                 ..Default::default()
             });
         }
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
+
+        // Review A F-004: snapshot the parent workspace policy once so both the
+        // sync and async spawn branches propagate the same typed
+        // compaction / validator contracts to child sessions. Without this,
+        // the child Agent silently runs without preflight compaction even
+        // when the parent's workspace_policy.toml declares one.
+        let parent_workspace_policy =
+            match crate::workspace_policy::read_workspace_policy(&self.working_dir) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    warn!(
+                        working_dir = %self.working_dir.display(),
+                        error = %error,
+                        "spawn: failed to read parent workspace policy; \
+                         child will run without propagated compaction/validator contracts"
+                    );
+                    None
+                }
+            };
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
@@ -1722,10 +1783,37 @@ impl Tool for SpawnTool {
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
             }
-            let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
+            let mut worker = Agent::new(worker_id, sub_llm.clone(), tools, self.memory.clone());
+            // Keep an Arc handle to the child's tool registry so we can run
+            // declared validators against it after `run_task` returns.
+            let child_tools_handle = worker.tool_registry().clone();
             if let Some(ref config) = self.worker_config {
                 worker = worker.with_config(config.clone());
             }
+
+            // Review A F-004: propagate the parent's declarative compaction
+            // policy onto the child Agent so the child honours the same token
+            // budget and preserved-artifact contract the parent committed to.
+            if let Some(ref policy) = parent_workspace_policy {
+                if let Some(compaction_policy) = policy.compaction.clone() {
+                    let runner = match compaction_policy.summarizer {
+                        crate::workspace_policy::CompactionSummarizerKind::LlmIterative => {
+                            crate::compaction::CompactionRunner::with_provider(
+                                compaction_policy,
+                                sub_llm.clone(),
+                            )
+                        }
+                        crate::workspace_policy::CompactionSummarizerKind::Extractive => {
+                            crate::compaction::CompactionRunner::new(compaction_policy)
+                        }
+                    }
+                    .with_workspace_policy(policy);
+                    worker = worker
+                        .with_compaction_runner(Arc::new(runner))
+                        .with_compaction_workspace(policy.clone());
+                }
+            }
+
             // Base prompt: configured worker prompt, or compiled-in default.
             // Additional instructions are appended, never replacing the base.
             let base_prompt = self
@@ -1751,12 +1839,44 @@ impl Tool for SpawnTool {
 
             let result = worker.run_task(&subtask).await;
             match result {
-                Ok(r) => Ok(ToolResult {
-                    output: r.output,
-                    success: r.success,
-                    tokens_used: Some(r.token_usage),
-                    ..Default::default()
-                }),
+                Ok(r) => {
+                    // Review A F-004: run declared completion-phase validators
+                    // against the child's artifacts before surfacing success.
+                    // Matches `enforce_spawn_task_contract`'s gating for
+                    // spawn-only tools and closes the "vacuous pass" hole in
+                    // `contract_failure_summary` (which only reads the ledger).
+                    let mut output = r.output;
+                    let mut success = r.success;
+                    if success {
+                        if let Some(ref policy) = parent_workspace_policy {
+                            if !policy.validation.validators.is_empty() {
+                                match crate::workspace_contract::run_declared_validators(
+                                    child_tools_handle.as_ref(),
+                                    &self.working_dir,
+                                    &policy.validation.validators,
+                                    "spawn",
+                                    crate::validators::ValidatorPhase::Completion,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {}
+                                    Err(reason) => {
+                                        success = false;
+                                        output = format!(
+                                            "Subagent failed: contract validator rejected child artifact: {reason}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(ToolResult {
+                        output,
+                        success,
+                        tokens_used: Some(r.token_usage),
+                        ..Default::default()
+                    })
+                }
                 Err(e) => Ok(ToolResult {
                     output: format!("Subagent failed: {e}"),
                     success: false,
@@ -1808,6 +1928,10 @@ impl Tool for SpawnTool {
             let parent_session_key = self.session_key.clone();
             let worker_hooks = self.hooks.clone();
             let hook_context_template = self.hook_context_template.clone();
+            // Review A F-004: carry the parent workspace policy into the
+            // background child task so the detached child inherits the same
+            // compaction + validator contracts the sync spawn path honours.
+            let child_workspace_policy = parent_workspace_policy.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -1907,7 +2031,14 @@ impl Tool for SpawnTool {
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
                 }
+                // Review A F-004: clone the child LLM provider before the
+                // Agent takes ownership so it can also back an LLM-iterative
+                // compaction summarizer if the parent policy requests one.
+                let child_llm_for_compaction = llm.clone();
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
+                // Keep an Arc to the child's tool registry for the
+                // post-`run_task` validator invocation below.
+                let child_tools_handle = worker.tool_registry().clone();
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
@@ -1925,6 +2056,32 @@ impl Tool for SpawnTool {
                 }) {
                     worker = worker.with_hook_context(ctx);
                 }
+
+                // Review A F-004: propagate the parent's declarative
+                // compaction policy onto the background child. The detached
+                // child would otherwise silently run without preflight
+                // compaction even when the parent's workspace_policy.toml
+                // declares one, undermining the contract the parent honours.
+                if let Some(ref policy) = child_workspace_policy {
+                    if let Some(compaction_policy) = policy.compaction.clone() {
+                        let runner = match compaction_policy.summarizer {
+                            crate::workspace_policy::CompactionSummarizerKind::LlmIterative => {
+                                crate::compaction::CompactionRunner::with_provider(
+                                    compaction_policy,
+                                    child_llm_for_compaction,
+                                )
+                            }
+                            crate::workspace_policy::CompactionSummarizerKind::Extractive => {
+                                crate::compaction::CompactionRunner::new(compaction_policy)
+                            }
+                        }
+                        .with_workspace_policy(policy);
+                        worker = worker
+                            .with_compaction_runner(Arc::new(runner))
+                            .with_compaction_workspace(policy.clone());
+                    }
+                }
+
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
@@ -1957,16 +2114,46 @@ impl Tool for SpawnTool {
                     )
                     .await;
                 }
-                let mut contract_failure = match &result {
-                    Ok(task_result) if task_result.success => resolve_background_terminal_files(
-                        &working_dir,
-                        &task_result.files_to_send,
-                        &task_result.files_modified,
-                        workflow_metadata.as_ref(),
-                    )
-                    .err(),
-                    _ => None,
-                };
+
+                // Review A F-004: actively run declared completion-phase
+                // validators before the existing ledger-read checks. The
+                // pre-fix path relied on `resolve_background_terminal_files`
+                // + ledger inspection, which trivially passed when the child
+                // never ran validators (the ledger was empty). Running the
+                // validators here guarantees the required rail is exercised
+                // before any downstream gate consults the ledger.
+                let mut contract_failure: Option<String> = None;
+                if let (Ok(task_result), Some(policy)) =
+                    (result.as_ref(), child_workspace_policy.as_ref())
+                {
+                    if task_result.success && !policy.validation.validators.is_empty() {
+                        if let Err(reason) = crate::workspace_contract::run_declared_validators(
+                            child_tools_handle.as_ref(),
+                            &working_dir,
+                            &policy.validation.validators,
+                            "spawn",
+                            crate::validators::ValidatorPhase::Completion,
+                        )
+                        .await
+                        {
+                            contract_failure = Some(reason);
+                        }
+                    }
+                }
+                if contract_failure.is_none() {
+                    contract_failure = match &result {
+                        Ok(task_result) if task_result.success => {
+                            resolve_background_terminal_files(
+                                &working_dir,
+                                &task_result.files_to_send,
+                                &task_result.files_modified,
+                                workflow_metadata.as_ref(),
+                            )
+                            .err()
+                        }
+                        _ => None,
+                    };
+                }
                 let mut terminal_files = match (&result, contract_failure.as_ref()) {
                     (Ok(task_result), None) if task_result.success => {
                         resolve_background_terminal_files(
