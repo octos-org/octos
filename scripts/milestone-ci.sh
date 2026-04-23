@@ -13,6 +13,7 @@ Usage: ./scripts/milestone-ci.sh <suite>
 
 Canonical milestone CI suites:
   dashboard               dashboard install/typecheck/build + embedded asset freshness
+  swarm-app               swarm-app install/typecheck/build/test + embedded asset freshness
   hosted-fast             fmt + clippy + workspace test + milestone regressions
   workspace-all-features  workspace/all-features build + test compilation + tests
   release-bundle          release binary + skill crate build
@@ -34,6 +35,22 @@ run_dashboard() {
   if [ -n "$(git status --porcelain -- crates/octos-cli/static/admin)" ]; then
     echo "Embedded dashboard assets are out of date. Run ./scripts/build-dashboard.sh and commit changes."
     git status --short -- crates/octos-cli/static/admin
+    exit 1
+  fi
+}
+
+run_swarm_app() {
+  pushd swarm-app >/dev/null
+  npm ci
+  npm run typecheck
+  npm run build
+  npx vitest run
+  popd >/dev/null
+
+  ./scripts/build-swarm-app.sh
+  if [ -n "$(git status --porcelain -- crates/octos-cli/static/swarm)" ]; then
+    echo "Embedded swarm-app assets are out of date. Run ./scripts/build-swarm-app.sh and commit changes."
+    git status --short -- crates/octos-cli/static/swarm
     exit 1
   fi
 }
@@ -67,6 +84,9 @@ SUITE="${1:-}"
 case "$SUITE" in
   dashboard)
     run_dashboard
+    ;;
+  swarm-app)
+    run_swarm_app
     ;;
   hosted-fast)
     run_hosted_fast

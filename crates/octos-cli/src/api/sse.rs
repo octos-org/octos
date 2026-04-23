@@ -19,6 +19,16 @@ impl SseBroadcaster {
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }
+
+    /// Send a raw pre-encoded JSON frame. Used by typed endpoints
+    /// (M7.6 swarm review decision) that construct the SSE body
+    /// directly instead of routing through a [`ProgressEvent`].
+    /// Returns the number of receivers the frame reached (0 when no
+    /// subscribers are connected — the send silently drops, matching
+    /// the `report` impl).
+    pub(crate) fn tx_send(&self, payload: String) -> usize {
+        self.tx.send(payload).unwrap_or(0)
+    }
 }
 
 impl ProgressReporter for SseBroadcaster {

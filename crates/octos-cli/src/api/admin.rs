@@ -4084,6 +4084,7 @@ mod register_tenant_email_tests {
             deployment_mode: DeploymentMode::Cloud,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         })
     }
 
@@ -4238,6 +4239,7 @@ mod register_flow_tests {
             deployment_mode: mode,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         });
         (state, user_store)
     }

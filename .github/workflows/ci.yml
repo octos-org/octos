@@ -47,6 +47,42 @@ jobs:
             exit 1
           fi
 
+  swarm-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: swarm-app/package-lock.json
+
+      - name: Install swarm-app deps
+        working-directory: swarm-app
+        run: npm ci
+
+      - name: Swarm-app typecheck
+        working-directory: swarm-app
+        run: npm run typecheck
+
+      - name: Swarm-app build
+        working-directory: swarm-app
+        run: npm run build
+
+      - name: Swarm-app unit tests
+        working-directory: swarm-app
+        run: npx vitest run
+
+      - name: Verify embedded swarm-app assets are up to date
+        run: |
+          ./scripts/build-swarm-app.sh
+          if [ -n "$(git status --porcelain -- crates/octos-cli/static/swarm)" ]; then
+            echo "Embedded swarm-app assets are out of date. Run ./scripts/build-swarm-app.sh and commit changes."
+            git status --short -- crates/octos-cli/static/swarm
+            exit 1
+          fi
+
   typos:
     runs-on: ubuntu-latest
     steps:

@@ -457,6 +457,10 @@ impl ServeCommand {
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
             )),
+            // Swarm wiring is opt-in — populated when the serve command
+            // is given an MCP backend factory. Handlers return 503 when
+            // `None`. See `crates/octos-cli/src/api/swarm.rs`.
+            swarm_state: None,
         });
 
         // Auto-start enabled profiles

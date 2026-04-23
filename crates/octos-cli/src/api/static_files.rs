@@ -17,8 +17,9 @@ struct Assets;
 /// The admin dashboard SPA handles all UI routes (login, profiles, users, etc.).
 ///
 /// The React SPA uses `basename="/admin"`, so all UI paths must start with `/admin/`.
-/// Non-admin paths that don't match a real asset are redirected to `/admin/` so that
-/// React Router can handle them properly.
+/// The swarm-app SPA uses `basename="/swarm"` and is served from the parallel
+/// `/swarm/` mount for the M7.6 PM+supervisor orchestrator. Non-matching
+/// paths are redirected to `/admin/` so that React Router can handle them.
 pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
@@ -38,9 +39,21 @@ pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Re
             .into_response();
     }
 
-    // Serve exact embedded asset (e.g. admin/assets/index-xxx.js)
+    // Serve exact embedded asset (e.g. admin/assets/index-xxx.js or
+    // swarm/assets/index-xxx.js).
     if let Some(file) = Assets::get(path) {
         return serve_file(path, &file.data);
+    }
+
+    // Swarm-app SPA: under /swarm/* with its own asset tree.
+    if path.starts_with("swarm") {
+        let swarm_path = format!("swarm/{}", path.trim_start_matches("swarm/"));
+        if let Some(file) = Assets::get(&swarm_path) {
+            return serve_file(&swarm_path, &file.data);
+        }
+        if let Some(file) = Assets::get("swarm/index.html") {
+            return serve_file("swarm/index.html", &file.data);
+        }
     }
 
     // Try under admin/ prefix (e.g. /assets/foo.js → admin/assets/foo.js)

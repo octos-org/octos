@@ -17,6 +17,7 @@ octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 octos-bus = { workspace = true }
 octos-pipeline = { workspace = true }
+octos-swarm = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -90,3 +91,5 @@ workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+tower = { workspace = true }
+axum = { workspace = true }

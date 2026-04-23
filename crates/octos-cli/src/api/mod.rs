@@ -12,12 +12,19 @@ pub mod purge;
 mod router;
 mod sse;
 mod static_files;
+pub mod swarm;
 pub mod user_admin;
 pub mod webhook_proxy;
 
 pub use metrics::init_metrics;
 pub use router::build_router;
 pub use sse::SseBroadcaster;
+pub use swarm::{
+    CostAttributionView, CostAttributionsResponse, DispatchIndexRow, SubtaskView, SwarmBudgetSpec,
+    SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest, SwarmDispatchResponse,
+    SwarmDispatchesResponse, SwarmReviewRequest, SwarmReviewResponse, SwarmState, TestStubBackend,
+    ValidatorView, build_swarm_state, build_test_swarm_state, parallel_topology,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -138,11 +145,15 @@ pub struct AppState {
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
     pub content_catalog_mgr: Option<Arc<ContentCatalogManager>>,
+    /// Shared swarm state for the M7.6 contract-authoring dashboard.
+    /// `None` when swarm wiring is not configured — handlers return
+    /// `503 Service Unavailable` in that case.
+    pub swarm_state: Option<Arc<swarm::SwarmState>>,
 }
 
-#[cfg(test)]
 impl AppState {
-    /// Empty `AppState` for unit tests — every store/service is `None`.
+    /// Empty `AppState` for unit and integration tests — every
+    /// store/service is `None`.
     ///
     /// Override individual fields with struct-update syntax:
     ///
@@ -152,7 +163,7 @@ impl AppState {
     ///     ..AppState::empty_for_tests()
     /// };
     /// ```
-    pub(crate) fn empty_for_tests() -> Self {
+    pub fn empty_for_tests() -> Self {
         let tmp =
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
@@ -183,6 +194,7 @@ impl AppState {
             deployment_mode: crate::config::DeploymentMode::Local,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         }
     }
 }
