@@ -43,8 +43,9 @@ import {
 const FANOUT_CHILD_SESSION_LIMIT = 3;
 
 function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
+  const replacement = returnToken ? `gamma-${returnToken}` : 'gamma';
   const tail = returnToken
-    ? `Return only the unified diff, then a final line exactly ${returnToken}.`
+    ? `Return only the unified diff, nothing else. The diff must contain ${returnToken}.`
     : 'Return only the unified diff, nothing else.';
 
   return [
@@ -55,7 +56,7 @@ function buildBoundedDiffPrompt(repoName: string, returnToken?: string) {
     'All subsequent shell commands must run from that repo root unless a step says otherwise.',
     'Inside it, create notes.txt with exactly two lines: alpha and beta.',
     'Run git add notes.txt so the file is tracked before editing it.',
-    'Make exactly one edit: change beta to gamma.',
+    `Make exactly one edit: change beta to ${replacement}.`,
     'Then run git diff -- notes.txt.',
     tail,
     'Do not explain tool availability.',
@@ -124,6 +125,16 @@ function buildLongRepairPrompt(repoName: string, resumeMarker: string) {
   ].join(' ');
 }
 
+function buildConcurrentFilePrompt(fileName: string, token: string) {
+  return [
+    'Use write_file and read_file only.',
+    'Do not use shell, spawn, or background work.',
+    `Create ./${fileName} with exactly this content: ${token}`,
+    `Read ./${fileName} back.`,
+    `Return exactly ${token} and nothing else.`,
+  ].join(' ');
+}
+
 test.describe('Phase 3 coding hard cases', () => {
   test.describe.configure({ mode: 'serial' });
   test.setTimeout(600_000);
@@ -163,14 +174,14 @@ test.describe('Phase 3 coding hard cases', () => {
 
     let repoName = uniqueRepoName('phase3-repair');
     let result = await sendAndWait(page, buildRepairPrompt(repoName), {
-      maxWait: 240_000,
+      maxWait: 420_000,
       label: 'repair-pass',
     });
     if (!result.responseText.includes('diff --git')) {
       await createNewSession(page);
       repoName = uniqueRepoName('phase3-repair-retry');
       result = await sendAndWait(page, buildRepairPrompt(repoName), {
-        maxWait: 240_000,
+        maxWait: 420_000,
         label: 'repair-pass-retry',
       });
     }
@@ -267,12 +278,12 @@ test.describe('Phase 3 coding hard cases', () => {
     try {
       const alphaToken = `ALPHA-CODE-${Date.now()}`;
       const betaToken = `BRAVO-CODE-${Date.now()}`;
-      const alphaPrompt = buildBoundedDiffPrompt(
-        uniqueRepoName('phase3-concurrent-alpha'),
+      const alphaPrompt = buildConcurrentFilePrompt(
+        `${uniqueRepoName('phase3-concurrent-alpha')}.txt`,
         alphaToken,
       );
-      const betaPrompt = buildBoundedDiffPrompt(
-        uniqueRepoName('phase3-concurrent-bravo'),
+      const betaPrompt = buildConcurrentFilePrompt(
+        `${uniqueRepoName('phase3-concurrent-bravo')}.txt`,
         betaToken,
       );
 

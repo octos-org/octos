@@ -21,6 +21,7 @@ pub fn build_output_dir_for_template(template: &str) -> &'static str {
 pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePolicy {
     let build_output_dir = build_output_dir_for_template_kind(template);
     WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
         workspace: WorkspacePolicyWorkspace {
             kind: WorkspacePolicyKind::Sites,
         },
@@ -52,6 +53,7 @@ pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePo
             ],
             on_source_change: Vec::new(),
             on_completion: vec![format!("file_exists:{build_output_dir}/index.html")],
+            validators: Vec::new(),
         },
         artifacts: WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([
@@ -63,6 +65,7 @@ pub fn workspace_policy_for_template_kind(template: SiteTemplate) -> WorkspacePo
             ]),
         },
         spawn_tasks: BTreeMap::new(),
+        compaction: None,
     }
 }
 

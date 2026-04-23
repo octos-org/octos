@@ -84,13 +84,15 @@ case "$SUITE" in
     run_suite "crew-core" "$CREW_URL" \
       tests/live-browser.spec.ts \
       tests/session-recovery.spec.ts \
+      tests/session-list-regression.spec.ts \
       tests/web-client.spec.ts
     ;;
   bot-runtime)
     ensure_deps
     run_suite "bot-runtime" "$BOT_URL" \
       tests/runtime-regression.spec.ts \
-      tests/tool-use-regression.spec.ts
+      tests/tool-use-regression.spec.ts \
+      tests/background-task-header-switching.spec.ts
     ;;
   ocean-deliverables)
     ensure_deps

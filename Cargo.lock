@@ -2353,6 +2353,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-starter-audio"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-coding"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-generic"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "harness-starter-report"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "octos-agent",
+ "octos-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3551,6 +3604,7 @@ dependencies = [
  "octos-core",
  "octos-llm",
  "octos-memory",
+ "redb",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -3686,7 +3740,9 @@ dependencies = [
  "chrono",
  "eyre",
  "futures",
+ "metrics",
  "octos-core",
+ "redb",
  "reqwest 0.12.28",
  "secrecy 0.10.3",
  "serde",
@@ -3742,9 +3798,13 @@ name = "octos-plugin"
 version = "0.1.1"
 dependencies = [
  "eyre",
+ "metrics",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-test",
  "tracing",
  "which 7.0.3",
 ]
@@ -3757,6 +3817,25 @@ dependencies = [
  "eyre",
  "rappct",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "octos-swarm"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "eyre",
+ "metrics",
+ "octos-agent",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

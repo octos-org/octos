@@ -9,6 +9,13 @@
       "name": "deep_search",
       "description": "Perform deep multi-round web research on a topic. Searches from multiple angles (follow-up queries, time-qualified, controversy), fetches all pages in parallel, chases most-referenced external sources, and produces a structured research report saved to disk. The report file path is printed at the end of the output.",
       "entrypoint": "target/release/deep-search",
+      "env": [
+        "SERPER_API_KEY",
+        "TAVILY_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "BRAVE_API_KEY",
+        "YDC_API_KEY"
+      ],
       "input_schema": {
         "type": "object",
         "properties": {

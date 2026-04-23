@@ -868,4 +868,17 @@ mod tests {
         let result = tool.execute(&serde_json::json!({})).await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn provider_keys_keep_first_party_search_credentials_available() {
+        let tool = WebSearchTool::new().with_provider_keys(HashMap::from([(
+            "tavily".to_string(),
+            "tvly-configured-key".to_string(),
+        )]));
+
+        assert_eq!(
+            tool.provider_key("tavily", "TAVILY_API_KEY").as_deref(),
+            Some("tvly-configured-key")
+        );
+    }
 }

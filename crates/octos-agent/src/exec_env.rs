@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use eyre::Result;
 
-use crate::sandbox::BLOCKED_ENV_VARS;
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 
 /// Filter out dangerous environment variables (code injection vectors).
 fn sanitize_env(env: &HashMap<String, String>) -> HashMap<String, String> {
+    let allowlist = EnvAllowlist::empty();
     env.iter()
-        .filter(|(k, _)| !BLOCKED_ENV_VARS.contains(&k.as_str()))
+        .filter(|(k, _)| should_forward_env_name(k, &allowlist))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -88,20 +89,20 @@ impl ExecEnvironment for LocalEnvironment {
         let safe_env = sanitize_env(env);
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), {
             #[cfg(windows)]
-            let fut = tokio::process::Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .current_dir(working_dir)
-                .envs(&safe_env)
-                .output();
+            let mut cmd = {
+                let mut cmd = tokio::process::Command::new("cmd");
+                cmd.arg("/C").arg(command);
+                cmd
+            };
             #[cfg(not(windows))]
-            let fut = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(working_dir)
-                .envs(&safe_env)
-                .output();
-            fut
+            let mut cmd = {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c").arg(command);
+                cmd
+            };
+            cmd.current_dir(working_dir);
+            sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+            cmd.envs(&safe_env).output()
         })
         .await;
 
@@ -370,6 +371,8 @@ mod tests {
         env.insert("PATH".into(), "/usr/bin".into());
         env.insert("LD_PRELOAD".into(), "/evil.so".into());
         env.insert("DYLD_INSERT_LIBRARIES".into(), "/evil.dylib".into());
+        env.insert("OPENAI_API_KEY".into(), "sk-secret".into());
+        env.insert("SMTP_PASSWORD".into(), "pw-secret".into());
         env.insert("MY_VAR".into(), "safe".into());
 
         let filtered = sanitize_env(&env);
@@ -377,6 +380,8 @@ mod tests {
         assert!(filtered.contains_key("MY_VAR"));
         assert!(!filtered.contains_key("LD_PRELOAD"));
         assert!(!filtered.contains_key("DYLD_INSERT_LIBRARIES"));
+        assert!(!filtered.contains_key("OPENAI_API_KEY"));
+        assert!(!filtered.contains_key("SMTP_PASSWORD"));
     }
 
     #[test]

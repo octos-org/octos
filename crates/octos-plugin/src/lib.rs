@@ -29,11 +29,17 @@
 
 pub mod discovery;
 pub mod gating;
+pub mod lifecycle;
 pub mod manifest;
 pub mod types;
 
 // Re-export primary types for convenience.
 pub use discovery::{PluginSource, discover_plugins};
 pub use gating::{GateCheck, GatingResult, check_requirements};
+pub use lifecycle::{
+    BLOCKED_ENV_VARS, HardwareLifecycle, LifecycleExecutor, LifecyclePhase, LifecycleStep,
+    NoSandbox, PhaseResult, SafePolicyDenial, Sandbox, StepKillReason, StepOutcome, StepResult,
+    is_safe_shell_command,
+};
 pub use manifest::{InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition};
 pub use types::{DiscoveredPlugin, PluginOrigin, PluginStatus};

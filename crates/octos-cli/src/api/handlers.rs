@@ -464,6 +464,15 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+fn is_internal_api_session_id(id: &str) -> bool {
+    id.split_once('#')
+        .is_some_and(|(_, topic)| is_internal_session_topic(topic))
+}
+
+fn is_internal_session_topic(topic: &str) -> bool {
+    topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
+}
+
 pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -473,6 +482,9 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
         let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
         all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
             let chat_id = id.strip_prefix(&prefix)?;
+            if is_internal_api_session_id(chat_id) {
+                return None;
+            }
             Some(SessionInfo {
                 id: chat_id.to_string(),
                 message_count: count,
@@ -489,11 +501,9 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
                     // Merge, dedup by id (standalone wins)
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
-                    all.extend(
-                        gateway_sessions
-                            .into_iter()
-                            .filter(|s| !existing.contains(&s.id)),
-                    );
+                    all.extend(gateway_sessions.into_iter().filter(|s| {
+                        !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
+                    }));
                 }
             }
         }
@@ -2985,6 +2995,88 @@ mod tests {
         assert_eq!(params.offset, 10);
         assert_eq!(params.since_seq, Some(3));
         assert_eq!(params.topic.as_deref(), Some("slides demo"));
+    }
+
+    #[test]
+    fn internal_api_session_ids_are_hidden_from_session_list() {
+        assert!(is_internal_api_session_id("web-123#child-task-1"));
+        assert!(is_internal_api_session_id("web-123#default.tasks"));
+        assert!(is_internal_api_session_id("web-123#research.tasks"));
+        assert!(!is_internal_api_session_id("web-123#research"));
+        assert!(!is_internal_api_session_id("web-123"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_hides_internal_runtime_sessions_from_standalone_store() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let parent = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-123");
+        let child = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-123", "child-1");
+        let task_ledger =
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-123", "default.tasks");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&parent, Message::user("parent"))
+                .await
+                .unwrap();
+            sess.add_message(&child, Message::user("child"))
+                .await
+                .unwrap();
+            sess.add_message(&task_ledger, Message::user("task ledger"))
+                .await
+                .unwrap();
+        }
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = list_sessions(State(state), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["web-123"]);
+    }
+
+    #[tokio::test]
+    async fn delete_session_accepts_listed_topic_session_id_from_standalone_store() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let topic_key =
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web-topic", "research");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&topic_key, Message::user("topic"))
+                .await
+                .unwrap();
+            assert!(sess.load(&topic_key).await.is_some());
+        }
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = delete_session(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("web-topic#research".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let fresh = octos_bus::SessionManager::open(data_dir.path()).unwrap();
+        assert!(fresh.load(&topic_key).await.is_none());
     }
 
     #[test]

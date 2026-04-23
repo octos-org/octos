@@ -1,0 +1,35 @@
+# Workspace policy fixture — M4.6 v1 shape for session workspaces (voice /
+# podcast path). Exercises the spawn_tasks contract as well.
+schema_version = 1
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = ["tmp/**", ".DS_Store"]
+
+[artifacts]
+primary_audio = "*.mp3"
+podcast_audio = "**/podcast_full_*.*"
+
+[spawn_tasks.fm_tts]
+artifact = "primary_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:1024",
+]
+on_failure = ["notify_user:TTS generation failed"]
+
+[spawn_tasks.podcast_generate]
+artifact = "podcast_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:4096",
+]
+on_failure = ["notify_user:Podcast generation failed"]

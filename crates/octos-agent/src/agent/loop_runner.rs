@@ -12,10 +12,14 @@ use octos_memory::{Episode, EpisodeOutcome};
 use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
+use super::budget::BudgetStop;
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
+use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
+use crate::harness_errors::HarnessError;
+use crate::harness_events::write_event_to_sink;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::session::SessionLimits;
@@ -47,6 +51,185 @@ struct ShellRetryRecovery {
 }
 
 impl Agent {
+    /// Classify a raw error escaping the agent loop into a `HarnessError`,
+    /// increment the `octos_loop_error_total{variant, recovery}` counter, and
+    /// emit a structured error event via the local harness event sink (if
+    /// one is attached). Returns the classified error so the caller can log
+    /// it or convert it into an `eyre::Report` for the caller's contract.
+    ///
+    /// Invariant (#488): every raw `eyre::Report` that would otherwise bubble
+    /// out of the agent loop must be routed through this classifier.
+    pub(crate) fn classify_loop_error(
+        &self,
+        report: &eyre::Report,
+        tool_name: Option<&str>,
+    ) -> HarnessError {
+        let classified = HarnessError::classify_report(report, tool_name);
+        classified.record_metric();
+
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = classified.to_event(
+                session_id, task_id, /* workflow */ None, /* phase */ None,
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write harness error event to sink");
+            }
+        }
+
+        tracing::warn!(
+            variant = classified.variant_name(),
+            recovery = %classified.recovery_hint(),
+            error = %report,
+            "harness error classified"
+        );
+        classified
+    }
+
+    fn harness_error_context(&self) -> (String, String) {
+        // The agent loop itself does not own a task_id — those are assigned
+        // per-spawn in `task_supervisor`. Use the registered sink context
+        // (written by `HarnessEventSink::new`) when available; fall back to
+        // stable placeholders so the event still validates.
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            if let Some(ctx) = crate::harness_events::lookup_event_sink_context(sink) {
+                return (ctx.session_id, ctx.task_id);
+            }
+        }
+        let session_id = self
+            .hook_ctx()
+            .and_then(|ctx| ctx.session_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        (session_id, "agent".to_string())
+    }
+
+    /// Shell-spiral dispatch (M6.2, issue #489). Routes the existing shell
+    /// retry recovery through the [`LoopRetryState`] state machine so
+    /// operators see one coherent retry ledger and the spiral bucket is
+    /// bounded. Returns the recovered shell output when the detector finds a
+    /// stable response, or `None` when no spiral is in progress.
+    ///
+    /// Behavior preserved from the pre-M6.2 free-standing
+    /// `recover_shell_retry` call site: identical detection input produces
+    /// identical content bytes — the only new side effects are
+    ///   1. an increment on `octos_loop_retry_total{variant="shell_spiral",decision="escalate"}`, and
+    ///   2. a `HarnessEventPayload::Retry` event written to the harness sink.
+    pub(crate) fn dispatch_shell_retry_recovery(
+        &self,
+        messages: &[Message],
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> Option<String> {
+        let recovery = recover_shell_retry(messages, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+        let decision = retry_state.observe_shell_spiral();
+        tracing::warn!(
+            recovery_kind = ?recovery.kind,
+            decision = %decision,
+            "shell spiral detected; routing through LoopRetryState"
+        );
+
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                SHELL_SPIRAL_VARIANT,
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write shell-spiral retry event");
+            }
+        }
+        Some(recovery.content)
+    }
+
+    /// Classify an error escaping the loop and drive it through the
+    /// [`LoopRetryState`] state machine (M6.2). Returns the bucketed
+    /// [`LoopDecision`] for the caller to act on. Also emits a typed
+    /// `HarnessEventPayload::Retry` event to the harness sink.
+    ///
+    /// This does NOT replace [`Self::classify_loop_error`]: the error event
+    /// still gets emitted, metrics still update, and the caller still owns
+    /// the decision of whether to return `Err(report)` after the state
+    /// machine has been driven.
+    #[allow(dead_code)]
+    pub(crate) fn dispatch_loop_error(
+        &self,
+        error: &HarnessError,
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> LoopDecision {
+        let decision = retry_state.observe(error);
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                error.variant_name(),
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write harness retry event");
+            }
+        }
+        decision
+    }
+
+    /// Budget grace-call dispatch (M6.2). When the loop hits a hard iteration
+    /// or token budget, this asks the retry state machine whether to grant
+    /// one free iteration past budget. Only `MaxIterations` and `MaxTokens`
+    /// stops are eligible — `Shutdown`, `ActivityTimeout`, and
+    /// `IdleProgressTimeout` are always hard stops so stalled loops and
+    /// operator shutdowns terminate immediately.
+    ///
+    /// Returns `true` iff a grace call was granted; the caller should skip
+    /// its budget-stop return path and proceed with one more iteration.
+    pub(super) fn try_budget_grace_call(
+        &self,
+        stop: &BudgetStop,
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+    ) -> bool {
+        if !matches!(
+            stop,
+            BudgetStop::MaxIterations | BudgetStop::MaxTokens { .. }
+        ) {
+            return false;
+        }
+        let decision = retry_state.observe_budget_exhaustion();
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = retry_state.emit_event(
+                "budget_exhaustion",
+                decision,
+                session_id,
+                task_id,
+                /* workflow */ None,
+                /* phase */ None,
+                Some(iteration),
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write budget-grace retry event");
+            }
+        }
+        match decision {
+            LoopDecision::Grace => {
+                tracing::warn!(
+                    iteration,
+                    "budget exhausted; granting one grace call via LoopRetryState"
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn enforce_session_limits_on_tool_calls(
         &self,
         response: &ChatResponse,
@@ -197,16 +380,13 @@ impl Agent {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
 
+                // Build the system prompt via the shared helper in
+                // execution.rs so conversation + task loops compose the same
+                // prompt. This is where realtime sensor summary gets appended
+                // once per turn (bounded by `sensor_budget_tokens`).
                 let mut messages = vec![Message {
                     role: MessageRole::System,
-                    content: self
-                        .system_prompt
-                        .read()
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("system prompt lock was poisoned, recovering");
-                            e.into_inner()
-                        })
-                        .clone(),
+                    content: super::execution::compose_system_prompt(self),
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: None,
@@ -249,25 +429,41 @@ impl Agent {
                 let mut files_modified = Vec::new();
                 let mut files_to_send = Vec::new();
                 let mut turn = LoopTurnState::new(Instant::now());
+                // M6.2: per-turn retry-bucket state machine. Lives alongside
+                // `LoopTurnState` rather than inside it so the file boundary
+                // from issue #489 stays exact.
+                let mut retry_state = LoopRetryState::new();
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
-                        turn.record_budget_stop(&stop);
-                        // Skip system prompt + history; return only new messages
-                        return Ok(ConversationResponse {
-                            content: stop.message(),
-                            reasoning_content: None,
-                            provider_metadata: None,
-                            token_usage: turn.total_usage().clone(),
-                            files_modified,
-                            files_to_send,
-                            streamed: false,
-                            messages: LoopTurnState::new_messages(&messages, history.len()),
-                        });
+                        let stop_iteration = turn.iteration();
+                        if !self.try_budget_grace_call(
+                            &stop,
+                            &mut retry_state,
+                            stop_iteration,
+                        ) {
+                            turn.record_budget_stop(&stop);
+                            // Skip system prompt + history; return only new messages
+                            return Ok(ConversationResponse {
+                                content: stop.message(),
+                                reasoning_content: None,
+                                provider_metadata: None,
+                                token_usage: turn.total_usage().clone(),
+                                files_modified,
+                                files_to_send,
+                                streamed: false,
+                                messages: LoopTurnState::new_messages(&messages, history.len()),
+                            });
+                        }
                     }
 
                     let iteration = turn.advance_iteration();
+                    // Realtime heartbeat: beat first, then abort the iteration
+                    // with a typed error if the controller reports stalled.
+                    // A None controller / disabled config is a no-op so the
+                    // 830+ existing tests see identical behavior.
+                    self.beat_heartbeat(iteration)?;
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -283,7 +479,18 @@ impl Agent {
                     }
 
                     let tools_spec = self.tools.specs();
+                    // Harness M6.3: run preflight compaction before the first
+                    // LLM call when a compaction policy is wired and the
+                    // context already exceeds the declared threshold.
+                    if iteration == 1 {
+                        self.maybe_run_preflight_compaction(&mut messages);
+                    }
                     prepare_conversation_messages(self, &mut messages, &mut turn);
+                    // Harness M6.3: post-prep compaction pass so the declarative
+                    // runner sees the final shape of the conversation (after
+                    // tool-pair repair + system-message normalization). This
+                    // also feeds the validator rail on subsequent iterations.
+                    self.maybe_run_turn_compaction(&mut messages, iteration);
                     let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
@@ -323,17 +530,28 @@ impl Agent {
                                 message: "Switching provider...".to_string(),
                                 iteration,
                             });
-                            self.call_llm_with_hooks(
-                                &messages,
-                                &tools_spec,
-                                &config,
-                                iteration,
-                                &total_usage,
-                                &mut turn,
-                            )
-                            .await?
+                            match self
+                                .call_llm_with_hooks(
+                                    &messages,
+                                    &tools_spec,
+                                    &config,
+                                    iteration,
+                                    &total_usage,
+                                    &mut turn,
+                                )
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let _ = self.classify_loop_error(&e, None);
+                                    return Err(e);
+                                }
+                            }
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            let _ = self.classify_loop_error(&e, None);
+                            return Err(e);
+                        }
                     };
                     Self::normalize_inline_invokes(&mut response);
                     self.reporter().report(ProgressEvent::Response {
@@ -391,17 +609,20 @@ impl Agent {
                                 if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
                                 {
                                     warn!("loop detected — breaking agent loop");
-                                    if let Some(recovery) = recover_shell_retry(
-                                        &messages,
-                                        SHELL_RETRY_RECOVERY_THRESHOLD,
-                                    ) {
+                                    let spiral_iteration = turn.iteration();
+                                    if let Some(recovered_content) = self
+                                        .dispatch_shell_retry_recovery(
+                                            &messages,
+                                            &mut retry_state,
+                                            spiral_iteration,
+                                        )
+                                    {
                                         warn!(
-                                            recovery_kind = ?recovery.kind,
                                             "loop detected after repeated shell attempts; returning recovered shell output"
                                         );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
-                                            content: recovery.content,
+                                            content: recovered_content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -431,27 +652,34 @@ impl Agent {
                                     });
                                 }
                             }
-                            self.handle_tool_use(
-                                &response,
-                                &mut messages,
-                                &mut files_modified,
-                                Some(&mut files_to_send),
-                                &mut turn,
-                                tracker,
-                            )
-                            .await?;
+                            if let Err(e) = self
+                                .handle_tool_use(
+                                    &response,
+                                    &mut messages,
+                                    &mut files_modified,
+                                    Some(&mut files_to_send),
+                                    &mut turn,
+                                    &mut retry_state,
+                                    tracker,
+                                )
+                                .await
+                            {
+                                let _ = self.classify_loop_error(&e, None);
+                                return Err(e);
+                            }
 
-                            if let Some(recovery) = recover_shell_retry(
+                            let spiral_iteration = turn.iteration();
+                            if let Some(recovered_content) = self.dispatch_shell_retry_recovery(
                                 &messages,
-                                SHELL_RETRY_RECOVERY_THRESHOLD,
+                                &mut retry_state,
+                                spiral_iteration,
                             ) {
                                 warn!(
-                                    recovery_kind = ?recovery.kind,
                                     "ending turn after repeated shell attempts with recovered shell output"
                                 );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
-                                    content: recovery.content,
+                                    content: recovered_content,
                                     reasoning_content: None,
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(
@@ -574,24 +802,39 @@ impl Agent {
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            // M6.2: per-run retry-bucket state machine. Same instance lives
+            // across all iterations of the task loop so bucket counters
+            // accumulate the way operators expect.
+            let mut retry_state = LoopRetryState::new();
             let config = self.chat_config();
 
             loop {
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
-                    turn.record_budget_stop(&stop);
-                    self.report_budget_stop(&stop, turn.iteration());
-                    return Ok(TaskResult {
-                        success: false,
-                        output: stop.message(),
-                        files_modified,
-                        files_to_send,
-                        subtasks: Vec::new(),
-                        token_usage: turn.total_usage().clone(),
-                    });
+                    let stop_iteration = turn.iteration();
+                    if !self.try_budget_grace_call(
+                        &stop,
+                        &mut retry_state,
+                        stop_iteration,
+                    ) {
+                        turn.record_budget_stop(&stop);
+                        self.report_budget_stop(&stop, stop_iteration);
+                        return Ok(TaskResult {
+                            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
+                            success: false,
+                            output: stop.message(),
+                            files_modified,
+                            files_to_send,
+                            subtasks: Vec::new(),
+                            token_usage: turn.total_usage().clone(),
+                        });
+                    }
                 }
 
                 let iteration = turn.advance_iteration();
                 let iter_start = Instant::now();
+                // Realtime heartbeat beat + stall check (no-op when realtime
+                // is disabled or unattached).
+                self.beat_heartbeat(iteration)?;
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
@@ -609,7 +852,7 @@ impl Agent {
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
-                let (mut response, _streamed) = self
+                let (mut response, _streamed) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -618,7 +861,14 @@ impl Agent {
                         &total_usage,
                         &mut turn,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = self.classify_loop_error(&e, None);
+                        return Err(e);
+                    }
+                };
                 Self::normalize_inline_invokes(&mut response);
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
@@ -712,15 +962,21 @@ impl Agent {
                         ));
                     }
                     StopReason::ToolUse => {
-                        self.handle_tool_use(
-                            &response,
-                            &mut messages,
-                            &mut files_modified,
-                            Some(&mut files_to_send),
-                            &mut turn,
-                            None,
-                        )
-                        .await?;
+                        if let Err(e) = self
+                            .handle_tool_use(
+                                &response,
+                                &mut messages,
+                                &mut files_modified,
+                                Some(&mut files_to_send),
+                                &mut turn,
+                                &mut retry_state,
+                                None,
+                            )
+                            .await
+                        {
+                            let _ = self.classify_loop_error(&e, None);
+                            return Err(e);
+                        }
                     }
                     StopReason::MaxTokens => {
                         self.emit_cost_update(turn.total_usage(), &response.usage);
@@ -772,6 +1028,7 @@ impl Agent {
     ) -> TaskResult {
         let success = response.stop_reason != StopReason::MaxTokens;
         TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
             output: response.content.clone().unwrap_or_default(),
             files_modified,
@@ -786,6 +1043,7 @@ impl Agent {
     }
 
     /// Execute tool calls from an LLM response and accumulate results.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tool_use(
         &self,
         response: &ChatResponse,
@@ -793,6 +1051,7 @@ impl Agent {
         files_modified: &mut Vec<PathBuf>,
         files_to_send: Option<&mut Vec<PathBuf>>,
         turn: &mut LoopTurnState,
+        retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
@@ -871,12 +1130,25 @@ impl Agent {
             tool_tokens.output_tokens += batch_tokens.output_tokens;
         }
 
-        messages.extend(merge_tool_messages_in_order(
+        let merged = merge_tool_messages_in_order(
             &response,
             &limited_response,
             tool_messages,
             blocked_messages,
-        ));
+        );
+
+        // M6.2: record a productive-tool-call signal per merged Tool message
+        // so the `LoopRetryState` grace-call path sees the loop making progress.
+        // A tool message counts as productive when it is neither an error
+        // ("Error:" prefix), a panic, a timeout, nor a hook/session-limit
+        // block — i.e. the tool produced output the LLM can act on.
+        for message in &merged {
+            if message.role == MessageRole::Tool && is_productive_tool_message(&message.content) {
+                retry_state.record_productive_tool_call();
+            }
+        }
+
+        messages.extend(merged);
         files_modified.extend(tool_files);
         if let Some(files_to_send) = files_to_send {
             files_to_send.extend(tool_send_files);
@@ -884,6 +1156,47 @@ impl Agent {
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
         Ok(())
     }
+}
+
+/// Classify a tool-result `content` string as productive for the M6.2
+/// grace-call gating.
+///
+/// A productive result is a tool message whose body carries strong evidence
+/// that the underlying tool actually accomplished useful work: either it
+/// ended with an explicit success exit code or it returned a substantive
+/// output block that is not one of the well-known error/denial conventions.
+/// We apply a conservative lower bound (128 bytes of substantive output or
+/// an explicit "Exit code: 0" marker) so that failure messages — which
+/// `ToolResult { success: false }` tools tend to emit as short diagnostic
+/// strings — do not accidentally keep a stalled loop alive past budget.
+fn is_productive_tool_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Never productive: explicit error/denial conventions.
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("[HOOK DENIED]")
+        || trimmed.starts_with("[SESSION LIMIT]")
+        || trimmed.starts_with("[SHELL RETRY LIMIT]")
+        || trimmed.starts_with("Path outside working directory")
+        || trimmed.starts_with("(no output)")
+        || trimmed.starts_with("File not found")
+        || (trimmed.starts_with("Tool '")
+            && (trimmed.contains("panicked") || trimmed.contains("timed out")))
+    {
+        return false;
+    }
+
+    // Positive: explicit shell success exit code.
+    if trimmed.contains("\nExit code: 0") || trimmed.ends_with("Exit code: 0") {
+        return true;
+    }
+
+    // Conservative fallback: require a substantive body. Short failure
+    // messages like "File too large..." or "Symlinks are not allowed" fall
+    // under this bound so they never inflate the productive counter.
+    trimmed.len() >= 128 && !trimmed.to_ascii_lowercase().contains("failed to")
 }
 
 fn check_per_tool_limit(
@@ -992,7 +1305,7 @@ fn recover_shell_retry(
                 .then(|| {
                     shell_results
                         .iter()
-                        .find(|content| is_useful_shell_output(content))
+                        .find(|content| is_recoverable_non_diff_shell_output(content))
                 })
                 .flatten()
                 .map(|content| ShellRetryRecovery {
@@ -1083,6 +1396,25 @@ fn is_validation_like_shell_output(content: &str) -> bool {
         .any(|marker| content.contains(marker))
 }
 
+fn is_recoverable_non_diff_shell_output(content: &str) -> bool {
+    is_useful_shell_output(content) && content.lines().any(is_git_status_short_line)
+}
+
+fn is_git_status_short_line(line: &str) -> bool {
+    let line = line.trim_end();
+    let bytes = line.as_bytes();
+    if bytes.len() < 4 || !bytes[2].is_ascii_whitespace() {
+        return false;
+    }
+
+    let status = &line[..2];
+    let has_status = status.chars().any(|ch| ch != ' ');
+    let valid_status = status
+        .chars()
+        .all(|ch| matches!(ch, ' ' | 'M' | 'A' | 'D' | 'R' | 'C' | 'U' | '?' | '!'));
+    has_status && valid_status && !line[3..].trim().is_empty()
+}
+
 fn strip_success_exit_suffix(content: &str) -> String {
     content
         .strip_suffix("\n\nExit code: 0")
@@ -1110,7 +1442,9 @@ mod tests {
     use octos_llm::{ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
     use octos_memory::EpisodeStore;
 
-    use crate::tools::{Tool, ToolRegistry, ToolResult};
+    use crate::plugins::PluginTool;
+    use crate::plugins::manifest::PluginToolDef;
+    use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
 
     struct FilesToSendOnlyTool {
         file_path: PathBuf,
@@ -1386,6 +1720,87 @@ mod tests {
         }
     }
 
+    struct ConsecutiveVoiceSaveProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ConsecutiveVoiceSaveProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let response = match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_save_yangmi".to_string(),
+                        name: "fm_voice_save".to_string(),
+                        arguments: serde_json::json!({"name": "yangmi"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: Some("yangmi saved".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                2 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_save_douwentao".to_string(),
+                        name: "fm_voice_save".to_string(),
+                        arguments: serde_json::json!({"name": "douwentao"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some("douwentao saved".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            };
+            Ok(response)
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_test_script(path: &std::path::Path, content: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[tokio::test]
     async fn run_task_collects_files_to_send_without_file_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -1443,7 +1858,7 @@ mod tests {
         let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
 
         let result = agent.process_message("do work", &[], vec![]).await.unwrap();
-        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<MessageRole> = result.messages.iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
             vec![
@@ -1511,6 +1926,102 @@ mod tests {
                 && content.contains("podcast_generate")
                 && content.contains("max 1")
         }));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn process_message_injects_distinct_audio_attachments_for_consecutive_voice_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_log = dir.path().join("plugin-inputs.jsonl");
+        let script_path = dir.path().join("mofa-fm-test.sh");
+        write_test_script(
+            &script_path,
+            r#"#!/bin/sh
+INPUT=$(cat)
+printf '%s\n' "$INPUT" >> "$INPUT_LOG"
+printf '{"output":"voice saved","success":true}\n'
+"#,
+        );
+
+        let first_audio = dir.path().join("yangmi_ref2.wav");
+        let second_audio = dir.path().join("douwentao.wav");
+        std::fs::write(&first_audio, b"fake wav 1").unwrap();
+        std::fs::write(&second_audio, b"fake wav 2").unwrap();
+        let first_audio = first_audio.to_string_lossy().into_owned();
+        let second_audio = second_audio.to_string_lossy().into_owned();
+
+        let def = PluginToolDef {
+            name: "fm_voice_save".to_string(),
+            description: "Save a cloned voice".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "audio_path": {"type": "string"}
+                },
+                "required": ["name", "audio_path"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let plugin = PluginTool::new("mofa-fm".into(), def, script_path).with_extra_env(vec![(
+            "INPUT_LOG".into(),
+            input_log.to_string_lossy().into_owned(),
+        )]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(plugin);
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(ConsecutiveVoiceSaveProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+
+        let first = agent
+            .process_message_with_attachments(
+                "克隆 yangmi 语音",
+                &[],
+                vec![],
+                TurnAttachmentContext {
+                    attachment_paths: vec![first_audio.clone()],
+                    audio_attachment_paths: vec![first_audio.clone()],
+                    file_attachment_paths: vec![],
+                    prompt_summary: Some("[Attached audio files]\n- yangmi_ref2.wav".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.content, "yangmi saved");
+
+        let second = agent
+            .process_message_with_attachments(
+                "克隆窦文涛语音",
+                &first.messages,
+                vec![],
+                TurnAttachmentContext {
+                    attachment_paths: vec![second_audio.clone()],
+                    audio_attachment_paths: vec![second_audio.clone()],
+                    file_attachment_paths: vec![],
+                    prompt_summary: Some("[Attached audio files]\n- douwentao.wav".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.content, "douwentao saved");
+
+        let log = std::fs::read_to_string(&input_log).unwrap();
+        let inputs = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["name"], "yangmi");
+        assert_eq!(inputs[0]["audio_path"], first_audio);
+        assert_eq!(inputs[1]["name"], "douwentao");
+        assert_eq!(inputs[1]["audio_path"], second_audio);
     }
 
     #[test]
@@ -1868,6 +2379,107 @@ mod tests {
     }
 
     #[test]
+    fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
+        let messages = vec![
+            Message::user("return the final diff"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "mkdir repo && cd repo && git init"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "Initialized empty Git repository in /tmp/repo/.git/\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cd repo && git commit -m initial"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "[master (root-commit) 1e19620] initial commit\n 1 file changed, 2 insertions(+)\n create mode 100644 notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "fatal: ambiguous argument 'notes.txt'\n\nExit code: 128".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "/tmp\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(recover_shell_retry(&messages, 4).is_none());
+    }
+
+    #[test]
     fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
         let messages = vec![
             Message::user("repair the repo"),
@@ -2174,5 +2786,53 @@ mod tests {
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
         assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
         assert!(recovered.content.contains("could not find Cargo.toml"));
+    }
+
+    // ── is_productive_tool_message (M6.2) ───────────────────────────────
+
+    #[test]
+    fn productive_message_rejects_known_failure_prefixes() {
+        assert!(!is_productive_tool_message("Error: boom"));
+        assert!(!is_productive_tool_message("[HOOK DENIED] blocked"));
+        assert!(!is_productive_tool_message("[SESSION LIMIT] cap"));
+        assert!(!is_productive_tool_message("[SHELL RETRY LIMIT] stop"));
+        assert!(!is_productive_tool_message(
+            "Path outside working directory: /etc/passwd"
+        ));
+        assert!(!is_productive_tool_message("(no output)"));
+        assert!(!is_productive_tool_message("File not found: missing.txt"));
+        assert!(!is_productive_tool_message(
+            "Tool 'shell' panicked: bad state"
+        ));
+        assert!(!is_productive_tool_message(
+            "Tool 'shell' timed out after 30 seconds"
+        ));
+    }
+
+    #[test]
+    fn productive_message_accepts_shell_success_exit() {
+        assert!(is_productive_tool_message("hello\n\nExit code: 0"));
+        assert!(is_productive_tool_message("short body\nExit code: 0"));
+    }
+
+    #[test]
+    fn productive_message_requires_substantive_output() {
+        // Short output without an explicit success marker is conservatively
+        // treated as non-productive so transient failure messages do not keep
+        // a stalled loop alive past budget.
+        assert!(!is_productive_tool_message("ok"));
+        assert!(!is_productive_tool_message("Done."));
+
+        // Long output that isn't a failure passes the fallback bar.
+        let long = "line ".repeat(40); // ~200 bytes
+        assert!(is_productive_tool_message(&long));
+    }
+
+    #[test]
+    fn productive_message_rejects_failed_to_prefix_in_long_body() {
+        // Long outputs that still contain "failed to" are excluded so
+        // large error payloads do not accidentally count as productive.
+        let body = "failed to resolve target: ".to_string() + &"x".repeat(200);
+        assert!(!is_productive_tool_message(&body));
     }
 }

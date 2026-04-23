@@ -1,0 +1,12 @@
+{
+    "schema_version": 1,
+    "success": true,
+    "output": "Task completed.",
+    "files_modified": ["src/main.rs"],
+    "files_to_send": ["output/report.md"],
+    "subtasks": [],
+    "token_usage": {
+        "input_tokens": 1234,
+        "output_tokens": 512
+    }
+}

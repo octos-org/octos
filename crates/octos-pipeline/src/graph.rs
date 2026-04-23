@@ -126,6 +126,18 @@ pub struct PipelineNode {
     pub planner_model: Option<String>,
     /// For `DynamicParallel`: maximum number of dynamic tasks (default 8).
     pub max_tasks: Option<u32>,
+    /// Deadline in seconds for this node's execution. On expiry, `deadline_action` fires.
+    /// Uses `f64` to allow sub-second precision (e.g. `0.5` for 500ms).
+    #[serde(default)]
+    pub deadline_secs: Option<f64>,
+    /// Action to take when the deadline expires. Defaults to `Abort` when a
+    /// deadline is set but no action is specified.
+    #[serde(default)]
+    pub deadline_action: Option<DeadlineAction>,
+    /// Mission-level checkpoints to persist after this node completes.
+    /// An empty list means no checkpoint is written for this node.
+    #[serde(default)]
+    pub checkpoints: Vec<MissionCheckpoint>,
 }
 
 impl Default for PipelineNode {
@@ -147,6 +159,9 @@ impl Default for PipelineNode {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: Vec::new(),
         }
     }
 }
@@ -216,6 +231,62 @@ impl HandlerKind {
     }
 }
 
+/// Action to take when a pipeline node exceeds its deadline.
+///
+/// Each variant has distinct, executor-enforced semantics:
+/// * `Abort` — cancel the node, propagate as pipeline error.
+/// * `Skip` — cancel the node, emit a skipped outcome, continue with next edge.
+/// * `Retry { max_attempts }` — re-run the node up to `max_attempts` times,
+///   then abort if still exceeding.
+/// * `Escalate` — fire `HookEvent::OnSpawnFailure` with a descriptive payload,
+///   then abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeadlineAction {
+    /// Abort the node and fail the pipeline.
+    #[default]
+    Abort,
+    /// Skip the node, mark as skipped, continue traversal.
+    Skip,
+    /// Retry the node up to `max_attempts` times before aborting.
+    Retry {
+        /// Maximum number of attempts (>= 1).
+        max_attempts: u32,
+    },
+    /// Fire `HookEvent::OnSpawnFailure` then abort.
+    Escalate,
+}
+
+impl DeadlineAction {
+    /// Short name for logging and metric label (`abort`, `skip`, `retry`, `escalate`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            DeadlineAction::Abort => "abort",
+            DeadlineAction::Skip => "skip",
+            DeadlineAction::Retry { .. } => "retry",
+            DeadlineAction::Escalate => "escalate",
+        }
+    }
+}
+
+/// A mission-level checkpoint declaration — marks a node as a resume point
+/// and names the checkpoint for the operator log.
+///
+/// When a pipeline executor finishes a node that declares checkpoints, it
+/// persists one `PersistedCheckpoint` per entry via `CheckpointStore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionCheckpoint {
+    /// Operator-visible label for this checkpoint (e.g. "post_navigate").
+    pub name: String,
+    /// Whether a resume can replay from this checkpoint (informational).
+    #[serde(default = "default_true")]
+    pub resumable: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// The outcome of executing a single pipeline node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeOutcome {
@@ -239,6 +310,8 @@ pub enum OutcomeStatus {
     Pass,
     Fail,
     Error,
+    /// Node deadline expired and `DeadlineAction::Skip` was configured.
+    Skipped,
 }
 
 /// A named subgraph (cluster) within a pipeline.

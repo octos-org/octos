@@ -5,11 +5,17 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use crate::harness_errors::HarnessError;
+use crate::harness_events::{
+    OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
+    OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context, write_event_to_sink,
+};
 use crate::progress::ProgressEvent;
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
 
 use super::manifest::PluginToolDef;
@@ -25,6 +31,7 @@ pub struct PluginTool {
     /// Environment variables to strip from the plugin's environment.
     blocked_env: Vec<String>,
     /// Extra environment variables to inject into the plugin's environment.
+    /// Secret-like names require the tool manifest's explicit env allowlist.
     extra_env: Vec<(String, String)>,
     /// Working directory for plugin execution (created on first use).
     work_dir: Option<PathBuf>,
@@ -87,6 +94,30 @@ impl PluginTool {
         }
     }
 
+    /// Record a `HarnessError` for this plugin tool: increments the
+    /// `octos_loop_error_total{variant, recovery}` counter and writes a
+    /// structured error event to the harness event sink (if one is wired
+    /// via `ToolContext`). Keeps plugin error paths consistent with the
+    /// in-process error boundary in `execution.rs`.
+    fn emit_plugin_error(&self, ctx: Option<&ToolContext>, classified: &HarnessError) {
+        classified.record_metric();
+        let Some(sink) = ctx.and_then(|c| c.harness_event_sink.as_deref()) else {
+            return;
+        };
+        let Some(sink_ctx) = lookup_event_sink_context(sink) else {
+            return;
+        };
+        let event = classified.to_event(sink_ctx.session_id, sink_ctx.task_id, None, None);
+        if let Err(error) = write_event_to_sink(sink, &event) {
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                tool = %self.tool_def.name,
+                error = %error,
+                "failed to write plugin error event to harness sink"
+            );
+        }
+    }
+
     fn rewrite_workspace_file_args(&self, args: &serde_json::Value) -> serde_json::Value {
         let Some(work_dir) = self.work_dir.as_ref() else {
             return args.clone();
@@ -118,18 +149,18 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style"
-                && let Some(style) = value.as_str()
-            {
-                if self.tool_def.name.starts_with("mofa_")
-                    && let Some(normalized) = normalize_mofa_style_name(style)
-                {
-                    rewritten.insert(key.clone(), serde_json::Value::String(normalized));
-                    continue;
-                }
-                if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
-                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
-                    continue;
+            if key == "style" {
+                if let Some(style) = value.as_str() {
+                    if self.tool_def.name.starts_with("mofa_") {
+                        if let Some(normalized) = normalize_mofa_style_name(style) {
+                            rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                            continue;
+                        }
+                    }
+                    if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
+                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                        continue;
+                    }
                 }
             }
             if key == "slides" {
@@ -181,13 +212,15 @@ impl PluginTool {
                 .unwrap_or(false);
             if !has_audio_path
                 && input_schema_has_property(&self.tool_def.input_schema, "audio_path")
-                && let Some(ctx) = ctx
-                && ctx.audio_attachment_paths.len() == 1
             {
-                obj.insert(
-                    "audio_path".into(),
-                    serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.audio_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "audio_path".into(),
+                            serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
 
             let has_file_path = obj
@@ -195,15 +228,16 @@ impl PluginTool {
                 .and_then(|value| value.as_str())
                 .map(|value| !value.is_empty())
                 .unwrap_or(false);
-            if !has_file_path
-                && input_schema_has_property(&self.tool_def.input_schema, "file_path")
-                && let Some(ctx) = ctx
-                && ctx.file_attachment_paths.len() == 1
+            if !has_file_path && input_schema_has_property(&self.tool_def.input_schema, "file_path")
             {
-                obj.insert(
-                    "file_path".into(),
-                    serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.file_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "file_path".into(),
+                            serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
         }
 
@@ -279,10 +313,19 @@ impl PluginTool {
         };
         let found = match out_file.or(from_output) {
             Some(path) => {
-                if path.exists() {
-                    Some(path)
+                let resolved = if path.exists() {
+                    path
                 } else {
-                    Some(self.wait_for_output_file(path).await)
+                    self.wait_for_output_file(path).await
+                };
+                if resolved.exists() {
+                    Some(resolved)
+                } else {
+                    tracing::warn!(
+                        file = %resolved.display(),
+                        "auto-detected plugin output file was not created; skipping delivery"
+                    );
+                    None
                 }
             }
             None => None,
@@ -447,14 +490,41 @@ impl Tool for PluginTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
+        sanitize_command_env(&mut cmd, &env_allowlist);
+
         // Remove blocked environment variables
         for var in &self.blocked_env {
             cmd.env_remove(var);
         }
 
+        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
+
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
-            cmd.env(key, val);
+            if should_forward_env_name(key, &env_allowlist) {
+                cmd.env(key, val);
+            } else {
+                tracing::debug!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    env = %key,
+                "skipping non-allowlisted secret environment variable for plugin tool"
+                );
+            }
+        }
+
+        if let Some(sink) = ctx
+            .as_ref()
+            .and_then(|ctx| ctx.harness_event_sink.as_deref())
+        {
+            cmd.env(OCTOS_EVENT_SINK_ENV, sink);
+            if let Some(context) = lookup_event_sink_context(sink) {
+                cmd.env(OCTOS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_TASK_ID_ENV, &context.task_id);
+                cmd.env(OCTOS_HARNESS_SESSION_ID_ENV, &context.session_id);
+                cmd.env(OCTOS_HARNESS_TASK_ID_ENV, &context.task_id);
+            }
         }
 
         // Set working directory so relative paths in tool args (e.g.
@@ -473,16 +543,24 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
-        let ctx: Option<ToolContext> = TOOL_CTX.try_with(|c| c.clone()).ok();
         let effective_args = self.prepare_effective_args(args, ctx.as_ref());
 
-        let mut child = cmd.spawn().wrap_err_with(|| {
-            format!(
-                "failed to spawn plugin '{}' executable: {}",
-                self.plugin_name,
-                self.executable.display()
-            )
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!(
+                    "failed to spawn plugin '{}' executable: {}: {err}",
+                    self.plugin_name,
+                    self.executable.display()
+                );
+                let classified = HarnessError::PluginSpawn {
+                    plugin_name: self.plugin_name.clone(),
+                    message: message.clone(),
+                };
+                self.emit_plugin_error(ctx.as_ref(), &classified);
+                return Err(eyre::Report::new(err).wrap_err(message));
+            }
+        };
 
         let child_pid = child.id().unwrap_or(0);
         tracing::info!(
@@ -505,12 +583,16 @@ impl Tool for PluginTool {
 
         // Spawn stderr reader: streams lines as ToolProgress events
         let tool_name = self.tool_def.name.clone();
+        // Clone ctx for the stderr reader so we can still consult the
+        // original after the reader task is spawned (needed for
+        // `emit_plugin_error` on spawn/timeout/protocol failures).
+        let stderr_ctx = ctx.clone();
         let stderr_task = tokio::spawn(async move {
             let mut collected = String::new();
             if let Some(stderr) = stderr_handle {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref ctx) = ctx {
+                    if let Some(ref ctx) = stderr_ctx {
                         ctx.reporter.report(ProgressEvent::ToolProgress {
                             name: tool_name.clone(),
                             tool_id: ctx.tool_id.clone(),
@@ -556,11 +638,16 @@ impl Tool for PluginTool {
             {
                 Ok((Ok(status), stdout_bytes, stderr_text)) => (status, stdout_bytes, stderr_text),
                 Ok((Err(e), _, _)) => {
-                    return Err(eyre::eyre!(
+                    let message = format!(
                         "plugin '{}' tool '{}' execution failed: {e}",
-                        self.plugin_name,
-                        self.tool_def.name
-                    ));
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginProtocol {
+                        plugin_name: self.plugin_name.clone(),
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
                 Err(_) => {
                     // Timeout — kill the child process
@@ -580,12 +667,18 @@ impl Tool for PluginTool {
                             .args(["/F", "/T", "/PID", &child_pid.to_string()])
                             .status();
                     }
-                    return Err(eyre::eyre!(
-                        "plugin '{}' tool '{}' timed out after {}s",
-                        self.plugin_name,
-                        self.tool_def.name,
-                        self.timeout.as_secs()
-                    ));
+                    let timeout_secs = self.timeout.as_secs();
+                    let message = format!(
+                        "plugin '{}' tool '{}' timed out after {timeout_secs}s",
+                        self.plugin_name, self.tool_def.name
+                    );
+                    let classified = HarnessError::PluginTimeout {
+                        plugin_name: self.plugin_name.clone(),
+                        timeout_secs,
+                        message: message.clone(),
+                    };
+                    self.emit_plugin_error(ctx.as_ref(), &classified);
+                    return Err(eyre::eyre!(message));
                 }
             };
         let stdout = String::from_utf8_lossy(&stdout_bytes);
@@ -690,6 +783,7 @@ mod tests {
             description: desc.to_string(),
             input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         }
     }
@@ -771,6 +865,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -805,6 +900,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -851,6 +947,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -881,6 +978,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -907,6 +1005,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -932,12 +1031,14 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
         let ctx = ToolContext {
             tool_id: "tool-1".to_string(),
             reporter: Arc::new(SilentReporter),
+            harness_event_sink: None,
             attachment_paths: vec![
                 "/workspace/voice.ogg".to_string(),
                 "/workspace/report.pdf".to_string(),
@@ -998,6 +1099,127 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
+    async fn execute_structured_progress_event_updates_task_supervisor() {
+        use crate::task_supervisor::TaskSupervisor;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("structured_tool", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"schema\":\"octos.harness.event.v1\",\"kind\":\"progress\",\"session_id\":\"%s\",\"task_id\":\"%s\",\"workflow\":\"deep_research\",\"phase\":\"fetching_sources\",\"message\":\"Fetching source 3/12\",\"progress\":0.42}\\n' \"$OCTOS_SESSION_ID\" \"$OCTOS_TASK_ID\" >> \"$OCTOS_EVENT_SINK\"\nprintf '{\"output\":\"ok\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("structured_tool", "writes harness events");
+        let tool = PluginTool::new("test-plugin".into(), def, script_path)
+            .with_timeout(Duration::from_secs(5));
+
+        let sink = crate::harness_events::HarnessEventSink::new(
+            supervisor.clone(),
+            task_id.clone(),
+            "api:session",
+        )
+        .expect("create sink");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let ctx = ToolContext {
+            tool_id: "tool-1".to_string(),
+            reporter: Arc::new(SilentReporter),
+            harness_event_sink: Some(sink.path().display().to_string()),
+            attachment_paths: vec![],
+            audio_attachment_paths: vec![],
+            file_attachment_paths: vec![],
+        };
+
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({})))
+            .await
+            .expect("tool execution should succeed");
+        assert!(result.success);
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("callback should fire")
+            .expect("task snapshot should be sent");
+
+        let detail: serde_json::Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetching_sources");
+        assert_eq!(detail["progress_message"], "Fetching source 3/12");
+        assert_eq!(updated.status, crate::task_supervisor::TaskStatus::Running);
+        assert_eq!(
+            updated.lifecycle_state(),
+            crate::task_supervisor::TaskLifecycleState::Running
+        );
+
+        let task = supervisor.get_task(&task_id).expect("task missing");
+        let task_detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(task_detail["current_phase"], "fetching_sources");
+        assert_eq!(task_detail["progress_message"], "Fetching source 3/12");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_does_not_expose_secret_extra_env_without_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("env_tool", "prints env");
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-regression".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "missing");
+        assert!(!result.output.contains("sk-octos-plugin-regression"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_exposes_secret_extra_env_with_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("env_tool", "prints env");
+        def.env.push("OPENAI_API_KEY".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-allowed".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "sk-octos-plugin-allowed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
     async fn execute_fallback_on_non_json_stdout() {
         // Script that outputs plain text (not JSON).
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1039,6 +1261,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -1078,6 +1301,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -1096,6 +1320,45 @@ mod tests {
             output_abs.exists(),
             "generated deck should appear after fallback wait"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_fallback_skips_missing_generated_pptx() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output_rel = "slides/demo/output/deck.pptx";
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho 'Generated PPTX: slides/demo/output/deck.pptx'\n",
+        );
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides output".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.file_modified, None);
+        assert!(result.files_to_send.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

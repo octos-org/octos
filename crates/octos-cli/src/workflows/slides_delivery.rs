@@ -43,6 +43,7 @@ pub fn build() -> WorkflowInstance {
 
 pub fn workspace_policy() -> WorkspacePolicy {
     WorkspacePolicy {
+        schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,
         workspace: WorkspacePolicyWorkspace {
             kind: WorkspacePolicyKind::Slides,
         },
@@ -73,6 +74,7 @@ pub fn workspace_policy() -> WorkspacePolicy {
                 "file_exists:output/deck.pptx".into(),
                 "file_exists:output/**/slide-*.png".into(),
             ],
+            validators: Vec::new(),
         },
         artifacts: WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([
@@ -82,6 +84,7 @@ pub fn workspace_policy() -> WorkspacePolicy {
             ]),
         },
         spawn_tasks: BTreeMap::new(),
+        compaction: None,
     }
 }
 

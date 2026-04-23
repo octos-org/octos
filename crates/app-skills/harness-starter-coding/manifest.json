@@ -1,0 +1,36 @@
+{
+  "name": "harness-starter-coding",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Starter for a harnessed coding-assistant custom app. Produces a diff artifact and a file-list preview under patches/.",
+  "timeout_secs": 90,
+  "tools": [
+    {
+      "name": "propose_patch",
+      "description": "Render a patch as a unified-diff file under patches/<slug>.diff plus a preview file list at patches/<slug>.files.txt.",
+      "spawn_only": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Short human-readable title; derives the filename."
+          },
+          "hunks": {
+            "type": "array",
+            "description": "List of patch hunks, each with file and new_content.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "new_content": { "type": "string" }
+              },
+              "required": ["file", "new_content"]
+            }
+          }
+        },
+        "required": ["title", "hunks"]
+      }
+    }
+  ]
+}

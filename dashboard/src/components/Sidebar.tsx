@@ -54,6 +54,7 @@ export default function Sidebar() {
                 <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Access" />
                 <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
+                <SidebarLink to="/harness" icon={<ShieldIcon />} label="Harness" />
                 <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
                 <SidebarLink to="/setup/wizard" icon={<WizardIcon />} label="Setup Wizard" />
               </>
@@ -221,6 +222,15 @@ function WizardIcon() {
   return (
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l3-3 3 3m-6 14l3 3 3-3M5 9l-3 3 3 3m14-6l3 3-3 3M12 8v8m-4-4h8" />
+    </svg>
+  )
+}
+
+function ShieldIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l8 4v5c0 4.5-3.3 8.6-8 9-4.7-.4-8-4.5-8-9V7l8-4z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4" />
     </svg>
   )
 }

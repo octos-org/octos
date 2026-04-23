@@ -379,6 +379,10 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
 }
 
 /// Remove an installed skill by name.
+///
+/// Removal is idempotent: if the skill directory is already absent the call
+/// succeeds without error, matching HTTP DELETE semantics and the harness
+/// compatibility contract (M4.4).
 pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     // Reject path traversal attempts
     if name.contains('/')
@@ -391,7 +395,8 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     }
     let dest = skills_dir.join(name);
     if !dest.exists() {
-        eyre::bail!("Skill '{name}' not found in {}", skills_dir.display());
+        // Idempotent: already removed.
+        return Ok(());
     }
     std::fs::remove_dir_all(&dest)?;
     Ok(())
@@ -1513,9 +1518,10 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Skip if executable already exists
     let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
-    if dir.join(&dir_name).exists() || dir.join("main").exists() {
+    // Skip if a real executable already exists. Generated lazy Cargo wrappers
+    // are install-time fallbacks, not proof that the skill has its binary.
+    if has_installed_skill_executable(dir, &dir_name) {
         return Ok(());
     }
 
@@ -1612,6 +1618,25 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn has_installed_skill_executable(dir: &Path, dir_name: &str) -> bool {
+    if dir.join(dir_name).exists() {
+        return true;
+    }
+
+    let main = dir.join("main");
+    main.exists() && !is_generated_lazy_cargo_wrapper(&main)
+}
+
+fn is_generated_lazy_cargo_wrapper(path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+
+    contents.contains("Skill binary is missing and cargo is not installed")
+        && contents.contains("cargo build --release")
+        && contents.contains("target/release/")
 }
 
 /// Recursively copy a directory, skipping .git, node_modules, and target (Rust build).
@@ -1826,5 +1851,41 @@ mod tests {
 
         let by_empty = filter_registry_entries(&entries, Some("   "));
         assert_eq!(by_empty.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_lazy_cargo_wrapper_does_not_block_binary_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-fm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("main"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+BIN="$SCRIPT_DIR/target/release/mofa-fm"
+if [[ ! -x "$BIN" ]]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    printf '{"output":"Skill binary is missing and cargo is not installed. Run: cargo build --release in mofa-fm","success":false}\n'
+    exit 0
+  fi
+  cargo build --release
+fi
+"#,
+        )
+        .unwrap();
+
+        assert!(!has_installed_skill_executable(&skill_dir, "mofa-fm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_main_executable_blocks_binary_reinstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("mofa-fm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("main"), "#!/usr/bin/env bash\necho ok\n").unwrap();
+
+        assert!(has_installed_skill_executable(&skill_dir, "mofa-fm"));
     }
 }

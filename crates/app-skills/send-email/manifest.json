@@ -7,6 +7,17 @@
     {
       "name": "send_email",
       "description": "Send an email to a recipient. Supports plain text and optional HTML body. Uses SMTP or Feishu/Lark as the delivery backend.",
+      "env": [
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_FROM",
+        "LARK_APP_ID",
+        "LARK_APP_SECRET",
+        "LARK_FROM_ADDRESS",
+        "LARK_REGION"
+      ],
       "input_schema": {
         "type": "object",
         "properties": {

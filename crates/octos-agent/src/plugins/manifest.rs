@@ -109,6 +109,13 @@ pub struct PluginToolDef {
     /// The execution loop returns immediately with `spawn_only_message`.
     #[serde(default)]
     pub spawn_only: bool,
+    /// Environment variable names this tool is explicitly allowed to receive.
+    ///
+    /// Secret-like env vars (API keys, passwords, tokens, secrets) are stripped
+    /// from plugin subprocesses unless their name is listed here. Non-secret
+    /// runtime env vars are still forwarded by default.
+    #[serde(default, alias = "env_allowlist")]
+    pub env: Vec<String>,
     /// Message returned to the LLM when a spawn_only tool is auto-backgrounded.
     /// Default: "SUCCESS: Task is now running in background..."
     #[serde(default)]
@@ -163,6 +170,25 @@ mod tests {
         assert_eq!(
             manifest.tools[0].input_schema,
             serde_json::json!({"type": "object"})
+        );
+        assert!(manifest.tools[0].env.is_empty());
+    }
+
+    #[test]
+    fn test_tool_env_allowlist() {
+        let json = r#"{
+            "name": "env-plugin",
+            "version": "1.0.0",
+            "tools": [{
+                "name": "send",
+                "description": "Send",
+                "env": ["SMTP_PASSWORD", "OPENAI_API_KEY"]
+            }]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            manifest.tools[0].env,
+            vec!["SMTP_PASSWORD".to_string(), "OPENAI_API_KEY".to_string()]
         );
     }
 

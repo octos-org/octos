@@ -1515,6 +1515,11 @@ impl ActorFactory {
         if let Some(ref ctx) = session_hook_context {
             spawn_tool = spawn_tool.with_hook_context(ctx.clone());
         }
+        if let Some(ref pipeline_factory) = self.pipeline_factory {
+            let pipeline_factory = pipeline_factory.clone();
+            spawn_tool =
+                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+        }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
         let bg_tx = tx.clone();
@@ -4947,6 +4952,51 @@ mod tests {
     }
 
     #[test]
+    fn session_task_query_store_exposes_harness_progress_runtime_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "deep_search",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        let event = octos_agent::HarnessEvent::progress(
+            "api:session",
+            task_id.clone(),
+            Some("deep_research"),
+            "fetch",
+            Some("Fetching 4 pages"),
+            Some(0.4),
+        );
+        supervisor.apply_harness_event(&task_id, &event).unwrap();
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], task_id);
+        assert_eq!(tasks[0]["session_key"], "api:session");
+        assert_eq!(tasks[0]["workflow_kind"], "deep_research");
+        assert_eq!(tasks[0]["current_phase"], "fetch");
+        assert_eq!(tasks[0]["runtime_detail"]["session_id"], "api:session");
+        assert_eq!(tasks[0]["runtime_detail"]["task_id"], task_id);
+        assert_eq!(
+            tasks[0]["runtime_detail"]["progress_message"],
+            "Fetching 4 pages"
+        );
+        assert_eq!(tasks[0]["runtime_detail"]["progress"], 0.4);
+    }
+
+    #[test]
     fn session_task_query_store_projects_verifying_lifecycle_state() {
         let dir = tempfile::TempDir::new().unwrap();
         let data_dir = dir.path().join("profile-data");
@@ -5879,7 +5929,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
 
         // ── Phase 1: Warm-up (5 fast messages to establish baseline) ──
@@ -6018,11 +6068,8 @@ mod tests {
         // Collect responses — should get 2 (both overflow and primary)
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => responses.push(msg.content),
-                _ => break,
-            }
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            responses.push(msg.content);
         }
 
         assert_eq!(
@@ -6070,7 +6117,7 @@ mod tests {
         let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-a", vec![]));
         let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new("router-b", vec![]));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
 
         // Warm-up
@@ -6425,9 +6472,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            contents
-                .iter()
-                .any(|content| *content == "[User sent attachments]"),
+            contents.contains(&"[User sent attachments]"),
             "generic attachment placeholder missing from history: {:?}",
             contents
         );
@@ -6466,7 +6511,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Collect, None, false, &dir).await;
 
         // Send first message → starts 2s processing
@@ -6508,7 +6553,7 @@ mod tests {
                 .collect();
             // First user msg: "first message"
             assert!(
-                user_messages.iter().any(|m| *m == "first message"),
+                user_messages.contains(&"first message"),
                 "first message not found: {:?}",
                 user_messages
             );
@@ -6540,7 +6585,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Steer, None, false, &dir).await;
 
         // Send first message → goes through 500ms coalescing delay, then starts 2s processing
@@ -6617,7 +6662,7 @@ mod tests {
             ],
         ));
 
-        let (tx, mut rx, handle, session_mgr) =
+        let (tx, mut rx, handle, _session_mgr) =
             setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
         // Send 3 messages
@@ -6715,18 +6760,14 @@ mod tests {
             };
             tx.send(make_inbound(&label)).await.unwrap();
             // Collect all available responses (may be 1 or 2 if "⚡" arrived)
-            loop {
-                match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-                    Ok(Some(msg)) => {
-                        let is_notification = msg.content.contains("⚡");
-                        all_responses.push(msg.content);
-                        if !is_notification {
-                            break; // Got the actual reply, move to next message
-                        }
-                        // If it was the notification, keep reading for the reply
-                    }
-                    _ => break,
+            while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await
+            {
+                let is_notification = msg.content.contains("⚡");
+                all_responses.push(msg.content);
+                if !is_notification {
+                    break; // Got the actual reply, move to next message
                 }
+                // If it was the notification, keep reading for the reply
             }
         }
 

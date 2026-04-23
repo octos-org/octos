@@ -44,6 +44,7 @@ base64 = { workspace = true }
 chromiumoxide = { workspace = true }
 tempfile = { workspace = true }
 lettre = { workspace = true }
+redb = { workspace = true }
 
 [features]
 git = ["dep:gix", "dep:similar"]

@@ -20,6 +20,8 @@ use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::harness_events::{HarnessEvent, HarnessEventPayload};
+
 const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
 
 /// Lifecycle status of a background task.
@@ -537,6 +539,136 @@ impl TaskSupervisor {
         }
     }
 
+    /// Apply a structured harness event to a tracked task.
+    pub fn apply_harness_event(
+        &self,
+        task_id: &str,
+        event: &HarnessEvent,
+    ) -> Result<(), &'static str> {
+        let snapshot = self.get_task(task_id).ok_or("unknown task")?;
+        let (workflow_kind, current_phase) = workflow_labels(snapshot.runtime_detail.as_deref());
+        let runtime_detail =
+            event.runtime_detail_value(workflow_kind.as_deref(), current_phase.as_deref());
+
+        match &event.payload {
+            HarnessEventPayload::Progress { .. }
+            | HarnessEventPayload::Phase { .. }
+            | HarnessEventPayload::Retry { .. } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::Artifact { .. } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::DeliveringOutputs,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::ValidatorResult { data } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::VerifyingOutputs,
+                    Some(runtime_detail.to_string()),
+                );
+                if !data.passed {
+                    let message = data.message.clone().unwrap_or_else(|| {
+                        "validator rejected structured harness event".to_string()
+                    });
+                    self.mark_failed(task_id, message);
+                }
+            }
+            HarnessEventPayload::Failure { data } => {
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::Failed,
+                    Some(runtime_detail.to_string()),
+                );
+                self.mark_failed(task_id, data.message.clone());
+            }
+            HarnessEventPayload::McpServerCall { .. } => {
+                // MCP-server dispatch events are audit records — they describe
+                // a call that already mapped onto the supervisor via
+                // run-to-completion. Nothing to reapply to lifecycle state.
+            }
+            HarnessEventPayload::SubAgentDispatch { .. } => {
+                // Dispatch events are observational — they record the fact
+                // that a task was shipped off to an MCP-backed sub-agent
+                // without mutating the task's terminal state. The outer
+                // spawn lifecycle still decides when the task completes or
+                // fails; we just attach the structured detail so operators
+                // can see which backend is servicing the task.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::SwarmDispatch { .. } => {
+                // Swarm dispatch events are observational from the
+                // supervisor's perspective — the `octos-swarm` primitive
+                // owns its own redb-backed session state and drives the
+                // retry loop. We just surface the aggregate detail so
+                // operators can see fan-out progress.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::CostAttribution { .. } => {
+                // Cost attributions are purely observational — they are
+                // committed after a sub-agent dispatch succeeds and do
+                // not move the task's lifecycle. Attach the structured
+                // detail so operators see the spend breakdown on the
+                // same task row as the dispatch.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::RoutingDecision { .. } => {
+                // Routing decisions are observational — they do not change the
+                // task's lifecycle state. We still attach the detail so the
+                // operator dashboard can surface the tier/reasons for this
+                // turn without inventing a dedicated sidecar channel.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::CredentialRotation { .. } => {
+                // Credential rotations are observability-only — they do not
+                // change the task lifecycle. We still update runtime_detail
+                // so operators can see which key is now active.
+                self.mark_runtime_state(
+                    task_id,
+                    snapshot.runtime_state,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::Error { data } => {
+                // Structured error events are diagnostic — record them in the
+                // runtime detail but only transition to Failed when the
+                // recovery hint marks the variant as non-retryable.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+                if matches!(data.recovery.as_str(), "fail_fast" | "bug") {
+                    self.mark_failed(task_id, data.message.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn persist_snapshot_by_id(&self, task_id: &str) {
         let snapshot = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -745,6 +877,82 @@ mod tests {
         assert_eq!(task.lifecycle_state(), TaskLifecycleState::Ready);
         assert!(task.completed_at.is_some());
         assert_eq!(task.output_files, vec!["output.mp3"]);
+    }
+
+    #[test]
+    fn should_apply_harness_progress_event_and_notify() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("deep_search", "call-9", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let event = crate::harness_events::HarnessEvent::progress(
+            "api:session",
+            id.clone(),
+            Some("deep_research"),
+            "fetching_sources",
+            Some("Fetching source 3/12"),
+            Some(0.42),
+        );
+
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetching_sources");
+        assert_eq!(detail["progress_message"], "Fetching source 3/12");
+        let progress = detail["progress"].as_f64().unwrap();
+        assert!((progress - 0.42).abs() < 0.0001);
+
+        let notified = rx.try_recv().expect("callback should fire");
+        let notified_detail: serde_json::Value =
+            serde_json::from_str(notified.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(notified_detail["current_phase"], "fetching_sources");
+        assert_eq!(notified.lifecycle_state(), TaskLifecycleState::Running);
+    }
+
+    #[test]
+    fn should_persist_harness_progress_event_for_replay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+        let id =
+            supervisor.register_with_lineage("deep_search", "call-9", Some("api:session"), None);
+        supervisor.mark_running(&id);
+
+        let event = crate::harness_events::HarnessEvent::progress(
+            "api:session",
+            id.clone(),
+            Some("deep_research"),
+            "fetch",
+            Some("Fetching 4 pages"),
+            Some(0.4),
+        );
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+        let task = restored.get_task(&id).expect("restored task missing");
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            detail["schema"],
+            crate::harness_events::HARNESS_EVENT_SCHEMA_V1
+        );
+        assert_eq!(detail["session_id"], "api:session");
+        assert_eq!(detail["task_id"], id);
+        assert_eq!(detail["workflow_kind"], "deep_research");
+        assert_eq!(detail["current_phase"], "fetch");
+        assert_eq!(detail["progress_message"], "Fetching 4 pages");
+        assert_eq!(task.status, TaskStatus::Running);
     }
 
     #[test]

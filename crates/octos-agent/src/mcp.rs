@@ -21,6 +21,7 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 const MAX_LINE_BYTES: usize = 1_048_576;
 
 use crate::sandbox::BLOCKED_ENV_VARS;
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,6 +376,9 @@ impl McpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // Forward stderr for debugging
 
+        let env_allowlist = EnvAllowlist::from_names(config.env.keys().map(|key| key.as_str()));
+        sanitize_command_env(&mut cmd, &env_allowlist);
+
         for (k, v) in &config.env {
             if BLOCKED_ENV_VARS
                 .iter()
@@ -383,6 +387,13 @@ impl McpClient {
                 warn!(
                     key = k,
                     "blocked dangerous MCP environment variable, skipping"
+                );
+                continue;
+            }
+            if !should_forward_env_name(k, &env_allowlist) {
+                warn!(
+                    key = k,
+                    "blocked non-allowlisted MCP environment variable, skipping"
                 );
                 continue;
             }
@@ -881,17 +892,14 @@ mod tests {
         .into_iter()
         .collect();
 
+        let allowlist = crate::subprocess_env::EnvAllowlist::empty();
         let allowed: Vec<&String> = env
             .keys()
-            .filter(|k| {
-                !BLOCKED_ENV_VARS
-                    .iter()
-                    .any(|blocked| k.eq_ignore_ascii_case(blocked))
-            })
+            .filter(|k| crate::subprocess_env::should_forward_env_name(k, &allowlist))
             .collect();
 
         assert!(allowed.contains(&&"SAFE_VAR".to_string()));
-        assert!(allowed.contains(&&"MY_TOKEN".to_string()));
+        assert!(!allowed.contains(&&"MY_TOKEN".to_string()));
         assert!(!allowed.contains(&&"LD_PRELOAD".to_string()));
         assert!(!allowed.contains(&&"NODE_OPTIONS".to_string()));
     }

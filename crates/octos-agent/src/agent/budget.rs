@@ -256,8 +256,10 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
         let tools = crate::tools::ToolRegistry::new();
         let mut agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
-        let mut config = AgentConfig::default();
-        config.max_timeout = max_timeout;
+        let config = AgentConfig {
+            max_timeout,
+            ..Default::default()
+        };
         agent = agent.with_config(config);
         agent
     }

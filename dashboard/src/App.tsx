@@ -15,6 +15,7 @@ import ServerMetricsPage from './pages/ServerMetricsPage'
 import SetupRotateToken from './pages/SetupRotateToken'
 import SetupWelcome from './pages/SetupWelcome'
 import SetupWizard from './pages/SetupWizard'
+import HarnessPage from './pages/HarnessPage'
 import { HomePage, LlmPage, MessagingPage, ToolsPage, SkillsPage, SystemPage } from './pages/profile'
 
 export default function App() {
@@ -36,6 +37,7 @@ export default function App() {
               <Route path="users" element={<AdminGuard><UsersPage /></AdminGuard>} />
               <Route path="admin-bot" element={<AdminGuard><AdminBotPage /></AdminGuard>} />
               <Route path="server" element={<AdminGuard><ServerMetricsPage /></AdminGuard>} />
+              <Route path="harness" element={<AdminGuard><HarnessPage /></AdminGuard>} />
               <Route path="profiles/new" element={<AdminGuard><NewProfile /></AdminGuard>} />
               <Route path="setup/wizard" element={<AdminGuard><SetupWizard /></AdminGuard>} />
 

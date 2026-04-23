@@ -480,7 +480,6 @@ mod tests {
                 initial_delay: Duration::from_millis(1), // fast for tests
                 max_delay: Duration::from_millis(10),
                 backoff_multiplier: 1.0,
-                ..Default::default()
             },
         };
 
@@ -499,7 +498,6 @@ mod tests {
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(10),
                 backoff_multiplier: 1.0,
-                ..Default::default()
             },
         };
 
