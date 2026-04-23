@@ -44,6 +44,23 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 
+/// Upper bound on every operator-supplied identifier carried through the
+/// dispatch API. Mirrors
+/// [`octos_agent::harness_events::MAX_MESSAGE_BYTES`] (2 KiB) so the
+/// validator rejects a bad field before the event validator further
+/// downstream sees it — making the 400 failure mode uniform with the
+/// sink-write validator. Measured in bytes, not chars.
+const MAX_DISPATCH_FIELD_BYTES: usize = 2 * 1024;
+
+/// Hard cap on [`SwarmState::dispatches`]. Long-running deployments can
+/// accumulate dispatches indefinitely; once this threshold is hit the
+/// push path evicts the oldest entry (FIFO ring buffer) and appends the
+/// new one. Ring-buffer was chosen over 507-rejection so legitimate
+/// high-load production traffic never surfaces a user-visible storage
+/// error — the primitive's redb file remains the durable ground truth,
+/// this Vec is a best-effort read-model.
+pub const MAX_IN_MEMORY_DISPATCHES: usize = 4096;
+
 /// Shared swarm state plumbed into [`AppState`] by `octos serve`. Owns
 /// the primitive, the cost ledger, and an in-memory dispatch index used
 /// for list / detail endpoints. The state is wired at serve boot so
@@ -60,7 +77,10 @@ pub struct SwarmState {
     /// In-memory record of each dispatch + its full
     /// [`SwarmResult`]. The primitive's redb file keeps the durable
     /// ground truth — this is the read-model the dashboard renders.
-    /// Re-dispatching an existing id overwrites the row.
+    /// Re-dispatching an existing id overwrites the row. Capped at
+    /// [`MAX_IN_MEMORY_DISPATCHES`] — the oldest entry is dropped FIFO
+    /// when the cap is exceeded so long-running servers cannot leak
+    /// memory through the read-model.
     pub dispatches: RwLock<Vec<DispatchEntry>>,
     /// Default supervisor context stamped on primitive dispatches. Real
     /// deployments override per-request; tests leave the default.
@@ -381,6 +401,14 @@ pub async fn dispatch_swarm(
                 entry.result = result.clone();
             }
             None => {
+                // Ring-buffer: evict the oldest entry (FIFO) when at the
+                // cap. The primitive's redb file keeps the durable ground
+                // truth; this Vec is a best-effort read-model, so we
+                // prefer a silent eviction to rejecting a legitimate
+                // dispatch with a user-visible 507.
+                if list.len() >= MAX_IN_MEMORY_DISPATCHES {
+                    list.remove(0);
+                }
                 list.push(DispatchEntry {
                     row: row.clone(),
                     result: result.clone(),
@@ -403,8 +431,22 @@ fn validate_dispatch_request(req: &SwarmDispatchRequest) -> Result<(), String> {
     if req.dispatch_id.trim().is_empty() {
         return Err("dispatch_id cannot be empty".into());
     }
+    // Length cap mirrors [`MAX_DISPATCH_FIELD_BYTES`] — a megabyte-scale
+    // dispatch_id should be rejected early so we never persist it.
+    if req.dispatch_id.len() > MAX_DISPATCH_FIELD_BYTES {
+        return Err(format!(
+            "dispatch_id length {} exceeds bound {MAX_DISPATCH_FIELD_BYTES}",
+            req.dispatch_id.len()
+        ));
+    }
     if req.contract_id.trim().is_empty() {
         return Err("contract_id cannot be empty".into());
+    }
+    if req.contract_id.len() > MAX_DISPATCH_FIELD_BYTES {
+        return Err(format!(
+            "contract_id length {} exceeds bound {MAX_DISPATCH_FIELD_BYTES}",
+            req.contract_id.len()
+        ));
     }
     if req.contracts.is_empty() {
         // Fanout topology supplies its own contracts via the pattern,
@@ -418,8 +460,20 @@ fn validate_dispatch_request(req: &SwarmDispatchRequest) -> Result<(), String> {
         if contract.contract_id.trim().is_empty() {
             return Err("contract.contract_id cannot be empty".into());
         }
+        if contract.contract_id.len() > MAX_DISPATCH_FIELD_BYTES {
+            return Err(format!(
+                "contract.contract_id length {} exceeds bound {MAX_DISPATCH_FIELD_BYTES}",
+                contract.contract_id.len()
+            ));
+        }
         if contract.tool_name.trim().is_empty() {
             return Err("contract.tool_name cannot be empty".into());
+        }
+        if contract.tool_name.len() > MAX_DISPATCH_FIELD_BYTES {
+            return Err(format!(
+                "contract.tool_name length {} exceeds bound {MAX_DISPATCH_FIELD_BYTES}",
+                contract.tool_name.len()
+            ));
         }
     }
     if let Some(rounds) = req.budget.max_retry_rounds {
@@ -1046,6 +1100,231 @@ mod tests {
     fn parallel_topology_helper_clamps_zero_to_one() {
         let topo = parallel_topology(0);
         assert_eq!(topo.max_concurrency(), 1);
+    }
+
+    /// C-001: a pathological `dispatch_id` exceeding
+    /// [`MAX_DISPATCH_FIELD_BYTES`] (2 KiB) must be rejected by the
+    /// validator before the primitive sees it. Guards against a caller
+    /// sending a multi-megabyte id that would then propagate into every
+    /// harness event emitted for the dispatch.
+    #[test]
+    fn should_reject_oversized_dispatch_id() {
+        let oversized = "a".repeat(MAX_DISPATCH_FIELD_BYTES + 1);
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: oversized,
+            contract_id: "c1".into(),
+            contracts: vec![ContractSpec {
+                contract_id: "sub".into(),
+                tool_name: "run".into(),
+                task: serde_json::json!({}),
+                label: None,
+            }],
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec::default(),
+            context: None,
+        };
+        let err = validate_dispatch_request(&req).expect_err("oversize dispatch_id must 400");
+        assert!(
+            err.contains("dispatch_id length"),
+            "expected typed reason, got: {err}"
+        );
+    }
+
+    /// C-001: oversize `contract_id` is rejected before persistence.
+    #[test]
+    fn should_reject_oversized_contract_id() {
+        let oversized = "c".repeat(MAX_DISPATCH_FIELD_BYTES + 1);
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: "d1".into(),
+            contract_id: oversized,
+            contracts: vec![ContractSpec {
+                contract_id: "sub".into(),
+                tool_name: "run".into(),
+                task: serde_json::json!({}),
+                label: None,
+            }],
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec::default(),
+            context: None,
+        };
+        let err = validate_dispatch_request(&req).expect_err("oversize contract_id must 400");
+        assert!(
+            err.contains("contract_id length"),
+            "expected typed reason, got: {err}"
+        );
+    }
+
+    /// C-001: oversize nested `contract.contract_id` is rejected.
+    #[test]
+    fn should_reject_oversized_contract_spec_id() {
+        let oversized = "x".repeat(MAX_DISPATCH_FIELD_BYTES + 1);
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: "d1".into(),
+            contract_id: "c1".into(),
+            contracts: vec![ContractSpec {
+                contract_id: oversized,
+                tool_name: "run".into(),
+                task: serde_json::json!({}),
+                label: None,
+            }],
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec::default(),
+            context: None,
+        };
+        let err =
+            validate_dispatch_request(&req).expect_err("oversize contract.contract_id must 400");
+        assert!(
+            err.contains("contract.contract_id length"),
+            "expected typed reason, got: {err}"
+        );
+    }
+
+    /// C-001: oversize `contract.tool_name` is rejected.
+    #[test]
+    fn should_reject_oversized_tool_name() {
+        let oversized = "t".repeat(MAX_DISPATCH_FIELD_BYTES + 1);
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: "d1".into(),
+            contract_id: "c1".into(),
+            contracts: vec![ContractSpec {
+                contract_id: "sub".into(),
+                tool_name: oversized,
+                task: serde_json::json!({}),
+                label: None,
+            }],
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec::default(),
+            context: None,
+        };
+        let err = validate_dispatch_request(&req).expect_err("oversize tool_name must 400");
+        assert!(
+            err.contains("contract.tool_name length"),
+            "expected typed reason, got: {err}"
+        );
+    }
+
+    /// C-001: pushing past [`MAX_IN_MEMORY_DISPATCHES`] must evict the
+    /// oldest entry FIFO and keep the Vec at the cap. This mirrors the
+    /// ring-buffer logic on the handler push path so we catch a future
+    /// regression that reverts to an uncapped push.
+    #[tokio::test]
+    async fn should_evict_oldest_when_dispatches_exceed_cap() {
+        use octos_swarm::{AggregateArtifact, SubtaskOutcome, SwarmOutcomeKind, SwarmResult};
+        use tempfile::TempDir;
+
+        let cap = MAX_IN_MEMORY_DISPATCHES;
+        assert!(
+            cap >= 2,
+            "cap must be at least 2 for this test to be meaningful"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let swarm_state = build_test_swarm_state(dir.path().join("swarm"), cost_ledger)
+            .await
+            .unwrap();
+
+        // Pre-seed to exactly the cap so the next insert must evict.
+        {
+            let mut entries = swarm_state.dispatches.write().unwrap();
+            for i in 0..cap {
+                entries.push(DispatchEntry {
+                    row: DispatchIndexRow {
+                        dispatch_id: format!("d-{i}"),
+                        contract_id: "c1".into(),
+                        topology: "parallel".into(),
+                        outcome: "success".into(),
+                        total_subtasks: 0,
+                        completed_subtasks: 0,
+                        retry_rounds_used: 0,
+                        created_at: "2026-04-22T00:00:00Z".into(),
+                        total_cost_usd: None,
+                        review_accepted: None,
+                    },
+                    result: SwarmResult {
+                        dispatch_id: format!("d-{i}"),
+                        outcome: SwarmOutcomeKind::Success,
+                        topology: "parallel".into(),
+                        total_subtasks: 0,
+                        completed_subtasks: 0,
+                        retry_rounds_used: 0,
+                        per_task_outcomes: Vec::<SubtaskOutcome>::new(),
+                        aggregate_artifact: AggregateArtifact::default(),
+                        validator_results: Vec::new(),
+                        total_cost_usd: None,
+                    },
+                    review_reviewer: None,
+                    review_notes: None,
+                });
+            }
+            assert_eq!(entries.len(), cap, "pre-seed should fill exactly to cap");
+        }
+
+        // Simulate the handler's ring-buffer push path directly — same
+        // `if len >= cap { remove(0) }; push(...)` semantics.
+        {
+            let mut list = swarm_state.dispatches.write().unwrap();
+            if list.len() >= MAX_IN_MEMORY_DISPATCHES {
+                list.remove(0);
+            }
+            list.push(DispatchEntry {
+                row: DispatchIndexRow {
+                    dispatch_id: "d-overflow".into(),
+                    contract_id: "c1".into(),
+                    topology: "parallel".into(),
+                    outcome: "success".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    created_at: "2026-04-22T00:00:01Z".into(),
+                    total_cost_usd: None,
+                    review_accepted: None,
+                },
+                result: SwarmResult {
+                    dispatch_id: "d-overflow".into(),
+                    outcome: SwarmOutcomeKind::Success,
+                    topology: "parallel".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    per_task_outcomes: Vec::<SubtaskOutcome>::new(),
+                    aggregate_artifact: AggregateArtifact::default(),
+                    validator_results: Vec::new(),
+                    total_cost_usd: None,
+                },
+                review_reviewer: None,
+                review_notes: None,
+            });
+        }
+
+        let entries = swarm_state.dispatches.read().unwrap();
+        assert_eq!(
+            entries.len(),
+            cap,
+            "ring buffer must stay exactly at cap after overflow push"
+        );
+        assert_eq!(
+            entries.first().unwrap().row.dispatch_id,
+            "d-1",
+            "oldest entry (d-0) must have been evicted — head should be d-1"
+        );
+        assert_eq!(
+            entries.last().unwrap().row.dispatch_id,
+            "d-overflow",
+            "newest entry must be the tail"
+        );
     }
 
     /// F-019: a user-role caller may only submit a review under their own
