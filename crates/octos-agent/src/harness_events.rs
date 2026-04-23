@@ -167,6 +167,15 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessFailureEvent,
     },
+    /// Outer orchestrator invoked a session-level MCP tool exposed by `octos mcp-serve`.
+    ///
+    /// Emitted once per `tools/call` dispatch (stdio or http). The `outcome`
+    /// field is one of `ready`, `failed`, `queued`, `running`, or `verifying`,
+    /// matching [`TaskLifecycleState`](crate::task_supervisor::TaskLifecycleState).
+    McpServerCall {
+        #[serde(flatten)]
+        data: HarnessMcpServerCallEvent,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -267,6 +276,30 @@ pub struct HarnessFailureEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// One MCP-server-mode `tools/call` dispatch — emitted by `octos mcp-serve` so
+/// outer orchestrators appear in the same harness audit log as local tool calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessMcpServerCallEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// The MCP tool name (currently always `run_octos_session`).
+    pub tool: String,
+    /// Opaque identifier for the caller. For stdio this is the parent process
+    /// label; for HTTP it is the bearer-token fingerprint (never the raw token).
+    pub caller_id: String,
+    /// Transport that received this call: `stdio` or `http`.
+    pub transport: String,
+    /// Coarse lifecycle outcome: `ready`, `failed`, `queued`, `running`, or
+    /// `verifying`. Matches [`TaskLifecycleState`](crate::task_supervisor::TaskLifecycleState).
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 impl HarnessEvent {
     pub fn progress(
         session_id: impl Into<String>,
@@ -308,6 +341,35 @@ impl HarnessEvent {
                     workflow: workflow.map(Into::into),
                     phase: phase.into(),
                     message: message.map(Into::into),
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mcp_server_call(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        tool: impl Into<String>,
+        caller_id: impl Into<String>,
+        transport: impl Into<String>,
+        outcome: impl Into<String>,
+        contract: Option<impl Into<String>>,
+        error: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::McpServerCall {
+                data: HarnessMcpServerCallEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    tool: tool.into(),
+                    caller_id: caller_id.into(),
+                    transport: transport.into(),
+                    outcome: outcome.into(),
+                    contract: contract.map(Into::into),
+                    error: error.map(Into::into),
                     extra: HashMap::new(),
                 },
             },
@@ -384,6 +446,17 @@ impl HarnessEvent {
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
                 validate_bounded("failure message", &data.message, MAX_MESSAGE_BYTES)?;
+            }
+            HarnessEventPayload::McpServerCall { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded("tool", &data.tool, MAX_WORKFLOW_BYTES)?;
+                validate_bounded("caller_id", &data.caller_id, MAX_WORKFLOW_BYTES)?;
+                validate_bounded("transport", &data.transport, MAX_PHASE_BYTES)?;
+                validate_bounded("outcome", &data.outcome, MAX_PHASE_BYTES)?;
+                validate_optional_name("contract", data.contract.as_deref(), MAX_WORKFLOW_BYTES)?;
+                if let Some(error) = data.error.as_deref() {
+                    validate_bounded("error", error, MAX_MESSAGE_BYTES)?;
+                }
             }
         }
 
@@ -498,6 +571,21 @@ impl HarnessEvent {
                     "retryable": data.retryable,
                 })
             }
+            HarnessEventPayload::McpServerCall { data } => serde_json::json!({
+                "schema": self.schema,
+                "kind": "mcp_server_call",
+                "session_id": data.session_id,
+                "task_id": data.task_id,
+                "tool": data.tool,
+                "caller_id": data.caller_id,
+                "transport": data.transport,
+                "outcome": data.outcome,
+                "contract": data.contract,
+                "workflow": fallback_workflow_kind,
+                "workflow_kind": fallback_workflow_kind,
+                "current_phase": fallback_current_phase,
+                "error": data.error,
+            }),
         }
     }
 
@@ -509,6 +597,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.session_id,
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
+            HarnessEventPayload::McpServerCall { data } => &data.session_id,
         }
     }
 
@@ -520,6 +609,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.task_id,
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
+            HarnessEventPayload::McpServerCall { data } => &data.task_id,
         }
     }
 
@@ -531,6 +621,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.workflow.as_deref(),
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
+            HarnessEventPayload::McpServerCall { .. } => None,
         }
     }
 
@@ -542,6 +633,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.phase.as_deref(),
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
+            HarnessEventPayload::McpServerCall { .. } => None,
         }
     }
 }
@@ -867,6 +959,52 @@ mod tests {
         assert_eq!(detail["schema_version"], VALIDATOR_RESULT_SCHEMA_VERSION);
         assert_eq!(detail["validator"], "cargo-test");
         assert_eq!(detail["passed"], true);
+    }
+
+    #[test]
+    fn mcp_server_call_event_round_trips() {
+        let event = HarnessEvent::mcp_server_call(
+            "mcp:http",
+            "task-42",
+            "run_octos_session",
+            "http-bearer",
+            "http",
+            "ready",
+            Some("slides_delivery"),
+            Option::<String>::None,
+        );
+        assert!(event.validate().is_ok());
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""kind":"mcp_server_call""#));
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        match &parsed.payload {
+            HarnessEventPayload::McpServerCall { data } => {
+                assert_eq!(data.tool, "run_octos_session");
+                assert_eq!(data.transport, "http");
+                assert_eq!(data.outcome, "ready");
+                assert_eq!(data.contract.as_deref(), Some("slides_delivery"));
+            }
+            _ => panic!("expected McpServerCall variant"),
+        }
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "mcp_server_call");
+        assert_eq!(detail["transport"], "http");
+        assert_eq!(detail["outcome"], "ready");
+    }
+
+    #[test]
+    fn mcp_server_call_event_rejects_empty_tool() {
+        let event = HarnessEvent::mcp_server_call(
+            "mcp:stdio",
+            "task-1",
+            "",
+            "parent-process",
+            "stdio",
+            "ready",
+            Option::<String>::None,
+            Option::<String>::None,
+        );
+        assert!(event.validate().is_err());
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod mcp_server;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -58,8 +59,8 @@ pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
-    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
-    HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
+    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent,
+    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessValidatorResultEvent,
     MAX_HARNESS_EVENT_LINE_BYTES,
 };
 pub use hooks::{
