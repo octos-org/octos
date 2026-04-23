@@ -1,7 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import HarnessTaskTable, { LIFECYCLE_ORDER } from '../components/HarnessTaskTable'
 import {
+  CompactionPanel,
+  CredentialPoolPanel,
+  DelegationTreeStub,
+  RetryBucketPanel,
+  RoutingDecisionPanel,
+} from '../components/CodingLoopPanel'
+import {
+  compactionViolationTotal,
+  credentialRotationTotal,
   harnessApi,
+  harnessErrorRows,
+  harnessErrorTotal,
+  loopRetryBuckets,
+  loopRetryTotal,
+  routingDecisionSummary,
+  taskHasLoopWarning,
   type HarnessLifecycleState,
   type HarnessTasksResponse,
   type OperatorSummaryResponse,
@@ -15,6 +30,7 @@ interface DerivedFilter {
   stale: boolean
   missingArtifact: boolean
   validatorFailed: boolean
+  loopWarnings: boolean
 }
 
 function formatTimestamp(iso: string | null | undefined): string {
@@ -77,6 +93,7 @@ export default function HarnessPage() {
     stale: false,
     missingArtifact: false,
     validatorFailed: false,
+    loopWarnings: false,
   })
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -130,9 +147,20 @@ export default function HarnessPage() {
       if (derivedFilter.stale && !task.derived.stale) return false
       if (derivedFilter.missingArtifact && !task.derived.missing_artifact) return false
       if (derivedFilter.validatorFailed && !task.derived.validator_failed) return false
+      if (derivedFilter.loopWarnings && !taskHasLoopWarning(task)) return false
       return true
     })
   }, [tasksResp, lifecycleFilter, derivedFilter])
+
+  const loopWarningCount = useMemo(
+    () => (tasksResp?.tasks ?? []).filter(taskHasLoopWarning).length,
+    [tasksResp],
+  )
+
+  const retryExhaustingCount = useMemo(
+    () => loopRetryBuckets(summary).filter((b) => b.exhausted_share > 0.5).length,
+    [summary],
+  )
 
   const totals = tasksResp?.totals_by_lifecycle ?? {}
   const summaryTotals = summary?.totals ?? {}
@@ -222,7 +250,7 @@ export default function HarnessPage() {
       </div>
 
       {/* Derived signal counts */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="derived-counts">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-3" data-testid="derived-counts">
         <CountCard
           label="Stale / zombie"
           value={tasksResp?.stale_count ?? 0}
@@ -256,7 +284,117 @@ export default function HarnessPage() {
           }
           active={derivedFilter.validatorFailed}
         />
+        <CountCard
+          label="Loop errors"
+          value={harnessErrorTotal(summary)}
+          testId="count-loop-errors"
+          tone={harnessErrorTotal(summary) > 0 ? 'danger' : 'ok'}
+          highlight={harnessErrorTotal(summary) > 0}
+        />
       </div>
+
+      {/* M6 coding-loop health cards — aggregated counters per panel */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3" data-testid="loop-health-counts">
+        <CountCard
+          label="Loop warnings"
+          value={loopWarningCount}
+          testId="count-loop-warnings"
+          tone={loopWarningCount > 0 ? 'warn' : 'ok'}
+          highlight={loopWarningCount > 0}
+          onClick={() =>
+            setDerivedFilter((d) => ({ ...d, loopWarnings: !d.loopWarnings }))
+          }
+          active={derivedFilter.loopWarnings}
+        />
+        <CountCard
+          label="Retry decisions"
+          value={loopRetryTotal(summary)}
+          testId="count-retry-decisions"
+          tone={retryExhaustingCount > 0 ? 'danger' : 'default'}
+          highlight={retryExhaustingCount > 0}
+        />
+        <CountCard
+          label="Compaction viol."
+          value={compactionViolationTotal(summary)}
+          testId="count-compaction-violations"
+          tone={compactionViolationTotal(summary) > 0 ? 'danger' : 'ok'}
+          highlight={compactionViolationTotal(summary) > 0}
+        />
+        <CountCard
+          label="Credential rotations"
+          value={credentialRotationTotal(summary)}
+          testId="count-credential-rotations"
+          tone="default"
+        />
+        <CountCard
+          label="Cheap share"
+          value={
+            routingDecisionSummary(summary).total > 0
+              ? `${(routingDecisionSummary(summary).cheap_share * 100).toFixed(0)}%`
+              : '—'
+          }
+          testId="count-routing-cheap-share"
+          tone="accent"
+        />
+      </div>
+
+      {/* M6.1 — harness error taxonomy breakdown */}
+      {harnessErrorRows(summary).length > 0 && (
+        <div
+          className="bg-surface border border-gray-700/50 rounded-xl"
+          data-testid="harness-errors"
+        >
+          <div className="px-5 py-3 border-b border-gray-700/30">
+            <h2 className="text-sm font-semibold text-gray-300">
+              Structured errors (last hour)
+            </h2>
+            <p className="text-[11px] text-gray-500">
+              Counter <code>octos_loop_error_total</code> by{' '}
+              <code>variant</code> and <code>recovery</code> hint. Variant names
+              match <code>HarnessError::variant_name()</code>.
+            </p>
+          </div>
+          <table className="w-full text-sm" data-testid="harness-error-table">
+            <thead>
+              <tr className="text-xs text-gray-500 border-b border-gray-700/30">
+                <th className="text-left py-2 px-5 font-medium">variant</th>
+                <th className="text-left py-2 px-3 font-medium">recovery</th>
+                <th className="text-right py-2 px-5 font-medium">count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {harnessErrorRows(summary)
+                .slice(0, 20)
+                .map((row, i) => (
+                  <tr
+                    key={`${row.variant}|${row.recovery}|${i}`}
+                    data-testid="harness-error-row"
+                    data-variant={row.variant}
+                    data-recovery={row.recovery}
+                    className="border-b border-gray-700/15 last:border-0"
+                  >
+                    <td className="py-2 px-5 font-mono text-gray-300">{row.variant}</td>
+                    <td className="py-2 px-3 font-mono text-gray-400">{row.recovery}</td>
+                    <td className="py-2 px-5 text-right font-mono text-gray-300">
+                      {row.count}
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* M6 coding-loop health panels */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4" data-testid="loop-health-panels">
+        <RetryBucketPanel summary={summary} />
+        <CompactionPanel summary={summary} />
+        <CredentialPoolPanel summary={summary} />
+        <RoutingDecisionPanel summary={summary} />
+      </div>
+
+      {/* Delegation tree (M6.7) stub. Replaced with real data when M6.7 merges. */}
+      <DelegationTreeStub />
 
       {tasksError && (
         <div
