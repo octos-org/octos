@@ -83,9 +83,8 @@ pub use tools::{
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
     PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, Tool, ToolConfigStore, ToolPolicy,
+    ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     install_robot_registry,
 };
