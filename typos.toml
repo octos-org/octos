@@ -31,6 +31,8 @@ unparseable = "unparseable"
 iz = "iz"
 # One-Time Passwords (OTPs)
 ot = "ot"
+# Rust TUI library name
+ratatui = "ratatui"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]
