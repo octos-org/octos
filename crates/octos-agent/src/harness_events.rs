@@ -1132,34 +1132,6 @@ mod tests {
     }
 
     #[test]
-    fn routing_decision_event_round_trips_and_keeps_kind() {
-        let event = HarnessEvent::routing_decision(
-            "session-1",
-            "task-1",
-            Some("chat"),
-            "strong",
-            vec!["code_fence".into(), "keyword:debug".into()],
-            512,
-        );
-        event.validate().expect("routing decision should be valid");
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""schema":"octos.harness.event.v1""#));
-        assert!(json.contains(r#""kind":"routing.decision""#));
-        assert!(json.contains(r#""tier":"strong""#));
-
-        let parsed = HarnessEvent::from_json_line(&json).unwrap();
-        assert_eq!(parsed.session_id(), "session-1");
-        assert_eq!(parsed.task_id(), "task-1");
-
-        let detail = parsed.runtime_detail_value(None, None);
-        assert_eq!(detail["kind"], "routing.decision");
-        assert_eq!(detail["tier"], "strong");
-        assert_eq!(detail["input_chars"], 512);
-        assert_eq!(detail["reasons"][0], "code_fence");
-    }
-
-    #[test]
     fn should_round_trip_credential_rotation_event() {
         let event = HarnessEvent::credential_rotation(
             "session-1",
@@ -1187,6 +1159,34 @@ mod tests {
         assert!(invalid.validate().is_err());
         let invalid = HarnessEvent::credential_rotation("s", "t", "key", "init", "");
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn routing_decision_event_round_trips_and_keeps_kind() {
+        let event = HarnessEvent::routing_decision(
+            "session-1",
+            "task-1",
+            Some("chat"),
+            "strong",
+            vec!["code_fence".into(), "keyword:debug".into()],
+            512,
+        );
+        event.validate().expect("routing decision should be valid");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""schema":"octos.harness.event.v1""#));
+        assert!(json.contains(r#""kind":"routing.decision""#));
+        assert!(json.contains(r#""tier":"strong""#));
+
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        assert_eq!(parsed.session_id(), "session-1");
+        assert_eq!(parsed.task_id(), "task-1");
+
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "routing.decision");
+        assert_eq!(detail["tier"], "strong");
+        assert_eq!(detail["input_chars"], 512);
+        assert_eq!(detail["reasons"][0], "code_fence");
     }
 
     #[test]

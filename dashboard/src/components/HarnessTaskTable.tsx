@@ -158,6 +158,18 @@ export default function HarnessTaskTable({ tasks, now }: HarnessTaskTableProps) 
                         validator
                       </span>
                     )}
+                    {task.error &&
+                      !task.derived.validator_failed &&
+                      !task.derived.stale &&
+                      !task.derived.missing_artifact && (
+                        <span
+                          data-testid="badge-loop-error"
+                          title={task.error}
+                          className="px-1.5 py-0.5 text-[10px] rounded bg-red-500/10 text-red-300 border border-red-500/30"
+                        >
+                          loop-err
+                        </span>
+                      )}
                   </div>
                 </td>
                 <td className="py-2 px-3">
