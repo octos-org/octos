@@ -55,6 +55,7 @@ export default function Sidebar() {
                 <SidebarLink to="/users" icon={<UsersIcon />} label="Access" />
                 <SidebarLink to="/admin-bot" icon={<BotIcon />} label="Admin Bot" />
                 <SidebarLink to="/harness" icon={<ShieldIcon />} label="Harness" />
+                <SidebarLink to="/swarm" icon={<SwarmIcon />} label="Swarm" />
                 <SidebarLink to="/server" icon={<PulseIcon />} label="Server" />
               </>
             )}
@@ -222,6 +223,19 @@ function ShieldIcon() {
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M12 3l8 4v5c0 4.5-3.3 8.6-8 9-4.7-.4-8-4.5-8-9V7l8-4z" />
       <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4" />
+    </svg>
+  )
+}
+
+function SwarmIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <circle cx="12" cy="12" r="2" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="5" cy="5" r="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="19" cy="5" r="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="5" cy="19" r="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="19" cy="19" r="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 10.5L6 6M13.5 10.5L18 6M10.5 13.5L6 18M13.5 13.5L18 18" />
     </svg>
   )
 }

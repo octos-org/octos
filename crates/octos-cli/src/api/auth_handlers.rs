@@ -2199,6 +2199,7 @@ mod tests {
             deployment_mode: crate::config::DeploymentMode::Local,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         };
         (dir, state, user_store, profile_store)
     }

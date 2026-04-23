@@ -82,6 +82,14 @@ pub const SWARM_DISPATCH_SCHEMA_VERSION: u32 = 1;
 /// fields so new additive fields stay backward compatible.
 pub const COST_ATTRIBUTION_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::SwarmReviewDecision`](crate::harness_events::HarnessEventPayload::SwarmReviewDecision)
+/// event emitted when a supervisor accepts or rejects a completed
+/// swarm dispatch via the M7.6 contract-authoring dashboard. The
+/// schema carries the `dispatch_id`, the `accepted` boolean, the
+/// reviewer identity, and optional free-form notes.
+pub const SWARM_REVIEW_DECISION_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `SessionSummary` (harness M6.4).
 ///
 /// Carries the typed LLM-iterative compaction summary: goal, constraints,
@@ -308,6 +316,27 @@ mod tests {
         let err = check_supported("CostAttribution", 99, COST_ATTRIBUTION_SCHEMA_VERSION)
             .expect_err("future version should be rejected");
         assert_eq!(err.kind, "CostAttribution");
+        assert_eq!(err.found, 99);
+    }
+
+    #[test]
+    fn swarm_review_decision_schema_version_is_registered_at_v1() {
+        assert_eq!(SWARM_REVIEW_DECISION_SCHEMA_VERSION, 1);
+        assert!(
+            check_supported(
+                "SwarmReviewDecision",
+                SWARM_REVIEW_DECISION_SCHEMA_VERSION,
+                SWARM_REVIEW_DECISION_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+        let err = check_supported(
+            "SwarmReviewDecision",
+            99,
+            SWARM_REVIEW_DECISION_SCHEMA_VERSION,
+        )
+        .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "SwarmReviewDecision");
         assert_eq!(err.found, 99);
     }
 }

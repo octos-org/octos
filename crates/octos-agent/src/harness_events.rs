@@ -20,6 +20,7 @@ use tracing::warn;
 use crate::abi_schema::{
     COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
     SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
+    SWARM_REVIEW_DECISION_SCHEMA_VERSION,
 };
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
@@ -53,6 +54,10 @@ fn default_swarm_dispatch_schema_version() -> u32 {
 
 fn default_cost_attribution_schema_version() -> u32 {
     COST_ATTRIBUTION_SCHEMA_VERSION
+}
+
+fn default_swarm_review_decision_schema_version() -> u32 {
+    SWARM_REVIEW_DECISION_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +257,16 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessSwarmDispatchEvent,
     },
+    /// Supervisor review outcome for a completed swarm dispatch (M7.6).
+    ///
+    /// Emitted when the contract-authoring dashboard's review gate
+    /// accepts or rejects a finalized `SwarmResult`. Typed so the
+    /// provenance ledger, archive, and Matrix audit stream all see the
+    /// same decision without re-parsing free-form JSON.
+    SwarmReviewDecision {
+        #[serde(flatten)]
+        data: HarnessSwarmReviewDecisionEvent,
+    },
     CostAttribution {
         #[serde(flatten)]
         data: HarnessCostAttributionEvent,
@@ -412,6 +427,41 @@ pub struct HarnessSwarmDispatchEvent {
     /// Optional human-readable error message for non-success outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Supervisor decision event emitted by the M7.6 review gate. Captures
+/// whether the reviewer accepted or rejected a finalized swarm dispatch,
+/// who reviewed it, and optional freeform notes. Downstream tooling
+/// (Matrix audit, ledger archive, operator summary) reads the typed
+/// variant so the decision never round-trips through stringly-typed JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessSwarmReviewDecisionEvent {
+    #[serde(default = "default_swarm_review_decision_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Dispatch id the review applies to. Matches the
+    /// [`HarnessSwarmDispatchEvent::dispatch_id`] the primitive emits
+    /// when the swarm finalises.
+    pub dispatch_id: String,
+    /// `true` when the reviewer accepted the aggregate artifact. `false`
+    /// routes the dispatch back to the supervisor for re-contract or
+    /// abandonment.
+    pub accepted: bool,
+    /// Stable identifier of the reviewer (user id, email, Matrix handle).
+    /// Kept short enough to fit the session_id bound.
+    pub reviewer: String,
+    /// Optional free-form notes. Bounded to
+    /// [`MAX_MESSAGE_BYTES`](crate::harness_events::MAX_HARNESS_EVENT_LINE_BYTES)
+    /// so a single review cannot blow the event line limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -591,6 +641,14 @@ impl HarnessEvent {
         Self {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
             payload: HarnessEventPayload::SwarmDispatch { data },
+        }
+    }
+
+    /// Convenience builder for a `SwarmReviewDecision` event (M7.6).
+    pub fn swarm_review_decision(data: HarnessSwarmReviewDecisionEvent) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::SwarmReviewDecision { data },
         }
     }
 
@@ -814,6 +872,22 @@ impl HarnessEvent {
                 validate_bounded("swarm topology", &data.topology, MAX_MESSAGE_BYTES)?;
                 validate_bounded("swarm outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
                 validate_optional_message(data.message.as_deref())?;
+            }
+            HarnessEventPayload::SwarmReviewDecision { data } => {
+                if data.schema_version > SWARM_REVIEW_DECISION_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported swarm review decision schema_version {} (max supported: {})",
+                        data.schema_version, SWARM_REVIEW_DECISION_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("review dispatch_id", &data.dispatch_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("reviewer", &data.reviewer, MAX_SESSION_ID_BYTES)?;
+                if let Some(notes) = data.notes.as_deref() {
+                    validate_bounded("review notes", notes, MAX_MESSAGE_BYTES)?;
+                }
             }
             HarnessEventPayload::CostAttribution { data } => {
                 if data.schema_version > COST_ATTRIBUTION_SCHEMA_VERSION {
@@ -1045,6 +1119,25 @@ impl HarnessEvent {
                     "message": data.message,
                 })
             }
+            HarnessEventPayload::SwarmReviewDecision { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "swarm_review_decision",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "dispatch_id": data.dispatch_id,
+                    "accepted": data.accepted,
+                    "reviewer": data.reviewer,
+                    "notes": data.notes,
+                })
+            }
             HarnessEventPayload::CostAttribution { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -1129,6 +1222,7 @@ impl HarnessEvent {
             HarnessEventPayload::McpServerCall { data } => &data.session_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.session_id,
             HarnessEventPayload::SwarmDispatch { data } => &data.session_id,
+            HarnessEventPayload::SwarmReviewDecision { data } => &data.session_id,
             HarnessEventPayload::CostAttribution { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
@@ -1147,6 +1241,7 @@ impl HarnessEvent {
             HarnessEventPayload::McpServerCall { data } => &data.task_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.task_id,
             HarnessEventPayload::SwarmDispatch { data } => &data.task_id,
+            HarnessEventPayload::SwarmReviewDecision { data } => &data.task_id,
             HarnessEventPayload::CostAttribution { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
@@ -1165,6 +1260,7 @@ impl HarnessEvent {
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.workflow.as_deref(),
             HarnessEventPayload::SwarmDispatch { data } => data.workflow.as_deref(),
+            HarnessEventPayload::SwarmReviewDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
@@ -1183,6 +1279,7 @@ impl HarnessEvent {
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.phase.as_deref(),
             HarnessEventPayload::SwarmDispatch { data } => data.phase.as_deref(),
+            HarnessEventPayload::SwarmReviewDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
