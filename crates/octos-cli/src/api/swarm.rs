@@ -38,7 +38,7 @@ use octos_agent::{
 };
 use octos_swarm::{
     ContractSpec, NoopCostLedger, SubtaskOutcome, SubtaskStatus, Swarm, SwarmBudget, SwarmContext,
-    SwarmOutcomeKind, SwarmResult, SwarmTopology,
+    SwarmEventSink, SwarmOutcomeKind, SwarmResult, SwarmTopology,
 };
 use serde::{Deserialize, Serialize};
 
@@ -762,16 +762,69 @@ pub async fn submit_review(
 
 // ── Helpers for wiring from `serve` ─────────────────────────────────
 
+/// [`SwarmEventSink`] that forwards every emitted [`HarnessEvent`] to
+/// the shared SSE broadcaster and — when configured — appends the same
+/// event to the JSONL harness sink.
+///
+/// F-009: previously `build_swarm_state` relied on the primitive's
+/// default [`NoopSwarmEventSink`], so every `HarnessSwarmDispatchEvent`
+/// was discarded and `/api/events/harness?kinds=SwarmDispatch` never
+/// received a single frame. The M7.8 live gate expected these events.
+pub struct BroadcasterSwarmEventSink {
+    pub broadcaster: Arc<super::SseBroadcaster>,
+    pub sink_path: Option<String>,
+}
+
+impl BroadcasterSwarmEventSink {
+    pub fn new(broadcaster: Arc<super::SseBroadcaster>, sink_path: Option<String>) -> Self {
+        Self {
+            broadcaster,
+            sink_path,
+        }
+    }
+}
+
+impl SwarmEventSink for BroadcasterSwarmEventSink {
+    fn emit(&self, event: &HarnessEvent) {
+        // Persist FIRST so a crash between the write and the broadcast
+        // can't lose the dispatch record. The live broadcast is the
+        // fire-and-forget half — subscribers that miss the frame can
+        // replay from the sink file later.
+        if let Some(sink_path) = self.sink_path.as_ref() {
+            if let Err(err) = write_event_to_sink(sink_path, event) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist swarm dispatch event to harness sink"
+                );
+            }
+        }
+        let body = serde_json::to_string(&event.runtime_detail_value(None, None))
+            .unwrap_or_else(|_| "{}".into());
+        let _ = self.broadcaster.send_raw(body);
+    }
+}
+
 /// Build a [`SwarmState`] given a backend and data directory. The backend
 /// is injected by the caller so the dashboard can swap transports (local
 /// stdio, remote HTTPS) without this module growing a backend factory.
+///
+/// The wired event sink forwards every `HarnessSwarmDispatchEvent`
+/// through [`BroadcasterSwarmEventSink`] so the dashboard's Live tab +
+/// the M7.8 live gate both see frames on `/api/events/harness`.
 pub async fn build_swarm_state(
     backend: Arc<dyn McpAgentBackend>,
     swarm_dir: impl Into<std::path::PathBuf>,
     cost_ledger: Arc<PersistentCostLedger>,
+    broadcaster: Arc<super::SseBroadcaster>,
+    sink_path: Option<String>,
 ) -> eyre::Result<SwarmState> {
     let swarm_dir = swarm_dir.into();
-    let swarm = Swarm::builder(backend, &swarm_dir).build().await?;
+    let sink: Arc<dyn SwarmEventSink> =
+        Arc::new(BroadcasterSwarmEventSink::new(broadcaster, sink_path));
+    let swarm = Swarm::builder(backend, &swarm_dir)
+        .with_event_sink(sink)
+        .build()
+        .await?;
     Ok(SwarmState {
         swarm: Arc::new(swarm),
         cost_ledger,
@@ -793,6 +846,31 @@ pub async fn build_test_swarm_state(
         // Wire a NoopCostLedger so the primitive's summarize never
         // contradicts the live PersistentCostLedger read.
         .with_ledger(Arc::new(NoopCostLedger))
+        .build()
+        .await?;
+    Ok(SwarmState {
+        swarm: Arc::new(swarm),
+        cost_ledger,
+        dispatches: RwLock::new(Vec::new()),
+        default_context: SwarmContextSpec::default(),
+    })
+}
+
+/// Test variant that wires the [`BroadcasterSwarmEventSink`] so integration
+/// tests can assert swarm dispatch events hit the broadcaster.
+pub async fn build_test_swarm_state_with_broadcaster(
+    swarm_dir: impl Into<std::path::PathBuf>,
+    cost_ledger: Arc<PersistentCostLedger>,
+    broadcaster: Arc<super::SseBroadcaster>,
+    sink_path: Option<String>,
+) -> eyre::Result<SwarmState> {
+    let backend: Arc<dyn McpAgentBackend> = Arc::new(TestStubBackend::default());
+    let swarm_dir = swarm_dir.into();
+    let sink: Arc<dyn SwarmEventSink> =
+        Arc::new(BroadcasterSwarmEventSink::new(broadcaster, sink_path));
+    let swarm = Swarm::builder(backend, &swarm_dir)
+        .with_ledger(Arc::new(NoopCostLedger))
+        .with_event_sink(sink)
         .build()
         .await?;
     Ok(SwarmState {
@@ -1265,5 +1343,139 @@ mod tests {
         assert!(resp.0.accepted);
         // No file — the tempdir is otherwise empty except for the redb
         // dirs. Nothing to assert beyond success + the sink being None.
+    }
+
+    /// F-009: every `HarnessSwarmDispatchEvent` the primitive emits must
+    /// reach the SSE broadcaster so the dashboard's Live tab + M7.8
+    /// live gate see frames on `/api/events/harness?kinds=SwarmDispatch`.
+    /// Before the fix `build_swarm_state` used the default
+    /// `NoopSwarmEventSink` and the event was silently discarded.
+    #[tokio::test]
+    async fn should_forward_swarm_event_to_broadcaster() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let broadcaster = Arc::new(super::super::SseBroadcaster::new(16));
+        let mut rx = broadcaster.subscribe();
+
+        let swarm_state = Arc::new(
+            build_test_swarm_state_with_broadcaster(
+                dir.path().join("swarm"),
+                cost_ledger,
+                broadcaster.clone(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Drive a dispatch through the primitive so it emits the
+        // `SwarmDispatch` event. TestStubBackend always succeeds so we
+        // know the event carries `outcome == "success"`.
+        use std::num::NonZeroUsize;
+        let outcome = swarm_state
+            .swarm
+            .dispatch(
+                String::from("d-event-sink"),
+                vec![ContractSpec {
+                    contract_id: "sub-1".into(),
+                    tool_name: "run".into(),
+                    task: serde_json::json!({}),
+                    label: None,
+                }],
+                SwarmTopology::Parallel {
+                    max_concurrency: NonZeroUsize::new(1).unwrap(),
+                },
+                SwarmBudget::default(),
+                SwarmContext {
+                    session_id: "api:swarm-test".into(),
+                    task_id: "task-1".into(),
+                    workflow: Some("swarm".into()),
+                    phase: Some("dispatch".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.total_subtasks, 1);
+
+        // Receive from the broadcaster — the frame must exist AND carry
+        // the SwarmDispatch kind with our dispatch_id, proving the sink
+        // was not the default Noop.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcaster frame must arrive within 1s")
+            .expect("broadcast channel still open");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("frame is JSON");
+        assert_eq!(
+            parsed.get("kind").and_then(|v| v.as_str()),
+            Some("swarm_dispatch"),
+            "expected swarm_dispatch kind, got frame: {frame}"
+        );
+        assert_eq!(
+            parsed.get("dispatch_id").and_then(|v| v.as_str()),
+            Some("d-event-sink")
+        );
+    }
+
+    /// F-009 durability complement: when a sink path is configured the
+    /// dispatch event also lands in the JSONL sink, matching the
+    /// guarantee documented on [`BroadcasterSwarmEventSink`].
+    #[tokio::test]
+    async fn should_persist_swarm_event_to_sink_when_configured() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let broadcaster = Arc::new(super::super::SseBroadcaster::new(16));
+        let sink_path = dir.path().join("swarm-events.jsonl");
+
+        let swarm_state = Arc::new(
+            build_test_swarm_state_with_broadcaster(
+                dir.path().join("swarm"),
+                cost_ledger,
+                broadcaster,
+                Some(sink_path.display().to_string()),
+            )
+            .await
+            .unwrap(),
+        );
+
+        use std::num::NonZeroUsize;
+        swarm_state
+            .swarm
+            .dispatch(
+                String::from("d-sink"),
+                vec![ContractSpec {
+                    contract_id: "sub-1".into(),
+                    tool_name: "run".into(),
+                    task: serde_json::json!({}),
+                    label: None,
+                }],
+                SwarmTopology::Parallel {
+                    max_concurrency: NonZeroUsize::new(1).unwrap(),
+                },
+                SwarmBudget::default(),
+                SwarmContext {
+                    session_id: "api:swarm-test".into(),
+                    task_id: "task-1".into(),
+                    workflow: Some("swarm".into()),
+                    phase: Some("dispatch".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&sink_path).expect("sink file must exist");
+        let line = contents.lines().next().expect("expected at least one line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("line must be JSON");
+        assert_eq!(
+            parsed.get("kind").and_then(|v| v.as_str()),
+            Some("swarm_dispatch")
+        );
+        assert_eq!(
+            parsed.get("dispatch_id").and_then(|v| v.as_str()),
+            Some("d-sink")
+        );
     }
 }

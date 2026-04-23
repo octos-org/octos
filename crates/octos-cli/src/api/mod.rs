@@ -20,10 +20,11 @@ pub use metrics::init_metrics;
 pub use router::build_router;
 pub use sse::SseBroadcaster;
 pub use swarm::{
-    CostAttributionView, CostAttributionsResponse, DispatchIndexRow, SubtaskView, SwarmBudgetSpec,
-    SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest, SwarmDispatchResponse,
-    SwarmDispatchesResponse, SwarmReviewRequest, SwarmReviewResponse, SwarmState, TestStubBackend,
-    ValidatorView, build_swarm_state, build_test_swarm_state, parallel_topology,
+    BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
+    SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
+    SwarmDispatchResponse, SwarmDispatchesResponse, SwarmReviewRequest, SwarmReviewResponse,
+    SwarmState, TestStubBackend, ValidatorView, build_swarm_state, build_test_swarm_state,
+    build_test_swarm_state_with_broadcaster, parallel_topology,
 };
 
 use std::collections::HashMap;
