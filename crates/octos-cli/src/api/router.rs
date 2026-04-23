@@ -746,7 +746,7 @@ async fn admin_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{AppState, SseBroadcaster};
+    use crate::api::AppState;
     use crate::config::DeploymentMode;
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;

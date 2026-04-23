@@ -4043,8 +4043,8 @@ mod register_setup_script_tests {
 #[cfg(test)]
 mod register_tenant_email_tests {
     use super::*;
+    use crate::api::AppState;
     use crate::api::router::AuthIdentity;
-    use crate::api::{AppState, SseBroadcaster};
     use crate::config::DeploymentMode;
     use crate::otp::{AuthManager, DashboardAuthConfig, SmtpConfig};
     use crate::user_store::{User, UserRole, UserStore};
@@ -4182,8 +4182,8 @@ mod register_tenant_email_tests {
 #[cfg(test)]
 mod register_flow_tests {
     use super::*;
+    use crate::api::AppState;
     use crate::api::router::AuthIdentity;
-    use crate::api::{AppState, SseBroadcaster};
     use crate::config::DeploymentMode;
     use crate::user_store::{User, UserRole, UserStore};
     use std::sync::Arc;

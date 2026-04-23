@@ -353,7 +353,7 @@ pub async fn frps_auth(
 #[cfg(test)]
 mod tests {
     use crate::api::admin::{CreateTenantRequest, create_tenant};
-    use crate::api::{AppState, RunIdCache, SseBroadcaster, build_router};
+    use crate::api::{AppState, build_router};
     use crate::config::DeploymentMode;
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::Json;
