@@ -11,6 +11,7 @@ mod cron;
 mod docs;
 pub(crate) mod gateway;
 mod init;
+mod mcp_serve;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
@@ -33,6 +34,7 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use mcp_serve::McpServeCommand;
 pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -89,6 +91,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
+    McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
     #[cfg(feature = "api")]
     Serve(ServeCommand),
@@ -171,6 +175,7 @@ impl Executable for Command {
             Self::Cron(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::McpServe(cmd) => cmd.execute(),
             #[cfg(feature = "api")]
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),

@@ -21,6 +21,7 @@ pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod mcp_server;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -69,9 +70,10 @@ pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCredentialRotationEvent,
     HarnessCredentialRotationSink, HarnessEvent, HarnessEventError, HarnessEventPayload,
-    HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent, HarnessProgressEvent,
-    HarnessRetryEvent, HarnessSubAgentDispatchEvent, HarnessValidatorResultEvent,
-    MAX_HARNESS_EVENT_LINE_BYTES, emit_registered_credential_rotation_event,
+    HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent, HarnessPhaseEvent,
+    HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
+    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    emit_registered_credential_rotation_event,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,

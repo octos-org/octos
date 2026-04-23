@@ -290,6 +290,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
         (
+            "mcp_server_calls".to_string(),
+            total_for_metric(samples, "octos_mcp_server_call_total"),
+        ),
+        (
             "sub_agent_dispatches".to_string(),
             total_for_metric(samples, "octos_sub_agent_dispatch_total"),
         ),
@@ -385,6 +389,10 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 "octos_workspace_validator_total",
                 &["status", "phase", "kind", "required"],
             ),
+        ),
+        (
+            "mcp_server_calls".to_string(),
+            breakdown(samples, "octos_mcp_server_call_total", &["tool", "outcome"]),
         ),
         (
             "sub_agent_dispatches".to_string(),
