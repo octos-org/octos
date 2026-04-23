@@ -250,6 +250,26 @@ pub struct ServeCommand {
     /// Disable automatic retry on transient errors.
     #[arg(long)]
     pub no_retry: bool,
+
+    /// ── swarm ── (M7.6 contract-authoring dashboard)
+    /// Backend transport for the swarm MCP agent. When unset the
+    /// `/api/swarm/*` endpoints return 503 (legacy opt-out behaviour).
+    /// `stdio` pairs with `--swarm-backend-cmd`; `http` pairs with
+    /// `--swarm-backend-url`.
+    #[arg(long, value_name = "stdio|http")]
+    pub swarm_backend: Option<String>,
+
+    /// Stdio MCP agent executable (e.g. `claude`). Required when
+    /// `--swarm-backend stdio` is set. Forwarded to
+    /// [`octos_agent::tools::mcp_agent::StdioMcpAgent`].
+    #[arg(long, value_name = "CMD")]
+    pub swarm_backend_cmd: Option<String>,
+
+    /// HTTPS URL for a remote MCP agent. Required when
+    /// `--swarm-backend http` is set. Forwarded to
+    /// [`octos_agent::tools::mcp_agent::HttpMcpAgent`].
+    #[arg(long, value_name = "URL")]
+    pub swarm_backend_url: Option<String>,
 }
 
 impl Executable for ServeCommand {
@@ -436,6 +456,24 @@ impl ServeCommand {
             .filter(|cfg| cfg.enabled)
             .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
 
+        // ── swarm ──────────────────────────────────────────────────
+        // F-010: construct an MCP backend + SwarmState when the
+        // `--swarm-backend` flag is set. Absent flag → stays `None` and
+        // every `/api/swarm/*` endpoint returns 503 (legacy behaviour).
+        // `stdio` pairs with `--swarm-backend-cmd <path>`; `http` pairs
+        // with `--swarm-backend-url <url>`.
+        let harness_sink_init = std::env::var("OCTOS_HARNESS_EVENT_SINK").ok();
+        let swarm_state_init = Self::build_swarm_state_from_flags(
+            self.swarm_backend.as_deref(),
+            self.swarm_backend_cmd.as_deref(),
+            self.swarm_backend_url.as_deref(),
+            &data_dir,
+            broadcaster.clone(),
+            harness_sink_init.clone(),
+        )
+        .await
+        .wrap_err("failed to build swarm state")?;
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -474,16 +512,17 @@ impl ServeCommand {
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
             )),
             // ── swarm ──────────────────────────────────────────────
-            // Swarm wiring is opt-in — populated by F-010 once an MCP
-            // backend factory is configured. Until then handlers return
-            // 503. See `crates/octos-cli/src/api/swarm.rs`.
-            swarm_state: None,
+            // F-010: populated when the operator opts in via
+            // `--swarm-backend`. Absent flag → `None` and handlers
+            // return 503 (legacy behaviour). See
+            // `crates/octos-cli/src/api/swarm.rs`.
+            swarm_state: swarm_state_init,
             // Harness JSONL event sink — wired from the
             // `OCTOS_HARNESS_EVENT_SINK` env var when the caller wants
             // review decisions and swarm dispatch events persisted (see
             // `/api/events/harness`). `None` keeps the pre-M7.6
             // behaviour of broadcast-only.
-            harness_event_sink_path: std::env::var("OCTOS_HARNESS_EVENT_SINK").ok(),
+            harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
         });
@@ -902,6 +941,85 @@ impl ServeCommand {
 
         Ok((agent, sessions))
     }
+
+    /// F-010: construct an `Option<Arc<SwarmState>>` from the
+    /// `--swarm-backend*` CLI flags. Returns `Ok(None)` when no
+    /// `--swarm-backend` is set (legacy opt-out — handlers return 503).
+    /// Returns an error when the flag combination is invalid (e.g.
+    /// `--swarm-backend stdio` without `--swarm-backend-cmd`).
+    ///
+    /// Takes the flag slices by `&str` instead of `&self` so the caller
+    /// can invoke this helper after partially moving other fields out
+    /// of `self` during the main init flow.
+    async fn build_swarm_state_from_flags(
+        swarm_backend: Option<&str>,
+        swarm_backend_cmd: Option<&str>,
+        swarm_backend_url: Option<&str>,
+        data_dir: &std::path::Path,
+        broadcaster: Arc<crate::api::SseBroadcaster>,
+        harness_sink: Option<String>,
+    ) -> Result<Option<Arc<crate::api::SwarmState>>> {
+        use octos_agent::cost_ledger::PersistentCostLedger;
+        use octos_agent::tools::mcp_agent::{
+            HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, StdioMcpAgent,
+        };
+
+        let Some(kind) = swarm_backend else {
+            return Ok(None);
+        };
+        let backend: Arc<dyn McpAgentBackend> = match kind {
+            "stdio" => {
+                let cmd = swarm_backend_cmd
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre::eyre!(
+                        "`--swarm-backend stdio` requires `--swarm-backend-cmd <path>` (path to the sub-agent MCP binary)"
+                    ))?;
+                let config = McpAgentBackendConfig::Local {
+                    cmd,
+                    args: Vec::new(),
+                    env: Default::default(),
+                    dispatch_timeout_secs: None,
+                };
+                Arc::new(StdioMcpAgent::from_config(&config)?)
+            }
+            "http" => {
+                let url = swarm_backend_url
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre::eyre!(
+                        "`--swarm-backend http` requires `--swarm-backend-url <url>` (HTTPS URL of the remote MCP endpoint)"
+                    ))?;
+                let config = McpAgentBackendConfig::Remote {
+                    url,
+                    auth_header: None,
+                    extra_headers: Default::default(),
+                    connect_timeout_secs: None,
+                    read_timeout_secs: None,
+                    dispatch_timeout_secs: None,
+                };
+                Arc::new(HttpMcpAgent::from_config(&config)?)
+            }
+            other => {
+                eyre::bail!("unknown --swarm-backend value `{other}` (expected `stdio` or `http`)");
+            }
+        };
+
+        let swarm_dir = data_dir.join("swarm");
+        let cost_ledger = Arc::new(
+            PersistentCostLedger::open(data_dir)
+                .await
+                .wrap_err("failed to open persistent cost ledger for swarm")?,
+        );
+        let state = crate::api::build_swarm_state(
+            backend,
+            swarm_dir,
+            cost_ledger,
+            broadcaster,
+            harness_sink,
+        )
+        .await
+        .wrap_err("failed to build swarm state")?;
+        Ok(Some(Arc::new(state)))
+    }
 }
 
 #[cfg(test)]
@@ -1155,5 +1273,131 @@ mod tests {
 
         let password = resolve_dashboard_auth_smtp_password(&store, &auth);
         assert_eq!(password.as_deref(), Some("app-password"));
+    }
+
+    /// F-010: without `--swarm-backend` the helper returns `None` so
+    /// every `/api/swarm/*` endpoint keeps its legacy 503.
+    #[tokio::test]
+    async fn should_return_none_when_swarm_backend_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            None,
+            None,
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+        )
+        .await
+        .expect("helper must succeed when the flag is absent");
+        assert!(
+            state.is_none(),
+            "swarm state must be None without --swarm-backend"
+        );
+    }
+
+    /// F-010: when `--swarm-backend stdio --swarm-backend-cmd /bin/cat`
+    /// is set, the helper builds a SwarmState. We use `/bin/cat` as a
+    /// placeholder command — `StdioMcpAgent::from_config` only validates
+    /// the command string is non-empty; the subprocess isn't spawned
+    /// until an actual dispatch.
+    #[tokio::test]
+    async fn should_populate_swarm_state_when_backend_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("stdio"),
+            Some("/bin/cat"),
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+        )
+        .await
+        .expect("helper must succeed when stdio backend is configured");
+        assert!(
+            state.is_some(),
+            "swarm state must be Some with --swarm-backend stdio"
+        );
+    }
+
+    /// F-010: `stdio` without `--swarm-backend-cmd` must fail — the
+    /// operator's misconfiguration should surface at startup, not on
+    /// the first dispatch.
+    #[tokio::test]
+    async fn should_reject_stdio_backend_without_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("stdio"),
+            None,
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing cmd must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--swarm-backend-cmd"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    /// F-010: `http` without `--swarm-backend-url` must fail for the
+    /// same reason.
+    #[tokio::test]
+    async fn should_reject_http_backend_without_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("http"),
+            None,
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("missing url must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--swarm-backend-url"),
+            "error must point at the missing flag, got: {msg}"
+        );
+    }
+
+    /// F-010: unknown backend kinds must error with a message that
+    /// lists the accepted values. Guards against silent fallthrough.
+    #[tokio::test]
+    async fn should_reject_unknown_swarm_backend_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let result = ServeCommand::build_swarm_state_from_flags(
+            Some("ouija"),
+            None,
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unknown kind must be rejected, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stdio") && msg.contains("http"),
+            "error must list accepted backends, got: {msg}"
+        );
     }
 }
