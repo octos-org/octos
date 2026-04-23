@@ -1,6 +1,8 @@
 //! Admin commands for tenant, tunnel, and operator management.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
@@ -9,6 +11,8 @@ use eyre::{Result, bail};
 use uuid::Uuid;
 
 use super::Executable;
+use crate::admin_token_store::AdminTokenStore;
+use crate::smtp_secret_store::SmtpSecretStore;
 use crate::tenant::{TenantConfig, TenantStatus, TenantStore, render_frpc_config};
 
 /// Admin commands for tenant and tunnel management.
@@ -78,6 +82,25 @@ pub enum AdminAction {
         /// Data directory override.
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
+    },
+    /// Reset the admin token, restoring bootstrap-token auth on the next request.
+    ResetToken {
+        /// Data directory. Defaults to the value used by `octos serve`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Write the SMTP password to `{data_dir}/smtp_secret.json` (0600).
+    /// Replaces the `SMTP_PASSWORD` environment variable for OTP email delivery.
+    SetSmtpPassword {
+        /// Data directory. Defaults to the value used by `octos serve`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Show a condensed operator view of runtime observability counters.
     OperatorSummary {
@@ -221,6 +244,69 @@ impl Executable for AdminCommand {
 
                 Ok(())
             }
+            AdminAction::ResetToken { data_dir, yes } => {
+                let data_dir = super::resolve_data_dir(data_dir)?;
+                let store = AdminTokenStore::new(&data_dir);
+                if !yes {
+                    print!(
+                        "Reset admin token at {}? [y/N]: ",
+                        store.path().display()
+                    );
+                    std::io::stdout().flush().ok();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let answer = input.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                run_reset_token(&data_dir)?;
+                println!(
+                    "Admin token reset. The next request will accept the bootstrap token from config/env."
+                );
+                Ok(())
+            }
+            AdminAction::SetSmtpPassword { data_dir, yes } => {
+                let data_dir = super::resolve_data_dir(data_dir)?;
+                let store = SmtpSecretStore::new(&data_dir);
+                if !yes {
+                    print!("Set SMTP password in {}? [y/N]: ", store.path().display());
+                    std::io::stdout().flush().ok();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let answer = input.trim().to_lowercase();
+                    if answer != "y" && answer != "yes" {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                use std::io::IsTerminal as _;
+                let is_tty = std::io::stdin().is_terminal();
+                let password = if is_tty {
+                    // rpassword isn't in the workspace yet. Warn the operator
+                    // that the password will be echoed, and read a plain line.
+                    eprintln!(
+                        "Warning: input will be echoed to the terminal. Paste a throwaway \
+                         password, then rotate it with your SMTP provider afterwards if needed."
+                    );
+                    print!("SMTP password: ");
+                    std::io::stdout().flush().ok();
+                    let mut pw = String::new();
+                    std::io::stdin().read_line(&mut pw)?;
+                    pw.trim_end_matches(['\r', '\n']).to_string()
+                } else {
+                    let mut pw = String::new();
+                    std::io::stdin().read_line(&mut pw)?;
+                    pw.trim_end_matches(['\r', '\n']).to_string()
+                };
+                if password.is_empty() {
+                    bail!("empty password; aborting");
+                }
+                run_set_smtp_password(&data_dir, &password)?;
+                println!("SMTP password saved at {}", store.path().display());
+                Ok(())
+            }
             AdminAction::OperatorSummary {
                 base_url,
                 auth_token,
@@ -240,6 +326,18 @@ impl Executable for AdminCommand {
             }
         }
     }
+}
+
+/// Delete the admin token file under `data_dir`, returning Ok if the file is
+/// absent. Factored out of the `ResetToken` handler for testability.
+pub(crate) fn run_reset_token(data_dir: &Path) -> Result<()> {
+    AdminTokenStore::new(data_dir).clear()
+}
+
+/// Persist `password` to `{data_dir}/smtp_secret.json`. Factored out of the
+/// `SetSmtpPassword` handler for testability.
+pub(crate) fn run_set_smtp_password(data_dir: &Path, password: &str) -> Result<()> {
+    SmtpSecretStore::new(data_dir).save(password)
 }
 
 fn resolve_base_url(cli_value: Option<String>) -> String {
@@ -547,6 +645,33 @@ mod tests {
             Some("token".into())
         );
         assert_eq!(resolve_auth_token(Some("   ".into())), None);
+    }
+
+    #[test]
+    fn reset_token_removes_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = AdminTokenStore::new(dir.path());
+        std::fs::write(store.path(), "{}").unwrap();
+        assert!(store.exists());
+        run_reset_token(dir.path()).unwrap();
+        assert!(!store.exists());
+    }
+
+    #[test]
+    fn reset_token_is_idempotent_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_reset_token(dir.path()).unwrap();
+        assert!(!AdminTokenStore::new(dir.path()).exists());
+    }
+
+    #[test]
+    fn set_smtp_password_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SmtpSecretStore::new(dir.path());
+        assert!(!store.exists());
+        run_set_smtp_password(dir.path(), "pw-42").unwrap();
+        assert!(store.exists());
+        assert_eq!(store.load().unwrap().unwrap(), "pw-42");
     }
 
     #[test]

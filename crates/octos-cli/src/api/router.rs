@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
+use super::admin_setup;
 use super::auth_handlers;
 use super::frps_plugin;
 use super::handlers;
@@ -261,6 +262,33 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/test-provider", post(admin::test_provider))
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
+        // First-run setup wizard
+        .route("/api/admin/token/status", get(admin_setup::token_status))
+        .route("/api/admin/token/rotate", post(admin_setup::rotate_token))
+        .route("/api/admin/setup/state", get(admin_setup::get_setup_state))
+        .route("/api/admin/setup/step", post(admin_setup::post_setup_step))
+        .route(
+            "/api/admin/setup/complete",
+            post(admin_setup::post_setup_complete),
+        )
+        .route("/api/admin/setup/skip", post(admin_setup::post_setup_skip))
+        // SMTP configuration
+        .route("/api/admin/smtp", get(admin_setup::get_smtp))
+        .route("/api/admin/smtp", post(admin_setup::post_smtp))
+        .route("/api/admin/smtp/test", post(admin_setup::post_smtp_test))
+        // Deployment mode
+        .route(
+            "/api/admin/deployment-mode",
+            get(admin_setup::get_deployment_mode),
+        )
+        .route(
+            "/api/admin/deployment-mode",
+            post(admin_setup::post_deployment_mode),
+        )
+        .route(
+            "/api/admin/deployment-mode/detect",
+            get(admin_setup::get_deployment_mode_detect),
+        )
         // Sub-account management
         .route(
             "/api/admin/profiles/{id}/accounts",
@@ -538,10 +566,26 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
         return None;
     }
 
-    // 1. Check admin token (constant-time)
-    if let Some(expected) = &state.auth_token {
-        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-            return Some(AuthIdentity::Admin);
+    // 1. Check hashed admin-token store. When the file is present, it is
+    //    authoritative for admin auth — the bootstrap token no longer works
+    //    until an operator runs `octos admin reset-token`. A corrupt file
+    //    fails closed (admin branch disabled; fall through to user-session).
+    match state.admin_token_store.load() {
+        Ok(Some(record)) => {
+            if record.verify(token) {
+                return Some(AuthIdentity::Admin);
+            }
+        }
+        Ok(None) => {
+            // 1a. No rotation yet — fall back to the config/env bootstrap token.
+            if let Some(expected) = &state.auth_token {
+                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                    return Some(AuthIdentity::Admin);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "admin_token.json could not be loaded; admin auth disabled until fixed");
         }
     }
 
@@ -809,6 +853,8 @@ mod tests {
             broadcaster: Arc::new(SseBroadcaster::new(16)),
             started_at: Utc::now(),
             auth_token: Some("admin-secret".into()),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
@@ -853,5 +899,58 @@ mod tests {
         assert!(body.contains("install.sh"));
 
         server.abort();
+    }
+
+    /// Build a minimal `AppState` for resolve_identity tests — only the
+    /// fields consulted by admin auth are populated.
+    fn identity_state(data_dir: &std::path::Path, bootstrap: Option<&str>) -> AppState {
+        AppState {
+            auth_token: bootstrap.map(|s| s.to_string()),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(data_dir)),
+            ..AppState::empty_for_tests()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_accepts_bootstrap_when_no_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = identity_state(dir.path(), Some("boot"));
+        assert!(matches!(
+            resolve_identity(&state, "boot").await,
+            Some(AuthIdentity::Admin)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_prefers_rotated_record_and_rejects_bootstrap() {
+        use crate::admin_token_store::{AdminTokenRecord, AdminTokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = AdminTokenStore::new(dir.path());
+        store
+            .save(&AdminTokenRecord::from_plaintext("rotated"))
+            .unwrap();
+
+        let state = identity_state(dir.path(), Some("boot"));
+
+        assert!(matches!(
+            resolve_identity(&state, "rotated").await,
+            Some(AuthIdentity::Admin)
+        ));
+        // Bootstrap token must NOT work once rotated.
+        assert!(resolve_identity(&state, "boot").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_fails_closed_on_corrupt_admin_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("admin_token.json"), b"{not json").unwrap();
+
+        let state = identity_state(dir.path(), Some("boot"));
+
+        // With a corrupt file, neither the bootstrap nor any other token
+        // resolves to Admin — admin auth is disabled until an operator fixes
+        // the file.
+        assert!(resolve_identity(&state, "boot").await.is_none());
+        assert!(resolve_identity(&state, "rotated").await.is_none());
     }
 }

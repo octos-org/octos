@@ -375,7 +375,8 @@ impl ServeCommand {
                 }
             };
             let mut mgr = crate::otp::AuthManager::new(auth_config.clone(), user_store.clone())
-                .with_sessions_path(data_dir.join("auth_sessions.json"));
+                .with_sessions_path(data_dir.join("auth_sessions.json"))
+                .with_data_dir(data_dir.clone());
 
             if let Some(password) = derived_profile_password {
                 mgr = mgr.with_smtp_password(password);
@@ -425,6 +426,8 @@ impl ServeCommand {
             broadcaster,
             started_at: chrono::Utc::now(),
             auth_token,
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(&data_dir)),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(&data_dir)),
             metrics_handle,
             profile_store: Some(profile_store.clone()),
             process_manager: Some(process_manager.clone()),

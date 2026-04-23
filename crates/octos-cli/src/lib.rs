@@ -5,6 +5,7 @@
 //! the MCP server dispatch in [`commands::mcp_serve`]). Keep the public API
 //! narrow — only items that integration tests or sibling crates consume.
 
+pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
 pub mod auth;
@@ -29,7 +30,9 @@ pub mod profiles;
 pub mod project_templates;
 mod qos_catalog;
 pub mod session_actor;
+pub mod setup_state_store;
 pub mod skills_scope;
+pub mod smtp_secret_store;
 pub mod soul_service;
 pub mod status_indicator;
 pub mod status_layers;
