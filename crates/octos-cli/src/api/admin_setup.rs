@@ -99,17 +99,17 @@ pub async fn get_setup_state(
 }
 
 /// POST `/api/admin/setup/step` — record the furthest wizard step reached.
-/// Rejects `step > 5` with `invalid_step`.
+/// Rejects `step > 4` with `invalid_step`.
 pub async fn post_setup_step(
     State(state): State<Arc<AppState>>,
     Json(body): Json<StepBody>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    if body.step > 5 {
+    if body.step > 4 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 code: "invalid_step",
-                message: "step must be between 0 and 5 inclusive".into(),
+                message: "step must be between 0 and 4 inclusive".into(),
             }),
         ));
     }
