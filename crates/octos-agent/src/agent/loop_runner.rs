@@ -16,6 +16,8 @@ use super::loop_compaction::{prepare_conversation_messages, prepare_task_message
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
+use crate::harness_errors::HarnessError;
+use crate::harness_events::write_event_to_sink;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::session::SessionLimits;
@@ -47,6 +49,58 @@ struct ShellRetryRecovery {
 }
 
 impl Agent {
+    /// Classify a raw error escaping the agent loop into a `HarnessError`,
+    /// increment the `octos_loop_error_total{variant, recovery}` counter, and
+    /// emit a structured error event via the local harness event sink (if
+    /// one is attached). Returns the classified error so the caller can log
+    /// it or convert it into an `eyre::Report` for the caller's contract.
+    ///
+    /// Invariant (#488): every raw `eyre::Report` that would otherwise bubble
+    /// out of the agent loop must be routed through this classifier.
+    pub(crate) fn classify_loop_error(
+        &self,
+        report: &eyre::Report,
+        tool_name: Option<&str>,
+    ) -> HarnessError {
+        let classified = HarnessError::classify_report(report, tool_name);
+        classified.record_metric();
+
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            let (session_id, task_id) = self.harness_error_context();
+            let event = classified.to_event(
+                session_id, task_id, /* workflow */ None, /* phase */ None,
+            );
+            if let Err(error) = write_event_to_sink(sink, &event) {
+                tracing::debug!(error = %error, "failed to write harness error event to sink");
+            }
+        }
+
+        tracing::warn!(
+            variant = classified.variant_name(),
+            recovery = %classified.recovery_hint(),
+            error = %report,
+            "harness error classified"
+        );
+        classified
+    }
+
+    fn harness_error_context(&self) -> (String, String) {
+        // The agent loop itself does not own a task_id — those are assigned
+        // per-spawn in `task_supervisor`. Use the registered sink context
+        // (written by `HarnessEventSink::new`) when available; fall back to
+        // stable placeholders so the event still validates.
+        if let Some(sink) = self.harness_event_sink.as_deref() {
+            if let Some(ctx) = crate::harness_events::lookup_event_sink_context(sink) {
+                return (ctx.session_id, ctx.task_id);
+            }
+        }
+        let session_id = self
+            .hook_ctx()
+            .and_then(|ctx| ctx.session_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        (session_id, "agent".to_string())
+    }
+
     fn enforce_session_limits_on_tool_calls(
         &self,
         response: &ChatResponse,
@@ -285,7 +339,18 @@ impl Agent {
                     }
 
                     let tools_spec = self.tools.specs();
+                    // Harness M6.3: run preflight compaction before the first
+                    // LLM call when a compaction policy is wired and the
+                    // context already exceeds the declared threshold.
+                    if iteration == 1 {
+                        self.maybe_run_preflight_compaction(&mut messages);
+                    }
                     prepare_conversation_messages(self, &mut messages, &mut turn);
+                    // Harness M6.3: post-prep compaction pass so the declarative
+                    // runner sees the final shape of the conversation (after
+                    // tool-pair repair + system-message normalization). This
+                    // also feeds the validator rail on subsequent iterations.
+                    self.maybe_run_turn_compaction(&mut messages, iteration);
                     let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
@@ -325,17 +390,28 @@ impl Agent {
                                 message: "Switching provider...".to_string(),
                                 iteration,
                             });
-                            self.call_llm_with_hooks(
-                                &messages,
-                                &tools_spec,
-                                &config,
-                                iteration,
-                                &total_usage,
-                                &mut turn,
-                            )
-                            .await?
+                            match self
+                                .call_llm_with_hooks(
+                                    &messages,
+                                    &tools_spec,
+                                    &config,
+                                    iteration,
+                                    &total_usage,
+                                    &mut turn,
+                                )
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let _ = self.classify_loop_error(&e, None);
+                                    return Err(e);
+                                }
+                            }
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            let _ = self.classify_loop_error(&e, None);
+                            return Err(e);
+                        }
                     };
                     Self::normalize_inline_invokes(&mut response);
                     self.reporter().report(ProgressEvent::Response {
@@ -433,15 +509,20 @@ impl Agent {
                                     });
                                 }
                             }
-                            self.handle_tool_use(
-                                &response,
-                                &mut messages,
-                                &mut files_modified,
-                                Some(&mut files_to_send),
-                                &mut turn,
-                                tracker,
-                            )
-                            .await?;
+                            if let Err(e) = self
+                                .handle_tool_use(
+                                    &response,
+                                    &mut messages,
+                                    &mut files_modified,
+                                    Some(&mut files_to_send),
+                                    &mut turn,
+                                    tracker,
+                                )
+                                .await
+                            {
+                                let _ = self.classify_loop_error(&e, None);
+                                return Err(e);
+                            }
 
                             if let Some(recovery) = recover_shell_retry(
                                 &messages,
@@ -615,7 +696,7 @@ impl Agent {
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
-                let (mut response, _streamed) = self
+                let (mut response, _streamed) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -624,7 +705,14 @@ impl Agent {
                         &total_usage,
                         &mut turn,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = self.classify_loop_error(&e, None);
+                        return Err(e);
+                    }
+                };
                 Self::normalize_inline_invokes(&mut response);
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
@@ -718,15 +806,20 @@ impl Agent {
                         ));
                     }
                     StopReason::ToolUse => {
-                        self.handle_tool_use(
-                            &response,
-                            &mut messages,
-                            &mut files_modified,
-                            Some(&mut files_to_send),
-                            &mut turn,
-                            None,
-                        )
-                        .await?;
+                        if let Err(e) = self
+                            .handle_tool_use(
+                                &response,
+                                &mut messages,
+                                &mut files_modified,
+                                Some(&mut files_to_send),
+                                &mut turn,
+                                None,
+                            )
+                            .await
+                        {
+                            let _ = self.classify_loop_error(&e, None);
+                            return Err(e);
+                        }
                     }
                     StopReason::MaxTokens => {
                         self.emit_cost_update(turn.total_usage(), &response.usage);

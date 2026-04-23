@@ -17,6 +17,8 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::abi_schema::HARNESS_ERROR_SCHEMA_VERSION;
+use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
 use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
 
@@ -221,6 +223,10 @@ pub enum HarnessEventPayload {
     CredentialRotation {
         #[serde(flatten)]
         data: HarnessCredentialRotationEvent,
+    },
+    Error {
+        #[serde(flatten)]
+        data: HarnessErrorEvent,
     },
 }
 
@@ -493,6 +499,20 @@ impl HarnessEvent {
                 validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
                 validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
             }
+            HarnessEventPayload::Error { data } => {
+                if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported harness error schema_version {} (max supported: {})",
+                        data.schema_version, HARNESS_ERROR_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("variant", &data.variant, MAX_PHASE_BYTES)?;
+                validate_bounded("recovery", &data.recovery, MAX_PHASE_BYTES)?;
+                validate_bounded("error message", &data.message, MAX_MESSAGE_BYTES)?;
+            }
         }
 
         Ok(())
@@ -617,6 +637,25 @@ impl HarnessEvent {
                     "strategy": data.strategy,
                 })
             }
+            HarnessEventPayload::Error { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "error",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "variant": data.variant,
+                    "recovery": data.recovery,
+                    "message": data.message,
+                    "details": data.details,
+                })
+            }
         }
     }
 
@@ -629,6 +668,7 @@ impl HarnessEvent {
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
+            HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
 
@@ -641,6 +681,7 @@ impl HarnessEvent {
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
+            HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
 
@@ -653,6 +694,7 @@ impl HarnessEvent {
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
 
@@ -665,6 +707,7 @@ impl HarnessEvent {
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
 }

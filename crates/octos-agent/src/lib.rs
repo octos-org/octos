@@ -13,9 +13,10 @@ pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
-mod compaction;
+pub mod compaction;
 pub mod event_bus;
 pub mod exec_env;
+pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
@@ -33,6 +34,7 @@ pub mod session;
 pub mod skills;
 pub mod steering;
 mod subprocess_env;
+pub mod summarizer;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -42,10 +44,10 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION,
-    PROGRESS_EVENT_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
-    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
-    default_credential_pool_config_schema_version,
+    COMPACTION_POLICY_SCHEMA_VERSION, CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION,
+    HARNESS_ERROR_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported, default_credential_pool_config_schema_version,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -58,6 +60,7 @@ pub use agent::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCredentialRotationEvent,
     HarnessCredentialRotationSink, HarnessEvent, HarnessEventError, HarnessEventPayload,
@@ -78,6 +81,7 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
 };
@@ -86,9 +90,8 @@ pub use tools::{
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
     DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
     PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, Tool, ToolConfigStore, ToolPolicy,
+    ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     install_robot_registry,
 };
@@ -105,11 +108,12 @@ pub use workspace_git::{
     snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    ValidationPolicy, Validator, ValidatorPhaseKind, ValidatorSpec, WORKSPACE_POLICY_FILE,
-    WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
-    WorkspaceVersionControlProvider, read_workspace_policy, upgrade_workspace_policy_if_legacy,
-    workspace_policy_path, write_workspace_policy,
+    CompactionPolicy, CompactionSummarizerKind, ValidationPolicy, Validator, ValidatorPhaseKind,
+    ValidatorSpec, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
+    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
+    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
+    write_workspace_policy,
 };
 
 #[cfg(test)]

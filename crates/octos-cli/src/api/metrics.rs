@@ -293,6 +293,14 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "credential_rotations".to_string(),
             total_for_metric(samples, "octos_llm_credential_rotation_total"),
         ),
+        (
+            "compaction_preservation_violations".to_string(),
+            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+        ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+        ),
     ])
 }
 
@@ -368,6 +376,22 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 samples,
                 "octos_llm_credential_rotation_total",
                 &["reason", "strategy"],
+            ),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            breakdown(
+                samples,
+                "octos_compaction_preservation_violations_total",
+                &["phase"],
+            ),
+        ),
+        (
+            "loop_errors".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
             ),
         ),
     ])

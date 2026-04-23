@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import HarnessTaskTable, { LIFECYCLE_ORDER } from '../components/HarnessTaskTable'
 import {
   harnessApi,
+  harnessErrorRows,
+  harnessErrorTotal,
   type HarnessLifecycleState,
   type HarnessTasksResponse,
   type OperatorSummaryResponse,
@@ -222,7 +224,7 @@ export default function HarnessPage() {
       </div>
 
       {/* Derived signal counts */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="derived-counts">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-3" data-testid="derived-counts">
         <CountCard
           label="Stale / zombie"
           value={tasksResp?.stale_count ?? 0}
@@ -256,7 +258,61 @@ export default function HarnessPage() {
           }
           active={derivedFilter.validatorFailed}
         />
+        <CountCard
+          label="Loop errors"
+          value={harnessErrorTotal(summary)}
+          testId="count-loop-errors"
+          tone={harnessErrorTotal(summary) > 0 ? 'danger' : 'ok'}
+          highlight={harnessErrorTotal(summary) > 0}
+        />
       </div>
+
+      {/* M6.1 — harness error taxonomy breakdown */}
+      {harnessErrorRows(summary).length > 0 && (
+        <div
+          className="bg-surface border border-gray-700/50 rounded-xl"
+          data-testid="harness-errors"
+        >
+          <div className="px-5 py-3 border-b border-gray-700/30">
+            <h2 className="text-sm font-semibold text-gray-300">
+              Structured errors (last hour)
+            </h2>
+            <p className="text-[11px] text-gray-500">
+              Counter <code>octos_loop_error_total</code> by{' '}
+              <code>variant</code> and <code>recovery</code> hint. Variant names
+              match <code>HarnessError::variant_name()</code>.
+            </p>
+          </div>
+          <table className="w-full text-sm" data-testid="harness-error-table">
+            <thead>
+              <tr className="text-xs text-gray-500 border-b border-gray-700/30">
+                <th className="text-left py-2 px-5 font-medium">variant</th>
+                <th className="text-left py-2 px-3 font-medium">recovery</th>
+                <th className="text-right py-2 px-5 font-medium">count</th>
+              </tr>
+            </thead>
+            <tbody>
+              {harnessErrorRows(summary)
+                .slice(0, 20)
+                .map((row, i) => (
+                  <tr
+                    key={`${row.variant}|${row.recovery}|${i}`}
+                    data-testid="harness-error-row"
+                    data-variant={row.variant}
+                    data-recovery={row.recovery}
+                    className="border-b border-gray-700/15 last:border-0"
+                  >
+                    <td className="py-2 px-5 font-mono text-gray-300">{row.variant}</td>
+                    <td className="py-2 px-3 font-mono text-gray-400">{row.recovery}</td>
+                    <td className="py-2 px-5 text-right font-mono text-gray-300">
+                      {row.count}
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {tasksError && (
         <div
