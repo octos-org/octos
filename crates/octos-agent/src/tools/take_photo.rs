@@ -156,20 +156,19 @@ impl Tool for TakePhotoTool {
             .stderr(std::process::Stdio::piped())
             .output();
 
-        let output = match tokio::time::timeout(std::time::Duration::from_secs(15), ffmpeg_fut)
-            .await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: "Error: ffmpeg photo capture timed out after 15s (no camera, \
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), ffmpeg_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: "Error: ffmpeg photo capture timed out after 15s (no camera, \
                              permission prompt, or device busy)"
-                        .to_string(),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        };
+                            .to_string(),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
 
         match output {
             Ok(out) if out.status.success() => {
