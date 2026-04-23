@@ -204,6 +204,23 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "fm_voice_list",
         ],
     },
+    // M6.7 — the canonical deny list applied to every DelegateTool child.
+    // Children may never re-delegate, spawn background workers, send user
+    // messages, write memory, or execute arbitrary code. Policy evaluation
+    // is deny-wins, so adding `group:delegated` to a child's deny list is
+    // sufficient to gate all of these surfaces regardless of allow list.
+    ToolGroupInfo {
+        name: "group:delegated",
+        description: "Delegated child deny list: re-delegation, spawning, user messaging, memory writes, and arbitrary code execution.",
+        tools: &[
+            "delegate_task",
+            "spawn",
+            "send_message",
+            "message",
+            "save_memory",
+            "execute_code",
+        ],
+    },
 ];
 
 /// Look up group info by name.
@@ -336,5 +353,34 @@ mod tests {
         let policy = ToolPolicy::default();
         assert!(policy.is_allowed_with_tags("anything", &["web"]));
         assert!(policy.is_allowed_with_tags("anything", &[]));
+    }
+
+    #[test]
+    fn should_expand_group_delegated_to_restricted_child_toolset() {
+        let info = tool_group_info("group:delegated").expect("group:delegated must be registered");
+        // The invariant tests lock in this exact set; don't widen without
+        // coordinating with DelegateTool documentation.
+        assert!(info.tools.contains(&"delegate_task"));
+        assert!(info.tools.contains(&"spawn"));
+        assert!(info.tools.contains(&"send_message"));
+        assert!(info.tools.contains(&"save_memory"));
+        assert!(info.tools.contains(&"execute_code"));
+    }
+
+    #[test]
+    fn should_deny_child_tool_when_group_delegated_is_in_deny_list() {
+        let policy = ToolPolicy {
+            deny: vec!["group:delegated".into()],
+            ..Default::default()
+        };
+        // Tools in group:delegated must be denied under a delegated child.
+        assert!(!policy.is_allowed("delegate_task"));
+        assert!(!policy.is_allowed("spawn"));
+        assert!(!policy.is_allowed("send_message"));
+        assert!(!policy.is_allowed("save_memory"));
+        assert!(!policy.is_allowed("execute_code"));
+        // Tools not in the group remain allowed by default.
+        assert!(policy.is_allowed("read_file"));
+        assert!(policy.is_allowed("shell"));
     }
 }
