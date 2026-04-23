@@ -11,6 +11,7 @@ mod config;
 pub mod content_classifier;
 pub mod context;
 mod context_override;
+pub mod credential_pool;
 pub mod embedding;
 mod failover;
 mod fallback;
@@ -50,6 +51,13 @@ pub use content_classifier::{
     RoutingConfig,
 };
 pub use context_override::ContextWindowOverride;
+pub use credential_pool::{
+    CREDENTIAL_POOL_SCHEMA_VERSION, Credential, CredentialPool, CredentialRotationEvent,
+    CredentialState, DEFAULT_COOLDOWN_US, DEFAULT_CREDENTIAL_POOL_DB_FILENAME, ErrorId,
+    InMemoryRotationEventSink, NullOAuthRefresher, NullRotationEventSink, OAuthRefresher,
+    PersistentCredentialPool, PersistentCredentialPoolOptions, RotationEventSink, RotationStrategy,
+    default_credential_pool_path, rotation_reason,
+};
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
 pub use error::{LlmError, LlmErrorKind};
 pub use failover::ProviderChain;

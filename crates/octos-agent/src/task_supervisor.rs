@@ -599,6 +599,29 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
+            HarnessEventPayload::CredentialRotation { .. } => {
+                // Credential rotations are observability-only — they do not
+                // change the task lifecycle. We still update runtime_detail
+                // so operators can see which key is now active.
+                self.mark_runtime_state(
+                    task_id,
+                    snapshot.runtime_state,
+                    Some(runtime_detail.to_string()),
+                );
+            }
+            HarnessEventPayload::Error { data } => {
+                // Structured error events are diagnostic — record them in the
+                // runtime detail but only transition to Failed when the
+                // recovery hint marks the variant as non-retryable.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+                if matches!(data.recovery.as_str(), "fail_fast" | "bug") {
+                    self.mark_failed(task_id, data.message.clone());
+                }
+            }
         }
 
         Ok(())
