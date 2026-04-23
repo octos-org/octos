@@ -49,7 +49,7 @@ impl SetupStateStore {
 
     pub fn update_last_step(&self, step: u32) -> Result<()> {
         let mut state = self.load()?;
-        state.wizard_last_step_reached = step;
+        state.wizard_last_step_reached = state.wizard_last_step_reached.max(step);
         self.save(&state)
     }
 
