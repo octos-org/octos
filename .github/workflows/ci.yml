@@ -73,7 +73,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        timeout-minutes: 25
+        run: cargo test --workspace -- --test-threads=1 --nocapture
 
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
