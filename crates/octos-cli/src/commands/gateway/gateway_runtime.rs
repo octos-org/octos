@@ -23,6 +23,7 @@ use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
     QosCatalog, RetryProvider, SwappableProvider,
 };
+use crate::commands::gateway::MAIN_PROFILE_ID;
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{info, warn};
