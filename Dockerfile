@@ -55,7 +55,9 @@ COPY . .
 RUN find crates -name '*.rs' -exec touch {} + && \
     cargo build --release --bin octos \
       -p octos-cli \
-      --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
+      --features api,telegram,discord,slack,whatsapp,feishu,email,matrix && \
+    mv ./target/release/octos /usr/local/bin/octos && \
+    cargo clean
 
 # ============================================================
 # Stage 2: Minimal runtime image
@@ -74,7 +76,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 RUN npm install -g pptxgenjs react-icons react react-dom sharp
 
 # Copy binary
-COPY --from=builder /src/target/release/octos /usr/local/bin/octos
+COPY --from=builder /usr/local/bin/octos /usr/local/bin/octos 
 
 # Copy builtin skills
 COPY --from=builder /src/crates/octos-agent/skills /opt/octos/skills
