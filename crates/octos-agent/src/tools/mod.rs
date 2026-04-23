@@ -195,6 +195,7 @@ pub mod ssrf;
 
 // Built-in tools
 pub mod deep_search;
+pub mod delegate;
 pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
@@ -231,6 +232,10 @@ pub mod git;
 pub mod code_structure;
 
 pub use deep_search::DeepSearchTool;
+pub use delegate::{
+    DELEGATED_DENY_GROUP, DELEGATION_METRIC, DelegateTool, DelegationEvent, DelegationOutcome,
+    DepthBudget, MAX_DEPTH, build_delegated_child_policy,
+};
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;

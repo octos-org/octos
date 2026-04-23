@@ -290,6 +290,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
         (
+            "delegations".to_string(),
+            total_for_metric(samples, "octos_delegation_total"),
+        ),
+        (
             "routing_decisions".to_string(),
             total_for_metric(samples, "octos_routing_decision_total"),
         ),
@@ -377,6 +381,10 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 "octos_workspace_validator_total",
                 &["status", "phase", "kind", "required"],
             ),
+        ),
+        (
+            "delegations".to_string(),
+            breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
         ),
         (
             "routing_decisions".to_string(),
