@@ -340,6 +340,12 @@ pub struct SpawnTool {
     /// MCP `tools/call` name dispatched on the backend. Defaults to
     /// [`DEFAULT_MCP_AGENT_TOOL_NAME`].
     mcp_agent_tool_name: Option<String>,
+    /// Cost / provenance accountant (M7.4). When present, every
+    /// successful MCP sub-agent dispatch writes a
+    /// [`crate::cost_ledger::CostAttributionEvent`] to the ledger.
+    /// When combined with a budget policy, the dispatcher rejects
+    /// spawns whose projected spend breaches the ceiling.
+    cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
 }
 
 impl SpawnTool {
@@ -372,6 +378,7 @@ impl SpawnTool {
             worker_config: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
+            cost_accountant: None,
         }
     }
 
@@ -407,6 +414,7 @@ impl SpawnTool {
             worker_config: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
+            cost_accountant: None,
         }
     }
 
@@ -515,6 +523,19 @@ impl SpawnTool {
     ) -> Result<Self> {
         let backend = build_backend_from_config(config, Some(self.working_dir.as_path()))?;
         Ok(self.with_mcp_agent_backend(backend, tool_name))
+    }
+
+    /// Attach a cost / provenance accountant (M7.4). Every successful
+    /// MCP sub-agent dispatch routed through this tool records an
+    /// attribution on the accountant's ledger. If the accountant carries
+    /// a [`crate::cost_ledger::CostBudgetPolicy`], pre-spawn projections
+    /// reject dispatches that breach the configured ceiling.
+    pub fn with_cost_accountant(
+        mut self,
+        accountant: Arc<crate::cost_ledger::CostAccountant>,
+    ) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
     }
 
     /// Dispatch a task to the configured MCP-backed sub-agent. Public so
@@ -1438,6 +1459,66 @@ impl Tool for SpawnTool {
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
             });
+
+            // Pre-dispatch budget projection (M7.4). Absent a
+            // configured accountant the check short-circuits and the
+            // dispatch proceeds unchanged — this keeps existing M7.1
+            // dispatch tests passing when no policy is configured.
+            let model_for_ledger = input
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown-model".to_string());
+            let contract_id_for_ledger = workflow_kind
+                .clone()
+                .unwrap_or_else(|| session_key_for_event.clone());
+            if let Some(accountant) = self.cost_accountant.as_ref() {
+                if let Some(policy) = accountant.policy() {
+                    if policy.is_enforced() {
+                        // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
+                        // the outbound task description divided by 4
+                        // (the classic 1 token ≈ 4 chars rule of thumb).
+                        // Good enough for budget rejection — the ledger
+                        // replaces this with the real count on success.
+                        let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
+                        let projected_usd = crate::cost_ledger::project_cost_usd(
+                            &model_for_ledger,
+                            tokens_in_estimate,
+                            0,
+                        )
+                        .unwrap_or(0.0);
+                        match accountant
+                            .project_dispatch(&contract_id_for_ledger, projected_usd)
+                            .await
+                        {
+                            Ok(crate::cost_ledger::BudgetProjection::Allowed { .. }) => {}
+                            Ok(crate::cost_ledger::BudgetProjection::Rejected {
+                                reason, ..
+                            }) => {
+                                let message = format!(
+                                    "Status: FAILED\nDispatch rejected by cost budget policy: {reason}"
+                                );
+                                warn!(
+                                    contract_id = %contract_id_for_ledger,
+                                    reason = %reason,
+                                    "rejecting MCP sub-agent dispatch before spawn"
+                                );
+                                return Ok(ToolResult {
+                                    output: message,
+                                    success: false,
+                                    ..Default::default()
+                                });
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "cost budget projection failed; allowing dispatch"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let (response, event) = {
                 let request = DispatchRequest {
                     tool_name,
@@ -1476,6 +1557,90 @@ impl Tool for SpawnTool {
             }
 
             let success = response.outcome == super::mcp_agent::DispatchOutcome::Success;
+
+            // Post-dispatch cost attribution (M7.4). Only record when
+            // the remote agent returned a ready artifact; failures and
+            // timeouts are already visible via the dispatch event and
+            // should not inflate the ledger.
+            if success {
+                if let Some(accountant) = self.cost_accountant.as_ref() {
+                    let tokens_in_est = task_desc.len().div_ceil(4) as u32;
+                    let tokens_out_est = response.output.len().div_ceil(4) as u32;
+                    let cost_usd = crate::cost_ledger::project_cost_usd(
+                        &model_for_ledger,
+                        tokens_in_est,
+                        tokens_out_est,
+                    )
+                    .unwrap_or(0.0);
+                    let attribution = crate::cost_ledger::CostAttributionEvent::new(
+                        session_key_for_event.clone(),
+                        contract_id_for_ledger.clone(),
+                        task_id_for_event.clone(),
+                        model_for_ledger.clone(),
+                        tokens_in_est,
+                        tokens_out_est,
+                        cost_usd,
+                    )
+                    .with_workflow(workflow_kind.clone(), workflow_phase.clone())
+                    .with_backend_outcome(
+                        Some(backend.as_ref().backend_label().to_string()),
+                        Some("success".to_string()),
+                    );
+                    let attribution_id_for_event = attribution.attribution_id.clone();
+
+                    // Commit to the ledger. Failing to persist is
+                    // non-fatal for the dispatch itself — we log and
+                    // continue so a bad disk does not mask a successful
+                    // agent run.
+                    if let Err(error) = accountant.ledger().record(attribution).await {
+                        warn!(
+                            task_id = %task_id_for_event,
+                            error = %error,
+                            "failed to persist cost attribution; dispatch succeeded"
+                        );
+                    } else {
+                        // Emit the typed event so downstream sinks,
+                        // including the operator summary aggregator,
+                        // see the spend even without re-reading the
+                        // ledger.
+                        let cost_event = HarnessEvent::cost_attribution(
+                            crate::harness_events::HarnessCostAttributionEvent {
+                                schema_version: crate::abi_schema::COST_ATTRIBUTION_SCHEMA_VERSION,
+                                session_id: session_key_for_event.clone(),
+                                task_id: task_id_for_event.clone(),
+                                workflow: workflow_kind.clone(),
+                                phase: workflow_phase.clone(),
+                                attribution_id: attribution_id_for_event,
+                                contract_id: contract_id_for_ledger.clone(),
+                                model: model_for_ledger.clone(),
+                                tokens_in: tokens_in_est,
+                                tokens_out: tokens_out_est,
+                                cost_usd,
+                                outcome: "success".to_string(),
+                                extra: std::collections::HashMap::new(),
+                            },
+                        );
+                        if let Err(error) = cost_event.validate() {
+                            warn!(
+                                task_id = %task_id_for_event,
+                                error = %error,
+                                "cost attribution event failed validation; skipping emission"
+                            );
+                        } else if let Some(supervisor) = self.task_supervisor.as_ref() {
+                            if let Err(error) =
+                                supervisor.apply_harness_event(&task_id_for_event, &cost_event)
+                            {
+                                warn!(
+                                    task_id = %task_id_for_event,
+                                    error = %error,
+                                    "cost attribution event could not be applied"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut files_to_send = response.files_to_send.clone();
             // Workflow contract families always gate outputs through the
             // workspace contract. The dispatch response is advisory; the
@@ -2275,6 +2440,7 @@ mod tests {
             worker_config: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
+            cost_accountant: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);

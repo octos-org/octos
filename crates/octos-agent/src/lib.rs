@@ -14,6 +14,7 @@ pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 mod compaction;
+pub mod cost_ledger;
 pub mod event_bus;
 pub mod exec_env;
 pub mod harness_events;
@@ -42,9 +43,9 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION,
-    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
-    check_supported,
+    COST_ATTRIBUTION_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
+    SUB_AGENT_DISPATCH_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
+    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -55,12 +56,17 @@ pub use agent::{
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
 };
+pub use cost_ledger::{
+    BudgetProjection, BudgetRejectionReason, COST_ATTRIBUTION_COUNTER, COST_LEDGER_FILE,
+    COST_USD_HISTOGRAM, ContractCostRollup, CostAccountant, CostAttributionEvent, CostBudgetPolicy,
+    CostLedger, PersistentCostLedger, project_cost_usd,
+};
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use harness_events::{
-    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessEvent, HarnessEventError,
-    HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessPhaseEvent,
-    HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
+    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent, HarnessEvent,
+    HarnessEventError, HarnessEventPayload, HarnessEventSink, HarnessFailureEvent,
+    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
     HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
 };
 pub use hooks::{

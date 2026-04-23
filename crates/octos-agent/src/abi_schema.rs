@@ -44,6 +44,16 @@ pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 /// [`check_supported`] before using any v1-specific fields.
 pub const SUB_AGENT_DISPATCH_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::CostAttribution`](crate::harness_events::HarnessEventPayload::CostAttribution)
+/// event and its nested
+/// [`HarnessCostAttributionEvent`](crate::harness_events::HarnessCostAttributionEvent)
+/// payload emitted when a sub-agent dispatch lands a cost/provenance entry
+/// in the ledger. Downstream tooling MUST validate the version on
+/// deserialization via [`check_supported`] before reading v1-specific
+/// fields so new additive fields stay backward compatible.
+pub const COST_ATTRIBUTION_SCHEMA_VERSION: u32 = 1;
+
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
 ///
@@ -162,6 +172,23 @@ mod tests {
         let err = check_supported("SubAgentDispatch", 99, SUB_AGENT_DISPATCH_SCHEMA_VERSION)
             .expect_err("future version should be rejected");
         assert_eq!(err.kind, "SubAgentDispatch");
+        assert_eq!(err.found, 99);
+    }
+
+    #[test]
+    fn cost_attribution_schema_version_is_registered_at_v1() {
+        assert_eq!(COST_ATTRIBUTION_SCHEMA_VERSION, 1);
+        assert!(
+            check_supported(
+                "CostAttribution",
+                COST_ATTRIBUTION_SCHEMA_VERSION,
+                COST_ATTRIBUTION_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+        let err = check_supported("CostAttribution", 99, COST_ATTRIBUTION_SCHEMA_VERSION)
+            .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "CostAttribution");
         assert_eq!(err.found, 99);
     }
 }
