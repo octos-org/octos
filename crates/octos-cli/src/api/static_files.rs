@@ -74,7 +74,11 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // bundle wasn't embedded, short-circuit with a 503 so operators
     // discover the misconfiguration instead of landing on the admin
     // redirect.
-    if path.starts_with("swarm") {
+    //
+    // Segment-match rather than `starts_with("swarm")` so sibling paths
+    // like `/swarmish` or `/swarm-config` fall through to the admin
+    // redirect instead of hijacking the 503 branch.
+    if path == "swarm" || path.starts_with("swarm/") {
         let swarm_path = format!("swarm/{}", path.trim_start_matches("swarm/"));
         if let Some(data) = assets.get(&swarm_path) {
             return serve_file(&swarm_path, &data);
@@ -206,5 +210,31 @@ mod tests {
         let assets = StubAssets::empty();
         let resp = serve_with(&assets, &state, "/swarm/assets/index-xyz.js").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// C-003: a prefix-match on `"swarm"` catches sibling paths like
+    /// `/swarmish` and would hijack them into the 503 branch even
+    /// though the operator never asked for the swarm dashboard.
+    /// Segment-match (`path == "swarm" || path.starts_with("swarm/")`)
+    /// makes `/swarmish` fall through to the admin redirect.
+    #[tokio::test]
+    async fn should_not_match_swarm_prefix_siblings() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        // `/swarmish` must fall through to the admin redirect (307), NOT
+        // the swarm 503 branch. The final catch-all returns a redirect
+        // to `/admin/`, so we assert we get exactly that.
+        let resp = serve_with(&assets, &state, "/swarmish").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "sibling prefix must not be captured by the swarm branch"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/admin/");
     }
 }
