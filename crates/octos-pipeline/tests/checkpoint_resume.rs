@@ -114,6 +114,7 @@ fn base_config(
         max_parallel_workers: 1,
         checkpoint_store: store,
         hook_executor: None,
+        workspace_context: octos_pipeline::context::PipelineContext::default(),
     }
 }
 

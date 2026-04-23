@@ -6,6 +6,7 @@
 pub mod artifact;
 pub mod checkpoint;
 pub mod condition;
+pub mod context;
 pub mod discovery;
 pub mod events;
 pub mod executor;
@@ -24,6 +25,7 @@ pub mod validate;
 
 pub use artifact::ArtifactStore;
 pub use checkpoint::{Checkpoint, CheckpointStore, FileSystemCheckpointStore, PersistedCheckpoint};
+pub use context::{PipelineContext, ValidatorsByNode};
 pub use events::{
     CollectingEventHandler, PipelineEvent, PipelineEventHandler, TracingEventHandler,
 };

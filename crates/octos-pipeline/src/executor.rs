@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
+use crate::context::PipelineContext;
 use crate::graph::{
     DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode,
@@ -202,6 +203,13 @@ pub struct ExecutorConfig {
     /// Optional hook executor. Fired as `HookEvent::OnSpawnFailure` when a
     /// node's `deadline_action == Escalate` trips.
     pub hook_executor: Option<Arc<HookExecutor>>,
+    /// Optional workspace-contract context (coding-blue FA-7). When
+    /// populated the executor propagates the parent's compaction
+    /// policy onto LLM-call nodes, reserves cost-ledger budget per
+    /// node, and runs the declared completion-phase validators at the
+    /// pipeline terminal. `None` = legacy behaviour (pre-FA-7),
+    /// byte-for-byte identical to the v0 path.
+    pub workspace_context: PipelineContext,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -613,6 +621,37 @@ pub struct PipelineExecutor {
 impl PipelineExecutor {
     pub fn new(config: ExecutorConfig) -> Self {
         Self { config }
+    }
+
+    /// Builder: attach a workspace-contract context (coding-blue FA-7).
+    ///
+    /// Replaces the executor's current [`PipelineContext`] with the
+    /// caller-supplied one. When the context's `is_empty()` is `true`
+    /// the executor stays on the legacy path (validators, compaction,
+    /// and cost reservation are all inert); otherwise every LLM-call
+    /// node inherits the parent's compaction policy, the pipeline-level
+    /// reservation runs at dispatch start, and the declared terminal
+    /// validators fire after the final edge is selected.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let ctx = PipelineContext::new()
+    ///     .with_policy(workspace_policy)
+    ///     .with_agent_llm_provider(llm.clone())
+    ///     .with_cost_accountant(accountant.clone())
+    ///     .with_contract_id("slides-delivery")
+    ///     .with_projected_usd(0.25);
+    /// let exec = PipelineExecutor::new(config).with_workspace_context(ctx);
+    /// ```
+    pub fn with_workspace_context(mut self, context: PipelineContext) -> Self {
+        self.config.workspace_context = context;
+        self
+    }
+
+    /// Access the currently installed workspace context. Returns an
+    /// empty context when the caller never opted in.
+    pub fn workspace_context(&self) -> &PipelineContext {
+        &self.config.workspace_context
     }
 
     /// Run a pipeline from a DOT string.
@@ -1937,6 +1976,7 @@ mod tests {
             max_parallel_workers: 8,
             checkpoint_store: None,
             hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
         }
     }
 
