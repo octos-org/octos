@@ -5,7 +5,8 @@ use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::abi_schema::{
-    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported, default_workspace_policy_schema_version,
+    COMPACTION_POLICY_SCHEMA_VERSION, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    default_compaction_policy_schema_version, default_workspace_policy_schema_version,
 };
 use crate::workspace_git::WorkspaceProjectKind;
 
@@ -33,6 +34,80 @@ pub struct WorkspacePolicy {
     pub artifacts: WorkspaceArtifactsPolicy,
     #[serde(default)]
     pub spawn_tasks: BTreeMap<String, WorkspaceSpawnTaskPolicy>,
+    /// Declarative compaction contract (harness M6.3). Absent = legacy extractive
+    /// behaviour with no preflight or typed placeholders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionPolicy>,
+}
+
+/// Harness-facing compaction contract (M6.3).
+///
+/// Declares the shape of compaction for a workspace: how many tokens to aim
+/// for, which declared artifacts must survive the pass, when to pre-emptively
+/// compact before the first LLM call, and how aggressively to prune stale
+/// tool outputs. When absent, the runtime falls back to the legacy extractive
+/// path and behaves exactly as before M6.3.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionPolicy {
+    /// Durable ABI schema version. See
+    /// [`COMPACTION_POLICY_SCHEMA_VERSION`]. Missing in legacy files;
+    /// defaulted to the current version via
+    /// [`default_compaction_policy_schema_version`].
+    #[serde(default = "default_compaction_policy_schema_version")]
+    pub schema_version: u32,
+    /// Target token budget for the compacted conversation after a pass.
+    pub token_budget: u32,
+    /// Artifact names (keys in `artifacts`) whose declared patterns MUST be
+    /// referenced at least once in the compacted message stream. Failure here
+    /// trips the validator rail and blocks terminal success.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved_artifacts: Vec<String>,
+    /// Free-form substrings that must survive compaction (e.g. a workspace
+    /// invariant flag string). Matched verbatim against message content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved_invariants: Vec<String>,
+    /// Summarizer flavour to use for the compaction pass. Defaults to the
+    /// extractive variant until M6.4 wires the LLM-iterative implementation.
+    #[serde(default)]
+    pub summarizer: CompactionSummarizerKind,
+    /// Trigger preflight compaction before the first LLM call when the
+    /// conversation already exceeds this token count. `None` disables
+    /// preflight entirely (post-call compaction still runs on overflow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_threshold: Option<u32>,
+    /// Replace tool results older than N user-turn boundaries with a typed
+    /// `ToolResultPlaceholder`. `None` keeps tool results intact until the
+    /// usual token-budget path kicks in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune_tool_results_after_turns: Option<u32>,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            schema_version: COMPACTION_POLICY_SCHEMA_VERSION,
+            token_budget: 8_000,
+            preserved_artifacts: Vec::new(),
+            preserved_invariants: Vec::new(),
+            summarizer: CompactionSummarizerKind::default(),
+            preflight_threshold: None,
+            prune_tool_results_after_turns: None,
+        }
+    }
+}
+
+/// Summarizer strategy declared in a [`CompactionPolicy`]. The runtime maps
+/// this to an implementation of [`crate::summarizer::Summarizer`] at wire
+/// time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionSummarizerKind {
+    /// Deterministic extractive summarizer (preserves legacy behaviour).
+    #[default]
+    Extractive,
+    /// LLM-iterative summarizer. Lands in M6.4; the extractive summarizer is
+    /// used as a fallback in the current runtime.
+    LlmIterative,
 }
 
 /// Tiered validation checks run at different points in the turn lifecycle.
@@ -269,6 +344,7 @@ impl WorkspacePolicy {
                     ]),
                 },
                 spawn_tasks: BTreeMap::new(),
+                compaction: None,
             },
             WorkspaceProjectKind::Sites => Self {
                 schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -298,6 +374,7 @@ impl WorkspacePolicy {
                 validation: ValidationPolicy::default(),
                 artifacts: WorkspaceArtifactsPolicy::default(),
                 spawn_tasks: BTreeMap::new(),
+                compaction: None,
             },
         }
     }
@@ -353,6 +430,7 @@ impl WorkspacePolicy {
             validation: ValidationPolicy::default(),
             artifacts: WorkspaceArtifactsPolicy { entries: artifacts },
             spawn_tasks,
+            compaction: None,
         }
     }
 

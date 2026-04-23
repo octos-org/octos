@@ -84,6 +84,7 @@ pub fn workspace_policy() -> WorkspacePolicy {
             ]),
         },
         spawn_tasks: BTreeMap::new(),
+        compaction: None,
     }
 }
 

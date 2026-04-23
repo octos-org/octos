@@ -144,7 +144,7 @@ impl Sandbox for MacosSandbox {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
