@@ -642,9 +642,20 @@ if [ -d ~/.ominix/models ]; then MODELS_DIR=~/.ominix/models
 elif [ -d ~/.OminiX/models ]; then MODELS_DIR=~/.OminiX/models
 else MODELS_DIR=~/.ominix/models; mkdir -p "$MODELS_DIR"; fi
 ASR_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) \( -name "Qwen3-ASR-*" -o -name "qwen3-asr-*" \) 2>/dev/null | head -1)"
-# Prefer CustomVoice model (has preset speakers); fall back to any TTS model
-TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) -iname "*customvoice*" 2>/dev/null | head -1)"
-[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) 2>/dev/null | head -1)"
+# OminiX catalog downloads use short names (qwen3-tts/qwen3-tts-base), while
+# older OminiX discovery expects "CustomVoice"/"Base" in the directory name.
+# Keep the model storage canonical, but add stable 5bit aliases for launch/discovery.
+if [ -d "$MODELS_DIR/qwen3-tts" ] && [ ! -e "$MODELS_DIR/Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit" ]; then
+    ln -s qwen3-tts "$MODELS_DIR/Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit" 2>/dev/null || true
+fi
+if [ -d "$MODELS_DIR/qwen3-tts-base" ] && [ ! -e "$MODELS_DIR/Qwen3-TTS-12Hz-1.7B-Base-5bit" ]; then
+    ln -s qwen3-tts-base "$MODELS_DIR/Qwen3-TTS-12Hz-1.7B-Base-5bit" 2>/dev/null || true
+fi
+# Prefer 5bit CustomVoice for preset speakers. Never select Base for /tts/qwen3.
+TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) -iname "*customvoice*5bit*" 2>/dev/null | head -1)"
+[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) -name "qwen3-tts" 2>/dev/null | head -1)"
+[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) -iname "*customvoice*" 2>/dev/null | head -1)"
+[ -z "$TTS_MODEL" ] && TTS_MODEL="$(find "$MODELS_DIR" -maxdepth 1 \( -type d -o -type l \) \( -name "Qwen3-TTS-*" -o -name "qwen3-tts-*" \) ! -iname "*base*" 2>/dev/null | head -1)"
 ARGS="        <string>$OMINIX_BIN</string>
         <string>--port</string>
         <string>8080</string>
@@ -838,8 +849,8 @@ echo "  ominix-api plist generated"'"'"
         # Models to download: repo_id local_dir_name (no associative arrays — bash 3 compat)
         set -- \
             "mlx-community/Qwen3-ASR-1.7B-8bit"                        "Qwen3-ASR-1.7B-8bit" \
-            "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"       "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit" \
-            "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"              "Qwen3-TTS-12Hz-1.7B-Base-8bit"
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit"       "Qwen3-TTS-12Hz-1.7B-CustomVoice-5bit" \
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-5bit"              "Qwen3-TTS-12Hz-1.7B-Base-5bit"
 
         while [ $# -ge 2 ]; do
             repo="$1"; local_name="$2"; shift 2
