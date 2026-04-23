@@ -4056,35 +4056,18 @@ mod register_tenant_email_tests {
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: chrono::Utc::now(),
-            auth_token: None,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
             user_store: Some(user_store),
-            allowlist_store: None,
             auth_manager,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
-            swarm_state: None,
+            ..AppState::empty_for_tests()
         })
     }
 
@@ -4211,35 +4194,17 @@ mod register_flow_tests {
     ) -> (Arc<AppState>, Arc<UserStore>) {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let state = Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: chrono::Utc::now(),
-            auth_token: None,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
             user_store: Some(user_store.clone()),
-            allowlist_store: None,
-            auth_manager: None,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
-            swarm_state: None,
+            ..AppState::empty_for_tests()
         });
         (state, user_store)
     }

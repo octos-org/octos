@@ -864,33 +864,15 @@ mod tests {
             .unwrap();
 
         let state = Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: Utc::now(),
             auth_token: Some("admin-secret".into()),
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
-            user_store: None,
-            allowlist_store: None,
-            auth_manager: None,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(store),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
-            swarm_state: None,
+            ..AppState::empty_for_tests()
         });
 
         let app = build_router(state);

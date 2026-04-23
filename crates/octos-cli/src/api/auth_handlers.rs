@@ -2175,33 +2175,14 @@ mod tests {
         let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
         let state = AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(crate::api::SseBroadcaster::new(8)),
-            started_at: chrono::Utc::now(),
             auth_token: Some("bootstrap-token".into()),
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
             profile_store: Some(profile_store.clone()),
-            process_manager: None,
             user_store: Some(user_store.clone()),
             allowlist_store: Some(allowlist_store),
             auth_manager: Some(Arc::new(AuthManager::new(None, user_store.clone()))),
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
-            tenant_store: None,
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
-            tunnel_domain: None,
-            frps_server: None,
-            frps_port: None,
-            deployment_mode: crate::config::DeploymentMode::Local,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
-            swarm_state: None,
+            ..AppState::empty_for_tests()
         };
         (dir, state, user_store, profile_store)
     }

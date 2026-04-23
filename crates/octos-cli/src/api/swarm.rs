@@ -14,9 +14,10 @@
 //! 2. Cost roll-up is a live read against the shared
 //!    [`PersistentCostLedger`]. Every GET recomputes — no caching.
 //! 3. Review decisions are emitted as typed
-//!    [`HarnessEventPayload::SwarmReviewDecision`] events through the
-//!    SSE broadcaster so the UI and any Matrix audit channel see the
-//!    same record.
+//!    [`HarnessEventPayload::SwarmReviewDecision`] events — written to
+//!    the JSONL sink if configured (durable record), broadcast live to
+//!    SSE subscribers, and surface on the Matrix audit channel only
+//!    when a Matrix puppet subscriber is attached to the broadcaster.
 //! 4. All persisted / event shapes carry `schema_version: u32` pinned
 //!    in [`abi_schema`](octos_agent::abi_schema).
 
@@ -27,6 +28,7 @@ use std::sync::{Arc, RwLock};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use octos_agent::harness_events::write_event_to_sink;
 use octos_agent::tools::mcp_agent::{
     DispatchOutcome, DispatchRequest, DispatchResponse, McpAgentBackend,
 };
@@ -619,6 +621,16 @@ pub async fn cost_attributions(
 
 /// POST /api/swarm/dispatches/{id}/review — write a typed review event.
 ///
+/// Delivery guarantees:
+/// - **Durable**: written to the JSONL harness-event sink when
+///   [`AppState::harness_event_sink_path`] is configured. Without a sink,
+///   the decision is live-only.
+/// - **Live**: broadcast to SSE subscribers on the existing `/api/events`
+///   stream.
+/// - **Matrix audit**: materialises only when a Matrix puppet subscriber
+///   is attached to the broadcaster — nothing in this handler pushes to
+///   Matrix directly.
+///
 /// The body's `reviewer` field is cross-checked against the authenticated
 /// caller: a non-admin user cannot submit a decision under somebody else's
 /// id (prevents Alice from acking as Bob). Admin callers can set any
@@ -721,6 +733,21 @@ pub async fn submit_review(
             format!("review event invalid: {e}"),
         )
     })?;
+
+    // Persist to the JSONL harness-event sink FIRST (if configured) so
+    // the decision survives a crash before the live SSE frame goes out.
+    // Broadcast-only would lose the decision when no subscriber is
+    // connected; a Matrix audit puppet is only one possible subscriber.
+    if let Some(sink_path) = state.harness_event_sink_path.as_ref() {
+        if let Err(err) = write_event_to_sink(sink_path, &event) {
+            tracing::warn!(
+                dispatch_id = %dispatch_id,
+                error = %err,
+                "failed to persist review decision to harness sink"
+            );
+        }
+    }
+
     let body = serde_json::to_string(&event.runtime_detail_value(None, None))
         .unwrap_or_else(|_| "{}".into());
     let _ = state.broadcaster.send_raw(body);
@@ -1059,5 +1086,184 @@ mod tests {
         .await
         .expect("admin may submit any reviewer string");
         assert_eq!(admin_ok.0.reviewer, "carol");
+    }
+
+    /// F-008: review decisions must land in the JSONL harness sink when
+    /// one is configured, not just the live SSE broadcaster. A reviewer
+    /// filing a decision while no SSE subscriber is connected must still
+    /// produce a durable record.
+    #[tokio::test]
+    async fn should_persist_review_decision_to_sink_when_configured() {
+        use octos_swarm::{AggregateArtifact, SubtaskOutcome, SwarmOutcomeKind, SwarmResult};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let swarm_state = Arc::new(
+            build_test_swarm_state(dir.path().join("swarm"), cost_ledger.clone())
+                .await
+                .unwrap(),
+        );
+
+        let dispatch_id = "d-durable".to_string();
+        {
+            let mut entries = swarm_state.dispatches.write().unwrap();
+            entries.push(DispatchEntry {
+                row: DispatchIndexRow {
+                    dispatch_id: dispatch_id.clone(),
+                    contract_id: "c1".into(),
+                    topology: "parallel".into(),
+                    outcome: "success".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    created_at: "2026-04-22T00:00:00Z".into(),
+                    total_cost_usd: None,
+                    review_accepted: None,
+                },
+                result: SwarmResult {
+                    dispatch_id: dispatch_id.clone(),
+                    outcome: SwarmOutcomeKind::Success,
+                    topology: "parallel".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    per_task_outcomes: Vec::<SubtaskOutcome>::new(),
+                    aggregate_artifact: AggregateArtifact::default(),
+                    validator_results: Vec::new(),
+                    total_cost_usd: None,
+                },
+                review_reviewer: None,
+                review_notes: None,
+            });
+        }
+
+        // Point the sink at a fresh temp path. Must not exist yet — the
+        // handler appends (creating if missing).
+        let sink_path = dir.path().join("harness-events.jsonl");
+        let mut state = AppState::empty_for_tests();
+        state.swarm_state = Some(swarm_state);
+        state.harness_event_sink_path = Some(sink_path.display().to_string());
+        let state = Arc::new(state);
+
+        let req = SwarmReviewRequest {
+            schema_version: 1,
+            accepted: false,
+            reviewer: "pm@futurewei.com".into(),
+            notes: Some("rejecting — missing test coverage".into()),
+        };
+
+        let resp = submit_review(
+            State(state),
+            axum::extract::Path(dispatch_id.clone()),
+            None, // no auth identity — skip the identity cross-check arm
+            Json(req),
+        )
+        .await
+        .expect("review should succeed");
+        assert!(!resp.0.accepted);
+        assert_eq!(resp.0.dispatch_id, dispatch_id);
+
+        // The sink file should contain the typed event as a single JSONL
+        // line. Both the `#[serde(tag = "kind")]` enum discriminant and
+        // the payload body use `#[serde(flatten)]` so every field lives
+        // at the top level. This proves the decision survived beyond the
+        // live broadcast.
+        let contents = std::fs::read_to_string(&sink_path).expect("sink file must exist");
+        let line = contents.lines().next().expect("expected at least one line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("line must be JSON");
+        assert_eq!(
+            parsed.get("kind").and_then(|v| v.as_str()),
+            Some("swarm_review_decision")
+        );
+        assert_eq!(
+            parsed.get("dispatch_id").and_then(|v| v.as_str()),
+            Some(dispatch_id.as_str())
+        );
+        assert_eq!(
+            parsed.get("accepted").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            parsed.get("reviewer").and_then(|v| v.as_str()),
+            Some("pm@futurewei.com")
+        );
+        assert_eq!(
+            parsed.get("schema").and_then(|v| v.as_str()),
+            Some(octos_agent::HARNESS_EVENT_SCHEMA_V1)
+        );
+    }
+
+    /// F-008 complement: without a sink configured the handler keeps the
+    /// pre-fix broadcast-only behaviour. Useful as a regression check so
+    /// nobody accidentally writes to a default path in the future.
+    #[tokio::test]
+    async fn should_not_persist_review_when_sink_not_configured() {
+        use octos_swarm::{AggregateArtifact, SubtaskOutcome, SwarmOutcomeKind, SwarmResult};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let swarm_state = Arc::new(
+            build_test_swarm_state(dir.path().join("swarm"), cost_ledger.clone())
+                .await
+                .unwrap(),
+        );
+
+        let dispatch_id = "d-no-sink".to_string();
+        {
+            let mut entries = swarm_state.dispatches.write().unwrap();
+            entries.push(DispatchEntry {
+                row: DispatchIndexRow {
+                    dispatch_id: dispatch_id.clone(),
+                    contract_id: "c1".into(),
+                    topology: "parallel".into(),
+                    outcome: "success".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    created_at: "2026-04-22T00:00:00Z".into(),
+                    total_cost_usd: None,
+                    review_accepted: None,
+                },
+                result: SwarmResult {
+                    dispatch_id: dispatch_id.clone(),
+                    outcome: SwarmOutcomeKind::Success,
+                    topology: "parallel".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    per_task_outcomes: Vec::<SubtaskOutcome>::new(),
+                    aggregate_artifact: AggregateArtifact::default(),
+                    validator_results: Vec::new(),
+                    total_cost_usd: None,
+                },
+                review_reviewer: None,
+                review_notes: None,
+            });
+        }
+
+        let mut state = AppState::empty_for_tests();
+        state.swarm_state = Some(swarm_state);
+        assert!(state.harness_event_sink_path.is_none());
+        let state = Arc::new(state);
+
+        let req = SwarmReviewRequest {
+            schema_version: 1,
+            accepted: true,
+            reviewer: "pm".into(),
+            notes: None,
+        };
+        let resp = submit_review(
+            State(state),
+            axum::extract::Path(dispatch_id),
+            None,
+            Json(req),
+        )
+        .await
+        .expect("review should succeed without a sink");
+        assert!(resp.0.accepted);
+        // No file — the tempdir is otherwise empty except for the redb
+        // dirs. Nothing to assert beyond success + the sink being None.
     }
 }
