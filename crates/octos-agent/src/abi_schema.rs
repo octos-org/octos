@@ -44,23 +44,6 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
-/// Current schema version for `HarnessError` events (M6.1, issue #488).
-/// Emitted as part of `octos.harness.event.v1` with `kind: "error"`.
-pub const HARNESS_ERROR_SCHEMA_VERSION: u32 = 1;
-
-/// Current schema version for `CredentialPoolConfig` persisted in profile
-/// files (M6.5). Bumped when the persisted state shape or the `Config`
-/// patch contract evolves in a non-backward-compatible way.
-pub const CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION: u32 = 1;
-
-/// Current schema version for the `routing.decision` harness event payload
-/// introduced in M6.6 (content-classified smart model routing).
-///
-/// The `kind`, `tier`, and `reasons` fields are stable. `lane` and
-/// `input_chars` are additive experimental fields today; bumping this
-/// version is only required when renaming or removing a stable field.
-pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
-
 /// Current schema version for `SessionSummary` (harness M6.4).
 ///
 /// Carries the typed LLM-iterative compaction summary: goal, constraints,
@@ -71,6 +54,23 @@ pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
 /// Re-exports [`octos_core::SESSION_SUMMARY_SCHEMA_VERSION`] so callers can
 /// take the value from either crate interchangeably.
 pub const SESSION_SUMMARY_SCHEMA_VERSION: u32 = octos_core::SESSION_SUMMARY_SCHEMA_VERSION;
+
+/// Current schema version for the `routing.decision` harness event payload
+/// introduced in M6.6 (content-classified smart model routing).
+///
+/// The `kind`, `tier`, and `reasons` fields are stable. `lane` and
+/// `input_chars` are additive experimental fields today; bumping this
+/// version is only required when renaming or removing a stable field.
+pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for `CredentialPoolConfig` persisted in profile
+/// files (M6.5). Bumped when the persisted state shape or the `Config`
+/// patch contract evolves in a non-backward-compatible way.
+pub const CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION: u32 = 1;
+
+/// Current schema version for `HarnessError` events (M6.1, issue #488).
+/// Emitted as part of `octos.harness.event.v1` with `kind: "error"`.
+pub const HARNESS_ERROR_SCHEMA_VERSION: u32 = 1;
 
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
@@ -130,16 +130,16 @@ pub(crate) fn default_hook_payload_schema_version() -> u32 {
     HOOK_PAYLOAD_SCHEMA_VERSION
 }
 
-/// Default schema version for `CompactionPolicy` deserialization. Applied when
-/// an older workspace-policy file omits the nested `schema_version` line.
-pub(crate) fn default_compaction_policy_schema_version() -> u32 {
-    COMPACTION_POLICY_SCHEMA_VERSION
-}
-
 /// Default schema version for `CredentialPoolConfig` deserialization (M6.5).
 /// Applied when an older profile file omits the field entirely.
 pub fn default_credential_pool_config_schema_version() -> u32 {
     CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION
+}
+
+/// Default schema version for `CompactionPolicy` deserialization. Applied when
+/// an older workspace-policy file omits the nested `schema_version` line.
+pub(crate) fn default_compaction_policy_schema_version() -> u32 {
+    COMPACTION_POLICY_SCHEMA_VERSION
 }
 
 #[cfg(test)]

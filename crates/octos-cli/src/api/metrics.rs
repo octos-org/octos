@@ -290,20 +290,24 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
         (
-            "loop_errors".to_string(),
-            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+            "delegations".to_string(),
+            total_for_metric(samples, "octos_delegation_total"),
         ),
         (
-            "compaction_preservation_violations".to_string(),
-            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+            "routing_decisions".to_string(),
+            total_for_metric(samples, "octos_routing_decision_total"),
         ),
         (
             "credential_rotations".to_string(),
             total_for_metric(samples, "octos_llm_credential_rotation_total"),
         ),
         (
-            "routing_decisions".to_string(),
-            total_for_metric(samples, "octos_routing_decision_total"),
+            "compaction_preservation_violations".to_string(),
+            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+        ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
         ),
         (
             "loop_retries".to_string(),
@@ -379,11 +383,19 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
             ),
         ),
         (
-            "loop_errors".to_string(),
+            "delegations".to_string(),
+            breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
+        ),
+        (
+            "routing_decisions".to_string(),
+            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
+        ),
+        (
+            "credential_rotations".to_string(),
             breakdown(
                 samples,
-                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
-                &["variant", "recovery"],
+                "octos_llm_credential_rotation_total",
+                &["reason", "strategy"],
             ),
         ),
         (
@@ -395,16 +407,12 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
             ),
         ),
         (
-            "credential_rotations".to_string(),
+            "loop_errors".to_string(),
             breakdown(
                 samples,
-                "octos_llm_credential_rotation_total",
-                &["reason", "strategy"],
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
             ),
-        ),
-        (
-            "routing_decisions".to_string(),
-            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
         ),
         (
             "loop_retries".to_string(),

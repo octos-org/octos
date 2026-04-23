@@ -220,14 +220,6 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessFailureEvent,
     },
-    Error {
-        #[serde(flatten)]
-        data: HarnessErrorEvent,
-    },
-    CredentialRotation {
-        #[serde(flatten)]
-        data: HarnessCredentialRotationEvent,
-    },
     /// Content-classified smart routing decision (M6.6).
     ///
     /// Emitted once per chat turn, before the adaptive router picks a lane.
@@ -236,6 +228,14 @@ pub enum HarnessEventPayload {
     RoutingDecision {
         #[serde(flatten)]
         data: HarnessRoutingDecisionEvent,
+    },
+    CredentialRotation {
+        #[serde(flatten)]
+        data: HarnessCredentialRotationEvent,
+    },
+    Error {
+        #[serde(flatten)]
+        data: HarnessErrorEvent,
     },
 }
 
@@ -337,26 +337,6 @@ pub struct HarnessFailureEvent {
     pub extra: HashMap<String, Value>,
 }
 
-/// Structured credential rotation event (M6.5).
-///
-/// Emitted by the credential pool on every successful selection. Consumers
-/// can tie the event to a Prometheus counter
-/// (`octos_llm_credential_rotation_total{reason, strategy}`) for parity.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HarnessCredentialRotationEvent {
-    pub session_id: String,
-    pub task_id: String,
-    /// Stable identifier of the credential that was selected.
-    pub credential_id: String,
-    /// Stable reason label (e.g. `initial_acquire`, `rate_limit_cooldown`,
-    /// `auth_failure`, `manual_release`).
-    pub reason: String,
-    /// Strategy label (`fill_first`, `round_robin`, `random`, `least_used`).
-    pub strategy: String,
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
 /// Content-classified smart routing decision payload (M6.6).
 ///
 /// Emitted once per chat turn with the classifier's tier choice and the
@@ -381,6 +361,26 @@ pub struct HarnessRoutingDecisionEvent {
     /// Classified input length in chars.
     #[serde(default)]
     pub input_chars: usize,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Structured credential rotation event (M6.5).
+///
+/// Emitted by the credential pool on every successful selection. Consumers
+/// can tie the event to a Prometheus counter
+/// (`octos_llm_credential_rotation_total{reason, strategy}`) for parity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCredentialRotationEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// Stable identifier of the credential that was selected.
+    pub credential_id: String,
+    /// Stable reason label (e.g. `initial_acquire`, `rate_limit_cooldown`,
+    /// `auth_failure`, `manual_release`).
+    pub reason: String,
+    /// Strategy label (`fill_first`, `round_robin`, `random`, `least_used`).
+    pub strategy: String,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -432,29 +432,6 @@ impl HarnessEvent {
         }
     }
 
-    /// Construct a credential rotation event (M6.5).
-    pub fn credential_rotation(
-        session_id: impl Into<String>,
-        task_id: impl Into<String>,
-        credential_id: impl Into<String>,
-        reason: impl Into<String>,
-        strategy: impl Into<String>,
-    ) -> Self {
-        Self {
-            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
-            payload: HarnessEventPayload::CredentialRotation {
-                data: HarnessCredentialRotationEvent {
-                    session_id: session_id.into(),
-                    task_id: task_id.into(),
-                    credential_id: credential_id.into(),
-                    reason: reason.into(),
-                    strategy: strategy.into(),
-                    extra: HashMap::new(),
-                },
-            },
-        }
-    }
-
     /// Build a `routing.decision` event for the content-classified smart router (M6.6).
     pub fn routing_decision(
         session_id: impl Into<String>,
@@ -476,6 +453,29 @@ impl HarnessEvent {
                     lane: None,
                     reasons,
                     input_chars,
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Construct a credential rotation event (M6.5).
+    pub fn credential_rotation(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        reason: impl Into<String>,
+        strategy: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::CredentialRotation {
+                data: HarnessCredentialRotationEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    credential_id: credential_id.into(),
+                    reason: reason.into(),
+                    strategy: strategy.into(),
                     extra: HashMap::new(),
                 },
             },
@@ -553,6 +553,26 @@ impl HarnessEvent {
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
                 validate_bounded("failure message", &data.message, MAX_MESSAGE_BYTES)?;
             }
+            HarnessEventPayload::RoutingDecision { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("tier", &data.tier, MAX_PHASE_BYTES)?;
+                validate_optional_name("lane", data.lane.as_deref(), MAX_PHASE_BYTES)?;
+                for reason in &data.reasons {
+                    validate_bounded("reason", reason, MAX_MESSAGE_BYTES)?;
+                }
+            }
+            HarnessEventPayload::CredentialRotation { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded(
+                    "credential_id",
+                    &data.credential_id,
+                    MAX_CREDENTIAL_ID_BYTES,
+                )?;
+                validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
+                validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
+            }
             HarnessEventPayload::Error { data } => {
                 if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
                     return Err(HarnessEventError(format!(
@@ -566,26 +586,6 @@ impl HarnessEvent {
                 validate_bounded("variant", &data.variant, MAX_PHASE_BYTES)?;
                 validate_bounded("recovery", &data.recovery, MAX_PHASE_BYTES)?;
                 validate_bounded("error message", &data.message, MAX_MESSAGE_BYTES)?;
-            }
-            HarnessEventPayload::CredentialRotation { data } => {
-                validate_common_ids(&data.session_id, &data.task_id)?;
-                validate_bounded(
-                    "credential_id",
-                    &data.credential_id,
-                    MAX_CREDENTIAL_ID_BYTES,
-                )?;
-                validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
-                validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
-            }
-            HarnessEventPayload::RoutingDecision { data } => {
-                validate_common_ids(&data.session_id, &data.task_id)?;
-                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
-                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
-                validate_bounded("tier", &data.tier, MAX_PHASE_BYTES)?;
-                validate_optional_name("lane", data.lane.as_deref(), MAX_PHASE_BYTES)?;
-                for reason in &data.reasons {
-                    validate_bounded("reason", reason, MAX_MESSAGE_BYTES)?;
-                }
             }
         }
 
@@ -700,6 +700,35 @@ impl HarnessEvent {
                     "retryable": data.retryable,
                 })
             }
+            HarnessEventPayload::RoutingDecision { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "routing.decision",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "tier": data.tier,
+                    "lane": data.lane,
+                    "reasons": data.reasons,
+                    "input_chars": data.input_chars,
+                })
+            }
+            HarnessEventPayload::CredentialRotation { data } => {
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "credential_rotation",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "credential_id": data.credential_id,
+                    "reason": data.reason,
+                    "strategy": data.strategy,
+                })
+            }
             HarnessEventPayload::Error { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -719,35 +748,6 @@ impl HarnessEvent {
                     "details": data.details,
                 })
             }
-            HarnessEventPayload::CredentialRotation { data } => {
-                serde_json::json!({
-                    "schema": self.schema,
-                    "kind": "credential_rotation",
-                    "session_id": data.session_id,
-                    "task_id": data.task_id,
-                    "credential_id": data.credential_id,
-                    "reason": data.reason,
-                    "strategy": data.strategy,
-                })
-            }
-            HarnessEventPayload::RoutingDecision { data } => {
-                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
-                let current_phase = data.phase.as_deref().or(fallback_current_phase);
-                serde_json::json!({
-                    "schema": self.schema,
-                    "kind": "routing.decision",
-                    "session_id": data.session_id,
-                    "task_id": data.task_id,
-                    "workflow": workflow,
-                    "workflow_kind": workflow,
-                    "phase": data.phase,
-                    "current_phase": current_phase,
-                    "tier": data.tier,
-                    "lane": data.lane,
-                    "reasons": data.reasons,
-                    "input_chars": data.input_chars,
-                })
-            }
         }
     }
 
@@ -759,9 +759,9 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.session_id,
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
-            HarnessEventPayload::Error { data } => &data.session_id,
-            HarnessEventPayload::CredentialRotation { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.session_id,
+            HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
 
@@ -773,9 +773,9 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.task_id,
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
-            HarnessEventPayload::Error { data } => &data.task_id,
-            HarnessEventPayload::CredentialRotation { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.task_id,
+            HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
 
@@ -787,9 +787,9 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.workflow.as_deref(),
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
-            HarnessEventPayload::Error { data } => data.workflow.as_deref(),
-            HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
 
@@ -801,9 +801,9 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.phase.as_deref(),
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
-            HarnessEventPayload::Error { data } => data.phase.as_deref(),
-            HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
 }

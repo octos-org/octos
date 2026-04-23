@@ -96,14 +96,14 @@ pub struct ProfileConfig {
     /// Adaptive routing configuration (QoS weights, mode, etc.).
     #[serde(default)]
     pub adaptive_routing: Option<crate::config::AdaptiveRoutingConfig>,
-    /// Credential pool configuration (M6.5). Named pools of API keys / OAuth
-    /// tokens with persistent cooldowns and rotation strategies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_pool: Option<CredentialPoolConfig>,
     /// Content-classified smart routing configuration (M6.6).
     /// Missing config defaults to `enabled: false` (invariant #3 of issue #493).
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
+    /// Credential pool configuration (M6.5). Named pools of API keys / OAuth
+    /// tokens with persistent cooldowns and rotation strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_pool: Option<CredentialPoolConfig>,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -299,9 +299,9 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub adaptive_routing: PatchField<crate::config::AdaptiveRoutingConfig>,
     #[serde(default)]
-    pub credential_pool: PatchField<CredentialPoolConfig>,
-    #[serde(default)]
     pub content_routing: PatchField<octos_llm::RoutingConfig>,
+    #[serde(default)]
+    pub credential_pool: PatchField<CredentialPoolConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -529,15 +529,15 @@ impl ProfileConfig {
             PatchField::Clear => self.adaptive_routing = None,
             PatchField::Value(adaptive_routing) => self.adaptive_routing = Some(adaptive_routing),
         }
-        match patch.credential_pool {
-            PatchField::Absent => {}
-            PatchField::Clear => self.credential_pool = None,
-            PatchField::Value(credential_pool) => self.credential_pool = Some(credential_pool),
-        }
         match patch.content_routing {
             PatchField::Absent => {}
             PatchField::Clear => self.content_routing = None,
             PatchField::Value(content_routing) => self.content_routing = Some(content_routing),
+        }
+        match patch.credential_pool {
+            PatchField::Absent => {}
+            PatchField::Clear => self.credential_pool = None,
+            PatchField::Value(credential_pool) => self.credential_pool = Some(credential_pool),
         }
 
         self.normalize_llm_contract();

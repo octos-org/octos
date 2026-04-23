@@ -92,14 +92,15 @@ pub use task_supervisor::{
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
-    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DeepSearchTool,
-    DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ManageSkillsTool, MessageTool,
-    PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DELEGATED_DENY_GROUP,
+    DELEGATION_METRIC, DeepSearchTool, DelegateTool, DelegationEvent, DelegationOutcome,
+    DepthBudget, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool, MAX_DEPTH,
+    ManageSkillsTool, MessageTool, PolicyDecision, ReadFileTool, RecallMemoryTool,
+    RobotToolRegistry, SaveMemoryTool, SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool,
+    Tool, ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext,
+    WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
-    install_robot_registry,
+    build_delegated_child_policy, install_robot_registry,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{

@@ -560,6 +560,12 @@ pub struct AdaptiveRouter {
     /// RwLock allows concurrent reads in the hot path (emit_status) while
     /// writes (set_status_callback) are rare setup-time operations.
     status_callback: RwLock<Option<StatusCallback>>,
+    /// Content classifier that biases lane selection. `None` means "disabled"
+    /// (router behaves as before — invariant #2 of issue #493). RwLock
+    /// mirrors the status callback pattern so runtime toggles are safe.
+    classifier: RwLock<Option<Arc<ContentClassifier>>>,
+    /// Observer fired with the classifier decision on each chat entry.
+    decision_callback: RwLock<Option<RoutingDecisionCallback>>,
     /// Optional per-slot credential pool. When attached, the router forwards
     /// rate-limit and auth failures to the pool so it can cool down or
     /// refresh the underlying credential. Empty vec means "no pools".
@@ -567,12 +573,6 @@ pub struct AdaptiveRouter {
     /// Id of the credential currently in use per slot. Updated at acquire
     /// time so failure notifications can identify the right credential.
     current_credential_ids: Mutex<Vec<Option<String>>>,
-    /// Content classifier that biases lane selection. `None` means "disabled"
-    /// (router behaves as before — invariant #2 of issue #493). RwLock
-    /// mirrors the status callback pattern so runtime toggles are safe.
-    classifier: RwLock<Option<Arc<ContentClassifier>>>,
-    /// Observer fired with the classifier decision on each chat entry.
-    decision_callback: RwLock<Option<RoutingDecisionCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -626,10 +626,10 @@ impl AdaptiveRouter {
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
             status_callback: RwLock::new(None),
-            credential_pools: RwLock::new(vec![None; slot_count]),
-            current_credential_ids: Mutex::new(vec![None; slot_count]),
             classifier: RwLock::new(None),
             decision_callback: RwLock::new(None),
+            credential_pools: RwLock::new(vec![None; slot_count]),
+            current_credential_ids: Mutex::new(vec![None; slot_count]),
         }
     }
 
