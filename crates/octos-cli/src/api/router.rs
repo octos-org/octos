@@ -19,6 +19,7 @@ use super::handlers;
 use super::metrics;
 use super::purge;
 use super::static_files;
+use super::swarm as swarm_api;
 use super::user_admin;
 use super::webhook_proxy;
 use crate::user_store::UserRole;
@@ -420,6 +421,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/tenants/{id}/setup-script",
             get(admin::tenant_setup_script),
+        )
+        // M7.6 — contract-authoring + swarm dispatch dashboard
+        .route("/api/swarm/dispatch", post(swarm_api::dispatch_swarm))
+        .route("/api/swarm/dispatches", get(swarm_api::list_dispatches))
+        .route(
+            "/api/swarm/dispatches/{id}",
+            get(swarm_api::dispatch_detail),
+        )
+        .route(
+            "/api/swarm/dispatches/{id}/review",
+            post(swarm_api::submit_review),
+        )
+        .route(
+            "/api/cost/attributions/{dispatch_id}",
+            get(swarm_api::cost_attributions),
         );
 
     // Conditionally enable admin shell endpoint (disabled by default).
@@ -874,6 +890,7 @@ mod tests {
             deployment_mode: DeploymentMode::Cloud,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         });
 
         let app = build_router(state);

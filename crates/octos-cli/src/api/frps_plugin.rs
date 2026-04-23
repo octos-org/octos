@@ -405,6 +405,7 @@ mod tests {
             deployment_mode: DeploymentMode::Cloud,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
         })
     }
 

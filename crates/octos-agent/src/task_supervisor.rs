@@ -618,6 +618,18 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
+            HarnessEventPayload::SwarmReviewDecision { .. } => {
+                // Review decisions are supervisor-authored audit records.
+                // They do not move the task lifecycle — the originating
+                // dispatch already reached a terminal state when the
+                // review panel was shown. Surface the detail so operators
+                // can see accept/reject transitions on the timeline.
+                self.mark_runtime_state(
+                    task_id,
+                    snapshot.runtime_state,
+                    Some(runtime_detail.to_string()),
+                );
+            }
             HarnessEventPayload::CostAttribution { .. } => {
                 // Cost attributions are purely observational — they are
                 // committed after a sub-agent dispatch succeeds and do
