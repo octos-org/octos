@@ -327,8 +327,37 @@ impl McpSessionDispatch for RealSessionDispatch {
             save_episodes: false,
             ..Default::default()
         };
-        let agent = Agent::new_shared(AgentId::new("mcp-serve"), llm, tools.clone(), memory)
-            .with_config(agent_config);
+        let mut agent = Agent::new_shared(
+            AgentId::new("mcp-serve"),
+            llm.clone(),
+            tools.clone(),
+            memory,
+        )
+        .with_config(agent_config);
+
+        // Review A F-004: propagate the workspace policy's declarative
+        // compaction contract onto the MCP-served child Agent. Parity with
+        // the local chat + session-actor wiring — the MCP-served child
+        // session must honour the same preflight-token budget and preserved
+        // artifacts declared in workspace_policy.toml.
+        if let Ok(Some(workspace_policy)) = octos_agent::read_workspace_policy(&self.config.cwd) {
+            if let Some(compaction_policy) = workspace_policy.compaction.clone() {
+                use octos_agent::compaction::CompactionRunner;
+                use octos_agent::workspace_policy::CompactionSummarizerKind;
+                let runner = match compaction_policy.summarizer {
+                    CompactionSummarizerKind::LlmIterative => {
+                        CompactionRunner::with_provider(compaction_policy, llm.clone())
+                    }
+                    CompactionSummarizerKind::Extractive => {
+                        CompactionRunner::new(compaction_policy)
+                    }
+                }
+                .with_workspace_policy(&workspace_policy);
+                agent = agent
+                    .with_compaction_runner(Arc::new(runner))
+                    .with_compaction_workspace(workspace_policy);
+            }
+        }
 
         // Run the task — this is the same code path the local chat command
         // uses. Any LLM/tool errors surface as `eyre::Report`.
