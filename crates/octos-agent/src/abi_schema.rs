@@ -44,6 +44,15 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the Matrix swarm supervisor config contract
+/// (M7.3). Older configs that omit the field default to v1.
+///
+/// This is the contract between the octos-cli profile loader and the
+/// octos-bus Matrix channel extension — the profile's
+/// `matrix.swarm_supervisor` section carries a matching numeric
+/// `schema_version`.
+pub const SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for the typed
 /// [`HarnessEventPayload::SubAgentDispatch`](crate::harness_events::HarnessEventPayload::SubAgentDispatch)
 /// event and its nested

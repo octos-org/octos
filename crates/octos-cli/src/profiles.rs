@@ -96,6 +96,13 @@ pub struct ProfileConfig {
     /// Adaptive routing configuration (QoS weights, mode, etc.).
     #[serde(default)]
     pub adaptive_routing: Option<crate::config::AdaptiveRoutingConfig>,
+    /// Matrix-specific profile config (e.g. swarm supervisor rooms).
+    ///
+    /// Absent → behaves exactly like pre-M7.3 Matrix deployments. Present →
+    /// enables Matrix-as-supervisor-UI via agent puppets (see
+    /// [`MatrixProfileConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixProfileConfig>,
     /// Content-classified smart routing configuration (M6.6).
     /// Missing config defaults to `enabled: false` (invariant #3 of issue #493).
     #[serde(default)]
@@ -160,6 +167,96 @@ pub struct RobotConfig {
     /// Realtime heartbeat + sensor-context-injection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime: Option<octos_agent::RealtimeConfig>,
+}
+
+/// Current schema version for [`SwarmSupervisorConfig`].
+///
+/// Older configs that omit `schema_version` are accepted as v1 via
+/// [`default_swarm_supervisor_schema_version`]. Tracks
+/// [`octos_agent::SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION`] — the two MUST
+/// stay in lock-step so the agent-side ABI compat checks and the CLI-side
+/// profile loader agree on the serialized shape.
+pub const SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION: u32 =
+    octos_agent::SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION;
+
+fn default_swarm_supervisor_schema_version() -> u32 {
+    SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION
+}
+
+/// Matrix-specific profile configuration.
+///
+/// Holds optional Matrix-scoped features that extend the baseline appservice
+/// channel; absent fields leave the channel behavior unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixProfileConfig {
+    /// Swarm supervisor UI contract — route harness events to per-swarm rooms
+    /// and accept supervisor replies as steering input. Absent → disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_supervisor: Option<SwarmSupervisorConfig>,
+}
+
+/// Configuration for Matrix-as-supervisor-UI via agent puppets (M7.3).
+///
+/// When present, each sub-agent in a swarm is surfaced as a Matrix puppet
+/// user in a per-swarm room. The human supervisor interacts through any
+/// Matrix client (Element, etc.) and replies route back to the addressed
+/// puppet as steering input.
+///
+/// The bot account backing the appservice MUST hold Matrix admin API
+/// permissions so it can register puppet users and invite them to rooms.
+/// Deployments without admin rights MUST leave this section absent, which
+/// preserves the pre-M7.3 Matrix channel behavior exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmSupervisorConfig {
+    /// Durable ABI schema version for this config section.
+    ///
+    /// See [`SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION`] for the current value
+    /// and `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for per-version field
+    /// guarantees. Older configs without this field default to v1.
+    #[serde(default = "default_swarm_supervisor_schema_version")]
+    pub schema_version: u32,
+    /// Matrix localpart prefix used for puppet users (e.g. `"swarm_"` →
+    /// `@swarm_s3f1:server`). Scopes puppets out of the shared user
+    /// namespace used by baseline bots.
+    #[serde(default = "default_swarm_puppet_prefix")]
+    pub puppet_prefix: String,
+    /// Matrix room alias prefix for per-swarm supervisor rooms (e.g.
+    /// `"swarm_"` → `#swarm_s3f1:server`). Aliases are idempotent — re-running
+    /// `ensure_swarm_room` returns the same room ID.
+    #[serde(default = "default_swarm_room_prefix")]
+    pub room_prefix: String,
+    /// Matrix user IDs that will be invited to every swarm room as
+    /// supervisors. Replies from these users route to the addressed puppet.
+    #[serde(default)]
+    pub supervisor_user_ids: Vec<String>,
+    /// If true, verify the bot account reports `admin: true` on the
+    /// homeserver before provisioning puppets. When disabled, the channel
+    /// best-effort uses the appservice token for user registration (the
+    /// existing Matrix appservice pattern).
+    #[serde(default)]
+    pub require_admin_api: bool,
+}
+
+impl Default for SwarmSupervisorConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION,
+            puppet_prefix: default_swarm_puppet_prefix(),
+            room_prefix: default_swarm_room_prefix(),
+            supervisor_user_ids: Vec::new(),
+            require_admin_api: false,
+        }
+    }
+}
+
+fn default_swarm_puppet_prefix() -> String {
+    "swarm_".to_string()
+}
+
+fn default_swarm_room_prefix() -> String {
+    "swarm_".to_string()
 }
 
 /// Credential pool configuration (M6.5).
@@ -298,6 +395,8 @@ pub struct ProfileConfigPatch {
     pub sandbox: Option<octos_agent::SandboxConfig>,
     #[serde(default)]
     pub adaptive_routing: PatchField<crate::config::AdaptiveRoutingConfig>,
+    #[serde(default)]
+    pub matrix: PatchField<MatrixProfileConfig>,
     #[serde(default)]
     pub content_routing: PatchField<octos_llm::RoutingConfig>,
     #[serde(default)]
@@ -528,6 +627,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.adaptive_routing = None,
             PatchField::Value(adaptive_routing) => self.adaptive_routing = Some(adaptive_routing),
+        }
+        match patch.matrix {
+            PatchField::Absent => {}
+            PatchField::Clear => self.matrix = None,
+            PatchField::Value(matrix) => self.matrix = Some(matrix),
         }
         match patch.content_routing {
             PatchField::Absent => {}

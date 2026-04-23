@@ -63,7 +63,11 @@ pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
 #[cfg(feature = "matrix")]
-pub use matrix_channel::{BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel};
+pub use matrix_channel::{
+    BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel, MatrixEventId, MatrixRoomId,
+    MatrixUserId, SWARM_SUPERVISOR_EVENT_SCHEMA_V1, SteeringInput, SwarmHarnessEvent,
+    SwarmSupervisorParams,
+};
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;
 #[cfg(feature = "slack")]
