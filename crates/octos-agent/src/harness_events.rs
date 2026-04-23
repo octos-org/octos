@@ -17,7 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::abi_schema::HARNESS_ERROR_SCHEMA_VERSION;
+use crate::abi_schema::{HARNESS_ERROR_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION};
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
 use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
@@ -38,6 +38,10 @@ const MAX_CREDENTIAL_ID_BYTES: usize = 256;
 
 fn default_validator_result_schema_version() -> u32 {
     VALIDATOR_RESULT_SCHEMA_VERSION
+}
+
+fn default_sub_agent_dispatch_schema_version() -> u32 {
+    SUB_AGENT_DISPATCH_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +224,10 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessFailureEvent,
     },
+    SubAgentDispatch {
+        #[serde(flatten)]
+        data: HarnessSubAgentDispatchEvent,
+    },
     /// Content-classified smart routing decision (M6.6).
     ///
     /// Emitted once per chat turn, before the adaptive router picks a lane.
@@ -337,6 +345,33 @@ pub struct HarnessFailureEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Typed payload emitted when the harness dispatches a task to an
+/// MCP-backed sub-agent. The schema is versioned so downstream tooling
+/// can reject unknown variants instead of silently dropping fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessSubAgentDispatchEvent {
+    #[serde(default = "default_sub_agent_dispatch_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Stable backend label: `"local"` (stdio subprocess) or `"remote"`
+    /// (HTTPS).
+    pub backend: String,
+    /// Human-readable endpoint identifier (command or URL).
+    pub endpoint: String,
+    /// Outcome label from [`crate::tools::mcp_agent::DispatchOutcome`].
+    pub outcome: String,
+    /// Optional error text for non-success outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Content-classified smart routing decision payload (M6.6).
 ///
 /// Emitted once per chat turn with the classifier's tier choice and the
@@ -407,6 +442,17 @@ impl HarnessEvent {
                     extra: HashMap::new(),
                 },
             },
+        }
+    }
+
+    /// Convenience builder for a `SubAgentDispatch` event. Takes a
+    /// pre-populated [`HarnessSubAgentDispatchEvent`] so callers pay
+    /// the construction cost once and this helper stays below clippy's
+    /// argument limit.
+    pub fn sub_agent_dispatch(data: HarnessSubAgentDispatchEvent) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::SubAgentDispatch { data },
         }
     }
 
@@ -552,6 +598,21 @@ impl HarnessEvent {
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
                 validate_bounded("failure message", &data.message, MAX_MESSAGE_BYTES)?;
+            }
+            HarnessEventPayload::SubAgentDispatch { data } => {
+                if data.schema_version > SUB_AGENT_DISPATCH_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported sub-agent dispatch schema_version {} (max supported: {})",
+                        data.schema_version, SUB_AGENT_DISPATCH_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("sub-agent backend", &data.backend, MAX_MESSAGE_BYTES)?;
+                validate_bounded("sub-agent endpoint", &data.endpoint, MAX_MESSAGE_BYTES)?;
+                validate_bounded("sub-agent outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
+                validate_optional_message(data.message.as_deref())?;
             }
             HarnessEventPayload::RoutingDecision { data } => {
                 validate_common_ids(&data.session_id, &data.task_id)?;
@@ -700,6 +761,25 @@ impl HarnessEvent {
                     "retryable": data.retryable,
                 })
             }
+            HarnessEventPayload::SubAgentDispatch { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "sub_agent_dispatch",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "backend": data.backend,
+                    "endpoint": data.endpoint,
+                    "outcome": data.outcome,
+                    "message": data.message,
+                })
+            }
             HarnessEventPayload::RoutingDecision { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -759,6 +839,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.session_id,
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
+            HarnessEventPayload::SubAgentDispatch { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
@@ -773,6 +854,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.task_id,
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
+            HarnessEventPayload::SubAgentDispatch { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
@@ -787,6 +869,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.workflow.as_deref(),
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
+            HarnessEventPayload::SubAgentDispatch { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
@@ -801,6 +884,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.phase.as_deref(),
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
+            HarnessEventPayload::SubAgentDispatch { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.phase.as_deref(),

@@ -44,6 +44,15 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::SubAgentDispatch`](crate::harness_events::HarnessEventPayload::SubAgentDispatch)
+/// event and its nested
+/// [`HarnessSubAgentDispatchEvent`](crate::harness_events::HarnessSubAgentDispatchEvent)
+/// payload emitted when the harness dispatches work to an MCP-exposed
+/// sub-agent. Callers MUST validate the version on deserialization via
+/// [`check_supported`] before using any v1-specific fields.
+pub const SUB_AGENT_DISPATCH_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `SessionSummary` (harness M6.4).
 ///
 /// Carries the typed LLM-iterative compaction summary: goal, constraints,
@@ -219,6 +228,23 @@ mod tests {
         )
         .expect_err("future version should be rejected");
         assert_eq!(err.kind, "CredentialPoolConfig");
+        assert_eq!(err.found, 99);
+    }
+
+    #[test]
+    fn sub_agent_dispatch_schema_version_is_registered_at_v1() {
+        assert_eq!(SUB_AGENT_DISPATCH_SCHEMA_VERSION, 1);
+        assert!(
+            check_supported(
+                "SubAgentDispatch",
+                SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+                SUB_AGENT_DISPATCH_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+        let err = check_supported("SubAgentDispatch", 99, SUB_AGENT_DISPATCH_SCHEMA_VERSION)
+            .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "SubAgentDispatch");
         assert_eq!(err.found, 99);
     }
 }
