@@ -4,18 +4,18 @@ mod account;
 mod admin;
 mod auth;
 mod channels;
-pub(crate) mod chat;
+pub mod chat;
 mod clean;
 mod completions;
 mod cron;
 mod docs;
-pub(crate) mod gateway;
+pub mod gateway;
 mod init;
-mod mcp_serve;
+pub mod mcp_serve;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
-pub(crate) mod skills;
+pub mod skills;
 mod status;
 
 use std::path::PathBuf;
@@ -118,7 +118,7 @@ pub trait Executable {
 /// Resolve the data directory for episodes, memory, sessions, etc.
 ///
 /// Priority: `--data-dir` CLI flag > `OCTOS_HOME` env var > `~/.octos` default.
-pub(crate) fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
+pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
     let dir = if let Some(d) = cli_override {
         d
     } else if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
