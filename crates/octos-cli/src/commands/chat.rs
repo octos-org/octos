@@ -7,7 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Args;
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::{Agent, AgentConfig, ConsoleReporter, HookExecutor, ToolRegistry};
+use octos_agent::compaction::CompactionRunner;
+use octos_agent::{
+    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, HookExecutor, ToolRegistry,
+    read_workspace_policy,
+};
 use octos_core::{AgentId, Message, MessageRole};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
@@ -329,6 +333,35 @@ impl ChatCommand {
 
         if let Some(embedder) = create_embedder(&config) {
             agent = agent.with_embedder(embedder);
+        }
+
+        // Harness M6.3/M6.4: wire the declarative compaction runner when the
+        // workspace policy in the cwd declares a compaction block. Picks the
+        // LLM-iterative summarizer when the policy asks for it; falls back to
+        // extractive otherwise. No-op when the policy file is missing or
+        // declares no compaction.
+        match read_workspace_policy(&cwd) {
+            Ok(Some(workspace_policy)) => {
+                if let Some(compaction_policy) = workspace_policy.compaction.clone() {
+                    let runner = match compaction_policy.summarizer {
+                        CompactionSummarizerKind::LlmIterative => CompactionRunner::with_provider(
+                            compaction_policy,
+                            agent.llm_provider(),
+                        ),
+                        CompactionSummarizerKind::Extractive => {
+                            CompactionRunner::new(compaction_policy)
+                        }
+                    }
+                    .with_workspace_policy(&workspace_policy);
+                    agent = agent
+                        .with_compaction_runner(Arc::new(runner))
+                        .with_compaction_workspace(workspace_policy);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("Warning: failed to read workspace policy for compaction: {error}");
+            }
         }
 
         // Single-message mode: send one message and exit

@@ -12,6 +12,7 @@ use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use metrics::counter;
+use octos_agent::compaction::CompactionRunner;
 use octos_agent::tools::spawn::{
     ChildSessionFailureAction, ChildSessionLifecycleKind, ChildSessionLifecyclePayload,
 };
@@ -20,9 +21,9 @@ use octos_agent::tools::{
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult, TaskSupervisor,
-    TokenTracker, TurnAttachmentContext, WorkspacePolicy, read_workspace_policy,
-    workspace_policy_path, write_workspace_policy,
+    Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
+    HookResult, TaskSupervisor, TokenTracker, TurnAttachmentContext, WorkspacePolicy,
+    read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -1396,54 +1397,61 @@ impl ActorFactory {
         let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);
         let desired_session_policy = WorkspacePolicy::for_session();
-        match read_workspace_policy(&user_workspace) {
-            Ok(Some(mut existing_policy)) => {
-                let mut updated = false;
-                for (name, pattern) in &desired_session_policy.artifacts.entries {
-                    if !existing_policy.artifacts.entries.contains_key(name) {
-                        existing_policy
-                            .artifacts
-                            .entries
-                            .insert(name.clone(), pattern.clone());
-                        updated = true;
+        let active_workspace_policy: Option<WorkspacePolicy> =
+            match read_workspace_policy(&user_workspace) {
+                Ok(Some(mut existing_policy)) => {
+                    let mut updated = false;
+                    for (name, pattern) in &desired_session_policy.artifacts.entries {
+                        if !existing_policy.artifacts.entries.contains_key(name) {
+                            existing_policy
+                                .artifacts
+                                .entries
+                                .insert(name.clone(), pattern.clone());
+                            updated = true;
+                        }
                     }
-                }
-                for (name, task) in &desired_session_policy.spawn_tasks {
-                    if !existing_policy.spawn_tasks.contains_key(name) {
-                        existing_policy
-                            .spawn_tasks
-                            .insert(name.clone(), task.clone());
-                        updated = true;
+                    for (name, task) in &desired_session_policy.spawn_tasks {
+                        if !existing_policy.spawn_tasks.contains_key(name) {
+                            existing_policy
+                                .spawn_tasks
+                                .insert(name.clone(), task.clone());
+                            updated = true;
+                        }
                     }
+                    if updated {
+                        if let Err(error) =
+                            write_workspace_policy(&user_workspace, &existing_policy)
+                        {
+                            warn!(
+                                session = %session_key,
+                                path = %session_policy_path.display(),
+                                "failed to upgrade session workspace policy: {error}"
+                            );
+                        }
+                    }
+                    Some(existing_policy)
                 }
-                if updated {
-                    if let Err(error) = write_workspace_policy(&user_workspace, &existing_policy) {
+                Ok(None) => {
+                    if let Err(error) =
+                        write_workspace_policy(&user_workspace, &desired_session_policy)
+                    {
                         warn!(
                             session = %session_key,
                             path = %session_policy_path.display(),
-                            "failed to upgrade session workspace policy: {error}"
+                            "failed to write session workspace policy: {error}"
                         );
                     }
+                    Some(desired_session_policy.clone())
                 }
-            }
-            Ok(None) => {
-                if let Err(error) = write_workspace_policy(&user_workspace, &desired_session_policy)
-                {
+                Err(error) => {
                     warn!(
                         session = %session_key,
                         path = %session_policy_path.display(),
-                        "failed to write session workspace policy: {error}"
+                        "failed to read session workspace policy: {error}"
                     );
+                    None
                 }
-            }
-            Err(error) => {
-                warn!(
-                    session = %session_key,
-                    path = %session_policy_path.display(),
-                    "failed to read session workspace policy: {error}"
-                );
-            }
-        }
+            };
 
         // send_file resolves relative paths against user_workspace (same as
         // write_file/read_file) so the LLM can write+send in one flow.
@@ -1723,6 +1731,27 @@ impl ActorFactory {
         }
         if let Some(ref ctx) = session_hook_context {
             agent = agent.with_hook_context(ctx.clone());
+        }
+
+        // Harness M6.3/M6.4: wire the declarative compaction runner when the
+        // active workspace policy declares a compaction block. Selects the
+        // LLM-iterative summarizer when the policy asks for it (hands in the
+        // agent's LlmProvider); falls back to extractive otherwise.
+        if let Some(ref workspace_policy) = active_workspace_policy {
+            if let Some(compaction_policy) = workspace_policy.compaction.clone() {
+                let runner = match compaction_policy.summarizer {
+                    CompactionSummarizerKind::LlmIterative => {
+                        CompactionRunner::with_provider(compaction_policy, agent.llm_provider())
+                    }
+                    CompactionSummarizerKind::Extractive => {
+                        CompactionRunner::new(compaction_policy)
+                    }
+                }
+                .with_workspace_policy(workspace_policy);
+                agent = agent
+                    .with_compaction_runner(Arc::new(runner))
+                    .with_compaction_workspace(workspace_policy.clone());
+            }
         }
 
         // Wire the activate_tools back-reference now that tools are in Arc
