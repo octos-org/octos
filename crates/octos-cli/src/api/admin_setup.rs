@@ -716,9 +716,10 @@ mod tests {
 
     #[tokio::test]
     async fn post_setup_step_accepts_boundary_values() {
+        // Handler rejects `step > 4`, so the valid inclusive range is 0..=4.
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_store(dir.path());
-        for step in [0u32, 5u32] {
+        for step in [0u32, 4u32] {
             let status = post_setup_step(State(state.clone()), Json(StepBody { step }))
                 .await
                 .unwrap();
