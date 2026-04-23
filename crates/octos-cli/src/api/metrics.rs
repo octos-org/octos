@@ -293,6 +293,26 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "delegations".to_string(),
             total_for_metric(samples, "octos_delegation_total"),
         ),
+        (
+            "routing_decisions".to_string(),
+            total_for_metric(samples, "octos_routing_decision_total"),
+        ),
+        (
+            "credential_rotations".to_string(),
+            total_for_metric(samples, "octos_llm_credential_rotation_total"),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+        ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+        ),
+        (
+            "loop_retries".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_RETRY_TOTAL),
+        ),
     ])
 }
 
@@ -365,6 +385,42 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
         (
             "delegations".to_string(),
             breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
+        ),
+        (
+            "routing_decisions".to_string(),
+            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
+        ),
+        (
+            "credential_rotations".to_string(),
+            breakdown(
+                samples,
+                "octos_llm_credential_rotation_total",
+                &["reason", "strategy"],
+            ),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            breakdown(
+                samples,
+                "octos_compaction_preservation_violations_total",
+                &["phase"],
+            ),
+        ),
+        (
+            "loop_errors".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
+            ),
+        ),
+        (
+            "loop_retries".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_RETRY_TOTAL,
+                &["variant", "decision"],
+            ),
         ),
     ])
 }
@@ -778,6 +834,21 @@ pub fn record_llm_tokens(direction: &str, count: u32) {
         .increment(u64::from(count));
 }
 
+/// Record a content-classified smart routing decision (M6.6).
+///
+/// Increments `octos_routing_decision_total{tier, lane}`. `lane` is optional —
+/// the classifier emits decisions before lane selection, so callers either
+/// pass the lane they ultimately picked or `None` to record as `"unset"`.
+pub fn record_routing_decision(tier: &str, lane: Option<&str>) {
+    let lane_label = lane.unwrap_or("unset").to_string();
+    counter!(
+        "octos_routing_decision_total",
+        "tier" => tier.to_string(),
+        "lane" => lane_label,
+    )
+    .increment(1);
+}
+
 /// Decorator that records Prometheus metrics for progress events,
 /// then delegates to an inner reporter.
 pub struct MetricsReporter {
@@ -866,6 +937,33 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         let summary = build_operator_summary("");
         assert!(!summary.available);
         assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn should_surface_credential_rotation_metrics() {
+        let metrics = r#"
+# TYPE octos_llm_credential_rotation_total counter
+octos_llm_credential_rotation_total{reason="initial_acquire",strategy="round_robin"} 4
+octos_llm_credential_rotation_total{reason="rate_limit_cooldown",strategy="round_robin"} 2
+octos_llm_credential_rotation_total{reason="auth_failure",strategy="fill_first"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert!(summary.available);
+        assert_eq!(summary.totals.get("credential_rotations"), Some(&7));
+        let rows = summary.breakdowns.get("credential_rotations").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().any(|r| r["reason"] == "initial_acquire"
+                && r["strategy"] == "round_robin"
+                && r["count"] == 4),
+            "missing initial_acquire row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["reason"] == "auth_failure"
+                && r["strategy"] == "fill_first"
+                && r["count"] == 1),
+            "missing auth_failure row: {rows:?}"
+        );
     }
 
     #[test]

@@ -109,9 +109,12 @@ impl DepthBudget {
     pub fn increment(self) -> std::result::Result<Self, HarnessError> {
         if self.is_exhausted() {
             return Err(HarnessError::DelegateDepthExceeded {
-                current: self.current,
-                max: self.max,
-                attempted: self.child_depth(),
+                depth: self.current,
+                limit: self.max,
+                message: format!(
+                    "delegation depth budget exhausted at depth {} (limit {})",
+                    self.current, self.max
+                ),
             });
         }
         Ok(Self {
@@ -686,14 +689,15 @@ mod tests {
             .expect_err("max depth reached must reject");
         match refused {
             HarnessError::DelegateDepthExceeded {
-                current,
-                max,
-                attempted,
+                depth,
+                limit,
+                message,
             } => {
-                assert_eq!(current, 2);
-                assert_eq!(max, MAX_DEPTH);
-                assert_eq!(attempted, 3);
+                assert_eq!(depth, 2);
+                assert_eq!(limit, MAX_DEPTH);
+                assert!(message.contains("depth 2"));
             }
+            other => panic!("expected DelegateDepthExceeded, got {other:?}"),
         }
     }
 

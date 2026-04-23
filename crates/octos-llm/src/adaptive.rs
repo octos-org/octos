@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ChatConfig;
+use crate::content_classifier::{ClassificationDecision, ContentClassifier};
+use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
@@ -535,6 +537,14 @@ pub struct AdaptiveStatus {
 /// switches that happen inside `chat_stream()` failover.
 pub type StatusCallback = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Callback invoked once per chat turn with a content classifier decision.
+/// Wired by the agent layer to emit `octos.harness.event.v1 { kind: "routing.decision" }`
+/// events and to bump the `octos_routing_decision_total` counter.
+///
+/// Invariant: this callback fires *before* the router picks a lane, so the
+/// decision is observable even when the subsequent lane selection fails.
+pub type RoutingDecisionCallback = Arc<dyn Fn(&ClassificationDecision) + Send + Sync>;
+
 pub struct AdaptiveRouter {
     slots: Vec<AdaptiveSlot>,
     config: AdaptiveConfig,
@@ -550,6 +560,19 @@ pub struct AdaptiveRouter {
     /// RwLock allows concurrent reads in the hot path (emit_status) while
     /// writes (set_status_callback) are rare setup-time operations.
     status_callback: RwLock<Option<StatusCallback>>,
+    /// Content classifier that biases lane selection. `None` means "disabled"
+    /// (router behaves as before — invariant #2 of issue #493). RwLock
+    /// mirrors the status callback pattern so runtime toggles are safe.
+    classifier: RwLock<Option<Arc<ContentClassifier>>>,
+    /// Observer fired with the classifier decision on each chat entry.
+    decision_callback: RwLock<Option<RoutingDecisionCallback>>,
+    /// Optional per-slot credential pool. When attached, the router forwards
+    /// rate-limit and auth failures to the pool so it can cool down or
+    /// refresh the underlying credential. Empty vec means "no pools".
+    credential_pools: RwLock<Vec<Option<Arc<dyn CredentialPool>>>>,
+    /// Id of the credential currently in use per slot. Updated at acquire
+    /// time so failure notifications can identify the right credential.
+    current_credential_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl AdaptiveRouter {
@@ -568,7 +591,7 @@ impl AdaptiveRouter {
             !providers.is_empty(),
             "AdaptiveRouter requires at least one provider"
         );
-        let slots = providers
+        let slots: Vec<AdaptiveSlot> = providers
             .into_iter()
             .enumerate()
             .map(|(i, p)| AdaptiveSlot {
@@ -589,6 +612,7 @@ impl AdaptiveRouter {
                 max_output: AtomicU64::new(0),
             })
             .collect();
+        let slot_count = slots.len();
         Self {
             slots,
             config,
@@ -602,7 +626,120 @@ impl AdaptiveRouter {
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
             status_callback: RwLock::new(None),
+            classifier: RwLock::new(None),
+            decision_callback: RwLock::new(None),
+            credential_pools: RwLock::new(vec![None; slot_count]),
+            current_credential_ids: Mutex::new(vec![None; slot_count]),
         }
+    }
+
+    /// Attach a credential pool to slot `idx`. The router forwards 429 and
+    /// auth failures to the pool so keys can rotate without the caller
+    /// orchestrating it. Silently ignores out-of-range indices.
+    pub fn attach_credential_pool(&self, idx: usize, pool: Arc<dyn CredentialPool>) {
+        let mut pools = self.credential_pools.write().unwrap();
+        if idx < pools.len() {
+            pools[idx] = Some(pool);
+        }
+    }
+
+    /// Acquire the current credential for `idx` from the attached pool (if
+    /// any). Returns `None` when no pool is attached, when the slot is out
+    /// of range, or when every credential is in cooldown. Callers that don't
+    /// use credential pools can ignore this entirely.
+    pub async fn acquire_credential(&self, idx: usize, reason: &str) -> Option<String> {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let pool = pool?;
+        match pool.acquire(reason).await {
+            Ok(cred) => {
+                let mut ids = self
+                    .current_credential_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(slot) = ids.get_mut(idx) {
+                    *slot = Some(cred.id.clone());
+                }
+                Some(cred.id)
+            }
+            Err(e) => {
+                warn!(idx, error = %e, "credential pool acquire failed");
+                None
+            }
+        }
+    }
+
+    /// Notify the attached credential pool (if any) that slot `idx` observed
+    /// a recoverable failure so it can cool the credential down or refresh
+    /// OAuth tokens. No-op when no pool is attached.
+    ///
+    /// `auth_failure` — treats the error as authentication and invokes the
+    /// refresher at most once per `error_id`.
+    /// `rate_limit_reset_us` — cooldown target for 429 errors.
+    pub async fn notify_credential_failure(
+        &self,
+        idx: usize,
+        auth_failure: bool,
+        rate_limit_reset_us: Option<u64>,
+        error_id: ErrorId,
+    ) {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let Some(pool) = pool else {
+            return;
+        };
+        let cred_id = {
+            let ids = self
+                .current_credential_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ids.get(idx).and_then(|slot| slot.clone())
+        };
+        let Some(cred_id) = cred_id else {
+            debug!(idx, "notify_credential_failure without acquired id");
+            return;
+        };
+        if auth_failure {
+            if let Err(e) = pool.mark_auth_failure(&cred_id, error_id).await {
+                warn!(idx, cred_id, error = %e, "mark_auth_failure failed");
+            }
+        } else if let Err(e) = pool.mark_rate_limited(&cred_id, rate_limit_reset_us).await {
+            warn!(idx, cred_id, error = %e, "mark_rate_limited failed");
+        }
+    }
+
+    /// Report a successful request for slot `idx` to its credential pool.
+    pub async fn notify_credential_success(&self, idx: usize) {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let Some(pool) = pool else {
+            return;
+        };
+        let cred_id = {
+            let ids = self
+                .current_credential_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ids.get(idx).and_then(|slot| slot.clone())
+        };
+        let Some(cred_id) = cred_id else {
+            return;
+        };
+        if let Err(e) = pool.mark_success(&cred_id).await {
+            warn!(idx, cred_id, error = %e, "mark_success failed");
+        }
+    }
+
+    /// Convenience: acquire the initial credential for slot `idx`.
+    pub async fn acquire_initial_credential(&self, idx: usize) -> Option<String> {
+        self.acquire_credential(idx, rotation_reason::INITIAL_ACQUIRE)
+            .await
     }
 
     /// Set initial adaptive mode and QoS toggle from config.
@@ -641,6 +778,37 @@ impl AdaptiveRouter {
     pub fn set_qos_ranking(&self, enabled: bool) {
         self.qos_ranking.store(enabled, Ordering::Relaxed);
         info!(enabled, "QoS quality ranking toggled");
+    }
+
+    /// Install the content classifier (M6.6). `None` disables — the router
+    /// then behaves as if the classifier contract did not exist.
+    ///
+    /// Wiring for credential-pool-aware lane selection (M6.5) consumes the
+    /// classifier's tier through `classify_turn()`. Until M6.5 lands the
+    /// tier is emitted as an event + counter only.
+    pub fn set_content_classifier(&self, classifier: Option<Arc<ContentClassifier>>) {
+        *self.classifier.write().unwrap() = classifier;
+    }
+
+    /// Install the routing-decision observer. The agent wires this to emit
+    /// the `routing.decision` harness event and bump the metric counter.
+    pub fn set_routing_decision_callback(&self, cb: Option<RoutingDecisionCallback>) {
+        *self.decision_callback.write().unwrap() = cb;
+    }
+
+    /// Classify the latest user turn and notify observers.
+    ///
+    /// Returns the decision so callers (and future M6.5 credential-pool lane
+    /// selection) can act on it. Returns `None` when no classifier is
+    /// attached, letting the router stay on its existing code path.
+    pub fn classify_turn(&self, messages: &[Message]) -> Option<ClassificationDecision> {
+        let classifier = self.classifier.read().unwrap().clone()?;
+        let input = latest_user_text(messages);
+        let decision = classifier.classify(&input);
+        if let Some(cb) = self.decision_callback.read().unwrap().as_ref() {
+            cb(&decision);
+        }
+        Some(decision)
     }
 
     /// Pre-seed metrics from benchmark baseline data so the router starts
@@ -1279,7 +1447,7 @@ impl AdaptiveRouter {
                     );
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 self.slots[idx].metrics.record_failure();
                 let consec = self.slots[idx]
                     .metrics
@@ -1292,6 +1460,7 @@ impl AdaptiveRouter {
                         "provider circuit breaker opened"
                     );
                 }
+                self.notify_credential_failure_from_error(idx, e).await;
             }
         }
 
@@ -1299,6 +1468,25 @@ impl AdaptiveRouter {
             response.provider_index = Some(idx);
             response
         })
+    }
+
+    /// Classify `err` and forward the failure to slot `idx`'s credential
+    /// pool (if attached). Runs once per error — the pool itself enforces
+    /// at-most-once OAuth refresh per error id via its own guard.
+    async fn notify_credential_failure_from_error(&self, idx: usize, err: &eyre::Report) {
+        let text = err.to_string().to_lowercase();
+        let is_auth = text.contains("401")
+            || text.contains("403")
+            || text.contains("authentication")
+            || text.contains("unauthorized");
+        let is_rate_limit = text.contains("429") || text.contains("rate limit");
+        if is_auth {
+            self.notify_credential_failure(idx, true, None, ErrorId::fresh())
+                .await;
+        } else if is_rate_limit {
+            self.notify_credential_failure(idx, false, None, ErrorId::fresh())
+                .await;
+        }
     }
 
     /// Try a stream request on a specific provider.
@@ -1323,8 +1511,9 @@ impl AdaptiveRouter {
                     .metrics
                     .record_success_with_alpha(elapsed_us, self.config.ema_alpha);
             }
-            Err(_) => {
+            Err(e) => {
                 self.slots[idx].metrics.record_failure();
+                self.notify_credential_failure_from_error(idx, e).await;
             }
         }
 
@@ -1346,6 +1535,12 @@ impl LlmProvider for AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        // Invariant #5 of issue #493: classify BEFORE selecting a lane so the
+        // decision is observable even if lane selection fails. M6.5 will
+        // consume the returned tier for credential-pool-aware selection;
+        // today the downstream router code path remains unchanged so
+        // `enabled: false` configs see identical behavior (invariant #2).
+        let _classifier_decision = self.classify_turn(messages);
         let mode = self.mode();
         let (start_idx, is_probe) = self.select_provider();
 
@@ -1420,6 +1615,8 @@ impl LlmProvider for AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        // Classify the turn before lane selection (see invariant #5 above).
+        let _classifier_decision = self.classify_turn(messages);
         let (start_idx, _is_probe) = self.select_provider();
 
         match self
@@ -1525,6 +1722,26 @@ fn now_epoch_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+/// Extract the text of the most recent user message, or fall back to the last
+/// message of any role. Returns an empty string if `messages` is empty.
+///
+/// The classifier runs against the "latest user turn" — this is the stable
+/// definition of that input. Keeping it centralized means the router and
+/// any future M6.5 credential-pool integration agree on the same slice.
+fn latest_user_text(messages: &[Message]) -> String {
+    if let Some(msg) = messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, octos_core::MessageRole::User))
+    {
+        return msg.content.clone();
+    }
+    messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

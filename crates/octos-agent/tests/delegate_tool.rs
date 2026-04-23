@@ -122,14 +122,15 @@ async fn should_deny_grandchild_delegation_with_typed_error() {
         .expect("error must downcast to HarnessError");
     match harness {
         HarnessError::DelegateDepthExceeded {
-            current,
-            max,
-            attempted,
+            depth,
+            limit,
+            message,
         } => {
-            assert_eq!(*current, MAX_DEPTH);
-            assert_eq!(*max, MAX_DEPTH);
-            assert_eq!(*attempted, MAX_DEPTH + 1);
+            assert_eq!(*depth, MAX_DEPTH);
+            assert_eq!(*limit, MAX_DEPTH);
+            assert!(message.contains(&format!("depth {MAX_DEPTH}")));
         }
+        other => panic!("expected DelegateDepthExceeded, got {other:?}"),
     }
 }
 
@@ -222,14 +223,15 @@ async fn should_increment_depth_budget_per_level() {
         .expect_err("past MAX_DEPTH must reject");
     match refused {
         HarnessError::DelegateDepthExceeded {
-            current,
-            max,
-            attempted,
+            depth,
+            limit,
+            message,
         } => {
-            assert_eq!(current, MAX_DEPTH);
-            assert_eq!(max, MAX_DEPTH);
-            assert_eq!(attempted, MAX_DEPTH + 1);
+            assert_eq!(depth, MAX_DEPTH);
+            assert_eq!(limit, MAX_DEPTH);
+            assert!(message.contains(&format!("depth {MAX_DEPTH}")));
         }
+        other => panic!("expected DelegateDepthExceeded, got {other:?}"),
     }
 
     // Same propagation via the owning-tool helper: a top-level parent
@@ -242,9 +244,10 @@ async fn should_increment_depth_budget_per_level() {
     assert_eq!(grandchild.depth_budget(), grandchild_budget);
     match grandchild.child_tool() {
         Ok(_) => panic!("grandchild must refuse a fourth level"),
-        Err(HarnessError::DelegateDepthExceeded { attempted, .. }) => {
-            assert_eq!(attempted, MAX_DEPTH + 1);
+        Err(HarnessError::DelegateDepthExceeded { depth, .. }) => {
+            assert_eq!(depth, MAX_DEPTH);
         }
+        Err(other) => panic!("expected DelegateDepthExceeded, got {other:?}"),
     }
 }
 
