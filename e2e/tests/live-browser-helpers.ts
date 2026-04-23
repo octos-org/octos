@@ -13,6 +13,12 @@ export const SEL = {
   newChatButton: "[data-testid='new-chat-button']",
   loginTokenInput: "[data-testid='token-input']",
   loginButton: "[data-testid='login-button']",
+  // Slash commands (/help, /queue, /adaptive, /status, /new, /reset, /soul)
+  // are consumed locally by the web client and render their feedback via
+  // cmd-feedback — NOT as assistant-message bubbles. cmd-hints is the
+  // autocomplete panel shown while typing a partial slash command.
+  cmdHints: "[data-testid='cmd-hints']",
+  cmdFeedback: "[data-testid='cmd-feedback']",
 } as const;
 
 export async function login(page: Page) {
