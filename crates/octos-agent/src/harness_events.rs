@@ -34,6 +34,7 @@ const MAX_TASK_ID_BYTES: usize = 128;
 const MAX_WORKFLOW_BYTES: usize = 128;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
+const MAX_CREDENTIAL_ID_BYTES: usize = 256;
 
 fn default_validator_result_schema_version() -> u32 {
     VALIDATOR_RESULT_SCHEMA_VERSION
@@ -135,6 +136,56 @@ pub fn emit_registered_progress_event(
     write_event_to_sink(raw_sink, &event).is_ok()
 }
 
+/// Emit a credential rotation event to a registered sink (M6.5). Returns
+/// `true` when the sink accepted the write. Used by the harness-layer sink
+/// adapter that forwards `octos_llm::CredentialRotationEvent` into the
+/// structured event stream.
+pub fn emit_registered_credential_rotation_event(
+    raw_sink: impl AsRef<str>,
+    credential_id: &str,
+    reason: &str,
+    strategy: &str,
+) -> bool {
+    let raw_sink = raw_sink.as_ref();
+    let Some(context) = lookup_event_sink_context(raw_sink) else {
+        return false;
+    };
+    let event = HarnessEvent::credential_rotation(
+        context.session_id,
+        context.task_id,
+        credential_id,
+        reason,
+        strategy,
+    );
+    write_event_to_sink(raw_sink, &event).is_ok()
+}
+
+/// Sink adapter that forwards octos-llm credential rotation events to a
+/// registered harness event sink identified by `raw_sink`. Implementations
+/// typically create one of these per task when a pool is attached.
+pub struct HarnessCredentialRotationSink {
+    raw_sink: String,
+}
+
+impl HarnessCredentialRotationSink {
+    pub fn new(raw_sink: impl Into<String>) -> Self {
+        Self {
+            raw_sink: raw_sink.into(),
+        }
+    }
+}
+
+impl octos_llm::RotationEventSink for HarnessCredentialRotationSink {
+    fn emit(&self, event: &octos_llm::CredentialRotationEvent) {
+        let _ = emit_registered_credential_rotation_event(
+            &self.raw_sink,
+            &event.credential_id,
+            &event.reason,
+            &event.strategy,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessEvent {
     pub schema: String,
@@ -168,6 +219,10 @@ pub enum HarnessEventPayload {
     Failure {
         #[serde(flatten)]
         data: HarnessFailureEvent,
+    },
+    CredentialRotation {
+        #[serde(flatten)]
+        data: HarnessCredentialRotationEvent,
     },
     Error {
         #[serde(flatten)]
@@ -273,6 +328,26 @@ pub struct HarnessFailureEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Structured credential rotation event (M6.5).
+///
+/// Emitted by the credential pool on every successful selection. Consumers
+/// can tie the event to a Prometheus counter
+/// (`octos_llm_credential_rotation_total{reason, strategy}`) for parity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCredentialRotationEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// Stable identifier of the credential that was selected.
+    pub credential_id: String,
+    /// Stable reason label (e.g. `initial_acquire`, `rate_limit_cooldown`,
+    /// `auth_failure`, `manual_release`).
+    pub reason: String,
+    /// Strategy label (`fill_first`, `round_robin`, `random`, `least_used`).
+    pub strategy: String,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 impl HarnessEvent {
     pub fn progress(
         session_id: impl Into<String>,
@@ -314,6 +389,29 @@ impl HarnessEvent {
                     workflow: workflow.map(Into::into),
                     phase: phase.into(),
                     message: message.map(Into::into),
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Construct a credential rotation event (M6.5).
+    pub fn credential_rotation(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        reason: impl Into<String>,
+        strategy: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::CredentialRotation {
+                data: HarnessCredentialRotationEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    credential_id: credential_id.into(),
+                    reason: reason.into(),
+                    strategy: strategy.into(),
                     extra: HashMap::new(),
                 },
             },
@@ -390,6 +488,16 @@ impl HarnessEvent {
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
                 validate_bounded("failure message", &data.message, MAX_MESSAGE_BYTES)?;
+            }
+            HarnessEventPayload::CredentialRotation { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded(
+                    "credential_id",
+                    &data.credential_id,
+                    MAX_CREDENTIAL_ID_BYTES,
+                )?;
+                validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
+                validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
             }
             HarnessEventPayload::Error { data } => {
                 if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
@@ -518,6 +626,17 @@ impl HarnessEvent {
                     "retryable": data.retryable,
                 })
             }
+            HarnessEventPayload::CredentialRotation { data } => {
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "credential_rotation",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "credential_id": data.credential_id,
+                    "reason": data.reason,
+                    "strategy": data.strategy,
+                })
+            }
             HarnessEventPayload::Error { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -548,6 +667,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.session_id,
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
@@ -560,6 +680,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.task_id,
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
@@ -572,6 +693,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.workflow.as_deref(),
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
@@ -584,6 +706,7 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.phase.as_deref(),
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
@@ -910,6 +1033,36 @@ mod tests {
         assert_eq!(detail["schema_version"], VALIDATOR_RESULT_SCHEMA_VERSION);
         assert_eq!(detail["validator"], "cargo-test");
         assert_eq!(detail["passed"], true);
+    }
+
+    #[test]
+    fn should_round_trip_credential_rotation_event() {
+        let event = HarnessEvent::credential_rotation(
+            "session-1",
+            "task-1",
+            "key-42",
+            "rate_limit_cooldown",
+            "round_robin",
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""kind":"credential_rotation""#));
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        assert_eq!(parsed.session_id(), "session-1");
+        assert_eq!(parsed.task_id(), "task-1");
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["credential_id"], "key-42");
+        assert_eq!(detail["reason"], "rate_limit_cooldown");
+        assert_eq!(detail["strategy"], "round_robin");
+    }
+
+    #[test]
+    fn should_reject_credential_rotation_event_without_required_fields() {
+        let invalid = HarnessEvent::credential_rotation("s", "t", "", "initial_acquire", "random");
+        assert!(invalid.validate().is_err());
+        let invalid = HarnessEvent::credential_rotation("s", "t", "key", "", "random");
+        assert!(invalid.validate().is_err());
+        let invalid = HarnessEvent::credential_rotation("s", "t", "key", "init", "");
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
