@@ -22,7 +22,7 @@ export default function BootstrapGate({ children }: { children: React.ReactNode 
         if (!cancelled) setStatus({ rotated: s.rotated, path: location.pathname })
       })
       .catch(() => {
-        if (!cancelled) setStatus({ rotated: true, path: location.pathname })
+        if (!cancelled) setStatus({ rotated: false, path: location.pathname })
       })
     return () => {
       cancelled = true
