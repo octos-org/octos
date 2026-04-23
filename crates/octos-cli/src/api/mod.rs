@@ -149,6 +149,23 @@ pub struct AppState {
     /// `None` when swarm wiring is not configured — handlers return
     /// `503 Service Unavailable` in that case.
     pub swarm_state: Option<Arc<swarm::SwarmState>>,
+    /// Optional path to the JSONL harness-event sink. When `Some`,
+    /// typed harness events (e.g. `SwarmReviewDecision`) are appended
+    /// to the file in addition to being broadcast live to SSE
+    /// subscribers. When `None`, events are broadcast-only — so a
+    /// decision made while no subscriber is connected is lost. Wired
+    /// by `octos serve` from the `OCTOS_HARNESS_EVENT_SINK` env var.
+    pub harness_event_sink_path: Option<String>,
+    /// Credential pool (M6.5, F-005). Initialised at startup from
+    /// `config.credential_pool` when present; `None` falls back to the
+    /// legacy single-credential flow. Shared with session actors so
+    /// per-LLM-call `acquire`/`mark_*` operations see a consistent view.
+    pub credential_pool: Option<Arc<octos_llm::PersistentCredentialPool>>,
+    /// Content classifier (M6.6, F-005). Populated when
+    /// `config.content_routing` is present and `enabled: true`. When
+    /// `None` the router falls through to the unclassified strong-only
+    /// default (invariant #3 of the M6.6 spec).
+    pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
 }
 
 impl AppState {
@@ -195,6 +212,9 @@ impl AppState {
             allow_admin_shell: false,
             content_catalog_mgr: None,
             swarm_state: None,
+            harness_event_sink_path: None,
+            credential_pool: None,
+            content_classifier: None,
         }
     }
 }

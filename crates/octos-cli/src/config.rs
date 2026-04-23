@@ -156,6 +156,68 @@ pub struct Config {
     #[cfg(feature = "api")]
     #[serde(default)]
     pub monitor: Option<MonitorConfig>,
+
+    /// Credential pool configuration (M6.5, F-005). Named pool of API
+    /// keys / OAuth tokens with persistent cooldowns and rotation
+    /// strategies. Absent → no pool is opened; adapters fall back to
+    /// single-credential behavior.
+    #[serde(default)]
+    pub credential_pool: Option<CredentialPoolConfig>,
+
+    /// Content-classified smart routing configuration (M6.6, F-005).
+    /// Absent or `enabled: false` → every turn is classified as Strong
+    /// (preserves pre-M6.6 routing behavior).
+    #[serde(default)]
+    pub content_routing: Option<octos_llm::RoutingConfig>,
+}
+
+/// Top-level credential-pool configuration for `chat` / `serve`. Mirrors
+/// the per-profile shape in `crate::profiles::CredentialPoolConfig` so
+/// operators who do not use the multi-profile setup can still enable the
+/// M6.5 pool via the top-level config.json.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPoolConfig {
+    /// Optional override for the persistent state file. Defaults to
+    /// `<data_dir>/credential_pool.redb` when absent.
+    #[serde(default)]
+    pub state_path: Option<String>,
+    /// Pool name used in metrics labels (e.g. `"anthropic"`). Default:
+    /// `"default"`.
+    #[serde(default = "default_credential_pool_name")]
+    pub name: String,
+    /// Rotation strategy identifier: `"fill_first"`, `"round_robin"`,
+    /// `"random"`, `"least_used"`. Defaults to `round_robin`.
+    #[serde(default = "default_credential_pool_strategy")]
+    pub strategy: String,
+    /// Credential ids that belong to the pool. Paired at runtime with
+    /// API keys from `env_vars`.
+    #[serde(default)]
+    pub credential_ids: Vec<String>,
+    /// Default cooldown applied to 429 responses without an explicit
+    /// `reset_at` hint. Milliseconds.
+    #[serde(default)]
+    pub default_cooldown_ms: Option<u64>,
+}
+
+fn default_credential_pool_name() -> String {
+    "default".into()
+}
+
+fn default_credential_pool_strategy() -> String {
+    "round_robin".into()
+}
+
+impl Default for CredentialPoolConfig {
+    fn default() -> Self {
+        Self {
+            state_path: None,
+            name: default_credential_pool_name(),
+            strategy: default_credential_pool_strategy(),
+            credential_ids: Vec::new(),
+            default_cooldown_ms: None,
+        }
+    }
 }
 
 /// A fallback model for the provider failover chain.

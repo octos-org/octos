@@ -420,6 +420,22 @@ impl ServeCommand {
             (wf, af)
         };
 
+        // F-005: Wire the credential pool at startup. Absent config →
+        // stays `None` so the session actor falls back to the legacy
+        // single-credential flow. Distinct variable name from FA-4's
+        // `swarm_state` field to avoid accidental shadowing.
+        let credential_pool_init =
+            super::build_credential_pool(config.credential_pool.as_ref(), &data_dir);
+
+        // F-005: Build the content classifier at startup. Absent config
+        // or `enabled: false` → stays `None` so routing keeps the
+        // pre-M6.6 strong-only default (invariant #3 of issue #493).
+        let content_classifier_init: Option<Arc<octos_llm::ContentClassifier>> = config
+            .content_routing
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -457,10 +473,19 @@ impl ServeCommand {
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
             )),
-            // Swarm wiring is opt-in — populated when the serve command
-            // is given an MCP backend factory. Handlers return 503 when
-            // `None`. See `crates/octos-cli/src/api/swarm.rs`.
+            // ── swarm ──────────────────────────────────────────────
+            // Swarm wiring is opt-in — populated by F-010 once an MCP
+            // backend factory is configured. Until then handlers return
+            // 503. See `crates/octos-cli/src/api/swarm.rs`.
             swarm_state: None,
+            // Harness JSONL event sink — wired from the
+            // `OCTOS_HARNESS_EVENT_SINK` env var when the caller wants
+            // review decisions and swarm dispatch events persisted (see
+            // `/api/events/harness`). `None` keeps the pre-M7.6
+            // behaviour of broadcast-only.
+            harness_event_sink_path: std::env::var("OCTOS_HARNESS_EVENT_SINK").ok(),
+            credential_pool: credential_pool_init,
+            content_classifier: content_classifier_init,
         });
 
         // Auto-start enabled profiles

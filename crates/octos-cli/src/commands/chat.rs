@@ -287,6 +287,19 @@ impl ChatCommand {
             }
         });
 
+        // F-005: Build credential pool + content classifier at startup.
+        // Absent config → `None` so the agent falls back to the legacy
+        // single-credential flow and strong-only routing. Distinct
+        // names (`_init` suffix) keep these out of the way of other
+        // per-profile wiring that may land here later.
+        let _credential_pool_init =
+            super::build_credential_pool(config.credential_pool.as_ref(), &data_dir);
+        let _content_classifier_init: Option<Arc<octos_llm::ContentClassifier>> = config
+            .content_routing
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
+
         // Create agent
         let reporter = Arc::new(ConsoleReporter::new().with_verbose(self.verbose));
         let agent_config = AgentConfig {
@@ -344,10 +357,9 @@ impl ChatCommand {
             Ok(Some(workspace_policy)) => {
                 if let Some(compaction_policy) = workspace_policy.compaction.clone() {
                     let runner = match compaction_policy.summarizer {
-                        CompactionSummarizerKind::LlmIterative => CompactionRunner::with_provider(
-                            compaction_policy,
-                            agent.llm_provider(),
-                        ),
+                        CompactionSummarizerKind::LlmIterative => {
+                            CompactionRunner::with_provider(compaction_policy, agent.llm_provider())
+                        }
                         CompactionSummarizerKind::Extractive => {
                             CompactionRunner::new(compaction_policy)
                         }
