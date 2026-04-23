@@ -17,7 +17,11 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::abi_schema::{SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION};
+use crate::abi_schema::{
+    COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
+    SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
+};
+use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
 use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
 
@@ -33,6 +37,7 @@ const MAX_TASK_ID_BYTES: usize = 128;
 const MAX_WORKFLOW_BYTES: usize = 128;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
+const MAX_CREDENTIAL_ID_BYTES: usize = 256;
 
 fn default_validator_result_schema_version() -> u32 {
     VALIDATOR_RESULT_SCHEMA_VERSION
@@ -44,6 +49,10 @@ fn default_sub_agent_dispatch_schema_version() -> u32 {
 
 fn default_swarm_dispatch_schema_version() -> u32 {
     SWARM_DISPATCH_SCHEMA_VERSION
+}
+
+fn default_cost_attribution_schema_version() -> u32 {
+    COST_ATTRIBUTION_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +151,56 @@ pub fn emit_registered_progress_event(
     write_event_to_sink(raw_sink, &event).is_ok()
 }
 
+/// Emit a credential rotation event to a registered sink (M6.5). Returns
+/// `true` when the sink accepted the write. Used by the harness-layer sink
+/// adapter that forwards `octos_llm::CredentialRotationEvent` into the
+/// structured event stream.
+pub fn emit_registered_credential_rotation_event(
+    raw_sink: impl AsRef<str>,
+    credential_id: &str,
+    reason: &str,
+    strategy: &str,
+) -> bool {
+    let raw_sink = raw_sink.as_ref();
+    let Some(context) = lookup_event_sink_context(raw_sink) else {
+        return false;
+    };
+    let event = HarnessEvent::credential_rotation(
+        context.session_id,
+        context.task_id,
+        credential_id,
+        reason,
+        strategy,
+    );
+    write_event_to_sink(raw_sink, &event).is_ok()
+}
+
+/// Sink adapter that forwards octos-llm credential rotation events to a
+/// registered harness event sink identified by `raw_sink`. Implementations
+/// typically create one of these per task when a pool is attached.
+pub struct HarnessCredentialRotationSink {
+    raw_sink: String,
+}
+
+impl HarnessCredentialRotationSink {
+    pub fn new(raw_sink: impl Into<String>) -> Self {
+        Self {
+            raw_sink: raw_sink.into(),
+        }
+    }
+}
+
+impl octos_llm::RotationEventSink for HarnessCredentialRotationSink {
+    fn emit(&self, event: &octos_llm::CredentialRotationEvent) {
+        let _ = emit_registered_credential_rotation_event(
+            &self.raw_sink,
+            &event.credential_id,
+            &event.reason,
+            &event.strategy,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessEvent {
     pub schema: String,
@@ -176,6 +235,15 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessFailureEvent,
     },
+    /// Outer orchestrator invoked a session-level MCP tool exposed by `octos mcp-serve`.
+    ///
+    /// Emitted once per `tools/call` dispatch (stdio or http). The `outcome`
+    /// field is one of `ready`, `failed`, `queued`, `running`, or `verifying`,
+    /// matching [`TaskLifecycleState`](crate::task_supervisor::TaskLifecycleState).
+    McpServerCall {
+        #[serde(flatten)]
+        data: HarnessMcpServerCallEvent,
+    },
     SubAgentDispatch {
         #[serde(flatten)]
         data: HarnessSubAgentDispatchEvent,
@@ -183,6 +251,27 @@ pub enum HarnessEventPayload {
     SwarmDispatch {
         #[serde(flatten)]
         data: HarnessSwarmDispatchEvent,
+    },
+    CostAttribution {
+        #[serde(flatten)]
+        data: HarnessCostAttributionEvent,
+    },
+    /// Content-classified smart routing decision (M6.6).
+    ///
+    /// Emitted once per chat turn, before the adaptive router picks a lane.
+    /// Contract: `octos.harness.event.v1 { kind: "routing.decision", tier, reasons }`.
+    #[serde(rename = "routing.decision")]
+    RoutingDecision {
+        #[serde(flatten)]
+        data: HarnessRoutingDecisionEvent,
+    },
+    CredentialRotation {
+        #[serde(flatten)]
+        data: HarnessCredentialRotationEvent,
+    },
+    Error {
+        #[serde(flatten)]
+        data: HarnessErrorEvent,
     },
 }
 
@@ -327,6 +416,30 @@ pub struct HarnessSwarmDispatchEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// One MCP-server-mode `tools/call` dispatch — emitted by `octos mcp-serve` so
+/// outer orchestrators appear in the same harness audit log as local tool calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessMcpServerCallEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// The MCP tool name (currently always `run_octos_session`).
+    pub tool: String,
+    /// Opaque identifier for the caller. For stdio this is the parent process
+    /// label; for HTTP it is the bearer-token fingerprint (never the raw token).
+    pub caller_id: String,
+    /// Transport that received this call: `stdio` or `http`.
+    pub transport: String,
+    /// Coarse lifecycle outcome: `ready`, `failed`, `queued`, `running`, or
+    /// `verifying`. Matches [`TaskLifecycleState`](crate::task_supervisor::TaskLifecycleState).
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Typed payload emitted when the harness dispatches a task to an
 /// MCP-backed sub-agent. The schema is versioned so downstream tooling
 /// can reject unknown variants instead of silently dropping fields.
@@ -350,6 +463,86 @@ pub struct HarnessSubAgentDispatchEvent {
     /// Optional error text for non-success outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Typed payload emitted when a sub-agent dispatch commits a cost
+/// attribution to the ledger (M7.4). Fired after the dispatch succeeds
+/// so operators can tie spend back to the originating contract, task,
+/// and model without joining against raw dispatch logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCostAttributionEvent {
+    #[serde(default = "default_cost_attribution_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Stable ledger row id — matches
+    /// [`crate::cost_ledger::CostAttributionEvent::attribution_id`].
+    pub attribution_id: String,
+    /// Contract identifier the spend is booked against (workspace
+    /// contract path, workflow slug, or an opaque operator-chosen id).
+    pub contract_id: String,
+    /// Model key declared by the sub-agent.
+    pub model: String,
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+    pub cost_usd: f64,
+    /// Dispatch outcome echoed from the originating
+    /// [`HarnessSubAgentDispatchEvent::outcome`].
+    pub outcome: String,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Content-classified smart routing decision payload (M6.6).
+///
+/// Emitted once per chat turn with the classifier's tier choice and the
+/// reasons that drove it. Useful for dashboards, A/B evaluation, and
+/// debugging mis-classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessRoutingDecisionEvent {
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Lowercase tier label: `"cheap"` or `"strong"`.
+    pub tier: String,
+    /// Optional lane hint (set by M6.5 credential-pool-aware selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// Ordered reasons (`"code_fence"`, `"keyword:debug"`, ...).
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Classified input length in chars.
+    #[serde(default)]
+    pub input_chars: usize,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Structured credential rotation event (M6.5).
+///
+/// Emitted by the credential pool on every successful selection. Consumers
+/// can tie the event to a Prometheus counter
+/// (`octos_llm_credential_rotation_total{reason, strategy}`) for parity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCredentialRotationEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// Stable identifier of the credential that was selected.
+    pub credential_id: String,
+    /// Stable reason label (e.g. `initial_acquire`, `rate_limit_cooldown`,
+    /// `auth_failure`, `manual_release`).
+    pub reason: String,
+    /// Strategy label (`fill_first`, `round_robin`, `random`, `least_used`).
+    pub strategy: String,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -401,6 +594,14 @@ impl HarnessEvent {
         }
     }
 
+    /// Convenience builder for a `CostAttribution` event.
+    pub fn cost_attribution(data: HarnessCostAttributionEvent) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::CostAttribution { data },
+        }
+    }
+
     pub fn phase_event(
         session_id: impl Into<String>,
         task_id: impl Into<String>,
@@ -417,6 +618,85 @@ impl HarnessEvent {
                     workflow: workflow.map(Into::into),
                     phase: phase.into(),
                     message: message.map(Into::into),
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mcp_server_call(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        tool: impl Into<String>,
+        caller_id: impl Into<String>,
+        transport: impl Into<String>,
+        outcome: impl Into<String>,
+        contract: Option<impl Into<String>>,
+        error: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::McpServerCall {
+                data: HarnessMcpServerCallEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    tool: tool.into(),
+                    caller_id: caller_id.into(),
+                    transport: transport.into(),
+                    outcome: outcome.into(),
+                    contract: contract.map(Into::into),
+                    error: error.map(Into::into),
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Build a `routing.decision` event for the content-classified smart router (M6.6).
+    pub fn routing_decision(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        workflow: Option<impl Into<String>>,
+        tier: impl Into<String>,
+        reasons: Vec<String>,
+        input_chars: usize,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::RoutingDecision {
+                data: HarnessRoutingDecisionEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    workflow: workflow.map(Into::into),
+                    phase: None,
+                    tier: tier.into(),
+                    lane: None,
+                    reasons,
+                    input_chars,
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Construct a credential rotation event (M6.5).
+    pub fn credential_rotation(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        reason: impl Into<String>,
+        strategy: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::CredentialRotation {
+                data: HarnessCredentialRotationEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    credential_id: credential_id.into(),
+                    reason: reason.into(),
+                    strategy: strategy.into(),
                     extra: HashMap::new(),
                 },
             },
@@ -494,6 +774,17 @@ impl HarnessEvent {
                 validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
                 validate_bounded("failure message", &data.message, MAX_MESSAGE_BYTES)?;
             }
+            HarnessEventPayload::McpServerCall { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded("tool", &data.tool, MAX_WORKFLOW_BYTES)?;
+                validate_bounded("caller_id", &data.caller_id, MAX_WORKFLOW_BYTES)?;
+                validate_bounded("transport", &data.transport, MAX_PHASE_BYTES)?;
+                validate_bounded("outcome", &data.outcome, MAX_PHASE_BYTES)?;
+                validate_optional_name("contract", data.contract.as_deref(), MAX_WORKFLOW_BYTES)?;
+                if let Some(error) = data.error.as_deref() {
+                    validate_bounded("error", error, MAX_MESSAGE_BYTES)?;
+                }
+            }
             HarnessEventPayload::SubAgentDispatch { data } => {
                 if data.schema_version > SUB_AGENT_DISPATCH_SCHEMA_VERSION {
                     return Err(HarnessEventError(format!(
@@ -523,6 +814,67 @@ impl HarnessEvent {
                 validate_bounded("swarm topology", &data.topology, MAX_MESSAGE_BYTES)?;
                 validate_bounded("swarm outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
                 validate_optional_message(data.message.as_deref())?;
+            }
+            HarnessEventPayload::CostAttribution { data } => {
+                if data.schema_version > COST_ATTRIBUTION_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported cost attribution schema_version {} (max supported: {})",
+                        data.schema_version, COST_ATTRIBUTION_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("attribution_id", &data.attribution_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("contract_id", &data.contract_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("model", &data.model, MAX_MESSAGE_BYTES)?;
+                validate_bounded("outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
+                if !data.cost_usd.is_finite() {
+                    return Err(HarnessEventError(format!(
+                        "cost_usd must be finite, got {}",
+                        data.cost_usd
+                    )));
+                }
+                if data.cost_usd < 0.0 {
+                    return Err(HarnessEventError(format!(
+                        "cost_usd must be non-negative, got {}",
+                        data.cost_usd
+                    )));
+                }
+            }
+            HarnessEventPayload::RoutingDecision { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("tier", &data.tier, MAX_PHASE_BYTES)?;
+                validate_optional_name("lane", data.lane.as_deref(), MAX_PHASE_BYTES)?;
+                for reason in &data.reasons {
+                    validate_bounded("reason", reason, MAX_MESSAGE_BYTES)?;
+                }
+            }
+            HarnessEventPayload::CredentialRotation { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded(
+                    "credential_id",
+                    &data.credential_id,
+                    MAX_CREDENTIAL_ID_BYTES,
+                )?;
+                validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
+                validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
+            }
+            HarnessEventPayload::Error { data } => {
+                if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported harness error schema_version {} (max supported: {})",
+                        data.schema_version, HARNESS_ERROR_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("variant", &data.variant, MAX_PHASE_BYTES)?;
+                validate_bounded("recovery", &data.recovery, MAX_PHASE_BYTES)?;
+                validate_bounded("error message", &data.message, MAX_MESSAGE_BYTES)?;
             }
         }
 
@@ -637,6 +989,21 @@ impl HarnessEvent {
                     "retryable": data.retryable,
                 })
             }
+            HarnessEventPayload::McpServerCall { data } => serde_json::json!({
+                "schema": self.schema,
+                "kind": "mcp_server_call",
+                "session_id": data.session_id,
+                "task_id": data.task_id,
+                "tool": data.tool,
+                "caller_id": data.caller_id,
+                "transport": data.transport,
+                "outcome": data.outcome,
+                "contract": data.contract,
+                "workflow": fallback_workflow_kind,
+                "workflow_kind": fallback_workflow_kind,
+                "current_phase": fallback_current_phase,
+                "error": data.error,
+            }),
             HarnessEventPayload::SubAgentDispatch { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -678,6 +1045,76 @@ impl HarnessEvent {
                     "message": data.message,
                 })
             }
+            HarnessEventPayload::CostAttribution { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "cost_attribution",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "attribution_id": data.attribution_id,
+                    "contract_id": data.contract_id,
+                    "model": data.model,
+                    "tokens_in": data.tokens_in,
+                    "tokens_out": data.tokens_out,
+                    "cost_usd": data.cost_usd,
+                    "outcome": data.outcome,
+                })
+            }
+            HarnessEventPayload::RoutingDecision { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "routing.decision",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "tier": data.tier,
+                    "lane": data.lane,
+                    "reasons": data.reasons,
+                    "input_chars": data.input_chars,
+                })
+            }
+            HarnessEventPayload::CredentialRotation { data } => {
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "credential_rotation",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "credential_id": data.credential_id,
+                    "reason": data.reason,
+                    "strategy": data.strategy,
+                })
+            }
+            HarnessEventPayload::Error { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "error",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "variant": data.variant,
+                    "recovery": data.recovery,
+                    "message": data.message,
+                    "details": data.details,
+                })
+            }
         }
     }
 
@@ -689,8 +1126,13 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.session_id,
             HarnessEventPayload::Retry { data } => &data.session_id,
             HarnessEventPayload::Failure { data } => &data.session_id,
+            HarnessEventPayload::McpServerCall { data } => &data.session_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.session_id,
             HarnessEventPayload::SwarmDispatch { data } => &data.session_id,
+            HarnessEventPayload::CostAttribution { data } => &data.session_id,
+            HarnessEventPayload::RoutingDecision { data } => &data.session_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.session_id,
+            HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
 
@@ -702,8 +1144,13 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => &data.task_id,
             HarnessEventPayload::Retry { data } => &data.task_id,
             HarnessEventPayload::Failure { data } => &data.task_id,
+            HarnessEventPayload::McpServerCall { data } => &data.task_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.task_id,
             HarnessEventPayload::SwarmDispatch { data } => &data.task_id,
+            HarnessEventPayload::CostAttribution { data } => &data.task_id,
+            HarnessEventPayload::RoutingDecision { data } => &data.task_id,
+            HarnessEventPayload::CredentialRotation { data } => &data.task_id,
+            HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
 
@@ -715,8 +1162,13 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.workflow.as_deref(),
             HarnessEventPayload::Retry { data } => data.workflow.as_deref(),
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
+            HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.workflow.as_deref(),
             HarnessEventPayload::SwarmDispatch { data } => data.workflow.as_deref(),
+            HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
+            HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
 
@@ -728,8 +1180,13 @@ impl HarnessEvent {
             HarnessEventPayload::ValidatorResult { data } => data.phase.as_deref(),
             HarnessEventPayload::Retry { data } => data.phase.as_deref(),
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
+            HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.phase.as_deref(),
             HarnessEventPayload::SwarmDispatch { data } => data.phase.as_deref(),
+            HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
+            HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
+            HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
 }
@@ -1055,6 +1512,110 @@ mod tests {
         assert_eq!(detail["schema_version"], VALIDATOR_RESULT_SCHEMA_VERSION);
         assert_eq!(detail["validator"], "cargo-test");
         assert_eq!(detail["passed"], true);
+    }
+
+    #[test]
+    fn mcp_server_call_event_round_trips() {
+        let event = HarnessEvent::mcp_server_call(
+            "mcp:http",
+            "task-42",
+            "run_octos_session",
+            "http-bearer",
+            "http",
+            "ready",
+            Some("slides_delivery"),
+            Option::<String>::None,
+        );
+        assert!(event.validate().is_ok());
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""kind":"mcp_server_call""#));
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        match &parsed.payload {
+            HarnessEventPayload::McpServerCall { data } => {
+                assert_eq!(data.tool, "run_octos_session");
+                assert_eq!(data.transport, "http");
+                assert_eq!(data.outcome, "ready");
+                assert_eq!(data.contract.as_deref(), Some("slides_delivery"));
+            }
+            _ => panic!("expected McpServerCall variant"),
+        }
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "mcp_server_call");
+        assert_eq!(detail["transport"], "http");
+        assert_eq!(detail["outcome"], "ready");
+    }
+
+    #[test]
+    fn mcp_server_call_event_rejects_empty_tool() {
+        let event = HarnessEvent::mcp_server_call(
+            "mcp:stdio",
+            "task-1",
+            "",
+            "parent-process",
+            "stdio",
+            "ready",
+            Option::<String>::None,
+            Option::<String>::None,
+        );
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn should_round_trip_credential_rotation_event() {
+        let event = HarnessEvent::credential_rotation(
+            "session-1",
+            "task-1",
+            "key-42",
+            "rate_limit_cooldown",
+            "round_robin",
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""kind":"credential_rotation""#));
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        assert_eq!(parsed.session_id(), "session-1");
+        assert_eq!(parsed.task_id(), "task-1");
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["credential_id"], "key-42");
+        assert_eq!(detail["reason"], "rate_limit_cooldown");
+        assert_eq!(detail["strategy"], "round_robin");
+    }
+
+    #[test]
+    fn should_reject_credential_rotation_event_without_required_fields() {
+        let invalid = HarnessEvent::credential_rotation("s", "t", "", "initial_acquire", "random");
+        assert!(invalid.validate().is_err());
+        let invalid = HarnessEvent::credential_rotation("s", "t", "key", "", "random");
+        assert!(invalid.validate().is_err());
+        let invalid = HarnessEvent::credential_rotation("s", "t", "key", "init", "");
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn routing_decision_event_round_trips_and_keeps_kind() {
+        let event = HarnessEvent::routing_decision(
+            "session-1",
+            "task-1",
+            Some("chat"),
+            "strong",
+            vec!["code_fence".into(), "keyword:debug".into()],
+            512,
+        );
+        event.validate().expect("routing decision should be valid");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""schema":"octos.harness.event.v1""#));
+        assert!(json.contains(r#""kind":"routing.decision""#));
+        assert!(json.contains(r#""tier":"strong""#));
+
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        assert_eq!(parsed.session_id(), "session-1");
+        assert_eq!(parsed.task_id(), "task-1");
+
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "routing.decision");
+        assert_eq!(detail["tier"], "strong");
+        assert_eq!(detail["input_chars"], 512);
+        assert_eq!(detail["reasons"][0], "code_fence");
     }
 
     #[test]

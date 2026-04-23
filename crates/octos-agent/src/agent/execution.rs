@@ -8,6 +8,8 @@ use octos_llm::ChatResponse;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
+use crate::harness_errors::HarnessError;
+use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
@@ -595,9 +597,34 @@ impl Agent {
                             )
                         }
                         Err(e) => {
+                            // Classify the tool failure as a typed HarnessError.
+                            // Invariant #1 (#488): every raw tool error escape
+                            // must be routed through classification so the
+                            // metrics counter and the sink event both fire.
+                            let classified =
+                                HarnessError::classify_report(&e, Some(tc_name.as_str()));
+                            classified.record_metric();
+                            if let Some(sink) = harness_event_sink.as_deref() {
+                                if let Some(ctx) = lookup_event_sink_context(sink) {
+                                    let event = classified.to_event(
+                                        ctx.session_id,
+                                        ctx.task_id,
+                                        None,
+                                        None,
+                                    );
+                                    if let Err(error) = write_event_to_sink(sink, &event) {
+                                        tracing::debug!(
+                                            error = %error,
+                                            "failed to write tool-failure harness error event"
+                                        );
+                                    }
+                                }
+                            }
                             warn!(
                                 tool = %tc_name,
                                 error = %e,
+                                variant = classified.variant_name(),
+                                recovery = %classified.recovery_hint(),
                                 duration_ms = duration.as_millis() as u64,
                                 "tool failed"
                             );

@@ -19,6 +19,8 @@ secrecy = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+redb = { workspace = true }
+metrics = { workspace = true }
 
 [lints]
 workspace = true

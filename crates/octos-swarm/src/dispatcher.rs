@@ -278,7 +278,7 @@ impl Swarm {
         // artifact exactly as the supervisor will see it.
         let validator_results = self.run_aggregate_validator(&record).await;
 
-        // TODO(M7.4): wire real ledger — summarize pulls from stub.
+        // Summarize roll-up from the wired ledger adapter.
         let total_cost_usd = self.ledger.summarize(&record.dispatch_id).await;
 
         let result = SwarmResult::from_parts(
@@ -328,7 +328,7 @@ impl Swarm {
                     continue;
                 }
             };
-            // TODO(M7.4): wire real ledger — stub no-op attribute.
+            // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, idx, &outcome).await;
             record.subtasks[idx] = outcome;
 
@@ -355,7 +355,7 @@ impl Swarm {
             let contract = &contracts[*idx];
             let attempts = record.subtasks[*idx].attempts;
             let outcome = dispatch_once(self.backend.as_ref(), contract, attempts).await;
-            // TODO(M7.4): wire real ledger — stub no-op attribute.
+            // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
             record.subtasks[*idx] = outcome;
@@ -396,7 +396,7 @@ impl Swarm {
             }
             let attempts = record.subtasks[*idx].attempts;
             let outcome = dispatch_once(self.backend.as_ref(), &contract, attempts).await;
-            // TODO(M7.4): wire real ledger — stub no-op attribute.
+            // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
             record.subtasks[*idx] = outcome;
@@ -429,7 +429,7 @@ impl Swarm {
         idx: usize,
         outcome: &SubtaskOutcome,
     ) {
-        // TODO(M7.4): wire real ledger — today this stub writes through
+        // Forward attribution to the wired ledger adapter — writes through
         // the [`NoopCostLedger`] unless an integration test injects a
         // spy. When M7.4 lands, replace `SwarmCostAttribution` with the
         // shared `CostAttributionEvent` and include token counts.

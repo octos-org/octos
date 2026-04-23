@@ -290,12 +290,44 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
         (
+            "mcp_server_calls".to_string(),
+            total_for_metric(samples, "octos_mcp_server_call_total"),
+        ),
+        (
             "sub_agent_dispatches".to_string(),
             total_for_metric(samples, "octos_sub_agent_dispatch_total"),
         ),
         (
             "swarm_dispatches".to_string(),
             total_for_metric(samples, "octos_swarm_dispatch_total"),
+        ),
+        (
+            "cost_attributions".to_string(),
+            total_for_metric(samples, "octos_cost_attribution_total"),
+        ),
+        (
+            "delegations".to_string(),
+            total_for_metric(samples, "octos_delegation_total"),
+        ),
+        (
+            "routing_decisions".to_string(),
+            total_for_metric(samples, "octos_routing_decision_total"),
+        ),
+        (
+            "credential_rotations".to_string(),
+            total_for_metric(samples, "octos_llm_credential_rotation_total"),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+        ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+        ),
+        (
+            "loop_retries".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_RETRY_TOTAL),
         ),
     ])
 }
@@ -367,6 +399,10 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
             ),
         ),
         (
+            "mcp_server_calls".to_string(),
+            breakdown(samples, "octos_mcp_server_call_total", &["tool", "outcome"]),
+        ),
+        (
             "sub_agent_dispatches".to_string(),
             breakdown(
                 samples,
@@ -382,7 +418,87 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 &["topology", "outcome"],
             ),
         ),
+        (
+            "cost_attributions".to_string(),
+            breakdown(
+                samples,
+                "octos_cost_attribution_total",
+                &["model", "outcome"],
+            ),
+        ),
+        (
+            "delegations".to_string(),
+            breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
+        ),
+        (
+            "routing_decisions".to_string(),
+            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
+        ),
+        (
+            "credential_rotations".to_string(),
+            breakdown(
+                samples,
+                "octos_llm_credential_rotation_total",
+                &["reason", "strategy"],
+            ),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            breakdown(
+                samples,
+                "octos_compaction_preservation_violations_total",
+                &["phase"],
+            ),
+        ),
+        (
+            "loop_errors".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
+            ),
+        ),
+        (
+            "loop_retries".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_RETRY_TOTAL,
+                &["variant", "decision"],
+            ),
+        ),
     ])
+}
+
+/// Operator-facing cost rollup exposed alongside the summary. Consumed
+/// by the admin dashboard to show a per-contract spend breakdown from
+/// the ledger. Construction is isolated behind a pure function so it
+/// remains unit-testable without touching redb.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OperatorContractCostSummary {
+    pub contract_id: String,
+    pub dispatch_count: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+}
+
+/// Convert [`octos_agent::ContractCostRollup`] records into the
+/// serialized dashboard shape. The conversion is deliberately
+/// one-way so the API layer stays decoupled from the ledger crate's
+/// internal types.
+pub fn operator_contract_cost_summary(
+    rollups: &[octos_agent::ContractCostRollup],
+) -> Vec<OperatorContractCostSummary> {
+    rollups
+        .iter()
+        .map(|rollup| OperatorContractCostSummary {
+            contract_id: rollup.contract_id.clone(),
+            dispatch_count: rollup.dispatch_count,
+            tokens_in: rollup.tokens_in,
+            tokens_out: rollup.tokens_out,
+            cost_usd: rollup.cost_usd,
+        })
+        .collect()
 }
 
 fn total_for_metric(samples: &[ParsedMetricSample], metric: &str) -> u64 {
@@ -794,6 +910,21 @@ pub fn record_llm_tokens(direction: &str, count: u32) {
         .increment(u64::from(count));
 }
 
+/// Record a content-classified smart routing decision (M6.6).
+///
+/// Increments `octos_routing_decision_total{tier, lane}`. `lane` is optional —
+/// the classifier emits decisions before lane selection, so callers either
+/// pass the lane they ultimately picked or `None` to record as `"unset"`.
+pub fn record_routing_decision(tier: &str, lane: Option<&str>) {
+    let lane_label = lane.unwrap_or("unset").to_string();
+    counter!(
+        "octos_routing_decision_total",
+        "tier" => tier.to_string(),
+        "lane" => lane_label,
+    )
+    .increment(1);
+}
+
 /// Decorator that records Prometheus metrics for progress events,
 /// then delegates to an inner reporter.
 pub struct MetricsReporter {
@@ -882,6 +1013,71 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         let summary = build_operator_summary("");
         assert!(!summary.available);
         assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn operator_summary_aggregates_cost_attribution_counter() {
+        let metrics = r#"
+octos_cost_attribution_total{model="claude-haiku",outcome="success"} 3
+octos_cost_attribution_total{model="claude-sonnet-4",outcome="success"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert_eq!(summary.totals.get("cost_attributions"), Some(&4));
+        let rows = summary.breakdowns.get("cost_attributions").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn operator_contract_cost_summary_preserves_sort_order() {
+        use octos_agent::ContractCostRollup;
+        let rollups = vec![
+            ContractCostRollup {
+                contract_id: "contract-B".into(),
+                dispatch_count: 2,
+                tokens_in: 1_000,
+                tokens_out: 500,
+                cost_usd: 0.50,
+            },
+            ContractCostRollup {
+                contract_id: "contract-A".into(),
+                dispatch_count: 5,
+                tokens_in: 4_000,
+                tokens_out: 2_500,
+                cost_usd: 0.12,
+            },
+        ];
+        let rendered = operator_contract_cost_summary(&rollups);
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].contract_id, "contract-B");
+        assert!((rendered[0].cost_usd - 0.50).abs() < 1e-9);
+        assert_eq!(rendered[1].dispatch_count, 5);
+    }
+
+    #[test]
+    fn should_surface_credential_rotation_metrics() {
+        let metrics = r#"
+# TYPE octos_llm_credential_rotation_total counter
+octos_llm_credential_rotation_total{reason="initial_acquire",strategy="round_robin"} 4
+octos_llm_credential_rotation_total{reason="rate_limit_cooldown",strategy="round_robin"} 2
+octos_llm_credential_rotation_total{reason="auth_failure",strategy="fill_first"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert!(summary.available);
+        assert_eq!(summary.totals.get("credential_rotations"), Some(&7));
+        let rows = summary.breakdowns.get("credential_rotations").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().any(|r| r["reason"] == "initial_acquire"
+                && r["strategy"] == "round_robin"
+                && r["count"] == 4),
+            "missing initial_acquire row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["reason"] == "auth_failure"
+                && r["strategy"] == "fill_first"
+                && r["count"] == 1),
+            "missing auth_failure row: {rows:?}"
+        );
     }
 
     #[test]

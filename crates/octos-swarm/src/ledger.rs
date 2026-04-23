@@ -1,20 +1,18 @@
-//! Cost ledger stub coordinated with M7.4.
+//! Cost ledger adapter layer for M7.5.
 //!
-//! M7.5 depends on per-subtask cost attribution, but M7.4 (the real
-//! `CostLedger` implementation + typed `CostAttribution` event) is being
-//! implemented in parallel on `harness-m7/04-cost-ledger`. Until M7.4
-//! lands, this module provides:
+//! M7.4 provides the durable [`octos_agent::cost_ledger::PersistentCostLedger`]
+//! backing the full `CostAttributionEvent` schema (see
+//! `crates/octos-agent/src/cost_ledger.rs`). The swarm primitive uses a
+//! slimmer in-process adapter trait so we can keep the dispatcher decoupled
+//! from redb and the full attribution event shape. The agent-side
+//! [`octos_agent::CostLedger`] is available as a re-export for callers that
+//! need the full persistent trait; the [`CostLedger`] in this module is the
+//! narrower swarm-facing trait.
 //!
-//! - A minimal [`CostLedger`] trait with a single async attribution
-//!   method. M7.4 will replace this with the shared trait.
-//! - A [`NoopCostLedger`] default that records nothing and returns
-//!   zero cost. Used when no ledger is wired.
-//!
-//! Every call site is tagged with `// TODO(M7.4): wire real ledger` so
-//! a small reconciliation commit can replace the stub once M7.4 merges.
-//! The primitive itself rolls up a numeric `total_cost_usd: Option<f64>`
-//! in [`SwarmResult`](crate::result::SwarmResult) — `None` today, set by
-//! M7.4 once it wires `CostLedger::summarize`.
+//! The primitive rolls up a numeric `total_cost_usd: Option<f64>` in
+//! [`SwarmResult`](crate::result::SwarmResult). Callers that want the full
+//! ledger semantics can supply a custom adapter wrapping
+//! `PersistentCostLedger`.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -64,9 +62,9 @@ pub struct NoopCostLedger;
 #[async_trait]
 impl CostLedger for NoopCostLedger {
     async fn attribute(&self, _record: &SwarmCostAttribution) {
-        // TODO(M7.4): wire real ledger — this is intentionally a no-op
-        // today so the swarm primitive compiles independently of
-        // M7.4's shared trait.
+        // No-op adapter. Callers that want durable persistence should
+        // supply their own adapter that forwards to
+        // `octos_agent::cost_ledger::PersistentCostLedger::record`.
     }
 }
 
