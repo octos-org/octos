@@ -360,10 +360,16 @@ pub async fn dispatch_swarm(
         )
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("dispatch failed: {e}"),
-            )
+            // Log the full eyre chain server-side for operators; the HTTP
+            // body is scrubbed so upstream error detail (file paths,
+            // credential fragments in nested messages, backend URLs)
+            // never leaks to unauthenticated or low-privilege callers.
+            tracing::error!(
+                dispatch_id = %req.dispatch_id,
+                error = ?e,
+                "swarm dispatch failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, "dispatch failed".into())
         })?;
 
     let outcome_label = outcome_str(result.outcome).to_string();
@@ -446,6 +452,16 @@ fn validate_dispatch_request(req: &SwarmDispatchRequest) -> Result<(), String> {
         return Err(format!(
             "contract_id length {} exceeds bound {MAX_DISPATCH_FIELD_BYTES}",
             req.contract_id.len()
+        ));
+    }
+    // Pre-validate contract count so an oversize payload can be rejected
+    // with a typed 400 instead of burning memory serializing it into the
+    // primitive only to have the budget cap reject later.
+    if req.contracts.len() > octos_swarm::MAX_CONTRACTS_PER_DISPATCH {
+        return Err(format!(
+            "contracts length {} exceeds bound {}",
+            req.contracts.len(),
+            octos_swarm::MAX_CONTRACTS_PER_DISPATCH
         ));
     }
     if req.contracts.is_empty() {
@@ -1334,6 +1350,107 @@ mod tests {
             entries.last().unwrap().row.dispatch_id,
             "d-overflow",
             "newest entry must be the tail"
+        );
+    }
+
+    /// C-004 part 1: too many contracts at the top-level `contracts`
+    /// array is rejected before the primitive's budget cap fires. 5000
+    /// contracts is ~40x the default bound — a reasonable DoS payload.
+    #[test]
+    fn should_reject_too_many_contracts() {
+        let contracts: Vec<ContractSpec> = (0..5000)
+            .map(|i| ContractSpec {
+                contract_id: format!("sub-{i}"),
+                tool_name: "run".into(),
+                task: serde_json::json!({}),
+                label: None,
+            })
+            .collect();
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: "d1".into(),
+            contract_id: "c1".into(),
+            contracts,
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec::default(),
+            context: None,
+        };
+        let err = validate_dispatch_request(&req).expect_err("5000 contracts must 400");
+        assert!(
+            err.contains("contracts length"),
+            "expected typed reason, got: {err}"
+        );
+    }
+
+    /// C-004 part 2: a dispatch that fails deep inside the primitive
+    /// must surface as 500 with a fixed-string body — no `eyre` chain,
+    /// no file paths, no credential fragments leaking to the caller.
+    /// We drive the error path by setting `budget.max_contracts = 0`
+    /// which the primitive's `effective_max_contracts` surfaces as a
+    /// bail describing both the supplied count and the cap. Neither
+    /// number should leak to the HTTP body.
+    #[tokio::test]
+    async fn should_scrub_dispatch_500_error_body() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let swarm_state = Arc::new(
+            build_test_swarm_state(dir.path().join("swarm"), cost_ledger)
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::empty_for_tests();
+        state.swarm_state = Some(swarm_state);
+        let state = Arc::new(state);
+
+        // `max_contracts: Some(0)` makes `effective_max_contracts` 0,
+        // so the primitive bails with
+        // "swarm dispatch exceeds max contracts (N > 0)". The validator
+        // doesn't reject 0 (only `> MAX_CONTRACTS_PER_DISPATCH`), so
+        // this flows to the `.map_err(...)` arm we are testing.
+        let req = SwarmDispatchRequest {
+            schema_version: 1,
+            dispatch_id: "d-fail".into(),
+            contract_id: "c1".into(),
+            contracts: vec![ContractSpec {
+                contract_id: "sub".into(),
+                tool_name: "run".into(),
+                task: serde_json::json!({}),
+                label: None,
+            }],
+            topology: SwarmTopology::Parallel {
+                max_concurrency: NonZeroUsize::new(1).unwrap(),
+            },
+            budget: SwarmBudgetSpec {
+                max_contracts: Some(0),
+                max_retry_rounds: None,
+            },
+            context: None,
+        };
+
+        let err = dispatch_swarm(State(state), Json(req))
+            .await
+            .expect_err("budget-of-zero must error");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err.1, "dispatch failed",
+            "500 body must be a fixed string — no eyre chain, no leaked detail"
+        );
+        // Belt-and-braces: ensure the underlying bail message doesn't
+        // leak. The primitive says "exceeds max contracts (N > 0)";
+        // none of those tokens must appear in the HTTP body.
+        assert!(
+            !err.1.contains("exceeds"),
+            "body must not leak primitive detail: {}",
+            err.1
+        );
+        assert!(
+            !err.1.contains("max contracts"),
+            "body must not leak primitive detail: {}",
+            err.1
         );
     }
 
