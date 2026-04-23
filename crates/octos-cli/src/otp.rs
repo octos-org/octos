@@ -84,8 +84,9 @@ pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
     sessions: RwLock<HashMap<String, ActiveSession>>,
     smtp_config: Option<SmtpConfig>,
-    /// Pre-resolved SMTP password (from profile env_vars or keychain).
-    /// Used as fallback when the process environment doesn't have the password.
+    /// Pre-resolved SMTP password from the selected profile email settings.
+    /// This is preferred over process env so stale launch env cannot shadow
+    /// dashboard-configured SMTP credentials.
     smtp_password: Option<String>,
     session_expiry_hours: u64,
     pub allow_self_registration: bool,
@@ -125,11 +126,16 @@ impl AuthManager {
         }
     }
 
-    /// Set an explicit SMTP password (e.g. resolved from profile env_vars).
-    /// Used as fallback when the process environment doesn't have the password.
+    /// Set an explicit SMTP password from the selected profile email settings.
     pub fn with_smtp_password(mut self, password: String) -> Self {
         self.smtp_password = Some(password);
         self
+    }
+
+    fn resolved_smtp_password(&self, smtp: &SmtpConfig) -> Option<String> {
+        resolve_smtp_password(self.smtp_password.as_deref(), &smtp.password_env, |name| {
+            std::env::var(name).ok()
+        })
     }
 
     /// Set the path for session persistence and load any existing sessions.
@@ -581,15 +587,12 @@ impl AuthManager {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-        let password = std::env::var(&smtp.password_env)
-            .ok()
-            .or_else(|| self.smtp_password.clone())
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "SMTP password not found in env var '{}' or profile env_vars",
-                    smtp.password_env,
-                )
-            })?;
+        let password = self.resolved_smtp_password(smtp).ok_or_else(|| {
+            eyre::eyre!(
+                "SMTP password not found in env var '{}' or profile env_vars",
+                smtp.password_env,
+            )
+        })?;
 
         let email_msg = Message::builder()
             .from(
@@ -644,6 +647,25 @@ impl AuthManager {
         tracing::info!(email = %email, subject = %subject, "email sent (content redacted, lettre not available)");
         Ok(())
     }
+}
+
+fn non_empty_secret(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn resolve_smtp_password(
+    profile_password: Option<&str>,
+    password_env: &str,
+    get_env: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    profile_password
+        .map(str::to_string)
+        .and_then(non_empty_secret)
+        .or_else(|| get_env(password_env).and_then(non_empty_secret))
 }
 
 /// Generate a 6-digit numeric OTP code.
@@ -731,6 +753,56 @@ mod tests {
     #[test]
     fn test_hex_encode() {
         assert_eq!(hex_encode(&[0x00, 0xff, 0x42]), "00ff42");
+    }
+
+    #[test]
+    fn test_smtp_password_resolution_prefers_profile_secret() {
+        let password = resolve_smtp_password(Some("profile-secret"), "SMTP_PASSWORD", |_| {
+            Some("stale-process-secret".to_string())
+        });
+        assert_eq!(password.as_deref(), Some("profile-secret"));
+    }
+
+    #[test]
+    fn test_smtp_password_resolution_ignores_empty_profile_secret() {
+        let password = resolve_smtp_password(Some("   "), "SMTP_PASSWORD", |_| {
+            Some("process-secret".to_string())
+        });
+        assert_eq!(password.as_deref(), Some("process-secret"));
+    }
+
+    #[test]
+    fn test_smtp_password_resolution_ignores_empty_process_env() {
+        let password = resolve_smtp_password(None, "SMTP_PASSWORD", |_| Some(String::new()));
+        assert!(password.is_none());
+    }
+
+    #[test]
+    fn test_auth_manager_uses_profile_smtp_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let smtp = SmtpConfig {
+            host: "smtp.gmail.com".into(),
+            port: 587,
+            username: "dspfac@gmail.com".into(),
+            password_env: "SMTP_PASSWORD".into(),
+            from_address: "dspfac@gmail.com".into(),
+        };
+        let mgr = AuthManager::new(
+            Some(DashboardAuthConfig {
+                smtp: smtp.clone(),
+                session_expiry_hours: 24,
+                allow_self_registration: false,
+                static_tokens: Vec::new(),
+            }),
+            user_store,
+        )
+        .with_smtp_password("profile-secret".into());
+
+        assert_eq!(
+            mgr.resolved_smtp_password(&smtp).as_deref(),
+            Some("profile-secret"),
+        );
     }
 
     #[tokio::test]
