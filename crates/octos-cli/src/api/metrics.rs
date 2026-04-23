@@ -293,6 +293,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "sub_agent_dispatches".to_string(),
             total_for_metric(samples, "octos_sub_agent_dispatch_total"),
         ),
+        (
+            "swarm_dispatches".to_string(),
+            total_for_metric(samples, "octos_swarm_dispatch_total"),
+        ),
     ])
 }
 
@@ -368,6 +372,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 samples,
                 "octos_sub_agent_dispatch_total",
                 &["backend", "outcome"],
+            ),
+        ),
+        (
+            "swarm_dispatches".to_string(),
+            breakdown(
+                samples,
+                "octos_swarm_dispatch_total",
+                &["topology", "outcome"],
             ),
         ),
     ])

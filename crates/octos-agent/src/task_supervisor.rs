@@ -601,6 +601,18 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
+            HarnessEventPayload::SwarmDispatch { .. } => {
+                // Swarm dispatch events are observational from the
+                // supervisor's perspective — the `octos-swarm` primitive
+                // owns its own redb-backed session state and drives the
+                // retry loop. We just surface the aggregate detail so
+                // operators can see fan-out progress.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
         }
 
         Ok(())
