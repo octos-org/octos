@@ -176,6 +176,157 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
+/// Current durable ABI schema version for [`SessionSummary`] (harness M6.4).
+///
+/// `SessionSummary` is the typed payload emitted by the LLM-iterative
+/// compaction summarizer. Serialized copies carry this field so future harness
+/// versions can upgrade the schema without silently dropping older summaries.
+/// See `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable vs experimental
+/// field list and the deprecation rules.
+pub const SESSION_SUMMARY_SCHEMA_VERSION: u32 = 1;
+
+fn default_session_summary_schema_version() -> u32 {
+    SESSION_SUMMARY_SCHEMA_VERSION
+}
+
+/// Typed error returned when a [`SessionSummary`] advertises a schema version
+/// the running harness does not know how to handle.
+///
+/// Surfacing this as a typed error (not a panic) lets the compaction runner
+/// log the mismatch, fall back to the extractive summarizer, and continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSessionSummaryVersion {
+    /// Version advertised by the parsed payload.
+    pub found: u32,
+    /// Highest version this harness supports.
+    pub supported: u32,
+}
+
+impl std::fmt::Display for UnsupportedSessionSummaryVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported SessionSummary schema_version {} (max supported: {}); upgrade octos to a newer release",
+            self.found, self.supported
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSessionSummaryVersion {}
+
+/// Typed payload produced by the LLM-iterative compaction summarizer
+/// (harness M6.4).
+///
+/// A `SessionSummary` is the typed re-expression of a conversation compaction
+/// pass. Unlike prose-only summaries, it preserves the structural shape of
+/// decisions, files, and next steps so iterative refinement can update
+/// existing records rather than regenerating from scratch.
+///
+/// Invariants:
+/// - `schema_version` is a durable ABI field; deserializers default it to
+///   [`SESSION_SUMMARY_SCHEMA_VERSION`] when missing (pre-M6.4 files remain
+///   readable).
+/// - Field order is stable for byte-identical serde round-trips.
+/// - Missing/future versions surface as
+///   [`UnsupportedSessionSummaryVersion`] (not panic).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// Durable ABI schema version. Defaults to
+    /// [`SESSION_SUMMARY_SCHEMA_VERSION`] when deserializing a pre-M6.4
+    /// payload that omits the field.
+    #[serde(default = "default_session_summary_schema_version")]
+    pub schema_version: u32,
+    /// Top-level goal the session is pursuing.
+    pub goal: String,
+    /// Hard constraints the session must respect (policies, invariants,
+    /// forbidden paths, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    /// Work items already completed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_done: Vec<String>,
+    /// Work items currently in-progress at the time of compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_in_progress: Vec<String>,
+    /// Typed decision log. Iterative refinement MUST either retain each
+    /// decision verbatim or explicitly mark it stale via
+    /// `DecisionRecord::summary` ("[STALE] ..."). Silent drops are a
+    /// contract violation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<DecisionRecord>,
+    /// Files referenced during the session with a short role annotation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileRecord>,
+    /// Next steps the agent should take after compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+}
+
+/// Prefix used when the iterative summarizer marks a prior decision stale.
+/// Callers can inspect decisions and filter/surface stale entries instead of
+/// dropping them silently.
+pub const STALE_DECISION_PREFIX: &str = "[STALE]";
+
+impl SessionSummary {
+    /// Construct an empty summary pinned to the current schema version.
+    pub fn empty(goal: impl Into<String>) -> Self {
+        Self {
+            schema_version: SESSION_SUMMARY_SCHEMA_VERSION,
+            goal: goal.into(),
+            constraints: Vec::new(),
+            progress_done: Vec::new(),
+            progress_in_progress: Vec::new(),
+            decisions: Vec::new(),
+            files: Vec::new(),
+            next_steps: Vec::new(),
+        }
+    }
+
+    /// Validate the schema version against the running harness.
+    ///
+    /// Returns `Ok(())` when the payload is at or below the current
+    /// [`SESSION_SUMMARY_SCHEMA_VERSION`] (older files remain readable) and a
+    /// typed [`UnsupportedSessionSummaryVersion`] otherwise.
+    pub fn validate_schema_version(&self) -> Result<(), UnsupportedSessionSummaryVersion> {
+        if self.schema_version > SESSION_SUMMARY_SCHEMA_VERSION {
+            Err(UnsupportedSessionSummaryVersion {
+                found: self.schema_version,
+                supported: SESSION_SUMMARY_SCHEMA_VERSION,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return true if this decision line is an explicit stale marker.
+    pub fn is_stale_line(line: &str) -> bool {
+        line.trim_start().starts_with(STALE_DECISION_PREFIX)
+    }
+}
+
+/// A single decision recorded in a [`SessionSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    /// Turn index at which the decision was reached (0 = first user turn).
+    pub at_turn: u32,
+    /// Short summary of the decision. Prefixed with
+    /// [`STALE_DECISION_PREFIX`] when iterative refinement retires the
+    /// decision (for example, the goal no longer requires it).
+    pub summary: String,
+    /// Optional longer-form rationale for the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
+/// A file referenced in a [`SessionSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRecord {
+    /// Relative path to the file.
+    pub path: String,
+    /// Short role annotation (e.g. `"input"`, `"generated"`, `"spec"`).
+    pub role: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +554,100 @@ mod tests {
         assert_eq!(parsed.branch, "main");
         assert!(parsed.has_uncommitted_changes);
         assert_eq!(parsed.head_commit.as_deref(), Some("abc123"));
+    }
+
+    fn sample_session_summary() -> SessionSummary {
+        SessionSummary {
+            schema_version: SESSION_SUMMARY_SCHEMA_VERSION,
+            goal: "land iterative summarizer".to_string(),
+            constraints: vec!["no unsafe".to_string()],
+            progress_done: vec!["read base summarizer".to_string()],
+            progress_in_progress: vec!["write tests".to_string()],
+            decisions: vec![
+                DecisionRecord {
+                    at_turn: 1,
+                    summary: "Store prior summary in Mutex".to_string(),
+                    rationale: Some("Sync trait forbids async state".to_string()),
+                },
+                DecisionRecord {
+                    at_turn: 2,
+                    summary: format!("{} revert stateless path", STALE_DECISION_PREFIX),
+                    rationale: None,
+                },
+            ],
+            files: vec![FileRecord {
+                path: "crates/octos-agent/src/summarizer.rs".to_string(),
+                role: "impl".to_string(),
+            }],
+            next_steps: vec!["wire acceptance tests".to_string()],
+        }
+    }
+
+    #[test]
+    fn should_round_trip_session_summary_byte_identical() {
+        let summary = sample_session_summary();
+        let json = serde_json::to_string(&summary).expect("serialize succeeds");
+        let parsed: SessionSummary = serde_json::from_str(&json).expect("deserialize succeeds");
+        assert_eq!(parsed, summary);
+        let reserialized = serde_json::to_string(&parsed).expect("reserialize succeeds");
+        assert_eq!(
+            reserialized, json,
+            "SessionSummary must round-trip byte-identical"
+        );
+    }
+
+    #[test]
+    fn should_default_missing_schema_version_to_v1() {
+        // Pre-M6.4 JSON that predates the `schema_version` field must still
+        // deserialize cleanly and pin to v1.
+        let legacy = r#"{
+            "goal": "old-world summary",
+            "constraints": [],
+            "progress_done": ["init"],
+            "progress_in_progress": [],
+            "decisions": [],
+            "files": [],
+            "next_steps": []
+        }"#;
+        let parsed: SessionSummary = serde_json::from_str(legacy).expect("legacy summary parses");
+        assert_eq!(parsed.schema_version, SESSION_SUMMARY_SCHEMA_VERSION);
+        assert_eq!(parsed.goal, "old-world summary");
+        parsed
+            .validate_schema_version()
+            .expect("defaulted version is supported");
+    }
+
+    #[test]
+    fn should_reject_future_schema_version_with_actionable_error() {
+        let future = serde_json::json!({
+            "schema_version": SESSION_SUMMARY_SCHEMA_VERSION + 7,
+            "goal": "from tomorrow",
+            "constraints": [],
+            "progress_done": [],
+            "progress_in_progress": [],
+            "decisions": [],
+            "files": [],
+            "next_steps": []
+        })
+        .to_string();
+        let parsed: SessionSummary =
+            serde_json::from_str(&future).expect("JSON still deserializes");
+        let err = parsed
+            .validate_schema_version()
+            .expect_err("future schema version must be rejected, not panic");
+        assert_eq!(err.found, SESSION_SUMMARY_SCHEMA_VERSION + 7);
+        assert_eq!(err.supported, SESSION_SUMMARY_SCHEMA_VERSION);
+        let rendered = err.to_string();
+        assert!(rendered.contains("SessionSummary"));
+        assert!(rendered.contains("upgrade octos"));
+    }
+
+    #[test]
+    fn stale_decision_prefix_is_recognised() {
+        assert!(SessionSummary::is_stale_line(
+            "[STALE] revert stateless path"
+        ));
+        assert!(!SessionSummary::is_stale_line("revert stateless path"));
+        assert!(SessionSummary::is_stale_line("   [STALE] indented"));
     }
 }

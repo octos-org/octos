@@ -101,6 +101,21 @@ pub struct ProfileConfig {
     /// records attributions so operators can audit spend retroactively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_budget: Option<octos_agent::CostBudgetPolicy>,
+    /// Matrix-specific profile config (e.g. swarm supervisor rooms).
+    ///
+    /// Absent → behaves exactly like pre-M7.3 Matrix deployments. Present →
+    /// enables Matrix-as-supervisor-UI via agent puppets (see
+    /// [`MatrixProfileConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixProfileConfig>,
+    /// Content-classified smart routing configuration (M6.6).
+    /// Missing config defaults to `enabled: false` (invariant #3 of issue #493).
+    #[serde(default)]
+    pub content_routing: Option<octos_llm::RoutingConfig>,
+    /// Credential pool configuration (M6.5). Named pools of API keys / OAuth
+    /// tokens with persistent cooldowns and rotation strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_pool: Option<CredentialPoolConfig>,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -157,6 +172,170 @@ pub struct RobotConfig {
     /// Realtime heartbeat + sensor-context-injection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime: Option<octos_agent::RealtimeConfig>,
+}
+
+/// Current schema version for [`SwarmSupervisorConfig`].
+///
+/// Older configs that omit `schema_version` are accepted as v1 via
+/// [`default_swarm_supervisor_schema_version`]. Tracks
+/// [`octos_agent::SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION`] — the two MUST
+/// stay in lock-step so the agent-side ABI compat checks and the CLI-side
+/// profile loader agree on the serialized shape.
+pub const SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION: u32 =
+    octos_agent::SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION;
+
+fn default_swarm_supervisor_schema_version() -> u32 {
+    SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION
+}
+
+/// Matrix-specific profile configuration.
+///
+/// Holds optional Matrix-scoped features that extend the baseline appservice
+/// channel; absent fields leave the channel behavior unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixProfileConfig {
+    /// Swarm supervisor UI contract — route harness events to per-swarm rooms
+    /// and accept supervisor replies as steering input. Absent → disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_supervisor: Option<SwarmSupervisorConfig>,
+}
+
+/// Configuration for Matrix-as-supervisor-UI via agent puppets (M7.3).
+///
+/// When present, each sub-agent in a swarm is surfaced as a Matrix puppet
+/// user in a per-swarm room. The human supervisor interacts through any
+/// Matrix client (Element, etc.) and replies route back to the addressed
+/// puppet as steering input.
+///
+/// The bot account backing the appservice MUST hold Matrix admin API
+/// permissions so it can register puppet users and invite them to rooms.
+/// Deployments without admin rights MUST leave this section absent, which
+/// preserves the pre-M7.3 Matrix channel behavior exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmSupervisorConfig {
+    /// Durable ABI schema version for this config section.
+    ///
+    /// See [`SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION`] for the current value
+    /// and `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for per-version field
+    /// guarantees. Older configs without this field default to v1.
+    #[serde(default = "default_swarm_supervisor_schema_version")]
+    pub schema_version: u32,
+    /// Matrix localpart prefix used for puppet users (e.g. `"swarm_"` →
+    /// `@swarm_s3f1:server`). Scopes puppets out of the shared user
+    /// namespace used by baseline bots.
+    #[serde(default = "default_swarm_puppet_prefix")]
+    pub puppet_prefix: String,
+    /// Matrix room alias prefix for per-swarm supervisor rooms (e.g.
+    /// `"swarm_"` → `#swarm_s3f1:server`). Aliases are idempotent — re-running
+    /// `ensure_swarm_room` returns the same room ID.
+    #[serde(default = "default_swarm_room_prefix")]
+    pub room_prefix: String,
+    /// Matrix user IDs that will be invited to every swarm room as
+    /// supervisors. Replies from these users route to the addressed puppet.
+    #[serde(default)]
+    pub supervisor_user_ids: Vec<String>,
+    /// If true, verify the bot account reports `admin: true` on the
+    /// homeserver before provisioning puppets. When disabled, the channel
+    /// best-effort uses the appservice token for user registration (the
+    /// existing Matrix appservice pattern).
+    #[serde(default)]
+    pub require_admin_api: bool,
+}
+
+impl Default for SwarmSupervisorConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION,
+            puppet_prefix: default_swarm_puppet_prefix(),
+            room_prefix: default_swarm_room_prefix(),
+            supervisor_user_ids: Vec::new(),
+            require_admin_api: false,
+        }
+    }
+}
+
+fn default_swarm_puppet_prefix() -> String {
+    "swarm_".to_string()
+}
+
+fn default_swarm_room_prefix() -> String {
+    "swarm_".to_string()
+}
+
+/// Credential pool configuration (M6.5).
+///
+/// Schema-versioned per M4.6 — older profiles default to
+/// `schema_version = 1`. A pool entry names a set of secrets (typically API
+/// keys) that the runtime rotates under the chosen strategy. The secrets
+/// themselves live in `env_vars` under `api_key_env`; only ids / knobs are
+/// persisted here.
+///
+/// Classified `RestartRequired` in `diff_profiles` (see the RP05 pattern) —
+/// rotating strategy or pool membership at runtime would require tearing
+/// down live provider clients, so the safer default is to restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPoolConfig {
+    /// Schema version for forward compatibility (M4.6 pattern).
+    #[serde(default = "octos_agent::default_credential_pool_config_schema_version")]
+    pub schema_version: u32,
+    /// Named pools keyed by integration id (e.g. `"anthropic"`, `"openai"`).
+    #[serde(default)]
+    pub pools: HashMap<String, CredentialPoolEntry>,
+}
+
+impl Default for CredentialPoolConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: octos_agent::default_credential_pool_config_schema_version(),
+            pools: HashMap::new(),
+        }
+    }
+}
+
+/// Single credential pool definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPoolEntry {
+    /// Rotation strategy identifier: `"fill_first"`, `"round_robin"`,
+    /// `"random"`, `"least_used"`. Defaults to `round_robin` when absent.
+    #[serde(default = "default_rotation_strategy")]
+    pub strategy: String,
+    /// Ordered credential ids that belong to this pool. The runtime pairs
+    /// each id with an API key env var from `env_vars` via `api_key_env`.
+    #[serde(default)]
+    pub credential_ids: Vec<String>,
+    /// Per-credential env var names (legacy bulk form). When both this and
+    /// `credential_ids` are present, `credential_ids` takes priority and
+    /// env vars are looked up by id.
+    #[serde(default)]
+    pub credential_env_vars: Vec<String>,
+    /// Default cooldown applied to 429 responses without an explicit
+    /// `reset_at` hint. Milliseconds.
+    #[serde(default)]
+    pub default_cooldown_ms: Option<u64>,
+    /// Optional override for the persistent state file. Defaults to
+    /// `<data_dir>/credential_pool.redb` per M6.5 spec.
+    #[serde(default)]
+    pub state_path: Option<String>,
+}
+
+impl Default for CredentialPoolEntry {
+    fn default() -> Self {
+        Self {
+            strategy: default_rotation_strategy(),
+            credential_ids: Vec::new(),
+            credential_env_vars: Vec::new(),
+            default_cooldown_ms: None,
+            state_path: None,
+        }
+    }
+}
+
+fn default_rotation_strategy() -> String {
+    "round_robin".into()
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -223,6 +402,12 @@ pub struct ProfileConfigPatch {
     pub adaptive_routing: PatchField<crate::config::AdaptiveRoutingConfig>,
     #[serde(default)]
     pub cost_budget: PatchField<octos_agent::CostBudgetPolicy>,
+    #[serde(default)]
+    pub matrix: PatchField<MatrixProfileConfig>,
+    #[serde(default)]
+    pub content_routing: PatchField<octos_llm::RoutingConfig>,
+    #[serde(default)]
+    pub credential_pool: PatchField<CredentialPoolConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -454,6 +639,21 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.cost_budget = None,
             PatchField::Value(cost_budget) => self.cost_budget = Some(cost_budget),
+        }
+        match patch.matrix {
+            PatchField::Absent => {}
+            PatchField::Clear => self.matrix = None,
+            PatchField::Value(matrix) => self.matrix = Some(matrix),
+        }
+        match patch.content_routing {
+            PatchField::Absent => {}
+            PatchField::Clear => self.content_routing = None,
+            PatchField::Value(content_routing) => self.content_routing = Some(content_routing),
+        }
+        match patch.credential_pool {
+            PatchField::Absent => {}
+            PatchField::Clear => self.credential_pool = None,
+            PatchField::Value(credential_pool) => self.credential_pool = Some(credential_pool),
         }
 
         self.normalize_llm_contract();
@@ -1442,7 +1642,8 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: llm, search, deep_crawl, apps, channels, env_vars.
+/// Restart-required: llm, search, deep_crawl, apps, channels, env_vars,
+///   email, hooks, credential_pool.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1481,6 +1682,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     }
     if oc.hooks != nc.hooks {
         restart_fields.push("hooks".into());
+    }
+    if oc.credential_pool != nc.credential_pool {
+        restart_fields.push("credential_pool".into());
     }
 
     if !restart_fields.is_empty() {
@@ -2300,6 +2504,81 @@ mod tests {
             }
             other => panic!("expected RestartRequired, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_classify_credential_pool_as_restart_required() {
+        let base = UserProfile {
+            id: "m65-diff".into(),
+            name: "M6.5".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                credential_pool: Some(CredentialPoolConfig {
+                    schema_version: 1,
+                    pools: [(
+                        "anthropic".into(),
+                        CredentialPoolEntry {
+                            strategy: "round_robin".into(),
+                            credential_ids: vec!["k1".into(), "k2".into()],
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.credential_pool = Some(CredentialPoolConfig {
+            schema_version: 1,
+            pools: [(
+                "anthropic".into(),
+                CredentialPoolEntry {
+                    strategy: "fill_first".into(),
+                    credential_ids: vec!["k1".into(), "k2".into(), "k3".into()],
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        });
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(
+                    fields.iter().any(|f| f == "credential_pool"),
+                    "expected `credential_pool` in restart-required fields, got {fields:?}",
+                );
+            }
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_default_credential_pool_config_schema_version() {
+        let cfg = CredentialPoolConfig::default();
+        assert_eq!(cfg.schema_version, 1);
+        assert!(cfg.pools.is_empty());
+
+        // Deserialization backfills the schema version.
+        let raw = serde_json::json!({
+            "pools": {
+                "openai": {
+                    "credential_ids": ["a", "b"]
+                }
+            }
+        });
+        let parsed: CredentialPoolConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.pools.len(), 1);
+        let p = &parsed.pools["openai"];
+        assert_eq!(p.strategy, "round_robin");
+        assert_eq!(p.credential_ids, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

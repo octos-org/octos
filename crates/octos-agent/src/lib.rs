@@ -13,14 +13,16 @@ pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
-mod compaction;
+pub mod compaction;
 pub mod cost_ledger;
 pub mod event_bus;
 pub mod exec_env;
+pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
 pub mod loop_detect;
 pub mod mcp;
+pub mod mcp_server;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
@@ -34,6 +36,7 @@ pub mod session;
 pub mod skills;
 pub mod steering;
 mod subprocess_env;
+pub mod summarizer;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -43,14 +46,21 @@ pub mod workspace_git;
 pub mod workspace_policy;
 
 pub use abi_schema::{
-    COST_ATTRIBUTION_SCHEMA_VERSION, HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION,
-    SUB_AGENT_DISPATCH_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError,
-    WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
+    COMPACTION_POLICY_SCHEMA_VERSION, COST_ATTRIBUTION_SCHEMA_VERSION,
+    CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
+    HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, SESSION_SUMMARY_SCHEMA_VERSION,
+    SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported, default_credential_pool_config_schema_version,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
     DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, RealtimeController,
     TASK_REPORTER, TokenTracker,
+    loop_state::{
+        LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
+        SHELL_SPIRAL_VARIANT,
+    },
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
@@ -63,11 +73,14 @@ pub use cost_ledger::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{
-    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent, HarnessEvent,
+    HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent,
+    HarnessCredentialRotationEvent, HarnessCredentialRotationSink, HarnessEvent,
     HarnessEventError, HarnessEventPayload, HarnessEventSink, HarnessFailureEvent,
-    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
-    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    HarnessMcpServerCallEvent, HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent,
+    HarnessSubAgentDispatchEvent, HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    emit_registered_credential_rotation_event,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
@@ -82,23 +95,24 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
-    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool,
-    DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
-    DEFAULT_HTTP_READ_TIMEOUT_SECS, DeepSearchTool, DiffEditTool, DispatchOutcome, DispatchRequest,
-    DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool, DELEGATED_DENY_GROUP,
+    DELEGATION_METRIC, DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DeepSearchTool, DelegateTool, DelegationEvent,
+    DelegationOutcome, DepthBudget, DiffEditTool, DispatchOutcome, DispatchRequest,
+    DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH,
     ManageSkillsTool, McpAgentBackend, McpAgentBackendConfig, MessageTool, PolicyDecision,
     ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendFileTool, SharedBackend,
-    ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, TakePhotoTool, Tool,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool, ToolConfigStore, ToolPolicy,
+    ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
-    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
-    install_robot_registry, record_dispatch,
+    build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,
+    dispatch_with_metrics, install_robot_registry, record_dispatch,
 };
 pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use validators::{
@@ -113,11 +127,12 @@ pub use workspace_git::{
     snapshot_workspace_change, snapshot_workspace_turn,
 };
 pub use workspace_policy::{
-    ValidationPolicy, Validator, ValidatorPhaseKind, ValidatorSpec, WORKSPACE_POLICY_FILE,
-    WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
-    WorkspaceSpawnTaskPolicy, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
-    WorkspaceVersionControlProvider, read_workspace_policy, upgrade_workspace_policy_if_legacy,
-    workspace_policy_path, write_workspace_policy,
+    CompactionPolicy, CompactionSummarizerKind, ValidationPolicy, Validator, ValidatorPhaseKind,
+    ValidatorSpec, WORKSPACE_POLICY_FILE, WorkspaceArtifactsPolicy, WorkspacePolicy,
+    WorkspacePolicyKind, WorkspaceSnapshotTrigger, WorkspaceSpawnTaskPolicy,
+    WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy, WorkspaceVersionControlProvider,
+    read_workspace_policy, upgrade_workspace_policy_if_legacy, workspace_policy_path,
+    write_workspace_policy,
 };
 
 #[cfg(test)]
