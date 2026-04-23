@@ -381,3 +381,37 @@ jobs:
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p crew-agent --test security_sandbox -- --nocapture
+
+  m7-swarm-live-gate:
+    runs-on: ubuntu-latest
+    # M7.8: live fleet swarm dispatch validation against the mini canary.
+    # Runs in --dry-run mode on PRs (non-blocking), and with real canary
+    # credentials on push-to-main. Required on push-to-main; advisory on PRs.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install jq + curl
+        run: |
+          which jq || sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Sanity-check script (syntax + --help)
+        run: |
+          bash -n scripts/validate-m7-swarm-live.sh
+          scripts/validate-m7-swarm-live.sh --help > /dev/null
+
+      - name: Dry-run gate (no network)
+        run: scripts/validate-m7-swarm-live.sh --dry-run
+
+      - name: Live gate against canary (push-to-main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          CANARY_URL: ${{ secrets.M7_CANARY_URL }}
+          OCTOS_AUTH_TOKEN: ${{ secrets.M7_CANARY_AUTH_TOKEN }}
+          OCTOS_PROFILE: ${{ secrets.M7_CANARY_PROFILE }}
+        run: |
+          if [ -z "$OCTOS_AUTH_TOKEN" ]; then
+            echo "M7_CANARY_AUTH_TOKEN secret not configured — skipping live run"
+            exit 0
+          fi
+          scripts/validate-m7-swarm-live.sh --timeout-seconds 180

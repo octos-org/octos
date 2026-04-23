@@ -83,4 +83,9 @@ scripts/deploy.sh
 !e2e/fixtures/compat-test-skill/SKILL.md
 !e2e/fixtures/compat-test-skill/manifest.json
 !e2e/fixtures/compat-test-skill/main
+# Harness M7.8 swarm-dispatch gate fixture (contract.toml + README.md must be tracked)
+!e2e/fixtures/m7-swarm-contract/README.md
+!e2e/fixtures/m7-swarm-contract/contract.toml
+# M7.8 live-gate diagnostic output (runtime-only)
+e2e/test-results-m7-swarm-live/
 tsconfig.tsbuildinfo

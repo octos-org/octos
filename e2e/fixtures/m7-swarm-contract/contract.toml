@@ -1,0 +1,46 @@
+# M7.8 live fleet gate swarm contract.
+#
+# Parallel-3 fanout: ask three sub-agents to each write a distinct variant of
+# a fibonacci implementation. The aggregate is three small artifacts that the
+# supervisor can inspect, not a single large deliverable. The contract is
+# deliberately tiny (under 1s per sub-agent on a warm canary) so the gate
+# focuses on orchestration primitives, not LLM output quality.
+#
+# Consumed by:
+#   - scripts/validate-m7-swarm-live.sh (dispatch payload body)
+#   - e2e/tests/swarm-dispatch-gate.spec.ts (UI-authored contract fixture)
+
+[dispatch]
+label = "m7.8-live-gate-fibonacci"
+topology = "parallel"
+max_concurrency = 3
+workflow = "harness.swarm.fibonacci"
+phase = "compose"
+
+[budget]
+max_contracts = 3
+max_retry_rounds = 1
+
+[validator]
+# The aggregate validator requires every subtask to deliver a non-empty
+# artifact. M4.3 runner treats missing artifacts as `Failed`.
+required = true
+kind = "non_empty_artifact"
+
+[[contract]]
+contract_id = "fib-iter"
+tool_name = "claude_code/run_task"
+label = "iterative fibonacci"
+prompt = "Write a single Rust function fn fib_iter(n: u32) -> u64 using a loop. Return only the function body and signature, no explanation."
+
+[[contract]]
+contract_id = "fib-rec"
+tool_name = "claude_code/run_task"
+label = "recursive fibonacci"
+prompt = "Write a single Rust function fn fib_rec(n: u32) -> u64 using naive recursion. Return only the function body and signature, no explanation."
+
+[[contract]]
+contract_id = "fib-memo"
+tool_name = "claude_code/run_task"
+label = "memoized fibonacci"
+prompt = "Write a single Rust function fn fib_memo(n: u32) -> u64 using a HashMap-based memo. Return only the function body and signature, no explanation."

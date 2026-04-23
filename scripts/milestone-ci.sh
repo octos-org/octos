@@ -16,10 +16,15 @@ Canonical milestone CI suites:
   hosted-fast             fmt + clippy + workspace test + milestone regressions
   workspace-all-features  workspace/all-features build + test compilation + tests
   release-bundle          release binary + skill crate build
+  m7-swarm-live-gate      M7.8 live fleet swarm dispatch validation
+                          (wraps scripts/validate-m7-swarm-live.sh)
 
 These suites are the single source of truth for milestone deliverable validation.
 GitHub workflows and self-hosted validation should call this script instead of
 repeating ad hoc command lists.
+
+For m7-swarm-live-gate, any args after the suite name pass through to the
+underlying validator (e.g. --dry-run, --help, --base-url ...).
 EOF
 }
 
@@ -63,7 +68,19 @@ run_release_bundle() {
   cargo build --release ${SKILL_CRATES}
 }
 
+run_m7_swarm_live_gate() {
+  # Thin wrapper: delegates to scripts/validate-m7-swarm-live.sh, forwarding
+  # any remaining args. Running with no args performs the default live-gate
+  # sequence (which requires $OCTOS_AUTH_TOKEN); use --dry-run for offline
+  # sanity in CI without canary credentials.
+  ./scripts/validate-m7-swarm-live.sh "$@"
+}
+
 SUITE="${1:-}"
+# Shift so the suite dispatcher can forward remaining args.
+if [ $# -gt 0 ]; then
+  shift
+fi
 case "$SUITE" in
   dashboard)
     run_dashboard
@@ -76,6 +93,9 @@ case "$SUITE" in
     ;;
   release-bundle)
     run_release_bundle
+    ;;
+  m7-swarm-live-gate)
+    run_m7_swarm_live_gate "$@"
     ;;
   --help|-h|"")
     usage
