@@ -1460,10 +1460,14 @@ impl Tool for SpawnTool {
                 "additional_instructions": input.additional_instructions,
             });
 
-            // Pre-dispatch budget projection (M7.4). Absent a
-            // configured accountant the check short-circuits and the
-            // dispatch proceeds unchanged — this keeps existing M7.1
-            // dispatch tests passing when no policy is configured.
+            // Pre-dispatch budget reservation (F-003). Absent a
+            // configured accountant the reservation short-circuits to
+            // `None` and the dispatch proceeds unchanged — this keeps
+            // existing M7.1 dispatch tests passing when no policy is
+            // configured. With a policy, `reserve` closes the TOCTOU
+            // race on concurrent dispatches by inserting the projected
+            // amount into the accountant's in-memory map under the
+            // same lock as the historical-spend read.
             let model_for_ledger = input
                 .model
                 .clone()
@@ -1471,53 +1475,47 @@ impl Tool for SpawnTool {
             let contract_id_for_ledger = workflow_kind
                 .clone()
                 .unwrap_or_else(|| session_key_for_event.clone());
-            if let Some(accountant) = self.cost_accountant.as_ref() {
-                if let Some(policy) = accountant.policy() {
-                    if policy.is_enforced() {
-                        // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
-                        // the outbound task description divided by 4
-                        // (the classic 1 token ≈ 4 chars rule of thumb).
-                        // Good enough for budget rejection — the ledger
-                        // replaces this with the real count on success.
-                        let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
-                        let projected_usd = crate::cost_ledger::project_cost_usd(
-                            &model_for_ledger,
-                            tokens_in_estimate,
-                            0,
-                        )
-                        .unwrap_or(0.0);
-                        match accountant
-                            .project_dispatch(&contract_id_for_ledger, projected_usd)
-                            .await
-                        {
-                            Ok(crate::cost_ledger::BudgetProjection::Allowed { .. }) => {}
-                            Ok(crate::cost_ledger::BudgetProjection::Rejected {
-                                reason, ..
-                            }) => {
-                                let message = format!(
-                                    "Status: FAILED\nDispatch rejected by cost budget policy: {reason}"
-                                );
-                                warn!(
-                                    contract_id = %contract_id_for_ledger,
-                                    reason = %reason,
-                                    "rejecting MCP sub-agent dispatch before spawn"
-                                );
-                                return Ok(ToolResult {
-                                    output: message,
-                                    success: false,
-                                    ..Default::default()
-                                });
-                            }
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    "cost budget projection failed; allowing dispatch"
-                                );
-                            }
+            let reservation = if let Some(accountant) = self.cost_accountant.as_ref() {
+                if accountant.policy().is_some_and(|p| p.is_enforced()) {
+                    // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
+                    // the outbound task description divided by 4
+                    // (the classic 1 token ≈ 4 chars rule of thumb).
+                    // Good enough for budget rejection — the ledger
+                    // replaces this with the real count on success.
+                    let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
+                    let projected_usd = crate::cost_ledger::project_cost_usd(
+                        &model_for_ledger,
+                        tokens_in_estimate,
+                        0,
+                    )
+                    .unwrap_or(0.0);
+                    match accountant
+                        .reserve(&contract_id_for_ledger, projected_usd)
+                        .await
+                    {
+                        Ok(handle) => Some(handle),
+                        Err(breach) => {
+                            let message = format!(
+                                "Status: FAILED\nDispatch rejected by cost budget policy: {breach}"
+                            );
+                            warn!(
+                                contract_id = %contract_id_for_ledger,
+                                reason = %breach,
+                                "rejecting MCP sub-agent dispatch before spawn"
+                            );
+                            return Ok(ToolResult {
+                                output: message,
+                                success: false,
+                                ..Default::default()
+                            });
                         }
                     }
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
             let (response, event) = {
                 let request = DispatchRequest {
@@ -1558,10 +1556,12 @@ impl Tool for SpawnTool {
 
             let success = response.outcome == super::mcp_agent::DispatchOutcome::Success;
 
-            // Post-dispatch cost attribution (M7.4). Only record when
-            // the remote agent returned a ready artifact; failures and
-            // timeouts are already visible via the dispatch event and
-            // should not inflate the ledger.
+            // Post-dispatch cost attribution (M7.4 + F-003). Only
+            // record when the remote agent returned a ready artifact;
+            // failures and timeouts are already visible via the
+            // dispatch event and should not inflate the ledger. On the
+            // failure path the reservation handle is dropped below,
+            // auto-refunding the pre-dispatch projection.
             if success {
                 if let Some(accountant) = self.cost_accountant.as_ref() {
                     let tokens_in_est = task_desc.len().div_ceil(4) as u32;
@@ -1588,11 +1588,19 @@ impl Tool for SpawnTool {
                     );
                     let attribution_id_for_event = attribution.attribution_id.clone();
 
-                    // Commit to the ledger. Failing to persist is
-                    // non-fatal for the dispatch itself — we log and
-                    // continue so a bad disk does not mask a successful
-                    // agent run.
-                    if let Err(error) = accountant.ledger().record(attribution).await {
+                    // Commit through the reservation handle if we hold
+                    // one (policy-enforced path). Otherwise fall back
+                    // to the legacy direct-record path for the
+                    // no-policy configuration. Failure to persist is
+                    // non-fatal — we log and continue so a bad disk
+                    // does not mask a successful agent run.
+                    let record_result = if let Some(handle) = reservation.as_ref() {
+                        handle.commit(attribution).await
+                    } else {
+                        accountant.ledger().record(attribution).await
+                    };
+
+                    if let Err(error) = record_result {
                         warn!(
                             task_id = %task_id_for_event,
                             error = %error,
@@ -1640,6 +1648,11 @@ impl Tool for SpawnTool {
                     }
                 }
             }
+            // On the failure path, drop the reservation explicitly so
+            // the auto-refund fires before we return the `Status: FAILED`
+            // result. The handle is scoped to this block — either
+            // `commit` above consumed it successfully, or Drop refunds.
+            drop(reservation);
 
             let mut files_to_send = response.files_to_send.clone();
             // Workflow contract families always gate outputs through the
