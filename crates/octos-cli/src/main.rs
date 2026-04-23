@@ -6,6 +6,23 @@ use color_eyre::eyre::Result;
 #[cfg_attr(not(feature = "api"), allow(unused_imports))]
 use octos_cli::commands::{self, Args, Executable};
 
+/// Interactive = at least one of stdout/stderr is a TTY. When running as a
+/// launchd daemon both are redirected to /dev/null, so this returns false and
+/// log init drops the console layer in favour of the rolling file logger —
+/// giving the service "one primary logging path" instead of duplicated sinks.
+fn is_interactive_terminal() -> bool {
+    use std::io::IsTerminal as _;
+
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
+}
+
+/// Enable the console tracing layer only when the invocation is interactive
+/// (dev/debug) OR when no rolling-file sink is configured (fallback so logs
+/// don't vanish entirely).
+fn should_enable_console_logs(has_rolling_file_logs: bool, interactive: bool) -> bool {
+    !has_rolling_file_logs || interactive
+}
+
 fn main() -> Result<()> {
     // Initialize error handling
     color_eyre::install()?;
@@ -47,21 +64,31 @@ fn init_tracing(
 
     // Check if JSON format is requested via environment
     let json_logs = std::env::var("OCTOS_LOG_JSON").is_ok();
+    let has_rolling_file_logs = log_dir.is_some();
+    let console_enabled =
+        should_enable_console_logs(has_rolling_file_logs, is_interactive_terminal());
 
-    // Console layer (boxed so we can unify json vs compact types)
-    let console_layer: Box<dyn Layer<_> + Send + Sync> = if json_logs {
-        fmt::layer()
-            .json()
-            .with_target(true)
-            .with_span_list(true)
-            .with_current_span(true)
-            .boxed()
+    // Console layer (boxed so we can unify json vs compact types). None when
+    // running as a daemon with a rolling-file sink — avoids duplicated logs.
+    let console_layer: Option<Box<dyn Layer<_> + Send + Sync>> = if !console_enabled {
+        None
+    } else if json_logs {
+        Some(
+            fmt::layer()
+                .json()
+                .with_target(true)
+                .with_span_list(true)
+                .with_current_span(true)
+                .boxed(),
+        )
     } else {
-        fmt::layer()
-            .with_target(false)
-            .with_thread_ids(false)
-            .compact()
-            .boxed()
+        Some(
+            fmt::layer()
+                .with_target(false)
+                .with_thread_ids(false)
+                .compact()
+                .boxed(),
+        )
     };
 
     if let Some(dir) = log_dir {
@@ -96,5 +123,30 @@ fn init_tracing(
             .init();
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_enable_console_logs;
+
+    #[test]
+    fn interactive_tty_with_file_logs_still_gets_console() {
+        assert!(should_enable_console_logs(true, true));
+    }
+
+    #[test]
+    fn daemon_with_file_logs_drops_console() {
+        assert!(!should_enable_console_logs(true, false));
+    }
+
+    #[test]
+    fn daemon_without_file_logs_falls_back_to_console() {
+        assert!(should_enable_console_logs(false, false));
+    }
+
+    #[test]
+    fn interactive_without_file_logs_gets_console() {
+        assert!(should_enable_console_logs(false, true));
     }
 }
