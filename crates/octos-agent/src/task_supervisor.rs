@@ -588,6 +588,17 @@ impl TaskSupervisor {
                 );
                 self.mark_failed(task_id, data.message.clone());
             }
+            HarnessEventPayload::RoutingDecision { .. } => {
+                // Routing decisions are observational — they do not change the
+                // task's lifecycle state. We still attach the detail so the
+                // operator dashboard can surface the tier/reasons for this
+                // turn without inventing a dedicated sidecar channel.
+                self.mark_runtime_state(
+                    task_id,
+                    TaskRuntimeState::ExecutingTool,
+                    Some(runtime_detail.to_string()),
+                );
+            }
             HarnessEventPayload::CredentialRotation { .. } => {
                 // Credential rotations are observability-only — they do not
                 // change the task lifecycle. We still update runtime_detail

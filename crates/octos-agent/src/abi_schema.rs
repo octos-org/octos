@@ -43,6 +43,14 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the `routing.decision` harness event payload
+/// introduced in M6.6 (content-classified smart model routing).
+///
+/// The `kind`, `tier`, and `reasons` fields are stable. `lane` and
+/// `input_chars` are additive experimental fields today; bumping this
+/// version is only required when renaming or removing a stable field.
+pub const ROUTING_DECISION_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `CredentialPoolConfig` persisted in profile
 /// files (M6.5). Bumped when the persisted state shape or the `Config`
 /// patch contract evolves in a non-backward-compatible way.

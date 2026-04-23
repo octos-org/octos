@@ -290,6 +290,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
         ),
         (
+            "routing_decisions".to_string(),
+            total_for_metric(samples, "octos_routing_decision_total"),
+        ),
+        (
             "credential_rotations".to_string(),
             total_for_metric(samples, "octos_llm_credential_rotation_total"),
         ),
@@ -373,6 +377,10 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 "octos_workspace_validator_total",
                 &["status", "phase", "kind", "required"],
             ),
+        ),
+        (
+            "routing_decisions".to_string(),
+            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
         ),
         (
             "credential_rotations".to_string(),
@@ -816,6 +824,21 @@ pub fn record_tool_call(name: &str, success: bool, duration_secs: f64) {
 pub fn record_llm_tokens(direction: &str, count: u32) {
     counter!("octos_llm_tokens_total", "direction" => direction.to_string())
         .increment(u64::from(count));
+}
+
+/// Record a content-classified smart routing decision (M6.6).
+///
+/// Increments `octos_routing_decision_total{tier, lane}`. `lane` is optional —
+/// the classifier emits decisions before lane selection, so callers either
+/// pass the lane they ultimately picked or `None` to record as `"unset"`.
+pub fn record_routing_decision(tier: &str, lane: Option<&str>) {
+    let lane_label = lane.unwrap_or("unset").to_string();
+    counter!(
+        "octos_routing_decision_total",
+        "tier" => tier.to_string(),
+        "lane" => lane_label,
+    )
+    .increment(1);
 }
 
 /// Decorator that records Prometheus metrics for progress events,
