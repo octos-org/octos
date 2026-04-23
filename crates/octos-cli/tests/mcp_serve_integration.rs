@@ -468,6 +468,7 @@ async fn should_populate_validator_results_when_workspace_policy_declares_valida
         },
         artifacts: WorkspaceArtifactsPolicy::default(),
         spawn_tasks: std::collections::BTreeMap::new(),
+        compaction: None,
     };
     write_workspace_policy(workspace.path(), &policy).unwrap();
 
