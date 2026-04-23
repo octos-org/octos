@@ -618,9 +618,16 @@ pub async fn cost_attributions(
 }
 
 /// POST /api/swarm/dispatches/{id}/review — write a typed review event.
+///
+/// The body's `reviewer` field is cross-checked against the authenticated
+/// caller: a non-admin user cannot submit a decision under somebody else's
+/// id (prevents Alice from acking as Bob). Admin callers can set any
+/// `reviewer` string — the field then doubles as an impersonation record
+/// for audit (e.g. an on-call admin filing a decision on behalf of a PM).
 pub async fn submit_review(
     State(state): State<Arc<AppState>>,
     Path(dispatch_id): Path<String>,
+    identity: Option<axum::Extension<super::router::AuthIdentity>>,
     Json(req): Json<SwarmReviewRequest>,
 ) -> Result<Json<SwarmReviewResponse>, (StatusCode, String)> {
     let swarm_state = state.swarm_state.as_ref().ok_or((
@@ -639,6 +646,17 @@ pub async fn submit_review(
                 req.schema_version, SWARM_REVIEW_DECISION_SCHEMA_VERSION
             ),
         ));
+    }
+
+    // Cross-check `reviewer` against the authenticated caller.
+    // - Admin: any `reviewer` string is allowed (audit-by-impersonation).
+    // - User: the body's `reviewer` must match the user's id exactly.
+    // - No identity (middleware not active, e.g. unauthenticated serve
+    //   mode): skip the check — there is nothing to compare against.
+    if let Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) = identity.as_ref() {
+        if &req.reviewer != id {
+            return Err((StatusCode::FORBIDDEN, "reviewer_identity_mismatch".into()));
+        }
     }
 
     // 404 when the dispatch is unknown — the dashboard should only
@@ -923,5 +941,123 @@ mod tests {
     fn parallel_topology_helper_clamps_zero_to_one() {
         let topo = parallel_topology(0);
         assert_eq!(topo.max_concurrency(), 1);
+    }
+
+    /// F-019: a user-role caller may only submit a review under their own
+    /// id. Forging another user's id must surface as 403
+    /// `reviewer_identity_mismatch` before any event is emitted.
+    #[tokio::test]
+    async fn should_reject_forged_reviewer_for_non_admin_caller() {
+        use crate::api::router::AuthIdentity;
+        use crate::user_store::UserRole;
+        use octos_swarm::{AggregateArtifact, SubtaskOutcome, SwarmOutcomeKind, SwarmResult};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
+        let swarm_state = Arc::new(
+            build_test_swarm_state(dir.path().join("swarm"), cost_ledger.clone())
+                .await
+                .unwrap(),
+        );
+
+        // Seed a dispatch so the handler gets past the 404 branch.
+        let dispatch_id = "d-forge".to_string();
+        {
+            let mut entries = swarm_state.dispatches.write().unwrap();
+            entries.push(DispatchEntry {
+                row: DispatchIndexRow {
+                    dispatch_id: dispatch_id.clone(),
+                    contract_id: "c1".into(),
+                    topology: "parallel".into(),
+                    outcome: "success".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    created_at: "2026-04-22T00:00:00Z".into(),
+                    total_cost_usd: None,
+                    review_accepted: None,
+                },
+                result: SwarmResult {
+                    dispatch_id: dispatch_id.clone(),
+                    outcome: SwarmOutcomeKind::Success,
+                    topology: "parallel".into(),
+                    total_subtasks: 0,
+                    completed_subtasks: 0,
+                    retry_rounds_used: 0,
+                    per_task_outcomes: Vec::<SubtaskOutcome>::new(),
+                    aggregate_artifact: AggregateArtifact::default(),
+                    validator_results: Vec::new(),
+                    total_cost_usd: None,
+                },
+                review_reviewer: None,
+                review_notes: None,
+            });
+        }
+
+        let mut state = AppState::empty_for_tests();
+        state.swarm_state = Some(swarm_state);
+        let state = Arc::new(state);
+
+        let alice = axum::Extension(AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::Admin,
+        });
+        let req = SwarmReviewRequest {
+            schema_version: 1,
+            accepted: true,
+            reviewer: "bob".into(),
+            notes: None,
+        };
+
+        let err = submit_review(
+            State(state.clone()),
+            axum::extract::Path(dispatch_id.clone()),
+            Some(alice),
+            Json(req),
+        )
+        .await
+        .expect_err("alice must not be able to submit as bob");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "reviewer_identity_mismatch");
+
+        // Sanity: when alice's `reviewer` matches her id, the review
+        // passes through (the 403 gate is the only thing we're testing).
+        let req_ok = SwarmReviewRequest {
+            schema_version: 1,
+            accepted: true,
+            reviewer: "alice".into(),
+            notes: None,
+        };
+        let ok = submit_review(
+            State(state.clone()),
+            axum::extract::Path(dispatch_id.clone()),
+            Some(axum::Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::Admin,
+            })),
+            Json(req_ok),
+        )
+        .await
+        .expect("matching reviewer id should succeed");
+        assert_eq!(ok.0.reviewer, "alice");
+
+        // Admins can impersonate any `reviewer` string (for audit
+        // by-proxy) — F-019 spec second bullet.
+        let admin_req = SwarmReviewRequest {
+            schema_version: 1,
+            accepted: true,
+            reviewer: "carol".into(),
+            notes: None,
+        };
+        let admin_ok = submit_review(
+            State(state),
+            axum::extract::Path(dispatch_id),
+            Some(axum::Extension(AuthIdentity::Admin)),
+            Json(admin_req),
+        )
+        .await
+        .expect("admin may submit any reviewer string");
+        assert_eq!(admin_ok.0.reviewer, "carol");
     }
 }
