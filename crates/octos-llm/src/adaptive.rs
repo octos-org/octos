@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ChatConfig;
+use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
@@ -550,6 +551,13 @@ pub struct AdaptiveRouter {
     /// RwLock allows concurrent reads in the hot path (emit_status) while
     /// writes (set_status_callback) are rare setup-time operations.
     status_callback: RwLock<Option<StatusCallback>>,
+    /// Optional per-slot credential pool. When attached, the router forwards
+    /// rate-limit and auth failures to the pool so it can cool down or
+    /// refresh the underlying credential. Empty vec means "no pools".
+    credential_pools: RwLock<Vec<Option<Arc<dyn CredentialPool>>>>,
+    /// Id of the credential currently in use per slot. Updated at acquire
+    /// time so failure notifications can identify the right credential.
+    current_credential_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl AdaptiveRouter {
@@ -568,7 +576,7 @@ impl AdaptiveRouter {
             !providers.is_empty(),
             "AdaptiveRouter requires at least one provider"
         );
-        let slots = providers
+        let slots: Vec<AdaptiveSlot> = providers
             .into_iter()
             .enumerate()
             .map(|(i, p)| AdaptiveSlot {
@@ -589,6 +597,7 @@ impl AdaptiveRouter {
                 max_output: AtomicU64::new(0),
             })
             .collect();
+        let slot_count = slots.len();
         Self {
             slots,
             config,
@@ -602,7 +611,118 @@ impl AdaptiveRouter {
             qos_ranking: AtomicBool::new(false),
             last_selected: AtomicU32::new(0),
             status_callback: RwLock::new(None),
+            credential_pools: RwLock::new(vec![None; slot_count]),
+            current_credential_ids: Mutex::new(vec![None; slot_count]),
         }
+    }
+
+    /// Attach a credential pool to slot `idx`. The router forwards 429 and
+    /// auth failures to the pool so keys can rotate without the caller
+    /// orchestrating it. Silently ignores out-of-range indices.
+    pub fn attach_credential_pool(&self, idx: usize, pool: Arc<dyn CredentialPool>) {
+        let mut pools = self.credential_pools.write().unwrap();
+        if idx < pools.len() {
+            pools[idx] = Some(pool);
+        }
+    }
+
+    /// Acquire the current credential for `idx` from the attached pool (if
+    /// any). Returns `None` when no pool is attached, when the slot is out
+    /// of range, or when every credential is in cooldown. Callers that don't
+    /// use credential pools can ignore this entirely.
+    pub async fn acquire_credential(&self, idx: usize, reason: &str) -> Option<String> {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let pool = pool?;
+        match pool.acquire(reason).await {
+            Ok(cred) => {
+                let mut ids = self
+                    .current_credential_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(slot) = ids.get_mut(idx) {
+                    *slot = Some(cred.id.clone());
+                }
+                Some(cred.id)
+            }
+            Err(e) => {
+                warn!(idx, error = %e, "credential pool acquire failed");
+                None
+            }
+        }
+    }
+
+    /// Notify the attached credential pool (if any) that slot `idx` observed
+    /// a recoverable failure so it can cool the credential down or refresh
+    /// OAuth tokens. No-op when no pool is attached.
+    ///
+    /// `auth_failure` — treats the error as authentication and invokes the
+    /// refresher at most once per `error_id`.
+    /// `rate_limit_reset_us` — cooldown target for 429 errors.
+    pub async fn notify_credential_failure(
+        &self,
+        idx: usize,
+        auth_failure: bool,
+        rate_limit_reset_us: Option<u64>,
+        error_id: ErrorId,
+    ) {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let Some(pool) = pool else {
+            return;
+        };
+        let cred_id = {
+            let ids = self
+                .current_credential_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ids.get(idx).and_then(|slot| slot.clone())
+        };
+        let Some(cred_id) = cred_id else {
+            debug!(idx, "notify_credential_failure without acquired id");
+            return;
+        };
+        if auth_failure {
+            if let Err(e) = pool.mark_auth_failure(&cred_id, error_id).await {
+                warn!(idx, cred_id, error = %e, "mark_auth_failure failed");
+            }
+        } else if let Err(e) = pool.mark_rate_limited(&cred_id, rate_limit_reset_us).await {
+            warn!(idx, cred_id, error = %e, "mark_rate_limited failed");
+        }
+    }
+
+    /// Report a successful request for slot `idx` to its credential pool.
+    pub async fn notify_credential_success(&self, idx: usize) {
+        let pool = {
+            let pools = self.credential_pools.read().unwrap();
+            pools.get(idx).and_then(|opt| opt.clone())
+        };
+        let Some(pool) = pool else {
+            return;
+        };
+        let cred_id = {
+            let ids = self
+                .current_credential_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ids.get(idx).and_then(|slot| slot.clone())
+        };
+        let Some(cred_id) = cred_id else {
+            return;
+        };
+        if let Err(e) = pool.mark_success(&cred_id).await {
+            warn!(idx, cred_id, error = %e, "mark_success failed");
+        }
+    }
+
+    /// Convenience: acquire the initial credential for slot `idx`.
+    pub async fn acquire_initial_credential(&self, idx: usize) -> Option<String> {
+        self.acquire_credential(idx, rotation_reason::INITIAL_ACQUIRE)
+            .await
     }
 
     /// Set initial adaptive mode and QoS toggle from config.
@@ -1279,7 +1399,7 @@ impl AdaptiveRouter {
                     );
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 self.slots[idx].metrics.record_failure();
                 let consec = self.slots[idx]
                     .metrics
@@ -1292,6 +1412,7 @@ impl AdaptiveRouter {
                         "provider circuit breaker opened"
                     );
                 }
+                self.notify_credential_failure_from_error(idx, e).await;
             }
         }
 
@@ -1299,6 +1420,25 @@ impl AdaptiveRouter {
             response.provider_index = Some(idx);
             response
         })
+    }
+
+    /// Classify `err` and forward the failure to slot `idx`'s credential
+    /// pool (if attached). Runs once per error — the pool itself enforces
+    /// at-most-once OAuth refresh per error id via its own guard.
+    async fn notify_credential_failure_from_error(&self, idx: usize, err: &eyre::Report) {
+        let text = err.to_string().to_lowercase();
+        let is_auth = text.contains("401")
+            || text.contains("403")
+            || text.contains("authentication")
+            || text.contains("unauthorized");
+        let is_rate_limit = text.contains("429") || text.contains("rate limit");
+        if is_auth {
+            self.notify_credential_failure(idx, true, None, ErrorId::fresh())
+                .await;
+        } else if is_rate_limit {
+            self.notify_credential_failure(idx, false, None, ErrorId::fresh())
+                .await;
+        }
     }
 
     /// Try a stream request on a specific provider.
@@ -1323,8 +1463,9 @@ impl AdaptiveRouter {
                     .metrics
                     .record_success_with_alpha(elapsed_us, self.config.ema_alpha);
             }
-            Err(_) => {
+            Err(e) => {
                 self.slots[idx].metrics.record_failure();
+                self.notify_credential_failure_from_error(idx, e).await;
             }
         }
 

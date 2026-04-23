@@ -43,6 +43,11 @@ pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for `CredentialPoolConfig` persisted in profile
+/// files (M6.5). Bumped when the persisted state shape or the `Config`
+/// patch contract evolves in a non-backward-compatible way.
+pub const CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `HarnessError` events (M6.1, issue #488).
 /// Emitted as part of `octos.harness.event.v1` with `kind: "error"`.
 pub const HARNESS_ERROR_SCHEMA_VERSION: u32 = 1;
@@ -105,6 +110,12 @@ pub(crate) fn default_hook_payload_schema_version() -> u32 {
     HOOK_PAYLOAD_SCHEMA_VERSION
 }
 
+/// Default schema version for `CredentialPoolConfig` deserialization (M6.5).
+/// Applied when an older profile file omits the field entirely.
+pub fn default_credential_pool_config_schema_version() -> u32 {
+    CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION
+}
+
 /// Default schema version for `CompactionPolicy` deserialization. Applied when
 /// an older workspace-policy file omits the nested `schema_version` line.
 pub(crate) fn default_compaction_policy_schema_version() -> u32 {
@@ -155,5 +166,39 @@ mod tests {
             default_hook_payload_schema_version(),
             HOOK_PAYLOAD_SCHEMA_VERSION
         );
+        assert_eq!(
+            default_credential_pool_config_schema_version(),
+            CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn credential_pool_config_schema_version_is_pinned() {
+        // Pin the version so later bumps are forced through a code review.
+        assert_eq!(CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn credential_pool_check_supported_accepts_current_version() {
+        assert!(
+            check_supported(
+                "CredentialPoolConfig",
+                CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION,
+                CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn credential_pool_check_supported_rejects_future_versions() {
+        let err = check_supported(
+            "CredentialPoolConfig",
+            99,
+            CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION,
+        )
+        .expect_err("future version should be rejected");
+        assert_eq!(err.kind, "CredentialPoolConfig");
+        assert_eq!(err.found, 99);
     }
 }
