@@ -172,6 +172,14 @@ pub struct Agent {
     /// Workspace policy associated with the compaction runner (used by the
     /// post-compaction validator rail to resolve preserved artifacts).
     pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// Cross-turn persistent retry bucket state (Review A F-015). When
+    /// present, the loop uses this shared state instead of constructing a
+    /// fresh `LoopRetryState` per `process_message` / `run_task`. Callers
+    /// (e.g. `SessionActor`) own the save/load lifecycle via the
+    /// `LoopRetryState::Serialize + Deserialize` impls. Absent = legacy
+    /// per-turn-reset behaviour, identical to every pre-F-015 caller.
+    pub(super) persistent_retry_state:
+        Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>>,
 }
 
 impl Agent {
@@ -202,6 +210,7 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            persistent_retry_state: None,
         }
     }
 
@@ -233,6 +242,7 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            persistent_retry_state: None,
         }
     }
 
@@ -368,6 +378,36 @@ impl Agent {
     /// Access the attached workspace policy used for compaction gating.
     pub fn compaction_workspace(&self) -> Option<&crate::workspace_policy::WorkspacePolicy> {
         self.compaction_workspace.as_ref()
+    }
+
+    /// Attach a cross-turn persistent [`LoopRetryState`]. When set, the
+    /// agent loop observes failures against this shared state instead of
+    /// constructing a fresh `LoopRetryState` per turn, so bucket counters
+    /// accumulate across `process_message` calls for the same session.
+    ///
+    /// The caller owns the save/load cycle — this is intentionally a shim
+    /// over `Arc<Mutex<...>>` so session actors can round-trip the state
+    /// to a JSON sidecar without re-implementing the bucket machine. See
+    /// Review A F-015 for the motivating bug: without this wiring, a
+    /// sequence of transient rate-limits spread across two turns never
+    /// triggers the per-bucket exhaustion path because the counters reset
+    /// on every turn boundary.
+    pub fn with_persistent_retry_state(
+        mut self,
+        state: Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>,
+    ) -> Self {
+        self.persistent_retry_state = Some(state);
+        self
+    }
+
+    /// Access the attached persistent retry state, if any. Exposed so
+    /// session actors can snapshot/serialize the bucket counters at turn
+    /// boundaries without having to plumb the handle back through a
+    /// separate field.
+    pub fn persistent_retry_state(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>> {
+        self.persistent_retry_state.clone()
     }
 
     /// Beat the heartbeat once (if a realtime controller is attached) and

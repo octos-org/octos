@@ -22,8 +22,8 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
-    HookResult, TaskSupervisor, TokenTracker, TurnAttachmentContext, WorkspacePolicy,
-    read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    HookResult, LoopRetryState, TaskSupervisor, TokenTracker, TurnAttachmentContext,
+    WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -111,6 +111,98 @@ const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 struct PersistedSessionMessage {
     seq: usize,
     timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Review A F-015: resolve the JSON sidecar path for a session's persistent
+/// retry-bucket state. Lives under `{data_dir}/sessions/retry_state_{id}.json`
+/// where `id` is a filesystem-safe hash of the session key. A collision-free
+/// URL-safe encoding would be more correct, but SHA-256 over the raw key is
+/// stable, short, and avoids any weird characters so we prefer it.
+fn retry_state_sidecar_path(
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.0.as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // 16 hex chars = 64 bits: plenty for per-user collision resistance and
+    // keeps the filename short. Full digest is available via debug logs.
+    let short = &hex[..16];
+    data_dir
+        .join("sessions")
+        .join(format!("retry_state_{short}.json"))
+}
+
+/// Review A F-015: read a session's persistent `LoopRetryState` from disk.
+/// Returns `LoopRetryState::default()` when the file is missing, empty,
+/// unreadable, or malformed — the schema is advisory (the state is safe to
+/// reset; the only downside is losing cross-turn accumulation for that
+/// session).
+fn load_retry_state(path: &std::path::Path) -> LoopRetryState {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return LoopRetryState::default();
+    };
+    match serde_json::from_str::<LoopRetryState>(&raw) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "retry_state sidecar is malformed; starting fresh"
+            );
+            LoopRetryState::default()
+        }
+    }
+}
+
+/// Review A F-015: write the session's persistent retry state to disk via
+/// the atomic write-then-rename dance already used by session JSONL files.
+/// Silently logs failures — the sidecar is best-effort durability and must
+/// never block the agent loop.
+fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(
+                path = %parent.display(),
+                error = %error,
+                "failed to create retry_state sidecar directory"
+            );
+            return;
+        }
+    }
+    let serialized = match serde_json::to_string_pretty(state) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to serialize retry_state sidecar"
+            );
+            return;
+        }
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&tmp_path, serialized) {
+        warn!(
+            path = %tmp_path.display(),
+            error = %error,
+            "failed to write retry_state sidecar (tmp)"
+        );
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp_path, path) {
+        warn!(
+            tmp = %tmp_path.display(),
+            path = %path.display(),
+            error = %error,
+            "failed to rename retry_state sidecar into place"
+        );
+    }
 }
 
 async fn persist_assistant_message(
@@ -1754,6 +1846,16 @@ impl ActorFactory {
             }
         }
 
+        // Review A F-015: attach a cross-turn persistent retry state handle
+        // so LoopRetryState buckets accumulate across consecutive
+        // `process_message` / `run_task` calls for this session. The sidecar
+        // is JSON so operators can inspect or purge it without opening redb;
+        // the handle is read-through / write-back owned by the agent loop.
+        let retry_state_path = retry_state_sidecar_path(&self.data_dir, &session_key);
+        let retry_state_initial = load_retry_state(&retry_state_path);
+        let persistent_retry_state = Arc::new(StdMutex::new(retry_state_initial));
+        agent = agent.with_persistent_retry_state(persistent_retry_state.clone());
+
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
 
@@ -1790,6 +1892,8 @@ impl ActorFactory {
             active_sessions: self.active_sessions.clone(),
             user_workspace: user_workspace.clone(),
             cron_tool: cron_tool_ref,
+            persistent_retry_state,
+            retry_state_path: Some(retry_state_path),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -1954,6 +2058,16 @@ struct SessionActor {
     user_workspace: std::path::PathBuf,
     /// Per-session cron tool reference — updated with channel/chat_id on each message.
     cron_tool: Option<Arc<CronTool>>,
+    /// Review A F-015: cross-turn persistent retry-bucket handle. The
+    /// agent loop's `PersistentRetryStateGuard` hydrates from this at turn
+    /// start and writes back on drop. We hold a clone of the same `Arc` so
+    /// we can flush the state to a JSON sidecar after every turn.
+    persistent_retry_state: Arc<StdMutex<LoopRetryState>>,
+    /// Path of the retry-state JSON sidecar on disk. `None` when the path
+    /// could not be resolved (e.g. unusual test data dirs); in that case
+    /// the in-memory state still accumulates within this actor's lifetime
+    /// but is not durable across process restarts.
+    retry_state_path: Option<std::path::PathBuf>,
 }
 
 impl SessionActor {
@@ -3511,6 +3625,21 @@ impl SessionActor {
 
         // Drop the semaphore permit before &mut self operations below.
         drop(_permit);
+
+        // Review A F-015: flush the cross-turn persistent retry-bucket state
+        // to its JSON sidecar so the next `process_message` call on this
+        // session sees the accumulated buckets. The in-memory `Arc<Mutex<..>>`
+        // has already been mutated by the agent loop's guard; we just need
+        // to persist it before the next turn loads. Best-effort: if the
+        // sidecar write fails we log and carry on.
+        if let Some(ref retry_path) = self.retry_state_path {
+            let snapshot = self
+                .persistent_retry_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            save_retry_state(retry_path, &snapshot);
+        }
 
         // Handle any slash commands that arrived during the select loop.
         // We deferred them to avoid &mut self borrow conflicts in tokio::select!.
@@ -5307,6 +5436,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5375,6 +5506,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5449,6 +5582,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5570,6 +5705,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5687,6 +5824,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5776,6 +5915,8 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
         };
 
         let handle = tokio::spawn(actor.run());

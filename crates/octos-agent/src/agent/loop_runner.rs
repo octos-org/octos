@@ -76,6 +76,54 @@ pub(crate) enum LoopErrorAction {
     Bail,
 }
 
+/// Review A F-015 RAII guard. Loads a `LoopRetryState` from an optional
+/// shared `Arc<Mutex<...>>` at construction and writes back on drop so
+/// bucket counters persist across `process_message` / `run_task` calls
+/// for sessions that attach a persistent retry-state handle.
+///
+/// The loop body accesses the owned `state` field via `Deref`/`DerefMut`
+/// so existing code keeps its `&mut retry_state` call pattern.
+///
+/// Sessions that do not attach a handle see the legacy reset-per-turn
+/// behaviour — the guard just owns a fresh `LoopRetryState` and writes
+/// nowhere on drop.
+struct PersistentRetryStateGuard {
+    state: super::loop_state::LoopRetryState,
+    handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>,
+}
+
+impl PersistentRetryStateGuard {
+    fn new(handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>) -> Self {
+        let state = handle
+            .as_ref()
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default();
+        Self { state, handle }
+    }
+}
+
+impl std::ops::Deref for PersistentRetryStateGuard {
+    type Target = super::loop_state::LoopRetryState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for PersistentRetryStateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for PersistentRetryStateGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            let mut locked = handle.lock().unwrap_or_else(|e| e.into_inner());
+            *locked = self.state.clone();
+        }
+    }
+}
+
 impl Agent {
     /// Classify a raw error escaping the agent loop into a `HarnessError`,
     /// increment the `octos_loop_error_total{variant, recovery}` counter, and
@@ -536,7 +584,13 @@ impl Agent {
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
                 // from issue #489 stays exact.
-                let mut retry_state = LoopRetryState::new();
+                //
+                // Review A F-015: when a persistent retry state is attached
+                // via `with_persistent_retry_state`, the guard hydrates from
+                // the shared handle on construction and writes back on drop,
+                // so bucket counters carry across turns for the same session.
+                let mut retry_state =
+                    PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
@@ -930,7 +984,12 @@ impl Agent {
             // M6.2: per-run retry-bucket state machine. Same instance lives
             // across all iterations of the task loop so bucket counters
             // accumulate the way operators expect.
-            let mut retry_state = LoopRetryState::new();
+            //
+            // Review A F-015: hydrate from the persistent handle when set so
+            // task buckets survive across repeated `run_task` invocations on
+            // the same session (the guard's `Drop` impl writes back).
+            let mut retry_state =
+                PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
             let config = self.chat_config();
 
             loop {
