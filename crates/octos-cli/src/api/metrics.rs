@@ -298,6 +298,10 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             total_for_metric(samples, "octos_sub_agent_dispatch_total"),
         ),
         (
+            "cost_attributions".to_string(),
+            total_for_metric(samples, "octos_cost_attribution_total"),
+        ),
+        (
             "delegations".to_string(),
             total_for_metric(samples, "octos_delegation_total"),
         ),
@@ -403,6 +407,14 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
             ),
         ),
         (
+            "cost_attributions".to_string(),
+            breakdown(
+                samples,
+                "octos_cost_attribution_total",
+                &["model", "outcome"],
+            ),
+        ),
+        (
             "delegations".to_string(),
             breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
         ),
@@ -443,6 +455,38 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
             ),
         ),
     ])
+}
+
+/// Operator-facing cost rollup exposed alongside the summary. Consumed
+/// by the admin dashboard to show a per-contract spend breakdown from
+/// the ledger. Construction is isolated behind a pure function so it
+/// remains unit-testable without touching redb.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OperatorContractCostSummary {
+    pub contract_id: String,
+    pub dispatch_count: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+}
+
+/// Convert [`octos_agent::ContractCostRollup`] records into the
+/// serialized dashboard shape. The conversion is deliberately
+/// one-way so the API layer stays decoupled from the ledger crate's
+/// internal types.
+pub fn operator_contract_cost_summary(
+    rollups: &[octos_agent::ContractCostRollup],
+) -> Vec<OperatorContractCostSummary> {
+    rollups
+        .iter()
+        .map(|rollup| OperatorContractCostSummary {
+            contract_id: rollup.contract_id.clone(),
+            dispatch_count: rollup.dispatch_count,
+            tokens_in: rollup.tokens_in,
+            tokens_out: rollup.tokens_out,
+            cost_usd: rollup.cost_usd,
+        })
+        .collect()
 }
 
 fn total_for_metric(samples: &[ParsedMetricSample], metric: &str) -> u64 {
@@ -957,6 +1001,44 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         let summary = build_operator_summary("");
         assert!(!summary.available);
         assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn operator_summary_aggregates_cost_attribution_counter() {
+        let metrics = r#"
+octos_cost_attribution_total{model="claude-haiku",outcome="success"} 3
+octos_cost_attribution_total{model="claude-sonnet-4",outcome="success"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert_eq!(summary.totals.get("cost_attributions"), Some(&4));
+        let rows = summary.breakdowns.get("cost_attributions").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn operator_contract_cost_summary_preserves_sort_order() {
+        use octos_agent::ContractCostRollup;
+        let rollups = vec![
+            ContractCostRollup {
+                contract_id: "contract-B".into(),
+                dispatch_count: 2,
+                tokens_in: 1_000,
+                tokens_out: 500,
+                cost_usd: 0.50,
+            },
+            ContractCostRollup {
+                contract_id: "contract-A".into(),
+                dispatch_count: 5,
+                tokens_in: 4_000,
+                tokens_out: 2_500,
+                cost_usd: 0.12,
+            },
+        ];
+        let rendered = operator_contract_cost_summary(&rollups);
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].contract_id, "contract-B");
+        assert!((rendered[0].cost_usd - 0.50).abs() < 1e-9);
+        assert_eq!(rendered[1].dispatch_count, 5);
     }
 
     #[test]

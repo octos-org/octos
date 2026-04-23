@@ -17,7 +17,9 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::abi_schema::{HARNESS_ERROR_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION};
+use crate::abi_schema::{
+    COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+};
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
 use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
@@ -42,6 +44,10 @@ fn default_validator_result_schema_version() -> u32 {
 
 fn default_sub_agent_dispatch_schema_version() -> u32 {
     SUB_AGENT_DISPATCH_SCHEMA_VERSION
+}
+
+fn default_cost_attribution_schema_version() -> u32 {
+    COST_ATTRIBUTION_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +243,10 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessSubAgentDispatchEvent,
     },
+    CostAttribution {
+        #[serde(flatten)]
+        data: HarnessCostAttributionEvent,
+    },
     /// Content-classified smart routing decision (M6.6).
     ///
     /// Emitted once per chat turn, before the adaptive router picks a lane.
@@ -405,6 +415,38 @@ pub struct HarnessSubAgentDispatchEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Typed payload emitted when a sub-agent dispatch commits a cost
+/// attribution to the ledger (M7.4). Fired after the dispatch succeeds
+/// so operators can tie spend back to the originating contract, task,
+/// and model without joining against raw dispatch logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessCostAttributionEvent {
+    #[serde(default = "default_cost_attribution_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Stable ledger row id — matches
+    /// [`crate::cost_ledger::CostAttributionEvent::attribution_id`].
+    pub attribution_id: String,
+    /// Contract identifier the spend is booked against (workspace
+    /// contract path, workflow slug, or an opaque operator-chosen id).
+    pub contract_id: String,
+    /// Model key declared by the sub-agent.
+    pub model: String,
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+    pub cost_usd: f64,
+    /// Dispatch outcome echoed from the originating
+    /// [`HarnessSubAgentDispatchEvent::outcome`].
+    pub outcome: String,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Content-classified smart routing decision payload (M6.6).
 ///
 /// Emitted once per chat turn with the classifier's tier choice and the
@@ -486,6 +528,14 @@ impl HarnessEvent {
         Self {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
             payload: HarnessEventPayload::SubAgentDispatch { data },
+        }
+    }
+
+    /// Convenience builder for a `CostAttribution` event.
+    pub fn cost_attribution(data: HarnessCostAttributionEvent) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::CostAttribution { data },
         }
     }
 
@@ -687,6 +737,33 @@ impl HarnessEvent {
                 validate_bounded("sub-agent outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
                 validate_optional_message(data.message.as_deref())?;
             }
+            HarnessEventPayload::CostAttribution { data } => {
+                if data.schema_version > COST_ATTRIBUTION_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported cost attribution schema_version {} (max supported: {})",
+                        data.schema_version, COST_ATTRIBUTION_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("attribution_id", &data.attribution_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("contract_id", &data.contract_id, MAX_MESSAGE_BYTES)?;
+                validate_bounded("model", &data.model, MAX_MESSAGE_BYTES)?;
+                validate_bounded("outcome", &data.outcome, MAX_MESSAGE_BYTES)?;
+                if !data.cost_usd.is_finite() {
+                    return Err(HarnessEventError(format!(
+                        "cost_usd must be finite, got {}",
+                        data.cost_usd
+                    )));
+                }
+                if data.cost_usd < 0.0 {
+                    return Err(HarnessEventError(format!(
+                        "cost_usd must be non-negative, got {}",
+                        data.cost_usd
+                    )));
+                }
+            }
             HarnessEventPayload::RoutingDecision { data } => {
                 validate_common_ids(&data.session_id, &data.task_id)?;
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
@@ -868,6 +945,28 @@ impl HarnessEvent {
                     "message": data.message,
                 })
             }
+            HarnessEventPayload::CostAttribution { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "cost_attribution",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "attribution_id": data.attribution_id,
+                    "contract_id": data.contract_id,
+                    "model": data.model,
+                    "tokens_in": data.tokens_in,
+                    "tokens_out": data.tokens_out,
+                    "cost_usd": data.cost_usd,
+                    "outcome": data.outcome,
+                })
+            }
             HarnessEventPayload::RoutingDecision { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -929,6 +1028,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => &data.session_id,
             HarnessEventPayload::McpServerCall { data } => &data.session_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.session_id,
+            HarnessEventPayload::CostAttribution { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
@@ -945,6 +1045,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => &data.task_id,
             HarnessEventPayload::McpServerCall { data } => &data.task_id,
             HarnessEventPayload::SubAgentDispatch { data } => &data.task_id,
+            HarnessEventPayload::CostAttribution { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
@@ -961,6 +1062,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => data.workflow.as_deref(),
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.workflow.as_deref(),
+            HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
@@ -977,6 +1079,7 @@ impl HarnessEvent {
             HarnessEventPayload::Failure { data } => data.phase.as_deref(),
             HarnessEventPayload::McpServerCall { .. } => None,
             HarnessEventPayload::SubAgentDispatch { data } => data.phase.as_deref(),
+            HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::Error { data } => data.phase.as_deref(),

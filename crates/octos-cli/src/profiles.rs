@@ -96,6 +96,11 @@ pub struct ProfileConfig {
     /// Adaptive routing configuration (QoS weights, mode, etc.).
     #[serde(default)]
     pub adaptive_routing: Option<crate::config::AdaptiveRoutingConfig>,
+    /// Optional cost / provenance budget policy for swarm dispatches
+    /// (M7.4). Absent or empty => no enforcement; the ledger still
+    /// records attributions so operators can audit spend retroactively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget: Option<octos_agent::CostBudgetPolicy>,
     /// Matrix-specific profile config (e.g. swarm supervisor rooms).
     ///
     /// Absent → behaves exactly like pre-M7.3 Matrix deployments. Present →
@@ -396,6 +401,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub adaptive_routing: PatchField<crate::config::AdaptiveRoutingConfig>,
     #[serde(default)]
+    pub cost_budget: PatchField<octos_agent::CostBudgetPolicy>,
+    #[serde(default)]
     pub matrix: PatchField<MatrixProfileConfig>,
     #[serde(default)]
     pub content_routing: PatchField<octos_llm::RoutingConfig>,
@@ -627,6 +634,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.adaptive_routing = None,
             PatchField::Value(adaptive_routing) => self.adaptive_routing = Some(adaptive_routing),
+        }
+        match patch.cost_budget {
+            PatchField::Absent => {}
+            PatchField::Clear => self.cost_budget = None,
+            PatchField::Value(cost_budget) => self.cost_budget = Some(cost_budget),
         }
         match patch.matrix {
             PatchField::Absent => {}
