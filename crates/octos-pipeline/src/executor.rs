@@ -795,6 +795,20 @@ impl PipelineExecutor {
             codergen = codergen.with_provider_router(router.clone());
         }
 
+        // coding-blue FA-7: propagate declared compaction policy +
+        // workspace policy + agent LLM provider onto every LLM-call
+        // node. On the legacy path (empty context) these setters are
+        // no-ops — the handler only attaches a CompactionRunner when
+        // `compaction_policy` is populated.
+        let ws_ctx = &self.config.workspace_context;
+        if let Some(policy) = ws_ctx.policy.as_ref() {
+            codergen = codergen.with_compaction_policy(policy.compaction.clone());
+            codergen = codergen.with_compaction_workspace(Some(policy.clone()));
+        }
+        if let Some(provider) = ws_ctx.agent_llm_provider.as_ref() {
+            codergen = codergen.with_compaction_llm_provider(Some(provider.clone()));
+        }
+
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
         registry.register(
             HandlerKind::Shell,

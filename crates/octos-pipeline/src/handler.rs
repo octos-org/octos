@@ -120,6 +120,18 @@ pub struct CodergenHandler {
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Declared compaction policy to propagate onto child Agents
+    /// (coding-blue FA-7). `None` = legacy path, no compaction runner
+    /// attached to the worker.
+    compaction_policy: Option<octos_agent::workspace_policy::CompactionPolicy>,
+    /// Workspace policy backing the compaction runner — lets the runner
+    /// resolve declared artifact names against glob patterns.
+    compaction_workspace: Option<octos_agent::workspace_policy::WorkspacePolicy>,
+    /// Agent LLM provider used to construct
+    /// `CompactionRunner::with_provider(...)`. Defaults to `self.llm`
+    /// when unset so extractive compaction still works without the
+    /// caller threading a dedicated provider in.
+    compaction_llm_provider: Option<Arc<dyn LlmProvider>>,
 }
 
 impl CodergenHandler {
@@ -137,6 +149,9 @@ impl CodergenHandler {
             provider_policy: None,
             plugin_dirs: Vec::new(),
             shutdown,
+            compaction_policy: None,
+            compaction_workspace: None,
+            compaction_llm_provider: None,
         }
     }
 
@@ -152,6 +167,50 @@ impl CodergenHandler {
 
     pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.plugin_dirs = dirs;
+        self
+    }
+
+    /// Attach a declarative compaction policy (coding-blue FA-7).
+    /// Each worker [`Agent`] built by this handler will receive a
+    /// [`CompactionRunner`] constructed from `policy` via
+    /// [`CompactionRunner::with_provider`] so LLM-iterative
+    /// summarisation fires when declared.
+    ///
+    /// [`CompactionRunner`]: octos_agent::compaction::CompactionRunner
+    /// [`CompactionRunner::with_provider`]: octos_agent::compaction::CompactionRunner::with_provider
+    pub fn with_compaction_policy(
+        mut self,
+        policy: Option<octos_agent::workspace_policy::CompactionPolicy>,
+    ) -> Self {
+        self.compaction_policy = policy;
+        self
+    }
+
+    /// Attach the workspace policy backing the compaction runner so
+    /// declared artifact names resolve against glob patterns. Consumed
+    /// via [`Agent::with_compaction_workspace`].
+    ///
+    /// [`Agent::with_compaction_workspace`]: octos_agent::Agent::with_compaction_workspace
+    pub fn with_compaction_workspace(
+        mut self,
+        workspace: Option<octos_agent::workspace_policy::WorkspacePolicy>,
+    ) -> Self {
+        self.compaction_workspace = workspace;
+        self
+    }
+
+    /// Attach the agent LLM provider used for
+    /// [`CompactionRunner::with_provider`]. When unset the worker's
+    /// resolved LLM provider is used — always safe because extractive
+    /// summarisation ignores the provider entirely and LLM-iterative
+    /// routes through the same Agent provider that serves the node.
+    ///
+    /// [`CompactionRunner::with_provider`]: octos_agent::compaction::CompactionRunner::with_provider
+    pub fn with_compaction_llm_provider(
+        mut self,
+        provider: Option<Arc<dyn LlmProvider>>,
+    ) -> Self {
+        self.compaction_llm_provider = provider;
         self
     }
 
@@ -342,13 +401,36 @@ impl Handler for CodergenHandler {
             .flatten();
 
         let mut worker =
-            octos_agent::Agent::new(worker_id.clone(), provider, tools, self.memory.clone())
+            octos_agent::Agent::new(worker_id.clone(), provider.clone(), tools, self.memory.clone())
                 .with_config(config)
                 .with_system_prompt(system_prompt)
                 .with_shutdown(self.shutdown.clone())
                 .with_reporter(reporter);
         if let Some(sink) = inherited_harness_sink {
             worker = worker.with_harness_event_sink(sink);
+        }
+
+        // coding-blue FA-7: propagate parent's declarative compaction
+        // onto every LLM-call node so the worker honours preflight +
+        // post-call compaction and the policy's preserved-artifacts
+        // rail. Both the compaction policy AND the backing workspace
+        // policy must be present — the workspace is how the runner
+        // resolves declared artifact names to glob patterns.
+        if let Some(compaction_policy) = self.compaction_policy.clone() {
+            let compaction_provider = self.compaction_llm_provider.clone().unwrap_or(provider);
+            let runner = octos_agent::compaction::CompactionRunner::with_provider(
+                compaction_policy,
+                compaction_provider,
+            );
+            let runner = if let Some(ref workspace) = self.compaction_workspace {
+                runner.with_workspace_policy(workspace)
+            } else {
+                runner
+            };
+            worker = worker.with_compaction_runner(Arc::new(runner));
+            if let Some(workspace) = self.compaction_workspace.clone() {
+                worker = worker.with_compaction_workspace(workspace);
+            }
         }
 
         let task = Task::new(
