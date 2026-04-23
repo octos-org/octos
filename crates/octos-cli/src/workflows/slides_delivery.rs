@@ -1,3 +1,14 @@
+//! Slides-delivery workflow definition.
+//!
+//! Pipeline-contract enforcement (coding-blue FA-7): the
+//! `workspace_policy()` helper below returns a typed
+//! [`WorkspacePolicy`] with `validation.on_completion` declaring the
+//! deck artifact + preview PNGs as required. When the session's
+//! working directory is initialised with `write_workspace_policy`,
+//! [`octos_pipeline::RunPipelineTool::build_workspace_context`] reads
+//! that policy on every `run_pipeline` invocation and propagates the
+//! validator block to the pipeline executor. Pipeline completion fails
+//! if the deck is missing — no new opt-in needed.
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };

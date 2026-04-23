@@ -211,6 +211,21 @@ impl CodergenHandler {
         self
     }
 
+    /// Accessor used by acceptance tests to confirm that the
+    /// compaction block was propagated from the parent
+    /// [`PipelineContext`]. Not part of the public API surface.
+    #[doc(hidden)]
+    pub fn has_compaction_policy(&self) -> bool {
+        self.compaction_policy.is_some()
+    }
+
+    /// Accessor used by acceptance tests to confirm that the workspace
+    /// policy was propagated for compaction artifact resolution.
+    #[doc(hidden)]
+    pub fn has_compaction_workspace(&self) -> bool {
+        self.compaction_workspace.is_some()
+    }
+
     /// Resolve LLM provider for a node, following SpawnTool pattern.
     ///
     /// When a model is explicitly specified and a `ProviderRouter` is available,

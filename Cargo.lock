@@ -3782,6 +3782,7 @@ dependencies = [
  "chrono",
  "eyre",
  "futures",
+ "glob",
  "octos-agent",
  "octos-core",
  "octos-llm",

@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use octos_agent::cost_ledger::CostAccountant;
 use octos_agent::{Tool, ToolPolicy, ToolResult};
 use octos_llm::{LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 
+use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
 use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineStatusBridge};
 
@@ -25,6 +27,14 @@ pub struct RunPipelineTool {
     discovery: PipelineDiscovery,
     /// Per-message status bridge (set via `set_status_bridge` before each call).
     status_bridge: std::sync::Mutex<Option<PipelineStatusBridge>>,
+    /// Optional cost accountant (coding-blue FA-7). When set, every
+    /// pipeline run reserves a pipeline-level budget at dispatch start
+    /// and per-node sub-budgets for LLM-call nodes.
+    cost_accountant: Option<Arc<CostAccountant>>,
+    /// Logical contract id used when the pipeline context
+    /// auto-populates from the workspace policy. Defaults to the
+    /// graph id + `"pipeline"` fallback when empty.
+    contract_id: Option<String>,
 }
 
 impl RunPipelineTool {
@@ -44,7 +54,60 @@ impl RunPipelineTool {
             plugin_dirs: Vec::new(),
             discovery,
             status_bridge: std::sync::Mutex::new(None),
+            cost_accountant: None,
+            contract_id: None,
         }
+    }
+
+    /// Attach a [`CostAccountant`] (coding-blue FA-7). When set, pipeline
+    /// executions reserve budget against the configured contract id and
+    /// commit the cumulative token attribution at pipeline terminal.
+    pub fn with_cost_accountant(mut self, accountant: Arc<CostAccountant>) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
+    }
+
+    /// Set the logical contract id for the cost ledger rollups
+    /// associated with this tool. Defaults to the pipeline graph id.
+    pub fn with_contract_id(mut self, contract_id: impl Into<String>) -> Self {
+        self.contract_id = Some(contract_id.into());
+        self
+    }
+
+    /// Build the [`PipelineContext`] for a single invocation.
+    ///
+    /// Reads the workspace policy from `self.working_dir` when present
+    /// and attaches the tool's LLM provider for LLM-iterative
+    /// compaction. When no policy is found the context is empty —
+    /// legacy behaviour intact. This is the adoption path for the
+    /// slides + site delivery workflows: a workspace with a
+    /// `workspace_policy.toml` automatically opts into terminal
+    /// validators + per-node compaction on every `run_pipeline` call
+    /// without threading new constructor args.
+    fn build_workspace_context(&self) -> PipelineContext {
+        let policy = match octos_agent::workspace_policy::read_workspace_policy(&self.working_dir) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    working_dir = %self.working_dir.display(),
+                    error = %error,
+                    "run_pipeline: failed to read workspace policy; running legacy path"
+                );
+                None
+            }
+        };
+        let mut ctx = PipelineContext::new();
+        if let Some(policy) = policy {
+            ctx = ctx.with_policy(policy);
+            ctx = ctx.with_agent_llm_provider(self.default_provider.clone());
+        }
+        if let Some(accountant) = self.cost_accountant.clone() {
+            ctx = ctx.with_cost_accountant(accountant);
+        }
+        if let Some(contract_id) = self.contract_id.as_deref() {
+            ctx = ctx.with_contract_id(contract_id);
+        }
+        ctx
     }
 
     /// Add the global octos-home skills directory as a search path.
@@ -246,7 +309,14 @@ impl Tool for RunPipelineTool {
             max_parallel_workers: 8,
             checkpoint_store: None,
             hook_executor: None,
-            workspace_context: crate::context::PipelineContext::default(),
+            // coding-blue FA-7: adopt workspace-contract enforcement.
+            // Reads the policy from the working dir on every call so
+            // the slides + site delivery workflows (and any other
+            // opted-in workflow) get validator + compaction + cost
+            // reservation for free. When no policy is present the
+            // context is empty and the executor stays on the legacy
+            // path.
+            workspace_context: self.build_workspace_context(),
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].

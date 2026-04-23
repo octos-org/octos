@@ -1138,9 +1138,15 @@ impl PipelineExecutor {
         Ok(Some(handle))
     }
 
-    fn build_handlers(&self) -> HandlerRegistry {
-        let mut registry = HandlerRegistry::new();
+    /// Build a fresh [`CodergenHandler`] with the installed
+    /// [`PipelineContext`] applied. Used by acceptance tests to
+    /// confirm the per-handler wiring (compaction policy + workspace).
+    #[doc(hidden)]
+    pub fn build_codergen_for_test(&self) -> CodergenHandler {
+        self.build_codergen()
+    }
 
+    fn build_codergen(&self) -> CodergenHandler {
         let mut codergen = CodergenHandler::new(
             self.config.default_provider.clone(),
             self.config.memory.clone(),
@@ -1154,11 +1160,6 @@ impl PipelineExecutor {
             codergen = codergen.with_provider_router(router.clone());
         }
 
-        // coding-blue FA-7: propagate declared compaction policy +
-        // workspace policy + agent LLM provider onto every LLM-call
-        // node. On the legacy path (empty context) these setters are
-        // no-ops — the handler only attaches a CompactionRunner when
-        // `compaction_policy` is populated.
         let ws_ctx = &self.config.workspace_context;
         if let Some(policy) = ws_ctx.policy.as_ref() {
             codergen = codergen.with_compaction_policy(policy.compaction.clone());
@@ -1167,6 +1168,19 @@ impl PipelineExecutor {
         if let Some(provider) = ws_ctx.agent_llm_provider.as_ref() {
             codergen = codergen.with_compaction_llm_provider(Some(provider.clone()));
         }
+
+        codergen
+    }
+
+    fn build_handlers(&self) -> HandlerRegistry {
+        let mut registry = HandlerRegistry::new();
+
+        // coding-blue FA-7: `build_codergen` reads the installed
+        // PipelineContext and propagates compaction policy + workspace
+        // onto every LLM-call node. When the context is empty (legacy
+        // path) the setters are no-ops — behaviour is byte-for-byte
+        // identical to pre-FA-7.
+        let codergen = self.build_codergen();
 
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
         registry.register(
