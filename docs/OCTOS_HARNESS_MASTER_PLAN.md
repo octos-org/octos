@@ -99,6 +99,7 @@ The current tracked control docs are:
 - `docs/OCTOS_RUNTIME_PHASE2.md`
 - `docs/OCTOS_RUNTIME_PHASE3.md`
 - `docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md`
+- `docs/OCTOS_HARNESS_M5_CODING_RUNNER_CONTRACT.md`
 
 ## Hard Rules
 
@@ -151,7 +152,12 @@ Remaining gap:
   developer-facing custom app platform still needs progress ABI productization,
   starter apps, validator runner tooling, third-party compatibility gates,
   operator dashboard coverage, and explicit ABI versioning.
+- freeform coding still needs a first-class coding policy layer on the existing
+  runtime: task kind, phase mapping from observed tool calls, validator-gated
+  completion, evidence bundles, and per-task UI replay.
 
 The next work should follow
-`docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md`, not restart exploratory
-refactoring or reopen completed Phase 3 implementation issues.
+`docs/OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md` and
+`docs/OCTOS_HARNESS_M5_CODING_RUNNER_CONTRACT.md`, not restart exploratory
+refactoring, fork the runner, or reopen completed Phase 3 implementation
+issues.

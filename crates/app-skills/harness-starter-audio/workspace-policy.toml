@@ -1,0 +1,33 @@
+# Example workspace policy for harness-starter-audio.
+#
+# Copy to `.octos-workspace.toml` at the workspace root.
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = ["tmp/**", ".DS_Store"]
+
+[validation]
+on_turn_end = []
+on_source_change = []
+on_completion = ["file_exists:audio/*.wav"]
+
+[artifacts]
+primary = "audio/*.wav"
+primary_audio = "audio/*.wav"
+
+[spawn_tasks.synthesize_clip]
+artifacts = ["primary_audio"]
+on_verify = [
+    "file_exists:$primary_audio",
+    "file_size_min:$primary_audio:4096",
+]
+on_deliver = []
+on_failure = ["notify_user:Audio synthesis failed"]

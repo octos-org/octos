@@ -11,7 +11,7 @@
 //! - Gating requirements against current environment
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use octos_plugin::gating;
@@ -200,8 +200,8 @@ fn format_summary(m: &PluginManifest, etype: &PluginType, dot_count: usize) -> S
     if dot_count > 0 {
         parts.push(format!("{dot_count} pipeline(s)"));
     }
-    if m.timeout_secs.is_some() {
-        parts.push(format!("timeout={}s", m.timeout_secs.unwrap()));
+    if let Some(timeout_secs) = m.timeout_secs {
+        parts.push(format!("timeout={timeout_secs}s"));
     }
     parts.join(", ")
 }

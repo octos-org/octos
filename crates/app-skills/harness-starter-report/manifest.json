@@ -1,0 +1,28 @@
+{
+  "name": "harness-starter-report",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Starter for a harnessed report-generator custom app. Writes a markdown file under reports/ and lets the workspace contract deliver it.",
+  "timeout_secs": 60,
+  "tools": [
+    {
+      "name": "generate_report",
+      "description": "Generate a markdown report for a topic. Writes to reports/<slug>.md. The workspace policy primary = \"reports/*.md\" resolves the delivered file.",
+      "spawn_only": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Report topic; also derives the filename."
+          },
+          "body": {
+            "type": "string",
+            "description": "Optional markdown body. When absent, a stub body is written."
+          }
+        },
+        "required": ["topic"]
+      }
+    }
+  ]
+}

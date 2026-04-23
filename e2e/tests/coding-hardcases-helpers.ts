@@ -9,9 +9,26 @@ import {
 } from './live-browser-helpers';
 
 export interface SessionTask {
+  id?: string | null;
   label?: string | null;
   status?: string | null;
   tool_name?: string | null;
+  tool_call_id?: string | null;
+  session_key?: string | null;
+  started_at?: string | null;
+  updated_at?: string | null;
+  lifecycle_state?: string | null;
+  workflow_kind?: string | null;
+  current_phase?: string | null;
+  progress_message?: string | null;
+  progress?: number | null;
+  runtime_detail?: {
+    workflow_kind?: string | null;
+    current_phase?: string | null;
+    progress_message?: string | null;
+    progress?: number | null;
+    [key: string]: unknown;
+  } | null;
   child_join_state?: string | null;
   child_session_key?: string | null;
   child_terminal_state?: string | null;
@@ -128,7 +145,7 @@ export async function waitForSingleSettledTurn(page: Page, timeoutMs = 240_000) 
   throw new Error('Timed out waiting for a single settled coding turn');
 }
 
-async function fetchSessionIds(page: Page): Promise<string[]> {
+export async function fetchSessionIds(page: Page): Promise<string[]> {
   return page.evaluate(async () => {
     const token =
       localStorage.getItem('octos_session_token') ||

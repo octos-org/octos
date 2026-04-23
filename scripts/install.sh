@@ -189,6 +189,32 @@ systemd_env_var_line() {
     printf 'Environment="%s=%s"\n' "$key" "$value"
 }
 
+# Write the SMTP password into `{DATA_DIR}/smtp_secret.json` (mode 0600) so
+# the running `octos serve` can read it without it living in the plist or
+# systemd unit as a plaintext env var. No-op when SMTP_PASSWORD is empty.
+write_smtp_secret_file() {
+    local password="${1:-${SMTP_PASSWORD:-}}"
+    [ -n "$password" ] || return 0
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    local target="$DATA_DIR/smtp_secret.json"
+    # Prefer python3 for JSON-safe escaping; fall back to a conservative
+    # sed-based escape if python3 isn't on PATH.
+    if command -v python3 >/dev/null 2>&1; then
+        SMTP_PASSWORD_TO_WRITE="$password" python3 -c '
+import json, os, sys
+p = os.environ["SMTP_PASSWORD_TO_WRITE"]
+sys.stdout.write(json.dumps({"password": p}, indent=2))
+' > "$target"
+        unset SMTP_PASSWORD_TO_WRITE
+    else
+        local escaped
+        escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '{\n  "password": "%s"\n}\n' "$escaped" > "$target"
+    fi
+    chmod 600 "$target"
+    ok "wrote SMTP password to $target"
+}
+
 section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
@@ -454,6 +480,11 @@ UNIT_EOF
 # Write and load the octos serve system service (plist on Darwin, systemd on Linux).
 # Uses globals: OCTOS_BIN, AUTH_TOKEN, DATA_DIR, PREFIX, HOME
 write_octos_service() {
+    # Persist the SMTP password in `$DATA_DIR/smtp_secret.json` (0600) before
+    # loading the service so the fresh process can read it. The password is
+    # intentionally not written into the plist / systemd unit env block.
+    write_smtp_secret_file "${SMTP_PASSWORD:-}"
+
     case "$OS" in
         Darwin)
             # Clean up legacy LaunchAgents (old names that conflict with port 8080)
@@ -515,7 +546,6 @@ $(launchd_env_var_xml "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(launchd_env_var_xml "SMTP_HOST" "${SMTP_HOST:-}")
 $(launchd_env_var_xml "SMTP_PORT" "${SMTP_PORT:-}")
 $(launchd_env_var_xml "SMTP_USERNAME" "${SMTP_USERNAME:-}")
-$(launchd_env_var_xml "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
 $(launchd_env_var_xml "SMTP_FROM" "${SMTP_FROM:-}")
     </dict>
     <key>WorkingDirectory</key>
@@ -557,7 +587,6 @@ $(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
 $(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
 $(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
-$(systemd_env_var_line "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
 $(systemd_env_var_line "SMTP_FROM" "${SMTP_FROM:-}")
 WorkingDirectory=$HOME
 

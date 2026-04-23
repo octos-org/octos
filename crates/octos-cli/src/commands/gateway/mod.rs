@@ -26,7 +26,7 @@ use matrix_integration::*;
 pub(crate) use prompt::build_system_prompt;
 
 // Types used by tests via `use super::*`
-#[cfg(test)]
+#[cfg(all(test, feature = "matrix"))]
 use {
     crate::session_actor::SnapshotToolRegistryFactory,
     octos_agent::{AgentConfig, ToolRegistry},

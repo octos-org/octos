@@ -14,10 +14,73 @@ import {
   login,
   sendAndWait,
 } from './live-browser-helpers';
-import { getActiveSessionId } from './coding-hardcases-helpers';
+import { getActiveSessionId, getSessionTasks } from './coding-hardcases-helpers';
 
 const TASK_INDICATOR = 'main .session-task-indicator';
+const TASK_WORKFLOW = "[data-testid='task-workflow-kind']";
+const TASK_PHASE = "[data-testid='task-current-phase']";
+const TASK_MESSAGE = "[data-testid='task-progress-message']";
+const TASK_PROGRESS_VALUE = "[data-testid='task-progress-value']";
 const AUDIO_ATTACHMENT = "[data-testid='audio-attachment']";
+
+function humanize(value: string) {
+  return value
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+function taskKey(task: any): string {
+  return (
+    task?.id ||
+    task?.child_session_key ||
+    task?.tool_call_id ||
+    task?.session_key ||
+    task?.tool_name ||
+    `${task?.started_at || ''}:${task?.updated_at || ''}:${task?.status || ''}`
+  );
+}
+
+function isActiveTask(task: any): boolean {
+  const status = String(task?.status || '').toLowerCase();
+  const lifecycle = String(task?.lifecycle_state || '').toLowerCase();
+  return (
+    status === 'spawned' ||
+    status === 'running' ||
+    lifecycle === 'queued' ||
+    lifecycle === 'running' ||
+    lifecycle === 'verifying'
+  );
+}
+
+function uniqueActiveTasks(tasks: any[]) {
+  const seen = new Set<string>();
+  return tasks.filter((task) => {
+    if (!isActiveTask(task)) return false;
+    const key = taskKey(task);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function waitForActiveTask(page: Page, sessionId: string) {
+  const deadline = Date.now() + 60_000;
+  let lastTasks: any[] = [];
+
+  while (Date.now() < deadline) {
+    lastTasks = await getSessionTasks(page, sessionId);
+    const activeTasks = uniqueActiveTasks(lastTasks);
+    if (activeTasks.length > 0) {
+      return activeTasks[0];
+    }
+    await page.waitForTimeout(2_000);
+  }
+
+  throw new Error(
+    `Timed out waiting for an active task in ${sessionId}. Last tasks: ${JSON.stringify(lastTasks)}`,
+  );
+}
 
 async function startPodcast(page: Page, marker: string) {
   const prompt =
@@ -30,12 +93,9 @@ async function startPodcast(page: Page, marker: string) {
   await getInput(page).fill(prompt);
   await getSendButton(page).click();
 
-  await expect(page.locator(TASK_INDICATOR)).toContainText(/running/i, {
+  await expect(page.locator(TASK_INDICATOR)).toHaveCount(1, {
     timeout: 60_000,
   });
-  await expect(page.locator(TASK_INDICATOR)).toContainText(
-    /Background work continues independently/i,
-  );
 
   return prompt;
 }
@@ -114,6 +174,28 @@ test.describe('background task header session switching', () => {
     const marker = `BG-PODCAST-${Date.now()}`;
     const prompt = await startPodcast(page, marker);
     const originSessionId = await getActiveSessionId(page);
+    const activeTask = await waitForActiveTask(page, originSessionId);
+    const runtimeDetail = activeTask.runtime_detail || {};
+
+    await expect(page.locator(TASK_INDICATOR)).toHaveCount(1);
+    if (runtimeDetail.workflow_kind) {
+      await expect(page.locator(TASK_WORKFLOW)).toContainText(
+        humanize(String(runtimeDetail.workflow_kind)),
+      );
+    }
+    if (runtimeDetail.current_phase) {
+      await expect(page.locator(TASK_PHASE)).toContainText(
+        humanize(String(runtimeDetail.current_phase)),
+      );
+    }
+    if (runtimeDetail.progress_message) {
+      await expect(page.locator(TASK_MESSAGE)).toContainText(
+        String(runtimeDetail.progress_message),
+      );
+    }
+    if (typeof runtimeDetail.progress === 'number') {
+      await expect(page.locator(TASK_PROGRESS_VALUE)).toContainText(/%$/);
+    }
 
     await expect(page.locator(TASK_INDICATOR)).toBeVisible();
     await expect(page.locator(SEL.userMessage).last()).toContainText(prompt.slice(0, 80));
@@ -136,8 +218,32 @@ test.describe('background task header session switching', () => {
 
     await switchToSession(page, originSessionId);
     await expect(page.locator(TASK_INDICATOR)).toBeVisible({ timeout: 15_000 });
-    await expect(page.locator(TASK_INDICATOR)).toContainText(/running/i);
+    await expect(page.locator(TASK_INDICATOR)).toHaveCount(1);
     await expect(await getChatThreadText(page)).toContain(marker);
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector(SEL.chatInput, { timeout: 15_000 });
+    await expect.poll(async () => getChatThreadText(page), {
+      timeout: 15_000,
+    }).toContain(marker);
+    const reloadedTask = await waitForActiveTask(page, originSessionId);
+    const reloadedDetail = reloadedTask.runtime_detail || {};
+    await expect(page.locator(TASK_INDICATOR)).toHaveCount(1, { timeout: 15_000 });
+    if (reloadedDetail.workflow_kind) {
+      await expect(page.locator(TASK_WORKFLOW)).toContainText(
+        humanize(String(reloadedDetail.workflow_kind)),
+      );
+    }
+    if (reloadedDetail.current_phase) {
+      await expect(page.locator(TASK_PHASE)).toContainText(
+        humanize(String(reloadedDetail.current_phase)),
+      );
+    }
+    if (reloadedDetail.progress_message) {
+      await expect(page.locator(TASK_MESSAGE)).toContainText(
+        String(reloadedDetail.progress_message),
+      );
+    }
 
     const originMedia = await waitForSessionMedia(page, originSessionId, 240_000);
     await switchToSession(page, originSessionId);

@@ -555,25 +555,25 @@ if [ "$CLOUD_MODE" = true ]; then
         [ -n "${SMTP_FROM_CFG:-}" ] && ok "SMTP from: $SMTP_FROM_CFG"
         ok "allow_self_registration: $ALLOW_SELF_REGISTRATION"
 
-        if [ -n "$SMTP_PASSWORD_ENV" ]; then
-            case "$OS" in
-                Darwin)
-                    if [ -f /Library/LaunchDaemons/io.octos.serve.plist ] && grep -q "<key>${SMTP_PASSWORD_ENV}</key>" /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null; then
-                        ok "octos serve plist includes $SMTP_PASSWORD_ENV"
-                    else
-                        err "octos serve plist does not include $SMTP_PASSWORD_ENV"
-                        hint "Re-run cloud-host-deploy.sh to rebuild the service with SMTP env"
-                    fi
-                    ;;
-                Linux)
-                    if [ -f /etc/systemd/system/octos-serve.service ] && grep -q "Environment=\"${SMTP_PASSWORD_ENV}=" /etc/systemd/system/octos-serve.service 2>/dev/null; then
-                        ok "octos serve unit includes $SMTP_PASSWORD_ENV"
-                    else
-                        err "octos serve unit does not include $SMTP_PASSWORD_ENV"
-                        hint "Re-run cloud-host-deploy.sh to rebuild the service with SMTP env"
-                    fi
-                    ;;
-            esac
+        # The SMTP password now lives in `$DATA_DIR/smtp_secret.json` (0600),
+        # not in the plist / systemd unit env. Fall back to the legacy env var
+        # check only if the file is missing.
+        SMTP_SECRET_FILE="$DATA_DIR/smtp_secret.json"
+        if [ -f "$SMTP_SECRET_FILE" ]; then
+            ok "SMTP password file present: $SMTP_SECRET_FILE"
+            if [ "$OS" = "Darwin" ] || [ "$OS" = "Linux" ]; then
+                MODE=$(stat -f '%A' "$SMTP_SECRET_FILE" 2>/dev/null || stat -c '%a' "$SMTP_SECRET_FILE" 2>/dev/null || echo "")
+                if [ "$MODE" = "600" ]; then
+                    ok "smtp_secret.json has 0600 permissions"
+                elif [ -n "$MODE" ]; then
+                    warn "smtp_secret.json permissions are $MODE (expected 600)"
+                    hint "chmod 600 $SMTP_SECRET_FILE"
+                fi
+            fi
+        elif [ -n "$SMTP_PASSWORD_ENV" ]; then
+            warn "SMTP password file not found at $SMTP_SECRET_FILE"
+            hint "Run 'octos admin set-smtp-password' or save via the setup wizard"
+            hint "Falling back to env var $SMTP_PASSWORD_ENV if the service exports it"
         fi
         if [ -f "$DATA_DIR/serve.log" ]; then
             SMTP_AUTH_ERRORS=$(grep -i 'send_otp failed.*535\|send_otp failed.*authentication failed' "$DATA_DIR/serve.log" 2>/dev/null | tail -1 || true)

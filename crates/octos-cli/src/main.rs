@@ -3,45 +3,8 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 
-#[cfg(feature = "api")]
-pub mod api;
-pub mod auth;
-mod commands;
-pub mod compaction;
-pub mod config;
-pub mod config_watcher;
-#[cfg(feature = "api")]
-pub mod content_catalog;
-pub mod cron_tool;
-pub mod gateway_dispatcher;
-#[cfg(feature = "api")]
-pub mod login_allowlist;
-#[cfg(feature = "api")]
-pub mod monitor;
-#[cfg(feature = "api")]
-pub mod otp;
-pub mod persona_service;
-#[cfg(feature = "api")]
-pub mod process_manager;
-pub mod profiles;
-pub mod project_templates;
-mod qos_catalog;
-pub mod session_actor;
-pub mod skills_scope;
-pub mod soul_service;
-pub mod status_indicator;
-pub mod status_layers;
-pub mod stream_reporter;
-pub mod tenant;
-pub mod tools;
-#[cfg(feature = "api")]
-pub mod updater;
-#[cfg(feature = "api")]
-pub mod user_store;
-pub mod workflow_runtime;
-pub mod workflows;
-
-use commands::{Args, Executable};
+#[cfg_attr(not(feature = "api"), allow(unused_imports))]
+use octos_cli::commands::{self, Args, Executable};
 
 fn main() -> Result<()> {
     // Initialize error handling

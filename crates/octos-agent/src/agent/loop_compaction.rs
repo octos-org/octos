@@ -201,12 +201,7 @@ mod tests {
                     .as_ref()
                     .map(|calls| calls.iter().map(|c| c.id.clone()).collect())
                     .unwrap_or_default();
-                (
-                    m.role.clone(),
-                    m.content.clone(),
-                    m.tool_call_id.clone(),
-                    tool_ids,
-                )
+                (m.role, m.content.clone(), m.tool_call_id.clone(), tool_ids)
             })
             .collect()
     }

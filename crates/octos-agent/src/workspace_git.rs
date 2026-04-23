@@ -11,8 +11,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::behaviour::{ActionContext, ActionResult, evaluate_actions_with_context};
+use crate::validators::{ValidatorLedger, ValidatorOutcome, ValidatorStatus};
 use crate::workspace_policy::{
-    WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
+    Validator, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSnapshotTrigger,
     WorkspaceVersionControlProvider, read_workspace_policy,
 };
 
@@ -116,6 +117,18 @@ pub struct WorkspaceContractStatus {
     pub turn_end_checks: Vec<WorkspaceCheckStatus>,
     pub completion_checks: Vec<WorkspaceCheckStatus>,
     pub artifacts: Vec<WorkspaceArtifactStatus>,
+    /// Latest typed validator outcomes (harness M4.3). Read from the persisted
+    /// ledger on each inspect, so replay survives reload/restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validator_outcomes: Vec<crate::validators::ValidatorOutcome>,
+    /// Number of optional validator failures recorded in the most recent
+    /// ledger entries. Operator-visible warning counter.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub optional_validator_warnings: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -565,6 +578,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
                 turn_end_checks: Vec::new(),
                 completion_checks: Vec::new(),
                 artifacts: Vec::new(),
+                validator_outcomes: Vec::new(),
+                optional_validator_warnings: 0,
             };
         }
         Err(error) => {
@@ -580,6 +595,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
                 turn_end_checks: Vec::new(),
                 completion_checks: Vec::new(),
                 artifacts: Vec::new(),
+                validator_outcomes: Vec::new(),
+                optional_validator_warnings: 0,
             };
         }
     };
@@ -601,6 +618,8 @@ pub fn inspect_workspace_contract(repo: &WorkspaceRepo) -> WorkspaceContractStat
             turn_end_checks: Vec::new(),
             completion_checks: Vec::new(),
             artifacts: Vec::new(),
+            validator_outcomes: Vec::new(),
+            optional_validator_warnings: 0,
         };
     }
 
@@ -639,9 +658,16 @@ fn inspect_managed_workspace_contract(
         &artifact_context,
         &policy.validation.on_completion,
     );
+
+    let validator_outcomes = latest_validator_outcomes(&repo.root, &policy.validation.validators);
+    let validator_gate_passed =
+        required_validators_satisfied(&policy.validation.validators, &validator_outcomes);
+    let optional_validator_warnings = count_optional_validator_warnings(&validator_outcomes);
+
     let ready = check_list_passed(&turn_end_checks)
         && check_list_passed(&completion_checks)
-        && artifacts.iter().all(|artifact| artifact.present);
+        && artifacts.iter().all(|artifact| artifact.present)
+        && validator_gate_passed;
 
     WorkspaceContractStatus {
         repo_label,
@@ -655,7 +681,77 @@ fn inspect_managed_workspace_contract(
         turn_end_checks,
         completion_checks,
         artifacts,
+        validator_outcomes,
+        optional_validator_warnings,
     }
+}
+
+/// Path of the validator ledger scoped to a workspace repo.
+pub fn workspace_validator_ledger_path(project_root: &Path) -> PathBuf {
+    project_root.join(".octos").join("validator_outcomes.jsonl")
+}
+
+/// Open (or create) the validator ledger for `project_root`.
+pub fn open_workspace_validator_ledger(project_root: &Path) -> Result<ValidatorLedger> {
+    ValidatorLedger::open(workspace_validator_ledger_path(project_root))
+}
+
+fn latest_validator_outcomes(project_root: &Path, declared: &[Validator]) -> Vec<ValidatorOutcome> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let ledger_path = workspace_validator_ledger_path(project_root);
+    let ledger = match ValidatorLedger::open(&ledger_path) {
+        Ok(ledger) => ledger,
+        Err(_) => return Vec::new(),
+    };
+    let all = ledger.read_all().unwrap_or_default();
+    let declared_ids: std::collections::HashSet<&str> = declared
+        .iter()
+        .map(|validator| validator.id.as_str())
+        .collect();
+
+    // Reduce to latest outcome per declared validator id.
+    let mut latest: HashMap<String, ValidatorOutcome> = HashMap::new();
+    for outcome in all {
+        if !declared_ids.contains(outcome.validator_id.as_str()) {
+            continue;
+        }
+        let slot = latest
+            .entry(outcome.validator_id.clone())
+            .or_insert_with(|| outcome.clone());
+        if outcome.started_at > slot.started_at {
+            *slot = outcome;
+        }
+    }
+    // Preserve declared order for stable UI output.
+    declared
+        .iter()
+        .filter_map(|validator| latest.remove(validator.id.as_str()))
+        .collect()
+}
+
+fn required_validators_satisfied(declared: &[Validator], outcomes: &[ValidatorOutcome]) -> bool {
+    for validator in declared {
+        if !validator.required {
+            continue;
+        }
+        let outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.validator_id == validator.id);
+        match outcome {
+            Some(outcome) if outcome.status == ValidatorStatus::Pass => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn count_optional_validator_warnings(outcomes: &[ValidatorOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| !outcome.required && outcome.status != ValidatorStatus::Pass)
+        .count()
 }
 
 fn evaluate_check_specs(

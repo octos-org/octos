@@ -8,6 +8,8 @@ use octos_llm::ChatResponse;
 use tracing::{debug, info, warn};
 
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
+use crate::harness_errors::HarnessError;
+use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
@@ -21,6 +23,26 @@ fn should_auto_send_tool_files(
     tool_name: &str,
 ) -> bool {
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
+}
+
+/// Produce the composite system-prompt text (worker prompt + realtime sensor
+/// summary) used at the top of every agent turn. Centralizing this in
+/// `execution.rs` keeps the message-building policy in a single location so
+/// the conversation loop and task loop compose the same prompt.
+///
+/// Returns the prompt text the caller should paste into the first system
+/// `Message`. When no realtime controller is attached this is byte-identical
+/// to the stored system prompt.
+pub(super) fn compose_system_prompt(agent: &Agent) -> String {
+    let mut content = agent.system_prompt_snapshot();
+    if let Some(summary) = agent.realtime_sensor_summary() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&summary);
+    }
+    content
 }
 
 impl Agent {
@@ -70,6 +92,7 @@ impl Agent {
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
                 let attachment_ctx = turn_attachment_ctx.clone();
+                let harness_event_sink = self.harness_event_sink.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -153,6 +176,7 @@ impl Agent {
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
+                                harness_event_sink: harness_event_sink.clone(),
                                 attachment_paths: bg_attachment_ctx.attachment_paths.clone(),
                                 audio_attachment_paths: bg_attachment_ctx
                                     .audio_attachment_paths
@@ -475,6 +499,7 @@ impl Agent {
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        harness_event_sink: harness_event_sink.clone(),
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
@@ -572,9 +597,34 @@ impl Agent {
                             )
                         }
                         Err(e) => {
+                            // Classify the tool failure as a typed HarnessError.
+                            // Invariant #1 (#488): every raw tool error escape
+                            // must be routed through classification so the
+                            // metrics counter and the sink event both fire.
+                            let classified =
+                                HarnessError::classify_report(&e, Some(tc_name.as_str()));
+                            classified.record_metric();
+                            if let Some(sink) = harness_event_sink.as_deref() {
+                                if let Some(ctx) = lookup_event_sink_context(sink) {
+                                    let event = classified.to_event(
+                                        ctx.session_id,
+                                        ctx.task_id,
+                                        None,
+                                        None,
+                                    );
+                                    if let Err(error) = write_event_to_sink(sink, &event) {
+                                        tracing::debug!(
+                                            error = %error,
+                                            "failed to write tool-failure harness error event"
+                                        );
+                                    }
+                                }
+                            }
                             warn!(
                                 tool = %tc_name,
                                 error = %e,
+                                variant = classified.variant_name(),
+                                recovery = %classified.recovery_hint(),
                                 duration_ms = duration.as_millis() as u64,
                                 "tool failed"
                             );

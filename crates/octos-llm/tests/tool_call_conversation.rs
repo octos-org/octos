@@ -481,8 +481,7 @@ async fn test_provider(
             );
             let preview: String = content.chars().take(120).collect();
             println!(
-                "  {} {name:20} ({model:30}) {:5.1}s  {tokens}",
-                "\u{2713}",
+                "  ✓ {name:20} ({model:30}) {:5.1}s  {tokens}",
                 elapsed.as_secs_f64(),
             );
             println!("    => {preview}");
@@ -494,8 +493,7 @@ async fn test_provider(
         Err(e) => {
             let err_str = format!("{e:#}");
             println!(
-                "  {} {name:20} ({model:30}) {:5.1}s  ERROR: {}",
-                "\u{2717}",
+                "  ✗ {name:20} ({model:30}) {:5.1}s  ERROR: {}",
                 elapsed.as_secs_f64(),
                 &err_str[..err_str.len().min(120)]
             );

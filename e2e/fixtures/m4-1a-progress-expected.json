@@ -1,0 +1,118 @@
+{
+  "$schema_doc": "Expected phase ladder for the M4.1A live release gate (issue #474). This is authoritative for the validate-m4-1a-live.sh script and the e2e live-progress-gate specs. Keep field names in sync with crates/octos-agent/src/harness_events.rs and crates/app-skills/deep-search/src/main.rs.",
+  "schema": "octos.harness.event.v1",
+  "kind": "progress",
+  "workflow": "deep_research",
+  "lifecycle_states": [
+    "queued",
+    "running",
+    "verifying",
+    "ready"
+  ],
+  "terminal_states": [
+    "ready",
+    "failed"
+  ],
+  "active_states": [
+    "queued",
+    "running",
+    "verifying"
+  ],
+  "runtime_states": [
+    "spawned",
+    "executing_tool",
+    "resolving_outputs",
+    "verifying_outputs",
+    "delivering_outputs",
+    "cleaning_up",
+    "completed",
+    "failed"
+  ],
+  "required_phases": [
+    {
+      "phase": "search",
+      "min_progress": 0.0,
+      "max_progress": 0.95,
+      "must_appear": true
+    },
+    {
+      "phase": "fetch",
+      "must_appear": true
+    },
+    {
+      "phase": "synthesize",
+      "must_appear": true
+    },
+    {
+      "phase": "report_build",
+      "must_appear": true
+    },
+    {
+      "phase": "completion",
+      "min_progress": 0.99,
+      "max_progress": 1.0,
+      "must_appear": true
+    }
+  ],
+  "phase_order": [
+    "search",
+    "fetch",
+    "synthesize",
+    "report_build",
+    "completion"
+  ],
+  "runtime_detail_fields": [
+    "schema",
+    "kind",
+    "session_id",
+    "task_id",
+    "workflow",
+    "workflow_kind",
+    "phase",
+    "current_phase",
+    "message",
+    "progress_message",
+    "progress"
+  ],
+  "task_fields": [
+    "id",
+    "status",
+    "runtime_state",
+    "lifecycle_state",
+    "session_key",
+    "tool_name",
+    "started_at",
+    "updated_at",
+    "runtime_detail"
+  ],
+  "ui_selectors": {
+    "task_indicator": "[data-testid='session-task-indicator']",
+    "workflow_kind": "[data-testid='task-workflow-kind']",
+    "current_phase": "[data-testid='task-current-phase']",
+    "status_label": "[data-testid='task-status-label']",
+    "progress_message": "[data-testid='task-progress-message']",
+    "progress_value": "[data-testid='task-progress-value']",
+    "progress_bar": "[data-testid='task-progress']"
+  },
+  "api_endpoints": {
+    "session_tasks": "/api/sessions/{id}/tasks",
+    "session_events": "/api/sessions/{id}/events/stream",
+    "sessions": "/api/sessions"
+  },
+  "prompts": {
+    "deep_research": "Do a deep research on the latest Rust programming language developments in 2026. Run the pipeline directly, don't ask me to choose."
+  },
+  "limits": {
+    "per_run_timeout_seconds": 600,
+    "poll_interval_seconds": 5,
+    "min_progress_events": 3,
+    "max_duplicate_sessions": 0
+  },
+  "notes": [
+    "A deep_research run MUST emit progress events for every phase in `required_phases` before the task transitions to `ready`.",
+    "`phase_order` is the canonical ordering; the monotonic check allows repeats but never a backward jump.",
+    "Field names mirror the canonical ABI: `progress` (not `progress_fraction`) in the HarnessEvent struct. Skills that still emit `progress_fraction` are acceptable as an aliased rendering; validators consume whichever the runtime exposes in `runtime_detail.progress`.",
+    "The `ui_selectors` map is the source of truth for the e2e live-progress-gate spec; keep it synchronized with crates/octos-cli/static/app.js.",
+    "This fixture is consumed by both scripts/validate-m4-1a-live.sh and e2e/tests/live-progress-gate.spec.ts."
+  ]
+}

@@ -23,15 +23,19 @@ pub mod tool;
 pub mod validate;
 
 pub use artifact::ArtifactStore;
-pub use checkpoint::{Checkpoint, CheckpointStore};
+pub use checkpoint::{Checkpoint, CheckpointStore, FileSystemCheckpointStore, PersistedCheckpoint};
 pub use events::{
     CollectingEventHandler, PipelineEvent, PipelineEventHandler, TracingEventHandler,
 };
-pub use executor::{PipelineExecutor, PipelineResult, PipelineStatusBridge};
+pub use executor::{
+    PIPELINE_CHECKPOINT_PERSISTED_TOTAL, PIPELINE_CHECKPOINT_RESUMED_TOTAL,
+    PIPELINE_DEADLINE_EXCEEDED_TOTAL, PipelineExecutor, PipelineResult, PipelineStatusBridge,
+    deadline_exceeded_count,
+};
 pub use fidelity::FidelityMode;
 pub use graph::{
-    HandlerKind, NodeOutcome, OutcomeStatus, PipelineEdge, PipelineGraph, PipelineNode, Subgraph,
-    validate_pipeline_id,
+    DeadlineAction, HandlerKind, MissionCheckpoint, NodeOutcome, OutcomeStatus, PipelineEdge,
+    PipelineGraph, PipelineNode, Subgraph, validate_pipeline_id,
 };
 pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,

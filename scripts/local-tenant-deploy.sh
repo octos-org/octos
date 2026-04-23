@@ -81,6 +81,30 @@ ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
 err()     { echo "    ERROR: $1"; exit 1; }
 
+# Write SMTP password into `$DATA_DIR/smtp_secret.json` (0600) when one is
+# present in the environment. The password is never placed into the plist
+# or systemd unit env block.
+write_smtp_secret_file() {
+    local password="${1:-${SMTP_PASSWORD:-}}"
+    [ -n "$password" ] || return 0
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    local target="$DATA_DIR/smtp_secret.json"
+    if command -v python3 >/dev/null 2>&1; then
+        SMTP_PASSWORD_TO_WRITE="$password" python3 -c '
+import json, os, sys
+p = os.environ["SMTP_PASSWORD_TO_WRITE"]
+sys.stdout.write(json.dumps({"password": p}, indent=2))
+' > "$target"
+        unset SMTP_PASSWORD_TO_WRITE
+    else
+        local escaped
+        escaped=$(printf '%s' "$password" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '{\n  "password": "%s"\n}\n' "$escaped" > "$target"
+    fi
+    chmod 600 "$target"
+    ok "wrote SMTP password to $target"
+}
+
 detect_provider_defaults() {
     if [ -n "${OPENAI_API_KEY:-}" ]; then
         DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
@@ -404,6 +428,10 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
     fi
 
     PLIST_LABEL="io.octos.serve"
+
+    # Persist the SMTP password (if set) before starting the service so the
+    # fresh process can read it from `$DATA_DIR/smtp_secret.json`.
+    write_smtp_secret_file "${SMTP_PASSWORD:-}"
 
     case "$OS" in
         Darwin)

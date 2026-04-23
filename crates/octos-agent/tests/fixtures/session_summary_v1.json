@@ -1,0 +1,35 @@
+{
+    "schema_version": 1,
+    "goal": "Ship the iterative summarizer behind the Summarizer trait",
+    "constraints": [
+        "no new unsafe",
+        "preserve every prior decision"
+    ],
+    "progress_done": [
+        "wire typed SessionSummary into octos-core"
+    ],
+    "progress_in_progress": [
+        "add iterative refinement path"
+    ],
+    "decisions": [
+        {
+            "at_turn": 1,
+            "summary": "Use JSON schema mode to constrain LLM output",
+            "rationale": "Structured output eliminates brittle regex parsing"
+        },
+        {
+            "at_turn": 2,
+            "summary": "Bridge async LLM call via block_in_place + block_on"
+        }
+    ],
+    "files": [
+        {
+            "path": "crates/octos-agent/src/summarizer.rs",
+            "role": "impl"
+        }
+    ],
+    "next_steps": [
+        "finish acceptance tests",
+        "wire through CompactionRunner"
+    ]
+}

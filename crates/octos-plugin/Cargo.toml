@@ -14,6 +14,10 @@ serde_json = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
 which = { workspace = true }
+tokio = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio-test = { workspace = true }
+regex = { workspace = true }

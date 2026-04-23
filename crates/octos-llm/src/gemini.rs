@@ -980,8 +980,10 @@ mod tests {
 
     #[test]
     fn test_gemini_sse_finish_with_tools() {
-        let mut state = GeminiStreamState::default();
-        state.has_tool_calls = true;
+        let mut state = GeminiStreamState {
+            has_tool_calls: true,
+            ..Default::default()
+        };
         let event = crate::sse::SseEvent {
             event: None,
             data: r#"{"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}"#.into(),

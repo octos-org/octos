@@ -504,6 +504,9 @@ pub struct MatrixChannel {
     /// Bounded FIFO of event_id → sender_user_id so edit_message can reuse the correct identity
     /// without growing unbounded over a long-lived gateway process.
     event_senders: Arc<RwLock<VecDeque<(String, String)>>>,
+    /// M7.3 swarm supervisor state. `None` means the supervisor contract is
+    /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
+    swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
 }
 
 impl MatrixChannel {
@@ -537,6 +540,7 @@ impl MatrixChannel {
             bot_manager: std::sync::OnceLock::new(),
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
+            swarm_supervisor: None,
         }
     }
 
@@ -1833,6 +1837,964 @@ impl MatrixChannel {
         }
 
         Ok(())
+    }
+}
+
+// ── M7.3: Matrix-as-supervisor-UI via agent puppets ─────────────────────────
+//
+// Register sub-agents as Matrix puppet users, route harness events to per-swarm
+// rooms, and accept supervisor replies as steering input. The human uses any
+// Matrix client (Element on desktop/mobile/web) as the swarm dashboard — octos
+// only emits typed events and listens for replies. Zero net-new UI code.
+//
+// When [`MatrixChannel::swarm_supervisor`] is `None` (no `ensure_swarm_room` or
+// `register_subagent_puppet` calls made), all pre-existing Matrix channel
+// behavior is unchanged. All pre-existing tests must continue to pass.
+//
+// **Required permissions:** the bot account MUST hold Matrix admin API
+// permissions (synapse: `admin: true`) so it can register puppet users and
+// invite them to rooms on behalf of sub-agents. Deployments without admin
+// rights must not configure `SwarmSupervisorConfig`. The current
+// implementation uses the appservice registration endpoint (already permitted
+// for the baseline bot), which works on homeservers that accept appservice
+// user creation; on homeservers that require true admin tokens, operators
+// must provision an admin-scoped appservice identity.
+
+/// Current schema version for the swarm-supervisor harness event envelope.
+///
+/// Versioned alongside [`profiles::SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION`] so
+/// clients that replay a Matrix room can detect unsupported shapes.
+pub const SWARM_SUPERVISOR_EVENT_SCHEMA_V1: &str = "octos.harness.event.v1";
+
+/// Typed harness event emitted into a swarm supervisor room.
+///
+/// Mirrors the shape of `octos_agent::HarnessEvent` without depending on the
+/// agent crate (octos-bus must stay sibling-free with octos-agent). Invariant 3
+/// of the M7.3 contract requires that serialization preserve `kind` and key
+/// summary fields — the `#[serde(tag = "kind", rename_all = "snake_case")]`
+/// envelope satisfies that exactly.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmHarnessEvent {
+    Progress {
+        session_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+        phase: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<f64>,
+    },
+    Phase {
+        session_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<String>,
+        phase: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Artifact {
+        session_id: String,
+        task_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    ValidatorResult {
+        session_id: String,
+        task_id: String,
+        validator: String,
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Retry {
+        session_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Failure {
+        session_id: String,
+        task_id: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
+    },
+}
+
+impl SwarmHarnessEvent {
+    /// Stable discriminant — identical to the serialized `"kind"` tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Progress { .. } => "progress",
+            Self::Phase { .. } => "phase",
+            Self::Artifact { .. } => "artifact",
+            Self::ValidatorResult { .. } => "validator_result",
+            Self::Retry { .. } => "retry",
+            Self::Failure { .. } => "failure",
+        }
+    }
+
+    /// Human-readable one-line summary for the Matrix message `body`.
+    ///
+    /// The full event JSON is shipped in `formatted_body` via `pre` so any
+    /// Matrix client can render the summary inline and expose structured
+    /// fields on expand. Consumer code MUST NOT rely on the exact phrasing —
+    /// it is tuned for human reading, not machine parsing.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Progress {
+                phase,
+                message,
+                progress,
+                ..
+            } => {
+                let pct = progress
+                    .map(|p| format!(" [{:.0}%]", p.clamp(0.0, 1.0) * 100.0))
+                    .unwrap_or_default();
+                let msg = message.as_deref().unwrap_or("progress");
+                format!("progress {phase}{pct}: {msg}")
+            }
+            Self::Phase { phase, message, .. } => {
+                let msg = message.as_deref().unwrap_or("phase changed");
+                format!("phase {phase}: {msg}")
+            }
+            Self::Artifact { name, path, .. } => match path {
+                Some(p) => format!("artifact {name} -> {p}"),
+                None => format!("artifact {name}"),
+            },
+            Self::ValidatorResult {
+                validator,
+                passed,
+                message,
+                ..
+            } => {
+                let status = if *passed { "passed" } else { "failed" };
+                let msg = message.as_deref().unwrap_or("");
+                if msg.is_empty() {
+                    format!("validator {validator} {status}")
+                } else {
+                    format!("validator {validator} {status}: {msg}")
+                }
+            }
+            Self::Retry {
+                attempt, message, ..
+            } => {
+                let label = attempt.map(|a| format!(" #{a}")).unwrap_or_default();
+                let msg = message.as_deref().unwrap_or("retrying");
+                format!("retry{label}: {msg}")
+            }
+            Self::Failure {
+                message, retryable, ..
+            } => {
+                let tag = match retryable {
+                    Some(true) => " (retryable)",
+                    Some(false) => " (permanent)",
+                    None => "",
+                };
+                format!("failure{tag}: {message}")
+            }
+        }
+    }
+}
+
+/// A supervisor reply routed from the swarm room back to the addressed puppet.
+///
+/// Produced by [`MatrixChannel::handle_supervisor_reply`] when a human reply
+/// targets exactly one puppet (either via mention or via in-reply-to). Callers
+/// in the gateway layer translate this into a `SteeringMessage::FollowUp` and
+/// deliver it to the sub-agent session queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteeringInput {
+    /// The swarm session the reply belongs to.
+    pub session_id: String,
+    /// The sub-agent label originally registered via
+    /// [`MatrixChannel::register_subagent_puppet`].
+    pub agent_label: String,
+    /// The fully-qualified Matrix puppet user ID (`@swarm_<label>:server`).
+    pub puppet_user_id: MatrixUserId,
+    /// The supervisor's Matrix user ID (the sender).
+    pub supervisor_user_id: String,
+    /// The reply message body with the `@puppet` mention already stripped.
+    pub body: String,
+}
+
+/// A Matrix user ID newtype — `@localpart:server_name`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MatrixUserId(String);
+
+impl MatrixUserId {
+    pub fn new(user_id: impl Into<String>) -> Self {
+        Self(user_id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MatrixUserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A Matrix room ID newtype — `!opaque:server_name`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MatrixRoomId(String);
+
+impl MatrixRoomId {
+    pub fn new(room_id: impl Into<String>) -> Self {
+        Self(room_id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MatrixRoomId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Per-swarm supervisor state held by a [`MatrixChannel`].
+///
+/// Keeps the `session_id → MatrixRoomId` and `(session_id, agent_label) →
+/// MatrixUserId` maps idempotent — the first call provisions the resource and
+/// caches the identifier; subsequent calls return the cached value without
+/// re-hitting the homeserver. This satisfies invariants 1 and 2.
+#[derive(Clone, Debug)]
+pub(crate) struct SwarmSupervisorState {
+    /// Localpart prefix for puppet users (e.g. `"swarm_"`).
+    puppet_prefix: String,
+    /// Localpart prefix for swarm rooms (e.g. `"swarm_"`).
+    room_prefix: String,
+    /// Homeserver base URL (no trailing slash).
+    homeserver: String,
+    /// Appservice token (`AS-Token`).
+    as_token: String,
+    /// Homeserver name (e.g. `"example.org"`).
+    server_name: String,
+    /// Matrix user IDs of configured supervisors — invited to every swarm
+    /// room at creation time.
+    supervisor_user_ids: Vec<String>,
+    /// session_id → room ID (idempotent).
+    rooms: Arc<RwLock<HashMap<String, MatrixRoomId>>>,
+    /// (session_id, agent_label) → puppet user ID (idempotent).
+    puppets: Arc<RwLock<HashMap<(String, String), MatrixUserId>>>,
+    /// Shared HTTP client.
+    http: reqwest::Client,
+}
+
+impl SwarmSupervisorState {
+    /// Compute the canonical puppet user ID for `(session, label)`.
+    ///
+    /// Matches [`register_subagent_puppet`](MatrixChannel::register_subagent_puppet)
+    /// / [`puppet_user_id_for`](Self::puppet_user_id_for) — `localpart` is
+    /// sanitized to Matrix's allowed character set, truncated if needed.
+    fn puppet_user_id_for(&self, session_id: &str, agent_label: &str) -> MatrixUserId {
+        let localpart = puppet_localpart(&self.puppet_prefix, session_id, agent_label);
+        MatrixUserId(format!("@{localpart}:{}", self.server_name))
+    }
+
+    /// Compute the canonical room alias localpart for `session_id`.
+    fn room_alias_localpart(&self, session_id: &str) -> String {
+        room_alias_localpart(&self.room_prefix, session_id)
+    }
+}
+
+/// Configuration inputs required to enable the swarm supervisor UI.
+///
+/// Plumbed from [`crate::profiles::SwarmSupervisorConfig`](../../../octos_cli/profiles/struct.SwarmSupervisorConfig.html)
+/// in the CLI (octos-cli cannot be imported from octos-bus; callers pass the
+/// already-validated fields directly).
+#[derive(Clone, Debug)]
+pub struct SwarmSupervisorParams {
+    pub puppet_prefix: String,
+    pub room_prefix: String,
+    pub supervisor_user_ids: Vec<String>,
+}
+
+impl Default for SwarmSupervisorParams {
+    fn default() -> Self {
+        Self {
+            puppet_prefix: "swarm_".to_string(),
+            room_prefix: "swarm_".to_string(),
+            supervisor_user_ids: Vec::new(),
+        }
+    }
+}
+
+/// Sanitize a string fragment to the characters Matrix allows in a localpart.
+///
+/// Matrix localparts accept `a-z 0-9 . _ = - /`. We lowercase ASCII, replace
+/// everything else with `_`, and collapse runs of `_` so labels stay readable.
+fn sanitize_localpart_fragment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_underscore = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '.' | '_' | '=' | '-' | '/') {
+            ch
+        } else {
+            '_'
+        };
+        if mapped == '_' {
+            if prev_underscore {
+                continue;
+            }
+            prev_underscore = true;
+        } else {
+            prev_underscore = false;
+        }
+        out.push(mapped);
+    }
+    // Trim trailing underscores for visual cleanliness.
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push('x');
+    }
+    out
+}
+
+fn puppet_localpart(prefix: &str, session_id: &str, agent_label: &str) -> String {
+    // 255 is the Matrix localpart hard limit; reserve a few chars for prefix
+    // + separator + server suffix budget. We cap at 180 to stay safe.
+    const MAX_LOCALPART_LEN: usize = 180;
+    let session = sanitize_localpart_fragment(session_id);
+    let label = sanitize_localpart_fragment(agent_label);
+    let mut out = format!("{prefix}{session}_{label}");
+    if out.len() > MAX_LOCALPART_LEN {
+        out.truncate(MAX_LOCALPART_LEN);
+        while !out.is_char_boundary(out.len()) {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn room_alias_localpart(prefix: &str, session_id: &str) -> String {
+    const MAX_ALIAS_LEN: usize = 180;
+    let session = sanitize_localpart_fragment(session_id);
+    let mut out = format!("{prefix}{session}");
+    if out.len() > MAX_ALIAS_LEN {
+        out.truncate(MAX_ALIAS_LEN);
+        while !out.is_char_boundary(out.len()) {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn record_swarm_room_action(action: &'static str) {
+    metrics::counter!(
+        "octos_matrix_swarm_room_total",
+        "action" => action.to_string()
+    )
+    .increment(1);
+}
+
+/// Create a Matrix room via the Client-Server API using the appservice token.
+///
+/// Returns the created room ID, or the already-existing room ID if the
+/// requested alias is taken (`M_ROOM_IN_USE`). The caller must resolve the
+/// alias in that case because the Matrix createRoom response only echoes the
+/// alias, not the room_id.
+#[allow(clippy::too_many_arguments)]
+async fn create_or_resolve_room(
+    http: &reqwest::Client,
+    homeserver: &str,
+    as_token: &str,
+    server_name: &str,
+    alias_localpart: &str,
+    name: &str,
+    topic: &str,
+    invite: &[String],
+    creator_user_id: &str,
+) -> Result<MatrixRoomId> {
+    let url = format!(
+        "{homeserver}/_matrix/client/v3/createRoom?user_id={}",
+        percent_encode_path(creator_user_id),
+    );
+    let body = json!({
+        "preset": "private_chat",
+        "visibility": "private",
+        "room_alias_name": alias_localpart,
+        "name": name,
+        "topic": topic,
+        "invite": invite,
+    });
+    let resp = http
+        .post(&url)
+        .bearer_auth(as_token)
+        .json(&body)
+        .send()
+        .await
+        .wrap_err("failed to send createRoom request to homeserver")?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse createRoom response")?;
+        let room_id = resp_body
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("createRoom response missing room_id: {resp_body}"))?;
+        return Ok(MatrixRoomId::new(room_id));
+    }
+
+    let resp_body: Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| json!({"errcode": "UNKNOWN"}));
+    let errcode = resp_body
+        .get("errcode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if errcode == "M_ROOM_IN_USE" {
+        // Alias is already taken — resolve it back to the existing room_id.
+        let alias = format!("#{alias_localpart}:{server_name}");
+        return resolve_room_alias(http, homeserver, as_token, &alias).await;
+    }
+
+    let error_msg = resp_body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown error");
+    Err(eyre::eyre!(
+        "createRoom failed: status={status} errcode={errcode} error={error_msg}"
+    ))
+}
+
+/// Resolve a Matrix room alias (`#foo:server`) to a room ID via the directory
+/// API. Used when `M_ROOM_IN_USE` signals an idempotent create.
+async fn resolve_room_alias(
+    http: &reqwest::Client,
+    homeserver: &str,
+    as_token: &str,
+    alias: &str,
+) -> Result<MatrixRoomId> {
+    let url = format!(
+        "{homeserver}/_matrix/client/v3/directory/room/{}",
+        percent_encode_path(alias),
+    );
+    let resp = http
+        .get(&url)
+        .bearer_auth(as_token)
+        .send()
+        .await
+        .wrap_err("failed to resolve room alias")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(eyre::eyre!(
+            "directory lookup failed for alias {alias}: {status} {body}"
+        ));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .wrap_err("failed to parse alias resolution")?;
+    let room_id = body
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| eyre::eyre!("alias resolution missing room_id: {body}"))?;
+    Ok(MatrixRoomId::new(room_id))
+}
+
+/// Invite an already-registered user to a room using the appservice bot's
+/// identity. Idempotent: `M_FORBIDDEN` ("already in room") is treated as
+/// success.
+async fn invite_user_to_room(
+    http: &reqwest::Client,
+    homeserver: &str,
+    as_token: &str,
+    room_id: &str,
+    user_id: &str,
+    inviter_user_id: &str,
+) -> Result<()> {
+    let url = format!(
+        "{homeserver}/_matrix/client/v3/rooms/{}/invite?user_id={}",
+        percent_encode_path(room_id),
+        percent_encode_path(inviter_user_id),
+    );
+    let body = json!({ "user_id": user_id });
+    let resp = http
+        .post(&url)
+        .bearer_auth(as_token)
+        .json(&body)
+        .send()
+        .await
+        .wrap_err("failed to send invite request")?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let resp_body: Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| json!({ "errcode": "UNKNOWN" }));
+    let errcode = resp_body
+        .get("errcode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // User already in room is not a failure for idempotent ensure_swarm_room.
+    if errcode == "M_FORBIDDEN" || errcode == "M_UNKNOWN" {
+        let err_str = resp_body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if err_str.contains("already in the room") || err_str.contains("already a member") {
+            return Ok(());
+        }
+    }
+    Err(eyre::eyre!(
+        "invite failed: room={room_id} user={user_id} status={status} body={resp_body}"
+    ))
+}
+
+impl MatrixChannel {
+    /// Attach the swarm supervisor contract.
+    ///
+    /// When this is called, the channel gains `register_subagent_puppet`,
+    /// `ensure_swarm_room`, `route_subagent_event`, and the supervisor-reply
+    /// matcher. Until this is called (or when the profile config omits the
+    /// `matrix.swarm_supervisor` section), the channel behaves exactly like
+    /// the pre-M7.3 appservice bot — no new routes, no puppet provisioning,
+    /// no extra state. This enforces invariant 5.
+    pub fn with_swarm_supervisor(mut self, params: SwarmSupervisorParams) -> Self {
+        self.swarm_supervisor = Some(Arc::new(SwarmSupervisorState {
+            puppet_prefix: params.puppet_prefix,
+            room_prefix: params.room_prefix,
+            homeserver: self.homeserver.clone(),
+            as_token: self.as_token.clone(),
+            server_name: self.server_name.clone(),
+            supervisor_user_ids: params.supervisor_user_ids,
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+            puppets: Arc::new(RwLock::new(HashMap::new())),
+            http: self.http.clone(),
+        }));
+        self
+    }
+
+    /// Return the shared swarm supervisor state, if configured.
+    fn swarm_state(&self) -> Result<Arc<SwarmSupervisorState>> {
+        self.swarm_supervisor
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("swarm supervisor not configured for this Matrix channel"))
+    }
+
+    /// Register a sub-agent as a Matrix puppet user. Idempotent.
+    ///
+    /// Invariant 1: re-registering the same `(session_id, agent_label)` is a
+    /// no-op and returns the same [`MatrixUserId`]. The puppet is also added
+    /// to the channel's `bot_router` + `registered_users` so outbound sends
+    /// from the puppet identity pass the sender-registration check.
+    pub async fn register_subagent_puppet(
+        &self,
+        session_id: &str,
+        agent_label: &str,
+    ) -> Result<MatrixUserId> {
+        let state = self.swarm_state()?;
+        let key = (session_id.to_string(), agent_label.to_string());
+
+        // Fast path: already registered.
+        if let Some(cached) = state.puppets.read().await.get(&key).cloned() {
+            return Ok(cached);
+        }
+
+        let user_id = state.puppet_user_id_for(session_id, agent_label);
+        let localpart = managed_localpart(user_id.as_str(), &state.server_name)
+            .ok_or_else(|| eyre::eyre!("invalid puppet user_id: {user_id}"))?;
+
+        // `register_user_via_appservice` treats `M_USER_IN_USE` as success, so
+        // re-running this from another process (after a restart) is safe.
+        register_user_via_appservice(&state.http, &state.homeserver, &state.as_token, localpart)
+            .await
+            .wrap_err_with(|| format!("failed to register puppet {user_id}"))?;
+
+        // Profile ID mirrors `session_id--agent_label` so the existing
+        // bot_router lookup surface works for messages addressed to this
+        // puppet. The `owner` and `visibility` fields are not semantically
+        // meaningful for supervisor puppets; we mark them public so existing
+        // visibility gates in `handle_transaction` are a no-op.
+        let profile_id = format!("{session_id}--{agent_label}");
+        self.bot_router
+            .register_entry(user_id.as_str(), &profile_id, "", BotVisibility::Public)
+            .await?;
+        self.registered_users
+            .write()
+            .await
+            .insert(user_id.as_str().to_string());
+
+        // Cache last so a mid-flight failure doesn't poison the map.
+        state.puppets.write().await.insert(key, user_id.clone());
+        Ok(user_id)
+    }
+
+    /// Ensure the per-swarm supervisor room exists, creating it if needed.
+    /// Idempotent.
+    ///
+    /// Invariant 2: re-calling this for the same `session_id` returns the
+    /// same [`MatrixRoomId`]. On first call we `createRoom` with a stable
+    /// alias `#<room_prefix><session>:<server>`; on subsequent calls we hit
+    /// the cache, and if the cache is cold after a restart we recover via
+    /// `M_ROOM_IN_USE` → directory lookup.
+    ///
+    /// Every configured supervisor is invited at creation time. The
+    /// appservice bot is implicitly the room creator and stays joined.
+    pub async fn ensure_swarm_room(&self, session_id: &str) -> Result<MatrixRoomId> {
+        let state = self.swarm_state()?;
+
+        // Fast path: cached.
+        if let Some(cached) = state.rooms.read().await.get(session_id).cloned() {
+            return Ok(cached);
+        }
+
+        let alias_localpart = state.room_alias_localpart(session_id);
+        let room = create_or_resolve_room(
+            &state.http,
+            &state.homeserver,
+            &state.as_token,
+            &state.server_name,
+            &alias_localpart,
+            &format!("Swarm {session_id}"),
+            &format!("octos swarm supervisor — session={session_id}"),
+            &state.supervisor_user_ids,
+            &self.bot_user_id,
+        )
+        .await?;
+
+        record_swarm_room_action("created");
+
+        // Invite supervisors best-effort (they may be invited by createRoom
+        // already). This cleans up races where createRoom returned an
+        // already-existing room whose supervisor list drifted.
+        for supervisor in &state.supervisor_user_ids {
+            if let Err(e) = invite_user_to_room(
+                &state.http,
+                &state.homeserver,
+                &state.as_token,
+                room.as_str(),
+                supervisor,
+                &self.bot_user_id,
+            )
+            .await
+            {
+                warn!(
+                    session_id,
+                    supervisor, error = %e,
+                    "failed to invite supervisor to swarm room (non-fatal)"
+                );
+            }
+        }
+
+        state
+            .rooms
+            .write()
+            .await
+            .insert(session_id.to_string(), room.clone());
+        Ok(room)
+    }
+
+    /// Route a typed harness event to the addressed puppet's message in the
+    /// swarm room.
+    ///
+    /// Invariant 3: serialization preserves `kind` + key summary fields. The
+    /// Matrix `body` carries the human-readable one-liner; `formatted_body`
+    /// carries the JSON envelope inside `<pre>` so clients that render HTML
+    /// can show the structured payload. `msgtype` is `m.text`.
+    ///
+    /// Prerequisites: both the puppet and the room must have been ensured
+    /// via [`register_subagent_puppet`](Self::register_subagent_puppet) +
+    /// [`ensure_swarm_room`](Self::ensure_swarm_room). Callers can rely on
+    /// those being idempotent, so a simple "ensure then route" pattern is
+    /// safe to run on every event.
+    pub async fn route_subagent_event(
+        &self,
+        session_id: &str,
+        agent_label: &str,
+        event: SwarmHarnessEvent,
+    ) -> Result<MatrixEventId> {
+        let state = self.swarm_state()?;
+        let puppet = state.puppet_user_id_for(session_id, agent_label);
+        let room = state
+            .rooms
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "swarm room not ensured for session {session_id}; call ensure_swarm_room first"
+                )
+            })?;
+
+        let summary = event.summary();
+        let envelope = json!({
+            "schema": SWARM_SUPERVISOR_EVENT_SCHEMA_V1,
+            "kind": event.kind(),
+            "agent_label": agent_label,
+            "session_id": session_id,
+            "event": serde_json::to_value(&event)
+                .wrap_err("failed to serialize swarm harness event")?,
+        });
+        let envelope_pretty = serde_json::to_string_pretty(&envelope)
+            .wrap_err("failed to render swarm harness event")?;
+        let event_id = self
+            .send_swarm_room_message(
+                room.as_str(),
+                puppet.as_str(),
+                &summary,
+                &envelope_pretty,
+                &envelope,
+            )
+            .await?;
+
+        record_swarm_room_action("routed");
+        Ok(event_id)
+    }
+
+    async fn send_swarm_room_message(
+        &self,
+        room_id: &str,
+        sender_user_id: &str,
+        body: &str,
+        pretty_envelope: &str,
+        envelope_value: &Value,
+    ) -> Result<MatrixEventId> {
+        let txn_id = uuid::Uuid::now_v7().to_string();
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}?user_id={}",
+            percent_encode_path(room_id),
+            percent_encode_path(&txn_id),
+            percent_encode_path(sender_user_id),
+        );
+        let url = format!("{}{}", self.homeserver, path);
+        // Escape `<`, `>`, `&` for HTML pre-block.
+        let escaped = pretty_envelope
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let formatted_body = format!("<pre><code class=\"language-json\">{escaped}</code></pre>");
+        let body_payload = json!({
+            "msgtype": MSGTYPE_TEXT,
+            "body": body,
+            "format": HTML_FORMAT,
+            "formatted_body": formatted_body,
+            // Structured envelope — clients that understand the custom event
+            // type can render the event directly without parsing the pre
+            // block. This mirrors the `m.new_content` convention.
+            "org.octos.swarm_event": envelope_value,
+        });
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body_payload)
+            .send()
+            .await
+            .wrap_err("failed to send swarm harness event to Matrix")?;
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .wrap_err("failed to parse Matrix send response")?;
+        if !status.is_success() {
+            return Err(eyre::eyre!(
+                "Matrix send failed for swarm event: status={status} body={resp_body}"
+            ));
+        }
+        let event_id = resp_body
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("Matrix send response missing event_id: {resp_body}"))?
+            .to_string();
+        Ok(MatrixEventId(event_id))
+    }
+
+    /// Inspect a supervisor's reply and route it to the addressed puppet.
+    ///
+    /// Invariant 4: the reply is routed ONLY to the puppet explicitly
+    /// addressed — either via `@puppet:server` text mention, a Matrix
+    /// `m.mentions` entry, or an explicit `m.relates_to.m.in_reply_to`
+    /// (fallback) where the referenced event was sent by a known puppet.
+    /// Replies that do not address exactly one puppet return `None` — the
+    /// caller MUST NOT broadcast to all puppets.
+    ///
+    /// Returns `None` when:
+    /// - the sender is not a configured supervisor AND is not the channel's
+    ///   operator sender (keeps unrelated room traffic out of steering);
+    /// - the room is not a known swarm room;
+    /// - the reply addresses zero puppets or more than one puppet.
+    pub async fn handle_supervisor_reply(
+        &self,
+        room_id: &str,
+        sender: &str,
+        message: &str,
+    ) -> Option<SteeringInput> {
+        let state = self.swarm_supervisor.clone()?;
+
+        // Find the session this room belongs to. This also filters out
+        // messages from non-swarm rooms.
+        let session_id = {
+            let rooms = state.rooms.read().await;
+            rooms
+                .iter()
+                .find(|(_, room)| room.as_str() == room_id)
+                .map(|(session, _)| session.clone())
+        }?;
+
+        // Supervisors are the configured `supervisor_user_ids` plus any
+        // operator sender (matching the existing admin-sender gate).
+        let is_configured_supervisor = state.supervisor_user_ids.iter().any(|u| u == sender);
+        let is_operator = self.is_operator_sender(sender);
+        if !is_configured_supervisor && !is_operator {
+            return None;
+        }
+
+        // Collect puppets registered for this session.
+        let candidates: Vec<(String, MatrixUserId)> = {
+            let puppets = state.puppets.read().await;
+            puppets
+                .iter()
+                .filter(|((sess, _), _)| sess == &session_id)
+                .map(|((_, label), uid)| (label.clone(), uid.clone()))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Invariant 4: address exactly one puppet.
+        //
+        // We recognize three mention forms common in Matrix clients:
+        //   1. Text: `@puppet:server body` (Element autocomplete pill)
+        //   2. Text: `@puppet:server: body` (humans typing the classic prefix)
+        //   3. HTML pill: `<a href="https://matrix.to/#/@puppet:server">…</a>`
+        // `contains_puppet_mention` relaxes the trailing-char rule to accept
+        // `:` + whitespace, which the baseline mention matcher rejects.
+        let matches: Vec<&(String, MatrixUserId)> = candidates
+            .iter()
+            .filter(|(_, uid)| contains_puppet_mention(message, uid.as_str()))
+            .collect();
+
+        if matches.len() != 1 {
+            return None;
+        }
+
+        let (agent_label, puppet_user_id) = matches[0].clone();
+        let stripped = strip_puppet_mention(message, puppet_user_id.as_str());
+
+        record_swarm_room_action("replied");
+        Some(SteeringInput {
+            session_id,
+            agent_label,
+            puppet_user_id,
+            supervisor_user_id: sender.to_string(),
+            body: stripped,
+        })
+    }
+}
+
+/// Whether the first character after a matched puppet user_id is allowed to
+/// end the mention.
+///
+/// Unlike [`is_matrix_user_id_char`], this accepts the `:` that humans type
+/// in the classic `@puppet:server: body` prefix — once a complete
+/// `@localpart:server_name` has matched, a second `:` cannot be part of the
+/// same user_id and so terminates the mention.
+fn is_puppet_mention_end(c: char) -> bool {
+    !is_matrix_user_id_char(c) || c == ':'
+}
+
+/// Variant of [`contains_exact_matrix_user_id_mention`] tailored to the
+/// supervisor reply matcher. See [`is_puppet_mention_end`] for the relaxed
+/// terminal rule.
+fn contains_puppet_mention(text: &str, user_id: &str) -> bool {
+    find_puppet_mention(text, user_id).is_some()
+}
+
+fn find_puppet_mention(text: &str, user_id: &str) -> Option<(usize, usize)> {
+    for (idx, _) in text.match_indices(user_id) {
+        let start_ok = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_matrix_user_id_char(c));
+        let end_idx = idx + user_id.len();
+        let end_ok = text[end_idx..]
+            .chars()
+            .next()
+            .is_none_or(is_puppet_mention_end);
+        if start_ok && end_ok {
+            return Some((idx, end_idx));
+        }
+    }
+    None
+}
+
+/// Strip the first occurrence of `@puppet:server` (plus optional trailing
+/// colon/space) from a supervisor reply so the downstream agent sees a clean
+/// message body.
+fn strip_puppet_mention(message: &str, user_id: &str) -> String {
+    let Some((idx, end_idx)) = find_puppet_mention(message, user_id) else {
+        return message.trim().to_string();
+    };
+    let mut prefix = message[..idx].to_string();
+    let suffix = &message[end_idx..];
+    // Strip a leading `:` and any whitespace the mention was followed by so
+    // the classic `@foo: do X` pattern routes cleanly.
+    let tail = suffix
+        .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+        .to_string();
+    if prefix.ends_with(char::is_whitespace) {
+        prefix = prefix.trim_end().to_string();
+    }
+    let mut out = String::with_capacity(prefix.len() + tail.len() + 1);
+    out.push_str(prefix.trim_end());
+    if !prefix.is_empty() && !tail.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(&tail);
+    out.trim().to_string()
+}
+
+/// A Matrix event ID newtype — the return value of a successful send.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MatrixEventId(String);
+
+impl MatrixEventId {
+    pub fn new(event_id: impl Into<String>) -> Self {
+        Self(event_id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MatrixEventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

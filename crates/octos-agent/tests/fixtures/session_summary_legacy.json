@@ -1,0 +1,15 @@
+{
+    "goal": "pre-M6.4 summary emitted without schema_version",
+    "constraints": [],
+    "progress_done": ["seed iterative summarizer prototype"],
+    "progress_in_progress": [],
+    "decisions": [
+        {
+            "at_turn": 0,
+            "summary": "Mirror hermes prose-template compression",
+            "rationale": "Initial sketch before M6.4 lands typed schema"
+        }
+    ],
+    "files": [],
+    "next_steps": ["audit schema shape"]
+}

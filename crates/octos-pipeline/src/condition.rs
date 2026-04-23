@@ -90,6 +90,7 @@ fn status_str(outcome: &NodeOutcome) -> &str {
         crate::graph::OutcomeStatus::Pass => "pass",
         crate::graph::OutcomeStatus::Fail => "fail",
         crate::graph::OutcomeStatus::Error => "error",
+        crate::graph::OutcomeStatus::Skipped => "skipped",
     }
 }
 

@@ -1,0 +1,32 @@
+[package]
+name = "harness-starter-report"
+version = "1.0.0"
+edition = "2024"
+description = "Starter for a harnessed report-generator custom app"
+authors = ["octos team"]
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "harness-starter-report"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+octos-agent = { workspace = true }
+octos-plugin = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[package.metadata.release]
+release = false
+
+[lints]
+workspace = true

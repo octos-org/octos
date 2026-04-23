@@ -1,0 +1,33 @@
+# Example workspace policy for harness-starter-report.
+#
+# Copy this file to `.octos-workspace.toml` at your workspace root when
+# adopting this starter.
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = ["tmp/**", ".DS_Store"]
+
+[validation]
+on_turn_end = []
+on_source_change = []
+on_completion = ["file_exists:reports/*.md"]
+
+[artifacts]
+primary = "reports/*.md"
+
+[spawn_tasks.generate_report]
+artifacts = ["primary"]
+on_verify = [
+    "file_exists:$primary",
+    "file_size_min:$primary:256",
+]
+on_deliver = []
+on_failure = ["notify_user:Report generation failed"]

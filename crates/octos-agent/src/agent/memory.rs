@@ -9,14 +9,7 @@ impl Agent {
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
             role: MessageRole::System,
-            content: self
-                .system_prompt
-                .read()
-                .unwrap_or_else(|e| {
-                    tracing::warn!("system prompt lock was poisoned, recovering");
-                    e.into_inner()
-                })
-                .clone(),
+            content: super::execution::compose_system_prompt(self),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,

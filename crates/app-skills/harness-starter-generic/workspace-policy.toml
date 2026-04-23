@@ -1,0 +1,31 @@
+# Example workspace policy for harness-starter-generic.
+#
+# Copy this file to `.octos-workspace.toml` at your workspace root when
+# adopting this starter. All fields shown here are on the STABLE list in
+# docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md Part 1.
+
+[workspace]
+kind = "session"
+
+[version_control]
+provider = "git"
+auto_init = false
+trigger = "turn_end"
+fail_on_error = false
+
+[tracking]
+ignore = ["tmp/**", ".DS_Store"]
+
+[validation]
+on_turn_end = []
+on_source_change = []
+on_completion = ["file_exists:output/artifact-*.txt"]
+
+[artifacts]
+primary = "output/artifact-*.txt"
+
+[spawn_tasks.produce_artifact]
+artifacts = ["primary"]
+on_verify = ["file_exists:$primary"]
+on_deliver = []
+on_failure = ["notify_user:Artifact generation failed"]

@@ -132,7 +132,7 @@ mod tests {
             &self,
             _messages: &[Message],
             _tools: &[ToolSpec],
-            config: &ChatConfig,
+            _config: &ChatConfig,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 content: Some(self.response.clone()),

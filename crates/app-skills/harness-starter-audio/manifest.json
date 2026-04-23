@@ -1,0 +1,28 @@
+{
+  "name": "harness-starter-audio",
+  "version": "1.0.0",
+  "author": "octos",
+  "description": "Starter for a harnessed audio custom app. Synthesizes a minimal WAV file under audio/ and lets the workspace contract deliver it.",
+  "timeout_secs": 120,
+  "tools": [
+    {
+      "name": "synthesize_clip",
+      "description": "Synthesize a short WAV clip for a label. Writes to audio/<slug>.wav. Replace with a real TTS/render engine when adapting the starter.",
+      "spawn_only": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Label used to derive the filename."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "description": "Clip duration in ms; clamped to [100, 5000]. Default 500."
+          }
+        },
+        "required": ["label"]
+      }
+    }
+  ]
+}

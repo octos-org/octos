@@ -71,22 +71,7 @@ detect_base_remote() {
 }
 
 check_changed_rustfmt() {
-    local base_ref base_remote merge_base
-    base_ref="$(detect_base_ref)" || return 1
-    base_remote="$(detect_base_remote "$base_ref")" || return 1
-    merge_base="$(git merge-base HEAD "$base_remote/$base_ref")"
-
-    local changed_rs=()
-    while IFS= read -r -d '' file; do
-        changed_rs+=("$file")
-    done < <(git diff -z --name-only --diff-filter=ACMRT "$merge_base"...HEAD -- '*.rs')
-
-    if [ "${#changed_rs[@]}" -eq 0 ]; then
-        echo "  No changed Rust files to format-check."
-        return 0
-    fi
-
-    rustfmt --check --edition 2021 --config skip_children=true "${changed_rs[@]}"
+    cargo fmt --all -- --check
 }
 
 # ── 1. Format ─────────────────────────────────────────────────────────
@@ -96,8 +81,6 @@ if [ "$FIX" = true ]; then
     pass "cargo fmt --all (fixed)"
 else
     if check_changed_rustfmt 2>&1; then
-        pass "rustfmt (changed files)"
-    elif cargo fmt --all -- --check 2>&1; then
         pass "cargo fmt"
     else
         fail "cargo fmt (run with --fix or: cargo fmt --all)"

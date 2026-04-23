@@ -4,13 +4,16 @@
 //! Before-hooks can deny operations (exit code 1). Circuit breaker auto-disables
 //! hooks after consecutive failures.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
+use crate::abi_schema::{HOOK_PAYLOAD_SCHEMA_VERSION, default_hook_payload_schema_version};
 use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
@@ -58,8 +61,18 @@ fn default_timeout_ms() -> u64 {
 }
 
 /// Payload sent to hook process as JSON on stdin.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `schema_version` is the durable ABI version. Hook consumers can branch on
+/// it before reading schema-specific fields; see
+/// `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
+/// field list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookPayload {
+    /// Durable ABI schema version for this payload. Defaults to
+    /// [`HOOK_PAYLOAD_SCHEMA_VERSION`] when absent so consumers that replay a
+    /// pre-versioned stream continue to parse.
+    #[serde(default = "default_hook_payload_schema_version")]
+    pub schema_version: u32,
     pub event: HookEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -129,6 +142,14 @@ pub struct HookPayload {
     pub output_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_action: Option<String>,
+
+    /// Opaque integrator-supplied context (robotics, domain-specific sensors, etc).
+    /// Populated by a `HookPayloadEnricher` registered on `HookExecutor`.
+    /// Serialized form is truncated to `MAX_PAYLOAD_FIELD_BYTES`; if the rendered
+    /// JSON exceeds that limit the field is replaced with a `{"truncated": true}`
+    /// marker object so hook scripts always see valid JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_data: Option<serde_json::Value>,
 }
 
 /// Maximum byte length for arguments/result fields in hook payloads.
@@ -477,6 +498,7 @@ impl HookPayload {
 
     fn empty(event: HookEvent) -> Self {
         Self {
+            schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event,
             tool_name: None,
             arguments: None,
@@ -508,8 +530,32 @@ impl HookPayload {
             current_phase: None,
             output_files: Vec::new(),
             failure_action: None,
+            domain_data: None,
         }
     }
+}
+
+/// Synchronous extension point for integrators to attach opaque, domain-specific
+/// context to hook payloads before they are serialized to the hook process stdin.
+///
+/// Robotics integrators use this to attach live sensor telemetry (force/torque,
+/// workspace bounds, e-stop state) that their shell-based before-hooks then
+/// filter on. The core agent stays domain-agnostic: it does not introduce
+/// robot-specific `HookEvent` variants.
+///
+/// Invariants:
+/// - `enrich` runs on the Tokio runtime before payload serialization; keep it
+///   cheap and non-blocking. Expensive I/O must be done off-thread ahead of time
+///   and surfaced through an `Arc`-shared snapshot.
+/// - The populated `HookPayload.domain_data` is subject to truncation: anything
+///   whose rendered JSON exceeds `MAX_PAYLOAD_FIELD_BYTES` is replaced with
+///   a `{"truncated": true}` marker object.
+/// - Implementors MUST be `Send + Sync` so the executor can share them through
+///   `Arc`.
+pub trait HookPayloadEnricher: Send + Sync {
+    /// Mutate the payload in place. Typically sets `payload.domain_data` to a
+    /// JSON object describing the integrator's domain state for `event`.
+    fn enrich(&self, event: &HookEvent, payload: &mut HookPayload);
 }
 
 /// Result of running hooks for an event.
@@ -532,6 +578,8 @@ pub struct HookExecutor {
     /// Per-hook consecutive failure count.
     failures: Vec<AtomicU32>,
     failure_threshold: u32,
+    /// Optional domain-data enricher applied to payloads before serialization.
+    enricher: Option<Arc<dyn HookPayloadEnricher>>,
 }
 
 impl HookExecutor {
@@ -545,13 +593,46 @@ impl HookExecutor {
             hooks,
             failures,
             failure_threshold,
+            enricher: None,
         }
+    }
+
+    /// Attach a synchronous domain-data enricher. Additive: callers that do
+    /// not register an enricher see no payload change.
+    pub fn with_enricher(mut self, enricher: Arc<dyn HookPayloadEnricher>) -> Self {
+        self.enricher = Some(enricher);
+        self
     }
 
     /// Run all matching hooks for the given event sequentially.
     /// Returns `Deny` on the first before-hook that exits with 1.
     pub async fn run(&self, event: HookEvent, payload: &HookPayload) -> HookResult {
-        let payload_json = match serde_json::to_string(payload) {
+        // Apply the optional enricher before serialization so integrators can
+        // attach domain-specific telemetry (force/torque, workspace bounds,
+        // e-stop) that the hook script filters on.
+        let payload_owned;
+        let payload_ref: &HookPayload = if let Some(ref enricher) = self.enricher {
+            let mut enriched = payload.clone();
+            enricher.enrich(&event, &mut enriched);
+            if let Some(ref data) = enriched.domain_data {
+                // Truncate to MAX_PAYLOAD_FIELD_BYTES. Replace with a
+                // marker object so hook scripts always receive valid JSON.
+                let serialized = serde_json::to_string(data).unwrap_or_default();
+                if serialized.len() > MAX_PAYLOAD_FIELD_BYTES {
+                    enriched.domain_data = Some(serde_json::json!({"truncated": true}));
+                }
+                counter!(
+                    "octos_hook_domain_data_enriched_total",
+                    "event" => format!("{:?}", event)
+                )
+                .increment(1);
+            }
+            payload_owned = enriched;
+            &payload_owned
+        } else {
+            payload
+        };
+        let payload_json = match serde_json::to_string(payload_ref) {
             Ok(j) => j,
             Err(e) => return HookResult::Error(format!("failed to serialize payload: {e}")),
         };
@@ -567,7 +648,7 @@ impl HookExecutor {
             if matches!(event, HookEvent::BeforeToolCall | HookEvent::AfterToolCall)
                 && !hook.tool_filter.is_empty()
             {
-                let tool_name = payload.tool_name.as_deref().unwrap_or("");
+                let tool_name = payload_ref.tool_name.as_deref().unwrap_or("");
                 if !hook.tool_filter.iter().any(|f| f == tool_name) {
                     continue;
                 }
@@ -863,6 +944,44 @@ mod tests {
     }
 
     #[test]
+    fn should_stamp_current_schema_version_on_every_constructor() {
+        let payloads = vec![
+            HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None),
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None),
+            HookPayload::before_llm("gpt-4", 0, 1, None),
+            HookPayload::on_resume(None),
+            HookPayload::on_turn_end("done", None),
+        ];
+        for p in payloads {
+            assert_eq!(p.schema_version, HOOK_PAYLOAD_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn should_default_missing_schema_version_to_v1_on_deserialize() {
+        // A payload emitted before M4.6 would have no schema_version field.
+        let legacy = r#"{
+            "event": "after_tool_call",
+            "tool_name": "shell",
+            "tool_id": "tc1",
+            "success": true,
+            "duration_ms": 12
+        }"#;
+        let parsed: HookPayload = serde_json::from_str(legacy).expect("legacy payload parses");
+        assert_eq!(parsed.schema_version, HOOK_PAYLOAD_SCHEMA_VERSION);
+        assert_eq!(parsed.event, HookEvent::AfterToolCall);
+        assert_eq!(parsed.tool_name.as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn should_include_schema_version_field_in_serialized_payload() {
+        let payload =
+            HookPayload::before_tool("shell", serde_json::json!({"command": "ls"}), "tc1", None);
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"schema_version\":1"));
+    }
+
+    #[test]
     fn test_payload_constructors() {
         let before_llm = HookPayload::before_llm("gpt-4", 10, 3, None);
         assert_eq!(before_llm.event, HookEvent::BeforeLlmCall);
@@ -1061,6 +1180,7 @@ mod tests {
         executor.failures[0].store(3, Ordering::Relaxed);
 
         let payload = HookPayload {
+            schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
             event: HookEvent::AfterToolCall,
             tool_name: Some("test".into()),
             arguments: None,
@@ -1092,6 +1212,7 @@ mod tests {
             current_phase: None,
             output_files: Vec::new(),
             failure_action: None,
+            domain_data: None,
         };
         let result = executor.run(HookEvent::AfterToolCall, &payload).await;
         // Hook should be skipped (circuit broken), not denied

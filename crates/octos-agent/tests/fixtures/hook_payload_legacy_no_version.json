@@ -1,0 +1,10 @@
+{
+    "event": "after_tool_call",
+    "tool_name": "glob",
+    "tool_id": "tc-xyz",
+    "result": "matched 3 files",
+    "success": true,
+    "duration_ms": 42,
+    "session_id": "sess-legacy",
+    "profile_id": "main"
+}

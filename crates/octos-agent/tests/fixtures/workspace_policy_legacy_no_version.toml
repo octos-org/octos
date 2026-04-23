@@ -1,0 +1,20 @@
+# Workspace policy fixture — pre-M4.6 sites policy WITHOUT schema_version.
+# This shape predates the harness ABI versioning milestone and must still
+# load cleanly: the harness treats a missing version as v1.
+[workspace]
+kind = "sites"
+
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = true
+
+[tracking]
+ignore = [
+    "node_modules/**",
+    "dist/**",
+    "out/**",
+    ".next/**",
+    ".DS_Store",
+]

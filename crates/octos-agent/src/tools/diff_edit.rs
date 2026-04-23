@@ -216,7 +216,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String> {
 
     // Apply hunks in reverse order so line numbers stay valid
     let mut sorted_hunks: Vec<(usize, &Hunk)> = hunks.iter().enumerate().collect();
-    sorted_hunks.sort_by(|a, b| b.1.old_start.cmp(&a.1.old_start));
+    sorted_hunks.sort_by_key(|entry| std::cmp::Reverse(entry.1.old_start));
 
     // Check for overlapping hunks (sorted descending by old_start)
     for window in sorted_hunks.windows(2) {

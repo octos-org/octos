@@ -4,17 +4,18 @@ mod account;
 mod admin;
 mod auth;
 mod channels;
-pub(crate) mod chat;
+pub mod chat;
 mod clean;
 mod completions;
 mod cron;
 mod docs;
-pub(crate) mod gateway;
+pub mod gateway;
 mod init;
+pub mod mcp_serve;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
-pub(crate) mod skills;
+pub mod skills;
 mod status;
 
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use mcp_serve::McpServeCommand;
 pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -89,6 +91,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Run as an MCP server so outer orchestrators can invoke octos as a sub-agent.
+    McpServe(McpServeCommand),
     /// Start the REST API server (requires --features api).
     #[cfg(feature = "api")]
     Serve(ServeCommand),
@@ -114,7 +118,7 @@ pub trait Executable {
 /// Resolve the data directory for episodes, memory, sessions, etc.
 ///
 /// Priority: `--data-dir` CLI flag > `OCTOS_HOME` env var > `~/.octos` default.
-pub(crate) fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
+pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> {
     let dir = if let Some(d) = cli_override {
         d
     } else if let Ok(env_dir) = std::env::var("OCTOS_HOME") {
@@ -171,6 +175,7 @@ impl Executable for Command {
             Self::Cron(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::McpServe(cmd) => cmd.execute(),
             #[cfg(feature = "api")]
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),

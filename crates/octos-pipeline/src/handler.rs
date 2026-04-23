@@ -13,6 +13,7 @@ use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
+use octos_agent::tools::TOOL_CTX;
 
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
@@ -335,12 +336,20 @@ impl Handler for CodergenHandler {
             model: resolved_model.clone(),
         });
 
-        let worker =
+        let inherited_harness_sink = TOOL_CTX
+            .try_with(|ctx| ctx.harness_event_sink.clone())
+            .ok()
+            .flatten();
+
+        let mut worker =
             octos_agent::Agent::new(worker_id.clone(), provider, tools, self.memory.clone())
                 .with_config(config)
                 .with_system_prompt(system_prompt)
                 .with_shutdown(self.shutdown.clone())
                 .with_reporter(reporter);
+        if let Some(sink) = inherited_harness_sink {
+            worker = worker.with_harness_event_sink(sink);
+        }
 
         let task = Task::new(
             TaskKind::Code {

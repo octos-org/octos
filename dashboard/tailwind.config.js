@@ -13,6 +13,9 @@ export default {
           DEFAULT: '#1a1a2e',
           light: '#1e1e3a',
         },
+        background: {
+          DEFAULT: '#1a1a2e',
+        },
         accent: {
           DEFAULT: '#0ea5e9',
           light: '#38bdf8',

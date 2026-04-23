@@ -6,9 +6,9 @@
 //! Reads JSON from stdin, outputs JSON to stdout, progress to stderr.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -261,7 +261,10 @@ async fn run_deep_search(
     // -----------------------------------------------------------------------
     let urls_to_fetch: Vec<String> = all_urls.into_iter().take(max_pages).collect();
     let total_fetch = urls_to_fetch.len();
-    progress_simple(&format!("Fetching {total_fetch} pages in parallel..."));
+    progress_simple(
+        ProgressPhase::Fetch,
+        &format!("Fetching {total_fetch} pages in parallel..."),
+    );
 
     let crawled_pages = fetch_pages_parallel(client, &urls_to_fetch, 20_000).await;
 
@@ -297,7 +300,7 @@ async fn run_deep_search(
             _ => 10,
         };
         let mut ranked: Vec<(String, u32)> = link_counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         let chase_urls: Vec<String> = ranked
             .into_iter()
             .take(chase_limit)
@@ -306,10 +309,10 @@ async fn run_deep_search(
             .collect();
 
         if !chase_urls.is_empty() {
-            progress_simple(&format!(
-                "Chasing {} most-referenced sources...",
-                chase_urls.len()
-            ));
+            progress_simple(
+                ProgressPhase::Fetch,
+                &format!("Chasing {} most-referenced sources...", chase_urls.len()),
+            );
             // Mark chased URLs as seen
             for url in &chase_urls {
                 seen_urls.insert(normalize_url(url));
@@ -369,28 +372,34 @@ async fn run_deep_search(
         };
 
         let mut ranked_domains: Vec<(String, Vec<String>)> = domain_links.into_iter().collect();
-        ranked_domains.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        ranked_domains.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
 
         let to_crawl: Vec<String> = ranked_domains
             .into_iter()
             .take(crawl_domains)
             .flat_map(|(domain, links)| {
                 let take = links.len().min(pages_per_domain);
-                progress_simple(&format!(
-                    "Site crawl: {} ({} internal links, fetching {})",
-                    domain,
-                    links.len(),
-                    take
-                ));
+                progress_simple(
+                    ProgressPhase::Fetch,
+                    &format!(
+                        "Site crawl: {} ({} internal links, fetching {})",
+                        domain,
+                        links.len(),
+                        take
+                    ),
+                );
                 links.into_iter().take(pages_per_domain)
             })
             .collect();
 
         if !to_crawl.is_empty() {
-            progress_simple(&format!(
-                "Site crawl: fetching {} additional pages from top domains...",
-                to_crawl.len()
-            ));
+            progress_simple(
+                ProgressPhase::Fetch,
+                &format!(
+                    "Site crawl: fetching {} additional pages from top domains...",
+                    to_crawl.len()
+                ),
+            );
 
             // Mark as seen
             for url in &to_crawl {
@@ -412,7 +421,8 @@ async fn run_deep_search(
     // -----------------------------------------------------------------------
     // Build structured report
     // -----------------------------------------------------------------------
-    progress_simple("Building report...");
+    progress_simple(ProgressPhase::Synthesize, "Synthesizing report...");
+    progress_simple(ProgressPhase::ReportBuild, "Building report...");
 
     let mut report = String::new();
     report.push_str(&format!("# Deep Research: {query}\n\n"));
@@ -457,6 +467,8 @@ async fn run_deep_search(
 
     // Save report
     let _ = fs::write(dir.join("_report.md"), &report);
+
+    progress_simple_with_fraction(ProgressPhase::Completion, "Deep search complete", Some(1.0));
 
     Output {
         output: report,
@@ -645,7 +657,7 @@ async fn web_search(
         };
     }
 
-    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    successful.sort_by_key(|entry| std::cmp::Reverse(entry.1.output.len()));
     let mut primary = successful.remove(0);
 
     // Append runner-up if it has substantial unique content
@@ -736,7 +748,7 @@ async fn parallel_all_engines(client: &reqwest::Client, query: &str, count: u8) 
         };
     }
 
-    successful.sort_by(|a, b| b.1.output.len().cmp(&a.1.output.len()));
+    successful.sort_by_key(|entry| std::cmp::Reverse(entry.1.output.len()));
     let mut primary = successful.remove(0);
     for (name, other) in &successful {
         if other.output.len() > 100 {
@@ -1983,10 +1995,126 @@ fn research_dir(slug: &str) -> PathBuf {
 
 fn progress(step: usize, total: usize, msg: &str) {
     eprintln!("[{step}/{total}] {msg}");
+    let progress_fraction = if total == 0 {
+        None
+    } else {
+        Some((step as f64 / total as f64).min(0.95))
+    };
+    emit_progress_event(ProgressPhase::Search, msg, progress_fraction);
 }
 
-fn progress_simple(msg: &str) {
+fn progress_simple(phase: ProgressPhase, msg: &str) {
+    progress_simple_with_fraction(phase, msg, None);
+}
+
+fn progress_simple_with_fraction(phase: ProgressPhase, msg: &str, progress_fraction: Option<f64>) {
     eprintln!("[*] {msg}");
+    emit_progress_event(phase, msg, progress_fraction);
+}
+
+#[derive(Copy, Clone)]
+enum ProgressPhase {
+    Search,
+    Fetch,
+    Synthesize,
+    ReportBuild,
+    Completion,
+}
+
+impl ProgressPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProgressPhase::Search => "search",
+            ProgressPhase::Fetch => "fetch",
+            ProgressPhase::Synthesize => "synthesize",
+            ProgressPhase::ReportBuild => "report_build",
+            ProgressPhase::Completion => "completion",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HarnessProgressEvent<'a> {
+    schema: &'static str,
+    kind: &'static str,
+    session_id: &'a str,
+    task_id: &'a str,
+    workflow: &'static str,
+    phase: &'a str,
+    message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<f64>,
+}
+
+struct HarnessContext {
+    sink: PathBuf,
+    session_id: String,
+    task_id: String,
+}
+
+fn emit_progress_event(phase: ProgressPhase, message: &str, progress_fraction: Option<f64>) {
+    let Some(context) = harness_context_from_env() else {
+        return;
+    };
+
+    let event = HarnessProgressEvent {
+        schema: "octos.harness.event.v1",
+        kind: "progress",
+        session_id: &context.session_id,
+        task_id: &context.task_id,
+        workflow: "deep_research",
+        phase: phase.as_str(),
+        message,
+        progress: progress_fraction,
+    };
+
+    if let Err(err) = write_progress_event_to_sink(&context.sink, &event) {
+        eprintln!(
+            "[progress] failed to write structured event to {}: {err}",
+            context.sink.display()
+        );
+    }
+}
+
+fn harness_context_from_env() -> Option<HarnessContext> {
+    let raw_sink = std::env::var_os("OCTOS_EVENT_SINK")?;
+    if raw_sink.is_empty() {
+        return None;
+    }
+    let session_id = std::env::var("OCTOS_HARNESS_SESSION_ID")
+        .or_else(|_| std::env::var("OCTOS_SESSION_ID"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let task_id = std::env::var("OCTOS_HARNESS_TASK_ID")
+        .or_else(|_| std::env::var("OCTOS_TASK_ID"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+
+    Some(HarnessContext {
+        sink: sink_path_from_env_value(raw_sink),
+        session_id,
+        task_id,
+    })
+}
+
+fn sink_path_from_env_value(raw_sink: std::ffi::OsString) -> PathBuf {
+    let raw = raw_sink.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix("file://") {
+        return PathBuf::from(rest.strip_prefix("localhost").unwrap_or(rest));
+    }
+    PathBuf::from(raw_sink)
+}
+
+fn write_progress_event_to_sink(
+    sink: impl AsRef<Path>,
+    event: &HarnessProgressEvent<'_>,
+) -> io::Result<()> {
+    let sink = sink.as_ref();
+    let mut file = OpenOptions::new().create(true).append(true).open(sink)?;
+    let json = serde_json::to_string(event)
+        .map_err(|err| io::Error::other(format!("serialize progress event: {err}")))?;
+    writeln!(file, "{json}")?;
+    file.flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -2127,5 +2255,86 @@ mod tests {
         assert!(is_non_content_url("https://example.com/api/v1/data"));
         assert!(!is_non_content_url("https://example.com/docs/guide"));
         assert!(!is_non_content_url("https://example.com/blog/post-1"));
+    }
+
+    #[test]
+    fn test_structured_progress_events_match_fixture() {
+        let mut sink = std::env::temp_dir();
+        let unique = format!(
+            "deep-search-progress-events-{}-{}.ndjson",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        sink.push(unique);
+        let _ = std::fs::remove_file(&sink);
+
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/progress_events.ndjson"
+        ));
+
+        let events = [
+            HarnessProgressEvent {
+                schema: "octos.harness.event.v1",
+                kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
+                workflow: "deep_research",
+                phase: "search",
+                message: "Searching: \"rust async\"",
+                progress: Some(0.25),
+            },
+            HarnessProgressEvent {
+                schema: "octos.harness.event.v1",
+                kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
+                workflow: "deep_research",
+                phase: "fetch",
+                message: "Fetching 4 pages in parallel...",
+                progress: None,
+            },
+            HarnessProgressEvent {
+                schema: "octos.harness.event.v1",
+                kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
+                workflow: "deep_research",
+                phase: "synthesize",
+                message: "Synthesizing report...",
+                progress: None,
+            },
+            HarnessProgressEvent {
+                schema: "octos.harness.event.v1",
+                kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
+                workflow: "deep_research",
+                phase: "report_build",
+                message: "Building report...",
+                progress: None,
+            },
+            HarnessProgressEvent {
+                schema: "octos.harness.event.v1",
+                kind: "progress",
+                session_id: "api:session",
+                task_id: "task-1",
+                workflow: "deep_research",
+                phase: "completion",
+                message: "Deep search complete",
+                progress: Some(1.0),
+            },
+        ];
+
+        for event in &events {
+            write_progress_event_to_sink(&sink, event).unwrap();
+        }
+
+        let actual = std::fs::read_to_string(&sink).unwrap();
+        assert_eq!(actual, fixture);
+        let _ = std::fs::remove_file(&sink);
     }
 }

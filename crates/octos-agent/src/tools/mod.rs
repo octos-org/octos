@@ -17,6 +17,8 @@ use crate::progress::ProgressReporter;
 pub struct ToolContext {
     pub tool_id: String,
     pub reporter: Arc<dyn ProgressReporter>,
+    /// Local newline-delimited JSON sink for structured harness progress.
+    pub harness_event_sink: Option<String>,
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
@@ -182,19 +184,25 @@ pub use registry::ToolRegistry;
 
 // Tool policy
 pub mod policy;
-pub use policy::ToolPolicy;
+pub use policy::{PolicyDecision, ToolPolicy};
+
+// Robot safety-tier groups consulted by ToolPolicy evaluation.
+pub mod robot_groups;
+pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_registry};
 
 // Shared SSRF protection
 pub mod ssrf;
 
 // Built-in tools
 pub mod deep_search;
+pub mod delegate;
 pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
 pub mod list_dir;
 pub mod manage_skills;
+pub mod mcp_agent;
 pub mod message;
 pub mod read_file;
 pub mod recall_memory;
@@ -206,7 +214,6 @@ pub mod shell;
 pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod synthesize_research;
-pub mod take_photo;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
@@ -226,12 +233,23 @@ pub mod git;
 pub mod code_structure;
 
 pub use deep_search::DeepSearchTool;
+pub use delegate::{
+    DELEGATED_DENY_GROUP, DELEGATION_METRIC, DelegateTool, DelegationEvent, DelegationOutcome,
+    DepthBudget, MAX_DEPTH, build_delegated_child_policy,
+};
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
+pub use mcp_agent::{
+    DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchOutcome, DispatchRequest, DispatchResponse,
+    HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend, StdioMcpAgent,
+    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    record_dispatch,
+};
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use recall_memory::RecallMemoryTool;
@@ -240,7 +258,6 @@ pub use send_file::SendFileTool;
 pub use shell::ShellTool;
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
 pub use synthesize_research::SynthesizeResearchTool;
-pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;

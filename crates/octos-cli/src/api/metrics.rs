@@ -269,6 +269,66 @@ fn build_totals(samples: &[ParsedMetricSample]) -> BTreeMap<String, u64> {
             "child_session_lifecycle".to_string(),
             total_for_metric(samples, "octos_child_session_lifecycle_total"),
         ),
+        (
+            "realtime_heartbeat_beats".to_string(),
+            total_for_metric(samples, "octos_realtime_heartbeat_beats_total"),
+        ),
+        (
+            "realtime_heartbeat_stalls".to_string(),
+            total_for_metric(samples, "octos_realtime_heartbeat_stalls_total"),
+        ),
+        (
+            "workspace_validator_runs".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_total"),
+        ),
+        (
+            "workspace_validator_required_failures".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_required_failed_total"),
+        ),
+        (
+            "workspace_validator_optional_warnings".to_string(),
+            total_for_metric(samples, "octos_workspace_validator_optional_warning_total"),
+        ),
+        (
+            "mcp_server_calls".to_string(),
+            total_for_metric(samples, "octos_mcp_server_call_total"),
+        ),
+        (
+            "sub_agent_dispatches".to_string(),
+            total_for_metric(samples, "octos_sub_agent_dispatch_total"),
+        ),
+        (
+            "swarm_dispatches".to_string(),
+            total_for_metric(samples, "octos_swarm_dispatch_total"),
+        ),
+        (
+            "cost_attributions".to_string(),
+            total_for_metric(samples, "octos_cost_attribution_total"),
+        ),
+        (
+            "delegations".to_string(),
+            total_for_metric(samples, "octos_delegation_total"),
+        ),
+        (
+            "routing_decisions".to_string(),
+            total_for_metric(samples, "octos_routing_decision_total"),
+        ),
+        (
+            "credential_rotations".to_string(),
+            total_for_metric(samples, "octos_llm_credential_rotation_total"),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            total_for_metric(samples, "octos_compaction_preservation_violations_total"),
+        ),
+        (
+            "loop_errors".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_ERROR_TOTAL),
+        ),
+        (
+            "loop_retries".to_string(),
+            total_for_metric(samples, octos_agent::OCTOS_LOOP_RETRY_TOTAL),
+        ),
     ])
 }
 
@@ -330,7 +390,115 @@ fn build_breakdowns(samples: &[ParsedMetricSample]) -> BTreeMap<String, Vec<Valu
                 &["kind", "outcome"],
             ),
         ),
+        (
+            "workspace_validator_runs".to_string(),
+            breakdown(
+                samples,
+                "octos_workspace_validator_total",
+                &["status", "phase", "kind", "required"],
+            ),
+        ),
+        (
+            "mcp_server_calls".to_string(),
+            breakdown(samples, "octos_mcp_server_call_total", &["tool", "outcome"]),
+        ),
+        (
+            "sub_agent_dispatches".to_string(),
+            breakdown(
+                samples,
+                "octos_sub_agent_dispatch_total",
+                &["backend", "outcome"],
+            ),
+        ),
+        (
+            "swarm_dispatches".to_string(),
+            breakdown(
+                samples,
+                "octos_swarm_dispatch_total",
+                &["topology", "outcome"],
+            ),
+        ),
+        (
+            "cost_attributions".to_string(),
+            breakdown(
+                samples,
+                "octos_cost_attribution_total",
+                &["model", "outcome"],
+            ),
+        ),
+        (
+            "delegations".to_string(),
+            breakdown(samples, "octos_delegation_total", &["depth", "outcome"]),
+        ),
+        (
+            "routing_decisions".to_string(),
+            breakdown(samples, "octos_routing_decision_total", &["tier", "lane"]),
+        ),
+        (
+            "credential_rotations".to_string(),
+            breakdown(
+                samples,
+                "octos_llm_credential_rotation_total",
+                &["reason", "strategy"],
+            ),
+        ),
+        (
+            "compaction_preservation_violations".to_string(),
+            breakdown(
+                samples,
+                "octos_compaction_preservation_violations_total",
+                &["phase"],
+            ),
+        ),
+        (
+            "loop_errors".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_ERROR_TOTAL,
+                &["variant", "recovery"],
+            ),
+        ),
+        (
+            "loop_retries".to_string(),
+            breakdown(
+                samples,
+                octos_agent::OCTOS_LOOP_RETRY_TOTAL,
+                &["variant", "decision"],
+            ),
+        ),
     ])
+}
+
+/// Operator-facing cost rollup exposed alongside the summary. Consumed
+/// by the admin dashboard to show a per-contract spend breakdown from
+/// the ledger. Construction is isolated behind a pure function so it
+/// remains unit-testable without touching redb.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OperatorContractCostSummary {
+    pub contract_id: String,
+    pub dispatch_count: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+}
+
+/// Convert [`octos_agent::ContractCostRollup`] records into the
+/// serialized dashboard shape. The conversion is deliberately
+/// one-way so the API layer stays decoupled from the ledger crate's
+/// internal types.
+pub fn operator_contract_cost_summary(
+    rollups: &[octos_agent::ContractCostRollup],
+) -> Vec<OperatorContractCostSummary> {
+    rollups
+        .iter()
+        .map(|rollup| OperatorContractCostSummary {
+            contract_id: rollup.contract_id.clone(),
+            dispatch_count: rollup.dispatch_count,
+            tokens_in: rollup.tokens_in,
+            tokens_out: rollup.tokens_out,
+            cost_usd: rollup.cost_usd,
+        })
+        .collect()
 }
 
 fn total_for_metric(samples: &[ParsedMetricSample], metric: &str) -> u64 {
@@ -471,6 +639,263 @@ fn unescape_label_value(raw: &str) -> String {
     raw.replace("\\\"", "\"").replace("\\\\", "\\")
 }
 
+// ── Operator harness task aggregation ────────────────────────────────
+//
+// The operator harness dashboard aggregates background task state across all
+// running gateways and derives stale/missing-artifact signals from the same
+// backend truth that `/api/sessions/:id/tasks` exposes.
+
+/// Default staleness threshold: a task that has not updated in this many
+/// seconds while still in a non-terminal lifecycle state is surfaced as
+/// stale/zombie.
+pub const DEFAULT_TASK_STALE_SECS: i64 = 300;
+
+/// Input for `build_operator_tasks_response` — one task snapshot per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorTaskInput {
+    pub profile_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub tool_name: String,
+    pub lifecycle_state: String,
+    pub runtime_state: Option<String>,
+    pub workflow_kind: Option<String>,
+    pub current_phase: Option<String>,
+    pub child_session_key: Option<String>,
+    pub child_terminal_state: Option<String>,
+    pub child_join_state: Option<String>,
+    pub child_failure_action: Option<String>,
+    pub output_files: Vec<String>,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// Summary fields derived from a task row — computed once, surfaced in the UI
+/// and used for filter counts.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorTaskDerived {
+    pub stale: bool,
+    pub missing_artifact: bool,
+    pub validator_failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorTaskView {
+    pub profile_id: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub tool_name: String,
+    pub lifecycle_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_terminal_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_join_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_failure_action: Option<String>,
+    pub output_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub derived: OperatorTaskDerived,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorTaskSource {
+    pub profile_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
+    pub session_count: usize,
+    pub task_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OperatorTasksResponse {
+    pub generated_at: String,
+    pub stale_threshold_secs: i64,
+    pub tasks: Vec<OperatorTaskView>,
+    /// Counts grouped by `lifecycle_state` — the dashboard row count per state
+    /// must match these values.
+    pub totals_by_lifecycle: BTreeMap<String, u64>,
+    pub stale_count: u64,
+    pub missing_artifact_count: u64,
+    pub validator_failed_count: u64,
+    pub sources: Vec<OperatorTaskSource>,
+    /// True if at least one source returned an error — UI should show a banner.
+    pub partial: bool,
+}
+
+/// Derive stale/missing-artifact flags for a task row. Exposed as a pure
+/// function so the derivation rule is unit-tested independently from the
+/// aggregation plumbing.
+pub fn derive_operator_task_flags(
+    input: &OperatorTaskInput,
+    now: chrono::DateTime<chrono::Utc>,
+    stale_threshold_secs: i64,
+) -> OperatorTaskDerived {
+    let is_terminal_ok = input.lifecycle_state == "ready";
+    let is_failed = input.lifecycle_state == "failed";
+    let is_active = matches!(
+        input.lifecycle_state.as_str(),
+        "queued" | "running" | "verifying"
+    );
+
+    let stale = if is_active {
+        match input
+            .updated_at
+            .as_deref()
+            .and_then(parse_rfc3339_timestamp)
+        {
+            Some(timestamp) => {
+                let age = (now - timestamp).num_seconds();
+                age >= stale_threshold_secs
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    // "Missing artifact" = reached terminal Ready but produced no output_files,
+    // or failed after the runtime selected child outputs but none were kept.
+    let missing_artifact = is_terminal_ok && input.output_files.is_empty();
+
+    // Validator-failure = child terminal state indicates a terminal failure and
+    // the task is either failed or currently verifying an unsuccessful child.
+    let validator_failed = is_failed
+        && matches!(
+            input.child_terminal_state.as_deref(),
+            Some("terminal_failed") | Some("retryable_failed")
+        );
+
+    OperatorTaskDerived {
+        stale,
+        missing_artifact,
+        validator_failed,
+    }
+}
+
+fn parse_rfc3339_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Build the operator tasks response from a list of per-task inputs and a set
+/// of per-profile source records.
+pub fn build_operator_tasks_response(
+    inputs: Vec<OperatorTaskInput>,
+    sources: Vec<OperatorTaskSource>,
+    now: chrono::DateTime<chrono::Utc>,
+    stale_threshold_secs: i64,
+) -> OperatorTasksResponse {
+    let mut totals_by_lifecycle: BTreeMap<String, u64> =
+        ["queued", "running", "verifying", "ready", "failed"]
+            .iter()
+            .map(|state| ((*state).to_string(), 0))
+            .collect();
+
+    let mut stale_count: u64 = 0;
+    let mut missing_artifact_count: u64 = 0;
+    let mut validator_failed_count: u64 = 0;
+
+    let mut tasks: Vec<OperatorTaskView> = inputs
+        .into_iter()
+        .map(|input| {
+            let derived = derive_operator_task_flags(&input, now, stale_threshold_secs);
+            *totals_by_lifecycle
+                .entry(input.lifecycle_state.clone())
+                .or_insert(0) += 1;
+            if derived.stale {
+                stale_count += 1;
+            }
+            if derived.missing_artifact {
+                missing_artifact_count += 1;
+            }
+            if derived.validator_failed {
+                validator_failed_count += 1;
+            }
+            OperatorTaskView {
+                profile_id: input.profile_id,
+                session_id: input.session_id,
+                task_id: input.task_id,
+                tool_name: input.tool_name,
+                lifecycle_state: input.lifecycle_state,
+                runtime_state: input.runtime_state,
+                workflow_kind: input.workflow_kind,
+                current_phase: input.current_phase,
+                child_session_key: input.child_session_key,
+                child_terminal_state: input.child_terminal_state,
+                child_join_state: input.child_join_state,
+                child_failure_action: input.child_failure_action,
+                output_files: input.output_files,
+                error: input.error,
+                started_at: input.started_at,
+                updated_at: input.updated_at,
+                completed_at: input.completed_at,
+                derived,
+            }
+        })
+        .collect();
+
+    tasks.sort_by(|left, right| {
+        lifecycle_priority(&left.lifecycle_state)
+            .cmp(&lifecycle_priority(&right.lifecycle_state))
+            .then_with(|| {
+                right
+                    .updated_at
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(left.updated_at.as_deref().unwrap_or(""))
+            })
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+
+    let partial = sources.iter().any(|source| source.status != "ok");
+
+    OperatorTasksResponse {
+        generated_at: now.to_rfc3339(),
+        stale_threshold_secs,
+        tasks,
+        totals_by_lifecycle,
+        stale_count,
+        missing_artifact_count,
+        validator_failed_count,
+        sources,
+        partial,
+    }
+}
+
+fn lifecycle_priority(state: &str) -> u8 {
+    // Render actionable states first. `failed` is most urgent; `ready` is
+    // surfaced last because it is a success terminus.
+    match state {
+        "failed" => 0,
+        "verifying" => 1,
+        "running" => 2,
+        "queued" => 3,
+        "ready" => 4,
+        _ => 5,
+    }
+}
+
 /// Record a tool call metric.
 pub fn record_tool_call(name: &str, success: bool, duration_secs: f64) {
     let labels = [("tool", name.to_string()), ("success", success.to_string())];
@@ -483,6 +908,21 @@ pub fn record_tool_call(name: &str, success: bool, duration_secs: f64) {
 pub fn record_llm_tokens(direction: &str, count: u32) {
     counter!("octos_llm_tokens_total", "direction" => direction.to_string())
         .increment(u64::from(count));
+}
+
+/// Record a content-classified smart routing decision (M6.6).
+///
+/// Increments `octos_routing_decision_total{tier, lane}`. `lane` is optional —
+/// the classifier emits decisions before lane selection, so callers either
+/// pass the lane they ultimately picked or `None` to record as `"unset"`.
+pub fn record_routing_decision(tier: &str, lane: Option<&str>) {
+    let lane_label = lane.unwrap_or("unset").to_string();
+    counter!(
+        "octos_routing_decision_total",
+        "tier" => tier.to_string(),
+        "lane" => lane_label,
+    )
+    .increment(1);
 }
 
 /// Decorator that records Prometheus metrics for progress events,
@@ -573,6 +1013,71 @@ octos_child_session_lifecycle_total{kind="completed",outcome="accepted"} 11
         let summary = build_operator_summary("");
         assert!(!summary.available);
         assert!(summary.totals.values().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn operator_summary_aggregates_cost_attribution_counter() {
+        let metrics = r#"
+octos_cost_attribution_total{model="claude-haiku",outcome="success"} 3
+octos_cost_attribution_total{model="claude-sonnet-4",outcome="success"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert_eq!(summary.totals.get("cost_attributions"), Some(&4));
+        let rows = summary.breakdowns.get("cost_attributions").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn operator_contract_cost_summary_preserves_sort_order() {
+        use octos_agent::ContractCostRollup;
+        let rollups = vec![
+            ContractCostRollup {
+                contract_id: "contract-B".into(),
+                dispatch_count: 2,
+                tokens_in: 1_000,
+                tokens_out: 500,
+                cost_usd: 0.50,
+            },
+            ContractCostRollup {
+                contract_id: "contract-A".into(),
+                dispatch_count: 5,
+                tokens_in: 4_000,
+                tokens_out: 2_500,
+                cost_usd: 0.12,
+            },
+        ];
+        let rendered = operator_contract_cost_summary(&rollups);
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].contract_id, "contract-B");
+        assert!((rendered[0].cost_usd - 0.50).abs() < 1e-9);
+        assert_eq!(rendered[1].dispatch_count, 5);
+    }
+
+    #[test]
+    fn should_surface_credential_rotation_metrics() {
+        let metrics = r#"
+# TYPE octos_llm_credential_rotation_total counter
+octos_llm_credential_rotation_total{reason="initial_acquire",strategy="round_robin"} 4
+octos_llm_credential_rotation_total{reason="rate_limit_cooldown",strategy="round_robin"} 2
+octos_llm_credential_rotation_total{reason="auth_failure",strategy="fill_first"} 1
+"#;
+        let summary = build_operator_summary(metrics);
+        assert!(summary.available);
+        assert_eq!(summary.totals.get("credential_rotations"), Some(&7));
+        let rows = summary.breakdowns.get("credential_rotations").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().any(|r| r["reason"] == "initial_acquire"
+                && r["strategy"] == "round_robin"
+                && r["count"] == 4),
+            "missing initial_acquire row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["reason"] == "auth_failure"
+                && r["strategy"] == "fill_first"
+                && r["count"] == 1),
+            "missing auth_failure row: {rows:?}"
+        );
     }
 
     #[test]
@@ -674,5 +1179,183 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
         assert_eq!(beta.scrape_status, "failed");
         assert_eq!(beta.scrape_error.as_deref(), Some("http 503"));
         assert!(!beta.available);
+    }
+
+    // ── Operator harness task aggregation ────────────────────────────
+
+    fn base_task_input() -> OperatorTaskInput {
+        OperatorTaskInput {
+            profile_id: "alpha".into(),
+            session_id: "session-1".into(),
+            task_id: "task-1".into(),
+            tool_name: "podcast_generate".into(),
+            lifecycle_state: "running".into(),
+            runtime_state: Some("executing_tool".into()),
+            workflow_kind: Some("research_podcast".into()),
+            current_phase: Some("fetch_sources".into()),
+            child_session_key: Some("alpha:api:session-1#child-xyz".into()),
+            child_terminal_state: None,
+            child_join_state: None,
+            child_failure_action: None,
+            output_files: Vec::new(),
+            error: None,
+            started_at: Some("2026-04-19T12:00:00Z".into()),
+            updated_at: Some("2026-04-19T12:00:00Z".into()),
+            completed_at: None,
+        }
+    }
+
+    fn now_fixture() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-04-19T12:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn derives_stale_when_active_task_past_threshold() {
+        let input = base_task_input();
+        // 10 minutes old, threshold 300s (5 minutes) => stale
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(derived.stale);
+        assert!(!derived.missing_artifact);
+    }
+
+    #[test]
+    fn derives_not_stale_when_fresh_update() {
+        let mut input = base_task_input();
+        input.updated_at = Some("2026-04-19T12:09:30Z".into());
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(!derived.stale);
+    }
+
+    #[test]
+    fn derives_not_stale_when_task_already_ready() {
+        let mut input = base_task_input();
+        input.lifecycle_state = "ready".into();
+        input.output_files = vec!["pf/deck.pptx".into()];
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(!derived.stale);
+        assert!(!derived.missing_artifact);
+    }
+
+    #[test]
+    fn derives_missing_artifact_when_ready_without_outputs() {
+        let mut input = base_task_input();
+        input.lifecycle_state = "ready".into();
+        input.output_files = Vec::new();
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(derived.missing_artifact);
+    }
+
+    #[test]
+    fn derives_validator_failed_when_failed_with_terminal_child() {
+        let mut input = base_task_input();
+        input.lifecycle_state = "failed".into();
+        input.child_terminal_state = Some("terminal_failed".into());
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(derived.validator_failed);
+    }
+
+    #[test]
+    fn derives_validator_not_failed_when_child_completed() {
+        let mut input = base_task_input();
+        input.lifecycle_state = "failed".into();
+        input.child_terminal_state = Some("completed".into());
+        let derived = derive_operator_task_flags(&input, now_fixture(), 300);
+        assert!(!derived.validator_failed);
+    }
+
+    #[test]
+    fn operator_tasks_response_groups_totals_and_sorts_by_urgency() {
+        let tasks = vec![
+            OperatorTaskInput {
+                lifecycle_state: "ready".into(),
+                output_files: vec!["pf/deck.pptx".into()],
+                updated_at: Some("2026-04-19T12:05:00Z".into()),
+                ..base_task_input()
+            },
+            OperatorTaskInput {
+                task_id: "task-2".into(),
+                lifecycle_state: "failed".into(),
+                child_terminal_state: Some("terminal_failed".into()),
+                updated_at: Some("2026-04-19T12:08:00Z".into()),
+                error: Some("validator deny".into()),
+                ..base_task_input()
+            },
+            OperatorTaskInput {
+                task_id: "task-3".into(),
+                lifecycle_state: "ready".into(),
+                output_files: Vec::new(),
+                updated_at: Some("2026-04-19T12:06:00Z".into()),
+                ..base_task_input()
+            },
+            OperatorTaskInput {
+                task_id: "task-4".into(),
+                lifecycle_state: "running".into(),
+                updated_at: Some("2026-04-19T11:50:00Z".into()),
+                ..base_task_input()
+            },
+        ];
+
+        let sources = vec![
+            OperatorTaskSource {
+                profile_id: "alpha".into(),
+                status: "ok".into(),
+                error: None,
+                api_port: Some(51001),
+                session_count: 1,
+                task_count: 4,
+            },
+            OperatorTaskSource {
+                profile_id: "beta".into(),
+                status: "failed".into(),
+                error: Some("http 502".into()),
+                api_port: Some(51002),
+                session_count: 0,
+                task_count: 0,
+            },
+        ];
+
+        let response = build_operator_tasks_response(tasks, sources, now_fixture(), 300);
+
+        assert_eq!(response.tasks.len(), 4);
+        // failed first, then running, then ready
+        assert_eq!(response.tasks[0].lifecycle_state, "failed");
+        assert_eq!(response.tasks[1].lifecycle_state, "running");
+        assert_eq!(response.tasks[2].lifecycle_state, "ready");
+        assert_eq!(response.tasks[3].lifecycle_state, "ready");
+
+        assert_eq!(response.totals_by_lifecycle.get("failed"), Some(&1));
+        assert_eq!(response.totals_by_lifecycle.get("ready"), Some(&2));
+        assert_eq!(response.totals_by_lifecycle.get("running"), Some(&1));
+        assert_eq!(response.totals_by_lifecycle.get("queued"), Some(&0));
+
+        assert_eq!(response.stale_count, 1);
+        assert_eq!(response.missing_artifact_count, 1);
+        assert_eq!(response.validator_failed_count, 1);
+        assert!(response.partial);
+        assert_eq!(response.stale_threshold_secs, 300);
+
+        // Dashboard row count MUST match totals_by_lifecycle
+        let summed: u64 = response.totals_by_lifecycle.values().sum();
+        assert_eq!(summed as usize, response.tasks.len());
+    }
+
+    #[test]
+    fn operator_tasks_response_is_not_partial_when_all_sources_ok() {
+        let response = build_operator_tasks_response(
+            Vec::new(),
+            vec![OperatorTaskSource {
+                profile_id: "alpha".into(),
+                status: "ok".into(),
+                error: None,
+                api_port: Some(51001),
+                session_count: 0,
+                task_count: 0,
+            }],
+            now_fixture(),
+            300,
+        );
+        assert!(!response.partial);
     }
 }

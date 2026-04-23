@@ -644,8 +644,10 @@ mod tests {
 
     #[test]
     fn test_sse_message_delta_end_turn() {
-        let mut state = AnthropicStreamState::default();
-        state.input_tokens = 100;
+        let mut state = AnthropicStreamState {
+            input_tokens: 100,
+            ..Default::default()
+        };
         let event = crate::sse::SseEvent {
             event: None,
             data: r#"{"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 50}}"#.into(),

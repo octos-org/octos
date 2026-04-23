@@ -1,0 +1,27 @@
+[package]
+name = "octos-swarm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Swarm orchestration primitive: fan-out / sequence / pipeline over MCP-backed sub-agents"
+
+[dependencies]
+octos-agent = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+eyre = { workspace = true }
+metrics = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

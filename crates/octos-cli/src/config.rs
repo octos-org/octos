@@ -694,6 +694,38 @@ fn default_max_history() -> usize {
     50
 }
 
+/// Load `config.json` as a raw `serde_json::Value`, apply `mutate`, and
+/// atomically write the result back. Preserves unknown fields that the
+/// strongly-typed [`Config`] struct would otherwise silently drop.
+///
+/// Creates the parent directory and an empty JSON object if the file does
+/// not exist yet. Writes to a sibling `*.tmp` file first, then renames.
+pub fn write_mutation<F>(path: &Path, mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut serde_json::Value) -> Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create dir: {}", parent.display()))?;
+    }
+    let mut value: serde_json::Value = if path.exists() {
+        let body = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str(&body)
+            .wrap_err_with(|| format!("failed to parse {}", path.display()))?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    mutate(&mut value)?;
+    let body = serde_json::to_string_pretty(&value)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &body)
+        .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .wrap_err_with(|| format!("failed to rename into {}", path.display()))?;
+    Ok(())
+}
+
 impl Config {
     /// Path to the runtime config file under the resolved data dir.
     pub fn data_dir_config_path(data_dir: &Path) -> PathBuf {
@@ -968,6 +1000,69 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_mutation_creates_file_with_pretty_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        write_mutation(&path, |v| {
+            let obj = v.as_object_mut().unwrap();
+            obj.insert("mode".into(), serde_json::json!("tenant"));
+            Ok(())
+        })
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"mode\": \"tenant\""));
+    }
+
+    #[test]
+    fn write_mutation_preserves_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"mode":"local","unknown_field":{"keep":"me"},"nested":[1,2,3]}"#,
+        )
+        .unwrap();
+        write_mutation(&path, |v| {
+            v.as_object_mut()
+                .unwrap()
+                .insert("mode".into(), serde_json::json!("cloud"));
+            Ok(())
+        })
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mode"], "cloud");
+        assert_eq!(parsed["unknown_field"]["keep"], "me");
+        assert_eq!(parsed["nested"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn write_mutation_round_trip_through_nested_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        write_mutation(&path, |v| {
+            let obj = v.as_object_mut().unwrap();
+            let auth = obj
+                .entry("dashboard_auth")
+                .or_insert_with(|| serde_json::json!({}));
+            let smtp = auth
+                .as_object_mut()
+                .unwrap()
+                .entry("smtp")
+                .or_insert_with(|| serde_json::json!({}));
+            let smtp = smtp.as_object_mut().unwrap();
+            smtp.insert("host".into(), serde_json::json!("smtp.example.com"));
+            smtp.insert("port".into(), serde_json::json!(465));
+            Ok(())
+        })
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["dashboard_auth"]["smtp"]["host"], "smtp.example.com");
+        assert_eq!(parsed["dashboard_auth"]["smtp"]["port"], 465);
+    }
 
     #[test]
     #[allow(unsafe_code)]

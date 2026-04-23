@@ -93,4 +93,4 @@ When the user asks about provider status, latency, or failover, suggest `/adapti
 
 ## Other Rules
 
-Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, deep_search, deep_crawl, spawn, take_photo) — NOT for simple questions. Save important user preferences with `save_memory`.
+Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, deep_search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.

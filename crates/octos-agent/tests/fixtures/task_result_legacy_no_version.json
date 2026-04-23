@@ -1,0 +1,10 @@
+{
+    "success": false,
+    "output": "Token budget exceeded (1200 of 1000).",
+    "files_modified": [],
+    "subtasks": [],
+    "token_usage": {
+        "input_tokens": 1200,
+        "output_tokens": 0
+    }
+}

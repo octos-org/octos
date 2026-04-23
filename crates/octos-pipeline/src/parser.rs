@@ -12,7 +12,10 @@ use std::collections::HashMap;
 
 use eyre::{Result, WrapErr};
 
-use crate::graph::{HandlerKind, PipelineEdge, PipelineGraph, PipelineNode, Subgraph};
+use crate::graph::{
+    DeadlineAction, HandlerKind, MissionCheckpoint, PipelineEdge, PipelineGraph, PipelineNode,
+    Subgraph,
+};
 
 /// Parse a DOT string into a `PipelineGraph`.
 pub fn parse_dot(input: &str) -> Result<PipelineGraph> {
@@ -534,6 +537,14 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
         .unwrap_or_default();
 
+    let deadline_secs = attrs
+        .get("deadline_secs")
+        .and_then(|s| parse_duration_secs_f64(s));
+    let deadline_action = attrs
+        .get("deadline_action")
+        .and_then(|s| parse_deadline_action(s));
+    let checkpoints = parse_checkpoints(attrs);
+
     PipelineNode {
         id: id.to_string(),
         handler,
@@ -559,7 +570,100 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         worker_prompt: attrs.get("worker_prompt").cloned(),
         planner_model: attrs.get("planner_model").cloned(),
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
+        deadline_secs,
+        deadline_action,
+        checkpoints,
     }
+}
+
+/// Parse a duration in seconds with optional unit suffix into `f64`.
+/// Accepts plain numbers ("1.5"), "<n>s", "<n>m", "<n>h", and "<n>ms".
+/// Returns `None` on parse error or non-finite values.
+fn parse_duration_secs_f64(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let parsed: f64 = if let Some(n) = s.strip_suffix("ms") {
+        n.trim().parse::<f64>().ok()? / 1000.0
+    } else if let Some(n) = s.strip_suffix('s') {
+        n.trim().parse::<f64>().ok()?
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.trim().parse::<f64>().ok()? * 60.0
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.trim().parse::<f64>().ok()? * 3600.0
+    } else {
+        s.parse::<f64>().ok()?
+    };
+    if parsed.is_finite() && parsed >= 0.0 {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+/// Parse a deadline-action attribute.
+///
+/// Accepted syntax:
+/// * `abort`, `skip`, `escalate` — simple variants
+/// * `retry:<n>` or `retry(<n>)` — retry with `max_attempts = n`
+fn parse_deadline_action(s: &str) -> Option<DeadlineAction> {
+    let s = s.trim();
+    match s {
+        "abort" => Some(DeadlineAction::Abort),
+        "skip" => Some(DeadlineAction::Skip),
+        "escalate" => Some(DeadlineAction::Escalate),
+        other => {
+            // retry:N or retry(N)
+            let rest = other
+                .strip_prefix("retry:")
+                .or_else(|| other.strip_prefix("retry("))
+                .map(|r| r.trim_end_matches(')'))?;
+            let n: u32 = rest.trim().parse().ok()?;
+            if n == 0 {
+                None
+            } else {
+                Some(DeadlineAction::Retry { max_attempts: n })
+            }
+        }
+    }
+}
+
+/// Parse checkpoint declarations from a DOT node's attributes.
+///
+/// Supported forms:
+/// * `checkpoint="true"` — legacy boolean; creates a single default checkpoint
+///   named after the node (delegated back at build time) with `resumable=true`.
+/// * `checkpoint="name1,name2"` — comma-separated named checkpoints.
+fn parse_checkpoints(attrs: &HashMap<String, String>) -> Vec<MissionCheckpoint> {
+    let raw = match attrs.get("checkpoint") {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    // Legacy boolean form — defer naming to the caller (the executor) by using
+    // a placeholder, but because DOT has no cross-attribute access, we fall
+    // back to a single checkpoint literally named "default".
+    if let Some(b) = parse_bool(trimmed) {
+        return if b {
+            vec![MissionCheckpoint {
+                name: "default".to_string(),
+                resumable: true,
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+    // Comma-separated named checkpoints.
+    trimmed
+        .split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|name| MissionCheckpoint {
+            name: name.to_string(),
+            resumable: true,
+        })
+        .collect()
 }
 
 fn build_edge(source: &str, target: &str, attrs: &HashMap<String, String>) -> PipelineEdge {
@@ -917,5 +1021,114 @@ mod tests {
         "#;
         let graph = parse_dot(dot).unwrap();
         assert!(graph.subgraphs.is_empty());
+    }
+
+    #[test]
+    fn should_parse_deadline_fields_when_present() {
+        let dot = r#"
+            digraph test {
+                nav [prompt="go", deadline_secs="1.5", deadline_action="skip"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        let nav = &graph.nodes["nav"];
+        assert_eq!(nav.deadline_secs, Some(1.5));
+        assert_eq!(nav.deadline_action, Some(DeadlineAction::Skip));
+    }
+
+    #[test]
+    fn should_parse_retry_action_with_max_attempts() {
+        let dot = r#"
+            digraph test {
+                grab [prompt="do", deadline_secs="0.5s", deadline_action="retry:3"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.nodes["grab"].deadline_action,
+            Some(DeadlineAction::Retry { max_attempts: 3 })
+        );
+    }
+
+    #[test]
+    fn should_parse_escalate_action() {
+        let dot = r#"
+            digraph test {
+                safety [prompt="check", deadline_secs="2", deadline_action="escalate"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(
+            graph.nodes["safety"].deadline_action,
+            Some(DeadlineAction::Escalate)
+        );
+    }
+
+    #[test]
+    fn should_parse_checkpoint_names_as_list() {
+        let dot = r#"
+            digraph test {
+                n1 [prompt="a", checkpoint="post_a, post_a_alt"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        let checkpoints = &graph.nodes["n1"].checkpoints;
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].name, "post_a");
+        assert_eq!(checkpoints[1].name, "post_a_alt");
+        assert!(checkpoints[0].resumable);
+    }
+
+    #[test]
+    fn should_parse_checkpoint_bool_true_as_default() {
+        let dot = r#"
+            digraph test {
+                n2 [prompt="a", checkpoint="true"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.nodes["n2"].checkpoints.len(), 1);
+        assert_eq!(graph.nodes["n2"].checkpoints[0].name, "default");
+    }
+
+    #[test]
+    fn should_return_empty_checkpoints_when_bool_false() {
+        let dot = r#"
+            digraph test {
+                n3 [prompt="a", checkpoint="false"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.nodes["n3"].checkpoints.is_empty());
+    }
+
+    #[test]
+    fn test_parse_duration_secs_f64() {
+        assert_eq!(parse_duration_secs_f64("1.5"), Some(1.5));
+        assert_eq!(parse_duration_secs_f64("1.5s"), Some(1.5));
+        assert_eq!(parse_duration_secs_f64("500ms"), Some(0.5));
+        assert_eq!(parse_duration_secs_f64("2m"), Some(120.0));
+        assert_eq!(parse_duration_secs_f64("bogus"), None);
+        assert_eq!(parse_duration_secs_f64("-1"), None);
+    }
+
+    #[test]
+    fn test_parse_deadline_action_variants() {
+        assert_eq!(parse_deadline_action("abort"), Some(DeadlineAction::Abort));
+        assert_eq!(parse_deadline_action("skip"), Some(DeadlineAction::Skip));
+        assert_eq!(
+            parse_deadline_action("escalate"),
+            Some(DeadlineAction::Escalate)
+        );
+        assert_eq!(
+            parse_deadline_action("retry:5"),
+            Some(DeadlineAction::Retry { max_attempts: 5 })
+        );
+        assert_eq!(
+            parse_deadline_action("retry(2)"),
+            Some(DeadlineAction::Retry { max_attempts: 2 })
+        );
+        assert_eq!(parse_deadline_action("retry:0"), None);
+        assert_eq!(parse_deadline_action("bogus"), None);
     }
 }

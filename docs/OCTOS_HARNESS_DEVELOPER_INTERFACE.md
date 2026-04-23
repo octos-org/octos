@@ -3,6 +3,10 @@
 This document defines the developer-facing harness interface that Phase 3
 should expose for customer skills and apps.
 
+For the concrete "how to ship" companion with copy-paste policy examples,
+stable vs internal field lists, and four runnable starter apps, see
+[OCTOS_HARNESS_DEVELOPER_GUIDE.md](./OCTOS_HARNESS_DEVELOPER_GUIDE.md).
+
 The goal is not to make Octos feel "open" in the vague sense. The goal is to
 make Octos feel safely programmable.
 

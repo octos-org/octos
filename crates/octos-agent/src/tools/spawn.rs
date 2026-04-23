@@ -14,13 +14,25 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::mcp_agent::{
+    DispatchRequest, DispatchResponse, McpAgentBackendConfig, SharedBackend,
+    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+};
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
+use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
 use crate::task_supervisor::TaskSupervisor;
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
 };
 use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
+
+/// Default MCP tool name dispatched on the remote agent. Chosen to match
+/// the `run_task` convention used by `claude mcp serve` and
+/// `codex mcp serve` — configurable via
+/// [`SpawnTool::with_mcp_agent_backend`] for runtimes that expose a
+/// different entry point.
+pub const DEFAULT_MCP_AGENT_TOOL_NAME: &str = "run_task";
 
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
@@ -320,6 +332,20 @@ pub struct SpawnTool {
     task_ledger_path: Option<PathBuf>,
     /// Optional agent config inherited from the parent session.
     worker_config: Option<AgentConfig>,
+    /// Optional MCP-backed sub-agent used when callers pick
+    /// `backend == "agent_mcp"`. Parent context stays small because the
+    /// sub-agent's internal messages never leak back — only the final
+    /// contract-gated artifact flows through [`DispatchResponse`].
+    mcp_agent_backend: Option<SharedBackend>,
+    /// MCP `tools/call` name dispatched on the backend. Defaults to
+    /// [`DEFAULT_MCP_AGENT_TOOL_NAME`].
+    mcp_agent_tool_name: Option<String>,
+    /// Cost / provenance accountant (M7.4). When present, every
+    /// successful MCP sub-agent dispatch writes a
+    /// [`crate::cost_ledger::CostAttributionEvent`] to the ledger.
+    /// When combined with a budget policy, the dispatcher rejects
+    /// spawns whose projected spend breaches the ceiling.
+    cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
 }
 
 impl SpawnTool {
@@ -350,6 +376,9 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            mcp_agent_backend: None,
+            mcp_agent_tool_name: None,
+            cost_accountant: None,
         }
     }
 
@@ -383,6 +412,9 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            mcp_agent_backend: None,
+            mcp_agent_tool_name: None,
+            cost_accountant: None,
         }
     }
 
@@ -466,6 +498,98 @@ impl SpawnTool {
         self
     }
 
+    /// Configure an MCP-backed sub-agent for this tool instance. Callers
+    /// that invoke spawn with `backend: "agent_mcp"` dispatch their task
+    /// to `backend` and receive only the final contract-gated artifact in
+    /// response — the sub-agent's intermediate messages stay inside the
+    /// MCP call.
+    pub fn with_mcp_agent_backend(
+        mut self,
+        backend: SharedBackend,
+        tool_name: Option<String>,
+    ) -> Self {
+        self.mcp_agent_backend = Some(backend);
+        self.mcp_agent_tool_name = tool_name;
+        self
+    }
+
+    /// Convenience: build an MCP-backed sub-agent from typed config and
+    /// wire it up as the default backend. The tool's working directory
+    /// is forwarded to stdio backends as the child's cwd.
+    pub fn with_mcp_agent_backend_config(
+        self,
+        config: &McpAgentBackendConfig,
+        tool_name: Option<String>,
+    ) -> Result<Self> {
+        let backend = build_backend_from_config(config, Some(self.working_dir.as_path()))?;
+        Ok(self.with_mcp_agent_backend(backend, tool_name))
+    }
+
+    /// Attach a cost / provenance accountant (M7.4). Every successful
+    /// MCP sub-agent dispatch routed through this tool records an
+    /// attribution on the accountant's ledger. If the accountant carries
+    /// a [`crate::cost_ledger::CostBudgetPolicy`], pre-spawn projections
+    /// reject dispatches that breach the configured ceiling.
+    pub fn with_cost_accountant(
+        mut self,
+        accountant: Arc<crate::cost_ledger::CostAccountant>,
+    ) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
+    }
+
+    /// Dispatch a task to the configured MCP-backed sub-agent. Public so
+    /// callers that want direct access (e.g. harness tests) can bypass
+    /// the full spawn lifecycle. Returns the raw [`DispatchResponse`]
+    /// alongside the typed harness payload the caller should emit.
+    pub async fn dispatch_to_mcp_agent(
+        &self,
+        task: serde_json::Value,
+        session_id: &str,
+        task_id: &str,
+        workflow: Option<&str>,
+        phase: Option<&str>,
+    ) -> Result<(DispatchResponse, HarnessEvent)> {
+        let backend = self
+            .mcp_agent_backend
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("no MCP agent backend configured on SpawnTool"))?;
+        let tool_name = self
+            .mcp_agent_tool_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
+
+        let request = DispatchRequest { tool_name, task };
+        let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
+        let payload = build_dispatch_event_payload(
+            session_id,
+            task_id,
+            workflow,
+            phase,
+            backend.as_ref(),
+            &response,
+        );
+        let event = HarnessEvent {
+            schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload,
+        };
+        event
+            .validate()
+            .map_err(|error| eyre::eyre!("dispatch event failed validation: {error}"))?;
+        Ok((response, event))
+    }
+
+    /// Emit a pre-built dispatch event to the given sink. Noop when
+    /// `sink_path` is `None` so callers without a supervisor still see
+    /// the metrics side-effect without emitting stray events.
+    pub fn emit_dispatch_event(sink_path: Option<&str>, event: &HarnessEvent) -> Result<()> {
+        let Some(sink) = sink_path else {
+            return Ok(());
+        };
+        write_event_to_sink(sink, event)
+            .map_err(|error| eyre::eyre!("failed to write dispatch event to sink: {error}"))
+    }
+
     /// Resolve the LLM provider for a sub-agent based on optional model and context_window.
     ///
     /// Context window priority: LLM-specified > config default > model native.
@@ -539,6 +663,20 @@ struct Input {
     /// Optional structured workflow metadata from the session runtime.
     #[serde(default)]
     workflow: Option<WorkflowMetadata>,
+    /// Which sub-agent backend services this request. Defaults to
+    /// `"builtin"` (in-process [`Agent`]). Set to `"agent_mcp"` to
+    /// dispatch via the configured [`super::mcp_agent::McpAgentBackend`].
+    #[serde(default = "default_backend")]
+    backend: String,
+    /// Optional override for the MCP tool name dispatched when
+    /// `backend == "agent_mcp"`. Falls back to the SpawnTool's configured
+    /// default and finally to [`DEFAULT_MCP_AGENT_TOOL_NAME`].
+    #[serde(default)]
+    agent_mcp_tool_name: Option<String>,
+}
+
+fn default_backend() -> String {
+    "builtin".into()
 }
 
 fn default_mode() -> String {
@@ -960,15 +1098,15 @@ fn resolve_background_terminal_files(
                 .collect()
         });
 
-    if terminal_files.is_empty()
-        && let Some(required_kind) = workflow_terminal_artifact_kind(workflow)
-    {
-        let workflow_kind = workflow
-            .map(|workflow| workflow.workflow_kind.as_str())
-            .unwrap_or("workflow");
-        return Err(format!(
-            "{workflow_kind} completed without required {required_kind} terminal artifact"
-        ));
+    if terminal_files.is_empty() {
+        if let Some(required_kind) = workflow_terminal_artifact_kind(workflow) {
+            let workflow_kind = workflow
+                .map(|workflow| workflow.workflow_kind.as_str())
+                .unwrap_or("workflow");
+            return Err(format!(
+                "{workflow_kind} completed without required {required_kind} terminal artifact"
+            ));
+        }
     }
 
     Ok(terminal_files)
@@ -1245,6 +1383,16 @@ impl Tool for SpawnTool {
                         }
                     },
                     "required": ["workflow_kind", "current_phase"]
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["builtin", "agent_mcp"],
+                    "description": "Sub-agent backend. 'builtin' runs an in-process Agent (default). 'agent_mcp' dispatches to the configured MCP agent backend (Claude Code / Codex / hermes / jiuwenclaw) so the sub-agent's internal tool calls never leak back to the parent context.",
+                    "default": "builtin"
+                },
+                "agent_mcp_tool_name": {
+                    "type": "string",
+                    "description": "Override the MCP tool name dispatched on the remote agent when backend='agent_mcp'. Defaults to 'run_task'."
                 }
             },
             "required": ["task"]
@@ -1270,13 +1418,269 @@ impl Tool for SpawnTool {
         let allowed_tools = input.allowed_tools.clone();
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
+        let is_agent_mcp = input.backend == "agent_mcp";
 
         info!(
             worker_id = %worker_id,
             mode = %input.mode,
+            backend = %input.backend,
             task = %input.task,
             "spawning subagent"
         );
+
+        // MCP-backed sub-agent dispatch. Runs synchronously (request /
+        // response) — the sub-agent's internal tool calls stay inside the
+        // MCP call; only the contract-gated artifact flows back. That's
+        // the ~10x parent-context saving the M7 plan doc promises.
+        if is_agent_mcp {
+            let backend = self.mcp_agent_backend.as_ref().ok_or_else(|| {
+                eyre::eyre!(
+                    "spawn backend='agent_mcp' requires a configured MCP agent backend; \
+                     use SpawnTool::with_mcp_agent_backend() to attach one"
+                )
+            })?;
+            let tool_name = input
+                .agent_mcp_tool_name
+                .clone()
+                .or_else(|| self.mcp_agent_tool_name.clone())
+                .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
+            let session_key_for_event = self
+                .session_key
+                .clone()
+                .unwrap_or_else(|| "sub-agent:unknown-session".to_string());
+            let task_id_for_event = worker_id.to_string();
+            let workflow_kind = workflow.as_ref().map(|w| w.workflow_kind.clone());
+            let workflow_phase = workflow.as_ref().map(|w| w.current_phase.clone());
+
+            let dispatch_payload = serde_json::json!({
+                "task": task_desc,
+                "label": label,
+                "allowed_tools": allowed_tools,
+                "workflow": workflow.clone(),
+                "additional_instructions": input.additional_instructions,
+            });
+
+            // Pre-dispatch budget projection (M7.4). Absent a
+            // configured accountant the check short-circuits and the
+            // dispatch proceeds unchanged — this keeps existing M7.1
+            // dispatch tests passing when no policy is configured.
+            let model_for_ledger = input
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown-model".to_string());
+            let contract_id_for_ledger = workflow_kind
+                .clone()
+                .unwrap_or_else(|| session_key_for_event.clone());
+            if let Some(accountant) = self.cost_accountant.as_ref() {
+                if let Some(policy) = accountant.policy() {
+                    if policy.is_enforced() {
+                        // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
+                        // the outbound task description divided by 4
+                        // (the classic 1 token ≈ 4 chars rule of thumb).
+                        // Good enough for budget rejection — the ledger
+                        // replaces this with the real count on success.
+                        let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
+                        let projected_usd = crate::cost_ledger::project_cost_usd(
+                            &model_for_ledger,
+                            tokens_in_estimate,
+                            0,
+                        )
+                        .unwrap_or(0.0);
+                        match accountant
+                            .project_dispatch(&contract_id_for_ledger, projected_usd)
+                            .await
+                        {
+                            Ok(crate::cost_ledger::BudgetProjection::Allowed { .. }) => {}
+                            Ok(crate::cost_ledger::BudgetProjection::Rejected {
+                                reason, ..
+                            }) => {
+                                let message = format!(
+                                    "Status: FAILED\nDispatch rejected by cost budget policy: {reason}"
+                                );
+                                warn!(
+                                    contract_id = %contract_id_for_ledger,
+                                    reason = %reason,
+                                    "rejecting MCP sub-agent dispatch before spawn"
+                                );
+                                return Ok(ToolResult {
+                                    output: message,
+                                    success: false,
+                                    ..Default::default()
+                                });
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "cost budget projection failed; allowing dispatch"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (response, event) = {
+                let request = DispatchRequest {
+                    tool_name,
+                    task: dispatch_payload,
+                };
+                let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
+                let payload = build_dispatch_event_payload(
+                    session_key_for_event.clone(),
+                    task_id_for_event.clone(),
+                    workflow_kind.as_deref(),
+                    workflow_phase.as_deref(),
+                    backend.as_ref(),
+                    &response,
+                );
+                let event = HarnessEvent {
+                    schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.to_string(),
+                    payload,
+                };
+                event.validate().map_err(|error| {
+                    eyre::eyre!("sub-agent dispatch event failed validation: {error}")
+                })?;
+                (response, event)
+            };
+
+            if let Some(supervisor) = self.task_supervisor.as_ref() {
+                if let Err(error) = supervisor.apply_harness_event(&task_id_for_event, &event) {
+                    // The dispatch event is observational; absence of a
+                    // tracked task is not a dispatch failure. Log and
+                    // continue.
+                    warn!(
+                        task_id = %task_id_for_event,
+                        error = %error,
+                        "dispatch event could not be applied to task supervisor"
+                    );
+                }
+            }
+
+            let success = response.outcome == super::mcp_agent::DispatchOutcome::Success;
+
+            // Post-dispatch cost attribution (M7.4). Only record when
+            // the remote agent returned a ready artifact; failures and
+            // timeouts are already visible via the dispatch event and
+            // should not inflate the ledger.
+            if success {
+                if let Some(accountant) = self.cost_accountant.as_ref() {
+                    let tokens_in_est = task_desc.len().div_ceil(4) as u32;
+                    let tokens_out_est = response.output.len().div_ceil(4) as u32;
+                    let cost_usd = crate::cost_ledger::project_cost_usd(
+                        &model_for_ledger,
+                        tokens_in_est,
+                        tokens_out_est,
+                    )
+                    .unwrap_or(0.0);
+                    let attribution = crate::cost_ledger::CostAttributionEvent::new(
+                        session_key_for_event.clone(),
+                        contract_id_for_ledger.clone(),
+                        task_id_for_event.clone(),
+                        model_for_ledger.clone(),
+                        tokens_in_est,
+                        tokens_out_est,
+                        cost_usd,
+                    )
+                    .with_workflow(workflow_kind.clone(), workflow_phase.clone())
+                    .with_backend_outcome(
+                        Some(backend.as_ref().backend_label().to_string()),
+                        Some("success".to_string()),
+                    );
+                    let attribution_id_for_event = attribution.attribution_id.clone();
+
+                    // Commit to the ledger. Failing to persist is
+                    // non-fatal for the dispatch itself — we log and
+                    // continue so a bad disk does not mask a successful
+                    // agent run.
+                    if let Err(error) = accountant.ledger().record(attribution).await {
+                        warn!(
+                            task_id = %task_id_for_event,
+                            error = %error,
+                            "failed to persist cost attribution; dispatch succeeded"
+                        );
+                    } else {
+                        // Emit the typed event so downstream sinks,
+                        // including the operator summary aggregator,
+                        // see the spend even without re-reading the
+                        // ledger.
+                        let cost_event = HarnessEvent::cost_attribution(
+                            crate::harness_events::HarnessCostAttributionEvent {
+                                schema_version: crate::abi_schema::COST_ATTRIBUTION_SCHEMA_VERSION,
+                                session_id: session_key_for_event.clone(),
+                                task_id: task_id_for_event.clone(),
+                                workflow: workflow_kind.clone(),
+                                phase: workflow_phase.clone(),
+                                attribution_id: attribution_id_for_event,
+                                contract_id: contract_id_for_ledger.clone(),
+                                model: model_for_ledger.clone(),
+                                tokens_in: tokens_in_est,
+                                tokens_out: tokens_out_est,
+                                cost_usd,
+                                outcome: "success".to_string(),
+                                extra: std::collections::HashMap::new(),
+                            },
+                        );
+                        if let Err(error) = cost_event.validate() {
+                            warn!(
+                                task_id = %task_id_for_event,
+                                error = %error,
+                                "cost attribution event failed validation; skipping emission"
+                            );
+                        } else if let Some(supervisor) = self.task_supervisor.as_ref() {
+                            if let Err(error) =
+                                supervisor.apply_harness_event(&task_id_for_event, &cost_event)
+                            {
+                                warn!(
+                                    task_id = %task_id_for_event,
+                                    error = %error,
+                                    "cost attribution event could not be applied"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut files_to_send = response.files_to_send.clone();
+            // Workflow contract families always gate outputs through the
+            // workspace contract. The dispatch response is advisory; the
+            // final delivery path remains owned by the runtime.
+            if let Some(workflow_meta) = workflow.as_ref() {
+                if workflow_uses_contract_terminal_delivery(workflow_meta) {
+                    match resolve_contract_terminal_files(
+                        self.working_dir.as_path(),
+                        Some(workflow_meta),
+                    ) {
+                        Ok(Some(contract_files)) => files_to_send = contract_files,
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Ok(ToolResult {
+                                output: format!("Status: FAILED\n{error}"),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+
+            return Ok(ToolResult {
+                output: if success {
+                    format!("Status: SUCCESS\n\n{}", response.output)
+                } else {
+                    format!(
+                        "Status: FAILED\n{}",
+                        response
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| response.output.clone())
+                    )
+                },
+                success,
+                files_to_send,
+                ..Default::default()
+            });
+        }
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
 
@@ -1438,6 +1842,35 @@ impl Tool for SpawnTool {
                     );
                 }
 
+                let harness_event_sink = match (
+                    task_supervisor.as_ref(),
+                    tracked_task_id.as_ref(),
+                    parent_session_key.as_ref(),
+                ) {
+                    (Some(supervisor), Some(task_id), Some(session_key)) => {
+                        match HarnessEventSink::new(
+                            supervisor.clone(),
+                            task_id.clone(),
+                            session_key.clone(),
+                        ) {
+                            Ok(sink) => Some(sink),
+                            Err(error) => {
+                                warn!(
+                                    task_id = %task_id,
+                                    session_key = %session_key,
+                                    error = %error,
+                                    "failed to create harness event sink; continuing without structured child progress"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let harness_event_sink_path = harness_event_sink
+                    .as_ref()
+                    .map(|sink| sink.path().display().to_string());
+
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.
                 if !plugin_dirs.is_empty() {
@@ -1465,6 +1898,9 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                if let Some(ref sink_path) = harness_event_sink_path {
+                    worker = worker.with_harness_event_sink(sink_path.clone());
+                }
                 if let Some(ref hooks) = worker_hooks {
                     worker = worker.with_hooks(hooks.clone());
                 }
@@ -2002,6 +2438,9 @@ mod tests {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            mcp_agent_backend: None,
+            mcp_agent_tool_name: None,
+            cost_accountant: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -2960,6 +3399,7 @@ PY
     #[test]
     fn classify_child_session_failure_as_retryable_when_budget_exhausted() {
         let result = Ok::<octos_core::TaskResult, eyre::Report>(octos_core::TaskResult {
+            schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success: false,
             output: "Token budget exceeded (120 of 100).".to_string(),
             files_modified: vec![],

@@ -1,0 +1,9 @@
+{
+    "schema_version": 1,
+    "event": "before_tool_call",
+    "tool_name": "shell",
+    "tool_id": "tc-abc",
+    "arguments": {"redacted": true, "reason": "sensitive tool"},
+    "session_id": "sess-1",
+    "profile_id": "main"
+}

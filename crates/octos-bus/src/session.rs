@@ -598,11 +598,7 @@ impl SessionManager {
                     );
                     let mut seen = std::collections::HashSet::new();
 
-                    for message in flat
-                        .messages
-                        .into_iter()
-                        .chain(per_user.messages.into_iter())
-                    {
+                    for message in flat.messages.into_iter().chain(per_user.messages) {
                         let Ok(fingerprint) = serde_json::to_string(&message) else {
                             continue;
                         };
@@ -1385,7 +1381,7 @@ impl SessionManager {
             });
         }
 
-        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         entries
     }
 
@@ -1427,7 +1423,7 @@ impl SessionManager {
             }
         }
 
-        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         entries
     }
 
@@ -1482,7 +1478,7 @@ impl SessionManager {
             });
         }
 
-        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         entries
     }
 }

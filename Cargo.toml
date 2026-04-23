@@ -17,10 +17,15 @@ members = [
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/pipeline-guard",
     "crates/app-skills/skill-evolve",
+    "crates/app-skills/harness-starter-generic",
+    "crates/app-skills/harness-starter-report",
+    "crates/app-skills/harness-starter-audio",
+    "crates/app-skills/harness-starter-coding",
     "crates/platform-skills/voice",
     "crates/octos-pipeline",
     "crates/octos-plugin",
     "crates/octos-sandbox",
+    "crates/octos-swarm",
 ]
 
 [workspace.package]
@@ -43,6 +48,7 @@ octos-agent = { path = "crates/octos-agent" }
 octos-bus = { path = "crates/octos-bus" }
 octos-pipeline = { path = "crates/octos-pipeline" }
 octos-plugin = { path = "crates/octos-plugin" }
+octos-swarm = { path = "crates/octos-swarm" }
 
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }

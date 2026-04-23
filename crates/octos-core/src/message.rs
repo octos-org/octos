@@ -59,6 +59,7 @@ mod tests {
 
     fn make_result() -> TaskResult {
         TaskResult {
+            schema_version: crate::task::TASK_RESULT_SCHEMA_VERSION,
             success: true,
             output: "done".into(),
             files_modified: vec![],

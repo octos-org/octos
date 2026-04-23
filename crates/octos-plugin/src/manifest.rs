@@ -3,6 +3,8 @@ use std::path::Path;
 use eyre::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::HardwareLifecycle;
+
 /// The type of plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +138,12 @@ pub struct PluginManifest {
     /// Legacy field: whether the plugin requires network access.
     #[serde(default)]
     pub requires_network: Option<bool>,
+
+    /// Hardware lifecycle declaration (preflight, init, shutdown, etc.).
+    /// Optional — only relevant for hardware-controlling plugins. Manifests
+    /// without this field behave exactly as they did before RP02.
+    #[serde(default)]
+    pub hardware_lifecycle: Option<HardwareLifecycle>,
 }
 
 impl PluginManifest {

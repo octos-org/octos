@@ -1,0 +1,50 @@
+// Example robot inspection mission using only the existing, supported
+// HandlerKind variants (Noop / Shell / Gate / Codergen). Per-node deadlines,
+// DeadlineActions, and mission checkpoints are declared as DOT attributes
+// and enforced by the pipeline executor at runtime.
+//
+// Shapes serve documentary purposes only — the RP04 parser ignores any
+// shape that does not map to a supported HandlerKind (see `from_shape`).
+digraph inspection_mission {
+    rankdir=LR;
+
+    // Preflight: a noop gate verifies the pipeline starts cleanly.
+    preflight [handler="noop", label="Preflight",
+               deadline_secs="5", deadline_action="abort"];
+
+    // Navigate: shell command drives the robot to the valve. On timeout we
+    // escalate to a spawn-failure hook so the operator console surfaces
+    // the miss.
+    navigate [handler="shell", label="Navigate to P1",
+              deadline_secs="120", deadline_action="escalate",
+              checkpoint="post_navigate"];
+
+    // Arrival check: a generic gate confirms position error is acceptable.
+    arrival_check [handler="gate", label="Arrival OK?",
+                   deadline_secs="10", deadline_action="abort"];
+
+    // Inspect valve: an LLM-driven step. On deadline, skip and continue.
+    inspect [handler="codergen", label="Inspect Valve",
+             deadline_secs="60", deadline_action="skip",
+             checkpoint="post_inspect"];
+
+    // Result gate: branch on the LLM's output.
+    result_gate [handler="gate", label="Anomaly?"];
+
+    // Corrective action: retry up to 3x, each bounded by the 90s deadline.
+    corrective [handler="codergen", label="Corrective Action",
+                deadline_secs="90", deadline_action="retry:3"];
+
+    // Return home: bounded by 120s; if missed, skip (we accept missing the
+    // home pose rather than trapping the robot in a failed state).
+    return_home [handler="shell", label="Return Home",
+                 deadline_secs="120", deadline_action="skip"];
+
+    preflight -> navigate;
+    navigate -> arrival_check;
+    arrival_check -> inspect;
+    inspect -> result_gate;
+    result_gate -> corrective [label="yes"];
+    result_gate -> return_home [label="no"];
+    corrective -> return_home;
+}

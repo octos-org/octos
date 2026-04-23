@@ -10,6 +10,7 @@ interface AuthContextValue {
   sendOtp: (email: string) => Promise<{ ok: boolean; message?: string }>
   verifyOtp: (email: string, code: string) => Promise<boolean>
   loginWithToken: (token: string) => Promise<boolean>
+  swapToken: (newToken: string) => void
   logout: () => Promise<void>
 }
 
@@ -74,6 +75,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const swapToken = useCallback((newToken: string) => {
+    localStorage.setItem('octos_auth_token', newToken)
+    setToken(newToken)
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       await authApi.logout()
@@ -88,7 +94,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, isAdmin, loading, sendOtp, verifyOtp, loginWithToken, logout }}
+      value={{ user, token, isAdmin, loading, sendOtp, verifyOtp, loginWithToken, swapToken, logout }}
     >
       {children}
     </AuthContext.Provider>

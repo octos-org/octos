@@ -55,8 +55,6 @@ fn octos_sbpl(workspace: &str, allow_network: bool) -> String {
     )
 }
 
-/// Helper: build SBPL with restricted reads (like octos read_allow_paths).
-
 fn is_macos() -> bool {
     cfg!(target_os = "macos")
 }
@@ -257,8 +255,7 @@ fn should_block_python_write_outside_workspace() {
     let profile = octos_sbpl(&real_workspace, false);
     let (code, stdout, _stderr) = run_sandboxed(
         &profile,
-        &format!(
-            r#"python3 -c "
+        r#"python3 -c "
 import os
 try:
     os.makedirs('/tmp/octos-security-test-python', exist_ok=True)
@@ -266,8 +263,7 @@ try:
     print('BAD: escaped')
 except PermissionError:
     print('BLOCKED')
-""#
-        ),
+""#,
     );
     assert!(
         stdout.contains("BLOCKED") || code != 0,

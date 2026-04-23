@@ -379,6 +379,10 @@ fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<Inst
 }
 
 /// Remove an installed skill by name.
+///
+/// Removal is idempotent: if the skill directory is already absent the call
+/// succeeds without error, matching HTTP DELETE semantics and the harness
+/// compatibility contract (M4.4).
 pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     // Reject path traversal attempts
     if name.contains('/')
@@ -391,7 +395,8 @@ pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
     }
     let dest = skills_dir.join(name);
     if !dest.exists() {
-        eyre::bail!("Skill '{name}' not found in {}", skills_dir.display());
+        // Idempotent: already removed.
+        return Ok(());
     }
     std::fs::remove_dir_all(&dest)?;
     Ok(())

@@ -60,6 +60,8 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         status_bridge: None,
         shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         max_parallel_workers: 8,
+        checkpoint_store: None,
+        hook_executor: None,
     }
 }
 
