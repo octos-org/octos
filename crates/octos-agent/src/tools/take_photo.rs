@@ -134,8 +134,10 @@ impl Tool for TakePhotoTool {
         let photo_path = photo_dir.join(format!("photo_{timestamp}.jpg"));
         let photo_path_str = photo_path.display().to_string();
 
-        // Capture photo using ffmpeg AVFoundation
-        let output = tokio::process::Command::new("ffmpeg")
+        // Capture photo using ffmpeg AVFoundation. Bounded at 15s so a missing
+        // permission prompt or unreachable camera device can't hang the agent
+        // (or the test binary — CI runners have no camera).
+        let ffmpeg_fut = tokio::process::Command::new("ffmpeg")
             .args([
                 "-f",
                 "avfoundation",
@@ -152,8 +154,22 @@ impl Tool for TakePhotoTool {
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()
-            .await;
+            .output();
+
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(15), ffmpeg_fut)
+            .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                return Ok(ToolResult {
+                    output: "Error: ffmpeg photo capture timed out after 15s (no camera, \
+                             permission prompt, or device busy)"
+                        .to_string(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
 
         match output {
             Ok(out) if out.status.success() => {
