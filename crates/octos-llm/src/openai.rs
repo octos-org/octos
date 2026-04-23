@@ -213,8 +213,8 @@ impl OpenAIProvider {
                 // is missing in assistant tool call message".
                 // Only synthesize a stub for models that actually need it (detected
                 // via fixed_temperature + model name containing "kimi-k2").
-                let needs_reasoning_stub = self.hints.fixed_temperature
-                    && self.model.to_lowercase().contains("kimi-k2");
+                let needs_reasoning_stub =
+                    self.hints.fixed_temperature && self.model.to_lowercase().contains("kimi-k2");
                 let reasoning = match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
                     _ if role == "assistant" && needs_reasoning_stub => Some("."),
