@@ -291,10 +291,26 @@ impl ChatCommand {
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
             ..Default::default()
         };
+        // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
+        // top of the crate-shipped built-ins (research-worker, repo-editor).
+        // Missing dirs fall back to built-ins only.
+        let agents_dir = cwd.join("agents");
+        let agent_definitions = match octos_agent::agents::AgentDefinitions::load_dir(&agents_dir) {
+            Ok(defs) => Arc::new(defs),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to load agent manifests from {}: {err}",
+                    agents_dir.display()
+                );
+                Arc::new(octos_agent::agents::AgentDefinitions::with_builtins())
+            }
+        };
+
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
-            .with_shutdown(shutdown.clone());
+            .with_shutdown(shutdown.clone())
+            .with_agent_definitions(agent_definitions);
 
         // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .octos/ directory
         let project_dir = cwd.join(".octos");

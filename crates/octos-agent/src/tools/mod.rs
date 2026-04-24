@@ -41,25 +41,12 @@ use crate::progress::ProgressReporter;
 
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
-/// M8.2 will populate this registry from `AgentDefinition` manifests on disk
-/// (see issue #536 → M8.2). Today it is an empty holder so the context can be
-/// constructed without wiring.
-#[derive(Clone, Debug, Default)]
-pub struct AgentDefinitions {
-    // M8.2 will add the concrete definition records here.
-}
-
-impl AgentDefinitions {
-    /// Create an empty agent-definition registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether any agent definitions are registered.
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-}
+/// Re-exported from [`crate::agents`] where the schema and loader live. M8.2
+/// filled in the stub shipped by M8.1: the registry now carries real
+/// [`crate::agents::AgentDefinition`] records by id. `ToolContext` keeps its
+/// M8.1 signature (`Arc<AgentDefinitions>`), so consumers of the field do
+/// not need to change.
+pub use crate::agents::AgentDefinitions;
 
 /// Per-tool permission facts consulted before each execution.
 ///

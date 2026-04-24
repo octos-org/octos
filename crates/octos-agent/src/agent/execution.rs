@@ -93,6 +93,7 @@ impl Agent {
                 let tc_args = tool_call.arguments.clone();
                 let attachment_ctx = turn_attachment_ctx.clone();
                 let harness_event_sink = self.harness_event_sink.clone();
+                let agent_definitions = self.agent_definitions.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -168,6 +169,7 @@ impl Agent {
                         let bg_supervisor = tools.supervisor();
                         let bg_reporter = reporter.clone();
                         let bg_attachment_ctx = attachment_ctx.clone();
+                        let bg_agent_definitions = agent_definitions.clone();
                         tokio::spawn(async move {
                             bg_supervisor.mark_running(&task_id);
                             let bg_started_at = std::time::SystemTime::now();
@@ -186,6 +188,7 @@ impl Agent {
                                 file_attachment_paths: bg_attachment_ctx
                                     .file_attachment_paths
                                     .clone(),
+                                agent_definitions: bg_agent_definitions.clone(),
                                 ..ToolContext::zero()
                             };
 
@@ -506,6 +509,7 @@ impl Agent {
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                        agent_definitions: agent_definitions.clone(),
                         ..ToolContext::zero()
                     };
                     // Thread the typed context into execute_with_context. Legacy tools

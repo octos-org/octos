@@ -9,6 +9,7 @@
 
 pub mod abi_schema;
 mod agent;
+pub mod agents;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
