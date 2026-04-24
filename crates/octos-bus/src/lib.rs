@@ -64,9 +64,9 @@ pub use email_channel::EmailChannel;
 pub use feishu_channel::FeishuChannel;
 #[cfg(feature = "matrix")]
 pub use matrix_channel::{
-    BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel, MatrixEventId, MatrixRoomId,
-    MatrixUserId, SWARM_SUPERVISOR_EVENT_SCHEMA_V1, SteeringInput, SwarmHarnessEvent,
-    SwarmSupervisorParams,
+    BotEntry, BotManager, BotRouter, BotVisibility, LoggingSteeringInputConsumer, MatrixChannel,
+    MatrixEventId, MatrixRoomId, MatrixUserId, SWARM_SUPERVISOR_EVENT_SCHEMA_V1, SteeringInput,
+    SteeringInputConsumer, SwarmHarnessEvent, SwarmSupervisorParams,
 };
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;

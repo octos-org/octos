@@ -507,6 +507,14 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
+    /// Harness M7.9b: Steering consumer that bridges parsed Matrix
+    /// supervisor replies onto the target puppet sub-agent's runtime
+    /// inbox. When `None`, `handle_supervisor_reply` still parses the
+    /// reply but the gateway layer is responsible for routing it
+    /// (legacy / test-only behaviour). When `Some`, the channel routes
+    /// the parsed input into the inbox itself — no external glue code
+    /// is needed on the gateway side.
+    steering_consumer: Option<Arc<dyn SteeringInputConsumer>>,
 }
 
 impl MatrixChannel {
@@ -541,7 +549,27 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
+            steering_consumer: None,
         }
+    }
+
+    /// Harness M7.9b: Attach a [`SteeringInputConsumer`] so parsed
+    /// supervisor replies route automatically into the target puppet
+    /// sub-agent's inbox. When attached, `handle_supervisor_reply`
+    /// additionally invokes the consumer before returning the parsed
+    /// `SteeringInput` — keeping the return value intact for any
+    /// observer (metrics, audit trail) that still wants the raw parse
+    /// result.
+    pub fn with_steering_consumer(mut self, consumer: Arc<dyn SteeringInputConsumer>) -> Self {
+        self.steering_consumer = Some(consumer);
+        self
+    }
+
+    /// Observability accessor: whether a steering consumer has been
+    /// wired. Exposed for integration tests + gateway health probes —
+    /// no runtime significance on the reply-handling path itself.
+    pub fn has_steering_consumer(&self) -> bool {
+        self.steering_consumer.is_some()
     }
 
     /// Restrict bot-management slash commands to the given Matrix user IDs.
@@ -2027,6 +2055,54 @@ pub struct SteeringInput {
     pub body: String,
 }
 
+/// Harness M7.9b: Sink for routing [`SteeringInput`] events into the
+/// target sub-agent's runtime inbox.
+///
+/// Implemented by the gateway when it wires up a Matrix channel with
+/// swarm supervisor support: the concrete impl bridges Matrix-domain
+/// identifiers (`session_id`, `agent_label`) to supervisor-domain
+/// `task_id` + pushes the message through the same mechanism the
+/// `send_to_agent` tool / REST endpoint use. Keeping this behind a
+/// trait keeps the Matrix channel free of direct `octos-agent`
+/// dependencies (avoids a crate cycle between `octos-bus` and
+/// `octos-agent`).
+///
+/// Invoked synchronously when [`MatrixChannel::handle_supervisor_reply`]
+/// produces a steering input — implementations that need to do async
+/// work (locking, persistence, metric emit) can spawn onto the runtime
+/// internally.
+///
+/// Returns a bool capturing whether delivery succeeded. `false` lets
+/// the gateway emit a best-effort "reply not delivered" notice back to
+/// the supervisor room when desired.
+#[async_trait::async_trait]
+pub trait SteeringInputConsumer: Send + Sync {
+    /// Deliver a parsed supervisor steering input to the target puppet
+    /// sub-agent's runtime inbox. Returns `true` on successful routing,
+    /// `false` when the target is terminal / missing / closed / etc.
+    async fn consume(&self, input: SteeringInput) -> bool;
+}
+
+/// Default/logging [`SteeringInputConsumer`] — records the input via
+/// `tracing` and returns `true`. Used as a reasonable no-op when no
+/// supervisor backend is wired (e.g. isolated tests, preview gateways).
+#[derive(Debug, Default, Clone)]
+pub struct LoggingSteeringInputConsumer;
+
+#[async_trait::async_trait]
+impl SteeringInputConsumer for LoggingSteeringInputConsumer {
+    async fn consume(&self, input: SteeringInput) -> bool {
+        tracing::info!(
+            session_id = %input.session_id,
+            agent_label = %input.agent_label,
+            supervisor = %input.supervisor_user_id,
+            body_len = input.body.len(),
+            "LoggingSteeringInputConsumer received steering input (no backend attached)"
+        );
+        true
+    }
+}
+
 /// A Matrix user ID newtype — `@localpart:server_name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatrixUserId(String);
@@ -2706,14 +2782,42 @@ impl MatrixChannel {
         let stripped = strip_puppet_mention(message, puppet_user_id.as_str());
 
         record_swarm_room_action("replied");
-        Some(SteeringInput {
+        let input = SteeringInput {
             session_id,
             agent_label,
             puppet_user_id,
             supervisor_user_id: sender.to_string(),
             body: stripped,
-        })
+        };
+
+        // Harness M7.9b: when a steering consumer is attached, route the
+        // parsed input through it so the running puppet sub-agent's
+        // inbox receives the message without waiting for the gateway
+        // layer to glue the pieces together. This closes M7.9's
+        // follow-up gap #3 — the FA-11 TODO has been resolved.
+        if let Some(consumer) = self.steering_consumer.as_ref() {
+            let outcome = consumer.consume(input.clone()).await;
+            record_swarm_supervisor_reply_routed(outcome);
+        }
+
+        Some(input)
     }
+}
+
+/// Metric: counts how many parsed supervisor replies were routed into
+/// an attached [`SteeringInputConsumer`]. `outcome=delivered` marks
+/// successful inbox delivery (or successful logging if only the default
+/// consumer is attached); `outcome=rejected` counts misses where the
+/// consumer signalled failure (e.g. terminal task, closed inbox). Used
+/// by the operator dashboard to flag swarms where steering quietly
+/// disappears despite parse success.
+fn record_swarm_supervisor_reply_routed(delivered: bool) {
+    let outcome = if delivered { "delivered" } else { "rejected" };
+    metrics::counter!(
+        "octos_swarm_supervisor_steering_routed_total",
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 /// Whether the first character after a matched puppet user_id is allowed to
