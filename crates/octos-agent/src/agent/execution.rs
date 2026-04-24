@@ -230,8 +230,17 @@ impl Agent {
                         ..ToolContext::zero()
                     };
 
+                    // M8.2/M8.4 reconciliation: use the typed
+                    // `execute_with_context` so the spawn-only background
+                    // branch carries `agent_definitions` and
+                    // `file_state_cache` through to the tool. The TOOL_CTX
+                    // scope still wraps the call so plugin/MCP tools that
+                    // read the task-local see the same fields.
                     let mut result = TOOL_CTX
-                        .scope(make_ctx(), bg_tools.execute(&bg_name, &bg_args))
+                        .scope(
+                            make_ctx(),
+                            bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
+                        )
                         .await;
 
                     // Retry once on transient failure (e.g. ominix-api restart)
@@ -243,7 +252,10 @@ impl Agent {
                             tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             result = TOOL_CTX
-                                .scope(make_ctx(), bg_tools.execute(&bg_name, &bg_args))
+                                .scope(
+                                    make_ctx(),
+                                    bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
+                                )
                                 .await;
                         }
                     }
