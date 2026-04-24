@@ -562,7 +562,13 @@ impl ChatCommand {
             }
 
             // Process message
-            let response = agent.process_message(input, &history, vec![]).await?;
+            let response = match agent.process_message(input, &history, vec![]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}: {e}", "Error".red().bold());
+                    continue;
+                }
+            };
 
             // Append to history
             history.push(Message {
