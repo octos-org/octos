@@ -124,7 +124,16 @@ export default function EmailTab({ config, onChange }: Props) {
                   className="input"
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  SMTP login password or app-specific password (e.g. Gmail app password, SendGrid API key). Stored in the profile config.
+                  SMTP login password or app-specific password (SendGrid API key,{' '}
+                  <a
+                    href="https://myaccount.google.com/apppasswords"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-400 hover:text-blue-300 underline"
+                  >
+                    Gmail app password
+                  </a>
+                  , etc.). Stored in the profile config.
                 </p>
               </div>
               <div>
