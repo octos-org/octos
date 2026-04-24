@@ -231,6 +231,35 @@ pub enum ToolProgress {
     Intermediate { summary: String },
 }
 
+/// Concurrency class of a tool — controls how the executor admits tool calls
+/// into a parallel batch (M8.8).
+///
+/// The executor unconditionally ran every tool call in parallel before M8.8.
+/// This was unsafe in the presence of mutating tools: a `shell && rm foo`
+/// dispatched concurrently with `read_file foo/x` could race and return
+/// inconsistent observations to the LLM. Claude Code's
+/// `StreamingToolExecutor.ts` classifies tools via `isConcurrencySafe()` —
+/// this mirrors that pattern at the trait surface.
+///
+/// Admission policy (implemented in `agent::execution`):
+/// - If every call in the batch is [`ConcurrencyClass::Safe`], the batch
+///   dispatches in parallel (today's behaviour).
+/// - If *any* call is [`ConcurrencyClass::Exclusive`], the entire batch runs
+///   serially in call order. A single error from an exclusive call cancels
+///   the remaining peers so the LLM sees the cascade instead of continuing
+///   to mutate state on a doomed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConcurrencyClass {
+    /// Read-only / side-effect-free. Can run in parallel with any other
+    /// `Safe` tool call without observable interference.
+    #[default]
+    Safe,
+    /// Mutating or stateful (writes files, spawns shells, updates memory).
+    /// Must run serialized: no other tool call runs concurrently while an
+    /// `Exclusive` call is in-flight.
+    Exclusive,
+}
+
 /// Result of executing a tool.
 #[derive(Default)]
 pub struct ToolResult {
@@ -312,6 +341,17 @@ pub trait Tool: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.
         &()
+    }
+
+    /// Concurrency class for parallel-batch admission (M8.8).
+    ///
+    /// The default is [`ConcurrencyClass::Safe`] so pre-M8.8 tools keep their
+    /// parallel-friendly behaviour. Mutating or stateful tools override this
+    /// and return [`ConcurrencyClass::Exclusive`] — see each tool's doc for
+    /// rationale. The executor (in `agent::execution`) uses the class to
+    /// decide whether a batch may fan out in parallel or must serialize.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Safe
     }
 }
 
@@ -991,5 +1031,54 @@ mod tool_context_tests {
         // tool_id is empty because ToolContext::zero() carries no id.
         assert!(result.output.starts_with("tool_id=;"));
         assert_eq!(tool.with_ctx_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---------- M8.8 concurrency-class tests ----------
+
+    struct ExclusiveStubTool;
+
+    #[async_trait]
+    impl Tool for ExclusiveStubTool {
+        fn name(&self) -> &str {
+            "exclusive_stub"
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            Ok(ToolResult::default())
+        }
+        fn concurrency_class(&self) -> ConcurrencyClass {
+            ConcurrencyClass::Exclusive
+        }
+    }
+
+    #[test]
+    fn default_concurrency_class_is_safe() {
+        // A tool that does not override the default must report Safe so that
+        // unmigrated tools keep pre-M8.8 parallel-friendly behaviour.
+        let tool = LegacyTool::new();
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+        let ctx_tool = ContextAwareTool::new();
+        assert_eq!(ctx_tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
+
+    #[test]
+    fn override_returns_exclusive() {
+        // A tool that opts into Exclusive must be reported as Exclusive.
+        let tool = ExclusiveStubTool;
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    #[test]
+    fn concurrency_class_is_copy_eq_default() {
+        // The enum exposes Copy + Eq + Default as contracted by the M8.8 spec.
+        let a: ConcurrencyClass = ConcurrencyClass::default();
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_eq!(ConcurrencyClass::default(), ConcurrencyClass::Safe);
     }
 }

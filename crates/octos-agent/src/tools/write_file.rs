@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolResult};
 
 /// Tool for writing/creating files.
 pub struct WriteFileTool {
@@ -42,6 +42,13 @@ impl Tool for WriteFileTool {
 
     fn tags(&self) -> &[&str] {
         &["fs", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // Writing to disk mutates state visible to every other tool. If a
+        // parallel `read_file` targets the same path we'd hand the LLM a
+        // torn view. Serialize the whole batch. See M8.8.
+        ConcurrencyClass::Exclusive
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -112,6 +119,15 @@ impl Tool for WriteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_file_tool_is_exclusive() {
+        // write_file mutates disk visible to other tools in the batch,
+        // so it must serialize (M8.8).
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[tokio::test]
     async fn test_write_file_creates_new() {

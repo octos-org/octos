@@ -187,6 +187,17 @@ impl Tool for ReadFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ConcurrencyClass;
+
+    #[test]
+    fn read_file_tool_is_safe() {
+        // read_file is read-only and side-effect-free — the M8.8 default
+        // class is Safe so the executor can parallel-dispatch it with other
+        // Safe tools.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
 
     #[tokio::test]
     async fn test_read_file_basic() {

@@ -252,6 +252,20 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Look up the concurrency class of a registered tool (M8.8).
+    ///
+    /// Unknown tools report [`super::ConcurrencyClass::Safe`] — the executor
+    /// defers error handling to `execute()` which bails with `unknown tool`
+    /// rather than letting the admission phase fail silently. Plugin/MCP
+    /// tools report `Safe` today because their wrapper inherits the trait
+    /// default; they will be wired through a declared class in a follow-up.
+    pub fn concurrency_class(&self, name: &str) -> super::ConcurrencyClass {
+        self.tools
+            .get(name)
+            .map(|t| t.concurrency_class())
+            .unwrap_or_default()
+    }
+
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
     pub fn specs(&self) -> Vec<ToolSpec> {
