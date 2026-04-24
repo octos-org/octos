@@ -4294,15 +4294,33 @@ impl SessionActor {
                             .as_ref()
                             .is_some_and(|sr| sr.message_id.is_some());
 
-                    if !reply.trim().is_empty() && !already_streamed {
+                    // FA-12 defect C: `already_streamed` is an unreliable
+                    // "content already delivered" signal for ApiChannel —
+                    // its `send_with_id` always returns `Some("sse-{chat_id}")`
+                    // so the first stream_forwarder flush marks the overflow
+                    // as "streamed", even if subsequent chunks silently no-op
+                    // because `pending[chat_id]` was removed by the primary
+                    // turn's `_completion`. Decouple the durable metadata
+                    // emission from the user-facing content rendering: when
+                    // we have a committed seq, always emit `_session_result`
+                    // metadata so `ApiChannel::send` routes via
+                    // `broadcast_session_event` → watchers (the durable
+                    // fanout that survives primary-turn completion). When
+                    // the channel already rendered the content inline, emit
+                    // with empty body so non-API channels don't produce a
+                    // duplicate bubble and the web side doesn't double-render.
+                    let have_durable_metadata = committed_seq.is_some();
+                    let should_emit =
+                        !reply.trim().is_empty() && (have_durable_metadata || !already_streamed);
+
+                    if should_emit {
                         let mut metadata = serde_json::Map::new();
                         metadata.insert(
                             "_history_persisted".to_string(),
                             serde_json::Value::Bool(committed_seq.is_some()),
                         );
                         if let Some(topic) = session_key.topic() {
-                            metadata
-                                .insert("topic".to_string(), serde_json::Value::from(topic));
+                            metadata.insert("topic".to_string(), serde_json::Value::from(topic));
                         }
                         if let Some(seq) = committed_seq {
                             metadata.insert(
@@ -4317,11 +4335,16 @@ impl SessionActor {
                                 }),
                             );
                         }
+                        let outbound_content = if already_streamed {
+                            String::new()
+                        } else {
+                            reply
+                        };
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel: channel.clone(),
                                 chat_id: chat_id.clone(),
-                                content: reply,
+                                content: outbound_content,
                                 reply_to: overflow_reply_to.clone(),
                                 media: vec![],
                                 metadata: serde_json::Value::Object(metadata),
@@ -6254,7 +6277,10 @@ mod tests {
                 (Duration::from_millis(200), make_response("warmup3")),
                 (Duration::from_millis(200), make_response("warmup4")),
                 (Duration::from_millis(200), make_response("warmup5")),
-                (Duration::from_secs(12), make_response("slow primary answer")),
+                (
+                    Duration::from_secs(12),
+                    make_response("slow primary answer"),
+                ),
                 (
                     Duration::from_millis(400),
                     make_response("overflow FA12 result payload"),
@@ -6333,10 +6359,7 @@ mod tests {
             "session_result role must be 'assistant'"
         );
         assert!(
-            session_result
-                .get("seq")
-                .and_then(|v| v.as_u64())
-                .is_some(),
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
             "session_result must include committed seq, got {}",
             session_result
         );
