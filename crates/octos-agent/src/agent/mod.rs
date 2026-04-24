@@ -172,6 +172,13 @@ pub struct Agent {
     /// Workspace policy associated with the compaction runner (used by the
     /// post-compaction validator rail to resolve preserved artifacts).
     pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// Three-tier compaction runner (harness M8.5). Optional — when wired,
+    /// the loop runs tier 1 (micro-compaction) at the top of each iteration
+    /// and decorates Anthropic requests with the tier-2
+    /// `context_management` payload. Tier 3 delegates to the existing
+    /// [`crate::compaction::CompactionRunner`] wrapped as a
+    /// [`crate::compaction_tiered::FullCompactor`].
+    pub(super) tiered_compaction: Option<Arc<crate::compaction_tiered::TieredCompactionRunner>>,
 }
 
 impl Agent {
@@ -202,6 +209,7 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            tiered_compaction: None,
         }
     }
 
@@ -233,6 +241,7 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            tiered_compaction: None,
         }
     }
 
@@ -368,6 +377,25 @@ impl Agent {
     /// Access the attached workspace policy used for compaction gating.
     pub fn compaction_workspace(&self) -> Option<&crate::workspace_policy::WorkspacePolicy> {
         self.compaction_workspace.as_ref()
+    }
+
+    /// Wire the M8.5 three-tier compaction runner. Tier 1 runs at the top
+    /// of every loop iteration; tier 2 decorates outgoing Anthropic
+    /// requests; tier 3 is the existing declarative runner wrapped behind a
+    /// [`crate::compaction_tiered::FullCompactor`].
+    pub fn with_tiered_compaction(
+        mut self,
+        runner: Arc<crate::compaction_tiered::TieredCompactionRunner>,
+    ) -> Self {
+        self.tiered_compaction = Some(runner);
+        self
+    }
+
+    /// Access the attached three-tier compaction runner, if any.
+    pub fn tiered_compaction(
+        &self,
+    ) -> Option<Arc<crate::compaction_tiered::TieredCompactionRunner>> {
+        self.tiered_compaction.clone()
     }
 
     /// Beat the heartbeat once (if a realtime controller is attached) and

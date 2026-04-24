@@ -219,6 +219,7 @@ impl PersonaService {
             stop_sequences: vec![],
             reasoning_effort: None,
             response_format: None,
+            context_management: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {
@@ -376,6 +377,7 @@ impl PersonaService {
             stop_sequences: vec![],
             reasoning_effort: None,
             response_format: None,
+            context_management: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {

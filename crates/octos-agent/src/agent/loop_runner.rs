@@ -36,6 +36,53 @@ fn split_tool_calls(
     tool_calls.chunks(batch_size).collect()
 }
 
+/// M8.5 tier 1 safety helper: collect the set of `tool_call_id`s that are
+/// currently in an unresolved state (i.e. an assistant tool call whose
+/// matching [`MessageRole::Tool`] reply has not landed yet). Those IDs are
+/// passed to the tier-1 prune pass as "protected" so we never drop a tool
+/// result that a pending retry/contract-gate handler still needs.
+///
+/// Works purely off the message list so it also covers contract-gated
+/// artifacts that are referenced by message indices — content-clearing
+/// preserves indices, but full pruning would not, so the prune pass
+/// explicitly skips these.
+fn collect_protected_tool_call_ids(messages: &[Message]) -> Vec<String> {
+    let mut requested: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages {
+        match msg.role {
+            MessageRole::Assistant => {
+                if let Some(ref calls) = msg.tool_calls {
+                    for call in calls {
+                        requested.insert(call.id.clone());
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                if let Some(ref id) = msg.tool_call_id {
+                    answered.insert(id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    requested.difference(&answered).cloned().collect()
+}
+
+/// M8.5 tier 2 helper: returns a `ChatConfig` with the agent's tier-2
+/// `context_management` payload attached when the active provider is
+/// Anthropic-flavoured.  Returns a clone with the field left as-is in every
+/// other case so non-Anthropic providers never see the Anthropic-only
+/// header.
+fn with_tier2_context_management(config: &ChatConfig, agent: &Agent) -> ChatConfig {
+    let Some(payload) = agent.build_tier2_context_management() else {
+        return config.clone();
+    };
+    let mut out = config.clone();
+    out.context_management = Some(payload);
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellRetryRecoveryKind {
     DiffLikeSuccess,
@@ -485,6 +532,12 @@ impl Agent {
                     if iteration == 1 {
                         self.maybe_run_preflight_compaction(&mut messages);
                     }
+                    // Harness M8.5 tier 1: cheap in-place stale/oversized
+                    // tool-result pruning. Runs every iteration (including
+                    // the first so large bootstrap payloads shrink before
+                    // tier 3 considers whether to summarise).
+                    let protected_ids = collect_protected_tool_call_ids(&messages);
+                    self.run_tier1_compaction(&mut messages, &protected_ids);
                     prepare_conversation_messages(self, &mut messages, &mut turn);
                     // Harness M6.3: post-prep compaction pass so the declarative
                     // runner sees the final shape of the conversation (after
@@ -507,11 +560,17 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
+                    // M8.5 tier 2: optionally decorate the outgoing ChatConfig
+                    // with the Anthropic `context_management` payload so the
+                    // server can clear old tool uses on its side. Non-Anthropic
+                    // providers ignore `context_management` via
+                    // `skip_serializing_if`.
+                    let call_config = with_tier2_context_management(&config, self);
                     let (mut response, streamed) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
-                            &config,
+                            &call_config,
                             iteration,
                             &total_usage,
                             &mut turn,
@@ -534,7 +593,7 @@ impl Agent {
                                 .call_llm_with_hooks(
                                     &messages,
                                     &tools_spec,
-                                    &config,
+                                    &call_config,
                                     iteration,
                                     &total_usage,
                                     &mut turn,
@@ -849,14 +908,20 @@ impl Agent {
                 }
 
                 let tools_spec = self.tools.specs();
+                // M8.5 tier 1: also runs in task mode so background workers
+                // benefit from the same cheap shrinkage before their LLM call.
+                let protected_ids = collect_protected_tool_call_ids(&messages);
+                self.run_tier1_compaction(&mut messages, &protected_ids);
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
+                // M8.5 tier 2: decorate the config with the Anthropic header.
+                let call_config = with_tier2_context_management(&config, self);
                 let (mut response, _streamed) = match self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
-                        &config,
+                        &call_config,
                         iteration,
                         &total_usage,
                         &mut turn,
