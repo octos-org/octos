@@ -318,6 +318,73 @@ impl ToolRegistry {
         self.retain(|name| policy.is_allowed(name));
     }
 
+    /// Narrow the registry to the tools permitted by a profile's tool
+    /// declaration ([`crate::profile::ProfileTools`]).
+    ///
+    /// Unlike [`ToolRegistry::apply_policy`] this method consumes the
+    /// profile-shaped enum directly so the CLI does not need to translate
+    /// profile modes into a [`ToolPolicy`] round-trip. Behaviour by mode:
+    ///
+    /// - [`crate::profile::ProfileTools::Default`] — no-op. The registry
+    ///   passes through untouched so the built-in `coding` profile
+    ///   preserves today's behaviour byte-for-byte.
+    /// - [`crate::profile::ProfileTools::AllowList`] — keeps tools whose
+    ///   names match the allow list (plain name, `group:<id>`, or
+    ///   `<prefix>*` wildcard). Any tool marked `spawn_only` is retained
+    ///   regardless — they carry background-execution wiring the runtime
+    ///   depends on.
+    /// - [`crate::profile::ProfileTools::DenyList`] — drops tools matching
+    ///   any deny list entry (same matching rules). Spawn-only tools are
+    ///   likewise preserved.
+    ///
+    /// The filter runs in-place. Cache invalidation is handled by
+    /// [`ToolRegistry::retain`]. Intended to be called as a post-build
+    /// step during startup; never from inside the agent loop.
+    pub fn filter_by_profile(&mut self, tools: &crate::profile::ProfileTools) {
+        use crate::profile::ProfileTools;
+
+        match tools {
+            ProfileTools::Default => {
+                // No-op — the default mode is the behaviour-parity path.
+            }
+            ProfileTools::AllowList { tools: allow } => {
+                if allow.is_empty() {
+                    // Empty allow list would evict the entire registry
+                    // minus spawn_only tools; that is a surprising outcome
+                    // for profile authors, so treat it as a pass-through
+                    // with a warning. Authors who really want to kill
+                    // every tool should use an explicit `deny_list`.
+                    tracing::warn!(
+                        "profile declares empty allow_list — skipping filter; use deny_list to \
+                         blacklist tools"
+                    );
+                    return;
+                }
+                let spawn_only = self.spawn_only.clone();
+                let allow_entries: Vec<String> = allow.clone();
+                self.retain(|name| {
+                    spawn_only.contains(name)
+                        || allow_entries
+                            .iter()
+                            .any(|entry| policy::entry_matches(entry, name))
+                });
+            }
+            ProfileTools::DenyList { tools: deny } => {
+                if deny.is_empty() {
+                    return;
+                }
+                let spawn_only = self.spawn_only.clone();
+                let deny_entries: Vec<String> = deny.clone();
+                self.retain(|name| {
+                    spawn_only.contains(name)
+                        || !deny_entries
+                            .iter()
+                            .any(|entry| policy::entry_matches(entry, name))
+                });
+            }
+        }
+    }
+
     /// Set a provider-specific policy that filters `specs()` and `execute()`.
     ///
     /// Unlike `apply_policy` which permanently removes tools from the registry,
@@ -1365,5 +1432,235 @@ mod context_threading_tests {
 
         let seen = tool.seen.lock().unwrap().clone();
         assert_eq!(seen.as_deref(), Some(""));
+    }
+}
+
+#[cfg(test)]
+mod profile_filter_tests {
+    //! M8.3 — `filter_by_profile` narrows the registry through a
+    //! [`crate::profile::ProfileTools`] declaration. Behaviour parity
+    //! with today's default path is covered by the
+    //! `default_mode_is_pass_through` test.
+
+    use super::*;
+    use crate::profile::ProfileTools;
+
+    fn builtin_names(reg: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = reg.tools.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn should_not_filter_when_profile_mode_is_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        let before = builtin_names(&reg);
+
+        reg.filter_by_profile(&ProfileTools::Default);
+
+        let after = builtin_names(&reg);
+        assert_eq!(before, after, "default mode must not narrow the registry");
+    }
+
+    #[test]
+    fn should_filter_tool_registry_by_allow_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+
+        reg.filter_by_profile(&ProfileTools::AllowList {
+            tools: vec!["read_file".into(), "group:search".into()],
+        });
+
+        let names: Vec<String> = reg.tools.keys().cloned().collect();
+        assert!(names.contains(&"read_file".to_string()));
+        // group:search expands to glob/grep/list_dir.
+        assert!(names.contains(&"glob".to_string()));
+        assert!(names.contains(&"grep".to_string()));
+        assert!(names.contains(&"list_dir".to_string()));
+        // Not on the allow list, not spawn_only -> evicted.
+        assert!(!names.contains(&"shell".to_string()));
+        assert!(!names.contains(&"web_fetch".to_string()));
+    }
+
+    #[test]
+    fn should_filter_tool_registry_by_deny_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        let before = builtin_names(&reg);
+
+        reg.filter_by_profile(&ProfileTools::DenyList {
+            tools: vec!["web_fetch".into(), "browser".into()],
+        });
+
+        let after = builtin_names(&reg);
+        assert!(!after.contains(&"web_fetch".to_string()));
+        assert!(!after.contains(&"browser".to_string()));
+        // Everything else must survive.
+        let expected_survivors: Vec<String> = before
+            .iter()
+            .filter(|n| n.as_str() != "web_fetch" && n.as_str() != "browser")
+            .cloned()
+            .collect();
+        for n in expected_survivors {
+            assert!(
+                after.contains(&n),
+                "{n} should survive the deny-list filter",
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_filter_spawn_only_tools_from_allow_list() {
+        // A spawn_only tool that does not appear in the allow list must
+        // still be retained — it carries background execution wiring the
+        // runtime depends on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        reg.mark_spawn_only("mofa_slides", None);
+        // Fake-register the tool so the filter has something to keep.
+        // We reuse an existing builtin name for the test; mark_spawn_only
+        // is just an annotation, it doesn't need the name to exist in
+        // `self.tools` — for the retention check we need a real entry,
+        // so register a no-op tool under that name.
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+        struct Noop;
+        #[async_trait]
+        impl Tool for Noop {
+            fn name(&self) -> &str {
+                "mofa_slides"
+            }
+            fn description(&self) -> &str {
+                "noop"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+        reg.register(Noop);
+
+        reg.filter_by_profile(&ProfileTools::AllowList {
+            tools: vec!["read_file".into()],
+        });
+
+        let names: Vec<String> = reg.tools.keys().cloned().collect();
+        assert!(
+            names.contains(&"mofa_slides".to_string()),
+            "spawn_only tools must survive an allow-list filter",
+        );
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(!names.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn should_not_filter_spawn_only_tools_from_deny_list() {
+        // Same invariant, but the user declared a deny list that *names*
+        // the spawn-only tool. The registry must still retain it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        reg.mark_spawn_only("mofa_slides", None);
+
+        use async_trait::async_trait;
+        use eyre::Result;
+        use serde_json::Value;
+        struct Noop;
+        #[async_trait]
+        impl Tool for Noop {
+            fn name(&self) -> &str {
+                "mofa_slides"
+            }
+            fn description(&self) -> &str {
+                "noop"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+        reg.register(Noop);
+
+        reg.filter_by_profile(&ProfileTools::DenyList {
+            tools: vec!["mofa_slides".into()],
+        });
+
+        let names: Vec<String> = reg.tools.keys().cloned().collect();
+        assert!(
+            names.contains(&"mofa_slides".to_string()),
+            "spawn_only tools cannot be evicted by a profile deny list",
+        );
+    }
+
+    #[test]
+    fn empty_allow_list_is_a_pass_through_with_warning() {
+        // Defensive: an empty allow list would wipe the registry (minus
+        // spawn_only). That is almost always an author mistake, so the
+        // filter treats it as a pass-through. Authors who really want an
+        // empty registry should use `deny_list` explicitly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        let before = builtin_names(&reg);
+
+        reg.filter_by_profile(&ProfileTools::AllowList { tools: Vec::new() });
+
+        let after = builtin_names(&reg);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn empty_deny_list_is_a_pass_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+        let before = builtin_names(&reg);
+
+        reg.filter_by_profile(&ProfileTools::DenyList { tools: Vec::new() });
+
+        let after = builtin_names(&reg);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn allow_list_wildcard_matches_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reg = ToolRegistry::with_builtins(dir.path());
+
+        reg.filter_by_profile(&ProfileTools::AllowList {
+            tools: vec!["workspace_*".into()],
+        });
+
+        let names: Vec<String> = reg.tools.keys().cloned().collect();
+        assert!(names.contains(&"workspace_log".to_string()));
+        assert!(names.contains(&"workspace_show".to_string()));
+        assert!(names.contains(&"workspace_diff".to_string()));
+        assert!(!names.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn coding_profile_produces_same_registry_as_default_builtins() {
+        // Behaviour parity gate: applying the built-in `coding` profile
+        // to a builtin registry must leave the registry IDENTICAL to
+        // what today's no-flag default path produces. This is the
+        // critical regression guard called out in the M8.3 issue.
+        use crate::profile::ProfileDefinition;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reference = ToolRegistry::with_builtins(dir.path());
+        let reference_names = builtin_names(&reference);
+
+        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let mut profiled = ToolRegistry::with_builtins(dir.path());
+        coding.apply_to_registry(&mut profiled);
+
+        let profiled_names = builtin_names(&profiled);
+        assert_eq!(
+            reference_names, profiled_names,
+            "coding profile must preserve behaviour parity with the default path",
+        );
     }
 }

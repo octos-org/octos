@@ -28,6 +28,7 @@ pub mod mcp_server;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
+pub mod profile;
 pub mod progress;
 pub mod prompt_guard;
 pub mod prompt_layer;
