@@ -536,6 +536,11 @@ pub struct TaskSupervisor {
     /// lifecycle state itself lives in `tasks`, handles are only valid for
     /// the current process lifetime.
     handles: Arc<Mutex<HashMap<String, TaskHandles>>>,
+    /// Path to the newline-JSON harness event sink used to emit
+    /// `task.lifecycle.cancelled` events. Attached via
+    /// `attach_harness_event_sink` — without it, `cancel_task` still
+    /// performs the abort + state transition but skips the event write.
+    harness_event_sink_path: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -552,6 +557,7 @@ impl TaskSupervisor {
             on_change: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             handles: Arc::new(Mutex::new(HashMap::new())),
+            harness_event_sink_path: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -966,6 +972,21 @@ impl TaskSupervisor {
                     self.mark_failed(task_id, data.message.clone());
                 }
             }
+            HarnessEventPayload::TaskLifecycleCancelled { data } => {
+                // Cancellation events are emitted by the supervisor itself
+                // when `cancel_task` runs. Replaying one from an external
+                // sink should be idempotent: we only transition if the task
+                // is not already terminal to avoid racing with a concurrent
+                // cancel_task call that already wrote the same record.
+                if snapshot.status.is_active() {
+                    let reason = if data.reason.is_empty() {
+                        "cancelled by operator".to_string()
+                    } else {
+                        data.reason.clone()
+                    };
+                    let _ = self.cancel_task(task_id, Some(reason));
+                }
+            }
         }
 
         Ok(())
@@ -1019,6 +1040,19 @@ impl TaskSupervisor {
     /// preempted, but we still record the terminal transition so operators
     /// get a consistent audit record.
     pub fn cancel_task(&self, task_id: &str, reason: Option<String>) -> Result<(), CancelError> {
+        self.cancel_task_with_origin(task_id, reason, "operator", None)
+    }
+
+    /// Cancel a running task with a caller-specified origin label and an
+    /// optional relaunch pointer. Used by the relaunch flow to emit the
+    /// `task.lifecycle.cancelled` event with `relaunched_as` populated.
+    pub fn cancel_task_with_origin(
+        &self,
+        task_id: &str,
+        reason: Option<String>,
+        origin: &'static str,
+        relaunched_as: Option<String>,
+    ) -> Result<(), CancelError> {
         let existing = self.get_task(task_id).ok_or(CancelError::UnknownTask)?;
         if matches!(
             existing.status,
@@ -1052,9 +1086,67 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
-            record_task_cancellation("operator");
+            record_task_cancellation(origin);
+            self.emit_cancelled_event(task, &effective_reason, origin, relaunched_as.as_deref());
         }
         Ok(())
+    }
+
+    fn emit_cancelled_event(
+        &self,
+        task: &BackgroundTask,
+        reason: &str,
+        origin: &'static str,
+        relaunched_as: Option<&str>,
+    ) {
+        let session_id = task
+            .parent_session_key
+            .clone()
+            .or_else(|| task.session_key.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let event = HarnessEvent::task_lifecycle_cancelled(
+            session_id,
+            task.id.clone(),
+            reason,
+            origin,
+            relaunched_as.map(str::to_string),
+        );
+        let sink = {
+            let guard = self
+                .harness_event_sink_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        if let Some(sink) = sink {
+            if let Err(error) = crate::harness_events::write_event_to_sink(&sink, &event) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    sink = %sink,
+                    error = %error,
+                    "failed to persist task.lifecycle.cancelled event"
+                );
+            }
+        }
+    }
+
+    /// Attach a harness event sink path used by `cancel_task` to emit
+    /// `task.lifecycle.cancelled` events. Must be the same newline-JSON
+    /// sink the rest of the harness events stream writes to.
+    pub fn attach_harness_event_sink(&self, path: impl Into<String>) {
+        let mut guard = self
+            .harness_event_sink_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(path.into());
+    }
+
+    pub fn harness_event_sink_path(&self) -> Option<String> {
+        let guard = self
+            .harness_event_sink_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clone()
     }
 
     /// Deliver an inbox message to a running sub-agent.
@@ -1146,6 +1238,17 @@ impl TaskSupervisor {
         }
         self.persist_snapshot_by_id(&new_task_id);
         record_task_relaunch("accepted");
+
+        // If the original is still active, cancel it with a relaunch
+        // origin so the emitted `task.lifecycle.cancelled` event carries
+        // the `relaunched_as` pointer. Ignore AlreadyTerminal — the caller
+        // may have already cancelled/waited.
+        let _ = self.cancel_task_with_origin(
+            task_id,
+            Some(format!("relaunched as {new_task_id}")),
+            "relaunch",
+            Some(new_task_id.clone()),
+        );
 
         Ok(RelaunchPlan {
             new_task_id,
@@ -1872,6 +1975,79 @@ mod tests {
             .relaunch_task(&id, serde_json::json!({}))
             .expect_err("should require spec snapshot");
         assert_eq!(err, RelaunchError::NoSpecSnapshot);
+    }
+
+    #[test]
+    fn should_emit_task_lifecycle_cancelled_event_to_sink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink_path = dir.path().join("events.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.attach_harness_event_sink(sink_path.to_string_lossy().to_string());
+
+        let id = supervisor.register("spawn", "call-evt", Some("api:sess"));
+        supervisor.mark_running(&id);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        supervisor.register_abort(&id, handle.abort_handle(), None, None);
+
+        supervisor
+            .cancel_task(&id, Some("kill please".into()))
+            .unwrap();
+
+        let body = std::fs::read_to_string(&sink_path).unwrap();
+        let mut lines = body.lines();
+        let first = lines.next().expect("at least one line emitted");
+        let parsed: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(parsed["schema"], crate::harness_events::HARNESS_EVENT_SCHEMA_V1);
+        assert_eq!(parsed["kind"], "task.lifecycle.cancelled");
+        assert_eq!(parsed["task_id"], id);
+        assert_eq!(parsed["reason"], "kill please");
+        assert_eq!(parsed["origin"], "operator");
+        assert!(parsed.get("relaunched_as").map(|v| v.is_null()).unwrap_or(true));
+
+        rt.shutdown_background();
+    }
+
+    #[test]
+    fn should_cancel_original_when_relaunched_and_emit_relaunched_as() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink_path = dir.path().join("events.jsonl");
+
+        let supervisor = TaskSupervisor::new();
+        supervisor.attach_harness_event_sink(sink_path.to_string_lossy().to_string());
+
+        let id = supervisor.register("spawn", "call-r2", Some("api:sess"));
+        supervisor.mark_running(&id);
+        let spec = serde_json::json!({"task": "original"});
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        supervisor.register_abort(&id, handle.abort_handle(), None, Some(spec));
+
+        let plan = supervisor
+            .relaunch_task(&id, serde_json::json!({"task": "v2"}))
+            .unwrap();
+
+        let original = supervisor.get_task(&id).unwrap();
+        assert_eq!(original.status, TaskStatus::Cancelled);
+        assert_eq!(
+            original.cancellation_reason.as_deref(),
+            Some(format!("relaunched as {}", plan.new_task_id).as_str())
+        );
+
+        let body = std::fs::read_to_string(&sink_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["origin"], "relaunch");
+        assert_eq!(parsed["relaunched_as"], plan.new_task_id);
+
+        rt.shutdown_background();
     }
 
     #[test]

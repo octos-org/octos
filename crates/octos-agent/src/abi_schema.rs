@@ -118,6 +118,16 @@ pub const CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION: u32 = 1;
 /// Emitted as part of `octos.harness.event.v1` with `kind: "error"`.
 pub const HARNESS_ERROR_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::TaskLifecycleCancelled`](crate::harness_events::HarnessEventPayload::TaskLifecycleCancelled)
+/// event emitted by [`TaskSupervisor::cancel_task`](crate::task_supervisor::TaskSupervisor::cancel_task).
+///
+/// The v1 contract carries `task_id`, `reason`, and `origin`. Downstream
+/// tooling (provenance ledger, Matrix audit, dashboard timeline) MUST
+/// validate the version before reading additive fields so new optional
+/// fields remain backward compatible.
+pub const TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION: u32 = 1;
+
 /// Typed error returned when a deserialized value advertises a schema version
 /// the running harness does not know how to handle.
 ///

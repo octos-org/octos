@@ -20,7 +20,7 @@ use tracing::warn;
 use crate::abi_schema::{
     COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
     SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
-    SWARM_REVIEW_DECISION_SCHEMA_VERSION,
+    SWARM_REVIEW_DECISION_SCHEMA_VERSION, TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION,
 };
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
@@ -58,6 +58,10 @@ fn default_cost_attribution_schema_version() -> u32 {
 
 fn default_swarm_review_decision_schema_version() -> u32 {
     SWARM_REVIEW_DECISION_SCHEMA_VERSION
+}
+
+fn default_task_lifecycle_cancelled_schema_version() -> u32 {
+    TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +287,15 @@ pub enum HarnessEventPayload {
     CredentialRotation {
         #[serde(flatten)]
         data: HarnessCredentialRotationEvent,
+    },
+    /// Emitted by [`TaskSupervisor::cancel_task`](crate::task_supervisor::TaskSupervisor::cancel_task)
+    /// when an operator (REST handler, PM agent tool, Matrix puppet steer)
+    /// kills a running sub-agent. Carries the task id plus a human-readable
+    /// reason and structured origin (`operator` / `scheduler` / `auto`).
+    #[serde(rename = "task.lifecycle.cancelled")]
+    TaskLifecycleCancelled {
+        #[serde(flatten)]
+        data: HarnessTaskLifecycleCancelledEvent,
     },
     Error {
         #[serde(flatten)]
@@ -577,6 +590,41 @@ pub struct HarnessRoutingDecisionEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Typed payload carried by the
+/// [`HarnessEventPayload::TaskLifecycleCancelled`] event variant (M7.9).
+///
+/// Produced by [`TaskSupervisor::cancel_task`](crate::task_supervisor::TaskSupervisor::cancel_task)
+/// when an operator kills a running sub-agent. Downstream tooling
+/// consumes the typed shape instead of re-parsing free-form JSON so the
+/// provenance ledger, Matrix audit, and dashboard timeline all agree on
+/// the lifecycle transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessTaskLifecycleCancelledEvent {
+    #[serde(default = "default_task_lifecycle_cancelled_schema_version")]
+    pub schema_version: u32,
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Human-readable reason recorded when the cancel was requested.
+    /// Bounded to [`MAX_MESSAGE_BYTES`] so a single cancel cannot blow
+    /// the event line limit.
+    pub reason: String,
+    /// Stable origin label: `operator`, `scheduler`, `auto`, or
+    /// `parent_shutdown`. Used to slice the `octos_task_cancellation_total`
+    /// Prometheus counter so operators can separate human kills from
+    /// automated shutdown.
+    pub origin: String,
+    /// Optional lineage: if the cancel was followed by a relaunch, the
+    /// fresh task id so dashboards can stitch the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_as: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Structured credential rotation event (M6.5).
 ///
 /// Emitted by the credential pool on every successful selection. Consumers
@@ -732,6 +780,32 @@ impl HarnessEvent {
                     lane: None,
                     reasons,
                     input_chars,
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Construct a `task.lifecycle.cancelled` event (M7.9).
+    pub fn task_lifecycle_cancelled(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        reason: impl Into<String>,
+        origin: impl Into<String>,
+        relaunched_as: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::TaskLifecycleCancelled {
+                data: HarnessTaskLifecycleCancelledEvent {
+                    schema_version: TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION,
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    workflow: None,
+                    phase: None,
+                    reason: reason.into(),
+                    origin: origin.into(),
+                    relaunched_as: relaunched_as.map(Into::into),
                     extra: HashMap::new(),
                 },
             },
@@ -935,6 +1009,22 @@ impl HarnessEvent {
                 )?;
                 validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
                 validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
+            }
+            HarnessEventPayload::TaskLifecycleCancelled { data } => {
+                if data.schema_version > TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported task lifecycle cancelled schema_version {} (max supported: {})",
+                        data.schema_version, TASK_LIFECYCLE_CANCELLED_SCHEMA_VERSION
+                    )));
+                }
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                validate_optional_name("phase", data.phase.as_deref(), MAX_PHASE_BYTES)?;
+                validate_bounded("reason", &data.reason, MAX_MESSAGE_BYTES)?;
+                validate_bounded("origin", &data.origin, MAX_PHASE_BYTES)?;
+                if let Some(relaunched_as) = data.relaunched_as.as_deref() {
+                    validate_bounded("relaunched_as", relaunched_as, MAX_TASK_ID_BYTES)?;
+                }
             }
             HarnessEventPayload::Error { data } => {
                 if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
@@ -1189,6 +1279,24 @@ impl HarnessEvent {
                     "strategy": data.strategy,
                 })
             }
+            HarnessEventPayload::TaskLifecycleCancelled { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                let current_phase = data.phase.as_deref().or(fallback_current_phase);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "schema_version": data.schema_version,
+                    "kind": "task.lifecycle.cancelled",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "phase": data.phase,
+                    "current_phase": current_phase,
+                    "reason": data.reason,
+                    "origin": data.origin,
+                    "relaunched_as": data.relaunched_as,
+                })
+            }
             HarnessEventPayload::Error { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -1226,6 +1334,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
+            HarnessEventPayload::TaskLifecycleCancelled { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
@@ -1245,6 +1354,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
+            HarnessEventPayload::TaskLifecycleCancelled { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
@@ -1264,6 +1374,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::TaskLifecycleCancelled { data } => data.workflow.as_deref(),
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
@@ -1283,6 +1394,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::TaskLifecycleCancelled { data } => data.phase.as_deref(),
             HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
