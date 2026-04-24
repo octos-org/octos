@@ -209,6 +209,7 @@ pub mod recall_memory;
 pub mod research_utils;
 pub mod save_memory;
 pub mod send_file;
+pub mod send_to_agent;
 pub mod shell;
 #[allow(dead_code)]
 pub(crate) mod site_crawl;
@@ -266,6 +267,7 @@ pub use activate_tools::ActivateToolsTool;
 pub use browser::BrowserTool;
 pub use check_background_tasks::CheckBackgroundTasksTool;
 pub use check_workspace_contract::CheckWorkspaceContractTool;
+pub use send_to_agent::SendToAgentTool;
 pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 pub use workspace_history::{WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool};
 
