@@ -135,6 +135,17 @@ pub struct Config {
     #[serde(default)]
     pub tunnel_domain: Option<String>,
 
+    /// Public-facing base domain each mini serves profiles under
+    /// (e.g. `"crew.ominix.io"`, `"bot.ominix.io"`, `"ocean.ominix.io"`).
+    ///
+    /// Used to compose CORS allowlist entries and surface preview URLs
+    /// in the admin dashboard. When `None` the server defaults to
+    /// `"crew.ominix.io"` for backward compatibility. Also read from
+    /// `OCTOS_BASE_DOMAIN` env var, which takes precedence over the
+    /// value in `config.json` when both are set.
+    #[serde(default)]
+    pub base_domain: Option<String>,
+
     /// frps server address for cloud/tenant mode (e.g. "163.192.33.32").
     /// Also read from FRPS_SERVER env var.
     #[serde(default)]
@@ -1349,6 +1360,23 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.tool_policy_by_provider.is_empty());
+    }
+
+    #[test]
+    fn should_deserialize_base_domain_from_config_json() {
+        let json = r#"{"base_domain": "ocean.ominix.io"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.base_domain.as_deref(), Some("ocean.ominix.io"));
+    }
+
+    #[test]
+    fn should_default_base_domain_to_none_when_absent() {
+        // Backward compat: existing configs without `base_domain` must
+        // deserialize to `None` so read sites fall back to the legacy
+        // `crew.ominix.io` default.
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.base_domain.is_none());
     }
 
     #[test]

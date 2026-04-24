@@ -34,28 +34,55 @@ pub enum AuthIdentity {
     User { id: String, role: UserRole },
 }
 
+/// Backward-compatible default when the operator has not configured a
+/// base domain via `config.base_domain` or `OCTOS_BASE_DOMAIN`.
+pub const DEFAULT_BASE_DOMAIN: &str = "crew.ominix.io";
+
+/// Compose the CORS allowlist for a given base domain.
+///
+/// The returned list always contains the bare-`ominix.io` entries and
+/// the loopback dev origins, plus the three `app./admin./api.` entries
+/// for the configured base domain. `None` falls back to the legacy
+/// `crew.ominix.io` triple so existing minis keep working without config
+/// changes.
+pub fn cors_allowlist_for_base_domain(base: Option<&str>) -> Vec<String> {
+    let base = base.unwrap_or(DEFAULT_BASE_DOMAIN);
+    vec![
+        "https://app.ominix.io".to_string(),
+        "https://admin.ominix.io".to_string(),
+        "https://api.ominix.io".to_string(),
+        format!("https://app.{base}"),
+        format!("https://admin.{base}"),
+        format!("https://api.{base}"),
+        "http://localhost:3000".to_string(),
+        "http://localhost:5173".to_string(),
+    ]
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     // Restrict CORS to an explicit allowlist of known origins.
     // Do NOT use suffix matching (e.g. ends_with(".ominix.io")) — a hijacked
     // subdomain would pass the check and enable cross-origin requests.
-    const ALLOWED_ORIGINS: &[&str] = &[
-        "https://app.ominix.io",
-        "https://admin.ominix.io",
-        "https://api.ominix.io",
-        "https://app.crew.ominix.io",
-        "https://admin.crew.ominix.io",
-        "https://api.crew.ominix.io",
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ];
-    let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
-            let o = origin.to_str().unwrap_or("");
-            ALLOWED_ORIGINS.contains(&o)
-        }))
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+    //
+    // The allowlist is composed from `state.base_domain` at startup so each
+    // mini accepts its own public subdomain variants (`crew.`, `bot.`,
+    // `octos.`, `ocean.`) without redeploys. `None` preserves the legacy
+    // `crew.ominix.io` triple.
+    let allowed_origins: Arc<Vec<String>> =
+        Arc::new(cors_allowlist_for_base_domain(state.base_domain.as_deref()));
+    let cors = {
+        let allowed = allowed_origins.clone();
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(
+                move |origin, _| {
+                    let o = origin.to_str().unwrap_or("");
+                    allowed.iter().any(|s| s == o)
+                },
+            ))
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    };
 
     // Public auth endpoints (no auth required)
     let auth_api = Router::new()
@@ -1057,5 +1084,44 @@ mod tests {
         assert_eq!(body["error"], "not_found");
 
         server.abort();
+    }
+
+    #[test]
+    fn should_compose_cors_allowlist_from_base_domain() {
+        let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
+        assert!(
+            list.contains(&"https://app.bot.ominix.io".to_string()),
+            "missing app.bot.ominix.io in {list:?}"
+        );
+        assert!(
+            list.contains(&"https://admin.bot.ominix.io".to_string()),
+            "missing admin.bot.ominix.io in {list:?}"
+        );
+        assert!(
+            list.contains(&"https://api.bot.ominix.io".to_string()),
+            "missing api.bot.ominix.io in {list:?}"
+        );
+        // The bare ominix.io entries remain for shared landing pages.
+        assert!(list.contains(&"https://app.ominix.io".to_string()));
+    }
+
+    #[test]
+    fn should_default_cors_to_crew_ominix_io_when_unset() {
+        // Backward-compat: when no base_domain is configured the server
+        // must still accept the historical `*.crew.ominix.io` origins so
+        // existing minis keep working without a config change.
+        let list = cors_allowlist_for_base_domain(None);
+        assert!(list.contains(&"https://app.crew.ominix.io".to_string()));
+        assert!(list.contains(&"https://admin.crew.ominix.io".to_string()));
+        assert!(list.contains(&"https://api.crew.ominix.io".to_string()));
+    }
+
+    #[test]
+    fn should_not_accept_unrelated_origin_in_base_domain_allowlist() {
+        // Defence-in-depth: a subdomain of a different tenant must never
+        // appear in the composed list even when a base_domain is set.
+        let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
+        assert!(!list.iter().any(|s| s.contains("evil.example.com")));
+        assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
     }
 }
