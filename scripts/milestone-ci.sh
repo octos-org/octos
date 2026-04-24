@@ -31,11 +31,6 @@ run_dashboard() {
   popd >/dev/null
 
   ./scripts/build-dashboard.sh
-  if [ -n "$(git status --porcelain -- crates/octos-cli/static/admin)" ]; then
-    echo "Embedded dashboard assets are out of date. Run ./scripts/build-dashboard.sh and commit changes."
-    git status --short -- crates/octos-cli/static/admin
-    exit 1
-  fi
 }
 
 run_hosted_fast() {

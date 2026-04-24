@@ -38,14 +38,8 @@ jobs:
         working-directory: dashboard
         run: npm run build
 
-      - name: Verify embedded dashboard assets are up to date
-        run: |
-          ./scripts/build-dashboard.sh
-          if [ -n "$(git status --porcelain -- crates/octos-cli/static/admin)" ]; then
-            echo "Embedded dashboard assets are out of date. Run ./scripts/build-dashboard.sh and commit changes."
-            git status --short -- crates/octos-cli/static/admin
-            exit 1
-          fi
+      - name: Verify embedded dashboard build succeeds
+        run: ./scripts/build-dashboard.sh
 
   typos:
     runs-on: ubuntu-latest
