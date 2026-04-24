@@ -19,10 +19,10 @@
 //!   not been updated) still get predictable behaviour.
 //! - [`ToolContext`] carries the legacy fields *plus* placeholder stubs for
 //!   future milestones: [`AgentDefinitions`], [`ToolPermissions`],
-//!   [`FileStateCache`], [`Notifications`], and [`AppStateHandle`]. Each stub
-//!   is annotated with the future issue that will populate it. They all have
-//!   cheap zero-value constructors so today's executor can build a context
-//!   without wiring.
+//!   [`FileStateCache`] (populated in M8.4), [`Notifications`], and
+//!   [`AppStateHandle`]. Each stub is annotated with the future issue that
+//!   will populate it. They all have cheap zero-value constructors so today's
+//!   executor can build a context without wiring.
 //!
 //! The executor still sets [`TOOL_CTX`] for legacy plugin tools that rely on
 //! the task-local read path (see `plugins/tool.rs`). Once every tool is
@@ -90,29 +90,13 @@ impl ToolPermissions {
     }
 }
 
-/// File-state cache that mirrors `FileStateCache` from Claude Code.
+/// File-state cache re-export (M8.4).
 ///
-/// M8.4 will grow this into the full LRU + mtime/hash invalidation cache
-/// described in the runtime plan (see issue #536 → M8.4). Today it is an
-/// empty stub so the context can hand out a shared handle without allocation.
-#[derive(Debug, Default)]
-pub struct FileStateCache {
-    // M8.4 will add the LRU state, mtime map, hash index, and
-    // `is_partial_view` tracking here.
-}
-
-impl FileStateCache {
-    /// Create an empty file-state cache handle.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether the cache currently has any recorded file entries. Always
-    /// `false` until M8.4 fills in the map.
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-}
+/// The concrete LRU + mtime/hash implementation lives in
+/// [`crate::file_state_cache`]; this re-export keeps the historical public
+/// path (`crate::tools::FileStateCache`) stable for downstream users while
+/// the ToolContext carries a shared handle.
+pub use crate::file_state_cache::FileStateCache;
 
 /// Inbox of in-flight notifications surfaced to tools and the agent loop.
 ///
@@ -173,7 +157,13 @@ pub struct ToolContext {
     pub agent_definitions: Arc<AgentDefinitions>,
     /// Per-tool permission facts. M8.3 will populate this.
     pub permissions: ToolPermissions,
-    /// File-state cache shared across tools in a turn. M8.4 will populate this.
+    /// File-state cache shared across tools in a turn (M8.4).
+    ///
+    /// File tools consult this cache on read and invalidate it on write. When
+    /// `None`, tools behave as they did pre-M8.4 (no cache, no stub). The
+    /// cache is wrapped in `Arc` so it can be cloned cheaply into subagents;
+    /// use [`FileStateCache::clone_for_subagent`] when a delegate should
+    /// receive an independent copy instead of a shared handle.
     pub file_state_cache: Option<Arc<FileStateCache>>,
     /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
     pub notifications: Arc<Notifications>,
