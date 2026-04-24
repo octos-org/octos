@@ -515,8 +515,16 @@ $(launchd_env_var_xml "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(launchd_env_var_xml "SMTP_HOST" "${SMTP_HOST:-}")
 $(launchd_env_var_xml "SMTP_PORT" "${SMTP_PORT:-}")
 $(launchd_env_var_xml "SMTP_USERNAME" "${SMTP_USERNAME:-}")
-$(launchd_env_var_xml "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
 $(launchd_env_var_xml "SMTP_FROM" "${SMTP_FROM:-}")
+        <!--
+            SMTP_PASSWORD intentionally NOT set here. The password is managed
+            via the admin UI (per-profile `email.password` or `password_env`)
+            which flows to skill subprocesses through process_manager and to
+            the OTP sender via serve.rs. Embedding it in the plist with an
+            `${SMTP_PASSWORD:-}` default defeats the profile-env-vars fallback
+            in serve.rs because std::env::var returns Ok("") not Err when the
+            operator forgets to export it at deploy time.
+        -->
     </dict>
     <key>WorkingDirectory</key>
     <string>$HOME</string>
@@ -557,8 +565,9 @@ $(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
 $(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
 $(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
-$(systemd_env_var_line "SMTP_PASSWORD" "${SMTP_PASSWORD:-}")
 $(systemd_env_var_line "SMTP_FROM" "${SMTP_FROM:-}")
+# SMTP_PASSWORD intentionally not set here — managed via admin UI profile
+# and flowed through via process_manager + serve.rs fallback.
 WorkingDirectory=$HOME
 
 [Install]
