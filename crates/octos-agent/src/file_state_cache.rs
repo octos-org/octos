@@ -263,6 +263,53 @@ impl FileStateCache {
         inner.total_size_bytes = 0;
     }
 
+    /// M8.4/M8.6 fix-first item 7: seed the cache from recovered
+    /// resume refs.
+    ///
+    /// The legacy session-actor hand-off consumed
+    /// [`octos_bus::ReplacementStateRef`] entries but did nothing with
+    /// them — the TODO(M8.4) comment explicitly flagged this as a
+    /// gap. The recovered refs carry the file path + optional content
+    /// hash the transcript claimed was last read. We can NOT fully
+    /// reconstruct the cache from a ref alone (the content bytes live
+    /// only in the original tool result, which has been pruned), but
+    /// we can record a best-effort entry with the ref's hash so a
+    /// later `read_file` can at least detect a changed mtime.
+    ///
+    /// When `content_hash` is missing on the ref (the pre-M8.4
+    /// transcript-only path) we skip that entry — a placeholder with a
+    /// zero hash would turn every subsequent read into a false
+    /// [FILE_UNCHANGED]. Returns the number of entries actually seeded.
+    pub fn seed_from_replacement_refs<'a, I>(&self, refs: I) -> usize
+    where
+        I: IntoIterator<Item = &'a octos_bus::ReplacementStateRef>,
+    {
+        let mut seeded = 0_usize;
+        for r in refs {
+            let Some(hash_str) = r.content_hash.as_deref() else {
+                continue;
+            };
+            let Ok(hash) = hash_str.parse::<u64>() else {
+                continue;
+            };
+            // Build a "best guess" CacheEntry: no mtime yet (set to
+            // UNIX_EPOCH so the first real read will always miss and
+            // repopulate); hash comes from the recovered ref; file size
+            // is unknown (0).
+            let entry = CacheEntry::new(
+                r.path.clone(),
+                std::time::SystemTime::UNIX_EPOCH,
+                hash,
+                0,
+                false,
+                None,
+            );
+            self.put(entry);
+            seeded += 1;
+        }
+        seeded
+    }
+
     /// Return a deep-copied cache for a subagent.
     ///
     /// The child's writes/invalidations do not race the parent. The caps are

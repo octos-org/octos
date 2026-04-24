@@ -443,6 +443,36 @@ impl TieredCompactionRunner {
         let outcome = self.tier3.compact(messages, phase);
         Some(outcome.into())
     }
+
+    /// M8.4/M8.5 fix-first item 7: tier-3 compaction boundary hook.
+    ///
+    /// When tier 3 fires, the old tool-result messages containing
+    /// `[FILE_UNCHANGED]` stubs are pruned/summarised. The matching
+    /// entries in the [`crate::file_state_cache::FileStateCache`] must
+    /// be cleared so a subsequent `read_file` does not short-circuit
+    /// against stale identity. The M8.4 docs promised this; the fix-
+    /// first checklist pins it.
+    ///
+    /// Callers that attach both the tiered runner and a file-state
+    /// cache should follow a tier-3 run with a
+    /// `cache.clear()` call — this helper performs the conditional
+    /// clear inline so the contract is easier to adopt.
+    pub fn run_tier3_and_invalidate_cache(
+        &self,
+        messages: &mut Vec<Message>,
+        phase: CompactionPhase,
+        file_state_cache: Option<&std::sync::Arc<crate::file_state_cache::FileStateCache>>,
+    ) -> Option<Tier3Report> {
+        let report = self.maybe_run_tier3(messages, phase)?;
+        // Tier 3 fired — clear the cache unconditionally. Partial
+        // invalidation would require tracking which files the pruned
+        // messages referenced; until that arrives, dropping the whole
+        // cache is the correctness-first policy.
+        if let Some(cache) = file_state_cache {
+            cache.clear();
+        }
+        Some(report)
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

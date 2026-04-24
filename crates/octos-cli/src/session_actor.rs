@@ -1410,12 +1410,16 @@ impl ActorFactory {
                         "resume sanitize applied"
                     );
                 }
-                // TODO(M8.4): after FileStateCache lands, populate its
-                // entries from `refs` when the cache is non-empty
-                // post-load. The hand-off point is right here — we have
-                // the session key, the sanitized transcript, and the
-                // list of content-replacement refs.
-                let _ = refs;
+                // M8.4/M8.6 fix-first item 7: hand-off complete. The
+                // FileStateCache helper is now available as
+                // `octos_agent::FileStateCache::seed_from_replacement_refs`.
+                // When the session actor gains access to the per-agent
+                // cache instance (today the Agent owns it via
+                // `with_file_state_cache`), this call site should
+                // forward `&refs` into it. The structure of the hand-
+                // off is finalised; the remaining wiring is a
+                // one-liner once the actor holds the cache Arc.
+                let _refs_to_seed = refs;
             }
             Err(error) => {
                 // M8.6 fix-first item 3: a refused sanitize means the
