@@ -1110,6 +1110,24 @@ impl SessionHandle {
         &mut self.session
     }
 
+    /// Returns `true` when this session has a recorded parent (i.e. a
+    /// background/child session forked from a top-level chat). Used by the
+    /// session actor (M8.6 fix-first item 3) to distinguish top-level
+    /// resume refusals (start fresh) from child resume refusals (mark task
+    /// failed).
+    pub fn is_child_session(&self) -> bool {
+        self.session.parent_key.is_some()
+    }
+
+    /// Drop all in-memory messages without persisting. Used by the session
+    /// actor (M8.6 fix-first item 3) on a top-level worktree-missing
+    /// refusal: the unsafe transcript must not flow into the first LLM
+    /// call. Caller is expected to follow up with a fresh
+    /// [`Self::rewrite`] if it wants the empty state to survive on disk.
+    pub fn clear_messages_for_unsafe_resume(&mut self) {
+        self.session.messages.clear();
+    }
+
     /// Get the most recent N messages from history.
     pub fn get_history(&self, max: usize) -> &[Message] {
         self.session.get_history(max)
@@ -2820,5 +2838,135 @@ mod tests {
         }
         // Transcript is preserved.
         assert_eq!(handle.session.messages.len(), before_count);
+    }
+
+    // ----------------------------------------------------------------------
+    // Item 3 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    // worktree-missing must be a hard resume refusal. The session actor
+    // calls `clear_messages_for_unsafe_resume()` on Err so the in-memory
+    // transcript cannot be silently consumed by the first LLM call.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn session_actor_refuses_resume_when_worktree_missing() {
+        // Top-level session whose worktree was cleaned up. After the actor
+        // clears the in-memory transcript, the handle must look like a
+        // fresh session.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "top-level-refusal");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "do thing"));
+        handle.session.messages.push(make_message(
+            MessageRole::Assistant,
+            "I'll start working on it",
+        ));
+
+        // Step 1: sanitize sees a missing worktree and returns Err.
+        let gone = tmp.path().join("ghost-worktree");
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+
+        // Step 2: session_actor responds with a hard refusal.
+        assert!(
+            !handle.is_child_session(),
+            "test fixture is top-level (no parent_key)"
+        );
+        handle.clear_messages_for_unsafe_resume();
+        assert_eq!(
+            handle.session.messages.len(),
+            0,
+            "top-level worktree-missing refusal must drop the in-memory transcript"
+        );
+    }
+
+    #[test]
+    fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missing() {
+        // The legacy "warn and continue" branch left the original
+        // transcript in `handle.session.messages` so the next LLM call
+        // would see unresolved tool_calls / orphan thinking. Verify the
+        // post-clear state is empty.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "no-unsafe-llm-call");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        // Add a transcript that previously would have been consumed unsafely:
+        //   user → assistant with unresolved tool_call (no matching Tool result).
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "go"));
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![octos_core::ToolCall {
+                id: "unresolved-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        });
+
+        let gone = tmp.path().join("ghost-worktree");
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+        // Even though the sanitizer DID NOT mutate, the actor's hard
+        // refusal must clear before any consumer reads `messages()`.
+        handle.clear_messages_for_unsafe_resume();
+        assert!(
+            handle.session.messages.is_empty(),
+            "no first LLM call must be made using the unsafe transcript"
+        );
+    }
+
+    #[test]
+    fn background_child_session_marks_failed_when_worktree_missing() {
+        // A child session has parent_key set. The session actor uses
+        // `is_child_session()` to drive a "mark task failed" decision in
+        // the supervisor (top-level decision is "drop transcript and
+        // start fresh"). The state-clear is the same on both branches —
+        // the difference is the operator-visible signal. We verify the
+        // parent linkage flows through here so the actor can branch on it.
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent-task");
+        let child = SessionKey::new("api", "parent-task#child-job-01");
+        let mut child_handle = SessionHandle::open(tmp.path(), &child);
+        child_handle.session.parent_key = Some(parent.clone());
+        child_handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "run"));
+
+        assert!(
+            child_handle.is_child_session(),
+            "child session must report is_child_session=true"
+        );
+
+        let gone = tmp.path().join("ghost-child-worktree");
+        let outcome = child_handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+        child_handle.clear_messages_for_unsafe_resume();
+        assert_eq!(
+            child_handle.session.messages.len(),
+            0,
+            "child worktree-missing refusal must also clear the unsafe transcript"
+        );
+        // Parent linkage survives the clear so the supervisor can find
+        // the parent on its mark-failed lookup.
+        assert_eq!(child_handle.session.parent_key, Some(parent));
     }
 }

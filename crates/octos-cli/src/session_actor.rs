@@ -1418,10 +1418,30 @@ impl ActorFactory {
                 let _ = refs;
             }
             Err(error) => {
+                // M8.6 fix-first item 3: a refused sanitize means the
+                // worktree is gone and the loaded transcript references
+                // state we cannot trust. The legacy "warn and continue"
+                // path silently fed the unsafe transcript into the first
+                // LLM call. We now hard-refuse:
+                //
+                // - top-level sessions: drop the in-memory transcript so
+                //   the actor restarts with an empty session. The disk
+                //   JSONL is left untouched so an operator can recover
+                //   it; only the in-memory copy is cleared.
+                // - child / background sessions: future workstream will
+                //   mark the task failed via the supervisor handle. We
+                //   already clear the transcript here as the safety
+                //   floor — caller-side task-failure plumbing is layered
+                //   on top of (not in place of) this refusal.
+                let is_child = session_handle.is_child_session();
+                session_handle.clear_messages_for_unsafe_resume();
+                let octos_bus::SanitizeError::WorktreeMissing { path, .. } = &error;
                 warn!(
                     session = %session_key,
-                    error = %error,
-                    "resume sanitize refused — continuing with original transcript"
+                    path = %path.display(),
+                    is_child,
+                    "resume sanitize HARD-REFUSED: worktree missing — \
+                     in-memory transcript dropped to prevent unsafe LLM call"
                 );
             }
         }
