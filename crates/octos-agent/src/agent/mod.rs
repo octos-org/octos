@@ -177,6 +177,11 @@ pub struct Agent {
     /// clone is O(1). When left at the default (empty registry) the agent
     /// behaves exactly as pre-M8.2.
     pub(super) agent_definitions: Arc<crate::agents::AgentDefinitions>,
+    /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
+    /// introspect the active profile name, compaction overrides, and model
+    /// preferences. `None` means no profile was explicitly applied — the
+    /// agent runs in legacy pre-M8.3 mode.
+    pub(super) profile: Option<Arc<crate::profile::ProfileDefinition>>,
 }
 
 impl Agent {
@@ -208,6 +213,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            profile: None,
         }
     }
 
@@ -240,6 +246,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            profile: None,
         }
     }
 
@@ -251,6 +258,32 @@ impl Agent {
     pub fn with_agent_definitions(mut self, defs: Arc<crate::agents::AgentDefinitions>) -> Self {
         self.agent_definitions = defs;
         self
+    }
+
+    /// Record the active [`crate::profile::ProfileDefinition`] envelope.
+    ///
+    /// Call this after the caller has already applied the profile's tool
+    /// filter to the [`crate::tools::ToolRegistry`] (via
+    /// [`crate::tools::ToolRegistry::filter_by_profile`]) and passed the
+    /// filtered registry into [`Agent::new`]. This setter only *records*
+    /// the profile so downstream code can introspect the active name,
+    /// compaction policy overrides, and model preferences.
+    ///
+    /// Fields that today land as *recorded only* (compaction policy, model
+    /// preferences, MCP server ids) keep their semantics — the agent loop
+    /// does not enforce them yet. See the
+    /// [`crate::profile`] module doc for the follow-up milestones that
+    /// wire each field in.
+    pub fn with_profile(mut self, profile: Arc<crate::profile::ProfileDefinition>) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Access the recorded [`crate::profile::ProfileDefinition`], if any.
+    /// Returns `None` when the agent was built without a profile envelope
+    /// (legacy pre-M8.3 mode).
+    pub fn profile(&self) -> Option<Arc<crate::profile::ProfileDefinition>> {
+        self.profile.clone()
     }
 
     /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
@@ -509,5 +542,104 @@ impl Agent {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod profile_integration_tests {
+    //! M8.3 — bootstrapping an [`Agent`] with the built-in `coding`
+    //! profile must yield the same tool set as today's default path. This
+    //! is the behaviour-parity gate called out in the milestone issue.
+
+    use super::*;
+    use octos_core::AgentId;
+    use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+    use octos_memory::EpisodeStore;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("unused in profile integration tests")
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    async fn agent_default(cwd: &std::path::Path) -> Agent {
+        let memory = Arc::new(
+            EpisodeStore::open(cwd.join("memory-default"))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::with_builtins(cwd);
+        Agent::new(AgentId::new("default"), provider, tools, memory)
+    }
+
+    async fn agent_with_coding_profile(cwd: &std::path::Path) -> Agent {
+        use crate::profile::ProfileDefinition;
+
+        let memory = Arc::new(
+            EpisodeStore::open(cwd.join("memory-profile"))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+
+        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let mut tools = ToolRegistry::with_builtins(cwd);
+        coding.apply_to_registry(&mut tools);
+
+        Agent::new(AgentId::new("coding"), provider, tools, memory).with_profile(Arc::new(coding))
+    }
+
+    fn tool_names(agent: &Agent) -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .tool_registry()
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn coding_profile_matches_default_tool_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = agent_default(tmp.path()).await;
+        let profiled = agent_with_coding_profile(tmp.path()).await;
+
+        assert_eq!(
+            tool_names(&base),
+            tool_names(&profiled),
+            "coding profile must preserve the default tool set byte-for-byte",
+        );
+
+        // The profiled agent also exposes the recorded profile handle.
+        let prof = profiled.profile().expect("profile handle present");
+        assert_eq!(prof.name, "coding");
+        assert_eq!(prof.version, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_without_profile_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent = agent_default(tmp.path()).await;
+        assert!(
+            agent.profile().is_none(),
+            "agents built without a profile envelope return None",
+        );
     }
 }

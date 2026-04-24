@@ -1,0 +1,46 @@
+{
+  "name": "swarm",
+  "version": 1,
+  "description": "Swarm coordinator profile. Extends the coding default by opening the swarm-coordination tools (send_to_agent, cancel_task, relaunch_task) and preloads the PM-supervisor agent set.",
+  "tools": {
+    "mode": "allow_list",
+    "tools": [
+      "shell",
+      "read_file",
+      "write_file",
+      "edit_file",
+      "diff_edit",
+      "glob",
+      "grep",
+      "list_dir",
+      "web_search",
+      "web_fetch",
+      "browser",
+      "spawn",
+      "send_to_agent",
+      "cancel_task",
+      "relaunch_task",
+      "check_background_tasks",
+      "check_workspace_contract",
+      "workspace_log",
+      "workspace_show",
+      "workspace_diff",
+      "recall_memory",
+      "save_memory",
+      "deep_search",
+      "synthesize_research",
+      "message",
+      "activate_tools",
+      "configure_tool",
+      "manage_skills"
+    ]
+  },
+  "mcp_servers": [],
+  "permissions": "default",
+  "agents": [
+    "pm-supervisor",
+    "sub-researcher",
+    "sub-coder",
+    "sub-validator"
+  ]
+}
