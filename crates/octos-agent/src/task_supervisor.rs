@@ -19,6 +19,7 @@ use metrics::counter;
 use octos_core::TaskId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task::AbortHandle;
 
 use crate::harness_events::{HarnessEvent, HarnessEventPayload};
 
@@ -32,6 +33,13 @@ pub enum TaskStatus {
     Running,
     Completed,
     Failed,
+    /// Task was cancelled via `TaskSupervisor::cancel_task`.
+    ///
+    /// Terminal state, distinct from `Failed` (non-user-initiated) and
+    /// `Completed` (workspace contract satisfied). Cancelled tasks may be
+    /// re-launched via `relaunch_task`, preserving the original `task_id`
+    /// as `parent_task_id` on the new task.
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -45,6 +53,7 @@ impl TaskStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -91,6 +100,8 @@ pub enum TaskRuntimeState {
     CleaningUp,
     Completed,
     Failed,
+    /// Task's `JoinHandle` was aborted via `cancel_task`.
+    Cancelled,
 }
 
 /// Stable externally-facing lifecycle state for background tasks.
@@ -106,6 +117,8 @@ pub enum TaskLifecycleState {
     Verifying,
     Ready,
     Failed,
+    /// User-initiated cancellation via the PM supervisor.
+    Cancelled,
 }
 
 /// A tracked background task spawned by a spawn_only tool.
@@ -142,6 +155,21 @@ pub struct BackgroundTask {
     /// Session that owns this task (for per-session filtering).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+    /// Lineage marker used when a task was re-launched via
+    /// [`TaskSupervisor::relaunch_task`]. Points at the original task id so
+    /// downstream UIs can render the chain of re-launches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// Serialized task spec (tool input) captured at spawn time so
+    /// `relaunch_task` can replay the same configuration with user-provided
+    /// overrides. Stored as opaque JSON so the spec schema can evolve per
+    /// tool without forcing a schema bump on the supervisor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_snapshot: Option<Value>,
+    /// Reason recorded when a task transitions into the `Cancelled` terminal
+    /// state. Typically the caller of `cancel_task` supplies this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_reason: Option<String>,
 }
 
 impl BackgroundTask {
@@ -150,6 +178,7 @@ impl BackgroundTask {
             TaskStatus::Spawned => TaskLifecycleState::Queued,
             TaskStatus::Completed => TaskLifecycleState::Ready,
             TaskStatus::Failed => TaskLifecycleState::Failed,
+            TaskStatus::Cancelled => TaskLifecycleState::Cancelled,
             TaskStatus::Running => match self.runtime_state {
                 TaskRuntimeState::Spawned | TaskRuntimeState::ExecutingTool => {
                     TaskLifecycleState::Running
@@ -160,6 +189,7 @@ impl BackgroundTask {
                 | TaskRuntimeState::CleaningUp
                 | TaskRuntimeState::Completed => TaskLifecycleState::Verifying,
                 TaskRuntimeState::Failed => TaskLifecycleState::Failed,
+                TaskRuntimeState::Cancelled => TaskLifecycleState::Cancelled,
             },
         }
     }
@@ -194,6 +224,126 @@ fn record_child_session_orphan(reason: &'static str) {
         "reason" => reason.to_string()
     )
     .increment(1);
+}
+
+fn record_task_cancellation(origin: &'static str) {
+    counter!(
+        "octos_task_cancellation_total",
+        "origin" => origin.to_string()
+    )
+    .increment(1);
+}
+
+fn record_send_to_agent(outcome: &'static str) {
+    counter!(
+        "octos_send_to_agent_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_task_relaunch(outcome: &'static str) {
+    counter!(
+        "octos_task_relaunch_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+/// Errors that can be produced by [`TaskSupervisor::cancel_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelError {
+    /// No task exists with the supplied id in the supervisor's registry.
+    UnknownTask,
+    /// The task has already reached a terminal state; cancellation is
+    /// idempotent but callers can distinguish "did something" from
+    /// "already done".
+    AlreadyTerminal(TaskStatus),
+}
+
+impl std::fmt::Display for CancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTask => write!(f, "unknown task id"),
+            Self::AlreadyTerminal(status) => write!(
+                f,
+                "task is already terminal (status={})",
+                status.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CancelError {}
+
+/// Errors that can be produced by [`TaskSupervisor::send_to_agent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendToAgentError {
+    UnknownTask,
+    /// The task exists but it was registered without an inbox sender —
+    /// typically because it runs on an MCP-backed backend that does not
+    /// yet plumb steering messages.
+    NoInbox,
+    InboxClosed,
+    Terminal(TaskStatus),
+}
+
+impl std::fmt::Display for SendToAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTask => write!(f, "unknown task id"),
+            Self::NoInbox => write!(f, "task registered without a steering inbox"),
+            Self::InboxClosed => write!(f, "task inbox receiver has been dropped"),
+            Self::Terminal(status) => write!(
+                f,
+                "task is already terminal (status={})",
+                status.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SendToAgentError {}
+
+/// Errors that can be produced by [`TaskSupervisor::relaunch_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelaunchError {
+    UnknownTask,
+    /// The original task was registered without a spec snapshot, so we
+    /// cannot reconstruct its tool input. Typical causes: the task came
+    /// from a pre-M7.9 spawn that never called `register_abort`, or a
+    /// non-spawn_only background wrapper.
+    NoSpecSnapshot,
+    /// The seed override patch was not a JSON object and therefore cannot
+    /// merge onto the stored spec snapshot.
+    InvalidOverrides,
+}
+
+impl std::fmt::Display for RelaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTask => write!(f, "unknown task id"),
+            Self::NoSpecSnapshot => {
+                write!(f, "task has no stored spec snapshot for re-launch")
+            }
+            Self::InvalidOverrides => {
+                write!(f, "relaunch overrides must be a JSON object")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RelaunchError {}
+
+/// Prepared re-launch spec ready to be handed back to the spawn-only tool.
+/// Includes the merged spec, the new task id, and the lineage link.
+#[derive(Debug, Clone)]
+pub struct RelaunchPlan {
+    pub new_task_id: String,
+    pub parent_task_id: String,
+    pub tool_name: String,
+    pub session_key: Option<String>,
+    pub merged_spec: Value,
 }
 
 fn record_workflow_phase_transition(workflow_kind: &str, from_phase: &str, to_phase: &str) {
@@ -236,6 +386,57 @@ fn child_join_outcome_label(state: &ChildSessionJoinState) -> &'static str {
     }
 }
 
+/// Shallow-merge a JSON object `overrides` onto `base`.
+///
+/// Kept intentionally simple: top-level object keys from `overrides` win,
+/// but we merge nested objects recursively so callers can patch a single
+/// field without clobbering siblings. Non-object `overrides` are rejected
+/// so a typo cannot silently replace the entire spec.
+fn merge_seed_overrides(base: Value, overrides: Value) -> Result<Value, RelaunchError> {
+    if overrides.is_null() {
+        return Ok(base);
+    }
+    let overrides = match overrides {
+        Value::Object(map) => map,
+        _ => return Err(RelaunchError::InvalidOverrides),
+    };
+
+    let mut base_map = match base {
+        Value::Object(map) => map,
+        other => {
+            // If the base was not an object (rare — typically a plugin
+            // returned a scalar input), we replace wholesale rather than
+            // silently discard the overrides.
+            return Ok(Value::Object(
+                overrides
+                    .into_iter()
+                    .chain(std::iter::once((
+                        "__previous_spec".to_string(),
+                        other,
+                    )))
+                    .collect(),
+            ));
+        }
+    };
+
+    for (key, value) in overrides {
+        match (base_map.remove(&key), value) {
+            (Some(Value::Object(nested_base)), Value::Object(nested_override)) => {
+                let merged = merge_seed_overrides(
+                    Value::Object(nested_base),
+                    Value::Object(nested_override),
+                )?;
+                base_map.insert(key, merged);
+            }
+            (_, other) => {
+                base_map.insert(key, other);
+            }
+        }
+    }
+
+    Ok(Value::Object(base_map))
+}
+
 fn child_failure_action_for_terminal_state(
     state: &ChildSessionTerminalState,
 ) -> Option<ChildSessionFailureAction> {
@@ -264,6 +465,64 @@ impl std::fmt::Debug for TaskSupervisor {
     }
 }
 
+/// Inbox message delivered to a running sub-agent via
+/// [`TaskSupervisor::send_to_agent`]. Drained at the start of each agent
+/// loop turn and prepended as a user-role message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxMessage {
+    /// Caller-supplied origin label (operator id, Matrix user, etc.). Used
+    /// for attribution in logs and system-message formatting.
+    pub sender: String,
+    pub body: String,
+    pub received_at: DateTime<Utc>,
+}
+
+impl InboxMessage {
+    pub fn new(sender: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            sender: sender.into(),
+            body: body.into(),
+            received_at: Utc::now(),
+        }
+    }
+}
+
+/// Handle attached to a running sub-agent's inbox. The supervisor stores a
+/// clone of the sender so out-of-band callers (REST handler, Matrix reply
+/// consumer, CLI tool) can route messages into the agent loop without
+/// needing direct access to the spawn future.
+#[derive(Clone)]
+pub struct SupervisorInbox {
+    sender: tokio::sync::mpsc::UnboundedSender<InboxMessage>,
+}
+
+impl SupervisorInbox {
+    pub fn new(sender: tokio::sync::mpsc::UnboundedSender<InboxMessage>) -> Self {
+        Self { sender }
+    }
+
+    /// Deliver a message to the bound agent. Returns `false` when the
+    /// receiver has been dropped (agent already completed or aborted).
+    pub fn send(&self, msg: InboxMessage) -> bool {
+        self.sender.send(msg).is_ok()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+/// Shared handle stored inside [`TaskSupervisor`] alongside the task record
+/// so `cancel_task` and `send_to_agent` can reach into a running background
+/// sub-agent. Holds `AbortHandle` for termination + [`SupervisorInbox`] for
+/// steering. Both fields are populated when [`TaskSupervisor::register_abort`]
+/// is called from the spawn-only tool wrapper.
+struct TaskHandles {
+    abort: Option<AbortHandle>,
+    inbox: Option<SupervisorInbox>,
+    spec_snapshot: Option<Value>,
+}
+
 /// Supervisor that tracks background task lifecycle.
 ///
 /// Thread-safe via interior `Mutex`. Cloning shares the same underlying state.
@@ -272,6 +531,11 @@ pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Per-task runtime handles for cancel / steer. Separate from `tasks`
+    /// because `AbortHandle` is neither `Serialize` nor persistable — the
+    /// lifecycle state itself lives in `tasks`, handles are only valid for
+    /// the current process lifetime.
+    handles: Arc<Mutex<HashMap<String, TaskHandles>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -287,6 +551,7 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             on_change: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
+            handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -358,6 +623,28 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
     ) -> String {
+        self.register_with_lineage_and_parent(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            None,
+        )
+    }
+
+    /// Register a new background task with optional parent-task lineage.
+    ///
+    /// `parent_task_id` is used by [`TaskSupervisor::relaunch_task`] to
+    /// preserve the re-launch chain for traceability. Callers creating a
+    /// fresh top-level task should pass `None`.
+    pub fn register_with_lineage_and_parent(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        parent_task_id: Option<&str>,
+    ) -> String {
         let id = TaskId::new().to_string();
         let derived_child_session_key = session_key.map(|parent| format!("{parent}#child-{id}"));
         let task = BackgroundTask {
@@ -386,6 +673,9 @@ impl TaskSupervisor {
             output_files: Vec::new(),
             error: None,
             session_key: session_key.map(|s| s.to_string()),
+            parent_task_id: parent_task_id.map(|id| id.to_string()),
+            spec_snapshot: None,
+            cancellation_reason: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(id.clone(), task);
@@ -679,6 +969,191 @@ impl TaskSupervisor {
         }
 
         Ok(())
+    }
+
+    /// Attach the abort handle + inbox for a running task.
+    ///
+    /// Called immediately after `tokio::spawn(...)` in the spawn-only tool
+    /// wrapper — the wrapper captures `AbortHandle::from(&handle)` and the
+    /// matching [`SupervisorInbox`] sender so operators can later steer or
+    /// kill the task via [`Self::cancel_task`] / [`Self::send_to_agent`].
+    pub fn register_abort(
+        &self,
+        task_id: &str,
+        abort: AbortHandle,
+        inbox: Option<SupervisorInbox>,
+        spec_snapshot: Option<Value>,
+    ) {
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        handles.insert(
+            task_id.to_string(),
+            TaskHandles {
+                abort: Some(abort),
+                inbox,
+                spec_snapshot: spec_snapshot.clone(),
+            },
+        );
+        drop(handles);
+        if let Some(snap) = spec_snapshot {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.spec_snapshot = Some(snap);
+                task.updated_at = Utc::now();
+            }
+        }
+    }
+
+    /// Remove the runtime handle for a task once it reaches a terminal
+    /// state. Safe to call multiple times — the record is a no-op after
+    /// the first removal.
+    pub fn unregister_abort(&self, task_id: &str) {
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        handles.remove(task_id);
+    }
+
+    /// Cancel a running background task. Aborts the underlying `JoinHandle`
+    /// and transitions the supervisor record to [`TaskStatus::Cancelled`].
+    ///
+    /// Returns an error if the task is unknown or already terminal. The
+    /// abort is best-effort: a task that has already yielded is not
+    /// preempted, but we still record the terminal transition so operators
+    /// get a consistent audit record.
+    pub fn cancel_task(&self, task_id: &str, reason: Option<String>) -> Result<(), CancelError> {
+        let existing = self.get_task(task_id).ok_or(CancelError::UnknownTask)?;
+        if matches!(
+            existing.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return Err(CancelError::AlreadyTerminal(existing.status));
+        }
+
+        let abort_handle = {
+            let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+            handles.get_mut(task_id).and_then(|h| h.abort.take())
+        };
+        if let Some(handle) = abort_handle {
+            handle.abort();
+        }
+
+        let effective_reason = reason.unwrap_or_else(|| "cancelled by operator".to_string());
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = TaskStatus::Cancelled;
+                task.runtime_state = TaskRuntimeState::Cancelled;
+                task.cancellation_reason = Some(effective_reason.clone());
+                task.updated_at = Utc::now();
+                task.completed_at = Some(Utc::now());
+                Some(task.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref task) = snapshot {
+            self.persist_snapshot(task);
+            self.notify_change(task);
+            record_task_cancellation("operator");
+        }
+        Ok(())
+    }
+
+    /// Deliver an inbox message to a running sub-agent.
+    ///
+    /// Returns `SendToAgentError::UnknownTask` if the supervisor has no
+    /// record, `NoInbox` if the task was registered without an inbox
+    /// sender (e.g. MCP-backed sub-agent where steering is unsupported),
+    /// or `Terminal` if the task already finished.
+    pub fn send_to_agent(
+        &self,
+        task_id: &str,
+        message: InboxMessage,
+    ) -> Result<(), SendToAgentError> {
+        let existing = self.get_task(task_id).ok_or(SendToAgentError::UnknownTask)?;
+        if !existing.status.is_active() {
+            return Err(SendToAgentError::Terminal(existing.status));
+        }
+
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = handles.get(task_id) else {
+            return Err(SendToAgentError::NoInbox);
+        };
+        let Some(inbox) = handle.inbox.clone() else {
+            return Err(SendToAgentError::NoInbox);
+        };
+        drop(handles);
+
+        if !inbox.send(message) {
+            return Err(SendToAgentError::InboxClosed);
+        }
+        record_send_to_agent("accepted");
+        Ok(())
+    }
+
+    /// Return the spec snapshot recorded at `register_abort` time, used by
+    /// `relaunch_task` to replay the task with caller-supplied overrides.
+    pub fn spec_snapshot(&self, task_id: &str) -> Option<Value> {
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        handles
+            .get(task_id)
+            .and_then(|h| h.spec_snapshot.clone())
+            .or_else(|| {
+                // Fall back to the stored task record — still present even
+                // after the runtime handle was unregistered for a completed
+                // task (needed when re-launching from a cancelled peer).
+                let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                tasks.get(task_id).and_then(|t| t.spec_snapshot.clone())
+            })
+    }
+
+    /// Prepare a re-launch of a tracked task with caller-supplied
+    /// `seed_overrides` patched onto the stored spec snapshot.
+    ///
+    /// This is the control-plane half of the relaunch flow — it registers
+    /// a fresh task id linked to the original via `parent_task_id`,
+    /// returns the merged spec + new id, and the caller (typically the
+    /// `SpawnTool` wrapper or a REST handler) is responsible for actually
+    /// invoking the tool with the merged spec. We split the control plane
+    /// from the data plane so the supervisor module does not need to
+    /// depend on `SpawnTool` internals.
+    pub fn relaunch_task(
+        &self,
+        task_id: &str,
+        seed_overrides: Value,
+    ) -> Result<RelaunchPlan, RelaunchError> {
+        let original = self.get_task(task_id).ok_or(RelaunchError::UnknownTask)?;
+        let spec = self
+            .spec_snapshot(task_id)
+            .ok_or(RelaunchError::NoSpecSnapshot)?;
+
+        let merged_spec = merge_seed_overrides(spec, seed_overrides)?;
+
+        let new_task_id = self.register_with_lineage_and_parent(
+            &original.tool_name,
+            &original.tool_call_id,
+            original.session_key.as_deref(),
+            original.task_ledger_path.as_deref(),
+            Some(task_id),
+        );
+
+        // Stamp the merged spec onto the fresh task so subsequent
+        // re-launches can chain without re-reading the original.
+        {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(&new_task_id) {
+                task.spec_snapshot = Some(merged_spec.clone());
+                task.updated_at = Utc::now();
+            }
+        }
+        self.persist_snapshot_by_id(&new_task_id);
+        record_task_relaunch("accepted");
+
+        Ok(RelaunchPlan {
+            new_task_id,
+            parent_task_id: task_id.to_string(),
+            tool_name: original.tool_name,
+            session_key: original.session_key,
+            merged_spec,
+        })
     }
 
     fn persist_snapshot_by_id(&self, task_id: &str) {
@@ -1207,5 +1682,224 @@ mod tests {
             Some(ChildSessionFailureAction::Escalate)
         );
         assert!(failed_task.child_joined_at.is_none());
+    }
+
+    // --- M7.9 PM supervisor primitives ---
+
+    #[test]
+    fn should_merge_seed_overrides_recursively() {
+        let base = serde_json::json!({
+            "task": "summarize",
+            "files": ["a.txt"],
+            "config": {
+                "model": "gpt-4",
+                "timeout": 30
+            }
+        });
+        let overrides = serde_json::json!({
+            "task": "rewrite",
+            "config": {
+                "timeout": 60
+            }
+        });
+        let merged = merge_seed_overrides(base, overrides).unwrap();
+        assert_eq!(merged["task"], "rewrite");
+        assert_eq!(merged["files"], serde_json::json!(["a.txt"]));
+        assert_eq!(merged["config"]["model"], "gpt-4");
+        assert_eq!(merged["config"]["timeout"], 60);
+    }
+
+    #[test]
+    fn should_reject_non_object_seed_overrides() {
+        let base = serde_json::json!({"task": "x"});
+        let err = merge_seed_overrides(base, serde_json::json!("not-an-object")).unwrap_err();
+        assert_eq!(err, RelaunchError::InvalidOverrides);
+    }
+
+    #[test]
+    fn should_cancel_running_task_and_record_terminal_state() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-cancel", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let abort = handle.abort_handle();
+        supervisor.register_abort(&id, abort, None, None);
+
+        supervisor
+            .cancel_task(&id, Some("operator kill".into()))
+            .expect("cancel should succeed");
+
+        let task = supervisor.get_task(&id).expect("task record missing");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Cancelled);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Cancelled);
+        assert_eq!(task.cancellation_reason.as_deref(), Some("operator kill"));
+        assert!(task.completed_at.is_some());
+
+        // Second cancel should surface AlreadyTerminal.
+        let err = supervisor
+            .cancel_task(&id, None)
+            .expect_err("double cancel should fail");
+        assert_eq!(err, CancelError::AlreadyTerminal(TaskStatus::Cancelled));
+
+        rt.shutdown_background();
+    }
+
+    #[test]
+    fn should_return_unknown_task_error_for_bogus_cancel() {
+        let supervisor = TaskSupervisor::new();
+        let err = supervisor
+            .cancel_task("does-not-exist", None)
+            .expect_err("expected failure");
+        assert_eq!(err, CancelError::UnknownTask);
+    }
+
+    #[test]
+    fn should_deliver_send_to_agent_into_inbox() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-inbox", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = SupervisorInbox::new(tx);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        supervisor.register_abort(&id, handle.abort_handle(), Some(inbox), None);
+
+        supervisor
+            .send_to_agent(&id, InboxMessage::new("operator", "please try again"))
+            .expect("send should succeed");
+
+        let msg = rx.try_recv().expect("inbox should have received message");
+        assert_eq!(msg.sender, "operator");
+        assert_eq!(msg.body, "please try again");
+        rt.shutdown_background();
+    }
+
+    #[test]
+    fn should_reject_send_to_agent_without_inbox() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-no-inbox", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        supervisor.register_abort(&id, handle.abort_handle(), None, None);
+
+        let err = supervisor
+            .send_to_agent(&id, InboxMessage::new("operator", "hi"))
+            .expect_err("should not deliver without inbox");
+        assert_eq!(err, SendToAgentError::NoInbox);
+        rt.shutdown_background();
+    }
+
+    #[test]
+    fn should_reject_send_to_agent_for_terminal_task() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-done", Some("api:session"));
+        supervisor.mark_running(&id);
+        supervisor.mark_completed(&id, vec![]);
+
+        let err = supervisor
+            .send_to_agent(&id, InboxMessage::new("operator", "late"))
+            .expect_err("terminal task should reject steering");
+        assert_eq!(err, SendToAgentError::Terminal(TaskStatus::Completed));
+    }
+
+    #[test]
+    fn should_relaunch_with_overrides_and_preserve_lineage() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-r", Some("api:session"));
+        supervisor.mark_running(&id);
+        let spec = serde_json::json!({
+            "task": "original",
+            "config": {"model": "m1"}
+        });
+        supervisor.register_abort(
+            &id,
+            {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let h = rt.spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+                let ab = h.abort_handle();
+                // shutdown rt at end — the abort handle outlives it but the
+                // underlying future is dropped. This is fine for a snapshot
+                // test.
+                rt.shutdown_background();
+                ab
+            },
+            None,
+            Some(spec),
+        );
+
+        let plan = supervisor
+            .relaunch_task(
+                &id,
+                serde_json::json!({"config": {"model": "m2"}, "extra": true}),
+            )
+            .expect("relaunch should succeed");
+
+        assert_ne!(plan.new_task_id, id);
+        assert_eq!(plan.parent_task_id, id);
+        assert_eq!(plan.tool_name, "spawn");
+        assert_eq!(plan.merged_spec["task"], "original");
+        assert_eq!(plan.merged_spec["config"]["model"], "m2");
+        assert_eq!(plan.merged_spec["extra"], true);
+
+        let new_task = supervisor.get_task(&plan.new_task_id).expect("missing");
+        assert_eq!(new_task.parent_task_id.as_deref(), Some(id.as_str()));
+        assert_eq!(new_task.tool_name, "spawn");
+        assert!(new_task.spec_snapshot.is_some());
+    }
+
+    #[test]
+    fn should_reject_relaunch_for_task_without_snapshot() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("spawn", "call-no-snap", Some("api:session"));
+        supervisor.mark_running(&id);
+
+        let err = supervisor
+            .relaunch_task(&id, serde_json::json!({}))
+            .expect_err("should require spec snapshot");
+        assert_eq!(err, RelaunchError::NoSpecSnapshot);
+    }
+
+    #[test]
+    fn should_preserve_spec_snapshot_across_persistence_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+
+        let id = supervisor.register_with_lineage(
+            "spawn",
+            "call-persist",
+            Some("api:session"),
+            None,
+        );
+        supervisor.mark_running(&id);
+        let spec = serde_json::json!({"task": "persisted", "seed": 42});
+        {
+            let mut tasks = supervisor.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut(&id) {
+                t.spec_snapshot = Some(spec.clone());
+            }
+        }
+        supervisor.persist_snapshot_by_id(&id);
+
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+        let task = restored.get_task(&id).expect("missing");
+        assert_eq!(task.spec_snapshot, Some(spec));
     }
 }
