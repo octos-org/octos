@@ -127,6 +127,12 @@ impl Agent {
         // shared file-state cache.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
+        // M8.7 wiring (item 4): hand the spawn_only background branch a
+        // reference to the configured router and summary generator so it
+        // can route output and start/stop watchers on real production
+        // tasks (not only test fixtures).
+        let subagent_output_router = self.subagent_output_router.clone();
+        let subagent_summary_generator = self.subagent_summary_generator.clone();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -211,8 +217,23 @@ impl Agent {
                 // does not silently zero them out.
                 let bg_agent_definitions = agent_definitions.clone();
                 let bg_file_state_cache = file_state_cache.clone();
+                // M8.7 (item 4): clone the optional router/generator so
+                // the background branch can mark_terminal on completion
+                // and stop the watcher when the task is done.
+                let bg_output_router = subagent_output_router.clone();
+                let bg_summary_generator = subagent_summary_generator.clone();
+                let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
+                    // M8.7 (item 4): start a periodic-summary watcher for
+                    // this background task. The watcher honours
+                    // `min_runtime` so short tasks never trigger an LLM
+                    // call. It self-terminates when the supervisor marks
+                    // the task complete or failed.
+                    if let Some(ref summary_gen) = bg_summary_generator {
+                        summary_gen
+                            .spawn_watcher(bg_session_id_for_watcher.as_str(), task_id.as_str());
+                    }
                     let bg_started_at = std::time::SystemTime::now();
 
                     // Helper to create TOOL_CTX for plugin stderr progress streaming.
@@ -230,6 +251,24 @@ impl Agent {
                         ..ToolContext::zero()
                     };
 
+                    // M8.7 (item 4): seed the router with a startup line
+                    // so a handle exists before the tool starts producing
+                    // output. Without this, mark_terminal is a no-op and
+                    // dashboards never know the task ran.
+                    if let Some(ref router) = bg_output_router {
+                        let _ = router.append(
+                            bg_session_id_for_watcher.as_str(),
+                            task_id.as_str(),
+                            format!(
+                                "[{} starting] tool={} task_id={}\n",
+                                chrono::Utc::now().to_rfc3339(),
+                                bg_name,
+                                task_id
+                            )
+                            .as_bytes(),
+                        );
+                    }
+
                     // M8.2/M8.4 reconciliation: use the typed
                     // `execute_with_context` so the spawn-only background
                     // branch carries `agent_definitions` and
@@ -242,6 +281,25 @@ impl Agent {
                             bg_tools.execute_with_context(&make_ctx(), &bg_name, &bg_args),
                         )
                         .await;
+
+                    // M8.7 (item 4): route the tool's textual output to
+                    // the router so it lands on disk for the dashboard
+                    // and so AgentSummaryGenerator's tail_lines source
+                    // has something to summarise.
+                    if let Some(ref router) = bg_output_router {
+                        if let Ok(ref r) = result {
+                            let preview = if r.output.is_empty() {
+                                "[no stdout]".to_string()
+                            } else {
+                                r.output.clone()
+                            };
+                            let _ = router.append(
+                                bg_session_id_for_watcher.as_str(),
+                                task_id.as_str(),
+                                format!("[output] {preview}\n").as_bytes(),
+                            );
+                        }
+                    }
 
                     // Retry once on transient failure (e.g. ominix-api restart)
                     if let Ok(ref r) = result {
@@ -352,6 +410,16 @@ impl Agent {
                                             })
                                             .await;
                                         }
+                                        // M8.7 (item 4): early-return path
+                                        // — emit terminal signals before
+                                        // returning so the router/watcher
+                                        // wiring is not skipped.
+                                        if let Some(ref router) = bg_output_router {
+                                            router.mark_terminal(&task_id);
+                                        }
+                                        if let Some(ref summary_gen) = bg_summary_generator {
+                                            summary_gen.stop_watcher(&task_id);
+                                        }
                                         return;
                                     }
 
@@ -376,6 +444,16 @@ impl Agent {
                                                 media: vec![],
                                             })
                                             .await;
+                                        }
+                                        // M8.7 (item 4): early-return path
+                                        // — emit terminal signals before
+                                        // returning so the router/watcher
+                                        // wiring is not skipped.
+                                        if let Some(ref router) = bg_output_router {
+                                            router.mark_terminal(&task_id);
+                                        }
+                                        if let Some(ref summary_gen) = bg_summary_generator {
+                                            summary_gen.stop_watcher(&task_id);
                                         }
                                         return;
                                     }
@@ -527,6 +605,21 @@ impl Agent {
                                 .await;
                             }
                         }
+                    }
+
+                    // M8.7 (item 4): tear down router/watcher state once
+                    // the task has reached a terminal supervisor status.
+                    // mark_terminal flips the dashboard "task running"
+                    // bit and stops further tail streams. The watcher
+                    // exits on its own next iteration via
+                    // `is_terminal(supervisor, task_id)`, but we also
+                    // call stop_watcher to release the registry slot
+                    // promptly.
+                    if let Some(ref router) = bg_output_router {
+                        router.mark_terminal(&task_id);
+                    }
+                    if let Some(ref summary_gen) = bg_summary_generator {
+                        summary_gen.stop_watcher(&task_id);
                     }
                 });
                 reporter.report(ProgressEvent::ToolCompleted {

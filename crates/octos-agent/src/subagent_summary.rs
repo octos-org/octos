@@ -258,11 +258,13 @@ impl AgentSummaryGenerator {
         let supervisor = self.supervisor.clone();
         let watcher_task_id = task_id.clone();
         let watcher_session_id = session_id.clone();
+        let min_runtime = self.min_runtime;
 
         let handle = tokio::spawn(async move {
             run_watcher_loop(
                 provider,
                 tick,
+                min_runtime,
                 window,
                 llm_timeout,
                 activity,
@@ -310,6 +312,7 @@ impl AgentSummaryGenerator {
 async fn run_watcher_loop(
     provider: Arc<dyn LlmProvider>,
     tick: Duration,
+    min_runtime: Duration,
     window: usize,
     llm_timeout: Duration,
     activity: Arc<ActivitySource>,
@@ -317,6 +320,28 @@ async fn run_watcher_loop(
     session_id: String,
     task_id: String,
 ) {
+    // Item 4 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    // honour `min_runtime` before producing the first summary. Short
+    // tasks that complete inside the warm-up window never trigger a
+    // cheap-lane LLM call. We poll terminal status during the wait so
+    // the watcher exits promptly when a fast task finishes. Use
+    // `tokio::time::Instant` so `tokio::time::pause()` test fixtures
+    // see the warm-up advance with virtual time.
+    let warmup_start = tokio::time::Instant::now();
+    while warmup_start.elapsed() < min_runtime {
+        if is_terminal(&supervisor, &task_id) {
+            return;
+        }
+        // Cap each warm-up nap at the regular tick so terminal detection
+        // stays tight even if the operator configured a long min_runtime.
+        let remaining = min_runtime.saturating_sub(warmup_start.elapsed());
+        let nap = remaining.min(tick);
+        if nap.is_zero() {
+            break;
+        }
+        tokio::time::sleep(nap).await;
+    }
+
     let mut tick_seq: u32 = 0;
     loop {
         tick_seq = tick_seq.saturating_add(1);
@@ -630,6 +655,7 @@ mod tests {
             supervisor.clone(),
         )
         .with_tick(Duration::from_millis(100))
+        .with_min_runtime(Duration::from_millis(0))
         .with_llm_timeout(Duration::from_secs(1));
 
         let spawned = generator.spawn_watcher("api:session", &id);
@@ -662,6 +688,7 @@ mod tests {
             supervisor.clone(),
         )
         .with_tick(Duration::from_millis(50))
+        .with_min_runtime(Duration::from_millis(0))
         .with_llm_timeout(Duration::from_secs(1));
 
         generator.spawn_watcher("api:session", &id);
@@ -691,6 +718,7 @@ mod tests {
             supervisor.clone(),
         )
         .with_tick(Duration::from_millis(50))
+        .with_min_runtime(Duration::from_millis(0))
         .with_llm_timeout(Duration::from_secs(1));
 
         generator.spawn_watcher("api:session", &id);

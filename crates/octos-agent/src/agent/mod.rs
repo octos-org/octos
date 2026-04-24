@@ -194,6 +194,17 @@ pub struct Agent {
     /// [`crate::compaction::CompactionRunner`] wrapped as a
     /// [`crate::compaction_tiered::FullCompactor`].
     pub(super) tiered_compaction: Option<Arc<crate::compaction_tiered::TieredCompactionRunner>>,
+    /// M8.7 sub-agent output router. When configured, the spawn_only
+    /// background branch in `execution.rs` calls
+    /// [`crate::SubAgentOutputRouter::mark_terminal`] when a task ends so
+    /// dashboards can stop tailing the on-disk output log. `None` keeps
+    /// pre-M8.7 behaviour.
+    pub(super) subagent_output_router: Option<Arc<crate::subagent_output::SubAgentOutputRouter>>,
+    /// M8.7 sub-agent progress summary generator. When configured, the
+    /// spawn_only background branch starts a watcher per task and stops
+    /// it on terminal completion. `None` keeps pre-M8.7 behaviour.
+    pub(super) subagent_summary_generator:
+        Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
 }
 
 impl Agent {
@@ -228,6 +239,8 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            subagent_output_router: None,
+            subagent_summary_generator: None,
         }
     }
 
@@ -263,6 +276,8 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            subagent_output_router: None,
+            subagent_summary_generator: None,
         }
     }
 
@@ -376,6 +391,43 @@ impl Agent {
     /// compaction boundaries — see M8.5 for the full integration.
     pub fn file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
         self.file_state_cache.as_ref()
+    }
+
+    /// Wire an M8.7 [`crate::subagent_output::SubAgentOutputRouter`] so the
+    /// spawn_only background branch can route textual output to disk and
+    /// flag terminal state for dashboards. Absent = pre-M8.7 behaviour.
+    pub fn with_subagent_output_router(
+        mut self,
+        router: Arc<crate::subagent_output::SubAgentOutputRouter>,
+    ) -> Self {
+        self.subagent_output_router = Some(router);
+        self
+    }
+
+    /// Access the M8.7 sub-agent output router, if configured.
+    pub fn subagent_output_router(
+        &self,
+    ) -> Option<&Arc<crate::subagent_output::SubAgentOutputRouter>> {
+        self.subagent_output_router.as_ref()
+    }
+
+    /// Wire an M8.7 [`crate::subagent_summary::AgentSummaryGenerator`] so the
+    /// spawn_only background branch can spawn a periodic summary watcher
+    /// per qualifying task and stop it on terminal completion. Absent =
+    /// pre-M8.7 behaviour.
+    pub fn with_subagent_summary_generator(
+        mut self,
+        generator: Arc<crate::subagent_summary::AgentSummaryGenerator>,
+    ) -> Self {
+        self.subagent_summary_generator = Some(generator);
+        self
+    }
+
+    /// Access the M8.7 sub-agent summary generator, if configured.
+    pub fn subagent_summary_generator(
+        &self,
+    ) -> Option<&Arc<crate::subagent_summary::AgentSummaryGenerator>> {
+        self.subagent_summary_generator.as_ref()
     }
 
     /// Set the embedding provider for hybrid memory search.
