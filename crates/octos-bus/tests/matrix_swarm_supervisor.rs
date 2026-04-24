@@ -718,3 +718,81 @@ async fn should_preserve_existing_matrix_channel_tests() {
         "unknown bots still return None — baseline BotRouter contract intact"
     );
 }
+
+// ── M7.9b Gap 3: SteeringInputConsumer wiring from handle_supervisor_reply ──
+
+/// Counting consumer used to verify that `handle_supervisor_reply`
+/// invokes an attached [`octos_bus::SteeringInputConsumer`]. Captures
+/// every routed input so the test can assert content + count.
+#[derive(Clone, Default)]
+struct CountingConsumer {
+    captured: Arc<Mutex<Vec<SteeringInput>>>,
+}
+
+#[async_trait::async_trait]
+impl octos_bus::SteeringInputConsumer for CountingConsumer {
+    async fn consume(&self, input: SteeringInput) -> bool {
+        self.captured.lock().await.push(input);
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_invoke_steering_consumer_when_reply_parses() {
+    let (homeserver, _mock, handle) = spawn_mock_homeserver().await;
+    let consumer = Arc::new(CountingConsumer::default());
+    let ch = make_supervisor_channel(&homeserver).with_steering_consumer(consumer.clone());
+    assert!(
+        ch.has_steering_consumer(),
+        "consumer wiring should register the consumer"
+    );
+
+    let puppet = ch.register_subagent_puppet("s9b1", "writer").await.unwrap();
+    let room = ch.ensure_swarm_room("s9b1").await.unwrap();
+
+    // Reply parses cleanly — consumer must receive the input alongside
+    // the Option<SteeringInput> return.
+    let reply = format!("{}: please tighten the conclusion", puppet);
+    let steering = ch
+        .handle_supervisor_reply(room.as_str(), "@alice:localhost", &reply)
+        .await
+        .expect("reply addressed to one puppet must produce steering input");
+    assert_eq!(steering.body, "please tighten the conclusion");
+
+    let captured = consumer.captured.lock().await.clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "consumer should be invoked exactly once for a cleanly-parsing reply"
+    );
+    assert_eq!(captured[0].session_id, "s9b1");
+    assert_eq!(captured[0].agent_label, "writer");
+    assert_eq!(captured[0].body, "please tighten the conclusion");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn should_skip_steering_consumer_when_reply_does_not_parse() {
+    let (homeserver, _mock, handle) = spawn_mock_homeserver().await;
+    let consumer = Arc::new(CountingConsumer::default());
+    let ch = make_supervisor_channel(&homeserver).with_steering_consumer(consumer.clone());
+
+    let puppet = ch.register_subagent_puppet("s9b2", "writer").await.unwrap();
+    let _room = ch.ensure_swarm_room("s9b2").await.unwrap();
+
+    // Reply from a non-supervisor: must be rejected *before* the
+    // consumer is invoked — it's a classic gate-before-route check.
+    let _unused = puppet;
+    let rejected = ch
+        .handle_supervisor_reply("!not-a-swarm-room:localhost", "@alice:localhost", "noise")
+        .await;
+    assert!(rejected.is_none());
+    let captured = consumer.captured.lock().await.clone();
+    assert!(
+        captured.is_empty(),
+        "consumer must NOT be invoked for non-parsing replies"
+    );
+
+    handle.abort();
+}

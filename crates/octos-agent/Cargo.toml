@@ -56,3 +56,8 @@ workspace = true
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# M7.9b: exercise the SteeringInputConsumer trait the Matrix gateway
+# uses without booting a full homeserver mock. Kept under `matrix`
+# feature so the base test suite still builds when the matrix
+# channel is gated off.
+octos-bus = { workspace = true, features = ["matrix"] }
