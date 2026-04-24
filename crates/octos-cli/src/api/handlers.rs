@@ -45,6 +45,11 @@ pub struct ChatRequest {
     pub media: Vec<String>,
     #[serde(default)]
     pub attach_only: bool,
+    /// Web-generated correlation id. Forwarded to the gateway so the
+    /// eventual `_session_result.response_to_client_message_id` matches
+    /// the web reducer's optimistic bubble (FA-12f).
+    #[serde(default)]
+    pub client_message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,6 +206,7 @@ pub async fn chat(
             &req.media,
             req.attach_only,
             req.stream,
+            req.client_message_id.as_deref(),
         )
         .await;
     }
@@ -2462,6 +2468,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         stream: true,
                         media: media.clone(),
                         attach_only: false,
+                        client_message_id: None,
                     },
                 ) {
                     // Standalone agent mode — run the agent directly.
@@ -2714,6 +2721,26 @@ mod tests {
         let json = r#"{"message": "hi", "stream": true}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert!(req.stream);
+    }
+
+    /// FA-12f follow-up: the outer `ChatRequest` (served at `/api/chat`) must
+    /// accept `client_message_id` so it survives proxy forwarding to the
+    /// gateway. The prior fix patched only the gateway-internal struct; the
+    /// outer struct silently dropped the field and overflow replies arrived
+    /// with `response_to_client_message_id: null`, breaking web-side
+    /// correlation under `/queue speculative`.
+    #[test]
+    fn chat_request_accepts_client_message_id() {
+        let json = r#"{"message": "hi", "client_message_id": "client-bravo-xyz"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.client_message_id.as_deref(), Some("client-bravo-xyz"));
+    }
+
+    #[test]
+    fn chat_request_client_message_id_defaults_to_none() {
+        let json = r#"{"message": "hi"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.client_message_id.is_none());
     }
 
     #[test]

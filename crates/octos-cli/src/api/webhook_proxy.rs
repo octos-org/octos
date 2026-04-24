@@ -195,6 +195,7 @@ fn webhook_upstream_error_response(
 ///
 /// Forwards `POST /api/chat` to the gateway's API channel HTTP server and
 /// streams the SSE response back to the web client.
+#[allow(clippy::too_many_arguments)]
 pub async fn api_chat_proxy(
     state: &AppState,
     port: u16,
@@ -205,6 +206,7 @@ pub async fn api_chat_proxy(
     media: &[String],
     attach_only: bool,
     stream: bool,
+    client_message_id: Option<&str>,
 ) -> Response {
     let url = format!("http://127.0.0.1:{port}/chat");
     let body = serde_json::json!({
@@ -214,6 +216,7 @@ pub async fn api_chat_proxy(
         "media": media,
         "target_profile_id": profile_id,
         "attach_only": attach_only,
+        "client_message_id": client_message_id,
     });
 
     let resp = match state
@@ -587,6 +590,7 @@ data: {"type":"done","content":"","tokens_in":1,"tokens_out":2}
             &[],
             false,
             true, // stream = true, the path where the bug happens
+            None,
         )
         .await;
 
@@ -644,6 +648,7 @@ data: {"type":"done","content":"","tokens_in":1,"tokens_out":2}
             &[],
             false,
             true,
+            None,
         )
         .await;
 
