@@ -246,6 +246,29 @@ impl ApiChannel {
         self
     }
 
+    /// Test helper: subscribe to the watchers fanout for a (chat_id, topic)
+    /// without going through the HTTP `/sessions/:id/events/stream` handler.
+    /// Mirrors the subscribe path that the real SSE handler uses (see
+    /// `handle_session_event_stream`), so integration tests can assert that
+    /// outbound messages carrying `_session_result` metadata are broadcast
+    /// to watchers even when the primary turn's `pending` channel has
+    /// already been removed (FA-11 defect B regression guard).
+    #[doc(hidden)]
+    pub async fn subscribe_watcher_for_tests(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+    ) -> broadcast::Receiver<String> {
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .entry(watcher_key(chat_id, topic))
+            .or_insert_with(|| {
+                let (tx, _rx) = new_sse_channel();
+                tx
+            })
+            .subscribe()
+    }
+
     fn session_workspace_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
         let encoded = crate::session::encode_path_component(key.base_key());
         data_dir.join("users").join(encoded).join("workspace")

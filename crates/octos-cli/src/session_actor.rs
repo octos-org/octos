@@ -4232,19 +4232,41 @@ impl SessionActor {
                     // Intermediate tool_call/tool_result messages are NOT saved
                     // to avoid tool_call ID collisions when multiple overflow
                     // tasks run concurrently (e.g. two deep_search_0 IDs).
-                    {
+                    //
+                    // Capture the committed seq + timestamp so the outbound
+                    // fanout below can carry `_session_result` metadata. The
+                    // ApiChannel routes that metadata through
+                    // `broadcast_session_event` → watchers, which survives
+                    // the primary turn's SSE stream completion. Without this,
+                    // the overflow reply would only route through
+                    // `pending[session_id]` — already removed when the
+                    // primary turn completed — and would be silently dropped
+                    // (FA-11 defect B).
+                    let final_reply_timestamp = chrono::Utc::now();
+                    let final_reply = Message {
+                        role: MessageRole::Assistant,
+                        content: final_content.clone(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: conv_response.reasoning_content.clone(),
+                        timestamp: final_reply_timestamp,
+                    };
+                    let committed_seq = {
                         let mut handle = session_handle.lock().await;
-                        let final_reply = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            timestamp: chrono::Utc::now(),
-                        };
-                        let _ = handle.add_message(final_reply).await;
-                    }
+                        handle
+                            .add_message_with_seq(final_reply)
+                            .await
+                            .map_err(|error| {
+                                warn!(
+                                    session = %session_key,
+                                    error = %error,
+                                    "failed to persist overflow assistant message"
+                                );
+                                error
+                            })
+                            .ok()
+                    };
 
                     let reply = strip_think_tags(&final_content);
                     // Prepend thinking content when show_thinking is enabled
@@ -4273,6 +4295,28 @@ impl SessionActor {
                             .is_some_and(|sr| sr.message_id.is_some());
 
                     if !reply.trim().is_empty() && !already_streamed {
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert(
+                            "_history_persisted".to_string(),
+                            serde_json::Value::Bool(committed_seq.is_some()),
+                        );
+                        if let Some(topic) = session_key.topic() {
+                            metadata
+                                .insert("topic".to_string(), serde_json::Value::from(topic));
+                        }
+                        if let Some(seq) = committed_seq {
+                            metadata.insert(
+                                "_session_result".to_string(),
+                                serde_json::json!({
+                                    "seq": seq,
+                                    "role": "assistant",
+                                    "content": reply.clone(),
+                                    "timestamp": final_reply_timestamp.to_rfc3339(),
+                                    "media": Vec::<String>::new(),
+                                    "response_to_client_message_id": overflow_reply_to.clone(),
+                                }),
+                            );
+                        }
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel: channel.clone(),
@@ -4280,7 +4324,7 @@ impl SessionActor {
                                 content: reply,
                                 reply_to: overflow_reply_to.clone(),
                                 media: vec![],
-                                metadata: serde_json::json!({}),
+                                metadata: serde_json::Value::Object(metadata),
                             })
                             .await;
                     }
@@ -6187,6 +6231,137 @@ mod tests {
         }
 
         // Clean shutdown
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// FA-11 defect B regression: the overflow assistant reply MUST carry
+    /// `_session_result` metadata so `ApiChannel::send` can route it via
+    /// `broadcast_session_event → watchers`. Without this metadata the reply
+    /// routes only through `pending[session_id]`, which was removed when
+    /// the primary turn emitted its `_completion` marker — so the overflow
+    /// reply was silently dropped.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_overflow_reply() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5 fast warmups + slow (12s) primary + fast overflow response.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (Duration::from_secs(12), make_response("slow primary answer")),
+                (
+                    Duration::from_millis(400),
+                    make_response("overflow FA12 result payload"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup to establish responsiveness baseline.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("please answer FA-12 probe"))
+            .await
+            .unwrap();
+
+        // Collect OutboundMessage records until we've seen both non-empty
+        // replies (overflow + slow primary).
+        let mut outbound_replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while outbound_replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        outbound_replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(
+            outbound_replies.len() >= 2,
+            "expected at least 2 replies (overflow + primary), got {}: {:?}",
+            outbound_replies.len(),
+            outbound_replies
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let overflow = outbound_replies
+            .iter()
+            .find(|msg| msg.content.contains("FA12") || msg.content.contains("overflow"))
+            .expect("overflow reply not found");
+        let session_result = overflow.metadata.get("_session_result").unwrap_or_else(|| {
+            panic!(
+                "overflow outbound must carry `_session_result` metadata — \
+                 got metadata = {}",
+                overflow.metadata
+            )
+        });
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "session_result must include committed seq, got {}",
+            session_result
+        );
+        assert!(
+            session_result
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("FA12") || s.contains("overflow")),
+            "session_result.content must match reply content, got {}",
+            session_result
+        );
+        assert!(
+            session_result.get("timestamp").is_some(),
+            "session_result must include rfc3339 timestamp, got {}",
+            session_result
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
