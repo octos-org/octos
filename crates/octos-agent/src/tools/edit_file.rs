@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolContext, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 
 /// Tool for editing files via string replacement.
 pub struct EditFileTool {
@@ -43,6 +43,12 @@ impl Tool for EditFileTool {
 
     fn tags(&self) -> &[&str] {
         &["fs", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // edit_file rewrites a file in place — same race hazard as
+        // write_file. Serialize the whole batch. See M8.8.
+        ConcurrencyClass::Exclusive
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -160,6 +166,15 @@ impl Tool for EditFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_file_tool_is_exclusive() {
+        // edit_file rewrites the target file; parallel read_file would race
+        // on in-flight content, so it must serialize (M8.8).
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EditFileTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[tokio::test]
     async fn test_edit_file_basic_replacement() {

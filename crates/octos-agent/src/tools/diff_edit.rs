@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolContext, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 
 /// Tool for editing files via unified diff format with fuzzy matching.
 pub struct DiffEditTool {
@@ -41,6 +41,12 @@ impl Tool for DiffEditTool {
 
     fn tags(&self) -> &[&str] {
         &["fs", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // diff_edit writes back to disk after applying the patch — the same
+        // race hazard as write_file / edit_file. Serialize. See M8.8.
+        ConcurrencyClass::Exclusive
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -342,6 +348,15 @@ fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_edit_tool_is_exclusive() {
+        // diff_edit writes back after applying the patch — same race hazard
+        // as write_file; must serialize (M8.8).
+        let dir = tempfile::tempdir().unwrap();
+        let tool = DiffEditTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[test]
     fn test_parse_simple_diff() {
