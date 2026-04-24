@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod admin_setup;
 pub mod auth_handlers;
+mod events_harness;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;

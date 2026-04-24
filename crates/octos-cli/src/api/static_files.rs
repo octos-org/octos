@@ -48,6 +48,27 @@ pub async fn static_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Res
 async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &str) -> Response {
     let path = request_path.trim_start_matches('/');
 
+    // API / infrastructure paths must NEVER fall through to the SPA
+    // redirect. If a request reached this handler with such a prefix the
+    // route simply isn't registered — return `404 Not Found` as JSON so
+    // API clients see a clean error instead of a `307 -> /admin/` that
+    // (a) breaks Playwright's `apiRequestContext` max-redirect cap and
+    // (b) hands an HTML body to a caller that asked for `text/event-stream`
+    // or JSON. Documented surfaces like `/api/events/harness` hit this
+    // branch when the route was planned but never wired.
+    if is_api_or_infra_path(path) {
+        let body = serde_json::json!({
+            "error": "not_found",
+            "path": format!("/{path}"),
+        });
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+    }
+
     // Root "/" → serve landing page only in cloud mode,
     // otherwise redirect to /admin/
     if path.is_empty() {
@@ -123,6 +144,19 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         .into_response()
 }
 
+/// Returns true when `path` (already stripped of the leading `/`) targets
+/// an API, webhook, or internal surface. Segment-match so sibling names
+/// like `apibackup` fall through to the admin redirect rather than being
+/// hijacked by the 404 branch.
+fn is_api_or_infra_path(path: &str) -> bool {
+    for prefix in ["api", "webhook", "internal"] {
+        if path == prefix || path.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+    false
+}
+
 fn serve_file(path: &str, data: &[u8]) -> Response {
     let mime = match path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
@@ -173,6 +207,14 @@ mod tests {
                 files: HashMap::new(),
             }
         }
+
+        fn with(entries: &[(&str, &[u8])]) -> Self {
+            let mut files = HashMap::new();
+            for (k, v) in entries {
+                files.insert((*k).to_string(), v.to_vec());
+            }
+            Self { files }
+        }
     }
 
     impl AssetStore for StubAssets {
@@ -210,6 +252,73 @@ mod tests {
         let assets = StubAssets::empty();
         let resp = serve_with(&assets, &state, "/swarm/assets/index-xyz.js").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Bug 1: any unmatched `/api/*` path must return a JSON 404 from
+    /// the SPA fallback. Previously these were returning
+    /// `307 Location: /admin/`, which breaks Playwright's
+    /// `apiRequestContext` (max-redirect trip) and hands HTML to a
+    /// caller that asked for `text/event-stream`. The live-sweep
+    /// surfaced this via a documented-but-unwired
+    /// `GET /api/events/harness?kinds=...` endpoint.
+    #[tokio::test]
+    async fn should_return_404_for_unmatched_api_path_even_without_admin_bundle() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/api/does-not-exist").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "not_found");
+        assert_eq!(body["path"], "/api/does-not-exist");
+    }
+
+    /// Even when the admin bundle is present, an unmatched `/api/` path
+    /// still must 404 — must NOT serve the SPA `admin/index.html` body
+    /// to a JSON/SSE client.
+    #[tokio::test]
+    async fn should_return_404_for_unmatched_api_path_even_with_admin_bundle() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
+        let resp = serve_with(&assets, &state, "/api/unknown").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `/webhook/*` is a distinct public surface — an unmatched webhook
+    /// route must 404, not get redirected to `/admin/`.
+    #[tokio::test]
+    async fn should_return_404_for_unmatched_webhook_path() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/webhook/unknown/profile").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Segment-match guard: `/apibackup` is a sibling name, NOT an API
+    /// surface, so it must fall through to the admin redirect branch
+    /// and not be hijacked by the 404 guard.
+    #[tokio::test]
+    async fn should_not_match_api_prefix_siblings() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
+        let resp = serve_with(&assets, &state, "/apibackup").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "sibling prefix must not be captured by the /api/ 404 guard"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/admin/");
     }
 
     /// C-003: a prefix-match on `"swarm"` catches sibling paths like

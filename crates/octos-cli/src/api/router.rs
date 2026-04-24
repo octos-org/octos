@@ -14,6 +14,7 @@ use super::AppState;
 use super::admin;
 use super::admin_setup;
 use super::auth_handlers;
+use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
@@ -67,6 +68,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
+        .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ws", get(handlers::ws_handler))
         .route(
             "/api/upload",
@@ -951,5 +953,109 @@ mod tests {
         // the file.
         assert!(resolve_identity(&state, "boot").await.is_none());
         assert!(resolve_identity(&state, "rotated").await.is_none());
+    }
+
+    /// Bug 1 regression: `GET /api/events/harness` with a valid admin
+    /// Bearer token must return `200 text/event-stream`, NOT the
+    /// `307 Location: /admin/` that the SPA static-file fallback was
+    /// emitting for this documented-but-unwired endpoint. Live-sweep
+    /// against release/coding-blue surfaced this as Playwright's
+    /// `apiRequestContext.get: Max redirect count exceeded`.
+    #[tokio::test]
+    async fn events_harness_route_with_bearer_auth_returns_200_sse() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            auth_token: Some("admin-secret".into()),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
+            ..AppState::empty_for_tests()
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::builder()
+            // Catch any lingering 307 as an explicit failure rather than
+            // letting reqwest silently follow it to `/admin/`.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{addr}/api/events/harness?kinds=swarm_dispatch"
+            ))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "bearer-authed /api/events/harness must return 200 (not 307 to /admin/)"
+        );
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "content-type must be text/event-stream, got {ct:?}"
+        );
+
+        server.abort();
+    }
+
+    /// Bug 1 regression (fallback side): an unknown `/api/*` path reaches
+    /// the SPA fallback because no route matches. It must return
+    /// `404 application/json`, NOT `307 Location: /admin/`, so API
+    /// clients see a typed error instead of being redirected into the
+    /// SPA.
+    #[tokio::test]
+    async fn unmatched_api_path_returns_json_404_not_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
+            ..AppState::empty_for_tests()
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/api/definitely-not-a-route"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/json"), "got {ct:?}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "not_found");
+
+        server.abort();
     }
 }
