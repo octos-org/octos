@@ -70,19 +70,15 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     }
 
     // Root "/" → serve landing page only in cloud mode,
-    // otherwise redirect to /admin/
+    // otherwise redirect to /admin/ (or 503 when the admin bundle is
+    // missing — see Bug 2 below).
     if path.is_empty() {
         if matches!(state.deployment_mode, crate::config::DeploymentMode::Cloud) {
             if let Some(data) = assets.get("landing.html") {
                 return serve_file("landing.html", &data);
             }
         }
-        return (
-            StatusCode::TEMPORARY_REDIRECT,
-            [(header::LOCATION, "/admin/")],
-            "",
-        )
-            .into_response();
+        return redirect_to_admin_or_503(assets);
     }
 
     // Serve exact embedded asset (e.g. admin/assets/index-xxx.js or
@@ -126,20 +122,55 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         return serve_file(&admin_path, &data);
     }
 
-    // SPA fallback: only serve index.html for paths under /admin/
-    // Non-admin paths redirect to /admin/ so React Router (basename="/admin") can handle them.
-    if path.starts_with("admin") {
+    // Admin SPA fallback. Segment-match rather than `starts_with("admin")`
+    // (see the C-003 swarm fix for the same class of issue with
+    // `/swarmish`). When the bundle is present, serve `admin/index.html`
+    // so React Router can handle client-side routing. When the bundle
+    // is missing — Bug 2 against release/coding-blue: binaries shipped
+    // without running `scripts/build-dashboard.sh` leave `static/admin/`
+    // populated with hashed asset files but no `index.html` — the
+    // handler used to fall through to `307 Location: /admin/`, which
+    // itself 307'd back here, and the browser hit
+    // `ERR_TOO_MANY_REDIRECTS`. Short-circuit to 503 so the failure is
+    // diagnosable instead of an infinite loop.
+    if path == "admin" || path.starts_with("admin/") {
         if let Some(data) = assets.get("admin/index.html") {
             return serve_file("admin/index.html", &data);
         }
+        return admin_bundle_missing_response();
     }
 
-    // Redirect unknown paths to /admin/ (e.g. /login → /admin/login won't help since
-    // the React Router handles its own routing; just send to /admin/)
+    // Catch-all: redirect to /admin/ so non-API UI paths land on the
+    // dashboard. Must also guard on `admin/index.html` — otherwise the
+    // redirect target itself 307s and the browser loops.
+    redirect_to_admin_or_503(assets)
+}
+
+/// Redirect to `/admin/` when the admin bundle is present; otherwise
+/// return a 503 so the caller sees a diagnosable "admin bundle missing"
+/// JSON body instead of being fed into an infinite redirect loop.
+fn redirect_to_admin_or_503<A: AssetStore>(assets: &A) -> Response {
+    if assets.get("admin/index.html").is_some() {
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, "/admin/")],
+            "",
+        )
+            .into_response();
+    }
+    admin_bundle_missing_response()
+}
+
+fn admin_bundle_missing_response() -> Response {
+    let body = serde_json::json!({
+        "error": "admin_bundle_missing",
+        "message":
+            "Run ./scripts/build-dashboard.sh + rebuild octos-cli to include the admin dashboard.",
+    });
     (
-        StatusCode::TEMPORARY_REDIRECT,
-        [(header::LOCATION, "/admin/")],
-        "",
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
     )
         .into_response()
 }
@@ -329,16 +360,116 @@ mod tests {
     #[tokio::test]
     async fn should_not_match_swarm_prefix_siblings() {
         let state = AppState::empty_for_tests();
-        let assets = StubAssets::empty();
-        // `/swarmish` must fall through to the admin redirect (307), NOT
-        // the swarm 503 branch. The final catch-all returns a redirect
-        // to `/admin/`, so we assert we get exactly that.
+        // Admin bundle present so the catch-all issues the 307 rather
+        // than the Bug-2 admin-missing 503.
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
         let resp = serve_with(&assets, &state, "/swarmish").await;
         assert_eq!(
             resp.status(),
             StatusCode::TEMPORARY_REDIRECT,
             "sibling prefix must not be captured by the swarm branch"
         );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/admin/");
+    }
+
+    /// Bug 2: when `admin/index.html` is missing from the embed (e.g.
+    /// operator built octos-cli without running
+    /// `scripts/build-dashboard.sh`), `/admin/*` must short-circuit
+    /// with `503 application/json` instead of falling through to
+    /// `307 Location: /admin/`. Without this guard a browser hitting
+    /// `/admin/profile/foo/skills` loops until `ERR_TOO_MANY_REDIRECTS`.
+    #[tokio::test]
+    async fn should_return_503_when_admin_bundle_missing_nested_path() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/admin/profile/dspfac/skills").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "admin_bundle_missing");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("build-dashboard.sh")
+        );
+    }
+
+    /// Bug 2: the bare `/admin/` URL — which the Location header of the
+    /// other-redirect branches points to — must NOT itself redirect
+    /// when the bundle is missing. Returning 307 here is the ingredient
+    /// that makes the loop infinite.
+    #[tokio::test]
+    async fn should_return_503_for_bare_admin_when_bundle_missing() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/admin/").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Bug 2: the catch-all branch (paths not under `admin/`, `swarm/`,
+    /// or the API) redirects to `/admin/`. When the admin bundle is
+    /// missing, doing so would hand the caller a Location header that
+    /// itself 307s back — so the catch-all must also short-circuit to
+    /// 503 to break the loop at the source.
+    #[tokio::test]
+    async fn should_return_503_for_catch_all_when_admin_bundle_missing() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/login").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Bug 2: root `/` under Local deployment should also refuse to
+    /// 307 into a missing admin bundle. Returns 503 for feedback.
+    #[tokio::test]
+    async fn should_return_503_for_root_when_admin_bundle_missing_local_mode() {
+        let state = AppState::empty_for_tests();
+        // Local deployment mode -> root redirects to /admin/ by default.
+        let assets = StubAssets::empty();
+        let resp = serve_with(&assets, &state, "/").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// When the admin bundle IS present, /admin/* SPA paths serve the
+    /// embedded index.html as before — the 503 guard only kicks in when
+    /// the bundle is absent.
+    #[tokio::test]
+    async fn should_serve_admin_index_for_admin_spa_paths_when_bundle_present() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html>admin</html>")]);
+        let resp = serve_with(&assets, &state, "/admin/profile/foo/skills").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"));
+    }
+
+    /// Segment-match guard for admin: `/administration` must not be
+    /// treated as an admin-SPA path. When admin bundle is missing it
+    /// should fall through to the catch-all 503, same as `/login`.
+    /// When admin bundle is present it follows the catch-all redirect.
+    #[tokio::test]
+    async fn should_not_match_admin_prefix_siblings() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
+        let resp = serve_with(&assets, &state, "/administration").await;
+        // With admin bundle present: fall-through to the catch-all 307.
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         let location = resp
             .headers()
             .get(header::LOCATION)
