@@ -269,6 +269,14 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessCredentialRotationEvent,
     },
+    /// Emitted once per session load after [`octos_bus::ResumePolicy`] runs
+    /// (M8.6). Carries a typed report so operators can see what the
+    /// sanitizer dropped and whether the worktree (if any) was still
+    /// present on disk.
+    SessionSanitized {
+        #[serde(flatten)]
+        data: HarnessSessionSanitizedEvent,
+    },
     Error {
         #[serde(flatten)]
         data: HarnessErrorEvent,
@@ -527,6 +535,48 @@ pub struct HarnessRoutingDecisionEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Typed payload emitted when [`octos_bus::ResumePolicy`] sanitizes a
+/// session transcript on load (M8.6).
+///
+/// The report fields mirror [`octos_bus::SessionSanitizeReport`] one-for-
+/// one so operators can build dashboards without joining against a raw
+/// log. `worktree_missing` is a hard signal that the sub-agent's git
+/// worktree was cleaned up externally (Claude Code issue #22355) — the
+/// caller should refuse to resume and start a fresh session instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessSessionSanitizedEvent {
+    pub session_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Messages loaded from JSONL before any filter ran.
+    pub input_len: usize,
+    /// Messages remaining after all 4 filter passes.
+    pub output_len: usize,
+    /// Tool-call assistant messages whose ids lacked matching results and
+    /// were not pinned by retry state.
+    #[serde(default)]
+    pub unresolved_tool_uses_dropped: usize,
+    /// Assistant messages with reasoning but no content or tool calls
+    /// (non-tail only).
+    #[serde(default)]
+    pub orphan_thinking_dropped: usize,
+    /// Assistant messages with whitespace-only content.
+    #[serde(default)]
+    pub whitespace_only_dropped: usize,
+    /// Count of [`octos_bus::ReplacementStateRef`] entries recovered.
+    #[serde(default)]
+    pub content_replacements_restored: usize,
+    /// `true` when `workspace_root` was provided and missing on disk.
+    #[serde(default)]
+    pub worktree_missing: bool,
+    /// Non-fatal diagnostics from the policy. Order-preserving.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Structured credential rotation event (M6.5).
 ///
 /// Emitted by the credential pool on every successful selection. Consumers
@@ -674,6 +724,37 @@ impl HarnessEvent {
                     lane: None,
                     reasons,
                     input_chars,
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Construct a `SessionSanitized` event from a
+    /// [`octos_bus::SessionSanitizeReport`] (M8.6). The caller supplies
+    /// session_id/task_id/workflow from its runtime context; the rest of
+    /// the fields come straight from the report.
+    pub fn session_sanitized(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        workflow: Option<impl Into<String>>,
+        report: &octos_bus::SessionSanitizeReport,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::SessionSanitized {
+                data: HarnessSessionSanitizedEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    workflow: workflow.map(Into::into),
+                    input_len: report.input_len,
+                    output_len: report.output_len,
+                    unresolved_tool_uses_dropped: report.unresolved_tool_uses_dropped,
+                    orphan_thinking_dropped: report.orphan_thinking_dropped,
+                    whitespace_only_dropped: report.whitespace_only_dropped,
+                    content_replacements_restored: report.content_replacements_restored,
+                    worktree_missing: report.worktree_missing,
+                    warnings: report.warnings.clone(),
                     extra: HashMap::new(),
                 },
             },
@@ -861,6 +942,13 @@ impl HarnessEvent {
                 )?;
                 validate_bounded("reason", &data.reason, MAX_PHASE_BYTES)?;
                 validate_bounded("strategy", &data.strategy, MAX_PHASE_BYTES)?;
+            }
+            HarnessEventPayload::SessionSanitized { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
+                for warning in &data.warnings {
+                    validate_bounded("warning", warning, MAX_MESSAGE_BYTES)?;
+                }
             }
             HarnessEventPayload::Error { data } => {
                 if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
@@ -1096,6 +1184,26 @@ impl HarnessEvent {
                     "strategy": data.strategy,
                 })
             }
+            HarnessEventPayload::SessionSanitized { data } => {
+                let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "session_sanitized",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "workflow": workflow,
+                    "workflow_kind": workflow,
+                    "current_phase": fallback_current_phase,
+                    "input_len": data.input_len,
+                    "output_len": data.output_len,
+                    "unresolved_tool_uses_dropped": data.unresolved_tool_uses_dropped,
+                    "orphan_thinking_dropped": data.orphan_thinking_dropped,
+                    "whitespace_only_dropped": data.whitespace_only_dropped,
+                    "content_replacements_restored": data.content_replacements_restored,
+                    "worktree_missing": data.worktree_missing,
+                    "warnings": data.warnings,
+                })
+            }
             HarnessEventPayload::Error { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -1132,6 +1240,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => &data.session_id,
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
+            HarnessEventPayload::SessionSanitized { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
@@ -1150,6 +1259,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => &data.task_id,
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
+            HarnessEventPayload::SessionSanitized { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
@@ -1168,6 +1278,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => data.workflow.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::SessionSanitized { data } => data.workflow.as_deref(),
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
@@ -1186,6 +1297,7 @@ impl HarnessEvent {
             HarnessEventPayload::CostAttribution { data } => data.phase.as_deref(),
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
+            HarnessEventPayload::SessionSanitized { .. } => None,
             HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
@@ -1707,5 +1819,126 @@ mod tests {
             .get_task(&other_task_id)
             .expect("other task missing");
         assert!(other.runtime_detail.is_none());
+    }
+
+    /// M8.6: `SessionSanitized` round-trips through JSON and reports the
+    /// report fields in `runtime_detail_value`.
+    #[test]
+    fn session_sanitized_event_round_trips() {
+        let report = octos_bus::SessionSanitizeReport {
+            input_len: 12,
+            output_len: 9,
+            unresolved_tool_uses_dropped: 2,
+            orphan_thinking_dropped: 1,
+            whitespace_only_dropped: 0,
+            content_replacements_restored: 3,
+            worktree_missing: false,
+            warnings: vec!["mtime bump degraded".into()],
+        };
+        let event =
+            HarnessEvent::session_sanitized("api:session", "task-resume", Some("coding"), &report);
+
+        assert!(event.validate().is_ok());
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""kind":"session_sanitized""#),
+            "event should serialize the session_sanitized kind; got: {json}"
+        );
+
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        match &parsed.payload {
+            HarnessEventPayload::SessionSanitized { data } => {
+                assert_eq!(data.input_len, 12);
+                assert_eq!(data.output_len, 9);
+                assert_eq!(data.unresolved_tool_uses_dropped, 2);
+                assert_eq!(data.orphan_thinking_dropped, 1);
+                assert_eq!(data.whitespace_only_dropped, 0);
+                assert_eq!(data.content_replacements_restored, 3);
+                assert!(!data.worktree_missing);
+                assert_eq!(data.warnings, vec!["mtime bump degraded".to_string()]);
+            }
+            other => panic!("expected SessionSanitized variant, got {other:?}"),
+        }
+
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "session_sanitized");
+        assert_eq!(detail["input_len"], 12);
+        assert_eq!(detail["output_len"], 9);
+        assert_eq!(detail["content_replacements_restored"], 3);
+    }
+
+    /// M8.6: a worktree-missing event must flag the condition so operators
+    /// can see it on the task dashboard.
+    #[test]
+    fn session_sanitized_event_flags_worktree_missing() {
+        let report = octos_bus::SessionSanitizeReport {
+            input_len: 4,
+            output_len: 4,
+            worktree_missing: true,
+            ..Default::default()
+        };
+        let event = HarnessEvent::session_sanitized(
+            "api:session",
+            "task-resume",
+            Option::<String>::None,
+            &report,
+        );
+
+        assert!(event.validate().is_ok());
+        let detail = event.runtime_detail_value(None, None);
+        assert_eq!(detail["worktree_missing"], true);
+        assert_eq!(detail["kind"], "session_sanitized");
+    }
+
+    /// M8.6: verify the sink pipeline delivers a session-sanitized event
+    /// to the task supervisor exactly as it does for progress/phase
+    /// events. This is the "emit via sink" happy path the caller-side
+    /// wiring relies on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_emit_session_sanitized_event_when_sink_configured() {
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("resume", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let sink = HarnessEventSink::new(supervisor.clone(), task_id.clone(), "api:session")
+            .expect("create sink");
+
+        let report = octos_bus::SessionSanitizeReport {
+            input_len: 3,
+            output_len: 2,
+            unresolved_tool_uses_dropped: 1,
+            ..Default::default()
+        };
+        let event = HarnessEvent::session_sanitized(
+            "api:session",
+            task_id.clone(),
+            Some("coding"),
+            &report,
+        );
+
+        write_event_to_sink(sink.path().display().to_string(), &event).unwrap();
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let task = rx.recv().await.expect("task update");
+                if task.id == task_id && task.runtime_detail.is_some() {
+                    break task;
+                }
+            }
+        })
+        .await
+        .expect("sink should deliver the session_sanitized event");
+
+        let detail: Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["kind"], "session_sanitized");
+        assert_eq!(detail["input_len"], 3);
+        assert_eq!(detail["output_len"], 2);
+        assert_eq!(detail["unresolved_tool_uses_dropped"], 1);
     }
 }

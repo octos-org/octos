@@ -93,9 +93,9 @@ pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent,
     HarnessCredentialRotationEvent, HarnessCredentialRotationSink, HarnessEvent, HarnessEventError,
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent,
-    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
-    HarnessSwarmDispatchEvent, HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
-    emit_registered_credential_rotation_event,
+    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSessionSanitizedEvent,
+    HarnessSubAgentDispatchEvent, HarnessSwarmDispatchEvent, HarnessValidatorResultEvent,
+    MAX_HARNESS_EVENT_LINE_BYTES, emit_registered_credential_rotation_event,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
