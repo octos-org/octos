@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 
 /// Tool for writing/creating files.
 pub struct WriteFileTool {
@@ -62,6 +62,17 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.4: legacy entry point routes through the typed path with a
+        // zero-value context so out-of-band callers still exercise the same
+        // file-state-cache invalidation logic.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: WriteFileInput =
             serde_json::from_value(args.clone()).wrap_err("invalid write_file tool input")?;
 
@@ -87,6 +98,13 @@ impl Tool for WriteFileTool {
         // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
         if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
             return Ok(super::file_io_error(e, &input.path));
+        }
+
+        // M8.4: invalidate any stale cache entry for this path — the file's
+        // contents (and mtime) just changed, so previous reads must not serve
+        // a [FILE_UNCHANGED] stub on the next read.
+        if let Some(cache) = ctx.file_state_cache.as_ref() {
+            cache.invalidate(&path);
         }
 
         if let Err(error) =
@@ -192,5 +210,52 @@ mod tests {
         let tool = WriteFileTool::new("/tmp");
         assert_eq!(tool.name(), "write_file");
         assert!(tool.tags().contains(&"fs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // M8.4 integration test — write invalidates the file-state cache.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn should_write_file_tool_invalidate_cache_after_write() {
+        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("note.txt");
+
+        // Pre-populate the cache as if the file had been read already.
+        let cache = Arc::new(FileStateCache::new());
+        cache.put(CacheEntry::new(
+            file_path.clone(),
+            SystemTime::now(),
+            0xABCD,
+            42,
+            false,
+            None,
+        ));
+        assert_eq!(cache.len(), 1);
+
+        // Wire the cache into the tool context.
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(cache.clone());
+
+        let tool = WriteFileTool::new(dir.path());
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "note.txt", "content": "new body\n"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        // After a successful write, the cache entry for this path must be gone.
+        assert!(
+            cache.peek(&file_path).is_none(),
+            "write_file must invalidate the cached entry"
+        );
+        assert_eq!(cache.len(), 0);
     }
 }

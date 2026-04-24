@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 
 /// Tool for editing files via unified diff format with fuzzy matching.
 pub struct DiffEditTool {
@@ -61,6 +61,17 @@ impl Tool for DiffEditTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.4: legacy entry point routes through the typed path with a
+        // zero-value context so out-of-band callers still exercise the same
+        // file-state-cache invalidation logic.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: DiffEditInput =
             serde_json::from_value(args.clone()).wrap_err("invalid diff_edit input")?;
 
@@ -114,6 +125,12 @@ impl Tool for DiffEditTool {
 
         if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
             return Ok(super::file_io_error(e, &input.path));
+        }
+
+        // M8.4: invalidate any stale cache entry — the file's contents and
+        // mtime just changed.
+        if let Some(cache) = ctx.file_state_cache.as_ref() {
+            cache.invalidate(&path);
         }
 
         if let Err(error) =

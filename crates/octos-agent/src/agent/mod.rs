@@ -23,6 +23,7 @@ use octos_core::{AgentId, Message, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
+use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::session::{SessionLimits, SessionUsage};
@@ -177,6 +178,10 @@ pub struct Agent {
     /// clone is O(1). When left at the default (empty registry) the agent
     /// behaves exactly as pre-M8.2.
     pub(super) agent_definitions: Arc<crate::agents::AgentDefinitions>,
+    /// Optional shared [`FileStateCache`] threaded into every
+    /// [`crate::tools::ToolContext`] so file tools can short-circuit
+    /// re-reads (M8.4). `None` keeps pre-M8.4 behaviour.
+    pub(super) file_state_cache: Option<Arc<FileStateCache>>,
 }
 
 impl Agent {
@@ -208,6 +213,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            file_state_cache: None,
         }
     }
 
@@ -240,6 +246,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            file_state_cache: None,
         }
     }
 
@@ -310,6 +317,23 @@ impl Agent {
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// Enable M8.4's [`FileStateCache`] for file tools.
+    ///
+    /// When set, file tools like `read_file`, `write_file`, `edit_file`, and
+    /// `diff_edit` consult this cache to short-circuit re-reads of unchanged
+    /// files and invalidate entries on write. Absent = pre-M8.4 behaviour.
+    pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Access the agent's [`FileStateCache`] handle (if configured). Used by
+    /// the compaction runner to invoke [`FileStateCache::clear`] at tier-3
+    /// compaction boundaries — see M8.5 for the full integration.
+    pub fn file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
+        self.file_state_cache.as_ref()
     }
 
     /// Set the embedding provider for hybrid memory search.

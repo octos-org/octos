@@ -18,6 +18,7 @@ pub mod compaction;
 pub mod cost_ledger;
 pub mod event_bus;
 pub mod exec_env;
+pub mod file_state_cache;
 pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
@@ -75,6 +76,11 @@ pub use cost_ledger::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use file_state_cache::{
+    CacheEntry as FileCacheEntry, DEFAULT_MAX_ENTRIES as FILE_CACHE_DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_TOTAL_BYTES as FILE_CACHE_DEFAULT_MAX_TOTAL_BYTES, FILE_UNCHANGED_STUB_PREFIX,
+    FileStateCache, FileStateCacheBuilder, format_file_unchanged_stub,
+};
 pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent,

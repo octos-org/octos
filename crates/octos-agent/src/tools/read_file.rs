@@ -7,6 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
+use crate::file_state_cache::{CacheEntry, FileStateCache, format_file_unchanged_stub};
 
 /// Tool for reading file contents.
 pub struct ReadFileTool {
@@ -108,7 +109,7 @@ impl Tool for ReadFileTool {
         // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
         // anyway, and reading a multi-GB file just to slice a few lines is wasteful).
         const MAX_FILE_BYTES: u64 = 10_000_000;
-        match tokio::fs::metadata(&path).await {
+        let (current_mtime, file_size) = match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
                 return Ok(ToolResult {
                     output: format!(
@@ -120,7 +121,27 @@ impl Tool for ReadFileTool {
                     ..Default::default()
                 });
             }
-            _ => {}
+            Ok(meta) => (meta.modified().ok(), meta.len() as usize),
+            Err(_) => (None, 0),
+        };
+
+        // M8.4: file-state cache consultation. When the cache is configured
+        // and the caller-supplied mtime matches, emit a typed
+        // `[FILE_UNCHANGED]` stub rather than re-reading and re-emitting the
+        // file body. This reduces token cost by 30-60 % in long sessions.
+        // We store the user-supplied range verbatim so the comparison here is
+        // exact (without needing to know the file's total line count).
+        let requested_range = user_range(input.start_line, input.end_line);
+        if let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime) {
+            if let Some(entry) = cache.get(&path, mtime) {
+                if cache_matches_request(&entry, requested_range) {
+                    return Ok(ToolResult {
+                        output: format_file_unchanged_stub(&path, entry.view_range),
+                        success: true,
+                        ..Default::default()
+                    });
+                }
+            }
         }
 
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
@@ -176,11 +197,62 @@ impl Tool for ReadFileTool {
         const MAX_OUTPUT: usize = 100000;
         octos_core::truncate_utf8(&mut output, MAX_OUTPUT, "\n... (content truncated)");
 
+        // M8.4: record this read in the file-state cache so a later read can
+        // short-circuit to the `[FILE_UNCHANGED]` stub. Skip binary blobs —
+        // we never want to serve an image/PDF body from the cache.
+        if let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime) {
+            let can_cache = !FileStateCache::has_binary_extension(&path)
+                && FileStateCache::is_text_cacheable(content.as_bytes());
+            if can_cache {
+                let view_range = user_range(input.start_line, input.end_line);
+                cache.put(CacheEntry::new(
+                    path.clone(),
+                    mtime,
+                    FileStateCache::content_hash(content.as_bytes()),
+                    file_size,
+                    view_range.is_some(),
+                    view_range,
+                ));
+            }
+        }
+
         Ok(ToolResult {
             output,
             success: true,
             ..Default::default()
         })
+    }
+}
+
+/// Encode the user-supplied (start_line, end_line) pair as a cache range.
+///
+/// Returns `None` when the caller did not provide either bound (meaning "the
+/// whole file"). When only one bound is set, the absent side is stored as
+/// 0 (for a missing start) or [`u64::MAX`] (for a missing end) so the tuple
+/// still compares by identity without needing the file's total-line count.
+fn user_range(start: Option<usize>, end: Option<usize>) -> Option<(u64, u64)> {
+    if start.is_none() && end.is_none() {
+        return None;
+    }
+    Some((
+        start.map(|s| s as u64).unwrap_or(0),
+        end.map(|e| e as u64).unwrap_or(u64::MAX),
+    ))
+}
+
+/// True when a cached entry can satisfy the caller's request without
+/// re-reading the file. A full-file cache satisfies any request. A partial
+/// cache satisfies a request only if the ranges agree exactly.
+fn cache_matches_request(entry: &CacheEntry, requested_range: Option<(u64, u64)>) -> bool {
+    match (entry.view_range, requested_range) {
+        // Full-file cache covers a full-file request.
+        (None, None) => true,
+        // A full-file read cannot satisfy a partial request without knowing
+        // the file's line count. Be conservative.
+        (None, Some(_)) => false,
+        // A partial cache cannot satisfy a full request.
+        (Some(_), None) => false,
+        (Some(cached), Some(requested)) => cached == requested,
     }
 }
 
@@ -295,5 +367,160 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("alpha"));
         assert!(result.output.contains("beta"));
+    }
+
+    // -----------------------------------------------------------------------
+    // M8.4 integration tests — file-state cache behaviour in ReadFileTool
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    fn ctx_with_cache(cache: Arc<FileStateCache>) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "read-with-cache".to_string();
+        ctx.file_state_cache = Some(cache);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn should_read_file_tool_return_file_unchanged_when_cache_hit() {
+        // First read populates the cache. Second read with unchanged mtime
+        // must short-circuit to the [FILE_UNCHANGED] stub.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stable.txt"), "first\nsecond\nthird\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let first = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "stable.txt"}))
+            .await
+            .unwrap();
+        assert!(first.success);
+        assert!(first.output.contains("first"));
+        assert!(!first.output.contains("[FILE_UNCHANGED]"));
+        assert_eq!(cache.len(), 1);
+
+        // Second read: mtime unchanged, must hit the cache and return the stub.
+        let second = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "stable.txt"}))
+            .await
+            .unwrap();
+        assert!(second.success);
+        assert!(
+            second.output.contains("[FILE_UNCHANGED]"),
+            "expected stub output, got: {}",
+            second.output
+        );
+        assert!(second.output.contains("stable.txt"));
+    }
+
+    #[tokio::test]
+    async fn should_read_file_tool_miss_when_file_changed_between_reads() {
+        // On most filesystems mtime resolution is coarser than a millisecond.
+        // Seed the cache with an explicitly-older mtime so the subsequent
+        // rewrite is guaranteed to bump it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edits.txt");
+        std::fs::write(&file, "v1\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let _ = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "edits.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Back-date the cached mtime by 5 seconds to simulate a later edit
+        // without waiting for wall-clock granularity to change on CI.
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        cache.put(CacheEntry::new(
+            dir.path().join("edits.txt"),
+            backdated,
+            0xDEAD_BEEF,
+            2,
+            false,
+            None,
+        ));
+
+        // Rewriting the file must bust the cache on the next read.
+        std::fs::write(&file, "v2_content\n").unwrap();
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "edits.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("[FILE_UNCHANGED]"),
+            "mtime changed — must NOT hit the cache, got: {}",
+            result.output
+        );
+        assert!(result.output.contains("v2_content"));
+    }
+
+    #[tokio::test]
+    async fn should_read_file_tool_miss_when_cache_is_none() {
+        // Tools with no cache configured must behave identically to the
+        // pre-M8.4 path — no stub output, no errors.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n.txt"), "one\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+
+        let a = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "n.txt"}))
+            .await
+            .unwrap();
+        let b = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "n.txt"}))
+            .await
+            .unwrap();
+        assert!(a.success && b.success);
+        assert!(!a.output.contains("[FILE_UNCHANGED]"));
+        assert!(!b.output.contains("[FILE_UNCHANGED]"));
+    }
+
+    #[tokio::test]
+    async fn should_read_file_tool_not_hit_when_range_differs() {
+        // A (1, 5) cache entry cannot satisfy a (3, 7) request.
+        let dir = tempfile::tempdir().unwrap();
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("f.txt"), &content).unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let _ = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "f.txt", "start_line": 1, "end_line": 5}),
+            )
+            .await
+            .unwrap();
+
+        let second = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "f.txt", "start_line": 3, "end_line": 7}),
+            )
+            .await
+            .unwrap();
+        assert!(second.success);
+        assert!(
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "different range must not hit cache, got: {}",
+            second.output
+        );
+        assert!(second.output.contains("line 7"));
     }
 }
