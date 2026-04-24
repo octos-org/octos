@@ -197,6 +197,23 @@ impl ToolRegistry {
             .register(tool_name, tool_call_id, self.session_key.as_deref())
     }
 
+    /// Register a background task and capture the original tool input so
+    /// failure-recovery flows (M8.9) can reference it without re-walking
+    /// the message history.
+    pub fn register_task_with_input(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        tool_input: Option<serde_json::Value>,
+    ) -> String {
+        self.supervisor.register_with_input(
+            tool_name,
+            tool_call_id,
+            self.session_key.as_deref(),
+            tool_input,
+        )
+    }
+
     /// Return the number of currently active background tasks.
     pub fn bg_task_count(&self) -> u32 {
         self.supervisor.task_count() as u32

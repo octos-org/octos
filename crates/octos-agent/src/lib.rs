@@ -54,7 +54,8 @@ pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage}
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use task_supervisor::{
-    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+    BackgroundTask, SpawnOnlyFailureSignal, TaskLifecycleState, TaskRuntimeState, TaskStatus,
+    TaskSupervisor, parse_alternatives,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
