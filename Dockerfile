@@ -1,5 +1,18 @@
 # ============================================================
-# Stage 1: Build the octos binary
+# Stage 1: Build the dashboard (React)
+# ============================================================
+FROM node:22-alpine AS dashboard-builder
+
+WORKDIR /dashboard
+COPY dashboard/package*.json ./
+RUN npm ci
+COPY dashboard/ ./
+ENV VITE_BASE_PATH="/admin/"
+ENV VITE_OUT_DIR="./dist"
+RUN npm run build
+
+# ============================================================
+# Stage 2: Build the octos binary
 # ============================================================
 FROM rust:1.88-alpine AS builder
 
@@ -52,6 +65,10 @@ RUN cargo build --release --bin octos \
 
 # Copy full source and build
 COPY . .
+
+# Copy dashboard build output into static folder for embedding
+COPY --from=dashboard-builder /dashboard/dist/ crates/octos-cli/static/admin/
+
 RUN find crates -name '*.rs' -exec touch {} + && \
     cargo build --release --bin octos \
       -p octos-cli \
@@ -84,4 +101,4 @@ RUN mkdir -p /root/.octos/skills && \
     cp -r /opt/octos/skills/* /root/.octos/skills/ 2>/dev/null || true
 
 ENTRYPOINT ["octos"]
-CMD ["gateway"]
+

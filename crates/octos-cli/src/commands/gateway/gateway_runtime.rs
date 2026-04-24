@@ -47,6 +47,7 @@ use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
 use crate::status_layers::StatusComposer;
+use crate::commands::gateway::MAIN_PROFILE_ID;
 
 #[cfg(feature = "matrix")]
 use super::matrix_integration::*;
