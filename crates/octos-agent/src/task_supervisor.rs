@@ -516,6 +516,40 @@ struct TaskHandles {
     spec_snapshot: Option<Value>,
 }
 
+/// Harness M7.9b: Injection point the supervisor uses to actually
+/// re-execute a cancelled task when `relaunch_task` is called.
+///
+/// The supervisor itself cannot depend on [`SpawnTool`] directly — that
+/// would reverse the crate layering (the supervisor lives under the
+/// broader agent module and must remain usable from tests that don't
+/// touch the spawn wrapper). Instead, the spawn wrapper registers a
+/// `TaskReexecutor` trait object at construction time, and `relaunch_task`
+/// calls into it from a fresh `tokio::spawn` the supervisor owns — so
+/// the relaunch is not tied to the parent agent's execution loop (which
+/// has moved on) and the new abort handle is attached before the parent
+/// returns.
+///
+/// Implementations are expected to:
+/// 1. Look up the spawn-only tool (typically `SpawnTool`) by the plan's
+///    `tool_name`.
+/// 2. Invoke `Tool::execute(&plan.merged_spec)` as a fresh tokio task.
+/// 3. During that execution, call `register_abort` on the supervisor with
+///    the new `plan.new_task_id` so steering / cancel continue to work
+///    against the relaunched task.
+///
+/// Fire-and-forget: the trait returns `()` — any failure is recorded
+/// into the supervisor's task ledger via `mark_failed` by the
+/// implementation itself, so the relaunch initiator does not block on
+/// the re-execution.
+#[async_trait::async_trait]
+pub trait TaskReexecutor: Send + Sync {
+    /// Re-execute the tool described by `plan`. The `plan.new_task_id`
+    /// has already been registered and the original task has been
+    /// cancelled with `origin=relaunch` — the implementation only needs
+    /// to kick off the tool itself.
+    async fn reexecute(&self, plan: RelaunchPlan);
+}
+
 /// Supervisor that tracks background task lifecycle.
 ///
 /// Thread-safe via interior `Mutex`. Cloning shares the same underlying state.
@@ -534,6 +568,12 @@ pub struct TaskSupervisor {
     /// `attach_harness_event_sink` — without it, `cancel_task` still
     /// performs the abort + state transition but skips the event write.
     harness_event_sink_path: Arc<Mutex<Option<String>>>,
+    /// Harness M7.9b: Re-executor registered by the spawn wrapper to
+    /// actually re-invoke a cancelled task when `relaunch_task` is
+    /// called. Absent = legacy M7.9 behaviour (`relaunch_task` returns a
+    /// plan but nothing re-runs the tool). The plan-only path still
+    /// works for callers that want to handle re-execution themselves.
+    reexecutor: Arc<Mutex<Option<Arc<dyn TaskReexecutor>>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -551,7 +591,34 @@ impl TaskSupervisor {
             persistence_path: Arc::new(Mutex::new(None)),
             handles: Arc::new(Mutex::new(HashMap::new())),
             harness_event_sink_path: Arc::new(Mutex::new(None)),
+            reexecutor: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Harness M7.9b: Attach a [`TaskReexecutor`] so `relaunch_task`
+    /// actually re-invokes the cancelled tool with the merged spec.
+    /// Without an attached re-executor, `relaunch_task` still records
+    /// the new task id + merged spec but the tool is not re-run (same
+    /// behaviour as pre-M7.9b).
+    ///
+    /// The spawn wrapper wires the re-executor at setup time so the
+    /// supervisor can drive re-execution without the parent agent
+    /// having to proxy the call.
+    pub fn attach_reexecutor(&self, re: Arc<dyn TaskReexecutor>) {
+        let mut guard = self.reexecutor.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(re);
+    }
+
+    /// Observability accessor: check whether a re-executor is
+    /// currently attached. Used by integration tests + runtime probes
+    /// that want to confirm the spawn wrapper wired the re-executor.
+    /// No runtime significance on the relaunch path itself — this is
+    /// purely an introspection shim.
+    pub fn has_reexecutor(&self) -> bool {
+        self.reexecutor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Enable append-only persistence for task snapshots and restore existing state.
@@ -1197,11 +1264,17 @@ impl TaskSupervisor {
     ///
     /// This is the control-plane half of the relaunch flow — it registers
     /// a fresh task id linked to the original via `parent_task_id`,
-    /// returns the merged spec + new id, and the caller (typically the
-    /// `SpawnTool` wrapper or a REST handler) is responsible for actually
-    /// invoking the tool with the merged spec. We split the control plane
-    /// from the data plane so the supervisor module does not need to
-    /// depend on `SpawnTool` internals.
+    /// cancels the original, returns the merged spec + new id, and —
+    /// since M7.9b — also kicks off the data-plane re-execution via an
+    /// attached [`TaskReexecutor`]. When no re-executor is attached (raw
+    /// supervisor, unit tests, pre-M7.9b callers) the plan-only path is
+    /// preserved so the existing harness test matrix continues to pass.
+    ///
+    /// The re-execution runs on a fresh `tokio::spawn` the supervisor
+    /// owns — specifically *not* on the parent agent's loop, because the
+    /// parent agent may have moved on or itself been cancelled. The
+    /// spawned future is fire-and-forget: failures are recorded into
+    /// the task ledger by the `TaskReexecutor` implementation.
     pub fn relaunch_task(
         &self,
         task_id: &str,
@@ -1245,13 +1318,30 @@ impl TaskSupervisor {
             Some(new_task_id.clone()),
         );
 
-        Ok(RelaunchPlan {
+        let plan = RelaunchPlan {
             new_task_id,
             parent_task_id: task_id.to_string(),
             tool_name: original.tool_name,
             session_key: original.session_key,
             merged_spec,
-        })
+        };
+
+        // Harness M7.9b: when a re-executor is attached, kick off the
+        // data-plane re-execution on a supervisor-owned tokio task.
+        // Cloning the Arc keeps the trait object alive for the whole
+        // re-execution even if `attach_reexecutor` is replaced mid-flight.
+        let reexecutor_snapshot = {
+            let guard = self.reexecutor.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        if let Some(reexec) = reexecutor_snapshot {
+            let plan_for_reexec = plan.clone();
+            tokio::spawn(async move {
+                reexec.reexecute(plan_for_reexec).await;
+            });
+        }
+
+        Ok(plan)
     }
 
     fn persist_snapshot_by_id(&self, task_id: &str) {

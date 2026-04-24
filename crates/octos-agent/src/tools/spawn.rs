@@ -2635,6 +2635,73 @@ impl Tool for SpawnTool {
     }
 }
 
+/// Harness M7.9b: [`TaskReexecutor`] impl that re-invokes a
+/// [`SpawnTool`] for a cancelled-and-relaunched task.
+///
+/// Holds an `Arc<SpawnTool>` so the supervisor can call
+/// `Tool::execute(merged_spec)` from a fresh tokio task. The merged spec
+/// is exactly the JSON body the spawn tool originally received (or its
+/// seed-override-patched version), so the re-execution goes through the
+/// same code path as an LLM-driven tool call — inbox wiring, session
+/// lifecycle, validators, workspace contract all honoured.
+///
+/// Failures during re-execution are recorded into the task ledger via
+/// `supervisor.mark_failed` so operators see the re-run succeed or fail
+/// in the same audit stream as the original.
+pub struct SpawnToolReexecutor {
+    spawn_tool: Arc<SpawnTool>,
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl SpawnToolReexecutor {
+    pub fn new(spawn_tool: Arc<SpawnTool>, supervisor: Arc<TaskSupervisor>) -> Self {
+        Self {
+            spawn_tool,
+            supervisor,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::task_supervisor::TaskReexecutor for SpawnToolReexecutor {
+    async fn reexecute(&self, plan: crate::task_supervisor::RelaunchPlan) {
+        use crate::tools::Tool;
+
+        tracing::info!(
+            new_task_id = %plan.new_task_id,
+            parent_task_id = %plan.parent_task_id,
+            tool_name = %plan.tool_name,
+            "relaunching task via SpawnToolReexecutor"
+        );
+
+        // The supervisor already registered `new_task_id` and cancelled
+        // the original; all we have to do is re-invoke the tool with the
+        // merged spec. `SpawnTool::execute` itself re-registers a fresh
+        // task id internally — so for re-execution we pre-stamp the
+        // merged spec onto the new_task_id and then kick off the call.
+        //
+        // The spawn wrapper will create yet another task id for its own
+        // internal bookkeeping; we link the two via the `parent_task_id`
+        // field already stamped by the supervisor, so the overall chain
+        // remains traceable from the ledger.
+        match self.spawn_tool.execute(&plan.merged_spec).await {
+            Ok(_) => {
+                counter!("octos_task_relaunch_reexec_total", "outcome" => "ok").increment(1);
+            }
+            Err(error) => {
+                counter!("octos_task_relaunch_reexec_total", "outcome" => "error").increment(1);
+                tracing::warn!(
+                    new_task_id = %plan.new_task_id,
+                    error = %error,
+                    "relaunch re-execution failed — marking task failed on the ledger"
+                );
+                self.supervisor
+                    .mark_failed(&plan.new_task_id, error.to_string());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

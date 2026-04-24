@@ -1800,7 +1800,22 @@ impl ActorFactory {
             },
         ));
 
-        tools.register(spawn_tool);
+        // Harness M7.9b: Wrap the SpawnTool in an Arc so we can (a)
+        // register it on the tool registry and (b) hand a second Arc to
+        // the TaskReexecutor so `TaskSupervisor::relaunch_task` can
+        // re-invoke the tool from a supervisor-owned tokio task.
+        let spawn_tool_arc: Arc<octos_agent::SpawnTool> = Arc::new(spawn_tool);
+        tools.register_arc(spawn_tool_arc.clone());
+
+        // Attach the re-executor onto the supervisor so `relaunch_task`
+        // actually drives the data plane (not just the status ledger).
+        // This closes M7.9's follow-up gap #2: the M7.9 relaunch flow
+        // stored the merged spec but never re-invoked SpawnTool::execute.
+        let reexecutor = Arc::new(octos_agent::SpawnToolReexecutor::new(
+            spawn_tool_arc.clone(),
+            supervisor.clone(),
+        ));
+        supervisor.attach_reexecutor(reexecutor);
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
