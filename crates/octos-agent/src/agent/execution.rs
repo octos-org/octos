@@ -93,6 +93,7 @@ impl Agent {
                 let tc_args = tool_call.arguments.clone();
                 let attachment_ctx = turn_attachment_ctx.clone();
                 let harness_event_sink = self.harness_event_sink.clone();
+                let file_state_cache = self.file_state_cache.clone();
 
                 tokio::spawn(async move {
                     let tool_start = Instant::now();
@@ -175,6 +176,7 @@ impl Agent {
                             // Helper to create TOOL_CTX for plugin stderr progress streaming.
                             // Base it on the zero-value context so M8.x placeholder fields
                             // carry their default-populated values.
+                            let bg_cache = file_state_cache.clone();
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
@@ -186,6 +188,7 @@ impl Agent {
                                 file_attachment_paths: bg_attachment_ctx
                                     .file_attachment_paths
                                     .clone(),
+                                file_state_cache: bg_cache.clone(),
                                 ..ToolContext::zero()
                             };
 
@@ -506,6 +509,7 @@ impl Agent {
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                        file_state_cache: file_state_cache.clone(),
                         ..ToolContext::zero()
                     };
                     // Thread the typed context into execute_with_context. Legacy tools
