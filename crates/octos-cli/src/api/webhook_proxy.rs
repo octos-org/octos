@@ -244,6 +244,43 @@ pub async fn api_chat_proxy(
     }
 
     if stream {
+        // Inspect upstream content-type BEFORE wrapping as SSE.
+        //
+        // Under `/queue speculative`, the gateway responds to a POST /chat that
+        // arrives while a previous SSE stream is still live with a plain JSON
+        // ack: `{"status":"queued","message":"…"}`. Forcing the outer response
+        // to `text/event-stream` in that case makes the JSON body look like
+        // malformed SSE to the client, which never observes a `done` event and
+        // leaves the corresponding assistant bubble stuck in "streaming"
+        // forever (FA-11 defect A).
+        //
+        // Pass the JSON body through with `content-type: application/json` so
+        // the web client can recognize the ack and subscribe to the
+        // session-event-stream for the overflow reply. Only force SSE
+        // content-type when upstream is actually an SSE stream.
+        let upstream_ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if upstream_ct.contains("application/json") {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            return match resp.bytes().await {
+                Ok(body) => {
+                    let mut response = (status, body.to_vec()).into_response();
+                    response
+                        .headers_mut()
+                        .insert("content-type", "application/json".parse().unwrap());
+                    response
+                }
+                Err(error) => json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("failed to read gateway JSON ack: {error}"),
+                ),
+            };
+        }
+
         let stream = resp.bytes_stream();
         return match Response::builder()
             .status(200)
@@ -507,6 +544,119 @@ data: {"type":"done","content":"","tokens_in":1,"tokens_out":2}
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "upstream request timed out after 50ms");
+
+        server.abort();
+    }
+
+    /// FA-11 defect A: A JSON queued-ack reply from the gateway must NOT be
+    /// wrapped as SSE. Under `/queue speculative`, the gateway returns
+    /// `application/json {status:"queued",...}` when a second prompt arrives
+    /// while an earlier SSE stream is still live. Forcing SSE content-type
+    /// made the JSON body look like malformed SSE to the client, which never
+    /// observed a `done` event and left the assistant bubble stuck streaming
+    /// forever.
+    #[tokio::test]
+    async fn should_passthrough_json_queued_ack() {
+        use axum::Router;
+        use axum::routing::post;
+
+        // Upstream stub returning JSON ack on /chat.
+        let app = Router::new().route(
+            "/chat",
+            post(|| async {
+                (
+                    [("content-type", "application/json")],
+                    r#"{"status":"queued","message":"Message queued — response will arrive on the existing stream"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::api::AppState::empty_for_tests();
+        let response = super::api_chat_proxy(
+            &state,
+            port,
+            None,
+            "hi",
+            Some("test-session"),
+            None,
+            &[],
+            false,
+            true, // stream = true, the path where the bug happens
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("application/json"),
+            "expected content-type application/json, got {content_type}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "queued");
+
+        server.abort();
+    }
+
+    /// Under the normal SSE path (upstream returns `text/event-stream`), the
+    /// proxy must keep forwarding SSE with `content-type: text/event-stream`.
+    /// This guards the FA-11 fix from regressing the happy path.
+    #[tokio::test]
+    async fn should_keep_sse_when_upstream_is_sse() {
+        use axum::Router;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/chat",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"type\":\"done\",\"content\":\"hi\",\"tokens_in\":1,\"tokens_out\":1}\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::api::AppState::empty_for_tests();
+        let response = super::api_chat_proxy(
+            &state,
+            port,
+            None,
+            "hi",
+            Some("test-session"),
+            None,
+            &[],
+            false,
+            true,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("text/event-stream"),
+            "expected content-type text/event-stream, got {content_type}"
+        );
 
         server.abort();
     }
