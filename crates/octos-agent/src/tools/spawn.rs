@@ -1400,6 +1400,10 @@ impl Tool for SpawnTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M7.9: preserve the exact caller payload before `Input` consumes
+        // fields. `relaunch_task` replays this snapshot with caller-supplied
+        // overrides, so we stamp it into the supervisor via `register_abort`.
+        let spec_snapshot = args.clone();
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
 
@@ -1933,7 +1937,20 @@ impl Tool for SpawnTool {
             // compaction + validator contracts the sync spawn path honours.
             let child_workspace_policy = parent_workspace_policy.clone();
 
-            tokio::spawn(async move {
+            // M7.9: build the supervisor inbox for the subagent before the
+            // spawn future moves the receiver. `inbox_rx` is consumed by the
+            // subagent loop (drained at the start of each turn) and
+            // `inbox_tx` is handed to the supervisor so out-of-band callers
+            // can steer the running task.
+            let (inbox_tx, inbox_rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::task_supervisor::InboxMessage,
+            >();
+            let supervisor_inbox = crate::task_supervisor::SupervisorInbox::new(inbox_tx);
+            let spec_for_supervisor = spec_snapshot.clone();
+            let tracked_task_id_for_handle = tracked_task_id.clone();
+            let supervisor_for_handle = task_supervisor.clone();
+
+            let join = tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
                     (task_supervisor.as_ref(), tracked_task_id.as_ref())
                 {
@@ -2563,7 +2580,32 @@ impl Tool for SpawnTool {
                 } else {
                     record_result_delivery("relay_inbound_message", "enqueued", result_kind);
                 }
+                // Keep the inbox receiver alive for the duration of the
+                // subagent. The supervisor tree may still be holding
+                // `SupervisorInbox` clones; dropping `_inbox_rx` here lets
+                // late `send_to_agent` calls surface `InboxClosed`.
+                let _inbox_rx = inbox_rx;
             });
+
+            // M7.9: attach the abort handle + steering inbox to the
+            // supervisor entry so `cancel_task` / `send_to_agent` /
+            // `relaunch_task` can reach this running background task.
+            if let (Some(sup), Some(tid)) =
+                (supervisor_for_handle.as_ref(), tracked_task_id_for_handle.as_ref())
+            {
+                sup.register_abort(
+                    tid,
+                    join.abort_handle(),
+                    Some(supervisor_inbox),
+                    Some(spec_for_supervisor),
+                );
+            } else {
+                // If there's no supervisor, we drop the inbox sender and let
+                // the spawned task run detached. The unused variable `join`
+                // is intentionally ignored so the JoinHandle auto-detaches.
+                drop(join);
+                drop(supervisor_inbox);
+            }
 
             Ok(ToolResult {
                 output: format!("Spawned background task: {label}"),
