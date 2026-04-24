@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 pub mod compaction;
+pub mod compaction_tiered;
 pub mod cost_ledger;
 pub mod event_bus;
 pub mod exec_env;
@@ -69,6 +70,11 @@ pub use agent::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
+};
+pub use compaction_tiered::{
+    ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,
+    DEFAULT_TIER2_KEEP_LAST_N_TURNS, FullCompactor, MicroCompactionPolicy, Tier1Report,
+    Tier3Report, TieredCompactionRunner, is_anthropic_provider,
 };
 pub use cost_ledger::{
     BudgetProjection, BudgetRejectionReason, COST_ATTRIBUTION_COUNTER, COST_LEDGER_FILE,

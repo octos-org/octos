@@ -298,6 +298,7 @@ rather than appending duplicates.\n\n",
                 schema,
                 strict: true,
             }),
+            context_management: None,
         };
         let messages = vec![Message::user(prompt)];
         // Bridge the async LLM call to the synchronous Summarizer contract.
