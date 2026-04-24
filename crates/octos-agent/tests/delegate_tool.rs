@@ -272,3 +272,47 @@ fn should_publish_delegated_deny_group_name_on_policy() {
     assert_eq!(policy.deny, vec![DELEGATED_DENY_GROUP.to_string()]);
     assert!(policy.allow.is_empty());
 }
+
+#[tokio::test]
+async fn should_route_delegation_event_through_tool_context_sink() {
+    // M8.1 migration smoke test — DelegateTool is now a context-aware tool.
+    // A tool instance constructed *without* `.with_harness_event_sink(...)`
+    // must still emit its delegation event to the sink path carried by the
+    // `ToolContext` when dispatched through `execute_with_context`. This
+    // proves the tool actually reads from the typed context rather than
+    // relying on its own builder-only wiring.
+    use octos_agent::progress::SilentReporter;
+    use octos_agent::tools::ToolContext;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let memory = memory(&dir).await;
+    let sink_path = dir.path().join("delegation-events.ndjson");
+
+    // DepthBudget already exhausted so execute_with_context emits the
+    // DepthExceeded event and returns. No child is spawned, which keeps the
+    // test hermetic (no real LLM interaction required).
+    let tool = DelegateTool::new(llm("unused"), memory, PathBuf::from(dir.path()))
+        .with_depth_budget(DepthBudget::at_level(MAX_DEPTH));
+
+    let ctx = ToolContext {
+        tool_id: "m8.1-smoke".to_string(),
+        reporter: Arc::new(SilentReporter),
+        harness_event_sink: Some(sink_path.to_string_lossy().to_string()),
+        attachment_paths: Vec::new(),
+        audio_attachment_paths: Vec::new(),
+        file_attachment_paths: Vec::new(),
+        ..ToolContext::zero()
+    };
+
+    let result = tool
+        .execute_with_context(&ctx, &serde_json::json!({"task": "ignored"}))
+        .await;
+    assert!(result.is_err(), "depth-exceeded must fail synchronously");
+
+    let raw = std::fs::read_to_string(&sink_path)
+        .expect("DelegateTool must write the depth-exceeded event to the context sink path");
+    let entry: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+    assert_eq!(entry["kind"], "delegation");
+    assert_eq!(entry["outcome"], "depth_exceeded");
+}
