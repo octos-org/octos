@@ -707,7 +707,10 @@ async fn test_06_send_file_sandbox_escape() {
     use octos_agent::tools::SendFileTool;
 
     let sandbox = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("octos-pipeline-send-file-outside-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
 
     // Create a "secret" file outside the sandbox
     let secret = outside.path().join("credentials.json");

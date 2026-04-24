@@ -1,5 +1,6 @@
 //! Plugin tool: wraps a plugin executable as a Tool.
 
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -592,7 +593,14 @@ impl Tool for PluginTool {
         // Write args to stdin
         if let Some(mut stdin) = child.stdin.take() {
             let data = serde_json::to_vec(&effective_args)?;
-            stdin.write_all(&data).await?;
+            if let Err(err) = stdin.write_all(&data).await {
+                // Some plugins do not read stdin at all and exit after writing a
+                // best-effort stdout result. Treat an early pipe close as
+                // non-fatal so fallback stdout parsing can still succeed.
+                if err.kind() != ErrorKind::BrokenPipe {
+                    return Err(err.into());
+                }
+            }
             // Drop stdin to signal EOF
         }
 
