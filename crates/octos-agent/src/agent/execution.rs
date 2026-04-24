@@ -172,7 +172,9 @@ impl Agent {
                             bg_supervisor.mark_running(&task_id);
                             let bg_started_at = std::time::SystemTime::now();
 
-                            // Helper to create TOOL_CTX for plugin stderr progress streaming
+                            // Helper to create TOOL_CTX for plugin stderr progress streaming.
+                            // Base it on the zero-value context so M8.x placeholder fields
+                            // carry their default-populated values.
                             let make_ctx = || ToolContext {
                                 tool_id: bg_tc_id.clone(),
                                 reporter: bg_reporter.clone(),
@@ -184,6 +186,7 @@ impl Agent {
                                 file_attachment_paths: bg_attachment_ctx
                                     .file_attachment_paths
                                     .clone(),
+                                ..ToolContext::zero()
                             };
 
                             let mut result = TOOL_CTX
@@ -503,9 +506,17 @@ impl Agent {
                         attachment_paths: attachment_ctx.attachment_paths.clone(),
                         audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
                         file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                        ..ToolContext::zero()
                     };
+                    // Thread the typed context into execute_with_context. Legacy tools
+                    // whose trait impl only overrides `execute` still work via the
+                    // default delegation path; migrated tools read the typed fields.
+                    // TOOL_CTX is still scoped for plugin tools that read the task-local.
                     let result = TOOL_CTX
-                        .scope(ctx, tools.execute(&tc_name, &effective_args))
+                        .scope(
+                            ctx.clone(),
+                            tools.execute_with_context(&ctx, &tc_name, &effective_args),
+                        )
                         .await;
 
                     let duration = tool_start.elapsed();

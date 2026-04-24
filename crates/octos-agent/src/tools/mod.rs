@@ -1,4 +1,33 @@
 //! Tool framework for agent tool execution.
+//!
+//! # Typed `ToolContext` migration (M8.1)
+//!
+//! Tools receive execution context through [`ToolContext`]. Historically the
+//! context was delivered indirectly via the [`TOOL_CTX`] task-local, which the
+//! executor populated before calling each tool's [`Tool::execute`]. That works
+//! but makes the carrier invisible at the trait surface, so tools that want a
+//! field must either read the task-local or reach into globals.
+//!
+//! M8.1 introduces [`Tool::execute_with_context`], a typed entry point that
+//! threads `&ToolContext` explicitly. To keep the migration additive:
+//!
+//! - The trait's default implementation of `execute_with_context` falls back
+//!   to the legacy [`Tool::execute`]. Existing tools keep working unchanged.
+//! - Migrated tools override `execute_with_context` and use the typed record.
+//!   Their `execute` impl simply re-enters `execute_with_context` with a
+//!   zero-value context so out-of-band callers (tests, integrations that have
+//!   not been updated) still get predictable behaviour.
+//! - [`ToolContext`] carries the legacy fields *plus* placeholder stubs for
+//!   future milestones: [`AgentDefinitions`], [`ToolPermissions`],
+//!   [`FileStateCache`], [`Notifications`], and [`AppStateHandle`]. Each stub
+//!   is annotated with the future issue that will populate it. They all have
+//!   cheap zero-value constructors so today's executor can build a context
+//!   without wiring.
+//!
+//! The executor still sets [`TOOL_CTX`] for legacy plugin tools that rely on
+//! the task-local read path (see `plugins/tool.rs`). Once every tool is
+//! migrated the task-local becomes redundant and can be retired, but that
+//! clean-up is out of scope for M8.1.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,9 +39,127 @@ use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
 
-/// Execution context available to tools via task-local.
-/// Set by the agent before each tool invocation so plugin tools
-/// can report progress without changing the Tool trait signature.
+/// Registry of [`AgentDefinition`]-style manifests available to tools.
+///
+/// M8.2 will populate this registry from `AgentDefinition` manifests on disk
+/// (see issue #536 → M8.2). Today it is an empty holder so the context can be
+/// constructed without wiring.
+#[derive(Clone, Debug, Default)]
+pub struct AgentDefinitions {
+    // M8.2 will add the concrete definition records here.
+}
+
+impl AgentDefinitions {
+    /// Create an empty agent-definition registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether any agent definitions are registered.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// Per-tool permission facts consulted before each execution.
+///
+/// M8.3 will wire real profile-derived permissions into this struct (see
+/// issue #536 → M8.3). Today it unconditionally allows every tool so behaviour
+/// matches the pre-M8.1 status quo.
+#[derive(Clone, Debug)]
+pub struct ToolPermissions {
+    allow_all: bool,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl ToolPermissions {
+    /// Allow-all permissions — the zero-value default carried by the context.
+    pub fn allow_all() -> Self {
+        Self { allow_all: true }
+    }
+
+    /// Check whether the named tool is currently permitted. Always `true`
+    /// while M8.3 is pending.
+    pub fn is_tool_allowed(&self, _tool: &str) -> bool {
+        self.allow_all
+    }
+}
+
+/// File-state cache that mirrors `FileStateCache` from Claude Code.
+///
+/// M8.4 will grow this into the full LRU + mtime/hash invalidation cache
+/// described in the runtime plan (see issue #536 → M8.4). Today it is an
+/// empty stub so the context can hand out a shared handle without allocation.
+#[derive(Debug, Default)]
+pub struct FileStateCache {
+    // M8.4 will add the LRU state, mtime map, hash index, and
+    // `is_partial_view` tracking here.
+}
+
+impl FileStateCache {
+    /// Create an empty file-state cache handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the cache currently has any recorded file entries. Always
+    /// `false` until M8.4 fills in the map.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// Inbox of in-flight notifications surfaced to tools and the agent loop.
+///
+/// M8.2/M8.3 will route real notifications (e.g. permission prompts, gate
+/// state) through this handle. Today it is a zero-length inbox.
+#[derive(Clone, Debug, Default)]
+pub struct Notifications {
+    // M8.2/M8.3 will add the notification queue and backpressure state here.
+}
+
+impl Notifications {
+    /// Create an empty notifications inbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the inbox is empty (no pending notifications). Always `true`
+    /// until M8.2/M8.3 start enqueueing notifications.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// Handle to the ambient app state shared across tools.
+///
+/// M8.3 will use this to expose profile/app state that tools may read (e.g.
+/// the active profile name, locale, workspace contract root). Today it is an
+/// empty handle that tools can carry without wiring.
+#[derive(Clone, Debug, Default)]
+pub struct AppStateHandle {
+    // M8.3 will add the shared state handle (Arc<ProfileState>) here.
+}
+
+impl AppStateHandle {
+    /// Create an empty app-state handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Execution context available to tools.
+///
+/// The legacy fields (`tool_id`, `reporter`, `harness_event_sink`, three
+/// attachment lists) carry today's behaviour. The trailing fields are M8.x
+/// placeholders — see each field's doc comment for the issue that will wire
+/// it up. Building a zero-value context is cheap: all placeholders implement
+/// `Default` and the required handles are backed by `Arc` so cloning is O(1).
 #[derive(Clone)]
 pub struct ToolContext {
     pub tool_id: String,
@@ -22,6 +169,37 @@ pub struct ToolContext {
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
+    /// Agent manifests available to tools. M8.2 will populate this.
+    pub agent_definitions: Arc<AgentDefinitions>,
+    /// Per-tool permission facts. M8.3 will populate this.
+    pub permissions: ToolPermissions,
+    /// File-state cache shared across tools in a turn. M8.4 will populate this.
+    pub file_state_cache: Option<Arc<FileStateCache>>,
+    /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
+    pub notifications: Arc<Notifications>,
+    /// Handle to the ambient app state. M8.3 will populate this.
+    pub app_state: AppStateHandle,
+}
+
+impl ToolContext {
+    /// Zero-value context suitable for unit tests and tools that do not need
+    /// live executor wiring. Uses a [`crate::progress::SilentReporter`] and
+    /// leaves every M8.x placeholder at its default.
+    pub fn zero() -> Self {
+        Self {
+            tool_id: String::new(),
+            reporter: Arc::new(crate::progress::SilentReporter),
+            harness_event_sink: None,
+            attachment_paths: Vec::new(),
+            audio_attachment_paths: Vec::new(),
+            file_attachment_paths: Vec::new(),
+            agent_definitions: Arc::new(AgentDefinitions::new()),
+            permissions: ToolPermissions::default(),
+            file_state_cache: None,
+            notifications: Arc::new(Notifications::new()),
+            app_state: AppStateHandle::new(),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -72,6 +250,23 @@ pub struct ToolResult {
 }
 
 /// Trait for implementing tools.
+///
+/// # Context threading
+///
+/// Tools get their execution context through one of two entry points:
+///
+/// - [`Tool::execute`] — the legacy argument-only entry point. Kept as the
+///   primary signature so unmigrated tools, tests, and external callers do
+///   not need to thread a [`ToolContext`]. The default implementation of
+///   `execute_with_context` delegates here, so implementors who override
+///   only `execute` keep working.
+/// - [`Tool::execute_with_context`] — the typed entry point introduced by
+///   M8.1. Migrated tools override this and may read any field on the
+///   [`ToolContext`]. The default body re-enters the legacy [`Tool::execute`]
+///   so unmigrated tools keep working.
+///
+/// A tool should override at most one of the two. Overriding both produces
+/// two independent entry paths that the executor cannot reconcile.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Tool name (must be unique).
@@ -90,7 +285,28 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute the tool with the given arguments.
+    ///
+    /// Kept as the primary entry point so existing tools, tests, and
+    /// integrations do not need to construct a [`ToolContext`]. Migrated
+    /// tools re-enter this via [`Tool::execute_with_context`]; to avoid
+    /// infinite recursion implementors that override `execute_with_context`
+    /// must also override `execute` to call
+    /// `self.execute_with_context(&ToolContext::zero(), args).await`.
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult>;
+
+    /// Execute the tool with typed execution context.
+    ///
+    /// The default implementation delegates to [`Tool::execute`], discarding
+    /// the context. Tools that want to read [`ToolContext`] fields override
+    /// this and ignore `execute`'s default path. See the module-level doc
+    /// comment for the migration pattern.
+    async fn execute_with_context(
+        &self,
+        _ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        self.execute(args).await
+    }
 
     /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
     fn as_any(&self) -> &dyn std::any::Any {
@@ -614,5 +830,166 @@ mod path_tests {
         if let Ok(p) = &result {
             assert!(p.starts_with(base));
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_context_tests {
+    //! M8.1 tests — typed `ToolContext` + `execute_with_context` scaffolding.
+
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tool whose legacy `execute` records how many times it was called.
+    /// Overrides *only* `execute`; the default `execute_with_context` impl
+    /// must delegate here.
+    struct LegacyTool {
+        execute_calls: AtomicUsize,
+    }
+
+    impl LegacyTool {
+        fn new() -> Self {
+            Self {
+                execute_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for LegacyTool {
+        fn name(&self) -> &str {
+            "legacy"
+        }
+        fn description(&self) -> &str {
+            "legacy"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                output: "legacy output".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Tool that consumes the typed `ToolContext` — overrides
+    /// `execute_with_context` and re-enters via zero-value context from
+    /// `execute`.
+    struct ContextAwareTool {
+        with_ctx_calls: AtomicUsize,
+    }
+
+    impl ContextAwareTool {
+        fn new() -> Self {
+            Self {
+                with_ctx_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ContextAwareTool {
+        fn name(&self) -> &str {
+            "ctx_aware"
+        }
+        fn description(&self) -> &str {
+            "ctx"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, args: &Value) -> Result<ToolResult> {
+            // Re-enter the typed path with the zero context so callers that
+            // still use the legacy entry point see identical behaviour.
+            self.execute_with_context(&ToolContext::zero(), args).await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &ToolContext,
+            _args: &Value,
+        ) -> Result<ToolResult> {
+            self.with_ctx_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                output: format!(
+                    "tool_id={};allow_all={};defs_empty={}",
+                    ctx.tool_id,
+                    ctx.permissions.is_tool_allowed("anything"),
+                    ctx.agent_definitions.is_empty(),
+                ),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn should_construct_zero_value_tool_context() {
+        let ctx = ToolContext::zero();
+        assert!(ctx.tool_id.is_empty());
+        assert!(ctx.harness_event_sink.is_none());
+        assert!(ctx.attachment_paths.is_empty());
+        assert!(ctx.audio_attachment_paths.is_empty());
+        assert!(ctx.file_attachment_paths.is_empty());
+        // M8.x placeholders — zero-value but constructible without panic.
+        assert!(ctx.agent_definitions.is_empty());
+        assert!(ctx.permissions.is_tool_allowed("any_tool"));
+        assert!(ctx.file_state_cache.is_none());
+        assert!(ctx.notifications.is_empty());
+        // AppStateHandle has no introspection beyond Default; just ensure
+        // it cloned cheaply.
+        let _cloned = ctx.app_state.clone();
+    }
+
+    #[tokio::test]
+    async fn should_delegate_execute_to_execute_with_context() {
+        // Legacy tool: override only `execute`. The default impl of
+        // `execute_with_context` must route to it.
+        let tool = LegacyTool::new();
+        let ctx = ToolContext::zero();
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await
+            .expect("legacy tool must succeed via default delegation");
+        assert!(result.success);
+        assert_eq!(result.output, "legacy output");
+        assert_eq!(tool.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn should_invoke_execute_with_context_for_migrated_tool() {
+        let tool = ContextAwareTool::new();
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call-42".to_string();
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await
+            .expect("ctx-aware tool must succeed");
+        assert!(result.success);
+        assert!(result.output.contains("tool_id=call-42"));
+        assert!(result.output.contains("allow_all=true"));
+        assert!(result.output.contains("defs_empty=true"));
+        assert_eq!(tool.with_ctx_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn should_route_migrated_tool_execute_back_through_context_path() {
+        // When a migrated tool is called via the legacy `execute` entry
+        // point, it must still take its ctx-aware branch (invoked with
+        // the zero-value context so out-of-band callers keep working).
+        let tool = ContextAwareTool::new();
+        let result = tool
+            .execute(&serde_json::json!({}))
+            .await
+            .expect("migrated tool's legacy execute must succeed");
+        assert!(result.success);
+        // tool_id is empty because ToolContext::zero() carries no id.
+        assert!(result.output.starts_with("tool_id=;"));
+        assert_eq!(tool.with_ctx_calls.load(Ordering::SeqCst), 1);
     }
 }

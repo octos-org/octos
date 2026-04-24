@@ -36,7 +36,7 @@ use octos_memory::EpisodeStore;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
+use super::{Tool, ToolContext, ToolPolicy, ToolRegistry, ToolResult};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::HARNESS_EVENT_SCHEMA_V1;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
@@ -458,8 +458,27 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.1: legacy entry point. Re-enter via execute_with_context with
+        // the zero-value context so out-of-band callers (tests, integrations
+        // that have not been updated) still exercise the same code path.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid delegate_task input")?;
+
+        // M8.1: prefer the sink path threaded through the typed context. Fall
+        // back to the tool's own configured sink for constructors that wired
+        // it directly (and for the legacy zero-context entry path).
+        let effective_sink: Option<&str> = ctx
+            .harness_event_sink
+            .as_deref()
+            .or(self.harness_event_sink.as_deref());
 
         // Step 1: depth guard. A parent whose budget is already exhausted
         // must reject synchronously, without spawning.
@@ -476,7 +495,7 @@ impl Tool for DelegateTool {
                     String::new(),
                     DelegationOutcome::DepthExceeded,
                 );
-                let _ = emit_delegation_event(self.harness_event_sink.as_deref(), &event);
+                let _ = emit_delegation_event(effective_sink, &event);
                 warn!(
                     parent_depth = self.depth_budget.current,
                     max = self.depth_budget.max,
@@ -507,7 +526,7 @@ impl Tool for DelegateTool {
 
         record_delegation(child_budget.current, DelegationOutcome::Accepted);
         let _ = emit_delegation_event(
-            self.harness_event_sink.as_deref(),
+            effective_sink,
             &DelegationEvent::new(
                 child_budget.current,
                 self.parent_task_id.clone().unwrap_or_default(),
@@ -546,7 +565,9 @@ impl Tool for DelegateTool {
             task_supervisor: self.task_supervisor.clone(),
             session_key: self.session_key.clone(),
             parent_task_id: Some(child_task_id.clone()),
-            harness_event_sink: self.harness_event_sink.clone(),
+            // Child inherits the effective sink so the context-threaded path
+            // still reaches grandchildren even if only the ToolContext set it.
+            harness_event_sink: effective_sink.map(|s| s.to_string()),
             worker_config: self.worker_config.clone(),
         };
         tools.register_arc(Arc::new(child_delegate));
@@ -621,7 +642,7 @@ impl Tool for DelegateTool {
         };
         record_delegation(child_budget.current, terminal_outcome);
         let _ = emit_delegation_event(
-            self.harness_event_sink.as_deref(),
+            effective_sink,
             &DelegationEvent::new(
                 child_budget.current,
                 self.parent_task_id.clone().unwrap_or_default(),
