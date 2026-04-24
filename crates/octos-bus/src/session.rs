@@ -1120,6 +1120,50 @@ impl SessionHandle {
         &mut self.session
     }
 
+    /// Sanitize the loaded transcript via [`crate::ResumePolicy`] (M8.6).
+    ///
+    /// Runs the four filter passes described in `resume_policy`, replaces
+    /// `self.session.messages` with the sanitized list, and returns the
+    /// typed report so callers can log it or forward it to a harness event
+    /// sink. A missing worktree is reported via
+    /// [`crate::SanitizeError::WorktreeMissing`] — the session's in-memory
+    /// messages are NOT mutated in that case so callers retain the
+    /// original transcript for operator inspection.
+    ///
+    /// NOTE: this does not persist the sanitized transcript to disk. Call
+    /// [`Self::rewrite`] afterward if the caller wants the sanitized
+    /// version to survive a subsequent reload.
+    pub fn sanitize_loaded_messages(
+        &mut self,
+        retry_state: Option<&dyn crate::RetryStateView>,
+        workspace_root: Option<&Path>,
+    ) -> Result<
+        (
+            crate::SessionSanitizeReport,
+            Vec<crate::ReplacementStateRef>,
+        ),
+        crate::SanitizeError,
+    > {
+        // Clone so we can restore the original on the worktree-missing
+        // path without a partial-move hazard.
+        let messages = self.session.messages.clone();
+        match crate::ResumePolicy::sanitize(messages, retry_state, workspace_root) {
+            Ok(outcome) => {
+                self.session.messages = outcome.messages;
+                Ok((outcome.report, outcome.content_replacements))
+            }
+            Err(error) => {
+                let crate::SanitizeError::WorktreeMissing { report, .. } = &error;
+                warn!(
+                    key = %self.session.key,
+                    report = %report,
+                    "resume sanitize refused: worktree missing"
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Add a message to the session and persist it.
     pub async fn add_message(&mut self, message: Message) -> Result<()> {
         self.add_message_with_seq(message).await.map(|_| ())
@@ -2687,5 +2731,94 @@ mod tests {
         assert_eq!(child.0, "api:web-task-ledger#child-spawn-01%2Falpha%20beta");
         assert_eq!(child.base_key(), "api:web-task-ledger");
         assert_eq!(child.topic(), Some("child-spawn-01%2Falpha%20beta"));
+    }
+
+    /// M8.6: `sanitize_loaded_messages` replaces the session's in-memory
+    /// transcript with the cleaned-up version and returns the report. No
+    /// disk state is touched until the caller rewrites.
+    #[test]
+    fn should_sanitize_loaded_messages_in_place() {
+        use octos_core::ToolCall;
+
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "resume-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        // Load an unresolved tool_call + a whitespace-only assistant
+        // message into the handle directly.
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "hi"));
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "unresolved-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        });
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: "   ".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let before = handle.session.messages.len();
+        let (report, refs) = handle
+            .sanitize_loaded_messages(None, None)
+            .expect("clean outcome — no workspace root");
+
+        assert_eq!(report.input_len, before);
+        assert_eq!(report.unresolved_tool_uses_dropped, 1);
+        assert_eq!(report.whitespace_only_dropped, 1);
+        assert_eq!(report.output_len, 1);
+        assert!(refs.is_empty());
+        // Handle was mutated in place.
+        assert_eq!(handle.session.messages.len(), 1);
+        assert_eq!(handle.session.messages[0].content, "hi");
+    }
+
+    /// M8.6: a missing worktree surfaces as `Err` and DOES NOT mutate the
+    /// session's in-memory transcript — callers can still log what was
+    /// loaded before deciding to refuse resume.
+    #[test]
+    fn should_preserve_messages_when_worktree_missing() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "resume-no-worktree");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "hi"));
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::Assistant, "there"));
+
+        let gone = tmp.path().join("ghost-worktree");
+        let before_count = handle.session.messages.len();
+
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+
+        match outcome {
+            Err(crate::SanitizeError::WorktreeMissing { path, .. }) => {
+                assert_eq!(path, gone);
+            }
+            other => panic!("expected WorktreeMissing, got {other:?}"),
+        }
+        // Transcript is preserved.
+        assert_eq!(handle.session.messages.len(), before_count);
     }
 }
