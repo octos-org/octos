@@ -1045,6 +1045,7 @@ mod tests {
             ],
             audio_attachment_paths: vec!["/workspace/voice.ogg".to_string()],
             file_attachment_paths: vec!["/workspace/report.pdf".to_string()],
+            ..ToolContext::zero()
         };
 
         let prepared = tool.prepare_effective_args(&json!({}), Some(&ctx));
@@ -1137,6 +1138,7 @@ mod tests {
             attachment_paths: vec![],
             audio_attachment_paths: vec![],
             file_attachment_paths: vec![],
+            ..ToolContext::zero()
         };
 
         let result = crate::tools::TOOL_CTX

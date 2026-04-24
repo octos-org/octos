@@ -571,7 +571,25 @@ impl ToolRegistry {
     /// Respects provider policy: tools hidden from `specs()` are also blocked
     /// from execution. This prevents an LLM from calling tools it shouldn't
     /// have access to.
+    ///
+    /// Delegates to [`ToolRegistry::execute_with_context`] with the zero-value
+    /// [`ToolContext`] so legacy callers continue to work unchanged.
     pub async fn execute(&self, name: &str, args: &serde_json::Value) -> Result<ToolResult> {
+        let ctx = super::ToolContext::zero();
+        self.execute_with_context(&ctx, name, args).await
+    }
+
+    /// Execute a tool by name with a typed [`ToolContext`].
+    ///
+    /// Migrated tools override [`super::Tool::execute_with_context`] and will
+    /// see the caller's context; unmigrated tools fall back to the default
+    /// trait impl which delegates to [`super::Tool::execute`].
+    pub async fn execute_with_context(
+        &self,
+        ctx: &super::ToolContext,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         if let Some(ref policy) = self.provider_policy {
             if let policy::PolicyDecision::Deny { reason } = policy.evaluate(name) {
                 eyre::bail!("tool '{}' denied by provider policy ({})", name, reason);
@@ -629,7 +647,7 @@ impl ToolRegistry {
         // Track usage for LRU auto-eviction
         self.record_usage(name);
 
-        tool.execute(args).await
+        tool.execute_with_context(ctx, args).await
     }
 }
 
@@ -1250,5 +1268,102 @@ mod lifecycle_tests {
         let msg = reg.spawn_only_message("mofa_slides");
 
         assert!(msg.contains("Output directory: /tmp/octos-profile/skill-output/"));
+    }
+}
+
+#[cfg(test)]
+mod context_threading_tests {
+    //! M8.1 — tool context threaded through the registry dispatch path.
+
+    use super::super::{Tool, ToolContext, ToolResult};
+    use super::*;
+    use async_trait::async_trait;
+    use eyre::Result;
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    /// Tool that echoes the `tool_id` it saw on the context, letting tests
+    /// confirm the registry forwarded the caller's `ToolContext` into
+    /// `execute_with_context`.
+    struct CapturingTool {
+        seen: Mutex<Option<String>>,
+    }
+
+    impl CapturingTool {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CapturingTool {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn description(&self) -> &str {
+            "test-only"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, args: &Value) -> Result<ToolResult> {
+            self.execute_with_context(&ToolContext::zero(), args).await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &ToolContext,
+            _args: &Value,
+        ) -> Result<ToolResult> {
+            *self.seen.lock().unwrap() = Some(ctx.tool_id.clone());
+            Ok(ToolResult {
+                output: ctx.tool_id.clone(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_pass_context_through_executor() {
+        let mut reg = ToolRegistry::new();
+        let tool = Arc::new(CapturingTool::new());
+        reg.register_arc(tool.clone());
+
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call-m8.1".to_string();
+
+        let result = reg
+            .execute_with_context(&ctx, "capturing", &serde_json::json!({}))
+            .await
+            .expect("capturing tool must succeed");
+        assert!(result.success);
+        assert_eq!(result.output, "call-m8.1");
+
+        let seen = tool.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some("call-m8.1"),
+            "registry must forward the caller's ToolContext into execute_with_context",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_route_legacy_execute_through_zero_value_context() {
+        // The legacy `execute(name, args)` entry must reach the same tool
+        // but with a zero-value context (empty tool_id).
+        let mut reg = ToolRegistry::new();
+        let tool = Arc::new(CapturingTool::new());
+        reg.register_arc(tool.clone());
+
+        let result = reg
+            .execute("capturing", &serde_json::json!({}))
+            .await
+            .expect("capturing tool must succeed via legacy entry");
+        assert!(result.success);
+
+        let seen = tool.seen.lock().unwrap().clone();
+        assert_eq!(seen.as_deref(), Some(""));
     }
 }
