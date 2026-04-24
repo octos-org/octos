@@ -294,17 +294,52 @@ impl ArtifactMimeClass {
     }
 }
 
+/// Minimum acceptable WAV duration in seconds. Anything shorter is almost
+/// certainly a failed-generation stub — ominix-api's silent-voice bug, for
+/// example, occasionally emits a valid 0.05s WAV when the voice is missing.
+const MIN_AUDIO_DURATION_SECS: f64 = 0.2;
+
+/// When we sample the PCM payload, reject the clip if fewer than this
+/// fraction of samples exceed `SILENCE_SAMPLE_THRESHOLD`. 10% of the first
+/// 4 KB ensures even quiet but real voice passes, while pure-silence WAVs
+/// are caught before we hand them to the user.
+const MIN_NON_SILENT_SAMPLE_RATIO: f64 = 0.10;
+
+/// Absolute value above which a 16-bit sample counts as non-silent. 256 is
+/// well below normal speech amplitude (~5000-30000) but comfortably above
+/// idle codec noise (~0-20).
+const SILENCE_SAMPLE_THRESHOLD: i16 = 256;
+
+/// Size of the PCM slice sampled for the silence check.
+const SILENCE_SAMPLE_BYTES: usize = 4096;
+
 /// Validate reported artifacts against the MIME-class size contract.
 ///
 /// Returns `Ok(())` when every artifact exists and satisfies its class's
-/// minimum size. The first failing artifact produces a structured error
-/// string with stable shape:
+/// minimum size plus any format-specific content checks. The first failing
+/// artifact produces a structured error string with stable shapes:
 ///
 /// - `"Skill reported success but artifact '{path}' failed validation: missing"`
 /// - `"Skill reported success but artifact '{path}' failed validation: size_{N}_below_{M}"`
+/// - `"Skill reported success but artifact '{path}' failed validation: not_a_valid_wav_container"`
+/// - `"Skill reported success but artifact '{path}' failed validation: mp3_magic_missing"`
+/// - `"Skill reported success but artifact '{path}' failed validation: m4a_ftyp_missing"`
+/// - `"Skill reported success but artifact '{path}' failed validation: ogg_magic_missing"`
+/// - `"Skill reported success but artifact '{path}' failed validation: flac_magic_missing"`
+/// - `"Skill reported success but artifact '{path}' failed validation: audio_appears_to_be_silence"`
+/// - `"Skill reported success but artifact '{path}' failed validation: duration_{N}ms_below_{M}ms"`
 ///
 /// An empty slice passes through (no artifacts to check) — callers handle
 /// the "no artifacts" case separately via the contract layer.
+///
+/// Validation is layered into three cheap tiers:
+///
+/// 1. Size floor from [`ArtifactMimeClass::min_bytes`].
+/// 2. Format magic-number matches extension (WAV/MP3/M4A/OGG/FLAC).
+/// 3. For WAV only: duration >= `MIN_AUDIO_DURATION_SECS` and non-silent PCM.
+///
+/// Tier 3 is skipped for compressed formats — we refuse to decode MP3/M4A
+/// inside the supervisor to keep the belt-and-suspenders check fast.
 pub fn validate_spawn_only_artifacts(files: &[PathBuf]) -> Result<(), String> {
     for path in files {
         let metadata = match std::fs::metadata(path) {
@@ -325,8 +360,206 @@ pub fn validate_spawn_only_artifacts(files: &[PathBuf]) -> Result<(), String> {
                 path.display()
             ));
         }
+        if matches!(class, ArtifactMimeClass::Audio) {
+            validate_audio_content(path)?;
+        }
     }
     Ok(())
+}
+
+/// Cheap, extension-aware audio content validation. Called after the size
+/// floor has passed. Reads at most a few KB from disk per artifact.
+fn validate_audio_content(path: &Path) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "wav" => validate_wav_content(path),
+        "mp3" => validate_simple_magic(path, &mp3_magic_check, "mp3_magic_missing"),
+        "m4a" => validate_simple_magic(path, &m4a_magic_check, "m4a_ftyp_missing"),
+        "ogg" => validate_simple_magic(path, &ogg_magic_check, "ogg_magic_missing"),
+        "flac" => validate_simple_magic(path, &flac_magic_check, "flac_magic_missing"),
+        // opus/aac are permitted without content checks — rare in our skills
+        // and either container-wrapped (ogg) or hard to identify cheaply.
+        _ => Ok(()),
+    }
+}
+
+fn rejection(path: &Path, reason: &str) -> String {
+    format!(
+        "Skill reported success but artifact '{}' failed validation: {reason}",
+        path.display()
+    )
+}
+
+fn validate_simple_magic(
+    path: &Path,
+    check: &dyn Fn(&[u8]) -> bool,
+    reason: &str,
+) -> Result<(), String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(rejection(path, "missing")),
+    };
+    if !check(&bytes) {
+        return Err(rejection(path, reason));
+    }
+    Ok(())
+}
+
+fn mp3_magic_check(bytes: &[u8]) -> bool {
+    if bytes.len() < 3 {
+        return false;
+    }
+    // ID3v2 tagged
+    if &bytes[0..3] == b"ID3" {
+        return true;
+    }
+    // Raw MPEG audio frame sync: 0xFF followed by 0xFB (MPEG-1 Layer 3)
+    // or 0xF3 (MPEG-2 Layer 3). Both are common for TTS output.
+    if bytes[0] == 0xFF && (bytes[1] == 0xFB || bytes[1] == 0xF3 || bytes[1] == 0xF2) {
+        return true;
+    }
+    false
+}
+
+fn m4a_magic_check(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
+}
+
+fn ogg_magic_check(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && &bytes[0..4] == b"OggS"
+}
+
+fn flac_magic_check(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && &bytes[0..4] == b"fLaC"
+}
+
+/// Validate a WAV artifact's header, duration, and non-silence.
+///
+/// This does NOT parse every sub-chunk — we only need the format chunk's
+/// sample-rate / channel / bits-per-sample fields and the data chunk's
+/// length. The scan walks chunks linearly and bails on the first format
+/// violation.
+fn validate_wav_content(path: &Path) -> Result<(), String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(rejection(path, "missing")),
+    };
+    if bytes.len() < 16 {
+        return Err(rejection(path, "not_a_valid_wav_container"));
+    }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" || &bytes[12..16] != b"fmt " {
+        return Err(rejection(path, "not_a_valid_wav_container"));
+    }
+
+    // The fmt chunk starts at byte 12. Layout:
+    //   bytes 12-15 : "fmt "
+    //   bytes 16-19 : fmt chunk size (u32 LE, usually 16 for PCM)
+    //   bytes 20-21 : format code (u16 LE, 1 = PCM)
+    //   bytes 22-23 : num channels (u16 LE)
+    //   bytes 24-27 : sample rate (u32 LE)
+    //   bytes 32-33 : bits per sample (u16 LE)
+    if bytes.len() < 36 {
+        return Err(rejection(path, "not_a_valid_wav_container"));
+    }
+    let fmt_size = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+    let num_channels = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+    let sample_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let bits_per_sample = u16::from_le_bytes([bytes[34], bytes[35]]) as usize;
+
+    if sample_rate == 0 || num_channels == 0 || bits_per_sample == 0 {
+        return Err(rejection(path, "not_a_valid_wav_container"));
+    }
+
+    // Locate the data chunk. Subchunks begin after fmt + its payload.
+    // fmt chunk header is bytes 12..20 (8 bytes), payload follows.
+    let data_search_start = 20usize.saturating_add(fmt_size);
+    let (data_offset, data_size) = match locate_data_chunk(&bytes, data_search_start) {
+        Some(tuple) => tuple,
+        None => return Err(rejection(path, "not_a_valid_wav_container")),
+    };
+
+    let bytes_per_sample_frame = num_channels.saturating_mul(bits_per_sample / 8).max(1);
+    let num_sample_frames = data_size / bytes_per_sample_frame;
+    let duration_secs = num_sample_frames as f64 / f64::from(sample_rate);
+    if duration_secs < MIN_AUDIO_DURATION_SECS {
+        let secs_ms = (duration_secs * 1000.0).round() as u64;
+        let min_ms = (MIN_AUDIO_DURATION_SECS * 1000.0).round() as u64;
+        return Err(rejection(
+            path,
+            &format!("duration_{secs_ms}ms_below_{min_ms}ms"),
+        ));
+    }
+
+    // Silence check (16-bit PCM only). Other bit depths are treated as
+    // non-silent by default — they are rare in our skills and we don't
+    // want to introduce format-specific code paths here.
+    if bits_per_sample == 16 {
+        let payload_end = data_offset.saturating_add(data_size).min(bytes.len());
+        let sample_window_end = data_offset
+            .saturating_add(SILENCE_SAMPLE_BYTES)
+            .min(payload_end);
+        let payload = &bytes[data_offset..sample_window_end];
+        if is_silent_pcm16(payload) {
+            return Err(rejection(path, "audio_appears_to_be_silence"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Linear-scan the RIFF subchunks starting at `start` looking for "data".
+/// Returns `(payload_offset, payload_size)` on success.
+fn locate_data_chunk(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut cursor = start;
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let payload_offset = cursor + 8;
+        if chunk_id == b"data" {
+            return Some((payload_offset, chunk_size));
+        }
+        // Chunks are padded to even size per the RIFF spec.
+        let advance = 8usize
+            .saturating_add(chunk_size)
+            .saturating_add(chunk_size & 1);
+        if advance == 0 {
+            return None;
+        }
+        cursor = cursor.saturating_add(advance);
+    }
+    None
+}
+
+/// Count 16-bit samples whose magnitude exceeds `SILENCE_SAMPLE_THRESHOLD`.
+/// Returns `true` when the non-silent sample ratio is below the accepted
+/// floor — i.e. the clip is effectively silent.
+fn is_silent_pcm16(payload: &[u8]) -> bool {
+    if payload.len() < 2 {
+        return true;
+    }
+    let mut loud = 0usize;
+    let mut total = 0usize;
+    for chunk in payload.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        if sample.saturating_abs() > SILENCE_SAMPLE_THRESHOLD {
+            loud += 1;
+        }
+        total += 1;
+    }
+    if total == 0 {
+        return true;
+    }
+    (loud as f64 / total as f64) < MIN_NON_SILENT_SAMPLE_RATIO
 }
 
 impl std::fmt::Debug for TaskSupervisor {
@@ -923,6 +1156,95 @@ impl TaskSupervisor {
 mod tests {
     use super::*;
 
+    /// Build a minimal-but-valid mono 16-bit PCM WAV containing a sine tone.
+    /// `duration_secs` controls the payload length; `sample_rate` is Hz.
+    /// Setting `silent` to `true` emits zero-valued samples so silence-check
+    /// tests can exercise the non-silent PCM gate.
+    fn build_sine_wav(duration_secs: f64, sample_rate: u32, silent: bool) -> Vec<u8> {
+        let num_samples = (duration_secs * f64::from(sample_rate)) as u32;
+        let bits_per_sample: u16 = 16;
+        let num_channels: u16 = 1;
+        let byte_rate = sample_rate * u32::from(num_channels) * u32::from(bits_per_sample) / 8;
+        let block_align = num_channels * bits_per_sample / 8;
+        let data_size = num_samples * u32::from(block_align);
+        let file_size = 36 + data_size;
+
+        let mut out = Vec::with_capacity(44 + data_size as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&file_size.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // format = PCM
+        out.extend_from_slice(&num_channels.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&block_align.to_le_bytes());
+        out.extend_from_slice(&bits_per_sample.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_size.to_le_bytes());
+
+        if silent {
+            out.resize(out.len() + data_size as usize, 0);
+        } else {
+            // 440 Hz sine, 0.5 amplitude — safely above the 256 silence floor.
+            let amplitude = 16_000.0_f64;
+            let frequency = 440.0_f64;
+            for n in 0..num_samples {
+                let t = f64::from(n) / f64::from(sample_rate);
+                let sample =
+                    (amplitude * (2.0 * std::f64::consts::PI * frequency * t).sin()) as i16;
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// A tiny MP3-like byte sequence starting with a valid ID3v2 header.
+    /// We do not decode — only the 3-byte magic is inspected.
+    fn build_id3_tagged_mp3(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(b"ID3\x03\x00\x00\x00\x00\x00\x00");
+        out.resize(len, 0);
+        out
+    }
+
+    /// A tiny MP3-like byte sequence starting with an MPEG frame-sync marker.
+    fn build_mpeg_sync_mp3(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        // 0xFF 0xFB => MPEG-1 Layer 3, no CRC
+        out.extend_from_slice(&[0xFFu8, 0xFB, 0x90, 0x00]);
+        out.resize(len, 0);
+        out
+    }
+
+    /// A tiny M4A-like byte sequence: 4 bytes of size then `ftyp` marker.
+    fn build_m4a(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x20]); // size
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(b"M4A ");
+        out.extend_from_slice(&[0x00; 8]);
+        out.resize(len, 0);
+        out
+    }
+
+    /// Minimal OGG-like page starting with `OggS`.
+    fn build_ogg(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(b"OggS");
+        out.resize(len, 0);
+        out
+    }
+
+    /// Minimal FLAC-like stream starting with `fLaC`.
+    fn build_flac(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(b"fLaC");
+        out.resize(len, 0);
+        out
+    }
+
     #[test]
     fn should_register_task_with_spawned_status() {
         let supervisor = TaskSupervisor::new();
@@ -1354,7 +1676,9 @@ mod tests {
     fn should_accept_audio_artifact_at_or_above_1kb() {
         let dir = tempfile::tempdir().unwrap();
         let clip = dir.path().join("voice.mp3");
-        std::fs::write(&clip, vec![0u8; 1024]).unwrap();
+        // Valid ID3-tagged MP3 padded to 1 KB. Size floor AND magic number
+        // both satisfied — this is the belt-and-suspenders happy path.
+        std::fs::write(&clip, build_id3_tagged_mp3(1024)).unwrap();
 
         let supervisor = TaskSupervisor::new();
         let id = supervisor.register("fm_tts", "call-2", None);
@@ -1395,7 +1719,8 @@ mod tests {
         let image = dir.path().join("cover.png");
         let video = dir.path().join("trailer.mp4");
         let report = dir.path().join("summary.txt");
-        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+        // 1 s, 16 kHz, 16-bit mono sine — passes WAV header + duration + silence.
+        std::fs::write(&audio, build_sine_wav(1.0, 16_000, false)).unwrap();
         std::fs::write(&image, vec![0u8; 1024]).unwrap();
         std::fs::write(&video, vec![0u8; 16_384]).unwrap();
         std::fs::write(&report, b"ok").unwrap();
@@ -1457,5 +1782,127 @@ mod tests {
             ArtifactMimeClass::from_path(Path::new("noext")).min_bytes(),
             1
         );
+    }
+
+    #[test]
+    fn should_accept_valid_wav_with_real_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.wav");
+        std::fs::write(&clip, build_sine_wav(1.0, 16_000, false)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("real 1s sine WAV must pass all tiers");
+    }
+
+    #[test]
+    fn should_reject_wav_with_bad_riff_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.wav");
+        // Start with 2 KB so size floor passes but RIFF header is wrong.
+        let mut bytes = vec![0u8; 2048];
+        bytes[0..4].copy_from_slice(b"RIFX");
+        std::fs::write(&clip, &bytes).unwrap();
+
+        let err = validate_spawn_only_artifacts(&[clip])
+            .expect_err("WAV with broken RIFF magic must be rejected");
+        assert!(
+            err.contains("not_a_valid_wav_container"),
+            "expected structural rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_wav_shorter_than_0_2_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("short.wav");
+        // 100 ms @ 16 kHz sine. Size floor passes (>=1KB once padded), but
+        // duration is below the 0.2 s floor.
+        let mut bytes = build_sine_wav(0.1, 16_000, false);
+        // The 100ms @ 16kHz 16-bit mono is ~3.2 KB, so size floor passes
+        // without padding. Sanity check in case the helper changes:
+        if bytes.len() < 1024 {
+            bytes.resize(1024, 0);
+        }
+        std::fs::write(&clip, &bytes).unwrap();
+
+        let err = validate_spawn_only_artifacts(&[clip])
+            .expect_err("0.1s WAV must be rejected for duration");
+        assert!(
+            err.contains("duration_"),
+            "expected duration rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_wav_with_all_silent_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("silent.wav");
+        std::fs::write(&clip, build_sine_wav(1.0, 16_000, true)).unwrap();
+
+        let err = validate_spawn_only_artifacts(&[clip])
+            .expect_err("all-zero PCM must be rejected for silence");
+        assert!(
+            err.contains("audio_appears_to_be_silence"),
+            "expected silence rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_accept_valid_id3_tagged_mp3() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.mp3");
+        std::fs::write(&clip, build_id3_tagged_mp3(2048)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("ID3v2 magic must pass");
+    }
+
+    #[test]
+    fn should_accept_valid_mpeg_sync_mp3() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.mp3");
+        std::fs::write(&clip, build_mpeg_sync_mp3(2048)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("0xFF 0xFB MPEG sync must pass");
+    }
+
+    #[test]
+    fn should_reject_mp3_with_garbage_bytes_no_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.mp3");
+        // 2 KB of random non-magic bytes. Size passes but magic check fails.
+        std::fs::write(&clip, vec![0x42u8; 2048]).unwrap();
+
+        let err = validate_spawn_only_artifacts(&[clip])
+            .expect_err("MP3 without ID3 or MPEG sync must be rejected");
+        assert!(
+            err.contains("mp3_magic_missing"),
+            "expected magic rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn should_accept_valid_m4a() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.m4a");
+        std::fs::write(&clip, build_m4a(2048)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("ftyp marker at offset 4 must pass");
+    }
+
+    #[test]
+    fn should_accept_valid_ogg() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.ogg");
+        std::fs::write(&clip, build_ogg(2048)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("OggS magic must pass");
+    }
+
+    #[test]
+    fn should_accept_valid_flac() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.flac");
+        std::fs::write(&clip, build_flac(2048)).unwrap();
+
+        validate_spawn_only_artifacts(&[clip]).expect("fLaC magic must pass");
     }
 }
