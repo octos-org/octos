@@ -225,6 +225,31 @@ scp_target() {
     esac
 }
 
+ssh_sudo_target() {
+    # ssh_sudo_target <index> <command string>
+    local i=$1; shift
+    local host="${DEPLOY_HOSTS[$i]}"
+    local auth_type="${DEPLOY_AUTH_TYPE[$i]}"
+    local auth_val="${DEPLOY_AUTH_VAL[$i]}"
+    local remote_cmd="$*"
+    local quoted_cmd
+    printf -v quoted_cmd "%q" "$remote_cmd"
+
+    case "$auth_type" in
+        password)
+            local quoted_pw
+            printf -v quoted_pw "%q" "$auth_val"
+            sshpass -p "$auth_val" ssh "${_ssh_opts[@]}" -o PreferredAuthentications=password,keyboard-interactive \
+                "$host" "printf '%s\n' ${quoted_pw} | sudo -S -p '' bash -lc ${quoted_cmd}" ;;
+        key)
+            if [[ "$auth_val" == "default" ]]; then
+                ssh "${_ssh_opts[@]}" "$host" "sudo bash -lc ${quoted_cmd}"
+            else
+                ssh "${_ssh_opts[@]}" -i "$auth_val" "$host" "sudo bash -lc ${quoted_cmd}"
+            fi ;;
+    esac
+}
+
 # Resolve remote $HOME (cached per target to avoid extra SSH roundtrips)
 REMOTE_HOME_CACHE=()
 resolve_remote_home() {
@@ -314,9 +339,9 @@ generate_plist() {
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${rdata}/serve.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>${rdata}/serve.log</string>
+    <string>/dev/null</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -327,8 +352,6 @@ generate_plist() {
         <string>${rdata}</string>
         <key>OCTOS_AUTH_TOKEN</key>
         <string>octos-admin-2026</string>
-        <key>SMTP_PASSWORD</key>
-        <string>${SMTP_PASSWORD:-}</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${rhome}</string>
@@ -336,6 +359,79 @@ generate_plist() {
 </plist>
 PEOF
     echo "    plist written"
+}
+
+stop_remote_caddy_services() {
+    local i=$1
+
+    echo "==> Removing stale Caddy services..."
+    ssh_target "$i" 'bash -lc '"'"'
+        uid=$(id -u)
+        launchctl bootout "gui/${uid}/homebrew.mxcl.caddy" 2>/dev/null || true
+        launchctl unload "$HOME/Library/LaunchAgents/homebrew.mxcl.caddy.plist" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/homebrew.mxcl.caddy.plist"
+        pkill -x caddy 2>/dev/null || true
+    '"'"
+    ssh_sudo_target "$i" "
+        launchctl bootout system/com.caddyserver.caddy 2>/dev/null || true
+        launchctl unload /Library/LaunchDaemons/com.caddyserver.caddy.plist 2>/dev/null || true
+        launchctl bootout system/io.octos.caddy 2>/dev/null || true
+        launchctl unload /Library/LaunchDaemons/io.octos.caddy.plist 2>/dev/null || true
+        rm -f /Library/LaunchDaemons/com.caddyserver.caddy.plist /Library/LaunchDaemons/io.octos.caddy.plist
+        pkill -x caddy 2>/dev/null || true
+    "
+}
+
+generate_caddy_launchd_plist() {
+    local i=$1
+    local rdata=$2
+    local rhome
+    local tmp_plist="${rdata}/io.octos.caddy.plist.tmp"
+    rhome=$(resolve_remote_home "$i")
+
+    echo "==> Generating managed Caddy LaunchDaemon..."
+    cat <<PEOF | ssh_target "$i" "cat > '${tmp_plist}'"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.octos.caddy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/caddy</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>${rdata}/Caddyfile</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/caddy.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${rhome}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>${rhome}</string>
+</dict>
+</plist>
+PEOF
+
+    ssh_sudo_target "$i" "
+        mkdir -p /Library/LaunchDaemons
+        mv '${tmp_plist}' /Library/LaunchDaemons/io.octos.caddy.plist
+        chown root:wheel /Library/LaunchDaemons/io.octos.caddy.plist
+        chmod 644 /Library/LaunchDaemons/io.octos.caddy.plist
+    "
+    echo "    Caddy plist written"
 }
 
 # --- Build from octos repo ---
@@ -384,6 +480,7 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
     LABEL="${DEPLOY_LABEL[$i]}"
     RBIN=$(resolve_remote_bin "$i")
     RDATA=$(resolve_remote_data "$i")
+    RHOME=$(resolve_remote_home "$i")
 
     echo ""
     echo "========================================"
@@ -399,6 +496,7 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
         # Stop all octos-related launchd services
         ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/${PLIST}.plist 2>/dev/null || true"
         ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true"
+        stop_remote_caddy_services "$i"
         # Remove legacy plists (old names from crew era)
         ssh_target "$i" 'bash -c '"'"'
             for plist in ~/Library/LaunchAgents/io.ominix.*.plist; do
@@ -413,7 +511,6 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
         sleep 1
 
         # Save profiles to local tmp if --keep-profiles
-        RHOME=$(resolve_remote_home "$i")
         SAVED_PROFILES_DIR=""
         if [[ "$KEEP_PROFILES" == true ]]; then
             SAVED_PROFILES_DIR=$(mktemp -d)
@@ -589,7 +686,7 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
         echo "==> Uploading octos-web chat client..."
         tar czf /tmp/octos-web-dist.tar.gz -C "$OCTOS_WEB_DIR/dist" .
         scp_target "$i" /tmp/octos-web-dist.tar.gz "$REMOTE:/tmp/octos-web-dist.tar.gz"
-        ssh_target "$i" "mkdir -p ~/octos-web && tar xzf /tmp/octos-web-dist.tar.gz -C ~/octos-web"
+        ssh_target "$i" "mkdir -p '${RHOME}/octos-web' && tar xzf /tmp/octos-web-dist.tar.gz -C '${RHOME}/octos-web'"
         echo "    octos-web deployed to ~/octos-web"
     fi
 
@@ -865,7 +962,7 @@ echo "  ominix-api plist generated"'"'"
     # --- Caddy setup (optional) ---
     if [[ -n "$CADDY_DOMAIN" ]]; then
         echo "==> Setting up Caddy for $CADDY_DOMAIN..."
-        ssh_target "$i" '
+        ssh_target "$i" 'bash -lc '"'"'
             # Install Caddy if missing
             if ! command -v caddy &>/dev/null; then
                 if command -v brew &>/dev/null; then
@@ -881,10 +978,11 @@ echo "  ominix-api plist generated"'"'"
                 fi
             fi
             echo "  Caddy: $(caddy version 2>/dev/null | head -1)"
-        '"
+        '"'"
 
-        CADDY_UPSTREAM=\"localhost:${SERVE_PORT}\"
-        ssh_target "$i" 'cat > ~/Caddyfile << CEOF
+        CADDY_UPSTREAM="localhost:${SERVE_PORT}"
+        CADDY_LABEL_INDEX=$(awk -F. '{print NF}' <<< "$CADDY_DOMAIN")
+        ssh_target "$i" "cat > '${RDATA}/Caddyfile' <<'CEOF'
 {
     on_demand_tls {
         ask http://localhost:9999/check
@@ -896,6 +994,9 @@ echo "  ominix-api plist generated"'"'"
 }
 
 '"${CADDY_DOMAIN}"' {
+    handle /admin/chat {
+        redir / permanent
+    }
     handle /api/* {
         reverse_proxy '"${CADDY_UPSTREAM}"'
     }
@@ -909,7 +1010,9 @@ echo "  ominix-api plist generated"'"'"
         reverse_proxy '"${CADDY_UPSTREAM}"'
     }
     handle {
-        reverse_proxy '"${CADDY_UPSTREAM}"'
+        root * '"${RHOME}"'/octos-web
+        try_files {path} /index.html
+        file_server
     }
 }
 
@@ -918,44 +1021,57 @@ echo "  ominix-api plist generated"'"'"
         on_demand
     }
 
+    @admin_chat path /admin/chat
     @api path /api/*
     @admin path /admin*
     @auth path /auth/*
+    @webhook path /webhook/*
 
+    handle @admin_chat {
+        redir / permanent
+    }
     handle @api {
         reverse_proxy '"${CADDY_UPSTREAM}"' {
-            header_up X-Profile-Id {labels.2}
+            header_up X-Profile-Id {labels.'"${CADDY_LABEL_INDEX}"'}
         }
     }
     handle @admin {
         reverse_proxy '"${CADDY_UPSTREAM}"' {
-            header_up X-Profile-Id {labels.2}
+            header_up X-Profile-Id {labels.'"${CADDY_LABEL_INDEX}"'}
         }
     }
     handle @auth {
         reverse_proxy '"${CADDY_UPSTREAM}"' {
-            header_up X-Profile-Id {labels.2}
+            header_up X-Profile-Id {labels.'"${CADDY_LABEL_INDEX}"'}
+        }
+    }
+    handle @webhook {
+        reverse_proxy '"${CADDY_UPSTREAM}"' {
+            header_up X-Profile-Id {labels.'"${CADDY_LABEL_INDEX}"'}
         }
     }
     handle {
-        reverse_proxy '"${CADDY_UPSTREAM}"'
+        root * '"${RHOME}"'/octos-web
+        try_files {path} /index.html
+        file_server
     }
 }
 CEOF
-            caddy fmt --overwrite ~/Caddyfile 2>/dev/null || true
-            if caddy validate --config ~/Caddyfile 2>/dev/null; then
+            caddy fmt --overwrite '${RDATA}/Caddyfile' 2>/dev/null || true
+            if caddy validate --config '${RDATA}/Caddyfile' 2>/dev/null; then
                 echo "  Caddyfile valid"
             else
                 echo "  WARNING: Caddyfile validation failed"
+                exit 1
             fi
-            if pgrep -x caddy > /dev/null 2>&1; then
-                caddy reload --config ~/Caddyfile 2>/dev/null
-                echo "  Caddy reloaded"
-            else
-                caddy start --config ~/Caddyfile 2>/dev/null
-                echo "  Caddy started"
-            fi
-        '"
+        "
+        stop_remote_caddy_services "$i"
+        generate_caddy_launchd_plist "$i" "$RDATA"
+        ssh_sudo_target "$i" "
+            launchctl bootstrap system /Library/LaunchDaemons/io.octos.caddy.plist
+            launchctl enable system/io.octos.caddy 2>/dev/null || true
+            launchctl kickstart -k system/io.octos.caddy
+        "
         echo "  Caddy configured for ${CADDY_DOMAIN} + *.${CADDY_DOMAIN}"
     fi
 

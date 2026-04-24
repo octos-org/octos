@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, eyre};
 use glob::glob;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Result of running a single behaviour action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +229,7 @@ fn action_file_exists(
             reason: format!("missing file for pattern: {pattern}"),
         })
     } else {
-        info!(pattern, count = matches.len(), "file_exists check passed");
+        debug!(pattern, count = matches.len(), "file_exists check passed");
         Ok(ActionResult::Pass)
     }
 }

@@ -38,7 +38,9 @@ fn main() -> Result<()> {
 fn init_tracing(
     log_dir: Option<&std::path::Path>,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+    use std::io::IsTerminal as _;
+    use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -48,21 +50,7 @@ fn init_tracing(
     // Check if JSON format is requested via environment
     let json_logs = std::env::var("OCTOS_LOG_JSON").is_ok();
 
-    // Console layer (boxed so we can unify json vs compact types)
-    let console_layer: Box<dyn Layer<_> + Send + Sync> = if json_logs {
-        fmt::layer()
-            .json()
-            .with_target(true)
-            .with_span_list(true)
-            .with_current_span(true)
-            .boxed()
-    } else {
-        fmt::layer()
-            .with_target(false)
-            .with_thread_ids(false)
-            .compact()
-            .boxed()
-    };
+    let enable_console = log_dir.is_none() || std::io::stderr().is_terminal();
 
     if let Some(dir) = log_dir {
         // Rolling daily log file, keep last 7 days
@@ -75,25 +63,61 @@ fn init_tracing(
             .map_err(|e| eyre::eyre!("failed to create log file appender: {e}"))?;
 
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let writer = if enable_console {
+            BoxMakeWriter::new(std::io::stderr.and(non_blocking))
+        } else {
+            BoxMakeWriter::new(non_blocking)
+        };
 
-        let file_layer = fmt::layer()
-            .with_ansi(false)
-            .with_target(false)
-            .compact()
-            .with_writer(non_blocking);
-
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .with(file_layer)
-            .with(filter)
-            .init();
+        if json_logs {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(true)
+                        .with_current_span(true)
+                        .with_writer(writer),
+                )
+                .with(filter)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_target(false)
+                        .compact()
+                        .with_writer(writer),
+                )
+                .with(filter)
+                .init();
+        }
 
         Ok(Some(guard))
     } else {
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .with(filter)
-            .init();
+        if json_logs {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(true)
+                        .with_current_span(true),
+                )
+                .with(filter)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_thread_ids(false)
+                        .compact(),
+                )
+                .with(filter)
+                .init();
+        }
 
         Ok(None)
     }
