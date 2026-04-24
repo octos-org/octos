@@ -3,7 +3,5 @@
   "version": 1,
   "tools": ["deep_search", "web_fetch", "web_search"],
   "disallowed_tools": ["shell", "write_file", "edit_file"],
-  "effort": "medium",
-  "max_turns": 20,
-  "background": false
+  "effort": "medium"
 }

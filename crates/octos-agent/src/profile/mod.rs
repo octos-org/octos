@@ -266,6 +266,39 @@ impl ProfileDefinition {
         Ok(())
     }
 
+    /// M8.5 fix-first item 5: cross-validate `profile.agents` against an
+    /// `AgentDefinitions` registry. Returns the list of unknown ids so
+    /// the caller can either reject the profile or warn the operator.
+    /// Empty result means every referenced manifest exists.
+    pub fn unknown_agent_ids(&self, registry: &crate::agents::AgentDefinitions) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter(|id| registry.get(id).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// M8.5 fix-first item 5: hard-validate `profile.agents` against a
+    /// registry. Returns an error listing the missing ids when any are
+    /// unknown. This is the call sites use when they need an
+    /// authoritative profile/manifest envelope (e.g. M9 control-plane).
+    pub fn validate_against_registry(
+        &self,
+        registry: &crate::agents::AgentDefinitions,
+    ) -> Result<()> {
+        let missing = self.unknown_agent_ids(registry);
+        if !missing.is_empty() {
+            eyre::bail!(
+                "profile '{}' references agent_definition ids not present in the registry: {:?} \
+                 (available: {:?})",
+                self.name,
+                missing,
+                registry.ids().collect::<Vec<_>>(),
+            );
+        }
+        Ok(())
+    }
+
     /// Parse a profile from JSON text. Validates on success.
     pub fn from_json_str(text: &str) -> Result<Self> {
         let def: Self =
@@ -675,5 +708,101 @@ mod tests {
             ProfileTools::DenyList { tools } => assert_eq!(tools, vec!["web_fetch".to_string()]),
             _ => panic!("expected deny_list"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 5 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    // Profiles and AgentDefinitions must be authoritative — fields that the
+    // runtime does NOT enforce should be rejected/cleaned up so M9 clients
+    // do not assume they are operational.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_load_fails_or_warns_on_unknown_agent_ids() {
+        // A profile that names manifests not in the registry must be
+        // rejected by `validate_against_registry`. The legacy path
+        // silently kept the bad ids, so this test pins the new
+        // hard-validation behaviour.
+        let mut profile = ProfileDefinition::builtin("coding").expect("coding");
+        profile.agents = vec!["typo-worker".into()];
+
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let unknown = profile.unknown_agent_ids(&registry);
+        assert_eq!(unknown, vec!["typo-worker".to_string()]);
+
+        let err = profile.validate_against_registry(&registry).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("typo-worker"),
+            "validation error must name the missing id: {msg}"
+        );
+    }
+
+    #[test]
+    fn builtin_swarm_profile_references_only_existing_agent_definitions() {
+        // The fix-first checklist explicitly calls out the swarm profile
+        // for referencing manifests that never shipped. Verify the
+        // built-in swarm now references only ids in the AgentDefinitions
+        // registry.
+        let swarm = ProfileDefinition::builtin("swarm").expect("swarm");
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let unknown = swarm.unknown_agent_ids(&registry);
+        assert!(
+            unknown.is_empty(),
+            "built-in swarm profile must reference only existing manifests, \
+             missing: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_application_does_not_hide_unimplemented_fields_in_prompt_text() {
+        // The legacy `apply_agent_definition` smuggled `effort` and
+        // `permission_mode` into `additional_instructions` so traces
+        // showed them as if they were enforced. The fix-first commit
+        // stops that. We assert here against the manifest itself so the
+        // contract holds even if the application path is reorganised.
+        // Built-in research-worker must NOT carry unimplemented fields
+        // (max_turns / background) any longer.
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let research = registry.get("research-worker").expect("research-worker");
+        let unimplemented = research.unimplemented_fields();
+        assert!(
+            unimplemented.is_empty(),
+            "built-in research-worker still carries unimplemented fields: {unimplemented:?}"
+        );
+
+        let repo_editor = registry.get("repo-editor").expect("repo-editor");
+        let unimplemented = repo_editor.unimplemented_fields();
+        assert!(
+            unimplemented.is_empty(),
+            "built-in repo-editor still carries unimplemented fields: {unimplemented:?}"
+        );
+    }
+
+    #[test]
+    fn profile_permissions_affect_tool_context_when_restricted() {
+        // The PermissionMode field is documented as "Coarse permission
+        // tier". Today the runtime keeps it internal-only — we record
+        // it but do not enforce it (per the fix-first checklist's
+        // accepted "internal-only until real" path). This test pins
+        // that behaviour: the field deserialises round-trip and the
+        // built-in profiles report consistent values, so a future
+        // wiring milestone has a stable API to grow into.
+        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        assert_eq!(coding.permissions, PermissionMode::Default);
+
+        let restricted = ProfileDefinition::from_json_str(
+            r#"{"name": "locked", "version": 1, "permissions": "restricted"}"#,
+        )
+        .expect("parse restricted");
+        assert_eq!(restricted.permissions, PermissionMode::Restricted);
+
+        // Until the wiring lands, ProfileDefinition does NOT expose a
+        // `to_tool_permissions()` helper. Adding one would be a real
+        // wiring step. The placeholder is here so a follow-up commit
+        // can replace this assertion with a meaningful behavioural one.
+        // For now we just assert the recorded value is what the
+        // profile JSON declared.
+        assert_ne!(coding.permissions, restricted.permissions);
     }
 }

@@ -734,27 +734,30 @@ fn apply_agent_definition(
     if input.model.is_none() {
         input.model = def.model.clone();
     }
-    if input.additional_instructions.is_none() {
-        // `effort` and `permission_mode` flow into later phases; surfacing
-        // them in `additional_instructions` keeps them visible in traces
-        // without baking runtime-specific plumbing into v1. The manifest's
-        // explicit `effort` / `permission_mode` strings are concatenated as
-        // a short prelude.
-        let mut hints = Vec::new();
-        if let Some(effort) = def.effort.as_deref() {
-            hints.push(format!("effort={effort}"));
-        }
-        if let Some(mode) = def.permission_mode.as_deref() {
-            hints.push(format!("permission_mode={mode}"));
-        }
-        if !hints.is_empty() {
-            input.additional_instructions = Some(format!(
-                "(agent_definition={}) {}",
-                def.name,
-                hints.join(", ")
-            ));
-        }
+    // M8.5 fix-first item 5: stop smuggling unsupported `AgentDefinition`
+    // fields (`effort`, `permission_mode`) into `additional_instructions`.
+    // Hiding them in prompt text gives clients a false sense that the
+    // runtime honours the manifest's permission/effort envelope. They
+    // remain available on the manifest struct for future enforcement,
+    // but they no longer pollute the LLM prompt.
+    let _ = def.effort.as_deref();
+    let _ = def.permission_mode.as_deref();
+
+    // M8.5 fix-first item 5: reject manifests that set fields the runtime
+    // does NOT yet enforce. Today: max_turns, background, memory, hooks,
+    // mcp_servers, isolation. Silently accepting them lets clients
+    // assume the runtime is honouring envelope state that does nothing,
+    // which is exactly the M9 promise the checklist wants to break.
+    let unimplemented = def.unimplemented_fields();
+    if !unimplemented.is_empty() {
+        eyre::bail!(
+            "spawn: agent_definition_id '{}' sets unimplemented fields {:?}; \
+             remove them from the manifest until the runtime wires them in",
+            def.name,
+            unimplemented,
+        );
     }
+
     Ok(())
 }
 

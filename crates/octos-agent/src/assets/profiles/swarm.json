@@ -38,9 +38,7 @@
   "mcp_servers": [],
   "permissions": "default",
   "agents": [
-    "pm-supervisor",
-    "sub-researcher",
-    "sub-coder",
-    "sub-validator"
+    "research-worker",
+    "repo-editor"
   ]
 }

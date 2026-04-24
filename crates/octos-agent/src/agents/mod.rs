@@ -148,6 +148,38 @@ impl AgentDefinition {
         }
         Ok(())
     }
+
+    /// M8.5 fix-first item 5: report which manifest fields the runtime
+    /// today does NOT enforce. Returns the labels of any populated
+    /// fields so callers can either reject the manifest or surface a
+    /// clear warning instead of silently accepting unsupported config.
+    ///
+    /// The fields tracked here are the same set the fix-first checklist
+    /// flagged: `max_turns`, `background`, `memory`, `hooks`,
+    /// `mcp_servers`, `isolation`. Each entry remains a placeholder
+    /// until a follow-up milestone wires it into real runtime behaviour.
+    pub fn unimplemented_fields(&self) -> Vec<&'static str> {
+        let mut flagged = Vec::new();
+        if self.max_turns.is_some() {
+            flagged.push("max_turns");
+        }
+        if self.background {
+            flagged.push("background");
+        }
+        if self.memory.is_some() {
+            flagged.push("memory");
+        }
+        if !self.hooks.is_empty() {
+            flagged.push("hooks");
+        }
+        if !self.mcp_servers.is_empty() {
+            flagged.push("mcp_servers");
+        }
+        if self.isolation.is_some() {
+            flagged.push("isolation");
+        }
+        flagged
+    }
 }
 
 /// Minimal v1 hook reference — event name + command.
