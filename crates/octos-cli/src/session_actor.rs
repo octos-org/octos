@@ -4013,13 +4013,15 @@ impl SessionActor {
                         display_content
                     };
 
-                    // If overflow was served while this task ran, prepend a
-                    // marker so the user knows this is a delayed result.
-                    let display_content = if overflow_served {
-                        format!("⬆️ Earlier task completed:\n\n{display_content}")
-                    } else {
-                        display_content
-                    };
+                    // The legacy "⬆️ Earlier task completed:" prefix was
+                    // dropped because users misread it — the wording sounded
+                    // like a stray prior reply when it actually meant "I
+                    // also processed your follow-up below in parallel." Tool
+                    // chips and the message timeline already convey that
+                    // without confusing boilerplate. The `overflow_served`
+                    // flag stays in scope so a future UI surface can render
+                    // a richer indicator if needed.
+                    let _ = overflow_served;
 
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
@@ -6423,6 +6425,433 @@ mod tests {
         }
 
         // Clean shutdown
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// FA-11 defect B regression: the overflow assistant reply MUST carry
+    /// `_session_result` metadata so `ApiChannel::send` can route it via
+    /// `broadcast_session_event → watchers`. Without this metadata the reply
+    /// routes only through `pending[session_id]`, which was removed when
+    /// the primary turn emitted its `_completion` marker — so the overflow
+    /// reply was silently dropped.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_overflow_reply() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5 fast warmups + slow (12s) primary + fast overflow response.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("slow primary answer"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("overflow FA12 result payload"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup to establish responsiveness baseline.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("please answer FA-12 probe"))
+            .await
+            .unwrap();
+
+        // Collect OutboundMessage records until we've seen both non-empty
+        // replies (overflow + slow primary).
+        let mut outbound_replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while outbound_replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        outbound_replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(
+            outbound_replies.len() >= 2,
+            "expected at least 2 replies (overflow + primary), got {}: {:?}",
+            outbound_replies.len(),
+            outbound_replies
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let overflow = outbound_replies
+            .iter()
+            .find(|msg| msg.content.contains("FA12") || msg.content.contains("overflow"))
+            .expect("overflow reply not found");
+        let session_result = overflow.metadata.get("_session_result").unwrap_or_else(|| {
+            panic!(
+                "overflow outbound must carry `_session_result` metadata — \
+                 got metadata = {}",
+                overflow.metadata
+            )
+        });
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq, got {}",
+            session_result
+        );
+        assert!(
+            session_result
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("FA12") || s.contains("overflow")),
+            "session_result.content must match reply content, got {}",
+            session_result
+        );
+        assert!(
+            session_result.get("timestamp").is_some(),
+            "session_result must include rfc3339 timestamp, got {}",
+            session_result
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Regression: when the speculative path serves an overflow during a slow
+    /// primary, the primary turn's final assistant reply must NOT be wrapped
+    /// in the legacy "⬆️ Earlier task completed:" prefix. Users misread the
+    /// prefix as a stray prior reply when it actually meant "I also processed
+    /// your follow-up below in parallel" — so the prefix is gone and tool
+    /// chips / message timeline carry the same meaning unambiguously.
+    #[tokio::test]
+    async fn should_drop_earlier_task_completed_prefix_when_overflow_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("PRIMARY_REPLY_BODY_marker"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("OVERFLOW_REPLY_BODY_marker"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("name follow-up")).await.unwrap();
+
+        let mut replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Confirm both replies arrived (sanity for the overflow scenario).
+        assert!(
+            replies.len() >= 2,
+            "expected primary + overflow replies, got {}",
+            replies.len()
+        );
+
+        // No reply should carry the legacy prefix any longer.
+        for reply in &replies {
+            assert!(
+                !reply.content.contains("Earlier task completed"),
+                "legacy '⬆️ Earlier task completed:' prefix must be dropped, \
+                 but reply contained it: {}",
+                reply.content
+            );
+        }
+
+        // The primary reply must surface its body unchanged (no leading
+        // boilerplate that the user has to read past).
+        let primary = replies
+            .iter()
+            .find(|m| m.content.contains("PRIMARY_REPLY_BODY_marker"))
+            .expect("primary reply not found in collected outbound messages");
+        assert!(
+            primary.content.starts_with("PRIMARY_REPLY_BODY_marker"),
+            "primary reply must start with its own body (no prefix), got: {}",
+            primary.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// FA-12d defect-C regression: when the overflow runs against an
+    /// `ApiChannel`-like transport (whose `send_with_id` always returns
+    /// `Some("sse-{chat_id}")`) and the stream forwarder has flushed at
+    /// least one chunk, the old code set `already_streamed = true` and
+    /// silently skipped the `_session_result` emission — leaving the web
+    /// client's Q2 bubble blank. The durable watchers fanout only fires
+    /// when `ApiChannel::send` sees `_session_result` metadata, so the
+    /// emission MUST happen regardless of `stream_result.message_id`.
+    ///
+    /// Guards the fix that decouples the durable metadata emission from
+    /// the user-facing content rendering: the `_session_result` fanout
+    /// always runs; only the outbound content body is suppressed when the
+    /// channel already streamed the reply inline.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_api_channel_overflow_when_already_streamed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent LLM: 5 fast warmups, slow (12s) primary, and a streaming
+        // overflow response. `StreamingMockProvider` pushes a `StreamChunk`
+        // into `TASK_REPORTER` before each response — on the overflow call
+        // that flows through `run_stream_forwarder` →
+        // `FakeSseChannel::send_with_id` → sets `message_id = Some(...)`,
+        // so `stream_result.message_id.is_some() == true` and the
+        // `already_streamed` branch is entered.
+        //
+        // `serve_overflow` invokes `agent.process_message_tracked` (NOT
+        // the adaptive router) for the overflow, so the agent's provider
+        // must emit the streaming chunk on the overflow call.
+        let agent_llm = Arc::new(StreamingMockProvider::new(
+            "agent-api",
+            vec![
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup1"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup2"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup3"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup4"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup5"),
+                ),
+                (
+                    Duration::from_secs(12),
+                    String::new(),
+                    make_response("slow primary answer"),
+                ),
+                (
+                    Duration::from_millis(300),
+                    "streaming chunk".into(),
+                    make_response("FA12d overflow BRAVO answer"),
+                ),
+            ],
+        ));
+
+        // AdaptiveRouter providers are unused by the overflow path
+        // (`serve_overflow` calls the agent directly) but the actor
+        // requires the router to be wired so speculative mode is enabled.
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let status_channel: Arc<dyn octos_bus::Channel> = Arc::new(FakeSseChannel::new("api"));
+        let (tx, mut rx, handle, _session_mgr) = setup_speculative_actor_with_indicator(
+            agent_llm,
+            vec![router_a, router_b],
+            status_channel,
+            "api",
+            &dir,
+        )
+        .await;
+
+        // Warmup loop to establish responsiveness baseline; drain replies
+        // from the channel as they come in (don't filter on content since
+        // the new fix may emit empty-content OutboundMessages alongside
+        // session_result metadata).
+        for i in 0..5 {
+            tx.send(make_inbound_api(&format!("warmup {i}"), "api"))
+                .await
+                .unwrap();
+            // Drain until we see a _completion marker or timeout.
+            let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(warmup_deadline, rx.recv()).await {
+                if msg.metadata.get("_completion").is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound_api("please run a big analysis", "api"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the next prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound_api("please answer FA-12d probe", "api"))
+            .await
+            .unwrap();
+
+        // Collect every OutboundMessage until we find one carrying the
+        // overflow's `_session_result` metadata, or we timeout.
+        let mut outbound_log: Vec<OutboundMessage> = Vec::new();
+        let mut overflow_emission: Option<OutboundMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let carries_overflow_session_result = msg
+                        .metadata
+                        .get("_session_result")
+                        .and_then(|sr| sr.get("content"))
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("FA12d") || s.contains("BRAVO"));
+                    outbound_log.push(msg.clone());
+                    if carries_overflow_session_result {
+                        overflow_emission = Some(msg);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let overflow = overflow_emission.unwrap_or_else(|| {
+            panic!(
+                "expected an overflow OutboundMessage carrying `_session_result` \
+                 metadata via watchers fanout, got {} messages: {:?}",
+                outbound_log.len(),
+                outbound_log
+                    .iter()
+                    .map(|m| format!("content={:?} metadata={}", m.content, m.metadata))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        let session_result = overflow
+            .metadata
+            .get("_session_result")
+            .expect("overflow must carry _session_result metadata");
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq, got {session_result}"
+        );
+        assert_eq!(
+            session_result
+                .get("response_to_client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("client-msg-bravo"),
+            "session_result must carry response_to_client_message_id so \
+             the web reducer can merge into the optimistic Q2 bubble"
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+        // When the channel already streamed the chunks (ApiChannel path),
+        // the durable emission omits the content body so non-API channels
+        // don't duplicate the bubble and the web doesn't double-render.
+        // The full reply is still captured inside `_session_result.content`.
+        assert!(
+            overflow.content.is_empty() || overflow.content == "FA12d overflow BRAVO answer",
+            "expected empty OR full-content body when already_streamed=true, got {:?}",
+            overflow.content
+        );
+
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
