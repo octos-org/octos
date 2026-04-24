@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useState } from 'react'
 import { api, type DeploymentMode, type SmtpSettings } from '../../api'
 
 type TestState =
@@ -10,17 +10,24 @@ type TestState =
 type SaveState =
   | { kind: 'idle' }
   | { kind: 'saving' }
-  | { kind: 'saved' }
   | { kind: 'err'; error: string }
+
+export type StepSmtpHandle = {
+  /** Saves the current form values. Resolves true on success, false on failure or when required fields are missing. */
+  save: () => Promise<boolean>
+}
 
 type Props = {
   /** Current deployment mode — determines whether SMTP is required. */
   mode: DeploymentMode | null
-  /** Called by the parent when the user clicks "Save and continue". */
-  onContinue: () => void
+  /** Notifies the parent when field validity changes so it can gate the Next button. */
+  onCanProceedChange: (canProceed: boolean) => void
 }
 
-export default function StepSmtp({ mode, onContinue }: Props) {
+const StepSmtp = forwardRef<StepSmtpHandle, Props>(function StepSmtp(
+  { mode, onCanProceedChange },
+  ref,
+) {
   const [host, setHost] = useState('')
   const [port, setPort] = useState(465)
   const [username, setUsername] = useState('')
@@ -65,25 +72,38 @@ export default function StepSmtp({ mode, onContinue }: Props) {
     (password.length > 0 || passwordConfigured)
   const canContinue = !isRequired || allFieldsFilled
 
-  const handleSave = async () => {
-    setSave({ kind: 'saving' })
-    try {
-      await api.saveSmtp({
-        host: host.trim(),
-        port,
-        username: username.trim(),
-        from_address: fromAddress.trim(),
-        password: password.length > 0 ? password : undefined,
-      })
-      setSave({ kind: 'saved' })
-      if (password.length > 0) {
-        setPassword('')
-        setPasswordConfigured(true)
-      }
-    } catch (e: any) {
-      setSave({ kind: 'err', error: e?.message || 'Save failed.' })
-    }
-  }
+  useEffect(() => {
+    onCanProceedChange(canContinue)
+  }, [canContinue, onCanProceedChange])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      save: async () => {
+        if (!canContinue) return false
+        setSave({ kind: 'saving' })
+        try {
+          await api.saveSmtp({
+            host: host.trim(),
+            port,
+            username: username.trim(),
+            from_address: fromAddress.trim(),
+            password: password.length > 0 ? password : undefined,
+          })
+          setSave({ kind: 'idle' })
+          if (password.length > 0) {
+            setPassword('')
+            setPasswordConfigured(true)
+          }
+          return true
+        } catch (e: any) {
+          setSave({ kind: 'err', error: e?.message || 'Save failed.' })
+          return false
+        }
+      },
+    }),
+    [canContinue, host, port, username, fromAddress, password],
+  )
 
   const handleTest = async () => {
     setTest({ kind: 'loading' })
@@ -109,12 +129,6 @@ export default function StepSmtp({ mode, onContinue }: Props) {
     } catch (e: any) {
       setTest({ kind: 'err', error: e?.message || 'Test request failed.' })
     }
-  }
-
-  const handleSaveAndContinue = async () => {
-    if (!canContinue) return
-    await handleSave()
-    onContinue()
   }
 
   return (
@@ -215,26 +229,12 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         )}
       </div>
 
-      <div className="flex items-center gap-3 border-t border-gray-700/50 pt-3">
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={save.kind === 'saving'}
-          className="px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          {save.kind === 'saving' ? 'Saving…' : 'Save'}
-        </button>
-        <button
-          type="button"
-          onClick={handleSaveAndContinue}
-          disabled={!canContinue || save.kind === 'saving'}
-          className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          Save and Continue
-        </button>
-        {save.kind === 'saved' && <span className="text-xs text-green-400">Saved</span>}
-        {save.kind === 'err' && <span className="text-xs text-red-400 break-all">{save.error}</span>}
-      </div>
+      {save.kind === 'saving' && (
+        <div className="text-xs text-gray-400">Saving…</div>
+      )}
+      {save.kind === 'err' && (
+        <div className="text-xs text-red-400 break-all">{save.error}</div>
+      )}
 
       {mode === null && (
         <p className="text-xs text-gray-500">
@@ -243,4 +243,6 @@ export default function StepSmtp({ mode, onContinue }: Props) {
       )}
     </div>
   )
-}
+})
+
+export default StepSmtp

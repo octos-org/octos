@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, type DeploymentMode } from '../api'
 import WizardNav from '../components/WizardNav'
 import StepOverview from './wizard/StepOverview'
 import StepLlmProvider from './wizard/StepLlmProvider'
-import StepSmtp from './wizard/StepSmtp'
+import StepSmtp, { type StepSmtpHandle } from './wizard/StepSmtp'
 import StepDeploymentMode from './wizard/StepDeploymentMode'
 import StepCreateProfile from './wizard/StepCreateProfile'
 
@@ -18,6 +18,8 @@ export default function SetupWizard() {
     Number.isFinite(rawStep) && rawStep >= 0 && rawStep < TOTAL_STEPS ? rawStep : 0
 
   const [mode, setMode] = useState<DeploymentMode | null>(null)
+  const [smtpCanProceed, setSmtpCanProceed] = useState(true)
+  const smtpRef = useRef<StepSmtpHandle>(null)
 
   useEffect(() => {
     // Ensure the URL has an explicit step once we've clamped.
@@ -67,9 +69,17 @@ export default function SetupWizard() {
     navigate('/')
   }
 
-  // Step 2 (SMTP) renders its own "Save and continue" primary CTA so it can
-  // gate advancement on required fields when mode ∈ { tenant, cloud }.
-  const stepOwnsPrimary = step === 2 || step === TOTAL_STEPS - 1
+  // The terminal step (StepCreateProfile) forks to two destinations, so it
+  // renders its own CTAs instead of using WizardNav's Next/Finish.
+  const stepOwnsPrimary = step === TOTAL_STEPS - 1
+
+  const handleNext = async () => {
+    if (step === 2 && smtpRef.current) {
+      const ok = await smtpRef.current.save()
+      if (!ok) return
+    }
+    goToStep(step + 1)
+  }
 
   const content = (() => {
     switch (step) {
@@ -78,7 +88,9 @@ export default function SetupWizard() {
       case 1:
         return <StepLlmProvider />
       case 2:
-        return <StepSmtp mode={mode} onContinue={() => goToStep(step + 1)} />
+        return (
+          <StepSmtp ref={smtpRef} mode={mode} onCanProceedChange={setSmtpCanProceed} />
+        )
       case 3:
         return <StepDeploymentMode onModeSaved={setMode} />
       case 4:
@@ -99,11 +111,12 @@ export default function SetupWizard() {
           step={step}
           totalSteps={TOTAL_STEPS}
           onBack={() => goToStep(step - 1)}
-          onNext={() => goToStep(step + 1)}
+          onNext={handleNext}
           onSkipStep={() => goToStep(step + 1)}
           onSkipWizard={handleSkipWizard}
           onFinish={handleFinish}
           stepOwnsPrimary={stepOwnsPrimary}
+          nextDisabled={step === 2 && !smtpCanProceed}
         />
       </div>
     </div>

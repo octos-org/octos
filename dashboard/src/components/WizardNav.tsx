@@ -8,6 +8,8 @@ type Props = {
   onFinish: () => void
   /** When true, the step renders its own finish/next CTAs; nav shows only Back + Skip wizard. */
   stepOwnsPrimary?: boolean
+  /** Disable the Next button (e.g. required fields missing). Ignored when stepOwnsPrimary. */
+  nextDisabled?: boolean
 }
 
 export default function WizardNav({
@@ -19,6 +21,7 @@ export default function WizardNav({
   onSkipWizard,
   onFinish,
   stepOwnsPrimary = false,
+  nextDisabled = false,
 }: Props) {
   const isFirst = step <= 0
   const isLast = step >= totalSteps - 1
@@ -60,7 +63,8 @@ export default function WizardNav({
             <button
               type="button"
               onClick={onNext}
-              className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
+              disabled={nextDisabled}
+              className="px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Next
             </button>
