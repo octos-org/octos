@@ -18,7 +18,7 @@ pub mod user_admin;
 pub mod webhook_proxy;
 
 pub use metrics::init_metrics;
-pub use router::build_router;
+pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 pub use sse::SseBroadcaster;
 pub use swarm::{
     BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
@@ -137,6 +137,12 @@ pub struct AppState {
     pub run_id_cache: Arc<RunIdCache>,
     /// Tunnel domain (e.g. "octos-cloud.org").
     pub tunnel_domain: Option<String>,
+    /// Public-facing base domain each mini serves profiles under
+    /// (e.g. `"crew.ominix.io"`, `"bot.ominix.io"`, `"ocean.ominix.io"`).
+    /// `None` is treated as `"crew.ominix.io"` by callers for backward
+    /// compatibility. See `crate::config::Config::base_domain` for the
+    /// config / env-var wiring.
+    pub base_domain: Option<String>,
     /// frps server address for tunnel config generation.
     pub frps_server: Option<String>,
     /// frps control port.
@@ -208,6 +214,7 @@ impl AppState {
             tenant_store: None,
             run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: None,
+            base_domain: None,
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
