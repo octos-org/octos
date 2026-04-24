@@ -372,13 +372,24 @@ async fn chat_streaming(
                     "chat: streaming response complete"
                 );
 
-                // Save all conversation messages (user, assistant iterations, tool calls/results)
-                {
+                // Save all conversation messages (user, assistant iterations,
+                // tool calls/results). Capture the committed seq of the final
+                // assistant message so the SSE `done` event can thread it back
+                // to the web client (M8.10-A).
+                let assistant_committed_seq: Option<u64> = {
                     let mut sess = sessions.lock().await;
+                    let mut last_assistant_seq: Option<u64> = None;
                     for msg in &response.messages {
-                        let _ = sess.add_message(&session_key, msg.clone()).await;
+                        match sess.add_message_with_seq(&session_key, msg.clone()).await {
+                            Ok(seq) if msg.role == octos_core::MessageRole::Assistant => {
+                                last_assistant_seq = u64::try_from(seq).ok();
+                            }
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
                     }
-                }
+                    last_assistant_seq
+                };
 
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
@@ -400,7 +411,7 @@ async fn chat_streaming(
                         response.token_usage.output_tokens,
                     )
                 });
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
@@ -411,6 +422,9 @@ async fn chat_streaming(
                     "tokens_out": response.token_usage.output_tokens,
                     "session_cost": session_cost,
                 });
+                if let Some(seq) = assistant_committed_seq {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
@@ -2638,13 +2652,23 @@ async fn ws_standalone_agent(
 
         match result {
             Ok(response) => {
-                // Save conversation messages to session
-                {
+                // Save conversation messages to session. Capture the committed
+                // seq of the final assistant message so the WebSocket-bridged
+                // `done` event can thread it back to the web client (M8.10-A).
+                let assistant_committed_seq: Option<u64> = {
                     let mut sess = sessions.lock().await;
+                    let mut last_assistant_seq: Option<u64> = None;
                     for msg in &response.messages {
-                        let _ = sess.add_message(&session_key2, msg.clone()).await;
+                        match sess.add_message_with_seq(&session_key2, msg.clone()).await {
+                            Ok(seq) if msg.role == octos_core::MessageRole::Assistant => {
+                                last_assistant_seq = u64::try_from(seq).ok();
+                            }
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
                     }
-                }
+                    last_assistant_seq
+                };
 
                 let provider_metadata = response.provider_metadata.clone();
                 let model_id = provider_metadata
@@ -2665,7 +2689,7 @@ async fn ws_standalone_agent(
                         response.token_usage.output_tokens,
                     )
                 });
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
@@ -2676,6 +2700,9 @@ async fn ws_standalone_agent(
                     "tokens_out": response.token_usage.output_tokens,
                     "session_cost": session_cost,
                 });
+                if let Some(seq) = assistant_committed_seq {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
