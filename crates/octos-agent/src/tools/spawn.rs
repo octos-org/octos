@@ -2052,6 +2052,21 @@ impl Tool for SpawnTool {
                 // compaction summarizer if the parent policy requests one.
                 let child_llm_for_compaction = llm.clone();
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory);
+                // Harness M7.9b: wire the supervisor inbox receiver into the
+                // child worker so the child's `run_task` loop drains queued
+                // steering messages between turns. The matching sender was
+                // handed to the supervisor via `register_abort` below — this
+                // closes the PM steering loop so `send_to_agent` /
+                // REST / Matrix-puppet replies have runtime effect on the
+                // child conversation, not just on the supervisor ledger.
+                //
+                // Moving `inbox_rx` here transfers ownership into the worker.
+                // The previous `let _inbox_rx = inbox_rx;` keep-alive at the
+                // end of the spawn future is removed in favour of the
+                // worker holding the receiver directly — the receiver stays
+                // alive for the duration of `run_task`, matching the
+                // sender's expected lifetime.
+                worker = worker.with_supervisor_inbox(inbox_rx);
                 // Keep an Arc to the child's tool registry for the
                 // post-`run_task` validator invocation below.
                 let child_tools_handle = worker.tool_registry().clone();
@@ -2579,11 +2594,15 @@ impl Tool for SpawnTool {
                 } else {
                     record_result_delivery("relay_inbound_message", "enqueued", result_kind);
                 }
-                // Keep the inbox receiver alive for the duration of the
-                // subagent. The supervisor tree may still be holding
-                // `SupervisorInbox` clones; dropping `_inbox_rx` here lets
-                // late `send_to_agent` calls surface `InboxClosed`.
-                let _inbox_rx = inbox_rx;
+                // Harness M7.9b: `inbox_rx` is now owned by the child
+                // worker (see `worker.with_supervisor_inbox(inbox_rx)`
+                // above). Keeping a second reference here would deadlock
+                // the drain — the worker takes `&self` into `try_lock`,
+                // and any outstanding borrow would block the drain
+                // indefinitely. Instead, when `run_task` returns, the
+                // worker drops, releasing the receiver and causing
+                // subsequent `send_to_agent` calls to surface the typed
+                // `InboxClosed` error.
             });
 
             // M7.9: attach the abort handle + steering inbox to the

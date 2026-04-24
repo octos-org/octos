@@ -180,6 +180,26 @@ pub struct Agent {
     /// per-turn-reset behaviour, identical to every pre-F-015 caller.
     pub(super) persistent_retry_state:
         Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>>,
+    /// Harness M7.9b: Supervisor inbox receiver. When present, the agent
+    /// loop drains queued [`crate::task_supervisor::InboxMessage`]s at the
+    /// start of each turn and prepends them as user-role messages into the
+    /// running conversation. Populated by `SpawnTool` when it launches a
+    /// background child subagent — the matching sender clone lives in the
+    /// `TaskSupervisor` handles map so out-of-band callers (`send_to_agent`
+    /// tool, REST endpoint, Matrix puppet steering consumer) can inject
+    /// steering messages without waiting for the current turn to finish.
+    ///
+    /// Wrapped in `tokio::sync::Mutex` so `&self` methods on the loop can
+    /// non-blockingly `try_lock + try_recv` drain without requiring `&mut`.
+    /// Absent = legacy behaviour (no steering), identical to every
+    /// pre-M7.9b caller.
+    pub(super) supervisor_inbox_rx: Option<
+        Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::UnboundedReceiver<crate::task_supervisor::InboxMessage>,
+            >,
+        >,
+    >,
 }
 
 impl Agent {
@@ -211,6 +231,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             persistent_retry_state: None,
+            supervisor_inbox_rx: None,
         }
     }
 
@@ -243,6 +264,7 @@ impl Agent {
             compaction_runner: None,
             compaction_workspace: None,
             persistent_retry_state: None,
+            supervisor_inbox_rx: None,
         }
     }
 
@@ -408,6 +430,68 @@ impl Agent {
         &self,
     ) -> Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>> {
         self.persistent_retry_state.clone()
+    }
+
+    /// Harness M7.9b: Attach a [`crate::task_supervisor::SupervisorInbox`]
+    /// receiver so the agent loop can drain out-of-band steering messages
+    /// at the start of each turn.
+    ///
+    /// Intended to be called by `SpawnTool` when it constructs the child
+    /// subagent — the matching sender is registered on the shared
+    /// `TaskSupervisor` via `register_abort(..)`, so the parent agent's
+    /// `send_to_agent` tool (and the REST + Matrix-puppet steering paths)
+    /// can inject a message without waiting for the running turn to
+    /// finish.
+    ///
+    /// Accepts a `tokio::sync::mpsc::UnboundedReceiver<InboxMessage>` —
+    /// the same receiver half of the channel whose sender was handed to
+    /// `TaskSupervisor::register_abort`. The agent loop non-blockingly
+    /// drains the receiver between iterations via `try_recv`, so a slow
+    /// or indefinitely-running turn still surfaces queued steering
+    /// messages on the next LLM call.
+    pub fn with_supervisor_inbox(
+        mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<crate::task_supervisor::InboxMessage>,
+    ) -> Self {
+        self.supervisor_inbox_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+        self
+    }
+
+    /// Harness M7.9b: Drain all queued supervisor inbox messages without
+    /// blocking. Returns an empty vector when no inbox is attached (legacy
+    /// callers) or when nothing has been queued since the previous drain.
+    ///
+    /// Called from the agent loop at the top of each turn, before
+    /// composing the message list for the LLM call. Draining is
+    /// non-blocking (`try_recv` / `try_lock`) so a still-running inbox
+    /// sender never blocks the loop — receivers that cannot grab the
+    /// mutex this tick simply pick up the messages next tick.
+    ///
+    /// Mirrors the `drainPendingMessages` pattern in Claude Code's CLI —
+    /// queued messages become synthetic user-role turns prepended to the
+    /// conversation. The `[from: sender]` prefix preserves attribution so
+    /// the model distinguishes operator / Matrix puppet / parent agent
+    /// originators.
+    pub(super) fn drain_supervisor_inbox(&self) -> Vec<crate::task_supervisor::InboxMessage> {
+        let Some(rx) = self.supervisor_inbox_rx.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(mut guard) = rx.try_lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(msg) = guard.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// Test / observability accessor: check whether a supervisor inbox
+    /// has been wired. Exposed for integration tests + external health
+    /// probes that want to confirm the spawn wrapper plumbed the inbox
+    /// receiver. No runtime significance — purely introspective.
+    pub fn has_supervisor_inbox(&self) -> bool {
+        self.supervisor_inbox_rx.is_some()
     }
 
     /// Beat the heartbeat once (if a realtime controller is attached) and

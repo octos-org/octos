@@ -23,10 +23,54 @@ use crate::harness_events::write_event_to_sink;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::session::SessionLimits;
+use crate::task_supervisor::InboxMessage;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
+
+/// Harness M7.9b: convert a drained [`InboxMessage`] into a synthetic
+/// user-role [`Message`] for injection into the running conversation.
+///
+/// Preserves attribution via a `[from: <sender>]` prefix so the LLM can
+/// distinguish whether the message originated from the parent PM agent,
+/// an operator, or a Matrix-puppet supervisor reply. Mirrors the
+/// claudecode `pendingMessages` drain pattern.
+///
+/// `received_at` is preserved by the supervisor for audit but is not
+/// surfaced to the model — the wall-clock timestamp would be noise in
+/// most steering cases; operators care about content, not latency.
+fn inbox_message_to_user(msg: InboxMessage) -> Message {
+    let body = format!("[from: {}]\n{}", msg.sender, msg.body);
+    Message {
+        role: MessageRole::User,
+        content: body,
+        media: vec![],
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// Drain the supervisor inbox and append the resulting synthetic
+/// user-role messages to the conversation history in-place. Returns the
+/// drained messages (in the order they were received) for observability
+/// hooks — callers in the loop emit a single tracing record if the
+/// returned slice is non-empty.
+pub(crate) fn drain_and_inject_supervisor_inbox(
+    agent: &Agent,
+    messages: &mut Vec<Message>,
+) -> Vec<InboxMessage> {
+    let drained = agent.drain_supervisor_inbox();
+    if drained.is_empty() {
+        return drained;
+    }
+    for msg in drained.iter().cloned() {
+        messages.push(inbox_message_to_user(msg));
+    }
+    drained
+}
 
 fn split_tool_calls(
     tool_calls: &[octos_core::ToolCall],
@@ -643,6 +687,22 @@ impl Agent {
                     if iteration == 1 {
                         self.maybe_run_preflight_compaction(&mut messages);
                     }
+                    // Harness M7.9b: drain the supervisor inbox and prepend
+                    // any queued steering messages as synthetic user-role
+                    // turns before the next LLM call. No-op when no inbox
+                    // is wired (every pre-M7.9b caller sees identical
+                    // behaviour). Drained messages slot in *after* the
+                    // accumulated history and before context repair so the
+                    // repair pipeline normalizes them the same way it does
+                    // real user input.
+                    let drained = drain_and_inject_supervisor_inbox(self, &mut messages);
+                    if !drained.is_empty() {
+                        tracing::info!(
+                            iteration,
+                            drained = drained.len(),
+                            "drained supervisor inbox steering messages into conversation"
+                        );
+                    }
                     prepare_conversation_messages(self, &mut messages, &mut turn);
                     // Harness M6.3: post-prep compaction pass so the declarative
                     // runner sees the final shape of the conversation (after
@@ -1033,6 +1093,18 @@ impl Agent {
                 }
 
                 let tools_spec = self.tools.specs();
+                // Harness M7.9b: drain the supervisor inbox for background
+                // subagents — background spawns go through `run_task`, so
+                // this is the path that matters for PM-steering a running
+                // child. No-op when no inbox is attached.
+                let drained = drain_and_inject_supervisor_inbox(self, &mut messages);
+                if !drained.is_empty() {
+                    tracing::info!(
+                        iteration,
+                        drained = drained.len(),
+                        "drained supervisor inbox steering messages into task loop"
+                    );
+                }
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
