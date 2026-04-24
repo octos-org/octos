@@ -431,6 +431,12 @@ fn say_voice_candidates(language: &str) -> &'static [&'static str] {
 /// bytes; a file near that size carries virtually no samples.
 const MIN_VALID_WAV_BYTES: u64 = 256;
 
+/// Public display-only list of voice IDs Qwen3-TTS accepts out-of-the-box.
+/// Used in error messages so the LLM can retry with a valid preset OR
+/// route custom voices (clones) to `fm_tts` from the mofa-fm skill.
+const PRESET_VOICE_LIST: &str =
+    "vivian, serena, ryan, aiden, eric, dylan, uncle_fu, ono_anna, sohee";
+
 fn wav_payload_is_silent_bytes(bytes: &[u8]) -> bool {
     bytes.len() <= 44 || bytes[44..].iter().all(|&b| b == 0)
 }
@@ -618,17 +624,31 @@ fn handle_synthesize(input_json: &str) {
                         ));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Qwen3-TTS produced invalid audio ({e}), falling back to macOS Say..."
-                        );
+                        // Qwen3-TTS succeeded but wrote invalid audio (often
+                        // indicates an unsupported speaker name like a custom
+                        // clone id). Fail explicitly so the LLM learns to
+                        // route custom voices to fm_tts instead of silently
+                        // downgrading to macOS Say.
                         let _ = std::fs::remove_file(&output_path);
-                        // Fall through to macOS Say below
+                        fail(&format!(
+                            "TTS failed: Qwen3-TTS returned invalid audio for voice '{speaker}' ({e}). \
+                             Preset voices only include {PRESET_VOICE_LIST}. \
+                             For custom / cloned voices (e.g. yangmi, douwentao) use `fm_tts` from the mofa-fm skill."
+                        ));
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Qwen3-TTS failed ({e}), falling back to macOS Say...");
-                // Fall through to macOS Say below
+                // Qwen3-TTS error — surface it to the LLM, don't silently
+                // fall back to Say. The error message usually names the
+                // actual cause (unknown voice, payload too long, etc.) so
+                // the LLM can react (retry with fm_tts for custom voices,
+                // shorten text, etc.).
+                fail(&format!(
+                    "TTS failed: Qwen3-TTS rejected request for voice '{speaker}': {e}. \
+                     Preset voices only include {PRESET_VOICE_LIST}. \
+                     For custom / cloned voices use `fm_tts` from the mofa-fm skill."
+                ));
             }
         }
     } else {
