@@ -39,6 +39,8 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod steering;
+pub mod subagent_output;
+pub mod subagent_summary;
 mod subprocess_env;
 pub mod summarizer;
 pub mod task_supervisor;
@@ -94,8 +96,9 @@ pub use harness_events::{
     HarnessCredentialRotationEvent, HarnessCredentialRotationSink, HarnessEvent, HarnessEventError,
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent,
     HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSessionSanitizedEvent,
-    HarnessSubAgentDispatchEvent, HarnessSwarmDispatchEvent, HarnessValidatorResultEvent,
-    MAX_HARNESS_EVENT_LINE_BYTES, emit_registered_credential_rotation_event,
+    HarnessSubAgentDispatchEvent, HarnessSubagentProgressEvent, HarnessSwarmDispatchEvent,
+    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    emit_registered_credential_rotation_event,
 };
 pub use hooks::{
     HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
@@ -110,6 +113,14 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use subagent_output::{
+    AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,
+    DEFAULT_PREVIEW_BYTES, SubAgentOutputRouter,
+};
+pub use subagent_summary::{
+    AgentSummaryGenerator, DEFAULT_SUBAGENT_SUMMARY_MIN_RUNTIME, DEFAULT_SUBAGENT_SUMMARY_TICK,
+    DEFAULT_SUBAGENT_SUMMARY_WINDOW, SubAgentSummaryRegistry, SubAgentSummaryWatcher,
+};
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,

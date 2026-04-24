@@ -277,6 +277,15 @@ pub enum HarnessEventPayload {
         #[serde(flatten)]
         data: HarnessSessionSanitizedEvent,
     },
+    /// Periodic progress summary emitted by the `AgentSummaryGenerator`
+    /// (M8.7). Produced every `tick` seconds while a spawn_only sub-agent
+    /// is running, backed by a cheap-lane LLM call over the last N
+    /// activities. The supervisor folds these into
+    /// `BackgroundTask.runtime_detail`.
+    SubagentProgress {
+        #[serde(flatten)]
+        data: HarnessSubagentProgressEvent,
+    },
     Error {
         #[serde(flatten)]
         data: HarnessErrorEvent,
@@ -577,6 +586,29 @@ pub struct HarnessSessionSanitizedEvent {
     pub extra: HashMap<String, Value>,
 }
 
+/// Periodic sub-agent progress summary event (M8.7).
+///
+/// Emitted every `tick` seconds by `AgentSummaryGenerator` while a
+/// spawn_only sub-agent is in `Running` status. Supervisors fold the
+/// `summary` string into `BackgroundTask.runtime_detail` so dashboards
+/// can display live "what is the sub-agent doing" text without tailing
+/// the per-task disk output log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessSubagentProgressEvent {
+    pub session_id: String,
+    pub task_id: String,
+    /// Short LLM-generated description of the current activity (3-5 words,
+    /// present continuous tense).
+    pub summary: String,
+    /// Monotonic tick sequence starting at 1 for the first summary of the
+    /// task. Useful for clients that want to deduplicate or show "tick N".
+    pub tick_seq: u32,
+    /// When the summary was produced (wall-clock, UTC).
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Structured credential rotation event (M6.5).
 ///
 /// Emitted by the credential pool on every successful selection. Consumers
@@ -755,6 +787,31 @@ impl HarnessEvent {
                     content_replacements_restored: report.content_replacements_restored,
                     worktree_missing: report.worktree_missing,
                     warnings: report.warnings.clone(),
+                    extra: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    /// Build a `SubagentProgress` event (M8.7). Emitted every tick while a
+    /// spawn_only sub-agent is running so operators can see a live
+    /// natural-language summary of current activity.
+    pub fn subagent_progress(
+        session_id: impl Into<String>,
+        task_id: impl Into<String>,
+        summary: impl Into<String>,
+        tick_seq: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
+            payload: HarnessEventPayload::SubagentProgress {
+                data: HarnessSubagentProgressEvent {
+                    session_id: session_id.into(),
+                    task_id: task_id.into(),
+                    summary: summary.into(),
+                    tick_seq,
+                    at,
                     extra: HashMap::new(),
                 },
             },
@@ -949,6 +1006,10 @@ impl HarnessEvent {
                 for warning in &data.warnings {
                     validate_bounded("warning", warning, MAX_MESSAGE_BYTES)?;
                 }
+            }
+            HarnessEventPayload::SubagentProgress { data } => {
+                validate_common_ids(&data.session_id, &data.task_id)?;
+                validate_bounded("summary", &data.summary, MAX_MESSAGE_BYTES)?;
             }
             HarnessEventPayload::Error { data } => {
                 if data.schema_version > HARNESS_ERROR_SCHEMA_VERSION {
@@ -1204,6 +1265,19 @@ impl HarnessEvent {
                     "warnings": data.warnings,
                 })
             }
+            HarnessEventPayload::SubagentProgress { data } => {
+                serde_json::json!({
+                    "schema": self.schema,
+                    "kind": "subagent_progress",
+                    "session_id": data.session_id,
+                    "task_id": data.task_id,
+                    "summary": data.summary,
+                    "tick": data.tick_seq,
+                    "at": data.at.to_rfc3339(),
+                    "workflow_kind": fallback_workflow_kind,
+                    "current_phase": fallback_current_phase,
+                })
+            }
             HarnessEventPayload::Error { data } => {
                 let workflow = data.workflow.as_deref().or(fallback_workflow_kind);
                 let current_phase = data.phase.as_deref().or(fallback_current_phase);
@@ -1241,6 +1315,7 @@ impl HarnessEvent {
             HarnessEventPayload::RoutingDecision { data } => &data.session_id,
             HarnessEventPayload::CredentialRotation { data } => &data.session_id,
             HarnessEventPayload::SessionSanitized { data } => &data.session_id,
+            HarnessEventPayload::SubagentProgress { data } => &data.session_id,
             HarnessEventPayload::Error { data } => &data.session_id,
         }
     }
@@ -1260,6 +1335,7 @@ impl HarnessEvent {
             HarnessEventPayload::RoutingDecision { data } => &data.task_id,
             HarnessEventPayload::CredentialRotation { data } => &data.task_id,
             HarnessEventPayload::SessionSanitized { data } => &data.task_id,
+            HarnessEventPayload::SubagentProgress { data } => &data.task_id,
             HarnessEventPayload::Error { data } => &data.task_id,
         }
     }
@@ -1279,6 +1355,7 @@ impl HarnessEvent {
             HarnessEventPayload::RoutingDecision { data } => data.workflow.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::SessionSanitized { data } => data.workflow.as_deref(),
+            HarnessEventPayload::SubagentProgress { .. } => None,
             HarnessEventPayload::Error { data } => data.workflow.as_deref(),
         }
     }
@@ -1298,6 +1375,7 @@ impl HarnessEvent {
             HarnessEventPayload::RoutingDecision { data } => data.phase.as_deref(),
             HarnessEventPayload::CredentialRotation { .. } => None,
             HarnessEventPayload::SessionSanitized { .. } => None,
+            HarnessEventPayload::SubagentProgress { .. } => None,
             HarnessEventPayload::Error { data } => data.phase.as_deref(),
         }
     }
@@ -1728,6 +1806,62 @@ mod tests {
         assert_eq!(detail["tier"], "strong");
         assert_eq!(detail["input_chars"], 512);
         assert_eq!(detail["reasons"][0], "code_fence");
+    }
+
+    #[test]
+    fn subagent_progress_event_roundtrips_json_line() {
+        let at = chrono::Utc::now();
+        let event = HarnessEvent::subagent_progress(
+            "api:session",
+            "task-42",
+            "fetching weather data",
+            7,
+            at,
+        );
+        assert!(event.validate().is_ok());
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed = HarnessEvent::from_json_line(&json).unwrap();
+        assert_eq!(parsed.session_id(), "api:session");
+        assert_eq!(parsed.task_id(), "task-42");
+        match &parsed.payload {
+            HarnessEventPayload::SubagentProgress { data } => {
+                assert_eq!(data.summary, "fetching weather data");
+                assert_eq!(data.tick_seq, 7);
+                assert_eq!(data.at, at);
+            }
+            other => panic!("expected SubagentProgress, got {other:?}"),
+        }
+        let detail = parsed.runtime_detail_value(None, None);
+        assert_eq!(detail["kind"], "subagent_progress");
+        assert_eq!(detail["summary"], "fetching weather data");
+        assert_eq!(detail["tick"], 7);
+    }
+
+    #[test]
+    fn subagent_progress_event_integrates_with_supervisor() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let event = HarnessEvent::subagent_progress(
+            "api:session",
+            task_id.clone(),
+            "parsing response",
+            3,
+            chrono::Utc::now(),
+        );
+        supervisor.apply_harness_event(&task_id, &event).unwrap();
+
+        let task = supervisor.get_task(&task_id).expect("task missing");
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["kind"], "subagent_progress");
+        assert_eq!(detail["summary"], "parsing response");
+        assert_eq!(detail["tick"], 3);
+        // The coarse status must remain Running — progress ticks are purely
+        // observational.
+        assert_eq!(task.status, crate::task_supervisor::TaskStatus::Running);
     }
 
     #[test]
