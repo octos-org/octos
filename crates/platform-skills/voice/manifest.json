@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "octos",
   "description": "OminiX voice skill: ASR, preset-voice TTS with emotion/speed control, and model management via local Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
   "timeout_secs": 600,
