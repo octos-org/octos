@@ -180,6 +180,15 @@ struct ChatRequest {
     target_profile_id: Option<String>,
     #[serde(default)]
     attach_only: bool,
+    /// Client-generated correlation id used by the web reducer to route
+    /// the eventual session_result event onto the optimistic bubble the
+    /// user sees. Without this, speculative-queue overflow replies arrive
+    /// carrying `response_to_client_message_id: null` and the reducer
+    /// cannot tell which streaming bubble they belong to — BRAVO's reply
+    /// then clobbers ALPHA's bubble and BRAVO's bubble stays empty
+    /// (FA-12f).
+    #[serde(default)]
+    client_message_id: Option<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -1081,6 +1090,12 @@ async fn handle_chat(
 
     if !req.attach_only {
         // Build and send InboundMessage to the gateway bus.
+        //
+        // FA-12f: thread the web's `client_message_id` through as the
+        // inbound's platform `message_id`. It surfaces downstream as the
+        // overflow agent's `reply_to` which becomes
+        // `_session_result.response_to_client_message_id` — the field the
+        // web reducer correlates against the optimistic streaming bubble.
         let inbound = InboundMessage {
             channel: "api".into(),
             sender_id: "web".into(),
@@ -1101,7 +1116,10 @@ async fn handle_chat(
                 }
                 serde_json::Value::Object(metadata)
             },
-            message_id: None,
+            message_id: req
+                .client_message_id
+                .clone()
+                .filter(|value| !value.is_empty()),
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
@@ -1969,6 +1987,125 @@ mod tests {
         let json = r#"{"message": "hi", "session_id": "web-123"}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("web-123"));
+    }
+
+    /// FA-12f regression: POST /api/chat carries a web-generated
+    /// `client_message_id` that must survive as
+    /// `InboundMessage.message_id` so downstream overflow emission can
+    /// propagate it into `_session_result.response_to_client_message_id`
+    /// — the field the web reducer correlates against the optimistic
+    /// streaming bubble.
+    ///
+    /// Before this fix the field was silently dropped at the request
+    /// deserializer; overflow replies then arrived with
+    /// `response_to_client_message_id: null` and the speculative-queue
+    /// BRAVO bubble never rendered (its reply clobbered ALPHA's bubble
+    /// via the session_result merge path).
+    #[tokio::test]
+    async fn chat_request_propagates_client_message_id_to_inbound() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let body = serde_json::json!({
+            "message": "Use shell: echo BRAVO",
+            "session_id": "web-fa12f",
+            "client_message_id": "client-bravo-xyz",
+            "stream": true,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("handle_chat must forward the message to the gateway bus")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("client-bravo-xyz"),
+            "InboundMessage.message_id must carry the request's client_message_id \
+             so the overflow reply can be routed back to the correct bubble",
+        );
+    }
+
+    /// Empty / missing `client_message_id` must NOT populate the inbound
+    /// `message_id` field — we want a sentinel-empty correlation id to
+    /// behave the same as "no correlation" so downstream emission doesn't
+    /// produce a session_result with an empty-string correlation id that
+    /// the reducer would then mis-route.
+    #[tokio::test]
+    async fn chat_request_treats_empty_client_message_id_as_absent() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let body = serde_json::json!({
+            "message": "hello",
+            "session_id": "web-fa12f-empty",
+            "client_message_id": "",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert!(
+            inbound.message_id.is_none(),
+            "empty client_message_id must not populate inbound.message_id, got {:?}",
+            inbound.message_id,
+        );
     }
 
     #[tokio::test]
