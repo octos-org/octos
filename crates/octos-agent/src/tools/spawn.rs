@@ -1350,6 +1350,16 @@ impl Tool for SpawnTool {
         &["gateway"]
     }
 
+    fn concurrency_class(&self) -> super::ConcurrencyClass {
+        // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+        // spawn() registers a background task with the supervisor,
+        // mutates the spawn_only_invoked atomic, and may share the
+        // backing memory store with peers in the same batch. Treat it
+        // as Exclusive so it never races a sibling tool that also
+        // mutates task / session state.
+        super::ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         // Build dynamic model field based on available sub-providers
         let model_prop = match &self.provider_router {

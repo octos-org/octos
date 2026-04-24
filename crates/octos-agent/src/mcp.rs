@@ -503,6 +503,13 @@ impl McpClient {
                 description: spec.description,
                 input_schema: spec.input_schema,
                 connection: spec.connection,
+                // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+                // MCP servers are conservative-by-default treated as
+                // Exclusive because the JSON-RPC transport serialises
+                // internally and most servers mutate remote state.
+                // A future milestone will let manifests/configs override
+                // this with per-server concurrency hints.
+                concurrency_class: crate::tools::ConcurrencyClass::Exclusive,
             });
         }
     }
@@ -540,6 +547,13 @@ struct McpTool {
     description: String,
     input_schema: serde_json::Value,
     connection: Arc<Mutex<McpConnection>>,
+    /// Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    /// concurrency class declared by the wrapper. Each MCP server is
+    /// configured with a single concurrency class — the wrapper does
+    /// not inspect MCP's `tools/list` for a per-tool hint. Server-level
+    /// declaration is appropriate because most MCP servers serialise
+    /// internally on the JSON-RPC stream anyway.
+    concurrency_class: crate::tools::ConcurrencyClass,
 }
 
 #[async_trait]
@@ -550,6 +564,10 @@ impl Tool for McpTool {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+        self.concurrency_class
     }
 
     fn input_schema(&self) -> serde_json::Value {

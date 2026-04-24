@@ -2029,6 +2029,7 @@ printf '{"output":"voice saved","success":true}\n'
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let plugin = PluginTool::new("mofa-fm".into(), def, script_path).with_extra_env(vec![(
             "INPUT_LOG".into(),

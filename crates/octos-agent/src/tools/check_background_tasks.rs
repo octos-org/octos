@@ -46,6 +46,16 @@ impl Tool for CheckBackgroundTasksTool {
         "Inspect background task state for the current session only. Use this when the user asks whether a background job like TTS, slides, podcast, or other spawned work is done yet."
     }
 
+    fn concurrency_class(&self) -> super::ConcurrencyClass {
+        // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+        // check_background_tasks reads the shared TaskSupervisor state.
+        // The reads are atomic individually but a sibling tool that
+        // mutates supervisor state in the same batch (e.g. spawn) can
+        // produce inconsistent snapshots. Mark Exclusive so the
+        // supervisor view is taken at a single point in batch order.
+        super::ConcurrencyClass::Exclusive
+    }
+
     fn tags(&self) -> &[&str] {
         &["gateway"]
     }
