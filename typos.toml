@@ -33,6 +33,10 @@ iz = "iz"
 ot = "ot"
 # Rust TUI library name
 ratatui = "ratatui"
+# English prefix "mis-" (misclassification, miscount, etc.)
+mis = "mis"
+# Constant-time equality test fixture (intentionally 1-byte diff from "abc")
+abd = "abd"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]

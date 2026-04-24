@@ -248,10 +248,7 @@ impl Executable for AdminCommand {
                 let data_dir = super::resolve_data_dir(data_dir)?;
                 let store = AdminTokenStore::new(&data_dir);
                 if !yes {
-                    print!(
-                        "Reset admin token at {}? [y/N]: ",
-                        store.path().display()
-                    );
+                    print!("Reset admin token at {}? [y/N]: ", store.path().display());
                     std::io::stdout().flush().ok();
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;

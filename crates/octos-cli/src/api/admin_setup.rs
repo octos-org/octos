@@ -412,9 +412,9 @@ pub async fn post_smtp(
 
     let path = require_config_path(&state)?;
     crate::config::write_mutation(&path, |value| {
-        let obj = value.as_object_mut().ok_or_else(|| {
-            eyre::eyre!("config.json root is not a JSON object")
-        })?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("config.json root is not a JSON object"))?;
         let auth = obj
             .entry("dashboard_auth".to_string())
             .or_insert_with(|| serde_json::json!({}));
@@ -851,7 +851,10 @@ mod tests {
         // password_env should be backfilled when missing.
         let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["dashboard_auth"]["smtp"]["password_env"], "SMTP_PASSWORD");
+        assert_eq!(
+            parsed["dashboard_auth"]["smtp"]["password_env"],
+            "SMTP_PASSWORD"
+        );
     }
 
     #[tokio::test]

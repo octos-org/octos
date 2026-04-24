@@ -141,7 +141,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = SetupStateStore::new(dir.path());
         store.update_last_step(1).unwrap();
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 }
