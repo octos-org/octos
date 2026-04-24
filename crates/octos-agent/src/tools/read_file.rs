@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
-use super::{Tool, ToolResult};
+use super::{Tool, ToolContext, ToolResult};
 
 /// Tool for reading file contents.
 pub struct ReadFileTool {
@@ -68,8 +68,30 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.1: legacy entry point routes through the typed path with a
+        // zero-value context so out-of-band callers still exercise the same
+        // permission and (post-M8.4) file-state-cache logic.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: ReadFileInput =
             serde_json::from_value(args.clone()).wrap_err("invalid read_file tool input")?;
+
+        // M8.1 permission gate (stub): consult the typed permissions record
+        // so the hook is in place before M8.3 wires real allow lists. Today
+        // `ToolPermissions::default()` returns allow-all.
+        if !ctx.permissions.is_tool_allowed(self.name()) {
+            return Ok(ToolResult {
+                output: "read_file is not permitted in this context".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         // Resolve path (with traversal protection)
         let path = match super::resolve_path(&self.base_dir, &input.path) {
@@ -251,5 +273,27 @@ mod tests {
         let tool = ReadFileTool::new("/tmp");
         assert_eq!(tool.name(), "read_file");
         assert!(tool.tags().contains(&"fs"));
+    }
+
+    #[tokio::test]
+    async fn should_read_via_execute_with_context() {
+        // M8.1 migration: `execute_with_context` is the authoritative entry
+        // point. Dispatching through it with a populated `ToolContext` must
+        // produce the same result as the legacy `execute` path.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "alpha\nbeta\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "read-via-ctx".to_string();
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "hello.txt"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("alpha"));
+        assert!(result.output.contains("beta"));
     }
 }
