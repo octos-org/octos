@@ -454,9 +454,12 @@ mod tests {
     async fn test_base_dir_blocks_non_tmp_outside_path() {
         let base = tempfile::tempdir().unwrap();
 
-        // Create a file outside base_dir (but not in /tmp/) to test path validation.
-        // Use a second tempdir as the "outside" location so this works on all platforms.
-        let outside_dir = tempfile::tempdir().unwrap();
+        // Create a file outside base_dir and outside /tmp/, since /tmp/ is
+        // explicitly allowlisted for generated artifacts.
+        let outside_dir = tempfile::Builder::new()
+            .prefix("octos-send-file-outside-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         let outside_file = outside_dir.path().join("secret.txt");
         std::fs::write(&outside_file, "secret").unwrap();
 

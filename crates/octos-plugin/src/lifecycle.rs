@@ -539,10 +539,12 @@ impl LifecycleExecutor {
                 // error out before reaching child.kill() below.
                 #[cfg(unix)]
                 if let Some(pid) = pid {
-                    // `kill -9 -<pgid>` targets the whole group. Since
-                    // we called process_group(0), pid == pgid.
+                    // `kill -9 -- -<pgid>` targets the whole group. The `--`
+                    // is required so the negative pgid is not parsed as
+                    // another option by the `kill` CLI. Since we called
+                    // process_group(0), pid == pgid.
                     let _ = std::process::Command::new("kill")
-                        .args(["-9", &format!("-{pid}")])
+                        .args(["-9", "--", &format!("-{pid}")])
                         .status();
                 }
                 if let Err(e) = child.kill().await {
@@ -551,6 +553,18 @@ impl LifecycleExecutor {
                         step = step.label,
                         error = %e,
                         "failed to kill timed-out lifecycle step child"
+                    );
+                }
+                // Reap the direct child before returning. Without this, the
+                // shell wrapper can remain as a zombie briefly, which delays
+                // reparenting/reaping of background children enough to trip
+                // the lifecycle timeout contract test.
+                if let Err(e) = child.wait().await {
+                    tracing::warn!(
+                        phase = phase.as_str(),
+                        step = step.label,
+                        error = %e,
+                        "failed to reap timed-out lifecycle step child"
                     );
                 }
                 #[cfg(windows)]
