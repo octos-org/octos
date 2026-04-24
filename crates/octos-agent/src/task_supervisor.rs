@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -244,6 +244,89 @@ fn child_failure_action_for_terminal_state(
         ChildSessionTerminalState::RetryableFailure => Some(ChildSessionFailureAction::Retry),
         ChildSessionTerminalState::TerminalFailure => Some(ChildSessionFailureAction::Escalate),
     }
+}
+
+/// Coarse MIME class used to gate background-task artifact size validation.
+///
+/// Spawn_only skills occasionally report `success: true` with malformed or
+/// empty artifacts (e.g. a 44-byte WAV stub, zero-byte PNG). The supervisor
+/// uses this classification as a belt-and-suspenders truth check before it
+/// transitions a task to `Completed`, independent of the per-workspace
+/// contract that can be missing or misconfigured at deploy time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactMimeClass {
+    Audio,
+    Image,
+    Video,
+    Other,
+}
+
+impl ArtifactMimeClass {
+    /// Minimum byte count required for an artifact of this class. Values
+    /// line up with the smallest sane outputs observed in production
+    /// skills (e.g. a MIDI-length audio clip, a 1x1 PNG metadata block).
+    pub fn min_bytes(self) -> u64 {
+        match self {
+            Self::Audio => 1024,
+            Self::Image => 512,
+            Self::Video => 8192,
+            Self::Other => 1,
+        }
+    }
+
+    /// Classify a path by its extension. Unknown or missing extensions fall
+    /// back to `Other` so skills that produce bespoke formats still pass a
+    /// non-empty check.
+    pub fn from_path(path: &Path) -> Self {
+        let Some(extension) = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+        else {
+            return Self::Other;
+        };
+        match extension.as_str() {
+            "wav" | "mp3" | "m4a" | "ogg" | "opus" | "flac" | "aac" => Self::Audio,
+            "png" | "jpg" | "jpeg" | "webp" => Self::Image,
+            "mp4" | "mov" | "webm" => Self::Video,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Validate reported artifacts against the MIME-class size contract.
+///
+/// Returns `Ok(())` when every artifact exists and satisfies its class's
+/// minimum size. The first failing artifact produces a structured error
+/// string with stable shape:
+///
+/// - `"Skill reported success but artifact '{path}' failed validation: missing"`
+/// - `"Skill reported success but artifact '{path}' failed validation: size_{N}_below_{M}"`
+///
+/// An empty slice passes through (no artifacts to check) — callers handle
+/// the "no artifacts" case separately via the contract layer.
+pub fn validate_spawn_only_artifacts(files: &[PathBuf]) -> Result<(), String> {
+    for path in files {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return Err(format!(
+                    "Skill reported success but artifact '{}' failed validation: missing",
+                    path.display()
+                ));
+            }
+        };
+        let class = ArtifactMimeClass::from_path(path);
+        let min_bytes = class.min_bytes();
+        let size = metadata.len();
+        if size < min_bytes {
+            return Err(format!(
+                "Skill reported success but artifact '{}' failed validation: size_{size}_below_{min_bytes}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for TaskSupervisor {
@@ -479,6 +562,35 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+        }
+    }
+
+    /// Mark a task as completed only if every reported artifact passes
+    /// MIME-class size validation. Otherwise mark the task failed with a
+    /// structured validation error. Tasks with an empty `output_files`
+    /// list pass through to the normal `mark_completed` path — the
+    /// "no artifacts" case is the workspace contract layer's concern.
+    ///
+    /// Returns `Ok(())` when the task transitions to `Completed`, or
+    /// `Err(reason)` when validation rejected the artifacts and the task
+    /// was transitioned to `Failed` instead. The error string matches the
+    /// value stored on the task's `error` field so callers can propagate
+    /// it verbatim into the session notification.
+    pub fn mark_completed_with_validation(
+        &self,
+        task_id: &str,
+        output_files: Vec<String>,
+    ) -> Result<(), String> {
+        let paths: Vec<PathBuf> = output_files.iter().map(PathBuf::from).collect();
+        match validate_spawn_only_artifacts(&paths) {
+            Ok(()) => {
+                self.mark_completed(task_id, output_files);
+                Ok(())
+            }
+            Err(error) => {
+                self.mark_failed(task_id, error.clone());
+                Err(error)
+            }
         }
     }
 
@@ -1207,5 +1319,143 @@ mod tests {
             Some(ChildSessionFailureAction::Escalate)
         );
         assert!(failed_task.child_joined_at.is_none());
+    }
+
+    #[test]
+    fn should_mark_task_failed_when_audio_artifact_below_1kb() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("voice.wav");
+        std::fs::write(&stub, vec![0u8; 44]).unwrap();
+
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("fm_tts", "call-1", None);
+        supervisor.mark_running(&id);
+
+        let result = supervisor
+            .mark_completed_with_validation(&id, vec![stub.to_string_lossy().to_string()]);
+
+        let error = result.expect_err("undersized audio must fail validation");
+        assert!(
+            error.contains("voice.wav"),
+            "error should mention the failing path: {error}"
+        );
+        assert!(
+            error.contains("size_44_below_1024"),
+            "error should carry structured size detail: {error}"
+        );
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Failed);
+        assert_eq!(task.error.as_deref(), Some(error.as_str()));
+    }
+
+    #[test]
+    fn should_accept_audio_artifact_at_or_above_1kb() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("voice.mp3");
+        std::fs::write(&clip, vec![0u8; 1024]).unwrap();
+
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("fm_tts", "call-2", None);
+        supervisor.mark_running(&id);
+
+        supervisor
+            .mark_completed_with_validation(&id, vec![clip.to_string_lossy().to_string()])
+            .expect("1KB audio should satisfy the contract");
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Completed);
+        assert!(task.error.is_none());
+    }
+
+    #[test]
+    fn should_mark_task_failed_when_artifact_path_is_missing() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("fm_tts", "call-3", None);
+        supervisor.mark_running(&id);
+
+        let result =
+            supervisor.mark_completed_with_validation(&id, vec!["/nonexistent/voice.wav".into()]);
+
+        let error = result.expect_err("missing artifact must fail validation");
+        assert!(error.contains("/nonexistent/voice.wav"));
+        assert!(error.contains("missing"));
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_deref(), Some(error.as_str()));
+    }
+
+    #[test]
+    fn should_preserve_completed_status_when_all_artifacts_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("clip.wav");
+        let image = dir.path().join("cover.png");
+        let video = dir.path().join("trailer.mp4");
+        let report = dir.path().join("summary.txt");
+        std::fs::write(&audio, vec![0u8; 2048]).unwrap();
+        std::fs::write(&image, vec![0u8; 1024]).unwrap();
+        std::fs::write(&video, vec![0u8; 16_384]).unwrap();
+        std::fs::write(&report, b"ok").unwrap();
+
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("bundle_generate", "call-4", None);
+        supervisor.mark_running(&id);
+
+        supervisor
+            .mark_completed_with_validation(
+                &id,
+                vec![
+                    audio.to_string_lossy().to_string(),
+                    image.to_string_lossy().to_string(),
+                    video.to_string_lossy().to_string(),
+                    report.to_string_lossy().to_string(),
+                ],
+            )
+            .expect("all class-compliant artifacts must pass");
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.output_files.len(), 4);
+    }
+
+    #[test]
+    fn should_treat_empty_file_list_as_completion() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("fm_tts", "call-5", None);
+        supervisor.mark_running(&id);
+
+        supervisor
+            .mark_completed_with_validation(&id, Vec::new())
+            .expect("empty file list should not trip validation");
+
+        let task = supervisor.get_task(&id).expect("task missing");
+        assert_eq!(task.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn artifact_mime_class_applies_min_bytes_per_class() {
+        assert_eq!(
+            ArtifactMimeClass::from_path(Path::new("out.WAV")).min_bytes(),
+            1024
+        );
+        assert_eq!(
+            ArtifactMimeClass::from_path(Path::new("out.png")).min_bytes(),
+            512
+        );
+        assert_eq!(
+            ArtifactMimeClass::from_path(Path::new("out.mp4")).min_bytes(),
+            8192
+        );
+        assert_eq!(
+            ArtifactMimeClass::from_path(Path::new("out.txt")).min_bytes(),
+            1
+        );
+        assert_eq!(
+            ArtifactMimeClass::from_path(Path::new("noext")).min_bytes(),
+            1
+        );
     }
 }

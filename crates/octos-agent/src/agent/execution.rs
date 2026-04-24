@@ -231,8 +231,31 @@ impl Agent {
                                             };
 
                                             if result_persisted {
-                                                bg_supervisor
-                                                    .mark_completed(&task_id, output_files.clone());
+                                                if let Err(validation_error) = bg_supervisor
+                                                    .mark_completed_with_validation(
+                                                        &task_id,
+                                                        output_files.clone(),
+                                                    )
+                                                {
+                                                    tracing::warn!(
+                                                        tool = %bg_name,
+                                                        files = ?output_files,
+                                                        error = %validation_error,
+                                                        "workspace contract satisfied but supervisor artifact validation rejected outputs"
+                                                    );
+                                                    if let Some(ref sender) = bg_sender {
+                                                        let _ = sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: format!(
+                                                                "✗ {} failed: {}",
+                                                                bg_name, validation_error
+                                                            ),
+                                                            kind: BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                        })
+                                                        .await;
+                                                    }
+                                                }
                                             } else {
                                                 let err_msg = format!(
                                                     "verified outputs for {} but failed to persist background result",
@@ -410,27 +433,59 @@ impl Agent {
                                                     .await;
                                                 }
                                             } else {
-                                                bg_supervisor
-                                                    .mark_completed(&task_id, sent_files.clone());
-                                                let file_info = format!(
-                                                    " ({})",
-                                                    sent_files
-                                                        .iter()
-                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✓ {} completed{}",
-                                                            bg_name, file_info
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                    })
-                                                    .await;
+                                                match bg_supervisor
+                                                    .mark_completed_with_validation(
+                                                        &task_id,
+                                                        sent_files.clone(),
+                                                    )
+                                                {
+                                                    Ok(()) => {
+                                                        let file_info = format!(
+                                                            " ({})",
+                                                            sent_files
+                                                                .iter()
+                                                                .map(|f| f
+                                                                    .rsplit('/')
+                                                                    .next()
+                                                                    .unwrap_or(f))
+                                                                .collect::<Vec<_>>()
+                                                                .join(", ")
+                                                        );
+                                                        if let Some(ref sender) = bg_sender {
+                                                            let _ = sender(BackgroundResultPayload {
+                                                                task_label: bg_name.clone(),
+                                                                content: format!(
+                                                                    "✓ {} completed{}",
+                                                                    bg_name, file_info
+                                                                ),
+                                                                kind:
+                                                                    BackgroundResultKind::Notification,
+                                                                media: vec![],
+                                                            })
+                                                            .await;
+                                                        }
+                                                    }
+                                                    Err(validation_error) => {
+                                                        tracing::warn!(
+                                                            tool = %bg_name,
+                                                            files = ?sent_files,
+                                                            error = %validation_error,
+                                                            "delivered outputs but supervisor artifact validation rejected them"
+                                                        );
+                                                        if let Some(ref sender) = bg_sender {
+                                                            let _ = sender(BackgroundResultPayload {
+                                                                task_label: bg_name.clone(),
+                                                                content: format!(
+                                                                    "✗ {} failed: {}",
+                                                                    bg_name, validation_error
+                                                                ),
+                                                                kind:
+                                                                    BackgroundResultKind::Notification,
+                                                                media: vec![],
+                                                            })
+                                                            .await;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
