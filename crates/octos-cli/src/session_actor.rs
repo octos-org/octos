@@ -1391,7 +1391,40 @@ impl ActorFactory {
         }
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
-        let session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        // M8.6: sanitize the loaded transcript. Dropping unresolved tool
+        // calls, orphan thinking, and whitespace-only messages here
+        // prevents the provider from 400-ing on the first request after a
+        // resume. `retry_state` and `workspace_root` are None for
+        // top-level sessions today — sub-agent workstreams will thread
+        // them in when M8.7 lands.
+        match session_handle.sanitize_loaded_messages(None, None) {
+            Ok((report, refs)) => {
+                if report.input_len != report.output_len
+                    || report.content_replacements_restored > 0
+                    || !report.warnings.is_empty()
+                {
+                    info!(
+                        session = %session_key,
+                        report = %report,
+                        "resume sanitize applied"
+                    );
+                }
+                // TODO(M8.4): after FileStateCache lands, populate its
+                // entries from `refs` when the cache is non-empty
+                // post-load. The hand-off point is right here — we have
+                // the session key, the sanitized transcript, and the
+                // list of content-replacement refs.
+                let _ = refs;
+            }
+            Err(error) => {
+                warn!(
+                    session = %session_key,
+                    error = %error,
+                    "resume sanitize refused — continuing with original transcript"
+                );
+            }
+        }
         let task_state_path = session_handle.task_state_path();
         let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);

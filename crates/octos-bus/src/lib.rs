@@ -11,6 +11,7 @@ pub mod file_handle;
 pub mod heartbeat;
 pub mod markdown_html;
 pub mod media;
+pub mod resume_policy;
 pub mod session;
 
 #[cfg(feature = "api")]
@@ -49,6 +50,12 @@ pub use cron_service::CronService;
 pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;
+pub use resume_policy::{
+    RESUME_MTIME_MARKER, ReplacementStateRef, ResumePolicy, RetryStateView, SanitizeError,
+    SanitizeOutcome, SessionSanitizeReport, filter_orphaned_thinking_only_messages,
+    filter_unresolved_tool_uses, filter_whitespace_only_assistant_messages,
+    reconstruct_content_replacement_state,
+};
 pub use session::{
     ActiveSessionStore, Session, SessionHandle, SessionListEntry, SessionManager,
     validate_topic_name,

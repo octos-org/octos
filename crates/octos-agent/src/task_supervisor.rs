@@ -651,6 +651,18 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
+            HarnessEventPayload::SessionSanitized { .. } => {
+                // Session-sanitize events are observability-only (M8.6).
+                // They fire once per resume and describe what the resume
+                // policy dropped — the task lifecycle is not affected; the
+                // session actor will subsequently drive normal
+                // Queued → Executing transitions as usual.
+                self.mark_runtime_state(
+                    task_id,
+                    snapshot.runtime_state,
+                    Some(runtime_detail.to_string()),
+                );
+            }
             HarnessEventPayload::Error { data } => {
                 // Structured error events are diagnostic — record them in the
                 // runtime detail but only transition to Failed when the
