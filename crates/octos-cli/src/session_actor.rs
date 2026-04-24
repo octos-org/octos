@@ -3954,13 +3954,15 @@ impl SessionActor {
                         display_content
                     };
 
-                    // If overflow was served while this task ran, prepend a
-                    // marker so the user knows this is a delayed result.
-                    let display_content = if overflow_served {
-                        format!("⬆️ Earlier task completed:\n\n{display_content}")
-                    } else {
-                        display_content
-                    };
+                    // The legacy "⬆️ Earlier task completed:" prefix was
+                    // dropped because users misread it — the wording sounded
+                    // like a stray prior reply when it actually meant "I
+                    // also processed your follow-up below in parallel." Tool
+                    // chips and the message timeline already convey that
+                    // without confusing boilerplate. The `overflow_served`
+                    // flag stays in scope so a future UI surface can render
+                    // a richer indicator if needed.
+                    let _ = overflow_served;
 
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
@@ -6716,6 +6718,104 @@ mod tests {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             "overflow outbound must flag history as persisted"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Regression: when the speculative path serves an overflow during a slow
+    /// primary, the primary turn's final assistant reply must NOT be wrapped
+    /// in the legacy "⬆️ Earlier task completed:" prefix. Users misread the
+    /// prefix as a stray prior reply when it actually meant "I also processed
+    /// your follow-up below in parallel" — so the prefix is gone and tool
+    /// chips / message timeline carry the same meaning unambiguously.
+    #[tokio::test]
+    async fn should_drop_earlier_task_completed_prefix_when_overflow_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("PRIMARY_REPLY_BODY_marker"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("OVERFLOW_REPLY_BODY_marker"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("name follow-up")).await.unwrap();
+
+        let mut replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Confirm both replies arrived (sanity for the overflow scenario).
+        assert!(
+            replies.len() >= 2,
+            "expected primary + overflow replies, got {}",
+            replies.len()
+        );
+
+        // No reply should carry the legacy prefix any longer.
+        for reply in &replies {
+            assert!(
+                !reply.content.contains("Earlier task completed"),
+                "legacy '⬆️ Earlier task completed:' prefix must be dropped, \
+                 but reply contained it: {}",
+                reply.content
+            );
+        }
+
+        // The primary reply must surface its body unchanged (no leading
+        // boilerplate that the user has to read past).
+        let primary = replies
+            .iter()
+            .find(|m| m.content.contains("PRIMARY_REPLY_BODY_marker"))
+            .expect("primary reply not found in collected outbound messages");
+        assert!(
+            primary.content.starts_with("PRIMARY_REPLY_BODY_marker"),
+            "primary reply must start with its own body (no prefix), got: {}",
+            primary.content
         );
 
         drop(tx);
