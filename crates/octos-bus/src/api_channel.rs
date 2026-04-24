@@ -840,7 +840,7 @@ impl Channel for ApiChannel {
                         }
                     }
                 }
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": "",
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
@@ -853,6 +853,13 @@ impl Channel for ApiChannel {
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
                     "has_bg_tasks": has_bg,
                 });
+                // M8.10-A: thread the committed session sequence into the done
+                // event so live-streamed bubbles on the web client can populate
+                // `historySeq`. Optional — omitted when persist failed or the
+                // metadata key was not provided (legacy/error paths).
+                if let Some(seq) = msg.metadata.get("committed_seq").and_then(|v| v.as_u64()) {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
                 let _ = tx.send(done.to_string());
                 pending.remove(&msg.chat_id);
                 drop(pending);
@@ -3057,6 +3064,86 @@ mod tests {
             rx.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn done_event_carries_committed_seq_when_message_persisted() {
+        // M8.10-A regression: the SSE `done` event must thread the committed
+        // session sequence back to the web client so live-streamed bubbles can
+        // populate `historySeq` and avoid floating to the end of the list.
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-seq".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-seq".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "committed_seq": 42,
+                "tokens_in": 10,
+                "tokens_out": 5,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert_eq!(parsed["committed_seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn done_event_omits_committed_seq_when_persist_failed_or_skipped() {
+        // M8.10-A: when the server has no committed seq (e.g. persist failed
+        // or is skipped), the done event must NOT include `committed_seq` so
+        // legacy/error-path behaviour is preserved.
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-noseq".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-noseq".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "tokens_in": 10,
+                "tokens_out": 5,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert!(
+            parsed.get("committed_seq").is_none() || parsed["committed_seq"].is_null(),
+            "committed_seq must be omitted when missing from metadata, got: {parsed}"
+        );
     }
 
     #[tokio::test]

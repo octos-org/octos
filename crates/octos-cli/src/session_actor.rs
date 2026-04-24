@@ -3770,7 +3770,7 @@ impl SessionActor {
                 );
             }
         }
-        let completion_meta = match &agent_result {
+        let mut completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
                 let provider_metadata = cr.provider_metadata.clone();
@@ -3827,6 +3827,7 @@ impl SessionActor {
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
+                let mut assistant_committed_seq: Option<u64> = None;
                 {
                     let mut handle = self.session_handle.lock().await;
                     let messages_to_save = if !conv_response.messages.is_empty()
@@ -3856,8 +3857,18 @@ impl SessionActor {
                             reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
-                        if let Err(e) = handle.add_message(assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                        // M8.10-A: capture the committed seq so the SSE `done`
+                        // event can thread it back to the web client. The
+                        // assistant timestamp is `Utc::now()` (newer than any
+                        // tool message) so the post-sort position matches the
+                        // append index returned here.
+                        match handle.add_message_with_seq(assistant_msg).await {
+                            Ok(seq) => {
+                                assistant_committed_seq = u64::try_from(seq).ok();
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                            }
                         }
                     }
 
@@ -3877,6 +3888,16 @@ impl SessionActor {
                     .await
                     {
                         warn!("session compaction failed: {e}");
+                    }
+                }
+
+                // M8.10-A: thread the committed assistant seq into the
+                // completion_meta so the SSE done event can carry it back to
+                // the web client. Live-streamed bubbles use this to populate
+                // their `historySeq` and stay in chronological order.
+                if let Some(seq) = assistant_committed_seq {
+                    if let Some(map) = completion_meta.as_object_mut() {
+                        map.insert("committed_seq".to_string(), serde_json::Value::from(seq));
                     }
                 }
 
@@ -7702,6 +7723,81 @@ mod tests {
             assert!(user_messages.contains(&"msg-b"));
             assert!(user_messages.contains(&"msg-c"));
         }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10-A: the primary-turn `_completion` OutboundMessage MUST carry
+    /// `committed_seq` so the API channel can thread it onto the SSE `done`
+    /// event. Without this, web clients can't populate `historySeq` on
+    /// live-streamed bubbles and they float to the end of the list.
+    #[tokio::test]
+    async fn primary_turn_completion_metadata_includes_committed_seq() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Single fast reply so the primary turn completes quickly and emits
+        // `_completion` metadata.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("primary turn reply"),
+            )],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let status_channel: Arc<dyn octos_bus::Channel> = Arc::new(FakeSseChannel::new("api"));
+        let (tx, mut rx, handle, _session_mgr) = setup_speculative_actor_with_indicator(
+            agent_llm,
+            vec![router_a, router_b],
+            status_channel,
+            "api",
+            &dir,
+        )
+        .await;
+
+        tx.send(make_inbound_api("hello", "api")).await.unwrap();
+
+        // Drain until we see the primary-turn `_completion` marker.
+        let mut completion: Option<OutboundMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if msg.metadata.get("_completion").is_some() {
+                        completion = Some(msg);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let completion =
+            completion.expect("expected a `_completion` OutboundMessage from primary turn");
+        let seq = completion
+            .metadata
+            .get("committed_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                panic!(
+                    "primary-turn _completion metadata must carry `committed_seq`; got {}",
+                    completion.metadata
+                )
+            });
+        // Seq is a position index — must point past the user message (seq 0).
+        assert!(
+            seq >= 1,
+            "committed_seq must reference the persisted assistant slot, got {seq}"
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
