@@ -29,9 +29,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use octos_bus::Channel;
 use octos_bus::api_channel::ApiChannel;
 use octos_bus::session::SessionManager;
-use octos_bus::Channel;
 use octos_core::OutboundMessage;
 use tokio::sync::Mutex;
 
@@ -56,20 +56,12 @@ fn test_sessions(dir: &std::path::Path) -> Arc<Mutex<SessionManager>> {
 async fn should_emit_session_result_metadata_for_overflow_reply() {
     let data_dir = tempfile::tempdir().unwrap();
     let sessions = test_sessions(data_dir.path());
-    let channel = ApiChannel::new(
-        8191,
-        None,
-        Arc::new(AtomicBool::new(false)),
-        sessions,
-        None,
-    );
+    let channel = ApiChannel::new(8191, None, Arc::new(AtomicBool::new(false)), sessions, None);
 
     // Subscribe a watcher BEFORE the overflow reply arrives — mimics the
     // web client's `GET /api/sessions/:id/events/stream` subscription that
     // is established when the JSON queued-ack comes back from POST /chat.
-    let mut watcher_rx = channel
-        .subscribe_watcher_for_tests("test-chat", None)
-        .await;
+    let mut watcher_rx = channel.subscribe_watcher_for_tests("test-chat", None).await;
 
     // The overflow reply carries the exact metadata shape that
     // `session_actor::serve_overflow` now emits.
@@ -101,13 +93,10 @@ async fn should_emit_session_result_metadata_for_overflow_reply() {
     // the overflow reply. This proves `_session_result` metadata causes
     // `ApiChannel::send` to route through `broadcast_session_event` even
     // when `pending` is empty.
-    let event_payload = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        watcher_rx.recv(),
-    )
-    .await
-    .expect("timed out waiting for session_result event on watcher")
-    .expect("watcher closed without event");
+    let event_payload = tokio::time::timeout(std::time::Duration::from_secs(2), watcher_rx.recv())
+        .await
+        .expect("timed out waiting for session_result event on watcher")
+        .expect("watcher closed without event");
 
     let event: serde_json::Value = serde_json::from_str(&event_payload).unwrap();
     assert_eq!(

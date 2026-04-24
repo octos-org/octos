@@ -5338,6 +5338,145 @@ mod tests {
         }
     }
 
+    /// Mock LLM provider that scripts a sequence of responses (like
+    /// `DelayedMockProvider`) AND emits a single `StreamChunk` through the
+    /// task-local `TASK_REPORTER` before returning each one. The stream
+    /// chunk drives the overflow's `stream_forwarder` to call
+    /// `channel.send_with_id`, so `stream_result.message_id` captures
+    /// whatever that channel returns — exercising the API-channel path
+    /// where `send_with_id` returns `Some("sse-{chat_id}")` and therefore
+    /// triggers the `already_streamed` guard in `serve_overflow`.
+    struct StreamingMockProvider {
+        responses: std::sync::Mutex<Vec<(Duration, String, ChatResponse)>>,
+        name: String,
+    }
+
+    impl StreamingMockProvider {
+        fn new(name: &str, responses: Vec<(Duration, String, ChatResponse)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let (delay, stream_chunk, response) = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Ok(ChatResponse {
+                        content: Some("(no more scripted responses)".into()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                        provider_index: None,
+                    });
+                }
+                responses.remove(0)
+            };
+            // Push a `StreamChunk` into the task-local reporter so the
+            // stream_forwarder sees it and calls `channel.send_with_id`.
+            // `try_with` fails open when no reporter is scoped (e.g. when
+            // called outside the overflow's TASK_REPORTER scope).
+            if !stream_chunk.is_empty() {
+                if let Ok(reporter) = octos_agent::TASK_REPORTER.try_with(|r| r.clone()) {
+                    reporter.report(octos_agent::ProgressEvent::StreamChunk {
+                        text: stream_chunk,
+                        iteration: 1,
+                    });
+                    // Give the stream_forwarder a chance to flush the chunk
+                    // through the channel (mimics real streaming latency).
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            Ok(response)
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    /// Mimics `ApiChannel::send_with_id`, which always returns
+    /// `Some("sse-{chat_id}")` so the stream forwarder switches to
+    /// `edit_message` for subsequent chunks. `edit_message` is a no-op
+    /// here — equivalent to `pending[chat_id]` having been removed after
+    /// the primary turn emitted its `_completion` marker. This setup
+    /// reproduces FA-12 defect C exactly: the forwarder believes content
+    /// was streamed (message_id is `Some`), but the web client's pending
+    /// SSE channel never received the chunks.
+    struct FakeSseChannel {
+        name: String,
+    }
+
+    impl FakeSseChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl octos_bus::Channel for FakeSseChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn start(
+            &self,
+            _inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+            // No-op: the real ApiChannel writes to `pending[chat_id]` which
+            // is removed when the primary turn emits `_completion`. We
+            // simulate the "pending is already gone" state by dropping
+            // everything silently.
+            Ok(())
+        }
+
+        async fn send_with_id(&self, msg: &OutboundMessage) -> eyre::Result<Option<String>> {
+            // Mirror ApiChannel::send_with_id exactly — always return
+            // Some("sse-{chat_id}"), flipping `stream_result.message_id`
+            // to Some and triggering the FA-12d defective branch.
+            Ok(Some(format!("sse-{}", msg.chat_id)))
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _new_content: &str,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        fn supports_edit(&self) -> bool {
+            true
+        }
+    }
+
     struct ErrorMockProvider {
         name: String,
         error: String,
@@ -5990,6 +6129,115 @@ mod tests {
         (inbox_tx, out_rx, handle, session_mgr)
     }
 
+    /// Variant of `setup_speculative_actor` that wires a real
+    /// `StatusComposer` backed by a caller-supplied `Channel`. Used by the
+    /// FA-12d regression test to route the overflow stream through a
+    /// channel whose `send_with_id` returns `Some("sse-{chat_id}")`, so
+    /// `stream_result.message_id.is_some()` evaluates to true.
+    async fn setup_speculative_actor_with_indicator(
+        agent_provider: Arc<dyn LlmProvider>,
+        router_providers: Vec<Arc<dyn LlmProvider>>,
+        status_channel: Arc<dyn octos_bus::Channel>,
+        reply_channel: &str,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-spec-api"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let router = Arc::new(
+            AdaptiveRouter::new(router_providers, &[], AdaptiveConfig::default())
+                .with_adaptive_config(AdaptiveMode::Hedge, false),
+        );
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let mut responsiveness = ResponsivenessObserver::new();
+        for _ in 0..5 {
+            responsiveness.record(Duration::from_millis(500));
+        }
+
+        // StatusComposer with our fake SSE channel — its `.channel()` is used
+        // by `run_stream_forwarder` to send/edit streaming chunks.
+        let status_indicator =
+            Arc::new(StatusComposer::new(status_channel, vec!["Thinking".into()]));
+
+        let session_key = SessionKey::new(reply_channel, "test-api-chat");
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: reply_channel.to_string(),
+            chat_id: "test-api-chat".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: Some(status_indicator),
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Speculative,
+            responsiveness,
+            adaptive_router: Some(router),
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Inbound helper that matches the fake SSE channel's chat_id.
+    fn make_inbound_api(content: &str, reply_channel: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: reply_channel.to_string(),
+                chat_id: "test-api-chat".to_string(),
+                sender_id: "user".to_string(),
+                content: content.to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: Some("client-msg-bravo".to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        }
+    }
+
     /// Core speculative overflow test:
     /// - Send a message that triggers a slow (3s) agent call
     /// - After 1s, send an overflow message
@@ -6383,6 +6631,204 @@ mod tests {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             "overflow outbound must flag history as persisted"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// FA-12d defect-C regression: when the overflow runs against an
+    /// `ApiChannel`-like transport (whose `send_with_id` always returns
+    /// `Some("sse-{chat_id}")`) and the stream forwarder has flushed at
+    /// least one chunk, the old code set `already_streamed = true` and
+    /// silently skipped the `_session_result` emission — leaving the web
+    /// client's Q2 bubble blank. The durable watchers fanout only fires
+    /// when `ApiChannel::send` sees `_session_result` metadata, so the
+    /// emission MUST happen regardless of `stream_result.message_id`.
+    ///
+    /// Guards the fix that decouples the durable metadata emission from
+    /// the user-facing content rendering: the `_session_result` fanout
+    /// always runs; only the outbound content body is suppressed when the
+    /// channel already streamed the reply inline.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_api_channel_overflow_when_already_streamed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent LLM: 5 fast warmups, slow (12s) primary, and a streaming
+        // overflow response. `StreamingMockProvider` pushes a `StreamChunk`
+        // into `TASK_REPORTER` before each response — on the overflow call
+        // that flows through `run_stream_forwarder` →
+        // `FakeSseChannel::send_with_id` → sets `message_id = Some(...)`,
+        // so `stream_result.message_id.is_some() == true` and the
+        // `already_streamed` branch is entered.
+        //
+        // `serve_overflow` invokes `agent.process_message_tracked` (NOT
+        // the adaptive router) for the overflow, so the agent's provider
+        // must emit the streaming chunk on the overflow call.
+        let agent_llm = Arc::new(StreamingMockProvider::new(
+            "agent-api",
+            vec![
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup1"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup2"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup3"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup4"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup5"),
+                ),
+                (
+                    Duration::from_secs(12),
+                    String::new(),
+                    make_response("slow primary answer"),
+                ),
+                (
+                    Duration::from_millis(300),
+                    "streaming chunk".into(),
+                    make_response("FA12d overflow BRAVO answer"),
+                ),
+            ],
+        ));
+
+        // AdaptiveRouter providers are unused by the overflow path
+        // (`serve_overflow` calls the agent directly) but the actor
+        // requires the router to be wired so speculative mode is enabled.
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let status_channel: Arc<dyn octos_bus::Channel> = Arc::new(FakeSseChannel::new("api"));
+        let (tx, mut rx, handle, _session_mgr) = setup_speculative_actor_with_indicator(
+            agent_llm,
+            vec![router_a, router_b],
+            status_channel,
+            "api",
+            &dir,
+        )
+        .await;
+
+        // Warmup loop to establish responsiveness baseline; drain replies
+        // from the channel as they come in (don't filter on content since
+        // the new fix may emit empty-content OutboundMessages alongside
+        // session_result metadata).
+        for i in 0..5 {
+            tx.send(make_inbound_api(&format!("warmup {i}"), "api"))
+                .await
+                .unwrap();
+            // Drain until we see a _completion marker or timeout.
+            let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(warmup_deadline, rx.recv()).await {
+                if msg.metadata.get("_completion").is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound_api("please run a big analysis", "api"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the next prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound_api("please answer FA-12d probe", "api"))
+            .await
+            .unwrap();
+
+        // Collect every OutboundMessage until we find one carrying the
+        // overflow's `_session_result` metadata, or we timeout.
+        let mut outbound_log: Vec<OutboundMessage> = Vec::new();
+        let mut overflow_emission: Option<OutboundMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let carries_overflow_session_result = msg
+                        .metadata
+                        .get("_session_result")
+                        .and_then(|sr| sr.get("content"))
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("FA12d") || s.contains("BRAVO"));
+                    outbound_log.push(msg.clone());
+                    if carries_overflow_session_result {
+                        overflow_emission = Some(msg);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let overflow = overflow_emission.unwrap_or_else(|| {
+            panic!(
+                "expected an overflow OutboundMessage carrying `_session_result` \
+                 metadata via watchers fanout, got {} messages: {:?}",
+                outbound_log.len(),
+                outbound_log
+                    .iter()
+                    .map(|m| format!("content={:?} metadata={}", m.content, m.metadata))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        let session_result = overflow
+            .metadata
+            .get("_session_result")
+            .expect("overflow must carry _session_result metadata");
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq, got {session_result}"
+        );
+        assert_eq!(
+            session_result
+                .get("response_to_client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("client-msg-bravo"),
+            "session_result must carry response_to_client_message_id so \
+             the web reducer can merge into the optimistic Q2 bubble"
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+        // When the channel already streamed the chunks (ApiChannel path),
+        // the durable emission omits the content body so non-API channels
+        // don't duplicate the bubble and the web doesn't double-render.
+        // The full reply is still captured inside `_session_result.content`.
+        assert!(
+            overflow.content.is_empty() || overflow.content == "FA12d overflow BRAVO answer",
+            "expected empty OR full-content body when already_streamed=true, got {:?}",
+            overflow.content
         );
 
         drop(tx);
