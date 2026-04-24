@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+/dist/
+/scripts/octos-bundle-*.tar.gz
 **/*.rs.bk
 /book/public/
 /book-zh/public/
