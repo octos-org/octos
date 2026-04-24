@@ -71,11 +71,7 @@ pub type TaskLifecycleCallbacks = Arc<dyn TaskLifecycleDispatcher + Send + Sync>
 /// steer a background task. Implemented by
 /// [`SessionTaskQueryStore`](crate::session_actor::SessionTaskQueryStore).
 pub trait TaskLifecycleDispatcher {
-    fn cancel(
-        &self,
-        task_id: &str,
-        reason: &str,
-    ) -> Result<serde_json::Value, (u16, String)>;
+    fn cancel(&self, task_id: &str, reason: &str) -> Result<serde_json::Value, (u16, String)>;
     fn relaunch(
         &self,
         task_id: &str,

@@ -812,12 +812,8 @@ impl SessionTaskQueryStore {
         match outcome {
             Some(Ok(json)) => Ok(json),
             Some(Err(err)) => match err {
-                octos_agent::CancelError::UnknownTask => {
-                    Err((404, format!("{err}")))
-                }
-                octos_agent::CancelError::AlreadyTerminal(_) => {
-                    Err((409, format!("{err}")))
-                }
+                octos_agent::CancelError::UnknownTask => Err((404, format!("{err}"))),
+                octos_agent::CancelError::AlreadyTerminal(_) => Err((409, format!("{err}"))),
             },
             None => Err((404, format!("unknown task: {task_id}"))),
         }
@@ -843,9 +839,7 @@ impl SessionTaskQueryStore {
             Some(Err(err)) => match err {
                 octos_agent::RelaunchError::UnknownTask => Err((404, format!("{err}"))),
                 octos_agent::RelaunchError::NoSpecSnapshot => Err((409, format!("{err}"))),
-                octos_agent::RelaunchError::InvalidOverrides => {
-                    Err((400, format!("{err}")))
-                }
+                octos_agent::RelaunchError::InvalidOverrides => Err((400, format!("{err}"))),
             },
             None => Err((404, format!("unknown task: {task_id}"))),
         }
@@ -874,16 +868,10 @@ impl SessionTaskQueryStore {
                 "sender": sender_label,
             })),
             Some(Err(err)) => match err {
-                octos_agent::SendToAgentError::UnknownTask => {
-                    Err((404, format!("{err}")))
-                }
+                octos_agent::SendToAgentError::UnknownTask => Err((404, format!("{err}"))),
                 octos_agent::SendToAgentError::NoInbox => Err((409, format!("{err}"))),
-                octos_agent::SendToAgentError::InboxClosed => {
-                    Err((410, format!("{err}")))
-                }
-                octos_agent::SendToAgentError::Terminal(_) => {
-                    Err((409, format!("{err}")))
-                }
+                octos_agent::SendToAgentError::InboxClosed => Err((410, format!("{err}"))),
+                octos_agent::SendToAgentError::Terminal(_) => Err((409, format!("{err}"))),
             },
             None => Err((404, format!("unknown task: {task_id}"))),
         }
@@ -899,11 +887,7 @@ fn sanitize_cancel_response(task_id: &str, reason: Option<&str>) -> serde_json::
 }
 
 impl crate::commands::gateway::adapters::TaskLifecycleDispatcher for SessionTaskQueryStore {
-    fn cancel(
-        &self,
-        task_id: &str,
-        reason: &str,
-    ) -> Result<serde_json::Value, (u16, String)> {
+    fn cancel(&self, task_id: &str, reason: &str) -> Result<serde_json::Value, (u16, String)> {
         SessionTaskQueryStore::cancel_task(self, task_id, reason)
     }
 

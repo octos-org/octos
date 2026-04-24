@@ -265,11 +265,9 @@ impl std::fmt::Display for CancelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownTask => write!(f, "unknown task id"),
-            Self::AlreadyTerminal(status) => write!(
-                f,
-                "task is already terminal (status={})",
-                status.as_str()
-            ),
+            Self::AlreadyTerminal(status) => {
+                write!(f, "task is already terminal (status={})", status.as_str())
+            }
         }
     }
 }
@@ -294,11 +292,9 @@ impl std::fmt::Display for SendToAgentError {
             Self::UnknownTask => write!(f, "unknown task id"),
             Self::NoInbox => write!(f, "task registered without a steering inbox"),
             Self::InboxClosed => write!(f, "task inbox receiver has been dropped"),
-            Self::Terminal(status) => write!(
-                f,
-                "task is already terminal (status={})",
-                status.as_str()
-            ),
+            Self::Terminal(status) => {
+                write!(f, "task is already terminal (status={})", status.as_str())
+            }
         }
     }
 }
@@ -410,10 +406,7 @@ fn merge_seed_overrides(base: Value, overrides: Value) -> Result<Value, Relaunch
             return Ok(Value::Object(
                 overrides
                     .into_iter()
-                    .chain(std::iter::once((
-                        "__previous_spec".to_string(),
-                        other,
-                    )))
+                    .chain(std::iter::once(("__previous_spec".to_string(), other)))
                     .collect(),
             ));
         }
@@ -1160,7 +1153,9 @@ impl TaskSupervisor {
         task_id: &str,
         message: InboxMessage,
     ) -> Result<(), SendToAgentError> {
-        let existing = self.get_task(task_id).ok_or(SendToAgentError::UnknownTask)?;
+        let existing = self
+            .get_task(task_id)
+            .ok_or(SendToAgentError::UnknownTask)?;
         if !existing.status.is_active() {
             return Err(SendToAgentError::Terminal(existing.status));
         }
@@ -2002,12 +1997,20 @@ mod tests {
         let mut lines = body.lines();
         let first = lines.next().expect("at least one line emitted");
         let parsed: serde_json::Value = serde_json::from_str(first).unwrap();
-        assert_eq!(parsed["schema"], crate::harness_events::HARNESS_EVENT_SCHEMA_V1);
+        assert_eq!(
+            parsed["schema"],
+            crate::harness_events::HARNESS_EVENT_SCHEMA_V1
+        );
         assert_eq!(parsed["kind"], "task.lifecycle.cancelled");
         assert_eq!(parsed["task_id"], id);
         assert_eq!(parsed["reason"], "kill please");
         assert_eq!(parsed["origin"], "operator");
-        assert!(parsed.get("relaunched_as").map(|v| v.is_null()).unwrap_or(true));
+        assert!(
+            parsed
+                .get("relaunched_as")
+                .map(|v| v.is_null())
+                .unwrap_or(true)
+        );
 
         rt.shutdown_background();
     }
@@ -2042,8 +2045,7 @@ mod tests {
         );
 
         let body = std::fs::read_to_string(&sink_path).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(parsed["origin"], "relaunch");
         assert_eq!(parsed["relaunched_as"], plan.new_task_id);
 
@@ -2057,12 +2059,8 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         supervisor.enable_persistence(&ledger_path).unwrap();
 
-        let id = supervisor.register_with_lineage(
-            "spawn",
-            "call-persist",
-            Some("api:session"),
-            None,
-        );
+        let id =
+            supervisor.register_with_lineage("spawn", "call-persist", Some("api:session"), None);
         supervisor.mark_running(&id);
         let spec = serde_json::json!({"task": "persisted", "seed": 42});
         {

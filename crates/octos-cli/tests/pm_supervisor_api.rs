@@ -22,10 +22,7 @@ fn session_key() -> SessionKey {
     SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "m79-cli", "default")
 }
 
-fn register_supervisor(
-    store: &SessionTaskQueryStore,
-    dir: &TempDir,
-) -> Arc<TaskSupervisor> {
+fn register_supervisor(store: &SessionTaskQueryStore, dir: &TempDir) -> Arc<TaskSupervisor> {
     let supervisor = Arc::new(TaskSupervisor::new());
     store.register(&session_key(), &supervisor, dir.path());
     supervisor
@@ -44,8 +41,7 @@ async fn should_cancel_task_via_dispatcher() {
     let dir = TempDir::new().unwrap();
     let store = SessionTaskQueryStore::default();
     let supervisor = register_supervisor(&store, &dir);
-    let task_id =
-        supervisor.register("spawn", "c1", Some(&session_key().to_string()));
+    let task_id = supervisor.register("spawn", "c1", Some(&session_key().to_string()));
     supervisor.mark_running(&task_id);
     let (abort, handle) = spawn_pending();
     supervisor.register_abort(&task_id, abort, None, None);
@@ -69,8 +65,7 @@ async fn should_relaunch_task_via_dispatcher() {
     let dir = TempDir::new().unwrap();
     let store = SessionTaskQueryStore::default();
     let supervisor = register_supervisor(&store, &dir);
-    let task_id =
-        supervisor.register("spawn", "c2", Some(&session_key().to_string()));
+    let task_id = supervisor.register("spawn", "c2", Some(&session_key().to_string()));
     supervisor.mark_running(&task_id);
     let (abort, _h) = spawn_pending();
     supervisor.register_abort(
@@ -96,8 +91,7 @@ async fn should_send_to_agent_via_dispatcher() {
     let dir = TempDir::new().unwrap();
     let store = SessionTaskQueryStore::default();
     let supervisor = register_supervisor(&store, &dir);
-    let task_id =
-        supervisor.register("spawn", "c3", Some(&session_key().to_string()));
+    let task_id = supervisor.register("spawn", "c3", Some(&session_key().to_string()));
     supervisor.mark_running(&task_id);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let inbox = SupervisorInbox::new(tx);

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use octos_agent::harness_events::HarnessEventPayload;
 use octos_agent::task_supervisor::{
-    CancelError, InboxMessage, RelaunchError, SendToAgentError, SupervisorInbox, TaskLifecycleState,
-    TaskStatus, TaskSupervisor,
+    CancelError, InboxMessage, RelaunchError, SendToAgentError, SupervisorInbox,
+    TaskLifecycleState, TaskStatus, TaskSupervisor,
 };
 use serde_json::json;
 
@@ -46,7 +46,10 @@ async fn should_cancel_running_task_and_emit_cancelled_event() {
     assert_eq!(task.lifecycle_state(), TaskLifecycleState::Cancelled);
     assert_eq!(task.cancellation_reason.as_deref(), Some("kill requested"));
     let join_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
-    assert!(matches!(join_result, Ok(Err(_))), "JoinHandle should be cancelled");
+    assert!(
+        matches!(join_result, Ok(Err(_))),
+        "JoinHandle should be cancelled"
+    );
 
     // Sink contains a typed event.
     let body = std::fs::read_to_string(&sink).unwrap();
@@ -80,7 +83,9 @@ async fn should_reject_double_cancel() {
     let (abort, _h) = spawn_pending_task();
     supervisor.register_abort(&id, abort, None, None);
     supervisor.cancel_task(&id, None).unwrap();
-    let err = supervisor.cancel_task(&id, None).expect_err("second cancel should fail");
+    let err = supervisor
+        .cancel_task(&id, None)
+        .expect_err("second cancel should fail");
     assert_eq!(err, CancelError::AlreadyTerminal(TaskStatus::Cancelled));
 }
 
@@ -129,7 +134,10 @@ async fn should_relaunch_cancelled_task_with_overrides() {
     let event: octos_agent::harness_events::HarnessEvent = serde_json::from_str(line).unwrap();
     if let HarnessEventPayload::TaskLifecycleCancelled { data } = event.payload {
         assert_eq!(data.origin, "relaunch");
-        assert_eq!(data.relaunched_as.as_deref(), Some(plan.new_task_id.as_str()));
+        assert_eq!(
+            data.relaunched_as.as_deref(),
+            Some(plan.new_task_id.as_str())
+        );
     } else {
         panic!("expected cancelled event");
     }
@@ -219,7 +227,9 @@ async fn should_carry_parent_task_id_through_relaunch_chain() {
     let (abort_a, _h_a) = spawn_pending_task();
     supervisor.register_abort(&a, abort_a, None, Some(json!({"task": "one"})));
 
-    let plan_b = supervisor.relaunch_task(&a, json!({"task": "two"})).unwrap();
+    let plan_b = supervisor
+        .relaunch_task(&a, json!({"task": "two"}))
+        .unwrap();
     supervisor.mark_running(&plan_b.new_task_id);
     let (abort_b, _h_b) = spawn_pending_task();
     // Re-register so the chain advances — the relaunch registers the task
@@ -235,7 +245,10 @@ async fn should_carry_parent_task_id_through_relaunch_chain() {
         .unwrap();
 
     let c = supervisor.get_task(&plan_c.new_task_id).unwrap();
-    assert_eq!(c.parent_task_id.as_deref(), Some(plan_b.new_task_id.as_str()));
+    assert_eq!(
+        c.parent_task_id.as_deref(),
+        Some(plan_b.new_task_id.as_str())
+    );
     let b = supervisor.get_task(&plan_b.new_task_id).unwrap();
     assert_eq!(b.parent_task_id.as_deref(), Some(a.as_str()));
     assert_eq!(b.status, TaskStatus::Cancelled);

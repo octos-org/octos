@@ -1942,9 +1942,8 @@ impl Tool for SpawnTool {
             // subagent loop (drained at the start of each turn) and
             // `inbox_tx` is handed to the supervisor so out-of-band callers
             // can steer the running task.
-            let (inbox_tx, inbox_rx) = tokio::sync::mpsc::unbounded_channel::<
-                crate::task_supervisor::InboxMessage,
-            >();
+            let (inbox_tx, inbox_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::task_supervisor::InboxMessage>();
             let supervisor_inbox = crate::task_supervisor::SupervisorInbox::new(inbox_tx);
             let spec_for_supervisor = spec_snapshot.clone();
             let tracked_task_id_for_handle = tracked_task_id.clone();
@@ -2590,9 +2589,10 @@ impl Tool for SpawnTool {
             // M7.9: attach the abort handle + steering inbox to the
             // supervisor entry so `cancel_task` / `send_to_agent` /
             // `relaunch_task` can reach this running background task.
-            if let (Some(sup), Some(tid)) =
-                (supervisor_for_handle.as_ref(), tracked_task_id_for_handle.as_ref())
-            {
+            if let (Some(sup), Some(tid)) = (
+                supervisor_for_handle.as_ref(),
+                tracked_task_id_for_handle.as_ref(),
+            ) {
                 sup.register_abort(
                     tid,
                     join.abort_handle(),

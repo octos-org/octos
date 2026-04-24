@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::commands::gateway::adapters::TaskLifecycleCallbacks;
 use crate::config::ChannelEntry;
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn register(
     channel_mgr: &mut ChannelManager,
     entry: &ChannelEntry,
@@ -48,11 +49,10 @@ pub fn register(
         let cancel_dispatcher = dispatcher.clone();
         let relaunch_dispatcher = dispatcher.clone();
         let send_dispatcher = dispatcher.clone();
-        let cancel_fn: Arc<octos_bus::TaskCancelFn> = Arc::new(
-            move |_session_key: &str, task_id: &str, reason: &str| {
+        let cancel_fn: Arc<octos_bus::TaskCancelFn> =
+            Arc::new(move |_session_key: &str, task_id: &str, reason: &str| {
                 cancel_dispatcher.cancel(task_id, reason)
-            },
-        );
+            });
         let relaunch_fn: Arc<octos_bus::TaskRelaunchFn> = Arc::new(
             move |_session_key: &str, task_id: &str, overrides: serde_json::Value| {
                 relaunch_dispatcher.relaunch(task_id, overrides)

@@ -50,19 +50,16 @@ pub type TaskLifecycleResult = Result<serde_json::Value, (u16, String)>;
 
 /// Callback for `DELETE /sessions/{id}/tasks/{task_id}`. The tuple is
 /// `(session_key, task_id, reason)`. Reason may be empty.
-pub type TaskCancelFn =
-    dyn Fn(&str, &str, &str) -> TaskLifecycleResult + Send + Sync;
+pub type TaskCancelFn = dyn Fn(&str, &str, &str) -> TaskLifecycleResult + Send + Sync;
 
 /// Callback for `POST /sessions/{id}/tasks/{task_id}/relaunch`. Receives
 /// the serialized seed-override patch (opaque JSON).
-pub type TaskRelaunchFn = dyn Fn(&str, &str, serde_json::Value) -> TaskLifecycleResult
-    + Send
-    + Sync;
+pub type TaskRelaunchFn =
+    dyn Fn(&str, &str, serde_json::Value) -> TaskLifecycleResult + Send + Sync;
 
 /// Callback for `POST /sessions/{id}/tasks/{task_id}/send`. Receives the
 /// message body + optional sender label.
-pub type TaskSendFn =
-    dyn Fn(&str, &str, &str, Option<&str>) -> TaskLifecycleResult + Send + Sync;
+pub type TaskSendFn = dyn Fn(&str, &str, &str, Option<&str>) -> TaskLifecycleResult + Send + Sync;
 
 const SSE_CHANNEL_CAPACITY: usize = 1024;
 
@@ -631,10 +628,7 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
             // PM supervisor endpoints (M7.9).
-            .route(
-                "/sessions/{id}/tasks/{task_id}",
-                delete(handle_cancel_task),
-            )
+            .route("/sessions/{id}/tasks/{task_id}", delete(handle_cancel_task))
             .route(
                 "/sessions/{id}/tasks/{task_id}/relaunch",
                 post(handle_relaunch_task),
@@ -2124,6 +2118,9 @@ mod tests {
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 sessions: test_sessions(),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2169,6 +2166,9 @@ mod tests {
                         { "id": "task-1", "tool_name": "run_pipeline", "status": "running" }
                     ])
                 })),
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2227,6 +2227,9 @@ mod tests {
                         serde_json::json!([])
                     }
                 })),
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2667,6 +2670,9 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            task_send: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -2732,6 +2738,9 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            task_send: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -2951,6 +2960,9 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            task_send: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -2995,6 +3007,9 @@ mod tests {
                     }
                 ])
             })),
+            task_cancel: None,
+            task_relaunch: None,
+            task_send: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3652,6 +3667,9 @@ mod tests {
                 sessions,
                 profile_id: Some("dspfac".into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3716,6 +3734,9 @@ mod tests {
                 sessions,
                 profile_id: Some("dspfac".into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3775,6 +3796,9 @@ mod tests {
                 sessions,
                 profile_id: Some(TEST_PROFILE_ID.into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3836,6 +3860,9 @@ mod tests {
                 sessions,
                 profile_id: Some(TEST_PROFILE_ID.into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3885,6 +3912,9 @@ mod tests {
                 sessions: sessions.clone(),
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3930,6 +3960,9 @@ mod tests {
                 sessions: sessions.clone(),
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                task_send: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
