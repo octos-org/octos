@@ -172,6 +172,11 @@ pub struct Agent {
     /// Workspace policy associated with the compaction runner (used by the
     /// post-compaction validator rail to resolve preserved artifacts).
     pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// M8.2 agent manifest registry shared with tools via `ToolContext`.
+    /// Shared behind an `Arc` so every per-tool `ToolContext::agent_definitions`
+    /// clone is O(1). When left at the default (empty registry) the agent
+    /// behaves exactly as pre-M8.2.
+    pub(super) agent_definitions: Arc<crate::agents::AgentDefinitions>,
 }
 
 impl Agent {
@@ -202,6 +207,7 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
         }
     }
 
@@ -233,7 +239,18 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
         }
+    }
+
+    /// Attach an [`crate::agents::AgentDefinitions`] registry. Threaded into
+    /// every per-tool [`crate::tools::ToolContext`] so tools that read
+    /// `ctx.agent_definitions` see the live registry instead of the M8.1
+    /// zero-value default. Idempotent — callers may swap the registry at
+    /// any time.
+    pub fn with_agent_definitions(mut self, defs: Arc<crate::agents::AgentDefinitions>) -> Self {
+        self.agent_definitions = defs;
+        self
     }
 
     /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
