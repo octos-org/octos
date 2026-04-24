@@ -142,6 +142,10 @@ pub struct BackgroundTask {
     /// Session that owns this task (for per-session filtering).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+    /// Original tool arguments — preserved so failure-recovery flows can
+    /// surface the exact input the LLM passed when offering alternatives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<Value>,
 }
 
 impl BackgroundTask {
@@ -167,6 +171,66 @@ impl BackgroundTask {
 
 /// Callback invoked when a task's status changes.
 type OnChangeCallback = Box<dyn Fn(&BackgroundTask) + Send + Sync>;
+
+/// Payload emitted when a `spawn_only` background task transitions to
+/// `Failed`. Consumers (e.g. the session actor) use this to schedule a
+/// synthetic recovery turn so the LLM can re-engage with an actionable
+/// error and offer alternatives instead of leaving the user stuck on a
+/// terminal-only failure notification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnOnlyFailureSignal {
+    /// Background task identifier (matches `BackgroundTask::id`).
+    pub task_id: String,
+    /// Tool that failed (e.g. `fm_tts`).
+    pub tool_name: String,
+    /// The original tool arguments passed by the LLM when invoking the tool.
+    /// May be `Value::Null` if the input was not captured for this task.
+    pub tool_input: Value,
+    /// The textual error reported by the tool, contract validator, or wrapper.
+    pub error_message: String,
+    /// Best-effort list of alternatives extracted from the error text via the
+    /// `available: X, Y, Z` pattern. Empty when no alternatives were detected.
+    pub suggested_alternatives: Vec<String>,
+    /// Owning session, when the failed task is bound to one.
+    pub parent_session_key: Option<String>,
+}
+
+/// Callback invoked when a `spawn_only` task fails. Receives the structured
+/// signal payload so consumers can build a recovery prompt without re-parsing
+/// the raw `BackgroundTask`.
+type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
+
+/// Extract a list of alternatives from a tool error message using the simple
+/// `available: X, Y, Z` pattern. Returns an empty vector when no match is
+/// found so callers can fall back to surfacing the raw error text.
+///
+/// This is intentionally conservative — we only handle the canonical
+/// "available: ..." phrasing emitted by the fm_tts/voice-skill family. More
+/// aggressive parsing belongs in the failure-modes inventory follow-up.
+pub fn parse_alternatives(error_text: &str) -> Vec<String> {
+    // Use a literal scan rather than a regex so we don't pull in a fresh
+    // dependency or risk pathological backtracking. The marker is
+    // case-insensitive and matched anywhere in the message.
+    let needle = "available:";
+    let lower = error_text.to_lowercase();
+    let Some(start) = lower.find(needle) else {
+        return Vec::new();
+    };
+    let tail = &error_text[start + needle.len()..];
+
+    // Stop at the first sentence boundary so we don't grab the entire
+    // remainder of the error message. Newlines and periods both terminate
+    // the alternatives clause.
+    let stop = tail.find(['\n', '.', ';']).unwrap_or(tail.len());
+    let clause = &tail[..stop];
+
+    clause
+        .split(',')
+        .map(|item| item.trim().trim_matches(['"', '\'']))
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedTaskRecord {
@@ -567,6 +631,7 @@ impl std::fmt::Debug for TaskSupervisor {
         f.debug_struct("TaskSupervisor")
             .field("tasks", &self.tasks)
             .field("on_change", &"<callback>")
+            .field("on_failure", &"<callback>")
             .field(
                 "persistence_path",
                 &self
@@ -587,6 +652,7 @@ impl std::fmt::Debug for TaskSupervisor {
 pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
+    on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
@@ -602,6 +668,7 @@ impl TaskSupervisor {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             on_change: Arc::new(Mutex::new(None)),
+            on_failure: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
         }
     }
@@ -656,6 +723,19 @@ impl TaskSupervisor {
         *guard = Some(Box::new(cb));
     }
 
+    /// Set a callback that fires only when a `spawn_only` task transitions to
+    /// `Failed`. This is the M8.9 hook the session actor uses to enqueue a
+    /// synthetic recovery turn. The callback is only invoked once per failed
+    /// task — re-marking a task as failed (or any subsequent state change)
+    /// will not re-fire the signal.
+    pub fn set_on_failure_signal(
+        &self,
+        cb: impl Fn(&SpawnOnlyFailureSignal) + Send + Sync + 'static,
+    ) {
+        let mut guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Box::new(cb));
+    }
+
     /// Register a new background task. Returns the generated task ID.
     pub fn register(
         &self,
@@ -673,6 +753,30 @@ impl TaskSupervisor {
         tool_call_id: &str,
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
+    ) -> String {
+        self.register_full(tool_name, tool_call_id, session_key, task_ledger_path, None)
+    }
+
+    /// Register a new background task with optional ledger-path lineage and
+    /// the original tool input. The tool input is preserved so failure
+    /// signals can include it without re-walking the message history.
+    pub fn register_with_input(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        tool_input: Option<Value>,
+    ) -> String {
+        self.register_full(tool_name, tool_call_id, session_key, None, tool_input)
+    }
+
+    fn register_full(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        tool_input: Option<Value>,
     ) -> String {
         let id = TaskId::new().to_string();
         let derived_child_session_key = session_key.map(|parent| format!("{parent}#child-{id}"));
@@ -702,6 +806,7 @@ impl TaskSupervisor {
             output_files: Vec::new(),
             error: None,
             session_key: session_key.map(|s| s.to_string()),
+            tool_input,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(id.clone(), task);
@@ -716,6 +821,16 @@ impl TaskSupervisor {
             },
         );
         id
+    }
+
+    /// Attach (or replace) the tool input for an already-registered task.
+    /// Useful when the task is registered eagerly and the args become
+    /// available later in the spawn pipeline.
+    pub fn set_tool_input(&self, task_id: &str, tool_input: Value) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(task) = tasks.get_mut(task_id) {
+            task.tool_input = Some(tool_input);
+        }
     }
 
     /// Mark a task as running.
@@ -828,24 +943,55 @@ impl TaskSupervisor {
     }
 
     /// Mark a task as failed with an error message.
+    ///
+    /// On the FIRST transition from a non-`Failed` status to `Failed`, also
+    /// emits a `SpawnOnlyFailureSignal` so listeners (e.g. the session
+    /// actor) can schedule a recovery turn. Re-marking an already-failed
+    /// task is a no-op for the failure signal — this guarantees at most one
+    /// recovery attempt per task even if multiple paths report the failure.
     pub fn mark_failed(&self, task_id: &str, error: String) {
-        let snapshot = {
+        let (snapshot, was_already_failed) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                let already_failed = task.status == TaskStatus::Failed;
                 task.status = TaskStatus::Failed;
                 task.runtime_state = TaskRuntimeState::Failed;
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error);
-                Some(task.clone())
+                (Some(task.clone()), already_failed)
             } else {
-                None
+                (None, false)
             }
         };
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            if !was_already_failed {
+                self.notify_failure(task);
+            }
         }
+    }
+
+    /// Emit a `SpawnOnlyFailureSignal` for a freshly-failed task, if a
+    /// failure callback has been registered. The error_message is taken
+    /// from the task's `error` field (set immediately before this call).
+    fn notify_failure(&self, task: &BackgroundTask) {
+        let guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cb) = guard.as_ref() else {
+            return;
+        };
+        let error_message = task.error.clone().unwrap_or_default();
+        let suggested_alternatives = parse_alternatives(&error_message);
+        let signal = SpawnOnlyFailureSignal {
+            task_id: task.id.clone(),
+            tool_name: task.tool_name.clone(),
+            tool_input: task.tool_input.clone().unwrap_or(Value::Null),
+            error_message,
+            suggested_alternatives,
+            parent_session_key: task.parent_session_key.clone(),
+        };
+        cb(&signal);
     }
 
     /// Record the child-session contract outcome for a task.
@@ -1784,6 +1930,197 @@ mod tests {
         );
     }
 
+    // ── M8.9: spawn_only failure recovery signals ───────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+
+    fn collect_failure_signals(
+        supervisor: &TaskSupervisor,
+    ) -> Arc<StdMutex<Vec<SpawnOnlyFailureSignal>>> {
+        let collected = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&collected);
+        supervisor.set_on_failure_signal(move |signal| {
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(signal.clone());
+        });
+        collected
+    }
+
+    #[test]
+    fn should_emit_failure_signal_when_spawn_only_task_status_becomes_failed() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register_with_input(
+            "fm_tts",
+            "call-1",
+            Some("api:session"),
+            Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(
+            &task_id,
+            "voice 'yangmi' not registered. available: vivian, serena, longxiang".to_string(),
+        );
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1, "expected exactly one failure signal");
+        let signal = &signals[0];
+        assert_eq!(signal.task_id, task_id);
+        assert_eq!(signal.tool_name, "fm_tts");
+        assert_eq!(signal.parent_session_key.as_deref(), Some("api:session"));
+        assert!(
+            signal
+                .error_message
+                .contains("voice 'yangmi' not registered")
+        );
+        assert_eq!(
+            signal.suggested_alternatives,
+            vec![
+                "vivian".to_string(),
+                "serena".to_string(),
+                "longxiang".to_string()
+            ]
+        );
+        assert_eq!(signal.tool_input["voice"], "yangmi");
+    }
+
+    #[test]
+    fn should_not_emit_signal_on_successful_completion() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-2", None);
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec!["/tmp/out.mp3".to_string()]);
+
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "completion must not emit failure signal"
+        );
+    }
+
+    #[test]
+    fn should_not_emit_signal_on_transient_running_state() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-3", None);
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".into()),
+        );
+
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "transient state changes must not emit failure signal"
+        );
+    }
+
+    #[test]
+    fn should_only_emit_failure_signal_once_per_task() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-4", None);
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "first failure".to_string());
+        // re-marking should NOT re-fire the signal — guards against runaway
+        // recovery loops if multiple paths report the same failure.
+        supervisor.mark_failed(&task_id, "second failure".to_string());
+        supervisor.mark_failed(&task_id, "third failure".to_string());
+
+        assert_eq!(
+            collected.lock().unwrap().len(),
+            1,
+            "subsequent failures must not re-fire the signal"
+        );
+    }
+
+    #[test]
+    fn should_capture_tool_input_in_failure_signal() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let input = serde_json::json!({
+            "voice": "yangmi",
+            "text": "hello world",
+            "format": "mp3",
+        });
+        let task_id = supervisor.register_with_input("fm_tts", "call-5", None, Some(input.clone()));
+        supervisor.mark_failed(&task_id, "internal error".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].tool_input, input);
+    }
+
+    #[test]
+    fn parse_alternatives_handles_canonical_pattern() {
+        let alts = parse_alternatives(
+            "voice 'yangmi' not registered. available: vivian, serena, longxiang.",
+        );
+        assert_eq!(alts, vec!["vivian", "serena", "longxiang"]);
+    }
+
+    #[test]
+    fn parse_alternatives_returns_empty_when_no_marker() {
+        let alts = parse_alternatives("connection refused after 3 retries");
+        assert!(alts.is_empty());
+    }
+
+    #[test]
+    fn parse_alternatives_strips_quotes_and_whitespace() {
+        let alts = parse_alternatives(r#"available: "alice", 'bob' , charlie"#);
+        assert_eq!(alts, vec!["alice", "bob", "charlie"]);
+    }
+
+    #[test]
+    fn should_set_tool_input_after_registration() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-6", None);
+        supervisor.set_tool_input(&task_id, serde_json::json!({"voice": "yangmi"}));
+        supervisor.mark_failed(&task_id, "voice missing".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].tool_input["voice"], "yangmi");
+    }
+
+    #[test]
+    fn should_not_enqueue_second_recovery_for_same_task_id() {
+        // Spec-named alias of should_only_emit_failure_signal_once_per_task —
+        // codifies that the supervisor-level dedup is what guarantees the
+        // session actor never sees a second hint for the same task id.
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-dedup", None);
+        supervisor.mark_failed(&task_id, "first".to_string());
+        supervisor.mark_failed(&task_id, "second".to_string());
+        assert_eq!(collected.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn should_include_parsed_alternatives_from_error_text() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-alts", None);
+        supervisor.mark_failed(
+            &task_id,
+            "voice missing. available: vivian, serena, longxiang.".to_string(),
+        );
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals[0].suggested_alternatives,
+            vec![
+                "vivian".to_string(),
+                "serena".to_string(),
+                "longxiang".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn should_accept_valid_wav_with_real_audio() {
         let dir = tempfile::tempdir().unwrap();
@@ -1904,5 +2241,34 @@ mod tests {
         std::fs::write(&clip, build_flac(2048)).unwrap();
 
         validate_spawn_only_artifacts(&[clip]).expect("fLaC magic must pass");
+    }
+
+    #[test]
+    fn should_include_tool_name_and_input_in_recovery_prompt() {
+        // Asserts the supervisor exposes both the tool name and the input
+        // on the SpawnOnlyFailureSignal so the session actor can build the
+        // recovery prompt without re-walking the message history.
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let input = serde_json::json!({"voice": "yangmi", "text": "hello"});
+        let task_id =
+            supervisor.register_with_input("fm_tts", "call-prompt", None, Some(input.clone()));
+        supervisor.mark_failed(&task_id, "voice missing".to_string());
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].tool_name, "fm_tts");
+        assert_eq!(signals[0].tool_input, input);
+    }
+
+    #[test]
+    fn should_emit_failure_signal_with_null_tool_input_when_unset() {
+        let supervisor = TaskSupervisor::new();
+        let collected = collect_failure_signals(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-7", None);
+        supervisor.mark_failed(&task_id, "boom".to_string());
+
+        let signals = collected.lock().unwrap().clone();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].tool_input, Value::Null);
     }
 }

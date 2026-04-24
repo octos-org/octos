@@ -163,7 +163,11 @@ impl Agent {
                         let bg_args = effective_args.clone();
                         let bg_sender = tools.background_result_sender();
                         let bg_tc_id = tc_id.clone();
-                        let task_id = tools.register_task(&tc_name, &tc_id);
+                        let task_id = tools.register_task_with_input(
+                            &tc_name,
+                            &tc_id,
+                            Some(effective_args.clone()),
+                        );
                         tools.mark_spawn_only_invoked();
                         let bg_supervisor = tools.supervisor();
                         let bg_reporter = reporter.clone();

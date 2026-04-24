@@ -866,6 +866,40 @@ async fn dispatch_background_result_to_actor(
     }
 }
 
+/// Build the synthetic `[system-internal]` recovery prompt that the
+/// session actor enqueues when a `spawn_only` task transitions to
+/// `Failed` (M8.9). The prompt frames the failure for the LLM and asks
+/// it to offer a path forward — alternatives parsed from the error, or
+/// a safer fallback the model can attempt itself.
+pub(crate) fn build_recovery_prompt(signal: &octos_agent::SpawnOnlyFailureSignal) -> String {
+    let alternatives_block = if signal.suggested_alternatives.is_empty() {
+        String::new()
+    } else {
+        let list = signal
+            .suggested_alternatives
+            .iter()
+            .map(|alt| format!("- {alt}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\nDetected alternatives:\n{list}\n")
+    };
+    let input_block = if signal.tool_input.is_null() {
+        String::new()
+    } else {
+        let pretty = serde_json::to_string(&signal.tool_input).unwrap_or_else(|_| "{}".into());
+        format!("\nOriginal input: {pretty}")
+    };
+    format!(
+        "[system-internal] Your previous `{tool}` call failed.\n\
+         Error: {err}{input}{alts}\n\
+         Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
+        tool = signal.tool_name,
+        err = signal.error_message,
+        input = input_block,
+        alts = alternatives_block,
+    )
+}
+
 fn git_turn_summary(content: &str) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
@@ -1070,6 +1104,18 @@ pub enum ActorMessage {
     TaskStatusChanged {
         /// Serialized JSON of the BackgroundTask.
         task_json: String,
+    },
+    /// Synthetic recovery turn enqueued by the spawn_only failure-signal
+    /// callback (M8.9). Drives the LLM to re-engage on a failed background
+    /// task with the actionable error and (optionally parsed) alternatives.
+    RecoveryHint {
+        /// Task ID that triggered the recovery (used for de-duplication).
+        task_id: String,
+        /// Tool that failed — surfaced verbatim in the synthetic prompt.
+        tool_name: String,
+        /// Best-effort prompt body. Already framed as `[system-internal]` so
+        /// the LLM treats it as runtime guidance, not a user turn.
+        prompt: String,
     },
     /// Cancel the current operation.
     Cancel,
@@ -1709,6 +1755,21 @@ impl ActorFactory {
             }
         });
 
+        // Wire supervisor on_failure_signal callback (M8.9): when a
+        // spawn_only task transitions to Failed, enqueue a synthetic
+        // recovery turn so the LLM can offer alternatives or take a
+        // recovery action instead of leaving the user with only a
+        // terminal failure notification.
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+            });
+        });
+
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
                 cron_service.clone(),
@@ -1931,6 +1992,7 @@ impl ActorFactory {
             cron_tool: cron_tool_ref,
             persistent_retry_state,
             retry_state_path: Some(retry_state_path),
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -2105,6 +2167,10 @@ struct SessionActor {
     /// the in-memory state still accumulates within this actor's lifetime
     /// but is not durable across process restarts.
     retry_state_path: Option<std::path::PathBuf>,
+    /// Set of `task_id`s that have already triggered an automatic recovery
+    /// turn (M8.9). Caps recovery at one attempt per task so a recovery
+    /// turn that itself fails cannot ignite a runaway loop.
+    recovered_tasks: Arc<StdMutex<std::collections::HashSet<String>>>,
 }
 
 impl SessionActor {
@@ -2191,6 +2257,35 @@ impl SessionActor {
             .get_active_topic(base_key)
             .to_string();
         my_topic == active_topic
+    }
+
+    /// Reserve a recovery slot for a task. Returns `true` if this is the
+    /// first recovery for the given task ID and the caller should proceed,
+    /// `false` if a recovery has already been triggered (and the second
+    /// signal should be dropped). Cap is one recovery attempt per task —
+    /// see M8.9.
+    fn claim_recovery_slot(&self, task_id: &str) -> bool {
+        let mut guard = self
+            .recovered_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(task_id.to_string())
+    }
+
+    /// Build a synthetic `InboundMessage` carrying the recovery prompt so
+    /// the existing inbound pipeline (history persistence, agent loop)
+    /// runs unchanged.
+    fn synthetic_recovery_inbound(&self, prompt: String) -> InboundMessage {
+        InboundMessage {
+            channel: self.channel.clone(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: self.chat_id.clone(),
+            content: prompt,
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({ "_recovery_turn": true }),
+            message_id: None,
+        }
     }
 
     async fn run(mut self) {
@@ -2322,6 +2417,41 @@ impl SessionActor {
                                     "_task_status": task_json
                                 }),
                             }).await;
+                        }
+                        Some(ActorMessage::RecoveryHint {
+                            task_id,
+                            tool_name,
+                            prompt,
+                        }) => {
+                            // Cap recovery at one attempt per task to avoid
+                            // runaway loops if the recovery turn itself
+                            // fails. Subsequent failures from the same task
+                            // ID are silently dropped here.
+                            if !self.claim_recovery_slot(&task_id) {
+                                debug!(
+                                    session = %self.session_key,
+                                    task_id,
+                                    tool_name,
+                                    "skipping duplicate recovery hint"
+                                );
+                                continue;
+                            }
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "enqueueing synthetic recovery turn"
+                            );
+                            let synthetic = self.synthetic_recovery_inbound(prompt);
+                            let final_attachment_media = self
+                                .copy_media_to_workspace(Vec::new());
+                            self.process_inbound(
+                                synthetic,
+                                Vec::new(),
+                                final_attachment_media,
+                                None,
+                            )
+                            .await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -2905,6 +3035,21 @@ impl SessionActor {
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
+                        Ok(ActorMessage::RecoveryHint {
+                            task_id, tool_name, ..
+                        }) => {
+                            // Drain context: a turn is already running. The
+                            // claim guarantees we won't try to recover this
+                            // task again later. Trace and drop — the LLM
+                            // will see the failure via TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint received during drain"
+                            );
+                            self.claim_recovery_slot(&task_id);
+                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -2966,6 +3111,21 @@ impl SessionActor {
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
+                        }
+                        Ok(ActorMessage::RecoveryHint {
+                            task_id, tool_name, ..
+                        }) => {
+                            // Drain context: a turn is already running. The
+                            // claim guarantees we won't try to recover this
+                            // task again later. Trace and drop — the LLM
+                            // will see the failure via TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint received during drain"
+                            );
+                            self.claim_recovery_slot(&task_id);
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -3638,6 +3798,20 @@ impl SessionActor {
                                     "_task_status": task_json
                                 }),
                             }).await;
+                        }
+                        Some(ActorMessage::RecoveryHint { task_id, tool_name, .. }) => {
+                            // Speculative-overflow context: the primary
+                            // turn is already running. Reserve the slot
+                            // (so we don't try again later) and drop the
+                            // hint — the failure will be visible via
+                            // TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint during speculative overflow"
+                            );
+                            self.claim_recovery_slot(&task_id);
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -5752,6 +5926,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5822,6 +5997,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5898,6 +6074,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -6021,6 +6198,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -6140,6 +6318,7 @@ mod tests {
             cron_tool: Some(cron_tool),
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -6231,6 +6410,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -6321,6 +6501,7 @@ mod tests {
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -8668,5 +8849,278 @@ mod tests {
             elapsed.as_millis()
         );
         assert_eq!(snapshot.len(), 2);
+    }
+
+    // ── M8.9: Runtime failure recovery ─────────────────────────────────────
+
+    #[test]
+    fn recovery_prompt_includes_tool_name_and_error() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-1".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi"}),
+            error_message: "voice 'yangmi' not registered".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: Some("api:test".into()),
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.starts_with("[system-internal]"));
+        assert!(prompt.contains("fm_tts"));
+        assert!(prompt.contains("voice 'yangmi' not registered"));
+        assert!(prompt.contains("path forward"));
+    }
+
+    #[test]
+    fn recovery_prompt_includes_alternatives_block_when_present() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-2".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::Value::Null,
+            error_message: "voice missing".into(),
+            suggested_alternatives: vec!["vivian".into(), "serena".into(), "longxiang".into()],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.contains("Detected alternatives"));
+        assert!(prompt.contains("- vivian"));
+        assert!(prompt.contains("- serena"));
+        assert!(prompt.contains("- longxiang"));
+    }
+
+    #[test]
+    fn recovery_prompt_omits_alternatives_block_when_empty() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-3".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::Value::Null,
+            error_message: "internal error".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(!prompt.contains("Detected alternatives"));
+    }
+
+    #[test]
+    fn recovery_prompt_includes_tool_input_when_set() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-4".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi", "text": "hello"}),
+            error_message: "voice missing".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.contains("Original input"));
+        assert!(prompt.contains("yangmi"));
+    }
+
+    #[tokio::test]
+    async fn should_enqueue_synthetic_recovery_turn_with_error_message() {
+        // End-to-end: a RecoveryHint pushed onto the inbox should drive a
+        // primary turn whose user/system content includes the recovery
+        // prompt, so the LLM (mock here) sees and responds to it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("acknowledging recovery"),
+            )],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm.clone(), QueueMode::Followup, None, false, &dir).await;
+
+        let prompt = build_recovery_prompt(&octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-rh-1".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi"}),
+            error_message: "voice 'yangmi' not registered. available: vivian, serena.".into(),
+            suggested_alternatives: vec!["vivian".into(), "serena".into()],
+            parent_session_key: Some("cli:test".into()),
+        });
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-rh-1".into(),
+            tool_name: "fm_tts".into(),
+            prompt,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.len() >= 1 {
+                break;
+            }
+        }
+        assert!(
+            responses
+                .iter()
+                .any(|c| c.contains("acknowledging recovery")),
+            "expected LLM to produce recovery response, got: {:?}",
+            responses
+        );
+
+        // Verify the synthetic recovery prompt actually landed in history.
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let recovery_user_msgs: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::User
+                    && m.content.contains("[system-internal]")
+                    && m.content.contains("fm_tts")
+            })
+            .collect();
+        assert_eq!(
+            recovery_user_msgs.len(),
+            1,
+            "expected exactly one recovery prompt in history, got: {:?}",
+            session.messages
+        );
+        assert!(
+            recovery_user_msgs[0].content.contains("vivian"),
+            "recovery prompt should include parsed alternatives"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn should_not_enqueue_second_recovery_for_same_task_id() {
+        // Two RecoveryHints for the same task_id — only the first should
+        // produce a recovery turn. The second is silently dropped via the
+        // recovered_tasks claim slot.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(50), make_response("first recovery")),
+                (Duration::from_millis(50), make_response("second recovery")),
+            ],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let prompt1 = "[system-internal] first recovery prompt".to_string();
+        let prompt2 = "[system-internal] second recovery prompt".to_string();
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-dup".into(),
+            tool_name: "fm_tts".into(),
+            prompt: prompt1,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-dup".into(),
+            tool_name: "fm_tts".into(),
+            prompt: prompt2,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+        }
+        // Only the first recovery should have driven an LLM turn.
+        let first_seen = responses.iter().any(|c| c.contains("first recovery"));
+        let second_seen = responses.iter().any(|c| c.contains("second recovery"));
+        assert!(
+            first_seen,
+            "first recovery should have run: {:?}",
+            responses
+        );
+        assert!(
+            !second_seen,
+            "second recovery should have been suppressed: {:?}",
+            responses
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end() {
+        // Full integration: install the failure-signal callback we set up
+        // in spawn(), trigger mark_failed, and assert the actor enqueues
+        // and processes a RecoveryHint.
+        use octos_agent::TaskSupervisor;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("recovery-handled"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Mirror the spawn() wiring: a TaskSupervisor whose failure signal
+        // dispatches a RecoveryHint into the actor inbox.
+        let supervisor = TaskSupervisor::new();
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+            });
+        });
+        let task_id = supervisor.register_with_input(
+            "fm_tts",
+            "call-int-1",
+            Some("cli:test"),
+            Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
+        );
+        supervisor.mark_failed(
+            &task_id,
+            "voice 'yangmi' not registered. available: vivian, serena.".into(),
+        );
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.iter().any(|r| r.contains("recovery-handled")) {
+                break;
+            }
+        }
+        assert!(
+            responses.iter().any(|c| c.contains("recovery-handled")),
+            "expected recovery turn to drive an LLM response, got: {:?}",
+            responses
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let prompt_present = session.messages.iter().any(|m| {
+            m.role == MessageRole::User
+                && m.content.contains("[system-internal]")
+                && m.content.contains("fm_tts")
+                && m.content.contains("vivian")
+        });
+        assert!(
+            prompt_present,
+            "synthetic recovery prompt should be in session history: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     }
 }
