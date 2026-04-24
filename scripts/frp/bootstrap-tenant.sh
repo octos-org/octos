@@ -311,9 +311,9 @@ if [ "$REMOTE_OS" = "Darwin" ]; then
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${RDATA}/serve.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>${RDATA}/serve.log</string>
+    <string>/dev/null</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -421,7 +421,7 @@ sleep 3
 if ssh_cmd "curl -sf --max-time 3 http://localhost:${SERVE_PORT}/api/status" > /dev/null 2>&1; then
     echo "    octos serve: RUNNING on port ${SERVE_PORT}"
 else
-    echo "    octos serve: starting up (check ${RDATA}/serve.log)"
+    echo "    octos serve: starting up (check ${RDATA}/logs/serve.\$(date +%F).log)"
 fi
 
 # Check frpc

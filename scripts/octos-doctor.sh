@@ -128,6 +128,20 @@ svc_hint() {
     esac
 }
 
+current_serve_log_hint() {
+    printf '%s/logs/serve.%s.log\n' "$DATA_DIR" "$(date +%F)"
+}
+
+latest_serve_log() {
+    local latest
+    latest=$(ls -1t "$DATA_DIR"/logs/serve.*.log 2>/dev/null | head -1 || true)
+    if [ -n "$latest" ]; then
+        printf '%s\n' "$latest"
+    elif [ -f "$DATA_DIR/serve.log" ]; then
+        printf '%s\n' "$DATA_DIR/serve.log"
+    fi
+}
+
 config_json_get() {
     local expr="$1"
     local config_path="$DATA_DIR/config.json"
@@ -407,7 +421,7 @@ case "$HTTP_CODE" in
         ;;
     *)
         warn "responds HTTP $HTTP_CODE"
-        hint "Check logs: tail -20 $DATA_DIR/serve.log"
+        hint "Check logs: tail -20 $(current_serve_log_hint)"
         ;;
 esac
 
@@ -575,10 +589,11 @@ if [ "$CLOUD_MODE" = true ]; then
             hint "Run 'octos admin set-smtp-password' or save via the setup wizard"
             hint "Falling back to env var $SMTP_PASSWORD_ENV if the service exports it"
         fi
-        if [ -f "$DATA_DIR/serve.log" ]; then
-            SMTP_AUTH_ERRORS=$(grep -i 'send_otp failed.*535\|send_otp failed.*authentication failed' "$DATA_DIR/serve.log" 2>/dev/null | tail -1 || true)
+        SERVE_LOG_FOR_SMTP=$(latest_serve_log)
+        if [ -n "$SERVE_LOG_FOR_SMTP" ] && [ -f "$SERVE_LOG_FOR_SMTP" ]; then
+            SMTP_AUTH_ERRORS=$(grep -i 'send_otp failed.*535\|send_otp failed.*authentication failed' "$SERVE_LOG_FOR_SMTP" 2>/dev/null | tail -1 || true)
             if [ -n "$SMTP_AUTH_ERRORS" ]; then
-                err "recent SMTP authentication failure detected in serve.log"
+                err "recent SMTP authentication failure detected in $(basename "$SERVE_LOG_FOR_SMTP")"
                 hint "Verify SMTP_USERNAME / SMTP_PASSWORD and reload io.octos.serve"
             fi
         fi
@@ -689,19 +704,19 @@ fi
 # ── Serve logs ───────────────────────────────────────────────────
 section "Recent serve logs"
 
-SERVE_LOG="$DATA_DIR/serve.log"
-if [ -f "$SERVE_LOG" ]; then
+SERVE_LOG=$(latest_serve_log)
+if [ -n "$SERVE_LOG" ] && [ -f "$SERVE_LOG" ]; then
     SERVE_ERRORS=$(tail -30 "$SERVE_LOG" 2>/dev/null | grep -i "error\|panic\|Address already in use\|send_otp failed" | tail -5)
     if [ -n "$SERVE_ERRORS" ]; then
-        warn "recent errors in serve.log:"
+        warn "recent errors in $(basename "$SERVE_LOG"):"
         echo "$SERVE_ERRORS" | while read -r line; do echo "      $line"; done
     else
-        ok "no recent errors in serve.log"
+        ok "no recent errors in $(basename "$SERVE_LOG")"
     fi
     echo "    Last 3 lines:"
     tail -3 "$SERVE_LOG" 2>/dev/null | while read -r line; do echo "      $line"; done
 else
-    warn "serve.log not found at $SERVE_LOG"
+    warn "no serve log found under $DATA_DIR/logs or at $DATA_DIR/serve.log"
 fi
 
 # ── Runtime dependencies ─────────────────────────────────────────
