@@ -61,9 +61,15 @@ export interface EmailSettings {
   smtp_host?: string | null
   smtp_port?: number | null
   username?: string | null
+  /** Literal SMTP password. Preferred over `password_env` when both are set. */
+  password?: string | null
+  /** Name of an env var holding the SMTP password (advanced — when `password` is unset). */
   password_env?: string | null
   from_address?: string | null
   feishu_app_id?: string | null
+  /** Literal Feishu app secret. Preferred over `feishu_app_secret_env`. */
+  feishu_app_secret?: string | null
+  /** Name of an env var holding the Feishu app secret (advanced). */
   feishu_app_secret_env?: string | null
   feishu_from_address?: string | null
   feishu_region?: string | null

@@ -10,14 +10,14 @@ const EMPTY_SMTP: EmailSettings = {
   smtp_host: '',
   smtp_port: 465,
   username: '',
-  password_env: 'SMTP_PASSWORD',
+  password: '',
   from_address: '',
 }
 
 const EMPTY_FEISHU: EmailSettings = {
   provider: 'feishu',
   feishu_app_id: '',
-  feishu_app_secret_env: 'FEISHU_APP_SECRET',
+  feishu_app_secret: '',
   feishu_from_address: '',
   feishu_region: 'cn',
 }
@@ -114,15 +114,17 @@ export default function EmailTab({ config, onChange }: Props) {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Password Env Var</label>
+                <label className="block text-sm font-medium text-gray-300 mb-1.5">SMTP Password</label>
                 <input
-                  value={email.password_env || ''}
-                  onChange={(e) => update({ password_env: e.target.value })}
-                  placeholder="SMTP_PASSWORD"
+                  type="password"
+                  value={email.password || ''}
+                  onChange={(e) => update({ password: e.target.value })}
+                  placeholder="App password or SMTP login password"
+                  autoComplete="new-password"
                   className="input"
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  Name of the environment variable holding the SMTP password. Set the actual value in Environment Variables below.
+                  SMTP login password or app-specific password (e.g. Gmail app password, SendGrid API key). Stored in the profile config.
                 </p>
               </div>
               <div>
@@ -149,15 +151,17 @@ export default function EmailTab({ config, onChange }: Props) {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">App Secret Env Var</label>
+                <label className="block text-sm font-medium text-gray-300 mb-1.5">App Secret</label>
                 <input
-                  value={email.feishu_app_secret_env || ''}
-                  onChange={(e) => update({ feishu_app_secret_env: e.target.value })}
-                  placeholder="FEISHU_APP_SECRET"
+                  type="password"
+                  value={email.feishu_app_secret || ''}
+                  onChange={(e) => update({ feishu_app_secret: e.target.value })}
+                  placeholder="Feishu app secret"
+                  autoComplete="new-password"
                   className="input"
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  Name of the environment variable holding the Feishu app secret. Set the actual value in Environment Variables below.
+                  Feishu/Lark app secret. Stored in the profile config.
                 </p>
               </div>
               <div>
