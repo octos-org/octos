@@ -205,12 +205,16 @@ test.describe('Coding shell repair', () => {
   test('shell repair returns the recovered diff without timing out', async () => {
     const sid = `shell-repair-${Date.now()}`;
     const marker = `phase3-shell-${Date.now()}`;
+    // Path is workspace-relative (`./repair-${marker}`). macOS sandbox only
+    // allows writes to the workspace CWD subpath — `/tmp` is denied, so the
+    // test must create the repo inside the workspace. The "wrong dir" for
+    // the intentional failure step is the workspace root one level up.
     const prompt = [
       'Use shell tool only.',
-      `Create a temporary git repo at /tmp/${marker}.`,
+      `Create a temporary git repo at ./repair-${marker}.`,
       'Inside it, create notes.txt with exactly two lines: alpha and beta.',
       'Make exactly one edit: change beta to gamma.',
-      'Intentionally run `git diff -- notes.txt` from /tmp once so it fails.',
+      'Intentionally run `git diff -- notes.txt` from the workspace root once so it fails.',
       'Then recover by running the same diff from the repo root.',
       'Return only the final unified diff, nothing else.',
       'Do not start background work.',
