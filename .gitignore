@@ -21,7 +21,14 @@ Thumbs.db
 # Node
 node_modules/
 
-# Dashboard build output
+# Dashboard build output.
+#
+# Policy: ephemeral bundle — the compiled dashboard lives in a release binary
+# via `rust-embed` (baked in at compile time) and is produced on demand by
+# `scripts/build-dashboard.sh`. It is NOT committed to the repo, to avoid
+# per-PR noise from minified hash-named files and merge conflicts on
+# rebuilt assets. CI + `scripts/install.sh` (via release tarball) + any
+# source-clone build are responsible for regenerating it.
 crates/octos-cli/static/admin/
 
 # Environment
