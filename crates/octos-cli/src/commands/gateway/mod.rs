@@ -1,7 +1,7 @@
 //! Gateway command: run as a persistent messaging daemon.
 
 mod account_handler;
-mod adapters;
+pub(crate) mod adapters;
 mod gateway_runtime;
 #[cfg(feature = "matrix")]
 mod matrix_integration;

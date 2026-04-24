@@ -750,6 +750,125 @@ pub async fn session_tasks(
     Json(serde_json::json!([])).into_response()
 }
 
+/// DELETE /api/sessions/{id}/tasks/{task_id} — kill a running sub-agent (M7.9).
+///
+/// Proxies to the gateway's `/sessions/{id}/tasks/{task_id}` DELETE endpoint,
+/// which resolves the task_id inside [`SessionTaskQueryStore`] and invokes
+/// [`TaskSupervisor::cancel_task`].
+pub async fn cancel_session_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, task_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<CancelTaskQueryParams>,
+) -> Response {
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let encoded_id = encode_api_session_path_id(&id);
+        let mut path = format!("/sessions/{encoded_id}/tasks/{task_id}");
+        if let Some(reason) = params.reason.as_deref().filter(|v| !v.is_empty()) {
+            path.push_str(&format!("?reason={}", encode_reason_param(reason)));
+        }
+        return super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "gateway unavailable"})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CancelTaskQueryParams {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Minimal percent-encode for the `reason` query param. We only proxy to
+/// the gateway (same host, trusted channel), but round-tripping a reason
+/// through `application/x-www-form-urlencoded` keeps spaces and unicode
+/// safe without pulling in a full URL-encoding crate.
+fn encode_reason_param(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// POST /api/sessions/{id}/tasks/{task_id}/relaunch — re-launch a task (M7.9).
+pub async fn relaunch_session_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, task_id)): axum::extract::Path<(String, String)>,
+    body: Option<Json<RelaunchTaskBody>>,
+) -> Response {
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let encoded_id = encode_api_session_path_id(&id);
+        let path = format!("/sessions/{encoded_id}/tasks/{task_id}/relaunch");
+        let payload = body
+            .map(|Json(b)| {
+                serde_json::json!({
+                    "seed_overrides": b.seed_overrides.unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+        return super::webhook_proxy::api_post_proxy(&state, port, &path, payload).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "gateway unavailable"})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RelaunchTaskBody {
+    #[serde(default)]
+    pub seed_overrides: Option<serde_json::Value>,
+}
+
+/// POST /api/sessions/{id}/tasks/{task_id}/send — steer a sub-agent (M7.9).
+pub async fn send_to_session_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, task_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<SendToAgentBody>,
+) -> Response {
+    if body.message.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message must not be empty"})),
+        )
+            .into_response();
+    }
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let encoded_id = encode_api_session_path_id(&id);
+        let path = format!("/sessions/{encoded_id}/tasks/{task_id}/send");
+        let payload = serde_json::json!({
+            "message": body.message,
+            "sender": body.sender,
+        });
+        return super::webhook_proxy::api_post_proxy(&state, port, &path, payload).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "gateway unavailable"})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SendToAgentBody {
+    pub message: String,
+    #[serde(default)]
+    pub sender: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct SessionFileInfo {
     pub filename: String,

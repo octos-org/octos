@@ -98,7 +98,8 @@ pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
-    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+    BackgroundTask, CancelError, InboxMessage, RelaunchError, RelaunchPlan, SendToAgentError,
+    SupervisorInbox, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
@@ -109,7 +110,8 @@ pub use tools::{
     DispatchRequest, DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool,
     MAX_DEPTH, ManageSkillsTool, McpAgentBackend, McpAgentBackendConfig, MessageTool,
     PolicyDecision, ReadFileTool, RecallMemoryTool, RobotToolRegistry, SaveMemoryTool,
-    SendFileTool, SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
+    SendFileTool, SendToAgentTool, SharedBackend, ShellTool, SpawnTool, StdioMcpAgent,
+    SynthesizeResearchTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
     WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},

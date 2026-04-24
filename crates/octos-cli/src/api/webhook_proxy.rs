@@ -423,7 +423,39 @@ pub async fn api_delete_proxy(state: &AppState, port: u16, path: &str) -> Respon
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    status.into_response()
+    let body = resp.bytes().await.unwrap_or_default();
+    let mut response = (status, body.to_vec()).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    response
+}
+
+/// Proxy a POST request with a JSON body to the gateway's API channel.
+pub async fn api_post_proxy(
+    state: &AppState,
+    port: u16,
+    path: &str,
+    body: serde_json::Value,
+) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state.http_client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API POST proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = resp.bytes().await.unwrap_or_default();
+    let mut response = (status, body_bytes.to_vec()).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    response
 }
 
 /// Return a JSON error response so Feishu/Lark doesn't complain about non-JSON.

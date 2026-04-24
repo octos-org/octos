@@ -42,6 +42,28 @@ pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Outcome returned by the PM-supervisor callbacks. Opaque JSON so the
+/// gateway can expose implementation-specific fields (error kinds,
+/// new_task_id, etc.) without the api_channel module needing to know
+/// about TaskSupervisor types.
+pub type TaskLifecycleResult = Result<serde_json::Value, (u16, String)>;
+
+/// Callback for `DELETE /sessions/{id}/tasks/{task_id}`. The tuple is
+/// `(session_key, task_id, reason)`. Reason may be empty.
+pub type TaskCancelFn =
+    dyn Fn(&str, &str, &str) -> TaskLifecycleResult + Send + Sync;
+
+/// Callback for `POST /sessions/{id}/tasks/{task_id}/relaunch`. Receives
+/// the serialized seed-override patch (opaque JSON).
+pub type TaskRelaunchFn = dyn Fn(&str, &str, serde_json::Value) -> TaskLifecycleResult
+    + Send
+    + Sync;
+
+/// Callback for `POST /sessions/{id}/tasks/{task_id}/send`. Receives the
+/// message body + optional sender label.
+pub type TaskSendFn =
+    dyn Fn(&str, &str, &str, Option<&str>) -> TaskLifecycleResult + Send + Sync;
+
 const SSE_CHANNEL_CAPACITY: usize = 1024;
 
 type SseSender = broadcast::Sender<String>;
@@ -57,6 +79,9 @@ struct ApiState {
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
+    task_send: Option<Arc<TaskSendFn>>,
     on_session_deleted: Option<OnSessionDeletedFn>,
     metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
@@ -198,6 +223,12 @@ pub struct ApiChannel {
     sessions: Arc<Mutex<SessionManager>>,
     /// Optional callback for querying background tasks by session key.
     task_query: Option<Arc<TaskQueryFn>>,
+    /// Optional callback for `DELETE /sessions/{id}/tasks/{task_id}` (M7.9).
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    /// Optional callback for `POST /sessions/{id}/tasks/{task_id}/relaunch` (M7.9).
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
+    /// Optional callback for `POST /sessions/{id}/tasks/{task_id}/send` (M7.9).
+    task_send: Option<Arc<TaskSendFn>>,
     /// Optional callback invoked when a session is deleted via API.
     on_session_deleted: Option<OnSessionDeletedFn>,
     /// Optional Prometheus render callback shared from the child gateway.
@@ -222,6 +253,9 @@ impl ApiChannel {
             last_content: Arc::new(Mutex::new(HashMap::new())),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            task_send: None,
             on_session_deleted: None,
             metrics_renderer: None,
         }
@@ -230,6 +264,19 @@ impl ApiChannel {
     /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
+        self
+    }
+
+    /// Attach the cancel/relaunch/send callbacks for PM supervisor endpoints.
+    pub fn with_task_lifecycle(
+        mut self,
+        cancel: Arc<TaskCancelFn>,
+        relaunch: Arc<TaskRelaunchFn>,
+        send: Arc<TaskSendFn>,
+    ) -> Self {
+        self.task_cancel = Some(cancel);
+        self.task_relaunch = Some(relaunch);
+        self.task_send = Some(send);
         self
     }
 
@@ -565,6 +612,9 @@ impl Channel for ApiChannel {
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
+            task_cancel: self.task_cancel.clone(),
+            task_relaunch: self.task_relaunch.clone(),
+            task_send: self.task_send.clone(),
             on_session_deleted: self.on_session_deleted.clone(),
             metrics_renderer: self.metrics_renderer.clone(),
         };
@@ -580,6 +630,19 @@ impl Channel for ApiChannel {
             )
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
+            // PM supervisor endpoints (M7.9).
+            .route(
+                "/sessions/{id}/tasks/{task_id}",
+                delete(handle_cancel_task),
+            )
+            .route(
+                "/sessions/{id}/tasks/{task_id}/relaunch",
+                post(handle_relaunch_task),
+            )
+            .route(
+                "/sessions/{id}/tasks/{task_id}/send",
+                post(handle_send_to_agent),
+            )
             .route("/sessions/{id}", delete(handle_delete_session))
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
@@ -1503,6 +1566,106 @@ async fn handle_session_tasks(
         params.topic.as_deref(),
     );
     Json(tasks).into_response()
+}
+
+/// DELETE /sessions/:id/tasks/:task_id — kill a running sub-agent (M7.9).
+async fn handle_cancel_task(
+    State(state): State<ApiState>,
+    axum::extract::Path((_id, task_id)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<CancelTaskParams>,
+) -> Response {
+    let Some(ref cancel_fn) = state.task_cancel else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "cancel_task unavailable"})),
+        )
+            .into_response();
+    };
+    let reason = params.reason.as_deref().unwrap_or("");
+    match cancel_fn("", &task_id, reason) {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err((code, msg)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /sessions/:id/tasks/:task_id/relaunch — re-launch with overrides (M7.9).
+async fn handle_relaunch_task(
+    State(state): State<ApiState>,
+    axum::extract::Path((_id, task_id)): axum::extract::Path<(String, String)>,
+    body: axum::extract::Json<RelaunchTaskRequest>,
+) -> Response {
+    let Some(ref relaunch_fn) = state.task_relaunch else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "relaunch_task unavailable"})),
+        )
+            .into_response();
+    };
+    let overrides = body
+        .seed_overrides
+        .clone()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    match relaunch_fn("", &task_id, overrides) {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err((code, msg)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /sessions/:id/tasks/:task_id/send — send steering message (M7.9).
+async fn handle_send_to_agent(
+    State(state): State<ApiState>,
+    axum::extract::Path((_id, task_id)): axum::extract::Path<(String, String)>,
+    body: axum::extract::Json<SendToAgentRequest>,
+) -> Response {
+    let Some(ref send_fn) = state.task_send else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "send_to_agent unavailable"})),
+        )
+            .into_response();
+    };
+    if body.message.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message must not be empty"})),
+        )
+            .into_response();
+    }
+    match send_fn("", &task_id, &body.message, body.sender.as_deref()) {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err((code, msg)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CancelTaskParams {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RelaunchTaskRequest {
+    #[serde(default)]
+    seed_overrides: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct SendToAgentRequest {
+    message: String,
+    #[serde(default)]
+    sender: Option<String>,
 }
 
 /// GET /sessions — list all API sessions.

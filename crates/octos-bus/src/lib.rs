@@ -55,7 +55,7 @@ pub use session::{
 };
 
 #[cfg(feature = "api")]
-pub use api_channel::ApiChannel;
+pub use api_channel::{ApiChannel, TaskCancelFn, TaskLifecycleResult, TaskRelaunchFn, TaskSendFn};
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
 #[cfg(feature = "email")]

@@ -1181,6 +1181,7 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                task_lifecycle: Some(Arc::new(task_query_store.clone())),
                 #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),
                 #[cfg(not(feature = "api"))]

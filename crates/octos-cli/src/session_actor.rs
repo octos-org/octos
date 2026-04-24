@@ -759,6 +759,170 @@ impl SessionTaskQueryStore {
             None => serde_json::json!([]),
         }
     }
+
+    /// Find the supervisor that owns `task_id` and invoke `f` with it.
+    ///
+    /// Returns `None` when no tracked supervisor knows about the id.
+    /// Walks all registered supervisors so callers (REST endpoints) do not
+    /// need to know which session the task belongs to up front.
+    fn with_supervisor_for_task<F, T>(&self, task_id: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(Arc<TaskSupervisor>) -> T,
+    {
+        let upgraded = {
+            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stale = Vec::new();
+            let mut found: Option<Arc<TaskSupervisor>> = None;
+            for (key, entry) in guard.iter() {
+                match entry.supervisor.upgrade() {
+                    Some(supervisor) => {
+                        if supervisor.get_task(task_id).is_some() {
+                            found = Some(supervisor);
+                            break;
+                        }
+                    }
+                    None => stale.push(key.clone()),
+                }
+            }
+            for key in stale {
+                guard.remove(&key);
+            }
+            found
+        };
+        upgraded.map(f)
+    }
+
+    /// Cancel a tracked task. Returns `Ok(payload)` with the cancelled task
+    /// id + new status when the supervisor accepts the request, or a typed
+    /// HTTP error otherwise.
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let reason_opt = if reason.is_empty() {
+            None
+        } else {
+            Some(reason.to_string())
+        };
+        let outcome = self.with_supervisor_for_task(task_id, |sup| {
+            sup.cancel_task(task_id, reason_opt.clone())
+                .map(|_| sanitize_cancel_response(task_id, reason_opt.as_deref()))
+        });
+        match outcome {
+            Some(Ok(json)) => Ok(json),
+            Some(Err(err)) => match err {
+                octos_agent::CancelError::UnknownTask => {
+                    Err((404, format!("{err}")))
+                }
+                octos_agent::CancelError::AlreadyTerminal(_) => {
+                    Err((409, format!("{err}")))
+                }
+            },
+            None => Err((404, format!("unknown task: {task_id}"))),
+        }
+    }
+
+    /// Relaunch a tracked task with caller-supplied overrides.
+    pub fn relaunch_task(
+        &self,
+        task_id: &str,
+        seed_overrides: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let outcome = self.with_supervisor_for_task(task_id, |sup| {
+            sup.relaunch_task(task_id, seed_overrides.clone())
+        });
+        match outcome {
+            Some(Ok(plan)) => Ok(serde_json::json!({
+                "parent_task_id": plan.parent_task_id,
+                "new_task_id": plan.new_task_id,
+                "tool_name": plan.tool_name,
+                "session_key": plan.session_key,
+                "merged_spec": plan.merged_spec,
+            })),
+            Some(Err(err)) => match err {
+                octos_agent::RelaunchError::UnknownTask => Err((404, format!("{err}"))),
+                octos_agent::RelaunchError::NoSpecSnapshot => Err((409, format!("{err}"))),
+                octos_agent::RelaunchError::InvalidOverrides => {
+                    Err((400, format!("{err}")))
+                }
+            },
+            None => Err((404, format!("unknown task: {task_id}"))),
+        }
+    }
+
+    /// Deliver a steering message to a tracked task.
+    pub fn send_to_agent(
+        &self,
+        task_id: &str,
+        message: &str,
+        sender: Option<&str>,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let sender_label = sender
+            .map(str::to_string)
+            .unwrap_or_else(|| "supervisor".to_string());
+        let outcome = self.with_supervisor_for_task(task_id, |sup| {
+            sup.send_to_agent(
+                task_id,
+                octos_agent::InboxMessage::new(sender_label.clone(), message.to_string()),
+            )
+        });
+        match outcome {
+            Some(Ok(())) => Ok(serde_json::json!({
+                "task_id": task_id,
+                "delivered": true,
+                "sender": sender_label,
+            })),
+            Some(Err(err)) => match err {
+                octos_agent::SendToAgentError::UnknownTask => {
+                    Err((404, format!("{err}")))
+                }
+                octos_agent::SendToAgentError::NoInbox => Err((409, format!("{err}"))),
+                octos_agent::SendToAgentError::InboxClosed => {
+                    Err((410, format!("{err}")))
+                }
+                octos_agent::SendToAgentError::Terminal(_) => {
+                    Err((409, format!("{err}")))
+                }
+            },
+            None => Err((404, format!("unknown task: {task_id}"))),
+        }
+    }
+}
+
+fn sanitize_cancel_response(task_id: &str, reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": task_id,
+        "status": "cancelled",
+        "reason": reason,
+    })
+}
+
+impl crate::commands::gateway::adapters::TaskLifecycleDispatcher for SessionTaskQueryStore {
+    fn cancel(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        SessionTaskQueryStore::cancel_task(self, task_id, reason)
+    }
+
+    fn relaunch(
+        &self,
+        task_id: &str,
+        seed_overrides: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        SessionTaskQueryStore::relaunch_task(self, task_id, seed_overrides)
+    }
+
+    fn send(
+        &self,
+        task_id: &str,
+        message: &str,
+        sender: Option<&str>,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        SessionTaskQueryStore::send_to_agent(self, task_id, message, sender)
+    }
 }
 
 fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {

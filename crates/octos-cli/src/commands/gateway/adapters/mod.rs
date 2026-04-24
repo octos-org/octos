@@ -62,6 +62,33 @@ pub(crate) use super::prompt::settings_str;
 pub type TaskQueryFn = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
 pub type SessionDeletedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Callback for the M7.9 PM-supervisor lifecycle endpoints. Wraps a
+/// [`SessionTaskQueryStore`](crate::session_actor::SessionTaskQueryStore)
+/// so the API channel does not need to depend on TaskSupervisor types.
+pub type TaskLifecycleCallbacks = Arc<dyn TaskLifecycleDispatcher + Send + Sync>;
+
+/// Dispatch surface used by the API channel to cancel, relaunch, or
+/// steer a background task. Implemented by
+/// [`SessionTaskQueryStore`](crate::session_actor::SessionTaskQueryStore).
+pub trait TaskLifecycleDispatcher {
+    fn cancel(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, (u16, String)>;
+    fn relaunch(
+        &self,
+        task_id: &str,
+        seed_overrides: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)>;
+    fn send(
+        &self,
+        task_id: &str,
+        message: &str,
+        sender: Option<&str>,
+    ) -> Result<serde_json::Value, (u16, String)>;
+}
+
 /// Context needed by adapters that require extra parameters beyond the common set.
 #[allow(dead_code)]
 pub struct ChannelRegistrationCtx<'a> {
@@ -74,6 +101,7 @@ pub struct ChannelRegistrationCtx<'a> {
     #[cfg(not(feature = "api"))]
     pub metrics_handle: Option<()>,
     pub task_query: Option<TaskQueryFn>,
+    pub task_lifecycle: Option<TaskLifecycleCallbacks>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
@@ -116,6 +144,7 @@ pub fn register_all(
                 ctx.session_mgr,
                 ctx.metrics_handle.clone(),
                 ctx.task_query.clone(),
+                ctx.task_lifecycle.clone(),
                 ctx.gateway_profile_id,
                 ctx.api_port_override,
                 ctx.on_session_deleted.clone(),

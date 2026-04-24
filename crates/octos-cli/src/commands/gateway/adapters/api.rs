@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::Mutex;
 
+use crate::commands::gateway::adapters::TaskLifecycleCallbacks;
 use crate::config::ChannelEntry;
 
 pub fn register(
@@ -13,6 +14,7 @@ pub fn register(
     session_mgr: &Arc<Mutex<SessionManager>>,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     task_query: Option<Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>>,
+    task_lifecycle: Option<TaskLifecycleCallbacks>,
     gateway_profile_id: Option<&str>,
     api_port_override: Option<u16>,
     on_session_deleted: Option<Arc<dyn Fn(&str) + Send + Sync>>,
@@ -41,6 +43,27 @@ pub fn register(
     }
     if let Some(task_query) = task_query {
         channel = channel.with_task_query(task_query);
+    }
+    if let Some(dispatcher) = task_lifecycle {
+        let cancel_dispatcher = dispatcher.clone();
+        let relaunch_dispatcher = dispatcher.clone();
+        let send_dispatcher = dispatcher.clone();
+        let cancel_fn: Arc<octos_bus::TaskCancelFn> = Arc::new(
+            move |_session_key: &str, task_id: &str, reason: &str| {
+                cancel_dispatcher.cancel(task_id, reason)
+            },
+        );
+        let relaunch_fn: Arc<octos_bus::TaskRelaunchFn> = Arc::new(
+            move |_session_key: &str, task_id: &str, overrides: serde_json::Value| {
+                relaunch_dispatcher.relaunch(task_id, overrides)
+            },
+        );
+        let send_fn: Arc<octos_bus::TaskSendFn> = Arc::new(
+            move |_session_key: &str, task_id: &str, message: &str, sender: Option<&str>| {
+                send_dispatcher.send(task_id, message, sender)
+            },
+        );
+        channel = channel.with_task_lifecycle(cancel_fn, relaunch_fn, send_fn);
     }
     if let Some(cb) = on_session_deleted {
         channel = channel.with_on_session_deleted(move |id| cb(id));

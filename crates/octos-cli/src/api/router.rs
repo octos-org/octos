@@ -102,6 +102,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
+        // M7.9 PM supervisor lifecycle endpoints. Admin auth required.
+        .route(
+            "/api/sessions/{id}/tasks/{task_id}",
+            delete(handlers::cancel_session_task),
+        )
+        .route(
+            "/api/sessions/{id}/tasks/{task_id}/relaunch",
+            post(handlers::relaunch_session_task),
+        )
+        .route(
+            "/api/sessions/{id}/tasks/{task_id}/send",
+            post(handlers::send_to_session_task),
+        )
         .route("/api/sessions/{id}/files", get(handlers::session_files))
         .route(
             "/api/sessions/{id}/workspace-contract",
