@@ -314,24 +314,47 @@ pub fn filter_unresolved_tool_uses(
                     kept.push(msg);
                     continue;
                 }
+                // M8.6 fix-first item 2: per-call filtering, not all-or-
+                // nothing. Walk the assistant's tool_calls and keep the
+                // ones whose ids are resolved (matching Tool message
+                // present) or retry-pinned. Drop only the unresolved
+                // ones. This preserves valid tool results from the same
+                // assistant turn that would otherwise be orphaned when a
+                // sibling call lacked a matching result.
                 let has_text = !msg.content.trim().is_empty();
-                let all_resolved = calls.iter().all(|call| {
-                    result_ids.contains(call.id.as_str())
+                let mut kept_calls: Vec<octos_core::ToolCall> = Vec::with_capacity(calls.len());
+                let mut had_unresolved = false;
+                for call in calls.iter() {
+                    let resolved = result_ids.contains(call.id.as_str())
                         || retry_state
                             .map(|state| state.contains_tool_call(&call.id))
-                            .unwrap_or(false)
-                });
-                if all_resolved {
-                    kept.push(msg);
+                            .unwrap_or(false);
+                    if resolved {
+                        kept_calls.push(call.clone());
+                    } else {
+                        had_unresolved = true;
+                    }
+                }
+                if had_unresolved {
+                    dropped += 1;
+                }
+                if !kept_calls.is_empty() {
+                    // At least one call survived — keep the assistant
+                    // message with the filtered call set so its matching
+                    // Tool results don't get dropped as orphans.
+                    let mut filtered = msg;
+                    filtered.tool_calls = Some(kept_calls);
+                    kept.push(filtered);
                 } else if has_text {
-                    // Keep the text but strip the unresolved tool_calls
-                    // so the provider accepts the request.
+                    // No surviving calls but the message has prose — keep
+                    // the prose so the conversation flow stays intact.
                     let mut stripped = msg;
                     stripped.tool_calls = None;
                     kept.push(stripped);
-                    dropped += 1;
                 } else {
-                    dropped += 1;
+                    // No prose, no surviving calls — the assistant
+                    // message has nothing left to keep.
+                    // (already counted in `dropped`)
                 }
             }
             _ => kept.push(msg),
@@ -739,6 +762,131 @@ mod tests {
                 .as_ref()
                 .map(|c| c.len() == 1 && c[0].id == "pending-1")
                 .unwrap_or(false)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 2 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24: per-call filtering
+    // for partial resolution. The legacy `all_resolved` branch dropped or
+    // stripped the entire `tool_calls` vector if any sibling was unresolved,
+    // orphaning matching tool results. The fix keeps resolved/pinned calls
+    // and drops only the unresolved ones.
+    // -----------------------------------------------------------------------
+
+    fn assistant_with_mixed_calls(content: &str, call_ids: &[&str]) -> Message {
+        // Builder shared by the partial-resolution tests. Distinct from
+        // `assistant_with_calls` only in that it is reused for clarity.
+        assistant_with_calls(content, call_ids)
+    }
+
+    #[test]
+    fn mixed_assistant_message_keeps_resolved_tool_calls_when_one_sibling_is_unresolved() {
+        // Assistant emitted three tool calls. Only call_a has a matching
+        // tool result; call_b and call_c are orphans. The partial-
+        // resolution policy must keep call_a (resolved), drop call_b /
+        // call_c (orphans), preserve the assistant's prose, and report
+        // exactly one drop.
+        let messages = vec![
+            user("do three things"),
+            assistant_with_mixed_calls("plan: a, b, c", &["call_a", "call_b", "call_c"]),
+            tool_result("call_a", r#"{"output": "a-done"}"#),
+        ];
+
+        let (filtered, dropped) = filter_unresolved_tool_uses(messages, None);
+
+        assert_eq!(dropped, 1, "one assistant message had unresolved siblings");
+        // user + assistant (with filtered call set) + tool result
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[1].content, "plan: a, b, c", "prose must survive");
+        let kept_calls = filtered[1]
+            .tool_calls
+            .as_ref()
+            .expect("resolved sibling must keep tool_calls populated");
+        assert_eq!(kept_calls.len(), 1);
+        assert_eq!(kept_calls[0].id, "call_a");
+    }
+
+    #[test]
+    fn mixed_assistant_message_preserves_matching_tool_result_after_sanitize() {
+        // Same setup as above, but we now assert that the matching tool
+        // result for `call_a` survives. Under the all-or-nothing legacy
+        // branch the assistant had its tool_calls stripped, then
+        // `result_has_matching_call` saw zero matches and the orphan-
+        // tool-result pass dropped the result. The fix preserves the
+        // pairing.
+        let messages = vec![
+            user("do two things"),
+            assistant_with_mixed_calls("a then b", &["call_a", "call_b"]),
+            tool_result("call_a", r#"{"output": "a-done"}"#),
+        ];
+
+        let (filtered, _dropped) = filter_unresolved_tool_uses(messages, None);
+
+        let tool_results: Vec<&Message> = filtered
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "matching tool result for call_a must survive partial-resolution sanitize"
+        );
+        assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("call_a"));
+    }
+
+    #[test]
+    fn retry_pinned_unresolved_call_does_not_delete_resolved_sibling_result() {
+        // Three calls: call_a is resolved by a Tool result, call_b is
+        // retry-pinned (still pending), call_c is fully unresolved. The
+        // sanitizer must keep call_a and call_b on the assistant message,
+        // drop call_c, preserve the prose, and keep the matching Tool
+        // result for call_a.
+        let messages = vec![
+            user("kick off"),
+            assistant_with_mixed_calls("ack", &["call_a", "call_b", "call_c"]),
+            tool_result("call_a", r#"{"output": "a-done"}"#),
+        ];
+
+        let mut retry: HashSet<String> = HashSet::new();
+        retry.insert("call_b".into());
+
+        let (filtered, dropped) =
+            filter_unresolved_tool_uses(messages, Some(&retry as &dyn RetryStateView));
+
+        assert_eq!(
+            dropped, 1,
+            "exactly one assistant message had a dropped call"
+        );
+        let kept_ids: Vec<&str> = filtered[1]
+            .tool_calls
+            .as_ref()
+            .expect("kept calls must remain")
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert!(
+            kept_ids.contains(&"call_a"),
+            "resolved call_a must survive: kept_ids={:?}",
+            kept_ids
+        );
+        assert!(
+            kept_ids.contains(&"call_b"),
+            "retry-pinned call_b must survive: kept_ids={:?}",
+            kept_ids
+        );
+        assert!(
+            !kept_ids.contains(&"call_c"),
+            "unresolved call_c must be removed: kept_ids={:?}",
+            kept_ids
+        );
+        let tool_results: Vec<&Message> = filtered
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "matching Tool result for call_a must not be orphaned by partial-resolution sanitize"
         );
     }
 
