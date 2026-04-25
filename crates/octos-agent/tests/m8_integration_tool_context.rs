@@ -43,6 +43,10 @@ struct CtxProbeTool {
 struct CapturedCtx {
     agent_definition_ids: Vec<String>,
     file_state_cache_present: bool,
+    /// Whether the captured `ToolContext.permissions` permits each
+    /// of the named tools. Used by the gap-4b coverage to prove the
+    /// profile-derived envelope reaches the call site.
+    permissions_for: std::collections::HashMap<String, bool>,
 }
 
 impl CtxProbeTool {
@@ -83,9 +87,14 @@ impl Tool for CtxProbeTool {
         ctx: &ToolContext,
         _args: &serde_json::Value,
     ) -> eyre::Result<ToolResult> {
+        let mut perms = std::collections::HashMap::new();
+        for tool in ["read_file", "write_file", "shell", "edit_file"] {
+            perms.insert(tool.to_string(), ctx.permissions.is_tool_allowed(tool));
+        }
         let captured = CapturedCtx {
             agent_definition_ids: ctx.agent_definitions.ids().map(|s| s.to_string()).collect(),
             file_state_cache_present: ctx.file_state_cache.is_some(),
+            permissions_for: perms,
         };
         *self.captured.lock().unwrap() = Some(captured);
         Ok(ToolResult {
@@ -392,5 +401,66 @@ async fn spawn_only_background_path_receives_full_tool_context_after_m8_8_schedu
         captured.file_state_cache_present,
         "spawn-only background ToolContext.file_state_cache was None — \
          M8.8 reconciliation must populate it"
+    );
+}
+
+#[tokio::test]
+async fn threads_profile_permissions_into_tool_context_after_m8_fix_8() {
+    // M8 fix-first item 8 (gap 4b): `Agent::with_profile` records the
+    // resolved profile envelope but pre-fix the ToolContext built per call
+    // always carried `ToolPermissions::default()` (allow-all). This test
+    // proves the wired path: a profile that denies `shell` must produce a
+    // ToolContext whose `permissions.is_tool_allowed("shell")` is false at
+    // the actual call site.
+    use octos_agent::profile::{PROFILE_SCHEMA_VERSION, ProfileDefinition, ProfileTools};
+
+    let dir = TempDir::new().unwrap();
+    let (probe, captured) = CtxProbeTool::new("perm_probe");
+
+    let profile = Arc::new(ProfileDefinition {
+        name: "no-shell".to_string(),
+        version: PROFILE_SCHEMA_VERSION,
+        tools: ProfileTools::DenyList {
+            tools: vec!["shell".to_string()],
+        },
+        ..Default::default()
+    });
+
+    let mut tools = ToolRegistry::new();
+    tools.register(probe);
+    let memory = Arc::new(EpisodeStore::open(dir.path().join(".octos")).await.unwrap());
+    let llm: Arc<dyn LlmProvider> = Arc::new(MockLlm::new(vec![
+        tool_use(vec![tc("call_1", "perm_probe", serde_json::json!({}))]),
+        end("done"),
+    ]));
+
+    let agent = Agent::new(AgentId::new("m8-fix-perms"), llm, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_profile(profile);
+
+    let _ = agent
+        .process_message("invoke perm probe", &[], vec![])
+        .await
+        .expect("agent loop must succeed");
+
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("probe must have observed a ToolContext");
+    assert_eq!(
+        captured.permissions_for.get("shell"),
+        Some(&false),
+        "profile deny-list for shell must reach the ToolContext: {:?}",
+        captured.permissions_for
+    );
+    assert_eq!(
+        captured.permissions_for.get("read_file"),
+        Some(&true),
+        "non-denied tools must remain permitted: {:?}",
+        captured.permissions_for
     );
 }

@@ -50,12 +50,34 @@ pub use crate::agents::AgentDefinitions;
 
 /// Per-tool permission facts consulted before each execution.
 ///
-/// M8.3 will wire real profile-derived permissions into this struct (see
-/// issue #536 → M8.3). Today it unconditionally allows every tool so behaviour
-/// matches the pre-M8.1 status quo.
+/// M8 fix-first item 8 (gap 4b): the M8.1 stub was always allow-all; the
+/// agent's recorded [`crate::profile::ProfileDefinition`] envelope was never
+/// consulted at the tool boundary even when the profile declared an explicit
+/// allow- or deny-list. The struct now carries the resolved policy:
+///
+/// - [`ToolPermissions::allow_all`] / [`ToolPermissions::default`] preserve
+///   the pre-M8.3 status quo (no restrictions).
+/// - [`ToolPermissions::from_profile`] derives the deny / allow lists from the
+///   profile's `tools` filter, expanding `group:*` references through
+///   [`crate::tools::policy::TOOL_GROUPS`] and the user-provided
+///   [`crate::profile::PermissionMode`]. Tools not on the allow list (when
+///   one is configured) are blocked, and tools on the deny list always lose.
+///
+/// Permission is evaluated by [`ToolPermissions::is_tool_allowed`] — the same
+/// hook the existing tools (e.g. `read_file`) consult before executing.
 #[derive(Clone, Debug)]
 pub struct ToolPermissions {
-    allow_all: bool,
+    /// Coarse permission tier from the profile envelope. Reserved for future
+    /// per-tier rules; today the variant is informational so callers can log
+    /// it without changing semantics.
+    mode: crate::profile::PermissionMode,
+    /// Tools the active profile explicitly forbids. Always wins over the
+    /// allow list (deny-wins semantics, mirroring [`ToolPolicy`]).
+    denied_tools: HashSet<String>,
+    /// Optional explicit allow list. When `Some`, only tools whose names are
+    /// in the set are permitted. When `None`, no allow-list filter applies
+    /// (default behaviour).
+    allowed_tools: Option<HashSet<String>>,
 }
 
 impl Default for ToolPermissions {
@@ -67,14 +89,79 @@ impl Default for ToolPermissions {
 impl ToolPermissions {
     /// Allow-all permissions — the zero-value default carried by the context.
     pub fn allow_all() -> Self {
-        Self { allow_all: true }
+        Self {
+            mode: crate::profile::PermissionMode::Default,
+            denied_tools: HashSet::new(),
+            allowed_tools: None,
+        }
     }
 
-    /// Check whether the named tool is currently permitted. Always `true`
-    /// while M8.3 is pending.
-    pub fn is_tool_allowed(&self, _tool: &str) -> bool {
-        self.allow_all
+    /// Derive a [`ToolPermissions`] envelope from a resolved
+    /// [`crate::profile::ProfileDefinition`].
+    ///
+    /// `group:*` references in the profile's tool filter are expanded
+    /// against [`crate::tools::policy::TOOL_GROUPS`] so the runtime gate
+    /// matches the registry filter from M8.3. The resulting record is
+    /// consulted at every tool boundary (see
+    /// [`ToolPermissions::is_tool_allowed`]).
+    pub fn from_profile(profile: &crate::profile::ProfileDefinition) -> Self {
+        use crate::profile::ProfileTools;
+        let mut denied: HashSet<String> = HashSet::new();
+        let mut allowed: Option<HashSet<String>> = None;
+        match &profile.tools {
+            ProfileTools::Default => {}
+            ProfileTools::AllowList { tools } => {
+                if !tools.is_empty() {
+                    allowed = Some(expand_profile_tool_entries(tools));
+                }
+            }
+            ProfileTools::DenyList { tools } => {
+                denied = expand_profile_tool_entries(tools);
+            }
+        }
+        Self {
+            mode: profile.permissions,
+            denied_tools: denied,
+            allowed_tools: allowed,
+        }
     }
+
+    /// Permission tier carried by the envelope. Reserved for future
+    /// per-tier rules; today purely informational.
+    pub fn mode(&self) -> crate::profile::PermissionMode {
+        self.mode
+    }
+
+    /// Check whether the named tool is currently permitted.
+    ///
+    /// Returns `false` when:
+    /// - the tool is on the profile's deny list, or
+    /// - the profile carries an allow list and the tool is not in it.
+    pub fn is_tool_allowed(&self, tool: &str) -> bool {
+        if self.denied_tools.contains(tool) {
+            return false;
+        }
+        match &self.allowed_tools {
+            Some(allow) => allow.contains(tool),
+            None => true,
+        }
+    }
+}
+
+/// Expand a profile-tool list (which may contain `group:*` references) into
+/// a flat set of tool names.
+fn expand_profile_tool_entries(entries: &[String]) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for entry in entries {
+        if let Some(group) = crate::tools::policy::tool_group_info(entry) {
+            for t in group.tools {
+                out.insert((*t).to_string());
+            }
+        } else {
+            out.insert(entry.clone());
+        }
+    }
+    out
 }
 
 /// File-state cache re-export (M8.4).
@@ -1057,5 +1144,137 @@ mod tool_context_tests {
         let b = a; // Copy
         assert_eq!(a, b);
         assert_eq!(ConcurrencyClass::default(), ConcurrencyClass::Safe);
+    }
+
+    // ---------- M8 fix-first item 8 (gap 4b) — ToolPermissions::from_profile ----------
+
+    use crate::profile::{PROFILE_SCHEMA_VERSION, PermissionMode, ProfileDefinition, ProfileTools};
+
+    fn make_profile(name: &str, tools: ProfileTools) -> ProfileDefinition {
+        ProfileDefinition {
+            name: name.to_string(),
+            version: PROFILE_SCHEMA_VERSION,
+            tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_allow_all_tools_when_profile_uses_default_filter() {
+        // Default profile filter must remain pass-through so today's
+        // `coding` profile path keeps allowing every registered tool.
+        let profile = make_profile("default", ProfileTools::Default);
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("read_file"));
+        assert!(permissions.is_tool_allowed("shell"));
+        assert!(permissions.is_tool_allowed("anything_else"));
+    }
+
+    #[test]
+    fn should_deny_listed_tools_when_profile_uses_deny_list() {
+        // DenyList must block the named tools while leaving everything else
+        // permitted. Plain tool names match exactly.
+        let profile = make_profile(
+            "no-shell",
+            ProfileTools::DenyList {
+                tools: vec!["shell".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(
+            !permissions.is_tool_allowed("shell"),
+            "shell must be denied"
+        );
+        assert!(permissions.is_tool_allowed("read_file"));
+    }
+
+    #[test]
+    fn should_only_allow_listed_tools_when_profile_uses_allow_list() {
+        // AllowList must restrict to only the named tools (everything else
+        // becomes implicitly denied). Tools outside the list lose.
+        let profile = make_profile(
+            "ro",
+            ProfileTools::AllowList {
+                tools: vec!["read_file".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("read_file"));
+        assert!(
+            !permissions.is_tool_allowed("shell"),
+            "non-allow-listed tools must be denied"
+        );
+        assert!(!permissions.is_tool_allowed("write_file"));
+    }
+
+    #[test]
+    fn should_expand_group_references_in_deny_list() {
+        // `group:fs` references must expand to read_file / write_file /
+        // edit_file / diff_edit per crate::tools::policy::TOOL_GROUPS so
+        // the runtime gate matches the registry filter.
+        let profile = make_profile(
+            "no-fs",
+            ProfileTools::DenyList {
+                tools: vec!["group:fs".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(!permissions.is_tool_allowed("read_file"));
+        assert!(!permissions.is_tool_allowed("write_file"));
+        assert!(!permissions.is_tool_allowed("edit_file"));
+        assert!(!permissions.is_tool_allowed("diff_edit"));
+        // Non-fs tools still permitted.
+        assert!(permissions.is_tool_allowed("shell"));
+    }
+
+    #[test]
+    fn should_expand_group_references_in_allow_list() {
+        // `group:search` allows glob/grep/list_dir; everything else is
+        // implicitly denied.
+        let profile = make_profile(
+            "search-only",
+            ProfileTools::AllowList {
+                tools: vec!["group:search".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("glob"));
+        assert!(permissions.is_tool_allowed("grep"));
+        assert!(permissions.is_tool_allowed("list_dir"));
+        assert!(!permissions.is_tool_allowed("shell"));
+        assert!(!permissions.is_tool_allowed("read_file"));
+    }
+
+    #[test]
+    fn should_pass_through_when_allow_list_is_empty() {
+        // Empty allow list mirrors the registry filter behaviour: an empty
+        // allow list is a degenerate case that we treat as "no filter" (the
+        // explicit deny list is the right tool to disable everything).
+        let profile = make_profile("empty-allow", ProfileTools::AllowList { tools: Vec::new() });
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("anything"));
+    }
+
+    #[test]
+    fn should_record_permission_mode_from_profile() {
+        // The mode field is informational today; verify it survives the
+        // from_profile boundary so future tier rules can read it.
+        let profile = ProfileDefinition {
+            name: "restricted".to_string(),
+            version: PROFILE_SCHEMA_VERSION,
+            permissions: PermissionMode::Restricted,
+            ..Default::default()
+        };
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert_eq!(permissions.mode(), PermissionMode::Restricted);
+    }
+
+    #[test]
+    fn default_tool_permissions_remain_allow_all() {
+        // Ensure the existing zero-value default keeps its allow-all
+        // semantics so unrelated tests/contexts do not regress.
+        let permissions = ToolPermissions::default();
+        assert!(permissions.is_tool_allowed("anything"));
+        assert!(permissions.is_tool_allowed("shell"));
     }
 }

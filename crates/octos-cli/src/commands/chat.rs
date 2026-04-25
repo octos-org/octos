@@ -335,16 +335,56 @@ impl ChatCommand {
             }
         };
 
+        // M8 fix-first item 8 (gap 4a): hard-validate the resolved profile's
+        // referenced agent ids against the loaded `AgentDefinitions`
+        // registry before bootstrapping. The validator helper has been
+        // present since M8.5 but bootstrap never invoked it; an unknown
+        // agent id silently let `spawn` succeed with a missing manifest.
+        // Bootstrap is the right place to fail fast on this.
+        profile
+            .validate_against_registry(&agent_definitions)
+            .wrap_err("profile references missing agent_definition ids")?;
+
         // M8.3: share the resolved profile with the Agent so downstream
         // code can introspect the envelope. The tool filter has already
         // been applied above.
         let profile_arc = Arc::new(profile);
+
+        // M8 fix-first item 8 (gap 1): the M8.4 FileStateCache helper
+        // exists and is consumed by file tools, but bootstrap never built
+        // an instance for the real chat agent. Construct one here so
+        // foreground reads short-circuit on unchanged files and the
+        // hand-off from `seed_from_replacement_refs` (M8.6) lands in a
+        // live cache.
+        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
+
+        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
+        // and AgentSummaryGenerator into the real chat agent. Without
+        // this the spawn_only background branch silently skips disk
+        // routing and the periodic summary watcher.
+        let subagent_output_root = data_dir.join("subagent-outputs");
+        let subagent_output_router =
+            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
+        // Dereference the Arc<TaskSupervisor> the registry hands back so
+        // `AgentSummaryGenerator::new` (which takes `TaskSupervisor` by
+        // value, leveraging its Clone impl that shares the inner state)
+        // gets a handle aliasing the same supervisor the registry uses.
+        let supervisor_for_summary = (*tools.supervisor()).clone();
+        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
+            llm.clone(),
+            subagent_output_router.clone(),
+            supervisor_for_summary,
+        ));
+
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
             .with_shutdown(shutdown.clone())
             .with_agent_definitions(agent_definitions)
-            .with_profile(profile_arc.clone());
+            .with_profile(profile_arc.clone())
+            .with_file_state_cache(file_state_cache)
+            .with_subagent_output_router(subagent_output_router)
+            .with_subagent_summary_generator(subagent_summary_generator);
 
         // M8.3: if the profile declares a system_prompt_template, try to
         // read it relative to `~/.octos/profiles/<name>/`. The path is a

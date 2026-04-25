@@ -127,6 +127,15 @@ impl Agent {
         // shared file-state cache.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
+        // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
+        // profile envelope, derive a ToolPermissions record once per turn
+        // and clone it into every ToolContext. Today's pre-M8 default
+        // (allow-all) is preserved when no profile is set.
+        let permissions = self
+            .profile
+            .as_deref()
+            .map(crate::tools::ToolPermissions::from_profile)
+            .unwrap_or_default();
         // M8.7 wiring (item 4): hand the spawn_only background branch a
         // reference to the configured router and summary generator so it
         // can route output and start/stop watchers on real production
@@ -217,6 +226,7 @@ impl Agent {
                 // does not silently zero them out.
                 let bg_agent_definitions = agent_definitions.clone();
                 let bg_file_state_cache = file_state_cache.clone();
+                let bg_permissions = permissions.clone();
                 // M8.7 (item 4): clone the optional router/generator so
                 // the background branch can mark_terminal on completion
                 // and stop the watcher when the task is done.
@@ -248,6 +258,11 @@ impl Agent {
                         file_attachment_paths: bg_attachment_ctx.file_attachment_paths.clone(),
                         agent_definitions: bg_agent_definitions.clone(),
                         file_state_cache: bg_file_state_cache.clone(),
+                        // M8 fix-first item 8 (gap 4b): carry the
+                        // profile-derived permissions so spawn_only
+                        // background tools see the same gate the
+                        // foreground branch enforces.
+                        permissions: bg_permissions.clone(),
                         ..ToolContext::zero()
                     };
 
@@ -658,6 +673,11 @@ impl Agent {
                 // tools see the live registry/cache instead of zeros.
                 agent_definitions: agent_definitions.clone(),
                 file_state_cache: file_state_cache.clone(),
+                // M8 fix-first item 8 (gap 4b): consult the profile
+                // envelope so deny-list profiles actually block tools at
+                // the call boundary (read_file already checks
+                // ctx.permissions.is_tool_allowed).
+                permissions: permissions.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
