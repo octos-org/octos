@@ -1443,31 +1443,37 @@ async fn replay_committed_session_results(
         return Vec::new();
     };
 
+    // Collect candidate-events first WITHOUT early-returning. The previous
+    // shape returned `events` as soon as ANY candidate file resolved, even
+    // when its filtered output was empty — short-circuiting the topic-less
+    // fallback below for the case where a topic-less candidate JSONL exists
+    // but only contains user/tool-trace lines (no displayable assistant
+    // content). The fallback is the only path that surfaces a topic-bearing
+    // audio bubble to a topic-less reconnect, so we must NOT early-return on
+    // an empty candidate result.
+    let mut candidate_events: Vec<String> = Vec::new();
     for candidate in &candidates {
         if let Some(session) = session_loader.load(candidate).await {
-            let events: Vec<String> = session
-                .messages
-                .iter()
-                .enumerate()
-                .filter(|(seq, message)| {
-                    since_seq.is_none_or(|since| *seq > since)
-                        && message.role == MessageRole::Assistant
-                        && assistant_message_has_displayable_content(message)
-                })
-                .map(|(seq, message)| {
+            for (seq, message) in session.messages.iter().enumerate() {
+                let passes = since_seq.is_none_or(|since| seq > since)
+                    && message.role == MessageRole::Assistant
+                    && assistant_message_has_displayable_content(message);
+                if !passes {
+                    continue;
+                }
+                candidate_events.push(
                     build_session_result_event_from_message(
                         message_info_from_history_message(message, &data_dir, seq),
                         topic,
                     )
-                    .to_string()
-                })
-                .collect();
-            if events.is_empty() {
-                record_replay("session_result", "empty", 1);
-            } else {
-                record_replay("session_result", "emitted", events.len());
+                    .to_string(),
+                );
             }
-            return events;
+            // Stop at the first resolved candidate file even if it produced
+            // zero displayable events — we do not want to layer multiple
+            // candidate JSONLs on top of each other; the fallback below
+            // handles the topic-less union case explicitly.
+            break;
         }
     }
 
@@ -1476,15 +1482,14 @@ async fn replay_committed_session_results(
     // without a topic, none of the topic-less candidates above resolves to
     // that file. Scan every per-user JSONL for these candidates' base_keys
     // and union the assistant messages so the audio bubble re-materialises.
+    let mut fallback_events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
     if topic.is_none() {
-        let mut scanned: Vec<String> = Vec::new();
-        let mut events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+        let mut scanned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for candidate in &candidates {
             let base_key = candidate.base_key();
-            if scanned.iter().any(|seen| seen == base_key) {
+            if !scanned.insert(base_key.to_string()) {
                 continue;
             }
-            scanned.push(base_key.to_string());
             for topic_key in session_loader.list_user_session_keys(base_key) {
                 if topic_key.topic().is_none() {
                     continue; // already covered by candidate-load above
@@ -1494,8 +1499,16 @@ async fn replay_committed_session_results(
                 };
                 let topic_str = topic_key.topic().map(str::to_string);
                 for (seq, message) in session.messages.iter().enumerate() {
-                    let passes = since_seq.is_none_or(|since| seq > since)
-                        && message.role == MessageRole::Assistant
+                    // NOTE: we deliberately do NOT apply `since_seq` here.
+                    // `since_seq` is a per-watcher cursor measured against the
+                    // unified replay sequence — comparing it to a per-file
+                    // index is the wrong axis (a cursor of 5 must NOT mean
+                    // "skip 5 messages of EACH topic file"). The fallback's
+                    // job is to re-materialise spawn_only file deliveries on
+                    // a topic-less reconnect; tracking per-file cursors is
+                    // meaningless here and was silently dropping legitimate
+                    // assistant rows.
+                    let passes = message.role == MessageRole::Assistant
                         && assistant_message_has_displayable_content(message);
                     if !passes {
                         continue;
@@ -1505,16 +1518,35 @@ async fn replay_committed_session_results(
                         topic_str.as_deref(),
                     )
                     .to_string();
-                    events.push((message.timestamp, payload));
+                    fallback_events.push((message.timestamp, payload));
                 }
             }
         }
-        if !events.is_empty() {
-            events.sort_by_key(|(timestamp, _)| *timestamp);
-            let payloads: Vec<String> = events.into_iter().map(|(_, payload)| payload).collect();
-            record_replay("session_result", "emitted_topic_fallback", payloads.len());
-            return payloads;
-        }
+    }
+
+    if !candidate_events.is_empty() && !fallback_events.is_empty() {
+        // Both branches produced events — concatenate, candidate first then
+        // fallback (sorted by timestamp). This is rare (it would require a
+        // displayable-message topic-less candidate AND a populated topic
+        // file under the same base_key) but we must still surface both.
+        fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
+        let mut combined = candidate_events;
+        combined.extend(fallback_events.into_iter().map(|(_, payload)| payload));
+        record_replay("session_result", "emitted_with_topic_fallback", combined.len());
+        return combined;
+    }
+
+    if !candidate_events.is_empty() {
+        record_replay("session_result", "emitted", candidate_events.len());
+        return candidate_events;
+    }
+
+    if !fallback_events.is_empty() {
+        fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> =
+            fallback_events.into_iter().map(|(_, payload)| payload).collect();
+        record_replay("session_result", "emitted_topic_fallback", payloads.len());
+        return payloads;
     }
 
     record_replay("session_result", "missing_session", 1);
@@ -2830,6 +2862,184 @@ mod tests {
             media[0].as_str().unwrap_or_default().starts_with("pf/"),
             "audio path must be projected through the profile-relative file handle so the web client can fetch it"
         );
+    }
+
+    #[tokio::test]
+    async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
+        // Regression for the topic-less-fallback short-circuit bug.
+        //
+        // When a topic-less candidate JSONL exists on disk but contains zero
+        // displayable assistant messages (only user lines, or only tool-trace
+        // assistant entries with empty content), the candidate-load early-
+        // returned with `events = []` BEFORE the topic-less per-user fallback
+        // ran. As a result the audio bubble committed under a topic-bearing
+        // file was never surfaced to a topic-less reconnect.
+        //
+        // Post-fix: the fallback path runs whenever the candidate-load returned
+        // empty content (vs returned a Some(session) with displayable rows). A
+        // populated topic-bearing per-user JSONL must surface even when an
+        // empty topic-less per-user file co-exists for the same base_key.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less per-user JSONL: exists, but only contains a user line —
+        // zero displayable assistant content.
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "fallback-chat",
+            None,
+        );
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topicless_key,
+            Message::user("hello — no assistant response yet on this branch"),
+        )
+        .await;
+
+        // Topic-bearing per-user JSONL: holds the actually-committed audio
+        // bubble that the topic-less reconnect must replay.
+        let topic = "site astro";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "fallback-chat",
+            Some(topic),
+        );
+        let mp3 = data_dir.path().join("audio").join("fallback.mp3");
+        std::fs::create_dir_all(mp3.parent().unwrap()).unwrap();
+        std::fs::write(&mp3, b"mp3 bytes").unwrap();
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topic_key,
+            Message {
+                role: MessageRole::Assistant,
+                content: "✓ topic-bearing audio bubble committed under topic JSONL".into(),
+                media: vec![mp3.to_string_lossy().into_owned()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed =
+            replay_committed_session_results(&state, "fallback-chat", None, None).await;
+        let topic_event = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .find(|payload| {
+                payload["message"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("topic-bearing audio bubble"))
+            });
+        assert!(
+            topic_event.is_some(),
+            "topic-less reconnect must reach the per-user fallback when the \
+             candidate topic-less JSONL is empty — the early `return events;` \
+             in the candidate-load loop short-circuited the fallback and the \
+             topic-bearing audio bubble silently disappeared"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_less_fallback_does_not_strip_messages_via_per_file_seq() {
+        // Regression for the wrong-axis `since_seq` filter in the topic-less
+        // fallback. Pre-fix, `since_seq` was compared against per-file
+        // `enumerate()` positions inside EACH topic JSONL independently — a
+        // watcher cursor of N meant "skip N messages of every topic file"
+        // instead of "skip the first N messages in the unified replay".
+        // For any topic file with > N messages this either wrongly stripped
+        // legitimate later assistant rows or wrongly let early rows through.
+        //
+        // Post-fix, the fallback path drops the per-file `since_seq` filter
+        // entirely. The fallback only runs on a topic-less reconnect — that
+        // is, the watcher has no unified cursor against which a per-file
+        // index could be measured. Tracking it was meaningless. We pin the
+        // contract: with `since_seq=Some(N)` the fallback still emits every
+        // displayable assistant message regardless of position in its file.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less per-user JSONL is empty so the candidate-load returns
+        // no events; the fallback is the only path that surfaces the audio
+        // bubbles below.
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "long-topic-chat",
+            None,
+        );
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topicless_key,
+            Message::user("kick off the topic"),
+        )
+        .await;
+
+        // Topic-bearing per-user JSONL with many displayable assistant rows.
+        // Pre-fix, with `since_seq=Some(5)` the fallback would silently strip
+        // rows 0..=5 from the topic file's per-file index (so messages 0-5
+        // would be dropped).
+        let topic = "long-topic";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "long-topic-chat",
+            Some(topic),
+        );
+        for n in 0..20usize {
+            actor_persist_to_per_user(
+                data_dir.path(),
+                &topic_key,
+                Message::assistant(format!("topic answer {n}")),
+            )
+            .await;
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed =
+            replay_committed_session_results(&state, "long-topic-chat", Some(5), None).await;
+        let recovered: std::collections::HashSet<String> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| {
+                payload["message"]["content"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        for n in 0..20usize {
+            let expected = format!("topic answer {n}");
+            assert!(
+                recovered.contains(&expected),
+                "fallback must surface every displayable assistant message in \
+                 a topic file regardless of `since_seq` (a per-watcher cursor \
+                 measured against the unified replay, NOT the per-file index). \
+                 Missing: `{expected}`"
+            );
+        }
     }
 
     #[tokio::test]
