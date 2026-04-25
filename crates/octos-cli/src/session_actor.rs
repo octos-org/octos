@@ -136,6 +136,72 @@ async fn persist_assistant_message(
     }
 }
 
+/// Read the optional `client_message_id` field from an InboundMessage's
+/// metadata. Empty strings count as absent so the wire schema stays simple
+/// for clients that always populate the field.
+fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
+    inbound
+        .metadata
+        .get("client_message_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Emit a `session_result` outbound event so the api channel can broadcast a
+/// `{message_role: "user", historySeq: K, client_message_id: ...}` payload to
+/// the web client. The client uses this to stamp the authoritative seq onto
+/// the optimistic user bubble it created before sending the request.
+///
+/// No-op outside the API channel — other channels neither produce optimistic
+/// bubbles nor consume `session_result` events.
+async fn broadcast_user_message_session_result(
+    session_actor: &SessionActor,
+    persisted_user_content: &str,
+    media: &[String],
+    client_message_id: Option<&str>,
+    user_seq: usize,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    if session_actor.channel != "api" {
+        return;
+    }
+    let topic = session_actor.session_key.topic();
+    let mut session_result = serde_json::json!({
+        "seq": user_seq,
+        "role": "user",
+        "content": persisted_user_content,
+        "timestamp": timestamp.to_rfc3339(),
+        "media": media,
+    });
+    if let Some(cmid) = client_message_id {
+        session_result.as_object_mut().expect("json object").insert(
+            "client_message_id".to_string(),
+            serde_json::Value::String(cmid.to_string()),
+        );
+    }
+    let metadata = serde_json::json!({
+        "topic": topic,
+        "_history_persisted": true,
+        "_session_result": session_result,
+    });
+
+    let _ = send_outbound_with_timeout(
+        &session_actor.session_key,
+        &session_actor.out_tx,
+        OutboundMessage {
+            channel: session_actor.channel.clone(),
+            chat_id: session_actor.chat_id.clone(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata,
+        },
+        "user_message_session_result",
+    )
+    .await;
+}
+
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -3206,6 +3272,7 @@ impl SessionActor {
             }
         };
 
+        let client_message_id = inbound_client_message_id(inbound);
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content.to_string(),
@@ -3213,17 +3280,37 @@ impl SessionActor {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: client_message_id.clone(),
             timestamp: chrono::Utc::now(),
         };
-        {
+        let user_msg_timestamp = user_msg.timestamp;
+        let user_seq = {
             let mut handle = self.session_handle.lock().await;
             let session = handle.get_or_create();
             if session.summary.is_none() && !persisted_user_content.trim().is_empty() {
                 session.summary = Some(persisted_user_content.chars().take(100).collect());
             }
-            if let Err(error) = handle.add_message(user_msg).await {
-                warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+            match handle.add_message_with_seq(user_msg).await {
+                Ok(seq) => Some(seq),
+                Err(error) => {
+                    warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+                    None
+                }
             }
+        };
+
+        // Same as the speculative path — let the web client correlate the
+        // optimistic bubble against the persisted seq.
+        if let Some(seq) = user_seq {
+            broadcast_user_message_session_result(
+                self,
+                persisted_user_content,
+                &[],
+                client_message_id.as_deref(),
+                seq,
+                user_msg_timestamp,
+            )
+            .await;
         }
 
         let ack_content = workflow_ack;
@@ -3341,6 +3428,9 @@ impl SessionActor {
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
+        let client_message_id = inbound_client_message_id(&inbound);
+        let persisted_user_content_for_event = persisted_user_content.clone();
+        let user_media_for_event = image_media.clone();
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content,
@@ -3348,9 +3438,11 @@ impl SessionActor {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: client_message_id.clone(),
             timestamp: chrono::Utc::now(),
         };
-        {
+        let user_msg_timestamp = user_msg.timestamp;
+        let user_seq = {
             let mut handle = self.session_handle.lock().await;
             // Auto-generate summary from first user message
             {
@@ -3360,7 +3452,23 @@ impl SessionActor {
                     session.summary = Some(summary);
                 }
             }
-            let _ = handle.add_message(user_msg).await;
+            handle.add_message_with_seq(user_msg).await.ok()
+        };
+
+        // Broadcast a user-message session_result event so the web client can
+        // stamp the authoritative `historySeq` onto its optimistic bubble. The
+        // event is correlated by `client_message_id`. No-op for non-API
+        // channels (telegram/etc don't render optimistic bubbles).
+        if let Some(seq) = user_seq {
+            broadcast_user_message_session_result(
+                self,
+                &persisted_user_content_for_event,
+                &user_media_for_event,
+                client_message_id.as_deref(),
+                seq,
+                user_msg_timestamp,
+            )
+            .await;
         }
 
         // Get conversation history (now includes the user message we just saved)
@@ -3800,6 +3908,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -4090,6 +4199,7 @@ impl SessionActor {
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
+        let overflow_client_message_id = inbound_client_message_id(msg);
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -4100,11 +4210,50 @@ impl SessionActor {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: overflow_client_message_id.clone(),
                 timestamp: chrono::Utc::now(),
             };
-            {
+            let user_msg_timestamp = user_msg.timestamp;
+            let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
-                let _ = handle.add_message(user_msg).await;
+                handle.add_message_with_seq(user_msg).await.ok()
+            };
+
+            // Same channel-side broadcast for overflow user messages.
+            if channel == "api" {
+                if let Some(seq) = user_seq_for_overflow {
+                    let mut session_result = serde_json::json!({
+                        "seq": seq,
+                        "role": "user",
+                        "content": content.clone(),
+                        "timestamp": user_msg_timestamp.to_rfc3339(),
+                        "media": Vec::<String>::new(),
+                    });
+                    if let Some(cmid) = overflow_client_message_id.as_deref() {
+                        session_result.as_object_mut().expect("json object").insert(
+                            "client_message_id".to_string(),
+                            serde_json::Value::String(cmid.to_string()),
+                        );
+                    }
+                    let _ = send_outbound_with_timeout(
+                        &session_key,
+                        &out_tx,
+                        OutboundMessage {
+                            channel: channel.clone(),
+                            chat_id: chat_id.clone(),
+                            content: String::new(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({
+                                "topic": session_key.topic(),
+                                "_history_persisted": true,
+                                "_session_result": session_result,
+                            }),
+                        },
+                        "user_message_session_result_overflow",
+                    )
+                    .await;
+                }
             }
 
             let history: Vec<Message> = history;
@@ -4224,6 +4373,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         let _ = handle.add_message(final_reply).await;
@@ -4577,6 +4727,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {

@@ -1675,6 +1675,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -2501,6 +2502,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: newer,
                 })
                 .unwrap()
@@ -2529,6 +2531,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: older,
                 })
                 .unwrap()
@@ -2727,6 +2730,34 @@ mod tests {
         assert_eq!(handle.get_history(10).len(), 2);
     }
 
+    #[tokio::test]
+    async fn add_message_preserves_client_message_id_through_jsonl_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-cmid-test");
+
+        // First handle: persist a user message tagged with a client_message_id.
+        {
+            let mut handle = SessionHandle::open(tmp.path(), &key);
+            let user_msg = Message::user("hi there").with_client_message_id("cmid-xyz");
+            let seq = handle.add_message_with_seq(user_msg).await.unwrap();
+            assert_eq!(seq, 0);
+        }
+
+        // Reopen the handle: it should reload from JSONL and the
+        // client_message_id field must survive the disk round-trip.
+        {
+            let handle = SessionHandle::open(tmp.path(), &key);
+            let history = handle.get_history(10);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].content, "hi there");
+            assert_eq!(
+                history[0].client_message_id.as_deref(),
+                Some("cmid-xyz"),
+                "client_message_id must survive append-and-reload"
+            );
+        }
+    }
+
     #[test]
     fn test_session_handle_task_state_path_uses_sidecar_file() {
         let tmp = TempDir::new().unwrap();
@@ -2780,6 +2811,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         });
         handle.session.messages.push(Message {
@@ -2789,6 +2821,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         });
 
@@ -2912,6 +2945,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         });
 

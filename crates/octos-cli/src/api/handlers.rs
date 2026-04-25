@@ -45,6 +45,11 @@ pub struct ChatRequest {
     pub media: Vec<String>,
     #[serde(default)]
     pub attach_only: bool,
+    /// Client-supplied UUID propagated onto the persisted user `Message` so
+    /// the matching `session_result` event lets the web client stamp the
+    /// authoritative `historySeq` onto its optimistic bubble.
+    #[serde(default)]
+    pub client_message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,6 +206,7 @@ pub async fn chat(
             &req.media,
             req.attach_only,
             req.stream,
+            req.client_message_id.as_deref(),
         )
         .await;
     }
@@ -364,8 +370,11 @@ async fn chat_streaming(
 
     let message = req.message;
     let media = req.media;
+    let client_message_id = req.client_message_id;
+    let topic_for_event = req.topic.clone();
 
     // Spawn the agent task
+    let user_event_tx = tx.clone();
     tokio::spawn(async move {
         let result = request_agent
             .process_message(&message, &history, media)
@@ -381,11 +390,71 @@ async fn chat_streaming(
                 );
 
                 // Save all conversation messages (user, assistant iterations, tool calls/results)
+                let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
                 {
                     let mut sess = sessions.lock().await;
+                    let mut user_persisted = false;
                     for msg in &response.messages {
-                        let _ = sess.add_message(&session_key, msg.clone()).await;
+                        // Tag the first user message with the client-supplied
+                        // id so the persisted row carries it through the JSONL
+                        // round-trip. Capture the committed seq so the SSE
+                        // bridge can correlate it back to the optimistic
+                        // bubble.
+                        let mut to_save = msg.clone();
+                        if !user_persisted && msg.role == MessageRole::User {
+                            user_persisted = true;
+                            if let Some(ref cmid) = client_message_id {
+                                if !cmid.is_empty() {
+                                    to_save.client_message_id = Some(cmid.clone());
+                                }
+                            }
+                            let timestamp = to_save.timestamp.to_rfc3339();
+                            let content_for_event = to_save.content.clone();
+                            match sess.add_message_with_seq(&session_key, to_save).await {
+                                Ok(seq) => {
+                                    user_message_seq_and_meta =
+                                        Some((seq, content_for_event, timestamp));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        error = %error,
+                                        "chat: failed to persist user message"
+                                    );
+                                }
+                            }
+                        } else {
+                            let _ = sess.add_message(&session_key, to_save).await;
+                        }
                     }
+                }
+
+                // Emit a user-message session_result event so the web client
+                // can stamp the authoritative seq onto its optimistic bubble.
+                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
+                    let mut message_payload = serde_json::json!({
+                        "seq": seq,
+                        "role": "user",
+                        "content": content,
+                        "timestamp": timestamp,
+                    });
+                    if let Some(ref cmid) = client_message_id {
+                        if !cmid.is_empty() {
+                            message_payload
+                                .as_object_mut()
+                                .expect("json object")
+                                .insert(
+                                    "client_message_id".to_string(),
+                                    serde_json::Value::String(cmid.clone()),
+                                );
+                        }
+                    }
+                    let event = serde_json::json!({
+                        "type": "session_result",
+                        "topic": topic_for_event,
+                        "message": message_payload,
+                    });
+                    let _ = user_event_tx.send(event.to_string());
                 }
 
                 // Send final done event (field names match what octos-web expects)

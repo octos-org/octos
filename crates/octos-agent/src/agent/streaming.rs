@@ -273,6 +273,7 @@ impl Agent {
             },
             tool_call_id: None,
             reasoning_content: response.reasoning_content.clone(),
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
