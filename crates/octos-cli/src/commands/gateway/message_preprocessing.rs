@@ -62,6 +62,19 @@ pub async fn process_media(
                                 serde_json::Value::String(text.clone()),
                             );
                         }
+                        // Emit a discrete `file` SSE event so web clients can
+                        // render an audio bubble with the transcript caption.
+                        // Non-SSE channels (Telegram, Matrix, etc.) treat
+                        // `send_raw_sse` as a no-op via the trait default.
+                        emit_transcript_bubble(
+                            channel_mgr,
+                            &inbound.channel,
+                            &inbound.chat_id,
+                            &resolved_path,
+                            &attachment_display_name(path),
+                            &text,
+                        )
+                        .await;
                         inbound.content = merge_transcript_into_content(&inbound.content, &text);
                     }
                     Err(e) => warn!("transcription failed: {e}"),
@@ -151,6 +164,30 @@ fn merge_transcript_into_content(existing: &str, transcript: &str) -> String {
     } else {
         format!("Transcribed audio:\n{transcript}\n\n{existing}")
     }
+}
+
+/// Emit a discrete `file` SSE event so SSE-aware clients (e.g. the web UI)
+/// render the transcribed audio as a separate bubble with the transcript as
+/// caption. Channels without SSE support no-op via `Channel::send_raw_sse`'s
+/// default implementation.
+async fn emit_transcript_bubble(
+    channel_mgr: &ChannelManager,
+    channel_name: &str,
+    chat_id: &str,
+    resolved_path: &str,
+    filename: &str,
+    transcript: &str,
+) {
+    let Some(channel) = channel_mgr.get_channel(channel_name) else {
+        return;
+    };
+    let event = serde_json::json!({
+        "type": "file",
+        "path": resolved_path,
+        "filename": filename,
+        "caption": format!("Transcribed:\n{transcript}"),
+    });
+    let _ = channel.send_raw_sse(chat_id, &event.to_string()).await;
 }
 
 fn attachment_display_name(path: &str) -> String {
@@ -296,7 +333,13 @@ async fn transcribe_via_skill(voice_binary: &Path, input_json: &str) -> eyre::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
+    use eyre::Result;
+    use octos_bus::Channel;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio::sync::mpsc;
 
     fn inbound_with_media(content: &str, media: Vec<&str>) -> InboundMessage {
         InboundMessage {
@@ -308,6 +351,48 @@ mod tests {
             media: media.into_iter().map(|path| path.to_string()).collect(),
             metadata: serde_json::json!({}),
             message_id: None,
+        }
+    }
+
+    /// Captured `(chat_id, json)` pairs from a `RecordingChannel`.
+    type CapturedSseEvents = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Test channel that records `send_raw_sse` payloads for assertion.
+    struct RecordingChannel {
+        name: String,
+        sse_events: CapturedSseEvents,
+    }
+
+    impl RecordingChannel {
+        fn new(name: &str) -> (Self, CapturedSseEvents) {
+            let events: CapturedSseEvents = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    name: name.to_string(),
+                    sse_events: Arc::clone(&events),
+                },
+                events,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn start(&self, _inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &OutboundMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn send_raw_sse(&self, chat_id: &str, json: &str) -> Result<()> {
+            self.sse_events
+                .lock()
+                .await
+                .push((chat_id.to_string(), json.to_string()));
+            Ok(())
         }
     }
 
@@ -380,5 +465,129 @@ mod tests {
             merge_transcript_into_content("", "hello world"),
             "hello world"
         );
+    }
+
+    #[tokio::test]
+    async fn emit_transcript_bubble_emits_file_event_with_caption() {
+        let (channel, events) = RecordingChannel::new("api");
+        let mut mgr = ChannelManager::new();
+        mgr.register(Arc::new(channel));
+
+        emit_transcript_bubble(
+            &mgr,
+            "api",
+            "chat-7",
+            "/tmp/uploads/voice-note.ogg",
+            "voice-note.ogg",
+            "hello world",
+        )
+        .await;
+
+        let captured = events.lock().await.clone();
+        assert_eq!(captured.len(), 1, "expected exactly one SSE event");
+        let (chat_id, payload) = &captured[0];
+        assert_eq!(chat_id, "chat-7");
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload).expect("SSE payload must be valid JSON");
+        assert_eq!(parsed["type"], "file");
+        assert_eq!(parsed["path"], "/tmp/uploads/voice-note.ogg");
+        assert_eq!(parsed["filename"], "voice-note.ogg");
+        assert_eq!(parsed["caption"], "Transcribed:\nhello world");
+    }
+
+    #[tokio::test]
+    async fn emit_transcript_bubble_is_no_op_when_channel_missing() {
+        let mgr = ChannelManager::new();
+        // Should not panic or error when no channel is registered.
+        emit_transcript_bubble(&mgr, "api", "chat-1", "/tmp/uploads/x.ogg", "x.ogg", "text").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_media_emits_transcript_bubble_event_after_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let asr_bin = dir.path().join("fake_asr.sh");
+        // Stub ASR binary: reads stdin, returns the contract JSON.
+        std::fs::write(
+            &asr_bin,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"success\":true,\"output\":\"hello world\"}\\n'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&asr_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&asr_bin, perms).unwrap();
+
+        let audio_path = dir.path().join("voice-note.ogg");
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let audio_str = audio_path.to_string_lossy().to_string();
+
+        let (channel, events) = RecordingChannel::new("api");
+        let mut mgr = ChannelManager::new();
+        mgr.register(Arc::new(channel));
+
+        let mut inbound = inbound_with_media("Please answer", vec![audio_str.as_str()]);
+        let _ = process_media(&mut inbound, Some(asr_bin.as_path()), None, &mgr).await;
+
+        let captured = events.lock().await.clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly one SSE event (the transcript bubble)"
+        );
+        let (chat_id, payload) = &captured[0];
+        assert_eq!(chat_id, "chat-1");
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["type"], "file");
+        assert_eq!(parsed["filename"], "voice-note.ogg");
+        assert_eq!(parsed["caption"], "Transcribed:\nhello world");
+
+        // Inlined transcript behavior is preserved.
+        assert!(
+            inbound.content.contains("hello world"),
+            "transcript should still be inlined: got {:?}",
+            inbound.content
+        );
+        assert_eq!(
+            inbound.metadata.get("voice_transcript"),
+            Some(&serde_json::Value::String("hello world".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_transcript_bubble_no_op_for_non_sse_channel() {
+        // A channel that does not override `send_raw_sse` should silently
+        // accept the call (default trait impl returns Ok(())).
+        struct PlainChannel {
+            name: String,
+        }
+        #[async_trait]
+        impl Channel for PlainChannel {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            async fn start(&self, _: mpsc::Sender<InboundMessage>) -> Result<()> {
+                Ok(())
+            }
+            async fn send(&self, _: &OutboundMessage) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut mgr = ChannelManager::new();
+        mgr.register(Arc::new(PlainChannel {
+            name: "telegram".into(),
+        }));
+        // No assertion needed beyond not panicking.
+        emit_transcript_bubble(
+            &mgr,
+            "telegram",
+            "chat-1",
+            "/tmp/uploads/x.ogg",
+            "x.ogg",
+            "text",
+        )
+        .await;
     }
 }
