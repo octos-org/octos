@@ -299,6 +299,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 2. User: multi-part request
@@ -311,6 +312,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 3. Assistant: parallel tool calls with EMPTY content (the problematic pattern)
@@ -341,6 +343,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             ]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 4. Tool result: weather
@@ -364,6 +367,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: Some("call_weather_001".to_string()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 5. Tool result: search
@@ -388,6 +392,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: Some("call_search_001".to_string()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 6. User: follow-up that requires synthesizing both results
@@ -400,6 +405,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 7. Assistant: another tool call with empty content
@@ -421,6 +427,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 8. Tool result: task created
@@ -437,6 +444,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: Some("call_task_001".to_string()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
         // 9. User: final follow-up to get a response
@@ -449,6 +457,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         },
     ]

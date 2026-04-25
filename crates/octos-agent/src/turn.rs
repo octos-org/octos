@@ -69,6 +69,7 @@ impl Turn {
                 media: vec![],
                 tool_calls: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: chrono::Utc::now(),
             },
             kind: TurnKind::ToolResult {
@@ -97,6 +98,7 @@ impl Turn {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: chrono::Utc::now(),
             },
             kind: TurnKind::SystemReminder,

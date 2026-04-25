@@ -657,6 +657,7 @@ impl CompactionRunner {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
         );
@@ -944,6 +945,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -956,6 +958,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -973,6 +976,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -985,6 +989,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(tool_id.to_string()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -997,6 +1002,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -1056,6 +1062,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }];
 
@@ -1151,6 +1158,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
         let summary = summarize_message(&msg, &[]);

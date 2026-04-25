@@ -611,6 +611,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         }
     }
@@ -623,6 +624,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
         }
     }
@@ -645,6 +647,7 @@ mod tests {
             ),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
         }
     }
@@ -657,6 +660,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 3).unwrap(),
         }
     }
@@ -669,6 +673,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: Some(reasoning.into()),
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 4).unwrap(),
         }
     }
@@ -681,6 +686,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 5).unwrap(),
         }
     }

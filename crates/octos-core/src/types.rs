@@ -66,6 +66,13 @@ pub struct Message {
     /// Reasoning/thinking content from thinking models (kimi-k2.5, o1, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Optional client-supplied UUID used to correlate optimistic UI bubbles
+    /// to the server-assigned sequence (`historySeq`). Plumbed end-to-end
+    /// through `add_message_with_seq` and the `session_result` event so the
+    /// web client can stamp the authoritative seq onto the right bubble
+    /// without a backfill round-trip. Legacy persisted rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -79,6 +86,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -92,6 +100,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -105,8 +114,17 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
+    }
+
+    /// Attach a client-supplied UUID used by the web/runtime client to
+    /// correlate optimistic message bubbles back to the persisted seq.
+    #[must_use]
+    pub fn with_client_message_id(mut self, client_message_id: impl Into<String>) -> Self {
+        self.client_message_id = Some(client_message_id.into());
+        self
     }
 }
 
@@ -304,6 +322,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -314,6 +333,33 @@ mod tests {
         assert!(!json.contains("tool_calls"));
         // empty media should be skipped
         assert!(!json.contains("media"));
+        // client_message_id should be skipped when None for forward compat
+        assert!(!json.contains("client_message_id"));
+    }
+
+    #[test]
+    fn message_round_trips_client_message_id_when_present() {
+        let msg = Message::user("hi").with_client_message_id("cmid-abc");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("client_message_id"));
+        assert!(json.contains("cmid-abc"));
+
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.client_message_id.as_deref(), Some("cmid-abc"));
+    }
+
+    #[test]
+    fn message_deserializes_legacy_jsonl_without_client_message_id() {
+        // Legacy persisted rows pre-dating this field MUST still parse so
+        // existing JSONL files don't break the runtime on reload.
+        let legacy = r#"{
+            "role": "user",
+            "content": "hi",
+            "timestamp": "2026-04-24T00:00:00Z"
+        }"#;
+        let msg: Message = serde_json::from_str(legacy).unwrap();
+        assert!(msg.client_message_id.is_none());
+        assert_eq!(msg.content, "hi");
     }
 
     #[test]

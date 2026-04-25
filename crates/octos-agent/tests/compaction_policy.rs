@@ -29,6 +29,7 @@ fn user_msg(content: &str) -> Message {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -41,6 +42,7 @@ fn assistant_msg(content: &str) -> Message {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -58,6 +60,7 @@ fn assistant_tool_call(tool_name: &str, tool_id: &str, args: serde_json::Value) 
         }]),
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -70,6 +73,7 @@ fn tool_result(tool_id: &str, content: &str) -> Message {
         tool_calls: None,
         tool_call_id: Some(tool_id.to_string()),
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -82,6 +86,7 @@ fn system_msg(content: &str) -> Message {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }

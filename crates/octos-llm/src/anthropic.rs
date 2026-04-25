@@ -506,6 +506,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -531,6 +532,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
         // Non-image media should include file paths for read_file
@@ -576,6 +578,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }];
         let config = ChatConfig::default();
