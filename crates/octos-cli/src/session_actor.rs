@@ -3681,10 +3681,17 @@ impl SessionActor {
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
+        // Persist BOTH image_media and attachment_media so future turns can
+        // re-reference uploaded audio/files. Without this, attachments only
+        // survived as TurnAttachmentContext for the current turn.
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content,
-            media: image_media.clone(),
+            media: image_media
+                .iter()
+                .chain(attachment_media.iter())
+                .cloned()
+                .collect(),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
