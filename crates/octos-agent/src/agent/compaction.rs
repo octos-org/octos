@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use super::Agent;
 use crate::compaction::CompactionPhase;
+use crate::compaction_tiered::Tier1Report;
 
 impl Agent {
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
@@ -101,6 +102,51 @@ impl Agent {
             "harness M6.3 compaction preflight fired"
         );
         self.enforce_preservation(messages, CompactionPhase::Preflight);
+    }
+
+    /// M8.5 tier 1: cheap per-turn micro-compaction.  Runs the
+    /// [`crate::compaction_tiered::MicroCompactionPolicy`] in-place across the
+    /// current message list so the next LLM request inherits placeholder-
+    /// shaped tool results instead of the original payloads. Runs only when a
+    /// [`crate::compaction_tiered::TieredCompactionRunner`] is wired.
+    ///
+    /// Callers must pass `protected_tool_call_ids` — any tool_call_id listed
+    /// there is left untouched, preserving the M6 contract-gated artifact
+    /// guarantees for pending retry buckets.
+    pub(super) fn run_tier1_compaction(
+        &self,
+        messages: &mut [Message],
+        protected_tool_call_ids: &[String],
+    ) -> Tier1Report {
+        let Some(runner) = self.tiered_compaction.as_ref() else {
+            return Tier1Report::default();
+        };
+        let report = runner.run_tier1(messages, protected_tool_call_ids);
+        if report.performed() {
+            info!(
+                results_pruned = report.results_pruned,
+                bytes_reclaimed = report.bytes_reclaimed,
+                protected = protected_tool_call_ids.len(),
+                "harness M8.5 tier-1 micro-compaction fired"
+            );
+            metrics::counter!(
+                "octos_tier1_compaction_pruned_total",
+                "scope" => "tool_results".to_string(),
+            )
+            .increment(report.results_pruned as u64);
+        }
+        report
+    }
+
+    /// M8.5 tier 2: build the opaque `context_management` payload when the
+    /// attached [`crate::compaction_tiered::TieredCompactionRunner`] has the
+    /// feature enabled and the active provider speaks the Anthropic wire
+    /// format.  Call-sites merge the returned JSON into
+    /// `ChatConfig.context_management`; returning `None` means the request
+    /// should be sent untouched.
+    pub(super) fn build_tier2_context_management(&self) -> Option<serde_json::Value> {
+        let runner = self.tiered_compaction.as_ref()?;
+        runner.build_tier2_payload_for(self.llm.provider_name())
     }
 
     /// Run declarative compaction per-iteration (after M0 message prep). Only

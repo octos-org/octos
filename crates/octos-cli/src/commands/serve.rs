@@ -846,6 +846,27 @@ impl ServeCommand {
         let reporter: Arc<dyn octos_agent::ProgressReporter> =
             Arc::new(MetricsReporter::new(broadcaster));
 
+        // M8 fix-first item 8 (gap 1): give the api agent a real
+        // FileStateCache so file tools short-circuit on repeat reads.
+        // Mirrors the chat path so behaviour is identical across CLI
+        // entry points.
+        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
+
+        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
+        // and AgentSummaryGenerator so the spawn_only background branch
+        // routes output to disk and starts/stops the periodic summary
+        // watcher per task. The router is rooted under the data dir so
+        // dashboards can read the per-task tail files.
+        let subagent_output_root = data_dir.join("subagent-outputs");
+        let subagent_output_router =
+            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
+        let supervisor_for_summary = (*tools.supervisor()).clone();
+        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
+            llm.clone(),
+            subagent_output_router.clone(),
+            supervisor_for_summary,
+        ));
+
         let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
             .with_config(AgentConfig {
                 max_iterations: 20,
@@ -853,7 +874,10 @@ impl ServeCommand {
                 chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
                 ..Default::default()
             })
-            .with_reporter(reporter);
+            .with_reporter(reporter)
+            .with_file_state_cache(file_state_cache)
+            .with_subagent_output_router(subagent_output_router)
+            .with_subagent_summary_generator(subagent_summary_generator);
 
         // Inject skill prompt fragments
         for fragment in &plugin_result.prompt_fragments {

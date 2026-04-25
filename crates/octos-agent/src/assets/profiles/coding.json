@@ -1,0 +1,9 @@
+{
+  "name": "coding",
+  "version": 1,
+  "description": "Default profile — preserves today's no-flag octos chat behaviour byte-for-byte. Tools are not filtered; the M8.2 built-in sub-agents are preloaded.",
+  "tools": {"mode": "default"},
+  "mcp_servers": [],
+  "permissions": "default",
+  "agents": ["research-worker", "repo-editor"]
+}

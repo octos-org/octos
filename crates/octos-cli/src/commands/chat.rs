@@ -61,6 +61,15 @@ pub struct ChatCommand {
     /// Send a single message and exit (non-interactive mode).
     #[arg(short, long)]
     pub message: Option<String>,
+
+    /// Runtime profile to apply at startup (M8.3). Accepts a built-in name
+    /// (`coding`, `swarm`), a user-dir id under `~/.octos/profiles/<id>/`,
+    /// or an explicit path to a profile JSON/TOML file.
+    ///
+    /// Defaults to `coding` which preserves today's no-flag behaviour
+    /// byte-for-byte.
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 /// Exit commands.
@@ -162,6 +171,21 @@ impl ChatCommand {
             EpisodeStore::open(&data_dir)
                 .await
                 .wrap_err("failed to open episode store")?,
+        );
+
+        // Resolve the runtime profile (M8.3). Order:
+        //   1. --profile CLI arg, if present;
+        //   2. `~/.octos/profile` symlink, if it exists (points at a
+        //      profile name or dir);
+        //   3. fallback to the built-in `coding` profile.
+        // The resolved profile's tool filter is applied after the full
+        // registry has been assembled, preserving the existing bootstrap
+        // path (plugins, MCP, pipelines etc. all register first).
+        let (profile, profile_source_label) = resolve_profile(&self.profile)?;
+        tracing::info!(
+            "profile resolved: name={} source={}",
+            profile.name,
+            profile_source_label
         );
 
         // Create tool registry (with sandbox if configured)
@@ -274,6 +298,11 @@ impl ChatCommand {
             tools.set_provider_policy(policy);
         }
 
+        // M8.3: narrow the tool registry through the resolved profile.
+        // Runs AFTER every other filter so profile narrowing is the final
+        // envelope and `spawn_only` tools are still preserved.
+        profile.apply_to_registry(&mut tools);
+
         // Set up Ctrl+C handler
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -291,10 +320,83 @@ impl ChatCommand {
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
             ..Default::default()
         };
+        // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
+        // top of the crate-shipped built-ins (research-worker, repo-editor).
+        // Missing dirs fall back to built-ins only.
+        let agents_dir = cwd.join("agents");
+        let agent_definitions = match octos_agent::agents::AgentDefinitions::load_dir(&agents_dir) {
+            Ok(defs) => Arc::new(defs),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to load agent manifests from {}: {err}",
+                    agents_dir.display()
+                );
+                Arc::new(octos_agent::agents::AgentDefinitions::with_builtins())
+            }
+        };
+
+        // M8 fix-first item 8 (gap 4a): hard-validate the resolved profile's
+        // referenced agent ids against the loaded `AgentDefinitions`
+        // registry before bootstrapping. The validator helper has been
+        // present since M8.5 but bootstrap never invoked it; an unknown
+        // agent id silently let `spawn` succeed with a missing manifest.
+        // Bootstrap is the right place to fail fast on this.
+        profile
+            .validate_against_registry(&agent_definitions)
+            .wrap_err("profile references missing agent_definition ids")?;
+
+        // M8.3: share the resolved profile with the Agent so downstream
+        // code can introspect the envelope. The tool filter has already
+        // been applied above.
+        let profile_arc = Arc::new(profile);
+
+        // M8 fix-first item 8 (gap 1): the M8.4 FileStateCache helper
+        // exists and is consumed by file tools, but bootstrap never built
+        // an instance for the real chat agent. Construct one here so
+        // foreground reads short-circuit on unchanged files and the
+        // hand-off from `seed_from_replacement_refs` (M8.6) lands in a
+        // live cache.
+        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
+
+        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
+        // and AgentSummaryGenerator into the real chat agent. Without
+        // this the spawn_only background branch silently skips disk
+        // routing and the periodic summary watcher.
+        let subagent_output_root = data_dir.join("subagent-outputs");
+        let subagent_output_router =
+            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
+        // Dereference the Arc<TaskSupervisor> the registry hands back so
+        // `AgentSummaryGenerator::new` (which takes `TaskSupervisor` by
+        // value, leveraging its Clone impl that shares the inner state)
+        // gets a handle aliasing the same supervisor the registry uses.
+        let supervisor_for_summary = (*tools.supervisor()).clone();
+        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
+            llm.clone(),
+            subagent_output_router.clone(),
+            supervisor_for_summary,
+        ));
+
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
-            .with_shutdown(shutdown.clone());
+            .with_shutdown(shutdown.clone())
+            .with_agent_definitions(agent_definitions)
+            .with_profile(profile_arc.clone())
+            .with_file_state_cache(file_state_cache)
+            .with_subagent_output_router(subagent_output_router)
+            .with_subagent_summary_generator(subagent_summary_generator);
+
+        // M8.3: if the profile declares a system_prompt_template, try to
+        // read it relative to `~/.octos/profiles/<name>/`. The path is a
+        // hint — missing files are a warning, not an error, so profiles
+        // referring to templates that ship separately keep working.
+        if let Some(template_rel) = profile_arc.system_prompt_template.as_ref() {
+            if let Some(prompt_text) =
+                super::load_profile_prompt_template(&profile_arc.name, template_rel)
+            {
+                agent.set_system_prompt(prompt_text);
+            }
+        }
 
         // Load bootstrap files (AGENTS.md, SOUL.md, etc.) from project .octos/ directory
         let project_dir = cwd.join(".octos");
@@ -457,6 +559,68 @@ impl ChatCommand {
 
         Ok(())
     }
+}
+
+/// M8.3 — resolve the runtime profile for an `octos chat` invocation.
+///
+/// Resolution order:
+///
+/// 1. `--profile <name_or_path>` CLI arg, if present.
+/// 2. `~/.octos/profile` symlink, if it exists (its target is treated as a
+///    profile name or path using the same rules as the CLI arg).
+/// 3. Built-in `coding` profile — the behaviour-parity fallback.
+///
+/// Returns the resolved [`octos_agent::profile::ProfileDefinition`] plus a
+/// human-readable source label (`cli`, `symlink`, or `default`) suitable for
+/// inclusion in the `profile resolved: ...` log line.
+pub(crate) fn resolve_profile(
+    cli_arg: &Option<String>,
+) -> Result<(octos_agent::profile::ProfileDefinition, &'static str)> {
+    use octos_agent::profile::ProfileDefinition;
+
+    if let Some(arg) = cli_arg.as_deref() {
+        let (def, _) = ProfileDefinition::load(arg)
+            .wrap_err_with(|| format!("failed to load profile '{arg}'"))?;
+        return Ok((def, "cli"));
+    }
+
+    // `~/.octos/profile` symlink (or plain file containing a profile name).
+    // A symlink target can be either a path (dereferences normally through
+    // filesystem APIs, which `load` will then detect as a path arg) or a
+    // simple profile name if the link points at a directory under
+    // `~/.octos/profiles/`.
+    if let Some(home) = dirs::home_dir() {
+        let pointer = home.join(".octos/profile");
+        if pointer.symlink_metadata().is_ok() {
+            // Plain symlink: dereference and feed the target into `load`.
+            if let Ok(target) = std::fs::read_link(&pointer) {
+                let target_str = target.to_string_lossy().to_string();
+                if let Ok((def, _)) = ProfileDefinition::load(&target_str) {
+                    return Ok((def, "symlink"));
+                }
+                tracing::warn!(
+                    target = %target.display(),
+                    "~/.octos/profile symlink target could not be resolved; falling back to default"
+                );
+            } else if let Ok(text) = std::fs::read_to_string(&pointer) {
+                // Regular file: treat its first non-empty line as a profile name.
+                let name = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    if let Ok((def, _)) = ProfileDefinition::load(name) {
+                        return Ok((def, "symlink"));
+                    }
+                }
+            }
+        }
+    }
+
+    let (def, _) = octos_agent::profile::ProfileDefinition::load("coding")
+        .wrap_err("failed to load built-in coding profile")?;
+    Ok((def, "default"))
 }
 
 /// Find the matching provider-specific tool policy for the active model.

@@ -23,6 +23,7 @@ use octos_core::{AgentId, Message, TokenUsage};
 use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
+use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
 use crate::session::{SessionLimits, SessionUsage};
@@ -178,6 +179,38 @@ pub struct Agent {
     /// Workspace policy associated with the compaction runner (used by the
     /// post-compaction validator rail to resolve preserved artifacts).
     pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// M8.2 agent manifest registry shared with tools via `ToolContext`.
+    /// Shared behind an `Arc` so every per-tool `ToolContext::agent_definitions`
+    /// clone is O(1). When left at the default (empty registry) the agent
+    /// behaves exactly as pre-M8.2.
+    pub(super) agent_definitions: Arc<crate::agents::AgentDefinitions>,
+    /// Optional shared [`FileStateCache`] threaded into every
+    /// [`crate::tools::ToolContext`] so file tools can short-circuit
+    /// re-reads (M8.4). `None` keeps pre-M8.4 behaviour.
+    pub(super) file_state_cache: Option<Arc<FileStateCache>>,
+    /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
+    /// introspect the active profile name, compaction overrides, and model
+    /// preferences. `None` means no profile was explicitly applied — the
+    /// agent runs in legacy pre-M8.3 mode.
+    pub(super) profile: Option<Arc<crate::profile::ProfileDefinition>>,
+    /// Three-tier compaction runner (harness M8.5). Optional — when wired,
+    /// the loop runs tier 1 (micro-compaction) at the top of each iteration
+    /// and decorates Anthropic requests with the tier-2
+    /// `context_management` payload. Tier 3 delegates to the existing
+    /// [`crate::compaction::CompactionRunner`] wrapped as a
+    /// [`crate::compaction_tiered::FullCompactor`].
+    pub(super) tiered_compaction: Option<Arc<crate::compaction_tiered::TieredCompactionRunner>>,
+    /// M8.7 sub-agent output router. When configured, the spawn_only
+    /// background branch in `execution.rs` calls
+    /// [`crate::SubAgentOutputRouter::mark_terminal`] when a task ends so
+    /// dashboards can stop tailing the on-disk output log. `None` keeps
+    /// pre-M8.7 behaviour.
+    pub(super) subagent_output_router: Option<Arc<crate::subagent_output::SubAgentOutputRouter>>,
+    /// M8.7 sub-agent progress summary generator. When configured, the
+    /// spawn_only background branch starts a watcher per task and stops
+    /// it on terminal completion. `None` keeps pre-M8.7 behaviour.
+    pub(super) subagent_summary_generator:
+        Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
 }
 
 impl Agent {
@@ -209,6 +242,12 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            file_state_cache: None,
+            profile: None,
+            tiered_compaction: None,
+            subagent_output_router: None,
+            subagent_summary_generator: None,
         }
     }
 
@@ -241,7 +280,49 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
+            file_state_cache: None,
+            profile: None,
+            tiered_compaction: None,
+            subagent_output_router: None,
+            subagent_summary_generator: None,
         }
+    }
+
+    /// Attach an [`crate::agents::AgentDefinitions`] registry. Threaded into
+    /// every per-tool [`crate::tools::ToolContext`] so tools that read
+    /// `ctx.agent_definitions` see the live registry instead of the M8.1
+    /// zero-value default. Idempotent — callers may swap the registry at
+    /// any time.
+    pub fn with_agent_definitions(mut self, defs: Arc<crate::agents::AgentDefinitions>) -> Self {
+        self.agent_definitions = defs;
+        self
+    }
+
+    /// Record the active [`crate::profile::ProfileDefinition`] envelope.
+    ///
+    /// Call this after the caller has already applied the profile's tool
+    /// filter to the [`crate::tools::ToolRegistry`] (via
+    /// [`crate::tools::ToolRegistry::filter_by_profile`]) and passed the
+    /// filtered registry into [`Agent::new`]. This setter only *records*
+    /// the profile so downstream code can introspect the active name,
+    /// compaction policy overrides, and model preferences.
+    ///
+    /// Fields that today land as *recorded only* (compaction policy, model
+    /// preferences, MCP server ids) keep their semantics — the agent loop
+    /// does not enforce them yet. See the
+    /// [`crate::profile`] module doc for the follow-up milestones that
+    /// wire each field in.
+    pub fn with_profile(mut self, profile: Arc<crate::profile::ProfileDefinition>) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Access the recorded [`crate::profile::ProfileDefinition`], if any.
+    /// Returns `None` when the agent was built without a profile envelope
+    /// (legacy pre-M8.3 mode).
+    pub fn profile(&self) -> Option<Arc<crate::profile::ProfileDefinition>> {
+        self.profile.clone()
     }
 
     /// Wire the `activate_tools` tool's back-reference to the shared tool registry.
@@ -301,6 +382,60 @@ impl Agent {
     pub fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// Enable M8.4's [`FileStateCache`] for file tools.
+    ///
+    /// When set, file tools like `read_file`, `write_file`, `edit_file`, and
+    /// `diff_edit` consult this cache to short-circuit re-reads of unchanged
+    /// files and invalidate entries on write. Absent = pre-M8.4 behaviour.
+    pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Access the agent's [`FileStateCache`] handle (if configured). Used by
+    /// the compaction runner to invoke [`FileStateCache::clear`] at tier-3
+    /// compaction boundaries — see M8.5 for the full integration.
+    pub fn file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
+        self.file_state_cache.as_ref()
+    }
+
+    /// Wire an M8.7 [`crate::subagent_output::SubAgentOutputRouter`] so the
+    /// spawn_only background branch can route textual output to disk and
+    /// flag terminal state for dashboards. Absent = pre-M8.7 behaviour.
+    pub fn with_subagent_output_router(
+        mut self,
+        router: Arc<crate::subagent_output::SubAgentOutputRouter>,
+    ) -> Self {
+        self.subagent_output_router = Some(router);
+        self
+    }
+
+    /// Access the M8.7 sub-agent output router, if configured.
+    pub fn subagent_output_router(
+        &self,
+    ) -> Option<&Arc<crate::subagent_output::SubAgentOutputRouter>> {
+        self.subagent_output_router.as_ref()
+    }
+
+    /// Wire an M8.7 [`crate::subagent_summary::AgentSummaryGenerator`] so the
+    /// spawn_only background branch can spawn a periodic summary watcher
+    /// per qualifying task and stop it on terminal completion. Absent =
+    /// pre-M8.7 behaviour.
+    pub fn with_subagent_summary_generator(
+        mut self,
+        generator: Arc<crate::subagent_summary::AgentSummaryGenerator>,
+    ) -> Self {
+        self.subagent_summary_generator = Some(generator);
+        self
+    }
+
+    /// Access the M8.7 sub-agent summary generator, if configured.
+    pub fn subagent_summary_generator(
+        &self,
+    ) -> Option<&Arc<crate::subagent_summary::AgentSummaryGenerator>> {
+        self.subagent_summary_generator.as_ref()
     }
 
     /// Set the embedding provider for hybrid memory search.
@@ -376,6 +511,25 @@ impl Agent {
     /// Access the attached workspace policy used for compaction gating.
     pub fn compaction_workspace(&self) -> Option<&crate::workspace_policy::WorkspacePolicy> {
         self.compaction_workspace.as_ref()
+    }
+
+    /// Wire the M8.5 three-tier compaction runner. Tier 1 runs at the top
+    /// of every loop iteration; tier 2 decorates outgoing Anthropic
+    /// requests; tier 3 is the existing declarative runner wrapped behind a
+    /// [`crate::compaction_tiered::FullCompactor`].
+    pub fn with_tiered_compaction(
+        mut self,
+        runner: Arc<crate::compaction_tiered::TieredCompactionRunner>,
+    ) -> Self {
+        self.tiered_compaction = Some(runner);
+        self
+    }
+
+    /// Access the attached three-tier compaction runner, if any.
+    pub fn tiered_compaction(
+        &self,
+    ) -> Option<Arc<crate::compaction_tiered::TieredCompactionRunner>> {
+        self.tiered_compaction.clone()
     }
 
     /// Beat the heartbeat once (if a realtime controller is attached) and
@@ -518,5 +672,104 @@ impl Agent {
     /// Mark the loop-detector warning as having just fired.
     pub(super) fn mark_loop_detected_recently(&self) {
         self.loop_detected_recently.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod profile_integration_tests {
+    //! M8.3 — bootstrapping an [`Agent`] with the built-in `coding`
+    //! profile must yield the same tool set as today's default path. This
+    //! is the behaviour-parity gate called out in the milestone issue.
+
+    use super::*;
+    use octos_core::AgentId;
+    use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
+    use octos_memory::EpisodeStore;
+
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("unused in profile integration tests")
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    async fn agent_default(cwd: &std::path::Path) -> Agent {
+        let memory = Arc::new(
+            EpisodeStore::open(cwd.join("memory-default"))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::with_builtins(cwd);
+        Agent::new(AgentId::new("default"), provider, tools, memory)
+    }
+
+    async fn agent_with_coding_profile(cwd: &std::path::Path) -> Agent {
+        use crate::profile::ProfileDefinition;
+
+        let memory = Arc::new(
+            EpisodeStore::open(cwd.join("memory-profile"))
+                .await
+                .expect("episode store"),
+        );
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoopProvider);
+
+        let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
+        let mut tools = ToolRegistry::with_builtins(cwd);
+        coding.apply_to_registry(&mut tools);
+
+        Agent::new(AgentId::new("coding"), provider, tools, memory).with_profile(Arc::new(coding))
+    }
+
+    fn tool_names(agent: &Agent) -> Vec<String> {
+        let mut names: Vec<String> = agent
+            .tool_registry()
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn coding_profile_matches_default_tool_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = agent_default(tmp.path()).await;
+        let profiled = agent_with_coding_profile(tmp.path()).await;
+
+        assert_eq!(
+            tool_names(&base),
+            tool_names(&profiled),
+            "coding profile must preserve the default tool set byte-for-byte",
+        );
+
+        // The profiled agent also exposes the recorded profile handle.
+        let prof = profiled.profile().expect("profile handle present");
+        assert_eq!(prof.name, "coding");
+        assert_eq!(prof.version, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_without_profile_returns_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent = agent_default(tmp.path()).await;
+        assert!(
+            agent.profile().is_none(),
+            "agents built without a profile envelope return None",
+        );
     }
 }

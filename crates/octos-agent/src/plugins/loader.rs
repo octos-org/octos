@@ -889,6 +889,7 @@ mod tests {
             spawn_only: false,
             env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
             spawn_only_message: None,
+            concurrency_class: None,
         };
 
         let augmented = apply_builtin_env_allowlist("mofa-slides", def);
@@ -911,6 +912,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let untrusted = apply_builtin_env_allowlist("custom-plugin", untrusted);
         assert!(untrusted.env.is_empty());

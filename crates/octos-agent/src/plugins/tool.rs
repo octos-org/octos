@@ -452,6 +452,25 @@ impl Tool for PluginTool {
         &self.tool_def.description
     }
 
+    fn concurrency_class(&self) -> super::super::tools::ConcurrencyClass {
+        // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+        // honour the plugin manifest's optional `concurrency_class`
+        // hint instead of inheriting the trait default `Safe`. When the
+        // plugin author marks the tool as `"exclusive"` (e.g. it
+        // mutates shared state, posts to a remote service, or writes
+        // to disk) the M8.8 scheduler serialises it against siblings.
+        match self
+            .tool_def
+            .concurrency_class
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("exclusive") => super::super::tools::ConcurrencyClass::Exclusive,
+            _ => super::super::tools::ConcurrencyClass::Safe,
+        }
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         let mut schema = self.tool_def.input_schema.clone();
         // Inject `timeout_secs` so the LLM can request longer timeouts for
@@ -793,6 +812,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         }
     }
 
@@ -875,6 +895,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
@@ -910,6 +931,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
@@ -957,6 +979,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
@@ -988,6 +1011,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
@@ -1015,6 +1039,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
@@ -1041,6 +1066,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
         let ctx = ToolContext {
@@ -1053,6 +1079,7 @@ mod tests {
             ],
             audio_attachment_paths: vec!["/workspace/voice.ogg".to_string()],
             file_attachment_paths: vec!["/workspace/report.pdf".to_string()],
+            ..ToolContext::zero()
         };
 
         let prepared = tool.prepare_effective_args(&json!({}), Some(&ctx));
@@ -1145,6 +1172,7 @@ mod tests {
             attachment_paths: vec![],
             audio_attachment_paths: vec![],
             file_attachment_paths: vec![],
+            ..ToolContext::zero()
         };
 
         let result = crate::tools::TOOL_CTX
@@ -1271,6 +1299,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
             .with_work_dir(dir.path().to_path_buf())
@@ -1311,6 +1340,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
             .with_work_dir(dir.path().to_path_buf())
@@ -1354,6 +1384,7 @@ mod tests {
             spawn_only: false,
             env: vec![],
             spawn_only_message: None,
+            concurrency_class: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
             .with_work_dir(dir.path().to_path_buf())

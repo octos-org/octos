@@ -119,7 +119,7 @@ impl ToolPolicy {
 }
 
 /// Check if a policy entry (group, wildcard, or exact name) matches a tool name.
-fn entry_matches(entry: &str, tool_name: &str) -> bool {
+pub(crate) fn entry_matches(entry: &str, tool_name: &str) -> bool {
     // Robot-tier groups resolve through the dynamic registry so integrators
     // register tool-to-tier mappings at runtime.
     if entry_is_robot_group(entry) {

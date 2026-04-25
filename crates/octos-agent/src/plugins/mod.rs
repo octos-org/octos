@@ -11,5 +11,5 @@ pub mod tool;
 
 pub use extras::{SkillExtras, resolve_extras};
 pub use loader::{PluginLoadResult, PluginLoader};
-pub use manifest::PluginManifest;
+pub use manifest::{PluginManifest, PluginToolDef};
 pub use tool::PluginTool;

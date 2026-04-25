@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 
 /// Tool for editing files via string replacement.
 pub struct EditFileTool {
@@ -45,6 +45,12 @@ impl Tool for EditFileTool {
         &["fs", "code"]
     }
 
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // edit_file rewrites a file in place — same race hazard as
+        // write_file. Serialize the whole batch. See M8.8.
+        ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -67,6 +73,17 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.4: legacy entry point routes through the typed path with a
+        // zero-value context so out-of-band callers still exercise the same
+        // file-state-cache invalidation logic.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: EditFileInput =
             serde_json::from_value(args.clone()).wrap_err("invalid edit_file tool input")?;
 
@@ -121,6 +138,12 @@ impl Tool for EditFileTool {
             return Ok(super::file_io_error(e, &input.path));
         }
 
+        // M8.4: invalidate any stale cache entry — the file's contents and
+        // mtime just changed.
+        if let Some(cache) = ctx.file_state_cache.as_ref() {
+            cache.invalidate(&path);
+        }
+
         if let Err(error) =
             crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "edit_file")
         {
@@ -143,6 +166,15 @@ impl Tool for EditFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_file_tool_is_exclusive() {
+        // edit_file rewrites the target file; parallel read_file would race
+        // on in-flight content, so it must serialize (M8.8).
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EditFileTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[tokio::test]
     async fn test_edit_file_basic_replacement() {
@@ -267,5 +299,46 @@ mod tests {
         let tool = EditFileTool::new("/tmp");
         assert_eq!(tool.name(), "edit_file");
         assert!(tool.tags().contains(&"fs"));
+    }
+
+    #[tokio::test]
+    async fn should_edit_file_tool_invalidate_cache_after_edit() {
+        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("code.rs");
+        std::fs::write(&file_path, "fn foo() {}\n").unwrap();
+
+        let cache = Arc::new(FileStateCache::new());
+        cache.put(CacheEntry::new(
+            file_path.clone(),
+            SystemTime::now(),
+            0xCAFE,
+            12,
+            false,
+            None,
+        ));
+        assert_eq!(cache.len(), 1);
+
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(cache.clone());
+
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "code.rs",
+                    "old_string": "fn foo() {}",
+                    "new_string": "fn bar() {}"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(cache.peek(&file_path).is_none());
     }
 }

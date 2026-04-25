@@ -9,14 +9,17 @@
 
 pub mod abi_schema;
 mod agent;
+pub mod agents;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 pub mod compaction;
+pub mod compaction_tiered;
 pub mod cost_ledger;
 pub mod event_bus;
 pub mod exec_env;
+pub mod file_state_cache;
 pub mod harness_errors;
 pub mod harness_events;
 pub mod hooks;
@@ -26,6 +29,7 @@ pub mod mcp_server;
 pub mod permissions;
 pub mod plugins;
 pub mod policy;
+pub mod profile;
 pub mod progress;
 pub mod prompt_guard;
 pub mod prompt_layer;
@@ -35,6 +39,8 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod steering;
+pub mod subagent_output;
+pub mod subagent_summary;
 mod subprocess_env;
 pub mod summarizer;
 pub mod task_supervisor;
@@ -67,6 +73,11 @@ pub use agent::{
         SensorContextInjector, SensorSnapshot, SensorSource,
     },
 };
+pub use compaction_tiered::{
+    ApiMicroCompactionConfig, DEFAULT_TIER1_MAX_AGE_TURNS, DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,
+    DEFAULT_TIER2_KEEP_LAST_N_TURNS, FullCompactor, MicroCompactionPolicy, Tier1Report,
+    Tier3Report, TieredCompactionRunner, is_anthropic_provider,
+};
 pub use cost_ledger::{
     BudgetProjection, BudgetRejectionReason, COST_ATTRIBUTION_COUNTER, COST_LEDGER_FILE,
     COST_USD_HISTOGRAM, ContractCostRollup, CostAccountant, CostAttributionEvent, CostBudgetPolicy,
@@ -74,13 +85,19 @@ pub use cost_ledger::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use file_state_cache::{
+    CacheEntry as FileCacheEntry, DEFAULT_MAX_ENTRIES as FILE_CACHE_DEFAULT_MAX_ENTRIES,
+    DEFAULT_MAX_TOTAL_BYTES as FILE_CACHE_DEFAULT_MAX_TOTAL_BYTES, FILE_UNCHANGED_STUB_PREFIX,
+    FileStateCache, FileStateCacheBuilder, format_file_unchanged_stub,
+};
 pub use harness_errors::{HarnessError, HarnessErrorEvent, OCTOS_LOOP_ERROR_TOTAL, RecoveryHint};
 pub use harness_events::{
     HARNESS_EVENT_SCHEMA_V1, HarnessArtifactEvent, HarnessCostAttributionEvent,
     HarnessCredentialRotationEvent, HarnessCredentialRotationSink, HarnessEvent, HarnessEventError,
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent,
-    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSubAgentDispatchEvent,
-    HarnessSwarmDispatchEvent, HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSessionSanitizedEvent,
+    HarnessSubAgentDispatchEvent, HarnessSubagentProgressEvent, HarnessSwarmDispatchEvent,
+    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
     emit_registered_credential_rotation_event,
 };
 pub use hooks::{
@@ -96,13 +113,21 @@ pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
+pub use subagent_output::{
+    AppendResult, DEFAULT_GC_AGE, DEFAULT_MAX_BYTES_PER_TASK, DEFAULT_MAX_BYTES_TOTAL,
+    DEFAULT_PREVIEW_BYTES, SubAgentOutputRouter,
+};
+pub use subagent_summary::{
+    AgentSummaryGenerator, DEFAULT_SUBAGENT_SUMMARY_MIN_RUNTIME, DEFAULT_SUBAGENT_SUMMARY_TICK,
+    DEFAULT_SUBAGENT_SUMMARY_WINDOW, SubAgentSummaryRegistry, SubAgentSummaryWatcher,
+};
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
     BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
-    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConfigureToolTool,
+    CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass, ConfigureToolTool,
     DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
     DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool, DispatchOutcome,

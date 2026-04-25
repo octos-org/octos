@@ -1,0 +1,7 @@
+{
+  "name": "repo-editor",
+  "version": 1,
+  "tools": ["read_file", "write_file", "edit_file", "shell", "grep", "glob"],
+  "disallowed_tools": ["deep_search"],
+  "effort": "high"
+}

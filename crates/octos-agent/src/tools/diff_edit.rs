@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{Tool, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 
 /// Tool for editing files via unified diff format with fuzzy matching.
 pub struct DiffEditTool {
@@ -43,6 +43,12 @@ impl Tool for DiffEditTool {
         &["fs", "code"]
     }
 
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // diff_edit writes back to disk after applying the patch — the same
+        // race hazard as write_file / edit_file. Serialize. See M8.8.
+        ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -61,6 +67,17 @@ impl Tool for DiffEditTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // M8.4: legacy entry point routes through the typed path with a
+        // zero-value context so out-of-band callers still exercise the same
+        // file-state-cache invalidation logic.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: DiffEditInput =
             serde_json::from_value(args.clone()).wrap_err("invalid diff_edit input")?;
 
@@ -114,6 +131,12 @@ impl Tool for DiffEditTool {
 
         if let Err(e) = super::write_no_follow(&path, new_content.as_bytes()).await {
             return Ok(super::file_io_error(e, &input.path));
+        }
+
+        // M8.4: invalidate any stale cache entry — the file's contents and
+        // mtime just changed.
+        if let Some(cache) = ctx.file_state_cache.as_ref() {
+            cache.invalidate(&path);
         }
 
         if let Err(error) =
@@ -325,6 +348,15 @@ fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_edit_tool_is_exclusive() {
+        // diff_edit writes back after applying the patch — same race hazard
+        // as write_file; must serialize (M8.8).
+        let dir = tempfile::tempdir().unwrap();
+        let tool = DiffEditTool::new(dir.path());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[test]
     fn test_parse_simple_diff() {

@@ -10,7 +10,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tokio::time::timeout;
 
-use super::{Tool, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolResult};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
@@ -157,6 +157,14 @@ impl Tool for ShellTool {
 
     fn tags(&self) -> &[&str] {
         &["runtime", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // Shell commands can mutate the filesystem or spawn long-lived
+        // processes. Running them in parallel with other tool calls races
+        // observable state (e.g. `shell: rm foo` vs `read_file foo/x`), so
+        // shell serializes the whole batch. See M8.8.
+        ConcurrencyClass::Exclusive
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -344,6 +352,14 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_tool_is_exclusive() {
+        // Shell must serialize relative to peers (M8.8) — a mutating command
+        // should never race with a parallel read_file on the same path.
+        let tool = ShellTool::new(std::env::temp_dir());
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[tokio::test]
     async fn test_timeout_clamped_to_max() {
