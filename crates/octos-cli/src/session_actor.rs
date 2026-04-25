@@ -3365,10 +3365,19 @@ impl SessionActor {
         let client_message_id = inbound_client_message_id(&inbound);
         let persisted_user_content_for_event = persisted_user_content.clone();
         let user_media_for_event = image_media.clone();
+        // Persist BOTH image_media and attachment_media so future turns can
+        // re-reference uploaded audio/files. Without this, a follow-up turn
+        // ("transcribe the wav again") loses the path because attachments
+        // only survived as TurnAttachmentContext for the current turn.
+        let combined_media: Vec<String> = image_media
+            .iter()
+            .chain(attachment_media.iter())
+            .cloned()
+            .collect();
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content,
-            media: image_media.clone(),
+            media: combined_media,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
