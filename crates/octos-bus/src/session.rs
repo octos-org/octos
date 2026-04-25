@@ -923,6 +923,53 @@ impl SessionManager {
         removed
     }
 
+    /// Drop the cached in-memory copy of a session so the next read consults
+    /// disk. Required by callers that write through alternate channels (e.g.
+    /// `SessionHandle`) and must keep the manager's LRU cache from serving
+    /// stale post-write reads.
+    pub fn invalidate_cache(&mut self, key: &SessionKey) {
+        self.cache.pop(&key.0);
+    }
+
+    /// Scan the per-user layout for every JSONL belonging to `base_key` and
+    /// return their reconstructed `SessionKey`s. The default file maps back to
+    /// the base key (no topic suffix); other files map to `{base_key}#{topic}`.
+    ///
+    /// Used by topic-less watcher reconnects so the replay path can union
+    /// every topic-specific JSONL the actor has written under this user even
+    /// when the URL didn't carry an explicit `?topic=...` parameter.
+    pub fn list_user_session_keys(&self, base_key: &str) -> Vec<SessionKey> {
+        let encoded_base = encode_path_component(base_key);
+        let user_sessions_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+        let mut keys = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(&user_sessions_dir) else {
+            return keys;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let topic = Self::decode_filename(stem);
+            let session_key = if topic == "default" {
+                SessionKey(base_key.to_string())
+            } else {
+                SessionKey(format!("{base_key}#{topic}"))
+            };
+            keys.push(session_key);
+        }
+        keys
+    }
+
     /// Ensure a session file exists in the per-user layout so that
     /// `list_user_sessions` can discover it.  Creates an empty JSONL
     /// (metadata-only) if the file does not already exist.
@@ -1009,15 +1056,30 @@ impl SessionHandle {
         let session = if new_path.exists() {
             Self::load_from_file(&new_path, key)
         } else {
-            // Fall back to legacy flat path for migration
+            // Fall back to legacy flat path for migration. We persist the
+            // loaded history into the per-user JSONL BEFORE removing the
+            // legacy file so a subsequent incremental `add_message_with_seq`
+            // (which only appends a single line) does not silently drop the
+            // pre-migration messages.
             let legacy_dir = data_dir.join("sessions");
             let legacy_path = SessionManager::session_path_static(&legacy_dir, key);
             if legacy_path.exists() {
                 debug!(key = %key, "migrating session from legacy flat layout");
                 let session = Self::load_from_file(&legacy_path, key);
-                // Migration: if loaded from legacy, we'll write to new path on next save
-                if session.is_some() {
-                    // Remove legacy file after successful load
+                if let Some(loaded) = session.as_ref() {
+                    if let Err(error) = Self::rewrite_blocking(&new_path, loaded) {
+                        warn!(
+                            key = %key,
+                            path = %new_path.display(),
+                            error = %error,
+                            "failed to materialize legacy session into per-user layout; \
+                             leaving legacy file in place"
+                        );
+                        return Self {
+                            sessions_dir: user_sessions_dir,
+                            session: loaded.clone(),
+                        };
+                    }
                     let _ = std::fs::remove_file(&legacy_path);
                 }
                 session
@@ -1300,6 +1362,35 @@ impl SessionHandle {
     fn session_path(&self) -> PathBuf {
         self.sessions_dir
             .join(Self::topic_filename(&self.session.key))
+    }
+
+    /// Synchronously rewrite a session JSONL at `path` from an in-memory
+    /// `Session`. Used by the migration path in [`Self::open`] where the
+    /// caller is not yet inside an async context. Atomic write-then-rename.
+    fn rewrite_blocking(path: &Path, session: &Session) -> Result<()> {
+        use std::io::Write;
+        let meta = SessionMeta {
+            schema_version: CURRENT_SESSION_SCHEMA,
+            session_key: session.key.0.clone(),
+            parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
+            topic: session.topic.clone(),
+            summary: session.summary.clone(),
+            child_contracts: session.child_contracts.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        };
+        let mut content = serde_json::to_string(&meta)?;
+        content.push('\n');
+        for msg in &session.messages {
+            content.push_str(&serde_json::to_string(msg)?);
+            content.push('\n');
+        }
+        let tmp_path = rewrite_tmp_path(path);
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
     }
 
     /// Append a single message to the JSONL file.
