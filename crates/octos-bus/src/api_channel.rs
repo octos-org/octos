@@ -187,6 +187,11 @@ struct ChatRequest {
     /// cannot tell which streaming bubble they belong to — BRAVO's reply
     /// then clobbers ALPHA's bubble and BRAVO's bubble stays empty
     /// (FA-12f).
+    ///
+    /// Also forwarded to the session actor so the persisted user message
+    /// carries it through `add_message_with_seq`, letting the user-message
+    /// `session_result` event correlate the optimistic web bubble back to
+    /// the server-assigned seq.
     #[serde(default)]
     client_message_id: Option<String>,
 }
@@ -691,6 +696,7 @@ impl Channel for ApiChannel {
                     tool_calls: None,
                     tool_call_id: tool_call_id.clone(),
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 self.persist_to_session(&msg.chat_id, topic, session_msg)
@@ -807,6 +813,7 @@ impl Channel for ApiChannel {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = self
@@ -1123,6 +1130,12 @@ async fn handle_chat(
                 if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
                     metadata.insert("topic".to_string(), serde_json::Value::String(topic));
                 }
+                if let Some(cmid) = req.client_message_id.filter(|value| !value.is_empty()) {
+                    metadata.insert(
+                        "client_message_id".to_string(),
+                        serde_json::Value::String(cmid),
+                    );
+                }
                 serde_json::Value::Object(metadata)
             },
             message_id: req
@@ -1230,6 +1243,11 @@ struct MessageInfo {
     media: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<serde_json::Value>,
+    /// Client-supplied UUID propagated from `Message::client_message_id`. Lets
+    /// the web/runtime client correlate optimistic bubbles to the persisted
+    /// seq without a backfill round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1402,6 +1420,7 @@ fn message_info_from_history_message(
             .iter()
             .filter_map(|path| response_path_for_session_file(data_dir, Path::new(path)))
             .collect(),
+        client_message_id: message.client_message_id.clone(),
         tool_calls: message
             .tool_calls
             .as_ref()
@@ -2064,6 +2083,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -2393,6 +2413,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         };
 
@@ -2406,6 +2427,33 @@ mod tests {
                 .contains(&artifact.to_string_lossy().to_string())
         );
         assert!(info.content.contains("[file:pf/"));
+    }
+
+    #[test]
+    fn message_info_propagates_client_message_id_from_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let message = Message::user("hello there").with_client_message_id("cmid-history-7");
+
+        let info = message_info_from_history_message(&message, data_dir.path(), 5);
+        assert_eq!(info.seq, Some(5));
+        assert_eq!(info.client_message_id.as_deref(), Some("cmid-history-7"));
+
+        // Round-trip via JSON (the wire shape) — the field is preserved.
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["client_message_id"], "cmid-history-7");
+    }
+
+    #[test]
+    fn message_info_omits_client_message_id_when_absent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let message = Message::user("hi");
+
+        let info = message_info_from_history_message(&message, data_dir.path(), 0);
+        assert!(info.client_message_id.is_none());
+
+        // Skipped from the serialized JSON for forward compat.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("client_message_id").is_none());
     }
 
     #[test]
@@ -2445,6 +2493,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
             data_dir.path(),
@@ -3430,6 +3479,7 @@ mod tests {
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
+                        client_message_id: None,
                         timestamp: chrono::Utc::now(),
                     },
                 )

@@ -92,6 +92,7 @@ async fn test_01_deepseek_connectivity() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -151,6 +152,7 @@ async fn test_01_dashscope_connectivity() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -1625,6 +1627,7 @@ async fn test_22_inbound_media_to_agent_message() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: inbound.timestamp,
     };
 

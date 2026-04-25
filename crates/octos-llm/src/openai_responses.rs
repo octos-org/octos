@@ -628,6 +628,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -662,6 +663,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_123".into()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
         let mut items = Vec::new();
@@ -686,6 +688,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
         // Should produce two top-level items: assistant message + function_call
