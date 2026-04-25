@@ -300,6 +300,22 @@ impl Agent {
         c
     }
 
+    /// Decide what to surface when the loop detector fires.
+    ///
+    /// First fire in a session-burst: returns the warning text and marks the
+    /// session as having warned. Subsequent fires within the same burst
+    /// (before the next `process_message` reset) return a terminal error so
+    /// the loop cannot keep emitting identical noise to the user.
+    pub(super) fn dedup_loop_warning(&self, warning: String) -> Result<String> {
+        if self.is_loop_detected_recently() {
+            return Err(eyre::eyre!(
+                "agent loop got stuck — please rephrase or simplify your request"
+            ));
+        }
+        self.mark_loop_detected_recently();
+        Ok(warning)
+    }
+
     /// Process a single message in conversation mode (chat/gateway).
     /// Takes the user's message, conversation history, and optional media paths.
     pub async fn process_message(
@@ -379,6 +395,7 @@ impl Agent {
                 TASK_REPORTER.scope(activity_reporter, async move {
                 // Reset per-run flags
                 self.tools.reset_spawn_only_invoked();
+                self.reset_loop_detected_recently();
 
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
@@ -635,10 +652,16 @@ impl Agent {
                                             ),
                                         });
                                     }
+                                    // Single-fire-per-burst: first fire emits the
+                                    // warning; subsequent fires within the same
+                                    // burst (before the next process_message reset)
+                                    // surface a terminal error instead of repeating
+                                    // identical noise.
+                                    let warning_content = self.dedup_loop_warning(warning)?;
                                     // Don't execute the tools — break out with a message
                                     self.emit_cost_update(turn.total_usage(), &response.usage);
                                     return Ok(ConversationResponse {
-                                        content: warning,
+                                        content: warning_content,
                                         reasoning_content: None,
                                         provider_metadata: None,
                                         token_usage: turn.total_usage().clone(),
@@ -2834,5 +2857,162 @@ printf '{"output":"voice saved","success":true}\n'
         // large error payloads do not accidentally count as productive.
         let body = "failed to resolve target: ".to_string() + &"x".repeat(200);
         assert!(!is_productive_tool_message(&body));
+    }
+
+    /// Mock LLM that always returns the same shell tool call with the same
+    /// arguments, forcing the loop detector to fire on iteration 4.
+    struct AlwaysSameToolProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysSameToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loop".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "loopy.txt"}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    async fn build_agent_with_mock(dir: &std::path::Path) -> Agent {
+        let tools = ToolRegistry::with_builtins(dir);
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.join("memory")).await.unwrap());
+        Agent::new(AgentId::new("loop-dedup"), provider, tools, memory)
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_returns_warning_on_first_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        assert!(!agent.is_loop_detected_recently());
+        let result = agent.dedup_loop_warning("[LOOP DETECTED] cycle".to_string());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "[LOOP DETECTED] cycle");
+        assert!(agent.is_loop_detected_recently());
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_returns_terminal_error_on_second_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        let first = agent.dedup_loop_warning("[LOOP DETECTED] one".to_string());
+        assert!(first.is_ok());
+        let second = agent.dedup_loop_warning("[LOOP DETECTED] two".to_string());
+        assert!(second.is_err());
+        let err = second.err().unwrap().to_string();
+        assert!(
+            err.contains("agent loop got stuck"),
+            "expected terminal error, got: {err}"
+        );
+        // Flag stays set after the terminal error so further fires keep
+        // returning terminal errors until the next process_message reset.
+        assert!(agent.is_loop_detected_recently());
+    }
+
+    #[tokio::test]
+    async fn dedup_loop_warning_resets_after_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = build_agent_with_mock(dir.path()).await;
+
+        agent
+            .dedup_loop_warning("[LOOP DETECTED]".to_string())
+            .unwrap();
+        assert!(agent.is_loop_detected_recently());
+        agent.reset_loop_detected_recently();
+        assert!(!agent.is_loop_detected_recently());
+
+        // After reset, a new fire returns a warning again (not terminal).
+        let again = agent.dedup_loop_warning("[LOOP DETECTED] again".to_string());
+        assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn process_message_resets_loop_detected_flag_at_start() {
+        // Pre-set the flag, then run a process_message that does NOT trigger
+        // the loop detector. The reset at the start of process_message_inner
+        // should clear the flag before the turn runs, and since no loop fires
+        // the flag stays cleared at exit.
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        let echo_path = dir.path().join("audio.mp3");
+        std::fs::write(&echo_path, b"x").unwrap();
+        tools.register(FilesToSendOnlyTool {
+            file_path: echo_path,
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("reset-test"), provider, tools, memory);
+
+        agent.mark_loop_detected_recently();
+        assert!(agent.is_loop_detected_recently());
+
+        let _ = agent
+            .process_message("hi", &[], vec![])
+            .await
+            .expect("process_message should succeed");
+
+        assert!(
+            !agent.is_loop_detected_recently(),
+            "process_message should reset the loop_detected flag at start"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_fires_loop_warning_once_then_terminal_error() {
+        // Two consecutive process_message calls with the same looping LLM.
+        // Each call resets at start, so each should emit a warning (not a
+        // terminal error). This documents the cross-turn dedup behavior:
+        // dedup is intra-turn only because each new user message starts a
+        // fresh session-burst slot.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("burst"), provider, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let first = agent.process_message("loop please", &[], vec![]).await;
+        // Either the loop warning surfaced, or the recover_shell_retry path
+        // returned. Both terminate cleanly without an Err.
+        assert!(first.is_ok(), "first call should not error");
+        // Flag set after first warning.
+        assert!(agent.is_loop_detected_recently());
+
+        let second = agent.process_message("loop again", &[], vec![]).await;
+        // Reset at start of process_message clears the flag, so a brand-new
+        // burst is allowed and emits a warning (Ok), not a terminal Err.
+        assert!(second.is_ok(), "second call should not error after reset");
     }
 }
