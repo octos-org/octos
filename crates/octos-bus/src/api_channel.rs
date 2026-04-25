@@ -956,11 +956,14 @@ impl ApiChannel {
     /// Persist a message to the canonical per-user session JSONL and return
     /// the authoritative committed message shape when available.
     ///
-    /// Routes through `SessionHandle` so bus-side writes hit the same
-    /// `users/<encoded_base>/sessions/<encoded_topic>.jsonl` file the
-    /// SessionActor uses. This is the unified write path that closed the
-    /// split-brain bug where bus-side writes landed in a hardcoded
-    /// `default.jsonl` while actor-side writes landed in `<topic>.jsonl`.
+    /// Routes through the shared
+    /// [`crate::session::persist_message_through_canonical_path`] helper so:
+    ///   - bus-side writes hit the same
+    ///     `users/<encoded_base>/sessions/<encoded_topic>.jsonl` file the
+    ///     `SessionActor` uses (closing the split-brain storage bug);
+    ///   - concurrent writes for the same session_key serialise via a
+    ///     per-key Tokio mutex (closing the concurrent-persist seq race).
+    ///
     /// The legacy flat layout is no longer touched on writes; reads still
     /// merge it for back-compat with stale on-disk data.
     async fn persist_to_session(
@@ -976,8 +979,12 @@ impl ApiChannel {
             sess.data_dir()
         };
 
-        let mut handle = crate::session::SessionHandle::open(&data_dir, &key);
-        let result = handle.add_message_with_seq(message.clone()).await;
+        let result = crate::session::persist_message_through_canonical_path(
+            &data_dir,
+            &key,
+            message.clone(),
+        )
+        .await;
 
         // Drop any stale `SessionManager` cache entry for this key so a
         // follow-up read (e.g. duplicate-detection or `?source=full`) consults
@@ -1532,7 +1539,11 @@ async fn replay_committed_session_results(
         fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
         let mut combined = candidate_events;
         combined.extend(fallback_events.into_iter().map(|(_, payload)| payload));
-        record_replay("session_result", "emitted_with_topic_fallback", combined.len());
+        record_replay(
+            "session_result",
+            "emitted_with_topic_fallback",
+            combined.len(),
+        );
         return combined;
     }
 
@@ -1543,8 +1554,10 @@ async fn replay_committed_session_results(
 
     if !fallback_events.is_empty() {
         fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
-        let payloads: Vec<String> =
-            fallback_events.into_iter().map(|(_, payload)| payload).collect();
+        let payloads: Vec<String> = fallback_events
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect();
         record_replay("session_result", "emitted_topic_fallback", payloads.len());
         return payloads;
     }
@@ -2865,6 +2878,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_bus_side_persists_get_distinct_seqs() {
+        // Regression for the concurrent-persist seq race introduced when
+        // `persist_to_session` switched from `SessionManager::add_message_with_seq`
+        // (shared mutex via `Arc<Mutex<SessionManager>>`) to
+        // `SessionHandle::open` + `add_message_with_seq`.
+        //
+        // Each `SessionHandle::open` loads disk into its OWN per-instance
+        // `messages: Vec<_>`. Two concurrent calls both observe `len = N`,
+        // both append, both return `seq = N`. Watcher correlation breaks —
+        // the web client sees two "session_result, seq=N" rows and renders
+        // duplicates.
+        //
+        // Post-fix: writes for the same session_key must serialise at the
+        // storage layer (per-key mutex map shared across actor + channel) so
+        // each call observes a fresh `len` and returns a distinct seq.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let channel = Arc::new(ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        ));
+
+        let chat_id = "race-chat";
+        let topic = Some("race-topic");
+        let n = 16usize;
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let channel = channel.clone();
+            let chat_id = chat_id.to_string();
+            handles.push(tokio::spawn(async move {
+                channel
+                    .persist_to_session(
+                        &chat_id,
+                        topic,
+                        Message::assistant(format!("concurrent assistant {i}")),
+                    )
+                    .await
+                    .and_then(|info| info.seq)
+            }));
+        }
+
+        let mut seqs: Vec<usize> = Vec::with_capacity(n);
+        for h in handles {
+            let result = h.await.expect("join");
+            seqs.push(result.expect("persist must succeed and return a seq"));
+        }
+        seqs.sort();
+        let expected: Vec<usize> = (0..n).collect();
+        assert_eq!(
+            seqs, expected,
+            "{n} concurrent bus-side persist calls must each receive a \
+             distinct sequence in 0..N (storage layer must serialise writes \
+             via a per-key lock map shared across actor + channel)"
+        );
+    }
+
+    #[tokio::test]
     async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
         // Regression for the topic-less-fallback short-circuit bug.
         //
@@ -2935,8 +3009,7 @@ mod tests {
             metrics_renderer: None,
         };
 
-        let replayed =
-            replay_committed_session_results(&state, "fallback-chat", None, None).await;
+        let replayed = replay_committed_session_results(&state, "fallback-chat", None, None).await;
         let topic_event = replayed
             .iter()
             .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
@@ -3024,11 +3097,7 @@ mod tests {
         let recovered: std::collections::HashSet<String> = replayed
             .iter()
             .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
-            .filter_map(|payload| {
-                payload["message"]["content"]
-                    .as_str()
-                    .map(str::to_string)
-            })
+            .filter_map(|payload| payload["message"]["content"].as_str().map(str::to_string))
             .collect();
         for n in 0..20usize {
             let expected = format!("topic answer {n}");

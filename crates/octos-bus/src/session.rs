@@ -1038,6 +1038,61 @@ pub struct SessionHandle {
     session: Session,
 }
 
+/// Per-key persist lock map.
+///
+/// Two writers (e.g. `SessionActor` and `ApiChannel::persist_to_session`) can
+/// each open a fresh `SessionHandle` for the same session_key concurrently.
+/// Each handle loads disk into its OWN per-instance `messages: Vec<_>`.
+/// Without serialisation, both observe `len = N`, both append, both return
+/// `seq = N` — duplicate seqs that break watcher correlation.
+///
+/// This map gives `persist_message_through_canonical_path` a per-key Tokio
+/// mutex so all writes for the same `SessionKey.0` serialise. The mutex is
+/// scoped to the session_key string (NOT the file path) so callers reaching
+/// the canonical per-user JSONL via different code paths still contend on
+/// the same lock.
+///
+/// Memory note: entries leak forever, one per active session_key. In a long-
+/// lived bus process this grows with active distinct sessions; given
+/// production keys are typically `<profile>:api:<chat>` and bounded by user
+/// count, this is acceptable. We can add LRU eviction later if needed.
+fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("persist lock map poisoned");
+    guard
+        .entry(key.0.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Persist a single message to the canonical per-user `<topic>.jsonl` file
+/// the `SessionActor` and `ApiChannel` both target. Returns the committed
+/// per-session sequence number.
+///
+/// Writes for the same `key` serialise via a per-key Tokio mutex (see
+/// [`persist_lock_for`]). This is the contract that closed the concurrent-
+/// persist seq race: every caller — whether `SessionActor` (which already
+/// owns `Arc<Mutex<SessionHandle>>` per actor), `ApiChannel::persist_to_session`,
+/// or the standalone `octos serve` `/chat` handlers — should funnel through
+/// this helper so the storage layer is the single ordering point.
+///
+/// Preserves the canonical migration path (legacy flat → per-user) inside
+/// `SessionHandle::open`.
+pub async fn persist_message_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    message: Message,
+) -> Result<usize> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+    handle.add_message_with_seq(message).await
+}
+
 impl SessionHandle {
     /// Open or create a session handle for the given key.
     ///
