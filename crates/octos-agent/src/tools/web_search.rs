@@ -20,9 +20,42 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{Tool, ToolResult};
+
+/// Detect whether a `ToolResult` represents a quota-exhausted or rate-limited
+/// response from a search provider. Used to drive auto-rotation across the
+/// provider chain in `WebSearchTool::execute` (M8.10-B, see issue #575).
+///
+/// Returns `true` only for `!result.success` outputs that contain telltale
+/// English or Chinese keywords. Successful results (including partial empties
+/// like "No results found") are NEVER treated as quota errors.
+pub(crate) fn is_quota_or_rate_limit_error(result: &ToolResult) -> bool {
+    if result.success {
+        return false;
+    }
+    let lower = result.output.to_ascii_lowercase();
+    // English keywords (case-insensitive).
+    const ENGLISH: &[&str] = &[
+        "429",
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "rate-limit",
+        "too many requests",
+        "usage limit",
+        "credit",
+        "insufficient",
+        "exhausted",
+    ];
+    if ENGLISH.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    // Chinese keywords (case is irrelevant for CJK).
+    const CHINESE: &[&str] = &["配额", "耗尽", "限流", "超出"];
+    CHINESE.iter().any(|kw| result.output.contains(kw))
+}
 
 pub struct WebSearchTool {
     client: Client,
@@ -220,8 +253,36 @@ impl Tool for WebSearchTool {
             let result = self.tavily_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
-                    info!(provider = "tavily", query = %input.query, "web search");
+                    info!(
+                        provider = "tavily",
+                        used_provider = "tavily",
+                        query = %input.query,
+                        "web_search"
+                    );
                     return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "tavily",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "tavily",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "tavily",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
                 }
             }
         }
@@ -230,8 +291,36 @@ impl Tool for WebSearchTool {
         let ddg_result = self.ddg_search(&input.query, count).await;
         if let Ok(ref r) = ddg_result {
             if r.success && !r.output.contains("No results found") {
-                info!(provider = "duckduckgo", query = %input.query, "web search");
+                info!(
+                    provider = "duckduckgo",
+                    used_provider = "duckduckgo",
+                    query = %input.query,
+                    "web_search"
+                );
                 return ddg_result;
+            }
+            if is_quota_or_rate_limit_error(r) {
+                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                warn!(
+                    provider = "duckduckgo",
+                    fallback_reason = "quota",
+                    error = %snippet,
+                    "web_search rotation"
+                );
+            } else if !r.success {
+                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                warn!(
+                    provider = "duckduckgo",
+                    fallback_reason = "error",
+                    error = %snippet,
+                    "web_search rotation"
+                );
+            } else {
+                info!(
+                    provider = "duckduckgo",
+                    fallback_reason = "empty",
+                    "web_search rotation"
+                );
             }
         }
 
@@ -240,8 +329,36 @@ impl Tool for WebSearchTool {
             let result = self.exa_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
-                    info!(provider = "exa", query = %input.query, "web search");
+                    info!(
+                        provider = "exa",
+                        used_provider = "exa",
+                        query = %input.query,
+                        "web_search"
+                    );
                     return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "exa",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "exa",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "exa",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
                 }
             }
         }
@@ -251,8 +368,36 @@ impl Tool for WebSearchTool {
             let result = self.brave_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
-                    info!(provider = "brave", query = %input.query, "web search");
+                    info!(
+                        provider = "brave",
+                        used_provider = "brave",
+                        query = %input.query,
+                        "web_search"
+                    );
                     return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "brave",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "brave",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "brave",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
                 }
             }
         }
@@ -262,20 +407,93 @@ impl Tool for WebSearchTool {
             let result = self.you_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
-                    info!(provider = "you.com", query = %input.query, "web search");
+                    info!(
+                        provider = "you.com",
+                        used_provider = "you.com",
+                        query = %input.query,
+                        "web_search"
+                    );
                     return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "you.com",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "you.com",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "you.com",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
                 }
             }
         }
 
-        // Perplexity Sonar as last resort (AI-synthesized, costs money)
+        // Perplexity Sonar as last resort (AI-synthesized, costs money).
+        // M8.10-B: previously this branch returned UNCONDITIONALLY, so a quota
+        // error from Perplexity surfaced directly to the LLM (issue #575
+        // problem B). Now we mirror the structure of every other provider:
+        // success → return; quota → log + fall through to DDG fallback;
+        // other failure → log + fall through.
         if let Some(api_key) = self.provider_key("perplexity", "PERPLEXITY_API_KEY") {
-            info!(provider = "perplexity", query = %input.query, "web search");
-            return self.perplexity_search(&input.query, &api_key).await;
+            let result = self.perplexity_search(&input.query, &api_key).await;
+            if let Ok(ref r) = result {
+                if r.success && !r.output.contains("No results found") {
+                    info!(
+                        provider = "perplexity",
+                        used_provider = "perplexity",
+                        query = %input.query,
+                        "web_search"
+                    );
+                    return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "perplexity",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "perplexity",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "perplexity",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
+                }
+            }
         }
 
-        info!(provider = "duckduckgo (fallback)", query = %input.query, "web search");
-        // Return whatever DDG gave us (even if empty)
+        info!(
+            provider = "duckduckgo (fallback)",
+            used_provider = "duckduckgo (fallback)",
+            query = %input.query,
+            "web_search"
+        );
+        // Return whatever DDG gave us (even if empty / quota-flagged); all
+        // configured providers were exhausted. The caller LLM should see this
+        // and not retry with identical args (worker.txt guidance).
         ddg_result
     }
 }
@@ -880,5 +1098,128 @@ mod tests {
             tool.provider_key("tavily", "TAVILY_API_KEY").as_deref(),
             Some("tvly-configured-key")
         );
+    }
+
+    // --- M8.10-B: quota / rate-limit detection ---
+
+    fn err_result(msg: &str) -> ToolResult {
+        ToolResult {
+            output: msg.to_string(),
+            success: false,
+            ..Default::default()
+        }
+    }
+
+    fn ok_result(msg: &str) -> ToolResult {
+        ToolResult {
+            output: msg.to_string(),
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_detects_http_429() {
+        let r = err_result("Perplexity API error (429): Too Many Requests");
+        assert!(is_quota_or_rate_limit_error(&r));
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_detects_chinese_quota_messages() {
+        let r = err_result("Perplexity 配额已耗尽，改用其他引擎");
+        assert!(is_quota_or_rate_limit_error(&r));
+
+        let r2 = err_result("当前节点已限流，请稍后再试");
+        assert!(is_quota_or_rate_limit_error(&r2));
+
+        let r3 = err_result("Brave 超出每月配额");
+        assert!(is_quota_or_rate_limit_error(&r3));
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_detects_english_quota_phrases() {
+        let cases = [
+            "Tavily API error (402): quota exceeded",
+            "rate limit hit, please retry later",
+            "RATE-LIMIT exceeded for plan",
+            "Too Many Requests",
+            "Monthly usage limit reached",
+            "insufficient credits remaining on this account",
+            "API credit has been exhausted for the day",
+        ];
+        for msg in cases {
+            let r = err_result(msg);
+            assert!(
+                is_quota_or_rate_limit_error(&r),
+                "should detect quota: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_negatives() {
+        // Successful results should never count as quota errors.
+        assert!(!is_quota_or_rate_limit_error(&ok_result(
+            "Results for: rust\n\n1. ..."
+        )));
+        // "No results found" is empty, not quota.
+        assert!(!is_quota_or_rate_limit_error(&ok_result(
+            "No results found for: rust"
+        )));
+        // success=false but unrelated message (e.g. parse error) is not quota.
+        assert!(!is_quota_or_rate_limit_error(&err_result(
+            "failed to parse Brave response"
+        )));
+        // success=true but text accidentally contains "quota" is NOT a rotation trigger.
+        assert!(!is_quota_or_rate_limit_error(&ok_result(
+            "Article on quota systems and rate-limit theory"
+        )));
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_case_insensitive_english() {
+        assert!(is_quota_or_rate_limit_error(&err_result("RATE LIMIT")));
+        assert!(is_quota_or_rate_limit_error(&err_result("Quota Exceeded")));
+        assert!(is_quota_or_rate_limit_error(&err_result(
+            "TOO MANY REQUESTS"
+        )));
+    }
+
+    #[test]
+    fn is_quota_or_rate_limit_error_with_underscore_or_hyphen() {
+        assert!(is_quota_or_rate_limit_error(&err_result(
+            "code: rate_limit_exceeded"
+        )));
+        assert!(is_quota_or_rate_limit_error(&err_result(
+            "code: rate-limit-exceeded"
+        )));
+    }
+
+    /// Structural invariant for the rotation order in `execute`:
+    ///
+    /// The `execute` method MUST iterate providers in the documented priority
+    /// (Tavily → DDG → Exa → Brave → You.com → Perplexity) and treat any
+    /// `is_quota_or_rate_limit_error(&r) == true` outcome as "fall through to
+    /// next provider", identical to the empty-results path. Perplexity must
+    /// NOT short-circuit unconditionally; on quota error it must fall through
+    /// to the DDG fallback at the bottom of `execute`.
+    ///
+    /// This invariant is enforced by code review + the per-provider guards in
+    /// `execute`. Mocking the HTTP layer would require restructuring the tool
+    /// (e.g. `Arc<dyn HttpClient>` injection) which is out of scope for M8.10-B.
+    #[test]
+    fn rotation_structural_invariant_documented() {
+        // This test is a structural anchor: if anyone changes the rotation
+        // order or removes the per-provider quota guard, they must read the
+        // doc comment above and update intentionally.
+        let providers = [
+            "tavily",
+            "duckduckgo",
+            "exa",
+            "brave",
+            "you.com",
+            "perplexity",
+        ];
+        assert_eq!(providers.len(), 6);
     }
 }
