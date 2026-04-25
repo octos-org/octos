@@ -301,60 +301,6 @@ fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Emit a `session_result` outbound event so the api channel can broadcast a
-/// `{message_role: "user", historySeq: K, client_message_id: ...}` payload to
-/// the web client. The client uses this to stamp the authoritative seq onto
-/// the optimistic user bubble it created before sending the request.
-///
-/// No-op outside the API channel — other channels neither produce optimistic
-/// bubbles nor consume `session_result` events.
-async fn broadcast_user_message_session_result(
-    session_actor: &SessionActor,
-    persisted_user_content: &str,
-    media: &[String],
-    client_message_id: Option<&str>,
-    user_seq: usize,
-    timestamp: chrono::DateTime<chrono::Utc>,
-) {
-    if session_actor.channel != "api" {
-        return;
-    }
-    let topic = session_actor.session_key.topic();
-    let mut session_result = serde_json::json!({
-        "seq": user_seq,
-        "role": "user",
-        "content": persisted_user_content,
-        "timestamp": timestamp.to_rfc3339(),
-        "media": media,
-    });
-    if let Some(cmid) = client_message_id {
-        session_result.as_object_mut().expect("json object").insert(
-            "client_message_id".to_string(),
-            serde_json::Value::String(cmid.to_string()),
-        );
-    }
-    let metadata = serde_json::json!({
-        "topic": topic,
-        "_history_persisted": true,
-        "_session_result": session_result,
-    });
-
-    let _ = send_outbound_with_timeout(
-        &session_actor.session_key,
-        &session_actor.out_tx,
-        OutboundMessage {
-            channel: session_actor.channel.clone(),
-            chat_id: session_actor.chat_id.clone(),
-            content: String::new(),
-            reply_to: None,
-            media: vec![],
-            metadata,
-        },
-        "user_message_session_result",
-    )
-    .await;
-}
-
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -3669,20 +3615,8 @@ impl SessionActor {
             }
         };
 
-        // Same as the speculative path — let the web client correlate the
-        // optimistic bubble against the persisted seq.
-        if let Some(seq) = user_seq {
-            broadcast_user_message_session_result(
-                self,
-                persisted_user_content,
-                &[],
-                client_message_id.as_deref(),
-                seq,
-                user_msg_timestamp,
-            )
-            .await;
-        }
-
+        let _ = user_seq; // sort comparator uses timestamp; seq retained for ledger.
+        let _ = user_msg_timestamp;
         let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -3833,21 +3767,14 @@ impl SessionActor {
             handle.add_message_with_seq(user_msg).await.ok()
         };
 
-        // Broadcast a user-message session_result event so the web client can
-        // stamp the authoritative `historySeq` onto its optimistic bubble. The
-        // event is correlated by `client_message_id`. No-op for non-API
-        // channels (telegram/etc don't render optimistic bubbles).
-        if let Some(seq) = user_seq {
-            broadcast_user_message_session_result(
-                self,
-                &persisted_user_content_for_event,
-                &user_media_for_event,
-                client_message_id.as_deref(),
-                seq,
-                user_msg_timestamp,
-            )
-            .await;
-        }
+        // The web client sorts by Message.timestamp (timestamp-primary
+        // comparator) so optimistic bubbles slot in chronological order
+        // without needing a server seq round-trip. Seq is still captured for
+        // ledger integrity.
+        let _ = user_seq;
+        let _ = user_msg_timestamp;
+        let _ = persisted_user_content_for_event;
+        let _ = user_media_for_event;
 
         // Get conversation history (now includes the user message we just saved)
         let history: Vec<Message> = {
@@ -4659,42 +4586,12 @@ impl SessionActor {
                 handle.add_message_with_seq(user_msg).await.ok()
             };
 
-            // Same channel-side broadcast for overflow user messages.
-            if channel == "api" {
-                if let Some(seq) = user_seq_for_overflow {
-                    let mut session_result = serde_json::json!({
-                        "seq": seq,
-                        "role": "user",
-                        "content": content.clone(),
-                        "timestamp": user_msg_timestamp.to_rfc3339(),
-                        "media": Vec::<String>::new(),
-                    });
-                    if let Some(cmid) = overflow_client_message_id.as_deref() {
-                        session_result.as_object_mut().expect("json object").insert(
-                            "client_message_id".to_string(),
-                            serde_json::Value::String(cmid.to_string()),
-                        );
-                    }
-                    let _ = send_outbound_with_timeout(
-                        &session_key,
-                        &out_tx,
-                        OutboundMessage {
-                            channel: channel.clone(),
-                            chat_id: chat_id.clone(),
-                            content: String::new(),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({
-                                "topic": session_key.topic(),
-                                "_history_persisted": true,
-                                "_session_result": session_result,
-                            }),
-                        },
-                        "user_message_session_result_overflow",
-                    )
-                    .await;
-                }
-            }
+            // The overflow path also relies on the timestamp-primary
+            // comparator client-side; no per-user-message session_result
+            // emission needed. Seq retained for ledger.
+            let _ = user_seq_for_overflow;
+            let _ = user_msg_timestamp;
+            let _ = overflow_client_message_id;
 
             // Refresh the history snapshot so the overflow LLM sees the
             // primary turn's assistant reply if it has already landed. The
