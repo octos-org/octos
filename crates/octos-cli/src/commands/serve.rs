@@ -342,7 +342,8 @@ impl ServeCommand {
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(self.port, auth_token.clone()),
+                .with_serve_config(self.port, auth_token.clone())
+                .with_data_dir(data_dir.clone()),
         );
         process_manager.set_self_ref();
 

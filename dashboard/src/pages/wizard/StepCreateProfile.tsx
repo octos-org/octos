@@ -1,19 +1,25 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../../api'
+import { WIZARD_DRAFT_KEY } from './StepLlmProvider'
 
 export default function StepCreateProfile() {
   const navigate = useNavigate()
   const [working, setWorking] = useState<'create' | 'skip' | null>(null)
 
-  const finishWith = async (target: string) => {
+  const finishWith = async (target: string, fromWizard: boolean) => {
     setWorking(target === '/profiles/new' ? 'create' : 'skip')
     try {
       await api.completeSetup()
     } catch (e) {
       console.warn('completeSetup failed', e)
     }
-    navigate(target)
+    if (!fromWizard) {
+      // User chose to skip — discard any draft so it doesn't leak into a
+      // future New Profile click outside the wizard.
+      sessionStorage.removeItem(WIZARD_DRAFT_KEY)
+    }
+    navigate(target, { state: fromWizard ? { fromWizard: true } : undefined })
   }
 
   return (
@@ -34,7 +40,7 @@ export default function StepCreateProfile() {
         <button
           type="button"
           disabled={working !== null}
-          onClick={() => finishWith('/profiles/new')}
+          onClick={() => finishWith('/profiles/new', true)}
           className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-50"
         >
           {working === 'create' ? 'Opening…' : 'Create Profile →'}
@@ -42,7 +48,7 @@ export default function StepCreateProfile() {
         <button
           type="button"
           disabled={working !== null}
-          onClick={() => finishWith('/')}
+          onClick={() => finishWith('/', false)}
           className="w-full px-4 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-50"
         >
           {working === 'skip' ? 'Finishing…' : 'I\'ll Do This Later'}

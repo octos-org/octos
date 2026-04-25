@@ -465,6 +465,93 @@ pub async fn post_smtp(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmailTokenBody {
+    pub to: String,
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailTokenResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST `/api/admin/token/email` — email the freshly rotated admin token to
+/// the given address. Requires SMTP to already be configured (typically by
+/// the CLI installer before the dashboard came up).
+pub async fn post_token_email(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmailTokenBody>,
+) -> Json<EmailTokenResult> {
+    if !body.to.contains('@') {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("recipient address must contain '@'".into()),
+        });
+    }
+    if body.token.trim().is_empty() {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("token must not be empty".into()),
+        });
+    }
+    let Some(ref auth_mgr) = state.auth_manager else {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("SMTP is not configured on the server".into()),
+        });
+    };
+    let escaped = html_escape(&body.token);
+    let html = format!(
+        "<p>Your new octos admin token:</p>\
+         <pre style=\"font-family:monospace;font-size:14px;padding:12px;background:#f4f4f4;border-radius:6px;word-break:break-all\">{}</pre>\
+         <p style=\"color:#666;font-size:12px\">Save this somewhere safe — it won't be shown in the dashboard again.</p>",
+        escaped
+    );
+    match auth_mgr
+        .send_html_email(&body.to, "Your octos admin token", &html)
+        .await
+    {
+        Ok(true) => Json(EmailTokenResult {
+            ok: true,
+            message: Some(format!("token emailed to {}", body.to)),
+            error: None,
+        }),
+        Ok(false) => Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("SMTP is not configured on the server".into()),
+        }),
+        Err(e) => Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// POST `/api/admin/smtp/test` — send a diagnostic email to the caller.
 pub async fn post_smtp_test(
     State(state): State<Arc<AppState>>,
