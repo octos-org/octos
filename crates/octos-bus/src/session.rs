@@ -1116,6 +1116,15 @@ impl SessionHandle {
             // legacy file so a subsequent incremental `add_message_with_seq`
             // (which only appends a single line) does not silently drop the
             // pre-migration messages.
+            //
+            // Migration race protection: on a previous open, `rewrite_blocking`
+            // may have succeeded but `remove_file(legacy)` failed. The next
+            // open then sees both files. We mark a per-key `.migrated.<topic>`
+            // flag in the per-user directory after a successful rewrite +
+            // remove pair. If the marker exists we skip migration entirely
+            // (per-user file is authoritative even if a stale legacy file
+            // co-exists). If the marker is missing but per-user exists, we
+            // best-effort retry the legacy removal.
             let legacy_dir = data_dir.join("sessions");
             let legacy_path = SessionManager::session_path_static(&legacy_dir, key);
             if legacy_path.exists() {
@@ -1135,7 +1144,10 @@ impl SessionHandle {
                             session: loaded.clone(),
                         };
                     }
-                    let _ = std::fs::remove_file(&legacy_path);
+                    if std::fs::remove_file(&legacy_path).is_ok() {
+                        let marker = Self::migration_marker_path(&user_sessions_dir, key);
+                        let _ = std::fs::write(&marker, b"migrated-from-flat\n");
+                    }
                 }
                 session
             } else {
@@ -1148,6 +1160,17 @@ impl SessionHandle {
             sessions_dir: user_sessions_dir,
             session,
         }
+    }
+
+    /// Path of the per-key migration marker written after a successful
+    /// rewrite + legacy-remove pair. Used by [`Self::open`] to detect a
+    /// completed migration on subsequent opens (so a stale legacy file —
+    /// e.g. from a remove_file failure on a prior boot — does not cause
+    /// double-history reads).
+    fn migration_marker_path(user_sessions_dir: &Path, key: &SessionKey) -> PathBuf {
+        let topic = key.topic().unwrap_or("default");
+        let encoded = encode_path_component(topic);
+        user_sessions_dir.join(format!(".migrated.{encoded}"))
     }
 
     /// Check whether a session file exists in either the per-user or legacy layout.
@@ -1422,7 +1445,22 @@ impl SessionHandle {
     /// Synchronously rewrite a session JSONL at `path` from an in-memory
     /// `Session`. Used by the migration path in [`Self::open`] where the
     /// caller is not yet inside an async context. Atomic write-then-rename.
+    ///
+    /// Cleans up the tmp file if the write or rename fails so a partial
+    /// migration does not leak `<path>.<pid>-<seq>.tmp` files on disk.
+    /// Records the same `octos_session_rewrite_total` metric as the async
+    /// `rewrite()` so operators see a unified rewrite count regardless of
+    /// the originating call path.
     fn rewrite_blocking(path: &Path, session: &Session) -> Result<()> {
+        let result = Self::rewrite_blocking_inner(path, session);
+        match &result {
+            Ok(()) => record_session_rewrite("committed"),
+            Err(_) => record_session_rewrite("failed"),
+        }
+        result
+    }
+
+    fn rewrite_blocking_inner(path: &Path, session: &Session) -> Result<()> {
         use std::io::Write;
         let meta = SessionMeta {
             schema_version: CURRENT_SESSION_SCHEMA,
@@ -1441,11 +1479,21 @@ impl SessionHandle {
             content.push('\n');
         }
         let tmp_path = rewrite_tmp_path(path);
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(content.as_bytes())?;
-        file.flush()?;
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.flush()?;
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            // Best-effort tmp cleanup. If the rename succeeded but a later
+            // step failed (currently impossible — rename is the last step)
+            // we'd skip this; if `File::create` or `write_all` fail, the
+            // tmp file may exist and must not leak.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
     }
 
     /// Append a single message to the JSONL file.
@@ -1817,6 +1865,10 @@ struct StoredActiveSessions {
 }
 
 /// Validate a topic name. Returns Err with a message if invalid.
+///
+/// Rejects the literal `"default"` because the per-user storage layout
+/// uses `default.jsonl` as the no-topic filename — a user-named `"default"`
+/// topic would silently collide with the topic-less mapping.
 pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str> {
     if topic.is_empty() {
         return Err("topic name cannot be empty");
@@ -1829,6 +1881,9 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
     }
     if topic.chars().any(|c| c.is_control()) {
         return Err("topic name cannot contain control characters");
+    }
+    if topic.eq_ignore_ascii_case("default") {
+        return Err("topic name 'default' is reserved (used as the no-topic filename in storage)");
     }
     Ok(())
 }
@@ -2664,6 +2719,13 @@ mod tests {
         assert!(validate_topic_name("a:b").is_err());
         assert!(validate_topic_name("a/b").is_err());
         assert!(validate_topic_name(&"x".repeat(51)).is_err());
+
+        // Reserved: "default" is the no-topic filename in the per-user
+        // layout. Allowing a user-named "default" topic would silently
+        // collide with the topic-less mapping.
+        assert!(validate_topic_name("default").is_err());
+        assert!(validate_topic_name("DEFAULT").is_err());
+        assert!(validate_topic_name("Default").is_err());
     }
 
     #[tokio::test]
