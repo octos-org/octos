@@ -344,7 +344,7 @@ async fn chat_streaming(
     ));
 
     // Build per-request agent sharing resources with the base agent
-    let request_agent = Agent::new_shared(
+    let mut request_agent = Agent::new_shared(
         AgentId::new(format!("api-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
         base_agent.tool_registry().clone(),
@@ -353,6 +353,20 @@ async fn chat_streaming(
     .with_config(base_agent.agent_config())
     .with_system_prompt(base_agent.system_prompt_snapshot())
     .with_reporter(reporter);
+
+    // M8 fix-first item 8 (gaps 1 + 2): `Agent::new_shared` zeroes the
+    // file-state cache and sub-agent router/generator. Per-request agents
+    // must inherit them from the base agent so chat requests land on the
+    // same M8 wiring the rest of the runtime sees.
+    if let Some(cache) = base_agent.file_state_cache() {
+        request_agent = request_agent.with_file_state_cache(cache.clone());
+    }
+    if let Some(router) = base_agent.subagent_output_router() {
+        request_agent = request_agent.with_subagent_output_router(router.clone());
+    }
+    if let Some(generator) = base_agent.subagent_summary_generator() {
+        request_agent = request_agent.with_subagent_summary_generator(generator.clone());
+    }
 
     let message = req.message;
     let media = req.media;

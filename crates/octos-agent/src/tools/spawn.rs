@@ -636,7 +636,7 @@ impl SpawnTool {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Input {
     task: String,
     #[serde(default)]
@@ -673,6 +673,13 @@ struct Input {
     /// default and finally to [`DEFAULT_MCP_AGENT_TOOL_NAME`].
     #[serde(default)]
     agent_mcp_tool_name: Option<String>,
+    /// Optional id of an [`crate::agents::AgentDefinition`] manifest to
+    /// resolve from [`crate::tools::ToolContext::agent_definitions`]. When
+    /// set, the manifest's fields become defaults for this spawn call;
+    /// fields explicitly provided inline on `Input` override the manifest.
+    /// Inline always wins.
+    #[serde(default)]
+    agent_definition_id: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -681,6 +688,77 @@ fn default_backend() -> String {
 
 fn default_mode() -> String {
     "background".into()
+}
+
+/// Resolve an optional `agent_definition_id` against the context's manifest
+/// registry and layer the manifest's fields onto the inline [`Input`].
+///
+/// Semantics: inline wins. A field already present on `Input` (non-default
+/// for `Option`-typed fields; non-empty for `Vec`-typed fields) is kept as-is.
+/// Missing fields on `Input` are filled from the manifest.
+///
+/// Returns an error when the id is set but does not exist in the registry —
+/// that's almost always a typo, and silently ignoring it would erase the
+/// manifest's safety envelope.
+fn apply_agent_definition(
+    input: &mut Input,
+    registry: &crate::agents::AgentDefinitions,
+) -> Result<()> {
+    let Some(id) = input.agent_definition_id.as_deref() else {
+        return Ok(());
+    };
+    let def = registry.get(id).ok_or_else(|| {
+        eyre::eyre!(
+            "spawn: agent_definition_id '{id}' not found in registry; \
+             available: [{}]",
+            registry.ids().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+
+    // Tool allow-list: manifest provides the default; inline takes
+    // precedence when it is non-empty. Manifest deny-list is merged into
+    // the inline `allowed_tools` as a removal step so a manifest that
+    // marks `shell` as disallowed cannot be re-enabled silently by
+    // inheriting the parent's default allow set.
+    if input.allowed_tools.is_empty() {
+        input.allowed_tools = def.tools.clone();
+    }
+    if !def.disallowed_tools.is_empty() {
+        input
+            .allowed_tools
+            .retain(|name| !def.disallowed_tools.contains(name));
+    }
+
+    // Option-typed fields: manifest only applies when the inline slot is
+    // None.
+    if input.model.is_none() {
+        input.model = def.model.clone();
+    }
+    // M8.5 fix-first item 5: stop smuggling unsupported `AgentDefinition`
+    // fields (`effort`, `permission_mode`) into `additional_instructions`.
+    // Hiding them in prompt text gives clients a false sense that the
+    // runtime honours the manifest's permission/effort envelope. They
+    // remain available on the manifest struct for future enforcement,
+    // but they no longer pollute the LLM prompt.
+    let _ = def.effort.as_deref();
+    let _ = def.permission_mode.as_deref();
+
+    // M8.5 fix-first item 5: reject manifests that set fields the runtime
+    // does NOT yet enforce. Today: max_turns, background, memory, hooks,
+    // mcp_servers, isolation. Silently accepting them lets clients
+    // assume the runtime is honouring envelope state that does nothing,
+    // which is exactly the M9 promise the checklist wants to break.
+    let unimplemented = def.unimplemented_fields();
+    if !unimplemented.is_empty() {
+        eyre::bail!(
+            "spawn: agent_definition_id '{}' sets unimplemented fields {:?}; \
+             remove them from the manifest until the runtime wires them in",
+            def.name,
+            unimplemented,
+        );
+    }
+
+    Ok(())
 }
 
 fn should_deliver_output_files(files: &[PathBuf]) -> bool {
@@ -1272,6 +1350,16 @@ impl Tool for SpawnTool {
         &["gateway"]
     }
 
+    fn concurrency_class(&self) -> super::ConcurrencyClass {
+        // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+        // spawn() registers a background task with the supervisor,
+        // mutates the spawn_only_invoked atomic, and may share the
+        // backing memory store with peers in the same batch. Treat it
+        // as Exclusive so it never races a sibling tool that also
+        // mutates task / session state.
+        super::ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         // Build dynamic model field based on available sub-providers
         let model_prop = match &self.provider_router {
@@ -1393,6 +1481,10 @@ impl Tool for SpawnTool {
                 "agent_mcp_tool_name": {
                     "type": "string",
                     "description": "Override the MCP tool name dispatched on the remote agent when backend='agent_mcp'. Defaults to 'run_task'."
+                },
+                "agent_definition_id": {
+                    "type": "string",
+                    "description": "Optional id of an AgentDefinition manifest (see crates/octos-agent/src/agents). The manifest's fields (tools, model, max_turns, etc.) become defaults for this spawn; any inline field on the spawn args overrides the manifest (inline wins)."
                 }
             },
             "required": ["task"]
@@ -1400,8 +1492,28 @@ impl Tool for SpawnTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let input: Input =
+        // Legacy entry point: route through the typed path with a zero-value
+        // context so out-of-band callers behave identically. Manifest-driven
+        // spawns require a populated `ctx.agent_definitions`, so legacy
+        // callers see a "no such manifest" error if they pass
+        // `agent_definition_id` without context — matching the existing
+        // guard behaviour for other ctx-dependent fields.
+        self.execute_with_context(&super::ToolContext::zero(), args)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &super::ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        let mut input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
+        // M8.2: if the caller referenced an AgentDefinition manifest by id,
+        // layer the manifest's fields onto the inline Input with "inline
+        // wins" semantics. Unknown ids are a hard error — silently ignoring
+        // them would let a typo erase the manifest's safety envelope.
+        apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
@@ -3742,5 +3854,131 @@ PY
         // Leak the dir so it stays alive for the test
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    /// Build a minimal `Input` from a JSON value with the defaults the
+    /// tests expect. Centralising this keeps the M8.2 manifest tests below
+    /// independent of future serde changes.
+    fn parse_spawn_input(value: serde_json::Value) -> Input {
+        serde_json::from_value(value).expect("input parses")
+    }
+
+    #[test]
+    fn should_resolve_manifest_in_spawn_tool() {
+        // Spawn args reference `research-worker`; the manifest's `tools`
+        // list must flow into the resolved `Input.allowed_tools`. Inline
+        // `allowed_tools` is empty so the manifest fills it in.
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "research this topic",
+            "agent_definition_id": "research-worker"
+        }));
+        apply_agent_definition(&mut input, &registry).expect("apply");
+
+        // Research-worker manifest lists deep_search + web_fetch + web_search.
+        for expected in ["deep_search", "web_fetch", "web_search"] {
+            assert!(
+                input.allowed_tools.contains(&expected.to_string()),
+                "manifest tool {expected} did not flow into allowed_tools"
+            );
+        }
+        // Manifest's disallowed_tools (shell/write/edit) must not appear.
+        for forbidden in ["shell", "write_file", "edit_file"] {
+            assert!(
+                !input.allowed_tools.contains(&forbidden.to_string()),
+                "manifest disallowed_tool {forbidden} leaked into allowed_tools"
+            );
+        }
+    }
+
+    #[test]
+    fn should_let_inline_fields_override_manifest() {
+        // Inline `model` must beat the manifest's `model`. The manifest
+        // sets no model on `research-worker`, so we use a local manifest
+        // that has one to make the override visible.
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "with-model",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "with-model",
+                    "version": 1,
+                    "tools": ["read_file"],
+                    "model": "manifest-model"
+                }"#,
+            )
+            .expect("parse"),
+        );
+
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "do it",
+            "agent_definition_id": "with-model",
+            "model": "inline-model"
+        }));
+        apply_agent_definition(&mut input, &registry).expect("apply");
+
+        // Inline wins for model.
+        assert_eq!(input.model.as_deref(), Some("inline-model"));
+    }
+
+    #[test]
+    fn should_let_inline_allowed_tools_override_manifest_allowed_tools() {
+        // When inline `allowed_tools` is non-empty it replaces the manifest
+        // list outright. The manifest's disallowed_tools still prune the
+        // result so a manifest cannot be silently bypassed.
+        let mut registry = crate::agents::AgentDefinitions::new();
+        registry.insert(
+            "example",
+            crate::agents::AgentDefinition::from_json_str(
+                r#"{
+                    "name": "example",
+                    "version": 1,
+                    "tools": ["read_file", "shell"],
+                    "disallowed_tools": ["shell"]
+                }"#,
+            )
+            .expect("parse"),
+        );
+
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "do it",
+            "agent_definition_id": "example",
+            "allowed_tools": ["shell", "grep"]
+        }));
+        apply_agent_definition(&mut input, &registry).expect("apply");
+
+        // Inline list is kept, but manifest's disallow pruned `shell`.
+        assert!(input.allowed_tools.contains(&"grep".to_string()));
+        assert!(!input.allowed_tools.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn should_error_when_agent_definition_id_unknown() {
+        // Typos in the id are a hard error so a silent-typo cannot erase
+        // the manifest's safety envelope.
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "do it",
+            "agent_definition_id": "no-such-manifest"
+        }));
+        let err = apply_agent_definition(&mut input, &registry).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no-such-manifest"), "message: {msg}");
+    }
+
+    #[test]
+    fn should_not_mutate_input_when_agent_definition_id_missing() {
+        // No id means no resolution. This preserves the fast path for
+        // callers that never touch manifests.
+        let registry = crate::agents::AgentDefinitions::with_builtins();
+        let mut input = parse_spawn_input(serde_json::json!({
+            "task": "plain spawn",
+            "allowed_tools": ["shell"]
+        }));
+        let before = input.clone();
+        apply_agent_definition(&mut input, &registry).expect("apply");
+
+        assert_eq!(input.allowed_tools, before.allowed_tools);
+        assert_eq!(input.model, before.model);
     }
 }

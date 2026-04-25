@@ -273,6 +273,15 @@ fn extract_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ConcurrencyClass;
+
+    #[test]
+    fn web_fetch_tool_is_safe() {
+        // web_fetch retrieves remote data; it does not mutate local state
+        // so it keeps the M8.8 default Safe class and can parallel-dispatch.
+        let tool = WebFetchTool::new();
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
 
     #[test]
     fn test_extract_text() {

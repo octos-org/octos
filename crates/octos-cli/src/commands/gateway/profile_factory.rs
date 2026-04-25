@@ -431,6 +431,9 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// Sandbox config for child bot tool registries.
     pub(super) sandbox_config: octos_agent::SandboxConfig,
     pub(super) task_query_store: SessionTaskQueryStore,
+    /// M8 fix-first item 8 (gap 2): shared SubAgentOutputRouter cloned
+    /// into every ActorFactory built by this builder.
+    pub(super) subagent_output_router: Arc<octos_agent::SubAgentOutputRouter>,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -783,6 +786,7 @@ impl ProfileActorFactoryBuilder {
             plugin_extra_env: actor_plugin_env,
             llm_strong,
             task_query_store: self.task_query_store.clone(),
+            subagent_output_router: self.subagent_output_router.clone(),
         })
     }
 }

@@ -271,6 +271,31 @@ octos serve
 
 For a repo-local tenant deploy (builds from source, sets up the same service + tunnel as `install.sh`), use `scripts/local-tenant-deploy.sh --full`.
 
+### Iterating on a system-installed octos
+
+`cargo install --path crates/octos-cli` only drops a binary into `~/.cargo/bin`. It does **not** rebuild the embedded admin dashboard or touch the service installed by `scripts/install.sh` (the LaunchDaemon on macOS / systemd unit on Linux runs `/usr/local/bin/octos`). If you have already run `install.sh` and want to redeploy local changes, use:
+
+```bash
+./scripts/build-local-bundle.sh --install           # build + bundle + reinstall
+./scripts/build-local-bundle.sh --install --tunnel  # same, with tunnel flags passed through
+./scripts/build-local-bundle.sh --skip-dashboard    # only Rust changed, skip npm/vite
+```
+
+What it does:
+
+1. Detects your host triple (mirrors `install.sh`'s platform mapping).
+2. Runs `scripts/build-dashboard.sh` so `rust_embed` bakes a complete SPA into the binary. Skip this and `/admin/` will 307-loop.
+3. Delegates `cargo build --release` to `scripts/milestone-ci.sh release-bundle` (single source of truth for `FEATURES` / `SKILL_CRATES`).
+4. Tars binaries into `scripts/octos-bundle-<TRIPLE>.tar.gz`, which `install.sh` auto-detects via `file://`, skipping the GitHub download.
+5. With `--install`, chains into `install.sh` — copies binaries to `$PREFIX`, rewrites the service plist/unit, reloads the daemon.
+
+Use this when:
+
+- You changed Rust **or** dashboard code and need to see it running under the installed service.
+- You want to exercise the full installer flow against a local build.
+
+Skip it when you just need the CLI (`octos chat`, `octos gateway`) — `cargo install --path crates/octos-cli` is faster.
+
 ## Documentation
 
 📖 **[Full Documentation](https://octos-org.github.io/octos/)** — installation, configuration, channels, providers, memory, skills, advanced features, and more.

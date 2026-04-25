@@ -3601,6 +3601,7 @@ dependencies = [
  "lettre",
  "libc",
  "metrics",
+ "octos-bus",
  "octos-core",
  "octos-llm",
  "octos-memory",

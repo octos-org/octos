@@ -8,6 +8,7 @@ description = "Agent runtime, tool execution, and coordination for octos"
 
 [dependencies]
 octos-core = { workspace = true }
+octos-bus = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
 # codex-execpolicy = { workspace = true }  # Enable when codex builds

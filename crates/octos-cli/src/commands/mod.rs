@@ -241,6 +241,42 @@ pub(crate) fn load_bootstrap_files(data_dir: &std::path::Path) -> String {
     parts.join("\n\n")
 }
 
+/// M8.3: load a profile's `system_prompt_template` hint.
+///
+/// The path is treated as relative to `~/.octos/profiles/<profile_name>/`.
+/// Missing files are not an error — we log and return `None` so the agent
+/// keeps its default prompt. Empty files are also treated as missing.
+pub(crate) fn load_profile_prompt_template(
+    profile_name: &str,
+    template_rel: &std::path::Path,
+) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let base = home.join(".octos/profiles").join(profile_name);
+    let path = base.join(template_rel);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "profile system_prompt_template exists but is empty; using default prompt"
+                );
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "profile system_prompt_template not found; using default prompt"
+            );
+            None
+        }
+    }
+}
+
 impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {

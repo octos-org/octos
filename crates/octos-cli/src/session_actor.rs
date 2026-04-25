@@ -796,6 +796,45 @@ impl SessionTaskQueryStore {
             None => serde_json::json!([]),
         }
     }
+
+    /// M8 fix-first item 8 (gap 3): mark the parent task that owns a
+    /// child session as failed.
+    ///
+    /// When a child session refuses to resume because its worktree has
+    /// disappeared, the in-memory transcript is cleared as a safety floor
+    /// (M8.6 fix-first item 3) but the parent task that spawned this
+    /// child is left in `Running`. Dashboards then show a stuck task that
+    /// will never make progress. This method walks every registered
+    /// supervisor, looking for a `BackgroundTask` whose
+    /// `child_session_key` matches `child_session_key`, and calls
+    /// [`TaskSupervisor::mark_failed`] on it. Returns `true` when a
+    /// matching task was found and updated; `false` otherwise.
+    pub fn mark_child_session_failed(&self, child_session_key: &str, error: &str) -> bool {
+        // Snapshot live supervisors and prune dropped ones in one pass so
+        // we hold the inner lock for as little as possible.
+        let snapshot: Vec<Arc<TaskSupervisor>> = {
+            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+            let mut alive = Vec::new();
+            guard.retain(|_, entry| match entry.supervisor.upgrade() {
+                Some(supervisor) => {
+                    alive.push(supervisor);
+                    true
+                }
+                None => false,
+            });
+            alive
+        };
+
+        for supervisor in snapshot {
+            for task in supervisor.get_all_tasks() {
+                if task.child_session_key.as_deref() == Some(child_session_key) {
+                    supervisor.mark_failed(&task.id, error.to_string());
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
@@ -1472,6 +1511,11 @@ pub struct ActorFactory {
     pub plugin_extra_env: Vec<(String, String)>,
     /// Session-scoped background task lookup for API inspection.
     pub task_query_store: SessionTaskQueryStore,
+    /// M8 fix-first item 8 (gap 2): shared SubAgentOutputRouter — one
+    /// router instance backs every actor so dashboards see a consistent
+    /// disk layout across sessions. Built once at factory construction
+    /// time and cloned (cheap Arc bump) per actor.
+    pub subagent_output_router: Arc<octos_agent::SubAgentOutputRouter>,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -1567,7 +1611,84 @@ impl ActorFactory {
         }
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
-        let session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        // M8 fix-first item 8 (gap 1): construct the per-actor
+        // FileStateCache BEFORE sanitize so the resume hand-off can seed
+        // it directly. The same Arc is later wired into Agent::new so the
+        // recovered file-identity claims actually reach the file tools.
+        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
+        // M8.6: sanitize the loaded transcript. Dropping unresolved tool
+        // calls, orphan thinking, and whitespace-only messages here
+        // prevents the provider from 400-ing on the first request after a
+        // resume. `retry_state` and `workspace_root` are None for
+        // top-level sessions today — sub-agent workstreams will thread
+        // them in when M8.7 lands.
+        match session_handle.sanitize_loaded_messages(None, None) {
+            Ok((report, refs)) => {
+                if report.input_len != report.output_len
+                    || report.content_replacements_restored > 0
+                    || !report.warnings.is_empty()
+                {
+                    info!(
+                        session = %session_key,
+                        report = %report,
+                        "resume sanitize applied"
+                    );
+                }
+                // M8.4/M8.6 fix-first item 7 + M8 fix-first item 8 (gap 1):
+                // hand-off complete and now WIRED. Seed the per-actor
+                // FileStateCache with the recovered replacement refs
+                // before any LLM call so post-resume reads consult the
+                // recovered hashes instead of returning false
+                // FILE_UNCHANGED stubs.
+                let seeded = file_state_cache.seed_from_replacement_refs(&refs);
+                if seeded > 0 {
+                    info!(
+                        session = %session_key,
+                        seeded,
+                        "seeded FileStateCache from resume refs"
+                    );
+                }
+            }
+            Err(error) => {
+                // M8.6 fix-first item 3: a refused sanitize means the
+                // worktree is gone and the loaded transcript references
+                // state we cannot trust. The legacy "warn and continue"
+                // path silently fed the unsafe transcript into the first
+                // LLM call. We now hard-refuse:
+                //
+                // - top-level sessions: drop the in-memory transcript so
+                //   the actor restarts with an empty session. The disk
+                //   JSONL is left untouched so an operator can recover
+                //   it; only the in-memory copy is cleared.
+                // - child / background sessions: M8 fix-first item 8
+                //   (gap 3) — mark the owning parent task as failed via
+                //   the supervisor lookup so dashboards see the cascade
+                //   instead of a stuck Running entry. The transcript
+                //   clear stays as the safety floor underneath.
+                let is_child = session_handle.is_child_session();
+                session_handle.clear_messages_for_unsafe_resume();
+                let octos_bus::SanitizeError::WorktreeMissing { path, .. } = &error;
+                let mut parent_marked_failed = false;
+                if is_child {
+                    let failure_reason = format!(
+                        "resume sanitize refused: worktree missing at {}",
+                        path.display()
+                    );
+                    parent_marked_failed = self
+                        .task_query_store
+                        .mark_child_session_failed(&session_key.to_string(), &failure_reason);
+                }
+                warn!(
+                    session = %session_key,
+                    path = %path.display(),
+                    is_child,
+                    parent_marked_failed,
+                    "resume sanitize HARD-REFUSED: worktree missing — \
+                     in-memory transcript dropped to prevent unsafe LLM call"
+                );
+            }
+        }
         let task_state_path = session_handle.task_state_path();
         let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);
@@ -1904,6 +2025,18 @@ impl ActorFactory {
             system_prompt.push_str(&template.replace("{tool_list}", &tool_names.join(", ")));
         }
 
+        // M8 fix-first item 8 (gap 2): build a per-actor
+        // AgentSummaryGenerator now that the supervisor handle and the
+        // shared SubAgentOutputRouter are both in scope. The generator
+        // binds the per-registry supervisor (so it can mark_terminal /
+        // start a watcher / etc. for THIS actor's tasks); the router
+        // is shared across actors via the factory.
+        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
+            self.llm_for_compaction.clone(),
+            self.subagent_output_router.clone(),
+            (*supervisor).clone(),
+        ));
+
         // Per-session cancellation flag: shared with the agent so that
         // interrupt mode can stop a running agent loop mid-iteration.
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1911,7 +2044,15 @@ impl ActorFactory {
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
             .with_shutdown(cancelled.clone())
-            .with_system_prompt(system_prompt);
+            .with_system_prompt(system_prompt)
+            // M8 fix-first item 8 (gap 1): wire the seeded per-actor
+            // FileStateCache so file tools see resumed-state claims.
+            .with_file_state_cache(file_state_cache.clone())
+            // M8 fix-first item 8 (gap 2): wire the M8.7 disk router and
+            // periodic summary generator so spawn_only background tasks
+            // surface output and status to dashboards.
+            .with_subagent_output_router(self.subagent_output_router.clone())
+            .with_subagent_summary_generator(subagent_summary_generator);
 
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
@@ -5560,6 +5701,91 @@ mod tests {
         assert!(!topic_requires_serial_delivery(None));
     }
 
+    #[test]
+    fn mark_child_session_failed_marks_owning_task_when_supervisor_registered() {
+        // M8 fix-first item 8 (gap 3): when a child session refuses to
+        // resume because its worktree is gone, SessionTaskQueryStore must
+        // walk every registered supervisor, find the BackgroundTask
+        // whose `child_session_key` matches, and call mark_failed on it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+
+        // Register a parent task that spawns a child session — the
+        // supervisor's `register_with_lineage` derives a deterministic
+        // `child_session_key` from the parent + task id.
+        let parent_session_key = SessionKey::new("api", "parent-session");
+        let task_id = supervisor.register_with_lineage(
+            "spawn",
+            "call-1",
+            Some(&parent_session_key.to_string()),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+
+        // Pull the derived child_session_key the supervisor recorded.
+        let registered_task = supervisor.get_task(&task_id).expect("task tracked");
+        let child_session_key = registered_task
+            .child_session_key
+            .clone()
+            .expect("register_with_lineage derives a child key");
+
+        // Register the supervisor in the query store as the parent
+        // session would. The store now tracks a Weak<TaskSupervisor>
+        // keyed by parent session key.
+        let store = SessionTaskQueryStore::default();
+        store.register(&parent_session_key, &supervisor, &data_dir);
+
+        // ACT: simulate the child session refusing to resume.
+        let was_marked = store.mark_child_session_failed(
+            &child_session_key,
+            "resume sanitize refused: worktree missing",
+        );
+        assert!(was_marked, "the parent task must be located by child key");
+
+        // ASSERT: the task transitioned to Failed with the supplied error.
+        let updated = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(
+            updated.status,
+            octos_agent::TaskStatus::Failed,
+            "WorktreeMissing on a child session must mark the parent task failed"
+        );
+        assert!(
+            updated
+                .error
+                .as_deref()
+                .map(|e| e.contains("worktree missing"))
+                .unwrap_or(false),
+            "task error must carry the resume failure reason: {:?}",
+            updated.error
+        );
+    }
+
+    #[test]
+    fn mark_child_session_failed_returns_false_when_no_task_matches() {
+        // The store returns false when no registered supervisor owns a
+        // task with the requested child_session_key. This guards against
+        // false-positive marks on unrelated supervisors.
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let parent_session_key = SessionKey::new("api", "parent-session");
+        let store = SessionTaskQueryStore::default();
+        store.register(&parent_session_key, &supervisor, &data_dir);
+
+        let was_marked = store.mark_child_session_failed("api:other-session#child-zzz", "anything");
+        assert!(
+            !was_marked,
+            "mark_child_session_failed must return false when no task matches"
+        );
+    }
+
     // ── Mock providers for speculative overflow tests ────────────────────
 
     /// Mock LLM provider with configurable delay per call.
@@ -8198,6 +8424,9 @@ mod tests {
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
             task_query_store: SessionTaskQueryStore::default(),
+            subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
+                dir.path().join("subagent-outputs"),
+            )),
         };
 
         let registry = ActorRegistry::new(

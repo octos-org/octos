@@ -1060,6 +1060,14 @@ impl GatewayRuntime {
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let task_query_store = SessionTaskQueryStore::default();
 
+        // M8 fix-first item 8 (gap 2): build a single shared
+        // SubAgentOutputRouter rooted under the gateway data dir. Every
+        // actor spawned by this factory clones the Arc so dashboards see
+        // a consistent on-disk layout across sessions.
+        let subagent_output_router = Arc::new(octos_agent::SubAgentOutputRouter::new(
+            data_dir.join("subagent-outputs"),
+        ));
+
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
             agent_config,
@@ -1096,6 +1104,7 @@ impl GatewayRuntime {
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),
+            subagent_output_router: subagent_output_router.clone(),
         };
         let profile_factory_builder =
             profile_store
@@ -1127,6 +1136,7 @@ impl GatewayRuntime {
                     no_retry: cmd.no_retry,
                     sandbox_config: sandbox_config.clone(),
                     task_query_store: task_query_store.clone(),
+                    subagent_output_router: subagent_output_router.clone(),
                 });
 
         // Start config watcher for hot-reload

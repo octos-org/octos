@@ -75,8 +75,7 @@ fn init_tracing(
     // avoid the launchd StandardErrorPath double-capturing what the rolling
     // appender is already persisting. When interactive, keep stderr alive so
     // `octos chat`/debugging still prints.
-    let enable_console = console_enabled
-        && (log_dir.is_none() || std::io::stderr().is_terminal());
+    let enable_console = console_enabled && (log_dir.is_none() || std::io::stderr().is_terminal());
     let _unused_has_rolling = has_rolling_file_logs; // retained for future use
 
     if let Some(dir) = log_dir {
