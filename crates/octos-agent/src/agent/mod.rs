@@ -16,7 +16,7 @@ mod streaming;
 mod turn_state;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use octos_core::{AgentId, Message, TokenUsage};
@@ -155,6 +155,12 @@ pub struct Agent {
     pub(super) harness_event_sink: Option<String>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
+    /// Tracks whether the LOOP DETECTED warning has already fired in the
+    /// current session-burst. Reset at the start of each `process_message`
+    /// invocation; if a second loop fire happens within the same turn (e.g.
+    /// re-engagement before the turn ends), the duplicate warning is replaced
+    /// by a terminal error so the loop cannot keep emitting identical noise.
+    pub(super) loop_detected_recently: Arc<AtomicBool>,
     /// Optional per-session runtime limits for tool rounds and per-tool calls.
     pub(super) session_limits: Option<SessionLimits>,
     /// Mutable usage tracked against `session_limits`.
@@ -205,6 +211,7 @@ impl Agent {
             hook_context: std::sync::Mutex::new(None),
             harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            loop_detected_recently: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
             realtime: None,
@@ -237,6 +244,7 @@ impl Agent {
             hook_context: std::sync::Mutex::new(None),
             harness_event_sink: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            loop_detected_recently: Arc::new(AtomicBool::new(false)),
             session_limits: None,
             session_usage: std::sync::Mutex::new(SessionUsage::default()),
             realtime: None,
@@ -532,5 +540,23 @@ impl Agent {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether the loop-detector warning has fired since the last reset.
+    /// Exposed for tests so they can verify single-fire-per-burst semantics.
+    pub fn is_loop_detected_recently(&self) -> bool {
+        self.loop_detected_recently.load(Ordering::Acquire)
+    }
+
+    /// Clear the "loop detected recently" flag.
+    /// Called at the start of each `process_message` turn so a new user
+    /// message starts with a clean slate.
+    pub(super) fn reset_loop_detected_recently(&self) {
+        self.loop_detected_recently.store(false, Ordering::Release);
+    }
+
+    /// Mark the loop-detector warning as having just fired.
+    pub(super) fn mark_loop_detected_recently(&self) {
+        self.loop_detected_recently.store(true, Ordering::Release);
     }
 }
