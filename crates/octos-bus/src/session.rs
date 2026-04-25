@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use eyre::Result;
@@ -13,6 +14,31 @@ use tracing::{debug, warn};
 
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
+
+/// Per-process counter for unique rewrite-temp-file names.
+///
+/// Two writers racing the same session file (e.g. fanout children of one
+/// parent terminating in the same millisecond, both calling
+/// `parent.upsert_child_contract → parent.rewrite()`) used to share a
+/// single `<file>.jsonl.tmp` path. They'd both `File::create` it (the
+/// second truncating the first), and only one `rename` would succeed —
+/// the loser saw `ENOENT` and returned an error. In the spawn lifecycle
+/// this manifested as the unlucky child being marked `Orphaned` instead
+/// of `Joined` despite both terminal states being `Completed`.
+static REWRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique temp-file path for atomic rewrite of a session JSONL.
+///
+/// PID + monotonic counter make the suffix collision-free across:
+/// - Concurrent rewrites of the same parent file from different tokio tasks
+///   (counter ticks)
+/// - Concurrent rewrites from different processes sharing a data dir
+///   (PID disambiguates)
+fn rewrite_tmp_path(target: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let seq = REWRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
+}
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
 /// Used for session filename suffixes on truncated keys.
@@ -737,7 +763,7 @@ impl SessionManager {
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let tmp_path = path.with_extension("jsonl.tmp");
+            let tmp_path = rewrite_tmp_path(&path);
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.flush()?;
@@ -1237,7 +1263,7 @@ impl SessionHandle {
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let tmp_path = path.with_extension("jsonl.tmp");
+            let tmp_path = rewrite_tmp_path(&path);
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.flush()?;
@@ -1870,6 +1896,73 @@ mod tests {
         assert_eq!(session2.messages.len(), 2);
         assert_eq!(session2.messages[0].content, "msg3");
         assert_eq!(session2.messages[1].content, "msg4");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rewrites_of_same_session_dont_collide_on_tmp_path() {
+        // Regression: prior to using a unique-per-call tmp suffix, two writers
+        // racing the same session file (e.g. fanout children of one parent
+        // calling parent.rewrite() in the same millisecond) shared a single
+        // `<file>.jsonl.tmp` path. Both `File::create` would clobber the same
+        // tmp; one rename succeeded, the other got ENOENT and surfaced as a
+        // failed rewrite — manifested in spawn lifecycle as `Orphaned` instead
+        // of `Joined` for the unlucky child. Asserts the rewrite race no
+        // longer drops state.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "rewrite-race");
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        for i in 0..3 {
+            mgr.add_message(&key, make_message(MessageRole::User, &format!("seed{i}")))
+                .await
+                .unwrap();
+        }
+        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
+
+        // Spawn N concurrent rewrites of the same session. Without the unique
+        // suffix, several would race on the shared `<file>.jsonl.tmp` path and
+        // ~1 in N would fail with ENOENT.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let mgr = mgr.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                let mgr = mgr.lock().await;
+                mgr.rewrite(&key).await
+            }));
+        }
+        for h in handles {
+            let result = h.await.expect("join");
+            assert!(
+                result.is_ok(),
+                "concurrent rewrite must not lose to tmp-file collision: {result:?}"
+            );
+        }
+
+        // Disk state should still be parseable.
+        let mut reload = SessionManager::open(tmp.path()).unwrap();
+        let session = reload.get_or_create(&key).await;
+        assert_eq!(session.messages.len(), 3);
+    }
+
+    #[test]
+    fn rewrite_tmp_path_is_unique_per_call() {
+        let target = std::path::PathBuf::from("/tmp/some/session.jsonl");
+        let a = rewrite_tmp_path(&target);
+        let b = rewrite_tmp_path(&target);
+        assert_ne!(a, b, "successive calls must produce distinct tmp paths");
+        assert!(
+            a.to_string_lossy().contains(".tmp"),
+            "tmp path keeps a .tmp suffix: {}",
+            a.display()
+        );
+        // Suffix encodes both PID and counter so cross-process races don't
+        // collide either.
+        let pid = std::process::id().to_string();
+        assert!(
+            a.to_string_lossy().contains(&pid),
+            "tmp path includes the pid for cross-process disambiguation: {}",
+            a.display()
+        );
     }
 
     #[tokio::test]
