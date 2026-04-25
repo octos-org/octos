@@ -37,16 +37,14 @@ export default function WizardNav({
         >
           Back
         </button>
-        {!stepOwnsPrimary && (
-          <button
-            type="button"
-            onClick={onSkipStep}
-            disabled={isLast}
-            className="px-3 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            Skip This Step
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={onSkipStep}
+          disabled={isLast}
+          className="px-3 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Skip This Step
+        </button>
       </div>
 
       <div className="flex gap-2">

@@ -1,4 +1,33 @@
 //! Tool framework for agent tool execution.
+//!
+//! # Typed `ToolContext` migration (M8.1)
+//!
+//! Tools receive execution context through [`ToolContext`]. Historically the
+//! context was delivered indirectly via the [`TOOL_CTX`] task-local, which the
+//! executor populated before calling each tool's [`Tool::execute`]. That works
+//! but makes the carrier invisible at the trait surface, so tools that want a
+//! field must either read the task-local or reach into globals.
+//!
+//! M8.1 introduces [`Tool::execute_with_context`], a typed entry point that
+//! threads `&ToolContext` explicitly. To keep the migration additive:
+//!
+//! - The trait's default implementation of `execute_with_context` falls back
+//!   to the legacy [`Tool::execute`]. Existing tools keep working unchanged.
+//! - Migrated tools override `execute_with_context` and use the typed record.
+//!   Their `execute` impl simply re-enters `execute_with_context` with a
+//!   zero-value context so out-of-band callers (tests, integrations that have
+//!   not been updated) still get predictable behaviour.
+//! - [`ToolContext`] carries the legacy fields *plus* placeholder stubs for
+//!   future milestones: [`AgentDefinitions`], [`ToolPermissions`],
+//!   [`FileStateCache`] (populated in M8.4), [`Notifications`], and
+//!   [`AppStateHandle`]. Each stub is annotated with the future issue that
+//!   will populate it. They all have cheap zero-value constructors so today's
+//!   executor can build a context without wiring.
+//!
+//! The executor still sets [`TOOL_CTX`] for legacy plugin tools that rely on
+//! the task-local read path (see `plugins/tool.rs`). Once every tool is
+//! migrated the task-local becomes redundant and can be retired, but that
+//! clean-up is out of scope for M8.1.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,9 +39,185 @@ use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
 
-/// Execution context available to tools via task-local.
-/// Set by the agent before each tool invocation so plugin tools
-/// can report progress without changing the Tool trait signature.
+/// Registry of [`AgentDefinition`]-style manifests available to tools.
+///
+/// Re-exported from [`crate::agents`] where the schema and loader live. M8.2
+/// filled in the stub shipped by M8.1: the registry now carries real
+/// [`crate::agents::AgentDefinition`] records by id. `ToolContext` keeps its
+/// M8.1 signature (`Arc<AgentDefinitions>`), so consumers of the field do
+/// not need to change.
+pub use crate::agents::AgentDefinitions;
+
+/// Per-tool permission facts consulted before each execution.
+///
+/// M8 fix-first item 8 (gap 4b): the M8.1 stub was always allow-all; the
+/// agent's recorded [`crate::profile::ProfileDefinition`] envelope was never
+/// consulted at the tool boundary even when the profile declared an explicit
+/// allow- or deny-list. The struct now carries the resolved policy:
+///
+/// - [`ToolPermissions::allow_all`] / [`ToolPermissions::default`] preserve
+///   the pre-M8.3 status quo (no restrictions).
+/// - [`ToolPermissions::from_profile`] derives the deny / allow lists from the
+///   profile's `tools` filter, expanding `group:*` references through
+///   [`crate::tools::policy::TOOL_GROUPS`] and the user-provided
+///   [`crate::profile::PermissionMode`]. Tools not on the allow list (when
+///   one is configured) are blocked, and tools on the deny list always lose.
+///
+/// Permission is evaluated by [`ToolPermissions::is_tool_allowed`] — the same
+/// hook the existing tools (e.g. `read_file`) consult before executing.
+#[derive(Clone, Debug)]
+pub struct ToolPermissions {
+    /// Coarse permission tier from the profile envelope. Reserved for future
+    /// per-tier rules; today the variant is informational so callers can log
+    /// it without changing semantics.
+    mode: crate::profile::PermissionMode,
+    /// Tools the active profile explicitly forbids. Always wins over the
+    /// allow list (deny-wins semantics, mirroring [`ToolPolicy`]).
+    denied_tools: HashSet<String>,
+    /// Optional explicit allow list. When `Some`, only tools whose names are
+    /// in the set are permitted. When `None`, no allow-list filter applies
+    /// (default behaviour).
+    allowed_tools: Option<HashSet<String>>,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl ToolPermissions {
+    /// Allow-all permissions — the zero-value default carried by the context.
+    pub fn allow_all() -> Self {
+        Self {
+            mode: crate::profile::PermissionMode::Default,
+            denied_tools: HashSet::new(),
+            allowed_tools: None,
+        }
+    }
+
+    /// Derive a [`ToolPermissions`] envelope from a resolved
+    /// [`crate::profile::ProfileDefinition`].
+    ///
+    /// `group:*` references in the profile's tool filter are expanded
+    /// against [`crate::tools::policy::TOOL_GROUPS`] so the runtime gate
+    /// matches the registry filter from M8.3. The resulting record is
+    /// consulted at every tool boundary (see
+    /// [`ToolPermissions::is_tool_allowed`]).
+    pub fn from_profile(profile: &crate::profile::ProfileDefinition) -> Self {
+        use crate::profile::ProfileTools;
+        let mut denied: HashSet<String> = HashSet::new();
+        let mut allowed: Option<HashSet<String>> = None;
+        match &profile.tools {
+            ProfileTools::Default => {}
+            ProfileTools::AllowList { tools } => {
+                if !tools.is_empty() {
+                    allowed = Some(expand_profile_tool_entries(tools));
+                }
+            }
+            ProfileTools::DenyList { tools } => {
+                denied = expand_profile_tool_entries(tools);
+            }
+        }
+        Self {
+            mode: profile.permissions,
+            denied_tools: denied,
+            allowed_tools: allowed,
+        }
+    }
+
+    /// Permission tier carried by the envelope. Reserved for future
+    /// per-tier rules; today purely informational.
+    pub fn mode(&self) -> crate::profile::PermissionMode {
+        self.mode
+    }
+
+    /// Check whether the named tool is currently permitted.
+    ///
+    /// Returns `false` when:
+    /// - the tool is on the profile's deny list, or
+    /// - the profile carries an allow list and the tool is not in it.
+    pub fn is_tool_allowed(&self, tool: &str) -> bool {
+        if self.denied_tools.contains(tool) {
+            return false;
+        }
+        match &self.allowed_tools {
+            Some(allow) => allow.contains(tool),
+            None => true,
+        }
+    }
+}
+
+/// Expand a profile-tool list (which may contain `group:*` references) into
+/// a flat set of tool names.
+fn expand_profile_tool_entries(entries: &[String]) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for entry in entries {
+        if let Some(group) = crate::tools::policy::tool_group_info(entry) {
+            for t in group.tools {
+                out.insert((*t).to_string());
+            }
+        } else {
+            out.insert(entry.clone());
+        }
+    }
+    out
+}
+
+/// File-state cache re-export (M8.4).
+///
+/// The concrete LRU + mtime/hash implementation lives in
+/// [`crate::file_state_cache`]; this re-export keeps the historical public
+/// path (`crate::tools::FileStateCache`) stable for downstream users while
+/// the ToolContext carries a shared handle.
+pub use crate::file_state_cache::FileStateCache;
+
+/// Inbox of in-flight notifications surfaced to tools and the agent loop.
+///
+/// M8.2/M8.3 will route real notifications (e.g. permission prompts, gate
+/// state) through this handle. Today it is a zero-length inbox.
+#[derive(Clone, Debug, Default)]
+pub struct Notifications {
+    // M8.2/M8.3 will add the notification queue and backpressure state here.
+}
+
+impl Notifications {
+    /// Create an empty notifications inbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the inbox is empty (no pending notifications). Always `true`
+    /// until M8.2/M8.3 start enqueueing notifications.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// Handle to the ambient app state shared across tools.
+///
+/// M8.3 will use this to expose profile/app state that tools may read (e.g.
+/// the active profile name, locale, workspace contract root). Today it is an
+/// empty handle that tools can carry without wiring.
+#[derive(Clone, Debug, Default)]
+pub struct AppStateHandle {
+    // M8.3 will add the shared state handle (Arc<ProfileState>) here.
+}
+
+impl AppStateHandle {
+    /// Create an empty app-state handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Execution context available to tools.
+///
+/// The legacy fields (`tool_id`, `reporter`, `harness_event_sink`, three
+/// attachment lists) carry today's behaviour. The trailing fields are M8.x
+/// placeholders — see each field's doc comment for the issue that will wire
+/// it up. Building a zero-value context is cheap: all placeholders implement
+/// `Default` and the required handles are backed by `Arc` so cloning is O(1).
 #[derive(Clone)]
 pub struct ToolContext {
     pub tool_id: String,
@@ -22,6 +227,43 @@ pub struct ToolContext {
     pub attachment_paths: Vec<String>,
     pub audio_attachment_paths: Vec<String>,
     pub file_attachment_paths: Vec<String>,
+    /// Agent manifests available to tools. M8.2 will populate this.
+    pub agent_definitions: Arc<AgentDefinitions>,
+    /// Per-tool permission facts. M8.3 will populate this.
+    pub permissions: ToolPermissions,
+    /// File-state cache shared across tools in a turn (M8.4).
+    ///
+    /// File tools consult this cache on read and invalidate it on write. When
+    /// `None`, tools behave as they did pre-M8.4 (no cache, no stub). The
+    /// cache is wrapped in `Arc` so it can be cloned cheaply into subagents;
+    /// use [`FileStateCache::clone_for_subagent`] when a delegate should
+    /// receive an independent copy instead of a shared handle.
+    pub file_state_cache: Option<Arc<FileStateCache>>,
+    /// Notification inbox surfaced to tools. M8.2/M8.3 will populate this.
+    pub notifications: Arc<Notifications>,
+    /// Handle to the ambient app state. M8.3 will populate this.
+    pub app_state: AppStateHandle,
+}
+
+impl ToolContext {
+    /// Zero-value context suitable for unit tests and tools that do not need
+    /// live executor wiring. Uses a [`crate::progress::SilentReporter`] and
+    /// leaves every M8.x placeholder at its default.
+    pub fn zero() -> Self {
+        Self {
+            tool_id: String::new(),
+            reporter: Arc::new(crate::progress::SilentReporter),
+            harness_event_sink: None,
+            attachment_paths: Vec::new(),
+            audio_attachment_paths: Vec::new(),
+            file_attachment_paths: Vec::new(),
+            agent_definitions: Arc::new(AgentDefinitions::new()),
+            permissions: ToolPermissions::default(),
+            file_state_cache: None,
+            notifications: Arc::new(Notifications::new()),
+            app_state: AppStateHandle::new(),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -53,6 +295,35 @@ pub enum ToolProgress {
     Intermediate { summary: String },
 }
 
+/// Concurrency class of a tool — controls how the executor admits tool calls
+/// into a parallel batch (M8.8).
+///
+/// The executor unconditionally ran every tool call in parallel before M8.8.
+/// This was unsafe in the presence of mutating tools: a `shell && rm foo`
+/// dispatched concurrently with `read_file foo/x` could race and return
+/// inconsistent observations to the LLM. Claude Code's
+/// `StreamingToolExecutor.ts` classifies tools via `isConcurrencySafe()` —
+/// this mirrors that pattern at the trait surface.
+///
+/// Admission policy (implemented in `agent::execution`):
+/// - If every call in the batch is [`ConcurrencyClass::Safe`], the batch
+///   dispatches in parallel (today's behaviour).
+/// - If *any* call is [`ConcurrencyClass::Exclusive`], the entire batch runs
+///   serially in call order. A single error from an exclusive call cancels
+///   the remaining peers so the LLM sees the cascade instead of continuing
+///   to mutate state on a doomed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConcurrencyClass {
+    /// Read-only / side-effect-free. Can run in parallel with any other
+    /// `Safe` tool call without observable interference.
+    #[default]
+    Safe,
+    /// Mutating or stateful (writes files, spawns shells, updates memory).
+    /// Must run serialized: no other tool call runs concurrently while an
+    /// `Exclusive` call is in-flight.
+    Exclusive,
+}
+
 /// Result of executing a tool.
 #[derive(Default)]
 pub struct ToolResult {
@@ -72,6 +343,23 @@ pub struct ToolResult {
 }
 
 /// Trait for implementing tools.
+///
+/// # Context threading
+///
+/// Tools get their execution context through one of two entry points:
+///
+/// - [`Tool::execute`] — the legacy argument-only entry point. Kept as the
+///   primary signature so unmigrated tools, tests, and external callers do
+///   not need to thread a [`ToolContext`]. The default implementation of
+///   `execute_with_context` delegates here, so implementors who override
+///   only `execute` keep working.
+/// - [`Tool::execute_with_context`] — the typed entry point introduced by
+///   M8.1. Migrated tools override this and may read any field on the
+///   [`ToolContext`]. The default body re-enters the legacy [`Tool::execute`]
+///   so unmigrated tools keep working.
+///
+/// A tool should override at most one of the two. Overriding both produces
+/// two independent entry paths that the executor cannot reconcile.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Tool name (must be unique).
@@ -90,12 +378,44 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute the tool with the given arguments.
+    ///
+    /// Kept as the primary entry point so existing tools, tests, and
+    /// integrations do not need to construct a [`ToolContext`]. Migrated
+    /// tools re-enter this via [`Tool::execute_with_context`]; to avoid
+    /// infinite recursion implementors that override `execute_with_context`
+    /// must also override `execute` to call
+    /// `self.execute_with_context(&ToolContext::zero(), args).await`.
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult>;
+
+    /// Execute the tool with typed execution context.
+    ///
+    /// The default implementation delegates to [`Tool::execute`], discarding
+    /// the context. Tools that want to read [`ToolContext`] fields override
+    /// this and ignore `execute`'s default path. See the module-level doc
+    /// comment for the migration pattern.
+    async fn execute_with_context(
+        &self,
+        _ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        self.execute(args).await
+    }
 
     /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.
         &()
+    }
+
+    /// Concurrency class for parallel-batch admission (M8.8).
+    ///
+    /// The default is [`ConcurrencyClass::Safe`] so pre-M8.8 tools keep their
+    /// parallel-friendly behaviour. Mutating or stateful tools override this
+    /// and return [`ConcurrencyClass::Exclusive`] — see each tool's doc for
+    /// rationale. The executor (in `agent::execution`) uses the class to
+    /// decide whether a batch may fan out in parallel or must serialize.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Safe
     }
 }
 
@@ -614,5 +934,347 @@ mod path_tests {
         if let Ok(p) = &result {
             assert!(p.starts_with(base));
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_context_tests {
+    //! M8.1 tests — typed `ToolContext` + `execute_with_context` scaffolding.
+
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tool whose legacy `execute` records how many times it was called.
+    /// Overrides *only* `execute`; the default `execute_with_context` impl
+    /// must delegate here.
+    struct LegacyTool {
+        execute_calls: AtomicUsize,
+    }
+
+    impl LegacyTool {
+        fn new() -> Self {
+            Self {
+                execute_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for LegacyTool {
+        fn name(&self) -> &str {
+            "legacy"
+        }
+        fn description(&self) -> &str {
+            "legacy"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                output: "legacy output".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Tool that consumes the typed `ToolContext` — overrides
+    /// `execute_with_context` and re-enters via zero-value context from
+    /// `execute`.
+    struct ContextAwareTool {
+        with_ctx_calls: AtomicUsize,
+    }
+
+    impl ContextAwareTool {
+        fn new() -> Self {
+            Self {
+                with_ctx_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ContextAwareTool {
+        fn name(&self) -> &str {
+            "ctx_aware"
+        }
+        fn description(&self) -> &str {
+            "ctx"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, args: &Value) -> Result<ToolResult> {
+            // Re-enter the typed path with the zero context so callers that
+            // still use the legacy entry point see identical behaviour.
+            self.execute_with_context(&ToolContext::zero(), args).await
+        }
+        async fn execute_with_context(
+            &self,
+            ctx: &ToolContext,
+            _args: &Value,
+        ) -> Result<ToolResult> {
+            self.with_ctx_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                output: format!(
+                    "tool_id={};allow_all={};defs_empty={}",
+                    ctx.tool_id,
+                    ctx.permissions.is_tool_allowed("anything"),
+                    ctx.agent_definitions.is_empty(),
+                ),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn should_construct_zero_value_tool_context() {
+        let ctx = ToolContext::zero();
+        assert!(ctx.tool_id.is_empty());
+        assert!(ctx.harness_event_sink.is_none());
+        assert!(ctx.attachment_paths.is_empty());
+        assert!(ctx.audio_attachment_paths.is_empty());
+        assert!(ctx.file_attachment_paths.is_empty());
+        // M8.x placeholders — zero-value but constructible without panic.
+        assert!(ctx.agent_definitions.is_empty());
+        assert!(ctx.permissions.is_tool_allowed("any_tool"));
+        assert!(ctx.file_state_cache.is_none());
+        assert!(ctx.notifications.is_empty());
+        // AppStateHandle has no introspection beyond Default; just ensure
+        // it cloned cheaply.
+        let _cloned = ctx.app_state.clone();
+    }
+
+    #[tokio::test]
+    async fn should_delegate_execute_to_execute_with_context() {
+        // Legacy tool: override only `execute`. The default impl of
+        // `execute_with_context` must route to it.
+        let tool = LegacyTool::new();
+        let ctx = ToolContext::zero();
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await
+            .expect("legacy tool must succeed via default delegation");
+        assert!(result.success);
+        assert_eq!(result.output, "legacy output");
+        assert_eq!(tool.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn should_invoke_execute_with_context_for_migrated_tool() {
+        let tool = ContextAwareTool::new();
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call-42".to_string();
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await
+            .expect("ctx-aware tool must succeed");
+        assert!(result.success);
+        assert!(result.output.contains("tool_id=call-42"));
+        assert!(result.output.contains("allow_all=true"));
+        assert!(result.output.contains("defs_empty=true"));
+        assert_eq!(tool.with_ctx_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn should_route_migrated_tool_execute_back_through_context_path() {
+        // When a migrated tool is called via the legacy `execute` entry
+        // point, it must still take its ctx-aware branch (invoked with
+        // the zero-value context so out-of-band callers keep working).
+        let tool = ContextAwareTool::new();
+        let result = tool
+            .execute(&serde_json::json!({}))
+            .await
+            .expect("migrated tool's legacy execute must succeed");
+        assert!(result.success);
+        // tool_id is empty because ToolContext::zero() carries no id.
+        assert!(result.output.starts_with("tool_id=;"));
+        assert_eq!(tool.with_ctx_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---------- M8.8 concurrency-class tests ----------
+
+    struct ExclusiveStubTool;
+
+    #[async_trait]
+    impl Tool for ExclusiveStubTool {
+        fn name(&self) -> &str {
+            "exclusive_stub"
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            Ok(ToolResult::default())
+        }
+        fn concurrency_class(&self) -> ConcurrencyClass {
+            ConcurrencyClass::Exclusive
+        }
+    }
+
+    #[test]
+    fn default_concurrency_class_is_safe() {
+        // A tool that does not override the default must report Safe so that
+        // unmigrated tools keep pre-M8.8 parallel-friendly behaviour.
+        let tool = LegacyTool::new();
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Safe);
+        let ctx_tool = ContextAwareTool::new();
+        assert_eq!(ctx_tool.concurrency_class(), ConcurrencyClass::Safe);
+    }
+
+    #[test]
+    fn override_returns_exclusive() {
+        // A tool that opts into Exclusive must be reported as Exclusive.
+        let tool = ExclusiveStubTool;
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    #[test]
+    fn concurrency_class_is_copy_eq_default() {
+        // The enum exposes Copy + Eq + Default as contracted by the M8.8 spec.
+        let a: ConcurrencyClass = ConcurrencyClass::default();
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_eq!(ConcurrencyClass::default(), ConcurrencyClass::Safe);
+    }
+
+    // ---------- M8 fix-first item 8 (gap 4b) — ToolPermissions::from_profile ----------
+
+    use crate::profile::{PROFILE_SCHEMA_VERSION, PermissionMode, ProfileDefinition, ProfileTools};
+
+    fn make_profile(name: &str, tools: ProfileTools) -> ProfileDefinition {
+        ProfileDefinition {
+            name: name.to_string(),
+            version: PROFILE_SCHEMA_VERSION,
+            tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_allow_all_tools_when_profile_uses_default_filter() {
+        // Default profile filter must remain pass-through so today's
+        // `coding` profile path keeps allowing every registered tool.
+        let profile = make_profile("default", ProfileTools::Default);
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("read_file"));
+        assert!(permissions.is_tool_allowed("shell"));
+        assert!(permissions.is_tool_allowed("anything_else"));
+    }
+
+    #[test]
+    fn should_deny_listed_tools_when_profile_uses_deny_list() {
+        // DenyList must block the named tools while leaving everything else
+        // permitted. Plain tool names match exactly.
+        let profile = make_profile(
+            "no-shell",
+            ProfileTools::DenyList {
+                tools: vec!["shell".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(
+            !permissions.is_tool_allowed("shell"),
+            "shell must be denied"
+        );
+        assert!(permissions.is_tool_allowed("read_file"));
+    }
+
+    #[test]
+    fn should_only_allow_listed_tools_when_profile_uses_allow_list() {
+        // AllowList must restrict to only the named tools (everything else
+        // becomes implicitly denied). Tools outside the list lose.
+        let profile = make_profile(
+            "ro",
+            ProfileTools::AllowList {
+                tools: vec!["read_file".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("read_file"));
+        assert!(
+            !permissions.is_tool_allowed("shell"),
+            "non-allow-listed tools must be denied"
+        );
+        assert!(!permissions.is_tool_allowed("write_file"));
+    }
+
+    #[test]
+    fn should_expand_group_references_in_deny_list() {
+        // `group:fs` references must expand to read_file / write_file /
+        // edit_file / diff_edit per crate::tools::policy::TOOL_GROUPS so
+        // the runtime gate matches the registry filter.
+        let profile = make_profile(
+            "no-fs",
+            ProfileTools::DenyList {
+                tools: vec!["group:fs".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(!permissions.is_tool_allowed("read_file"));
+        assert!(!permissions.is_tool_allowed("write_file"));
+        assert!(!permissions.is_tool_allowed("edit_file"));
+        assert!(!permissions.is_tool_allowed("diff_edit"));
+        // Non-fs tools still permitted.
+        assert!(permissions.is_tool_allowed("shell"));
+    }
+
+    #[test]
+    fn should_expand_group_references_in_allow_list() {
+        // `group:search` allows glob/grep/list_dir; everything else is
+        // implicitly denied.
+        let profile = make_profile(
+            "search-only",
+            ProfileTools::AllowList {
+                tools: vec!["group:search".to_string()],
+            },
+        );
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("glob"));
+        assert!(permissions.is_tool_allowed("grep"));
+        assert!(permissions.is_tool_allowed("list_dir"));
+        assert!(!permissions.is_tool_allowed("shell"));
+        assert!(!permissions.is_tool_allowed("read_file"));
+    }
+
+    #[test]
+    fn should_pass_through_when_allow_list_is_empty() {
+        // Empty allow list mirrors the registry filter behaviour: an empty
+        // allow list is a degenerate case that we treat as "no filter" (the
+        // explicit deny list is the right tool to disable everything).
+        let profile = make_profile("empty-allow", ProfileTools::AllowList { tools: Vec::new() });
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(permissions.is_tool_allowed("anything"));
+    }
+
+    #[test]
+    fn should_record_permission_mode_from_profile() {
+        // The mode field is informational today; verify it survives the
+        // from_profile boundary so future tier rules can read it.
+        let profile = ProfileDefinition {
+            name: "restricted".to_string(),
+            version: PROFILE_SCHEMA_VERSION,
+            permissions: PermissionMode::Restricted,
+            ..Default::default()
+        };
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert_eq!(permissions.mode(), PermissionMode::Restricted);
+    }
+
+    #[test]
+    fn default_tool_permissions_remain_allow_all() {
+        // Ensure the existing zero-value default keeps its allow-all
+        // semantics so unrelated tests/contexts do not regress.
+        let permissions = ToolPermissions::default();
+        assert!(permissions.is_tool_allowed("anything"));
+        assert!(permissions.is_tool_allowed("shell"));
     }
 }

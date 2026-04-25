@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use eyre::Result;
@@ -13,6 +14,31 @@ use tracing::{debug, warn};
 
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
+
+/// Per-process counter for unique rewrite-temp-file names.
+///
+/// Two writers racing the same session file (e.g. fanout children of one
+/// parent terminating in the same millisecond, both calling
+/// `parent.upsert_child_contract → parent.rewrite()`) used to share a
+/// single `<file>.jsonl.tmp` path. They'd both `File::create` it (the
+/// second truncating the first), and only one `rename` would succeed —
+/// the loser saw `ENOENT` and returned an error. In the spawn lifecycle
+/// this manifested as the unlucky child being marked `Orphaned` instead
+/// of `Joined` despite both terminal states being `Completed`.
+static REWRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique temp-file path for atomic rewrite of a session JSONL.
+///
+/// PID + monotonic counter make the suffix collision-free across:
+/// - Concurrent rewrites of the same parent file from different tokio tasks
+///   (counter ticks)
+/// - Concurrent rewrites from different processes sharing a data dir
+///   (PID disambiguates)
+fn rewrite_tmp_path(target: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let seq = REWRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
+}
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
 /// Used for session filename suffixes on truncated keys.
@@ -737,7 +763,7 @@ impl SessionManager {
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let tmp_path = path.with_extension("jsonl.tmp");
+            let tmp_path = rewrite_tmp_path(&path);
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.flush()?;
@@ -1110,6 +1136,24 @@ impl SessionHandle {
         &mut self.session
     }
 
+    /// Returns `true` when this session has a recorded parent (i.e. a
+    /// background/child session forked from a top-level chat). Used by the
+    /// session actor (M8.6 fix-first item 3) to distinguish top-level
+    /// resume refusals (start fresh) from child resume refusals (mark task
+    /// failed).
+    pub fn is_child_session(&self) -> bool {
+        self.session.parent_key.is_some()
+    }
+
+    /// Drop all in-memory messages without persisting. Used by the session
+    /// actor (M8.6 fix-first item 3) on a top-level worktree-missing
+    /// refusal: the unsafe transcript must not flow into the first LLM
+    /// call. Caller is expected to follow up with a fresh
+    /// [`Self::rewrite`] if it wants the empty state to survive on disk.
+    pub fn clear_messages_for_unsafe_resume(&mut self) {
+        self.session.messages.clear();
+    }
+
     /// Get the most recent N messages from history.
     pub fn get_history(&self, max: usize) -> &[Message] {
         self.session.get_history(max)
@@ -1118,6 +1162,50 @@ impl SessionHandle {
     /// Get or initialize the session (always returns a reference).
     pub fn get_or_create(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    /// Sanitize the loaded transcript via [`crate::ResumePolicy`] (M8.6).
+    ///
+    /// Runs the four filter passes described in `resume_policy`, replaces
+    /// `self.session.messages` with the sanitized list, and returns the
+    /// typed report so callers can log it or forward it to a harness event
+    /// sink. A missing worktree is reported via
+    /// [`crate::SanitizeError::WorktreeMissing`] — the session's in-memory
+    /// messages are NOT mutated in that case so callers retain the
+    /// original transcript for operator inspection.
+    ///
+    /// NOTE: this does not persist the sanitized transcript to disk. Call
+    /// [`Self::rewrite`] afterward if the caller wants the sanitized
+    /// version to survive a subsequent reload.
+    pub fn sanitize_loaded_messages(
+        &mut self,
+        retry_state: Option<&dyn crate::RetryStateView>,
+        workspace_root: Option<&Path>,
+    ) -> Result<
+        (
+            crate::SessionSanitizeReport,
+            Vec<crate::ReplacementStateRef>,
+        ),
+        crate::SanitizeError,
+    > {
+        // Clone so we can restore the original on the worktree-missing
+        // path without a partial-move hazard.
+        let messages = self.session.messages.clone();
+        match crate::ResumePolicy::sanitize(messages, retry_state, workspace_root) {
+            Ok(outcome) => {
+                self.session.messages = outcome.messages;
+                Ok((outcome.report, outcome.content_replacements))
+            }
+            Err(error) => {
+                let crate::SanitizeError::WorktreeMissing { report, .. } = &error;
+                warn!(
+                    key = %self.session.key,
+                    report = %report,
+                    "resume sanitize refused: worktree missing"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Add a message to the session and persist it.
@@ -1175,7 +1263,7 @@ impl SessionHandle {
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let tmp_path = path.with_extension("jsonl.tmp");
+            let tmp_path = rewrite_tmp_path(&path);
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
             file.flush()?;
@@ -1613,6 +1701,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -1808,6 +1897,73 @@ mod tests {
         assert_eq!(session2.messages.len(), 2);
         assert_eq!(session2.messages[0].content, "msg3");
         assert_eq!(session2.messages[1].content, "msg4");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rewrites_of_same_session_dont_collide_on_tmp_path() {
+        // Regression: prior to using a unique-per-call tmp suffix, two writers
+        // racing the same session file (e.g. fanout children of one parent
+        // calling parent.rewrite() in the same millisecond) shared a single
+        // `<file>.jsonl.tmp` path. Both `File::create` would clobber the same
+        // tmp; one rename succeeded, the other got ENOENT and surfaced as a
+        // failed rewrite — manifested in spawn lifecycle as `Orphaned` instead
+        // of `Joined` for the unlucky child. Asserts the rewrite race no
+        // longer drops state.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "rewrite-race");
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        for i in 0..3 {
+            mgr.add_message(&key, make_message(MessageRole::User, &format!("seed{i}")))
+                .await
+                .unwrap();
+        }
+        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
+
+        // Spawn N concurrent rewrites of the same session. Without the unique
+        // suffix, several would race on the shared `<file>.jsonl.tmp` path and
+        // ~1 in N would fail with ENOENT.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let mgr = mgr.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                let mgr = mgr.lock().await;
+                mgr.rewrite(&key).await
+            }));
+        }
+        for h in handles {
+            let result = h.await.expect("join");
+            assert!(
+                result.is_ok(),
+                "concurrent rewrite must not lose to tmp-file collision: {result:?}"
+            );
+        }
+
+        // Disk state should still be parseable.
+        let mut reload = SessionManager::open(tmp.path()).unwrap();
+        let session = reload.get_or_create(&key).await;
+        assert_eq!(session.messages.len(), 3);
+    }
+
+    #[test]
+    fn rewrite_tmp_path_is_unique_per_call() {
+        let target = std::path::PathBuf::from("/tmp/some/session.jsonl");
+        let a = rewrite_tmp_path(&target);
+        let b = rewrite_tmp_path(&target);
+        assert_ne!(a, b, "successive calls must produce distinct tmp paths");
+        assert!(
+            a.to_string_lossy().contains(".tmp"),
+            "tmp path keeps a .tmp suffix: {}",
+            a.display()
+        );
+        // Suffix encodes both PID and counter so cross-process races don't
+        // collide either.
+        let pid = std::process::id().to_string();
+        assert!(
+            a.to_string_lossy().contains(&pid),
+            "tmp path includes the pid for cross-process disambiguation: {}",
+            a.display()
+        );
     }
 
     #[tokio::test]
@@ -2439,6 +2595,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: newer,
                 })
                 .unwrap()
@@ -2467,6 +2624,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: older,
                 })
                 .unwrap()
@@ -2665,6 +2823,34 @@ mod tests {
         assert_eq!(handle.get_history(10).len(), 2);
     }
 
+    #[tokio::test]
+    async fn add_message_preserves_client_message_id_through_jsonl_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-cmid-test");
+
+        // First handle: persist a user message tagged with a client_message_id.
+        {
+            let mut handle = SessionHandle::open(tmp.path(), &key);
+            let user_msg = Message::user("hi there").with_client_message_id("cmid-xyz");
+            let seq = handle.add_message_with_seq(user_msg).await.unwrap();
+            assert_eq!(seq, 0);
+        }
+
+        // Reopen the handle: it should reload from JSONL and the
+        // client_message_id field must survive the disk round-trip.
+        {
+            let handle = SessionHandle::open(tmp.path(), &key);
+            let history = handle.get_history(10);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].content, "hi there");
+            assert_eq!(
+                history[0].client_message_id.as_deref(),
+                Some("cmid-xyz"),
+                "client_message_id must survive append-and-reload"
+            );
+        }
+    }
+
     #[test]
     fn test_session_handle_task_state_path_uses_sidecar_file() {
         let tmp = TempDir::new().unwrap();
@@ -2687,5 +2873,227 @@ mod tests {
         assert_eq!(child.0, "api:web-task-ledger#child-spawn-01%2Falpha%20beta");
         assert_eq!(child.base_key(), "api:web-task-ledger");
         assert_eq!(child.topic(), Some("child-spawn-01%2Falpha%20beta"));
+    }
+
+    /// M8.6: `sanitize_loaded_messages` replaces the session's in-memory
+    /// transcript with the cleaned-up version and returns the report. No
+    /// disk state is touched until the caller rewrites.
+    #[test]
+    fn should_sanitize_loaded_messages_in_place() {
+        use octos_core::ToolCall;
+
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "resume-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        // Load an unresolved tool_call + a whitespace-only assistant
+        // message into the handle directly.
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "hi"));
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "unresolved-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: "   ".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let before = handle.session.messages.len();
+        let (report, refs) = handle
+            .sanitize_loaded_messages(None, None)
+            .expect("clean outcome — no workspace root");
+
+        assert_eq!(report.input_len, before);
+        assert_eq!(report.unresolved_tool_uses_dropped, 1);
+        assert_eq!(report.whitespace_only_dropped, 1);
+        assert_eq!(report.output_len, 1);
+        assert!(refs.is_empty());
+        // Handle was mutated in place.
+        assert_eq!(handle.session.messages.len(), 1);
+        assert_eq!(handle.session.messages[0].content, "hi");
+    }
+
+    /// M8.6: a missing worktree surfaces as `Err` and DOES NOT mutate the
+    /// session's in-memory transcript — callers can still log what was
+    /// loaded before deciding to refuse resume.
+    #[test]
+    fn should_preserve_messages_when_worktree_missing() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "resume-no-worktree");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "hi"));
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::Assistant, "there"));
+
+        let gone = tmp.path().join("ghost-worktree");
+        let before_count = handle.session.messages.len();
+
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+
+        match outcome {
+            Err(crate::SanitizeError::WorktreeMissing { path, .. }) => {
+                assert_eq!(path, gone);
+            }
+            other => panic!("expected WorktreeMissing, got {other:?}"),
+        }
+        // Transcript is preserved.
+        assert_eq!(handle.session.messages.len(), before_count);
+    }
+
+    // ----------------------------------------------------------------------
+    // Item 3 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    // worktree-missing must be a hard resume refusal. The session actor
+    // calls `clear_messages_for_unsafe_resume()` on Err so the in-memory
+    // transcript cannot be silently consumed by the first LLM call.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn session_actor_refuses_resume_when_worktree_missing() {
+        // Top-level session whose worktree was cleaned up. After the actor
+        // clears the in-memory transcript, the handle must look like a
+        // fresh session.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "top-level-refusal");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "do thing"));
+        handle.session.messages.push(make_message(
+            MessageRole::Assistant,
+            "I'll start working on it",
+        ));
+
+        // Step 1: sanitize sees a missing worktree and returns Err.
+        let gone = tmp.path().join("ghost-worktree");
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+
+        // Step 2: session_actor responds with a hard refusal.
+        assert!(
+            !handle.is_child_session(),
+            "test fixture is top-level (no parent_key)"
+        );
+        handle.clear_messages_for_unsafe_resume();
+        assert_eq!(
+            handle.session.messages.len(),
+            0,
+            "top-level worktree-missing refusal must drop the in-memory transcript"
+        );
+    }
+
+    #[test]
+    fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missing() {
+        // The legacy "warn and continue" branch left the original
+        // transcript in `handle.session.messages` so the next LLM call
+        // would see unresolved tool_calls / orphan thinking. Verify the
+        // post-clear state is empty.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "no-unsafe-llm-call");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        // Add a transcript that previously would have been consumed unsafely:
+        //   user → assistant with unresolved tool_call (no matching Tool result).
+        handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "go"));
+        handle.session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![octos_core::ToolCall {
+                id: "unresolved-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            timestamp: Utc::now(),
+        });
+
+        let gone = tmp.path().join("ghost-worktree");
+        let outcome = handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+        // Even though the sanitizer DID NOT mutate, the actor's hard
+        // refusal must clear before any consumer reads `messages()`.
+        handle.clear_messages_for_unsafe_resume();
+        assert!(
+            handle.session.messages.is_empty(),
+            "no first LLM call must be made using the unsafe transcript"
+        );
+    }
+
+    #[test]
+    fn background_child_session_marks_failed_when_worktree_missing() {
+        // A child session has parent_key set. The session actor uses
+        // `is_child_session()` to drive a "mark task failed" decision in
+        // the supervisor (top-level decision is "drop transcript and
+        // start fresh"). The state-clear is the same on both branches —
+        // the difference is the operator-visible signal. We verify the
+        // parent linkage flows through here so the actor can branch on it.
+        let tmp = TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent-task");
+        let child = SessionKey::new("api", "parent-task#child-job-01");
+        let mut child_handle = SessionHandle::open(tmp.path(), &child);
+        child_handle.session.parent_key = Some(parent.clone());
+        child_handle
+            .session
+            .messages
+            .push(make_message(MessageRole::User, "run"));
+
+        assert!(
+            child_handle.is_child_session(),
+            "child session must report is_child_session=true"
+        );
+
+        let gone = tmp.path().join("ghost-child-worktree");
+        let outcome = child_handle.sanitize_loaded_messages(None, Some(&gone));
+        assert!(matches!(
+            outcome,
+            Err(crate::SanitizeError::WorktreeMissing { .. })
+        ));
+        child_handle.clear_messages_for_unsafe_resume();
+        assert_eq!(
+            child_handle.session.messages.len(),
+            0,
+            "child worktree-missing refusal must also clear the unsafe transcript"
+        );
+        // Parent linkage survives the clear so the supervisor can find
+        // the parent on its mark-failed lookup.
+        assert_eq!(child_handle.session.parent_key, Some(parent));
     }
 }

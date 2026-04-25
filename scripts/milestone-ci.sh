@@ -30,6 +30,9 @@ run_dashboard() {
   npm run build
   popd >/dev/null
 
+  # Ephemeral bundle policy: the compiled dashboard is gitignored and rebuilt
+  # on demand. We just verify the canonical script runs cleanly — there is
+  # no committed bundle to diff against. See .gitignore for the rationale.
   ./scripts/build-dashboard.sh
 }
 

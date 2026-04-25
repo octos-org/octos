@@ -418,6 +418,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -475,6 +476,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
 

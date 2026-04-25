@@ -26,6 +26,13 @@ pub struct ChatConfig {
     /// conforming to the given schema (JSON mode or JSON Schema).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// Anthropic-only: opaque `context_management` payload (e.g. the
+    /// `clear_tool_uses_20250919` config) that decorates the request so the
+    /// server performs tier-2 tool-use clearing on its side. M8.5 wires this
+    /// from the `ApiMicroCompactionConfig` builder. Providers other than
+    /// Anthropic ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<serde_json::Value>,
 }
 
 /// Structured output format for chat responses.
@@ -70,6 +77,7 @@ impl Default for ChatConfig {
             stop_sequences: Vec::new(),
             reasoning_effort: None,
             response_format: None,
+            context_management: None,
         }
     }
 }
@@ -120,6 +128,7 @@ mod tests {
             stop_sequences: vec!["STOP".to_string()],
             reasoning_effort: None,
             response_format: None,
+            context_management: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -138,11 +147,29 @@ mod tests {
             stop_sequences: vec![],
             reasoning_effort: None,
             response_format: None,
+            context_management: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());
         assert!(json.get("temperature").is_none());
         assert!(json.get("stop_sequences").is_none());
+        assert!(json.get("context_management").is_none());
+    }
+
+    #[test]
+    fn should_serialize_context_management_when_present() {
+        let config = ChatConfig {
+            context_management: Some(serde_json::json!({
+                "edits": [
+                    { "type": "clear_tool_uses_20250919", "keep": { "type": "input_tokens", "value": 10 } }
+                ]
+            })),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        let cm = json.get("context_management").expect("field present");
+        assert!(cm.is_object());
+        assert!(cm.get("edits").is_some());
     }
 
     #[test]

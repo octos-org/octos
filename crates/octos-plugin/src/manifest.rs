@@ -28,6 +28,16 @@ pub struct ToolDefinition {
     /// Optional entrypoint override (legacy field).
     #[serde(default)]
     pub entrypoint: Option<String>,
+    /// Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
+    /// optional concurrency class. When set to `"exclusive"` the M8.8
+    /// scheduler serialises this tool against any other tool in the
+    /// same batch instead of fanning out in parallel. Defaults to
+    /// `None` which the wrapper treats as `Safe` (the legacy default).
+    /// Mutating wrappers (e.g. plugins that write files, push to a
+    /// remote service, or modify shared state) should declare
+    /// `"exclusive"` so they cannot race a sibling tool by accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_class: Option<String>,
 }
 
 /// Requirements that must be satisfied for the plugin to load.

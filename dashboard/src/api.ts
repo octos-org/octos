@@ -224,6 +224,12 @@ export const api = {
       body: JSON.stringify({ new_token }),
     }),
 
+  emailToken: (to: string, token: string) =>
+    request<EmailTokenResult>('/token/email', {
+      method: 'POST',
+      body: JSON.stringify({ to, token }),
+    }),
+
   getSetupState: () => request<SetupState>('/setup/state'),
 
   postSetupStep: (step: number) =>
@@ -306,6 +312,12 @@ export type SmtpSettingsBody = {
 }
 
 export type SmtpTestResult = {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+export type EmailTokenResult = {
   ok: boolean
   message?: string
   error?: string

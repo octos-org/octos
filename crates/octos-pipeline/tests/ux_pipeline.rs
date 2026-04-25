@@ -91,6 +91,7 @@ async fn test_01_deepseek_connectivity() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -150,6 +151,7 @@ async fn test_01_dashscope_connectivity() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -704,7 +706,10 @@ async fn test_06_send_file_sandbox_escape() {
     use octos_agent::tools::SendFileTool;
 
     let sandbox = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("octos-pipeline-send-file-outside-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
 
     // Create a "secret" file outside the sandbox
     let secret = outside.path().join("credentials.json");
@@ -1624,6 +1629,7 @@ async fn test_22_inbound_media_to_agent_message() {
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: inbound.timestamp,
     };
 

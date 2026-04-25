@@ -75,7 +75,7 @@ impl AnthropicProvider {
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
-        config: &ChatConfig,
+        config: &'a ChatConfig,
     ) -> AnthropicRequest<'a> {
         AnthropicRequest {
             model: &self.model,
@@ -109,6 +109,7 @@ impl AnthropicProvider {
                 }
             },
             tools: if tools.is_empty() { None } else { Some(tools) },
+            context_management: config.context_management.as_ref(),
         }
     }
 }
@@ -265,6 +266,13 @@ struct AnthropicRequest<'a> {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolSpec]>,
+    /// M8.5 tier 2: forwarded from `ChatConfig.context_management`. Opaque
+    /// payload (typically `{ "edits": [ { "type":
+    /// "clear_tool_uses_20250919", ... } ] }`) that tells Anthropic's server
+    /// to clear old tool uses on its side. Only emitted when the field is
+    /// non-null and the caller opted in via the builder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -498,6 +506,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -523,6 +532,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         };
         // Non-image media should include file paths for read_file
@@ -568,6 +578,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             reasoning_content: None,
+            client_message_id: None,
             timestamp: chrono::Utc::now(),
         }];
         let config = ChatConfig::default();
@@ -592,6 +603,40 @@ mod tests {
         let config = ChatConfig::default();
         let request = provider.build_request(&messages, &[], &config);
         assert_eq!(request.max_tokens, crate::context::default_max_tokens());
+    }
+
+    #[test]
+    fn should_forward_context_management_payload_when_set() {
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let payload = serde_json::json!({
+            "edits": [
+                {
+                    "type": "clear_tool_uses_20250919",
+                    "keep": { "type": "input_tokens", "value": 10 }
+                }
+            ]
+        });
+        let config = ChatConfig {
+            context_management: Some(payload.clone()),
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &[], &config);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["context_management"], payload);
+    }
+
+    #[test]
+    fn should_omit_context_management_when_not_set() {
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let config = ChatConfig::default();
+        let request = provider.build_request(&messages, &[], &config);
+        let body = serde_json::to_value(&request).unwrap();
+        assert!(
+            body.get("context_management").is_none(),
+            "field must be omitted when not configured: {body}"
+        );
     }
 
     // --- SSE mapping tests ---

@@ -719,8 +719,7 @@ where
     mutate(&mut value)?;
     let body = serde_json::to_string_pretty(&value)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &body)
-        .wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::write(&tmp, &body).wrap_err_with(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .wrap_err_with(|| format!("failed to rename into {}", path.display()))?;
     Ok(())

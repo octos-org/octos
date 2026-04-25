@@ -7,7 +7,7 @@ use eyre::{Result, WrapErr};
 use octos_memory::MemoryStore;
 use serde::Deserialize;
 
-use super::{Tool, ToolResult};
+use super::{ConcurrencyClass, Tool, ToolResult};
 
 /// Tool that saves or updates entity pages in the memory bank.
 pub struct SaveMemoryTool {
@@ -53,6 +53,12 @@ impl Tool for SaveMemoryTool {
          IMPORTANT: When updating an existing entity, first use `recall_memory` to \
          load the current content, then MERGE new information into it before saving. \
          Never discard existing facts — add to or update them."
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // save_memory writes the memory bank. A parallel recall_memory could
+        // observe a half-written entity. Serialize the whole batch. See M8.8.
+        ConcurrencyClass::Exclusive
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -189,6 +195,19 @@ mod tests {
     }
 
     // --- Tool metadata ---
+
+    #[test]
+    fn save_memory_tool_is_exclusive() {
+        // save_memory writes the memory bank; parallel recall_memory could
+        // read half-written content. Serialize the whole batch (M8.8).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            Arc::new(MemoryStore::open(dir.path()).await.unwrap())
+        });
+        let tool = SaveMemoryTool::new(store);
+        assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
 
     #[test]
     fn tool_metadata() {

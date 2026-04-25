@@ -1,4 +1,5 @@
 import type { ProfileConfig, EmailSettings } from '../../types'
+import SmtpFields from '../SmtpFields'
 
 interface Props {
   config: ProfileConfig
@@ -7,11 +8,6 @@ interface Props {
 
 const EMPTY_SMTP: EmailSettings = {
   provider: 'smtp',
-  smtp_host: '',
-  smtp_port: 465,
-  username: '',
-  password_env: 'SMTP_PASSWORD',
-  from_address: '',
 }
 
 const EMPTY_FEISHU: EmailSettings = {
@@ -51,7 +47,10 @@ export default function EmailTab({ config, onChange }: Props) {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium text-gray-300">Send Email Tool</p>
-          <p className="text-xs text-gray-500">Allow the agent to send emails. On the admin profile, SMTP settings here also back dashboard OTP login email when a separate dashboard SMTP config is not set.</p>
+          <p className="text-xs text-gray-500">
+            Allow the agent to send emails. The SMTP provider uses the dashboard SMTP settings
+            (shared across all profiles and the OTP login flow).
+          </p>
         </div>
         <button
           onClick={toggleEnabled}
@@ -85,56 +84,13 @@ export default function EmailTab({ config, onChange }: Props) {
           </div>
 
           {email?.provider === 'smtp' && (
-            <>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">SMTP Host</label>
-                <input
-                  value={email.smtp_host || ''}
-                  onChange={(e) => update({ smtp_host: e.target.value })}
-                  placeholder="smtp.gmail.com"
-                  className="input"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">SMTP Port</label>
-                <input
-                  value={email.smtp_port ?? ''}
-                  onChange={(e) => update({ smtp_port: e.target.value ? Number(e.target.value) : undefined })}
-                  placeholder="465"
-                  className="input max-w-[120px]"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Username</label>
-                <input
-                  value={email.username || ''}
-                  onChange={(e) => update({ username: e.target.value })}
-                  placeholder="user@gmail.com"
-                  className="input"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Password Env Var</label>
-                <input
-                  value={email.password_env || ''}
-                  onChange={(e) => update({ password_env: e.target.value })}
-                  placeholder="SMTP_PASSWORD"
-                  className="input"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Name of the environment variable holding the SMTP password. Set the actual value in Environment Variables below.
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">From Address</label>
-                <input
-                  value={email.from_address || ''}
-                  onChange={(e) => update({ from_address: e.target.value })}
-                  placeholder="bot@example.com"
-                  className="input"
-                />
-              </div>
-            </>
+            <div className="border border-gray-700/50 rounded-lg p-4 bg-background/40">
+              <p className="text-xs text-gray-500 mb-3">
+                Edits below save to the dashboard-wide SMTP store and take effect immediately —
+                they apply to OTP login emails and to all profiles using the SMTP email provider.
+              </p>
+              <SmtpFields />
+            </div>
           )}
 
           {(email?.provider === 'feishu' || email?.provider === 'lark') && (
