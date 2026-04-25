@@ -733,6 +733,7 @@ pub async fn test_provider(
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }];
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,

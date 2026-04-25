@@ -136,6 +136,18 @@ async fn persist_assistant_message(
     }
 }
 
+/// Read the optional `client_message_id` field from an InboundMessage's
+/// metadata. Empty strings count as absent so the wire schema stays simple
+/// for clients that always populate the field.
+fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
+    inbound
+        .metadata
+        .get("client_message_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -3206,6 +3218,7 @@ impl SessionActor {
             }
         };
 
+        let client_message_id = inbound_client_message_id(inbound);
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content.to_string(),
@@ -3213,19 +3226,27 @@ impl SessionActor {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: client_message_id.clone(),
             timestamp: chrono::Utc::now(),
         };
-        {
+        let user_msg_timestamp = user_msg.timestamp;
+        let user_seq = {
             let mut handle = self.session_handle.lock().await;
             let session = handle.get_or_create();
             if session.summary.is_none() && !persisted_user_content.trim().is_empty() {
                 session.summary = Some(persisted_user_content.chars().take(100).collect());
             }
-            if let Err(error) = handle.add_message(user_msg).await {
-                warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+            match handle.add_message_with_seq(user_msg).await {
+                Ok(seq) => Some(seq),
+                Err(error) => {
+                    warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+                    None
+                }
             }
-        }
+        };
 
+        let _ = user_seq; // sort comparator uses timestamp; seq retained for ledger.
+        let _ = user_msg_timestamp;
         let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -3341,16 +3362,30 @@ impl SessionActor {
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
+        let client_message_id = inbound_client_message_id(&inbound);
+        let persisted_user_content_for_event = persisted_user_content.clone();
+        let user_media_for_event = image_media.clone();
+        // Persist BOTH image_media and attachment_media so future turns can
+        // re-reference uploaded audio/files. Without this, a follow-up turn
+        // ("transcribe the wav again") loses the path because attachments
+        // only survived as TurnAttachmentContext for the current turn.
+        let combined_media: Vec<String> = image_media
+            .iter()
+            .chain(attachment_media.iter())
+            .cloned()
+            .collect();
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content,
-            media: image_media.clone(),
+            media: combined_media,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: client_message_id.clone(),
             timestamp: chrono::Utc::now(),
         };
-        {
+        let user_msg_timestamp = user_msg.timestamp;
+        let user_seq = {
             let mut handle = self.session_handle.lock().await;
             // Auto-generate summary from first user message
             {
@@ -3360,8 +3395,17 @@ impl SessionActor {
                     session.summary = Some(summary);
                 }
             }
-            let _ = handle.add_message(user_msg).await;
-        }
+            handle.add_message_with_seq(user_msg).await.ok()
+        };
+
+        // The web client sorts by Message.timestamp (timestamp-primary
+        // comparator) so optimistic bubbles slot in chronological order
+        // without needing a server seq round-trip. Seq is still captured for
+        // ledger integrity.
+        let _ = user_seq;
+        let _ = user_msg_timestamp;
+        let _ = persisted_user_content_for_event;
+        let _ = user_media_for_event;
 
         // Get conversation history (now includes the user message we just saved)
         let history: Vec<Message> = {
@@ -3800,6 +3844,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -4090,6 +4135,7 @@ impl SessionActor {
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
+        let overflow_client_message_id = inbound_client_message_id(msg);
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -4100,12 +4146,21 @@ impl SessionActor {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: overflow_client_message_id.clone(),
                 timestamp: chrono::Utc::now(),
             };
-            {
+            let user_msg_timestamp = user_msg.timestamp;
+            let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
-                let _ = handle.add_message(user_msg).await;
-            }
+                handle.add_message_with_seq(user_msg).await.ok()
+            };
+
+            // The overflow path also relies on the timestamp-primary
+            // comparator client-side; no per-user-message session_result
+            // emission needed. Seq retained for ledger.
+            let _ = user_seq_for_overflow;
+            let _ = user_msg_timestamp;
+            let _ = overflow_client_message_id;
 
             let history: Vec<Message> = history;
             let tracker = Arc::new(TokenTracker::new());
@@ -4224,6 +4279,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         let _ = handle.add_message(final_reply).await;
@@ -4577,6 +4633,7 @@ impl SessionActor {
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
+                            client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {

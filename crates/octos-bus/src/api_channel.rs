@@ -180,6 +180,12 @@ struct ChatRequest {
     target_profile_id: Option<String>,
     #[serde(default)]
     attach_only: bool,
+    /// Client-supplied UUID forwarded to the session actor so the persisted
+    /// user message carries it through `add_message_with_seq` and the
+    /// `session_result` event can correlate the optimistic web bubble back
+    /// to the server-assigned seq.
+    #[serde(default)]
+    client_message_id: Option<String>,
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -659,6 +665,7 @@ impl Channel for ApiChannel {
                     tool_calls: None,
                     tool_call_id: tool_call_id.clone(),
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 self.persist_to_session(&msg.chat_id, topic, session_msg)
@@ -775,6 +782,7 @@ impl Channel for ApiChannel {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    client_message_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = self
@@ -1076,6 +1084,12 @@ async fn handle_chat(
                 if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
                     metadata.insert("topic".to_string(), serde_json::Value::String(topic));
                 }
+                if let Some(cmid) = req.client_message_id.filter(|value| !value.is_empty()) {
+                    metadata.insert(
+                        "client_message_id".to_string(),
+                        serde_json::Value::String(cmid),
+                    );
+                }
                 serde_json::Value::Object(metadata)
             },
             message_id: None,
@@ -1180,6 +1194,11 @@ struct MessageInfo {
     media: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<serde_json::Value>,
+    /// Client-supplied UUID propagated from `Message::client_message_id`. Lets
+    /// the web/runtime client correlate optimistic bubbles to the persisted
+    /// seq without a backfill round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1352,6 +1371,7 @@ fn message_info_from_history_message(
             .iter()
             .filter_map(|path| response_path_for_session_file(data_dir, Path::new(path)))
             .collect(),
+        client_message_id: message.client_message_id.clone(),
         tool_calls: message
             .tool_calls
             .as_ref()
@@ -1918,6 +1938,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -2128,6 +2149,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            client_message_id: None,
             timestamp: Utc::now(),
         };
 
@@ -2141,6 +2163,33 @@ mod tests {
                 .contains(&artifact.to_string_lossy().to_string())
         );
         assert!(info.content.contains("[file:pf/"));
+    }
+
+    #[test]
+    fn message_info_propagates_client_message_id_from_message() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let message = Message::user("hello there").with_client_message_id("cmid-history-7");
+
+        let info = message_info_from_history_message(&message, data_dir.path(), 5);
+        assert_eq!(info.seq, Some(5));
+        assert_eq!(info.client_message_id.as_deref(), Some("cmid-history-7"));
+
+        // Round-trip via JSON (the wire shape) — the field is preserved.
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["client_message_id"], "cmid-history-7");
+    }
+
+    #[test]
+    fn message_info_omits_client_message_id_when_absent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let message = Message::user("hi");
+
+        let info = message_info_from_history_message(&message, data_dir.path(), 0);
+        assert!(info.client_message_id.is_none());
+
+        // Skipped from the serialized JSON for forward compat.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("client_message_id").is_none());
     }
 
     #[test]
@@ -2180,6 +2229,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
             data_dir.path(),
@@ -2471,6 +2521,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broadcasts_session_result_for_user_message_with_client_message_id() {
+        // Verifies that the api_channel `send()` path emits a session_result
+        // event for a persisted *user* message when the OutboundMessage carries
+        // `_session_result` metadata with role="user" and a client_message_id.
+        // This is the wire shape the web client uses to stamp the
+        // server-assigned `historySeq` onto its optimistic user bubble (the
+        // M8.10-A-counterpart fix for user messages).
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-user-msg-chat".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-user-msg-chat".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_history_persisted": true,
+                "_session_result": {
+                    "seq": 4,
+                    "role": "user",
+                    "content": "remind me about lunch",
+                    "timestamp": "2026-04-24T19:15:03Z",
+                    "client_message_id": "cmid-user-bubble-42",
+                }
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "session_result");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["seq"], 4);
+        assert_eq!(parsed["message"]["content"], "remind me about lunch");
+        assert_eq!(
+            parsed["message"]["client_message_id"], "cmid-user-bubble-42",
+            "user-message session_result events must carry the client-supplied id so the web client can correlate optimistic bubbles to the server seq"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
         let data_dir = tempfile::tempdir().unwrap();
         let sessions = test_sessions_in(data_dir.path());
@@ -2554,6 +2659,7 @@ mod tests {
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
+                        client_message_id: None,
                         timestamp: chrono::Utc::now(),
                     },
                 )

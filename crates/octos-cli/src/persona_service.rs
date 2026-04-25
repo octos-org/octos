@@ -199,6 +199,7 @@ impl PersonaService {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
             Message {
@@ -208,6 +209,7 @@ impl PersonaService {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
         ];
@@ -357,6 +359,7 @@ impl PersonaService {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
             Message {
@@ -366,6 +369,7 @@ impl PersonaService {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                client_message_id: None,
                 timestamp: Utc::now(),
             },
         ];

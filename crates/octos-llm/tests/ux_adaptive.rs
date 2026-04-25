@@ -30,6 +30,7 @@ fn msg(content: &str) -> Message {
         tool_calls: None,
         media: vec![],
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -42,6 +43,7 @@ fn assistant_msg(content: &str) -> Message {
         tool_calls: None,
         media: vec![],
         reasoning_content: None,
+        client_message_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
