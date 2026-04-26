@@ -123,7 +123,8 @@ pub use subagent_summary::{
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
-    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+    ArtifactMimeClass, BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus,
+    TaskSupervisor, validate_spawn_only_artifacts,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

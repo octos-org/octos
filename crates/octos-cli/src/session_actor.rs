@@ -171,6 +171,43 @@ fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Poll the session log briefly for the primary turn's assistant reply, then
+/// return the freshest history snapshot.
+///
+/// This exists to fix a stale-history bug on the speculative-overflow path:
+/// when a user sends a follow-up while the primary turn is still running, the
+/// overflow agent used to read a snapshot taken BEFORE the primary turn
+/// started, missing the answer the primary just produced. Polling for a new
+/// assistant message lets the overflow re-use that fresh context.
+///
+/// `pre_primary_assistant_count` is the number of assistant messages observed
+/// before the primary turn began. The loop exits once the live snapshot has
+/// strictly more, or once the deadline elapses (so a slow primary never blocks
+/// the overflow indefinitely — it just runs with whatever context it has).
+async fn wait_for_primary_assistant_reply(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    max_history: usize,
+    pre_primary_assistant_count: usize,
+    max_wait: Duration,
+    poll_interval: Duration,
+) -> Vec<Message> {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let snapshot: Vec<Message> = {
+            let handle = session_handle.lock().await;
+            handle.get_history(max_history).to_vec()
+        };
+        let cur_assistant_count = snapshot
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        if cur_assistant_count > pre_primary_assistant_count || Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -3976,13 +4013,15 @@ impl SessionActor {
                         display_content
                     };
 
-                    // If overflow was served while this task ran, prepend a
-                    // marker so the user knows this is a delayed result.
-                    let display_content = if overflow_served {
-                        format!("⬆️ Earlier task completed:\n\n{display_content}")
-                    } else {
-                        display_content
-                    };
+                    // The legacy "⬆️ Earlier task completed:" prefix was
+                    // dropped because users misread it — the wording sounded
+                    // like a stray prior reply when it actually meant "I
+                    // also processed your follow-up below in parallel." Tool
+                    // chips and the message timeline already convey that
+                    // without confusing boilerplate. The `overflow_served`
+                    // flag stays in scope so a future UI surface can render
+                    // a richer indicator if needed.
+                    let _ = overflow_served;
 
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
@@ -4164,7 +4203,12 @@ impl SessionActor {
         let status_indicator = self.status_indicator.clone();
         let sender_user_id = self.sender_user_id.clone();
         let user_status_config = self.user_status_config.clone();
-        let history = pre_primary_history.to_vec();
+        let pre_primary_history_vec = pre_primary_history.to_vec();
+        let pre_primary_assistant_count = pre_primary_history_vec
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        let max_history = self.max_history.load(Ordering::Acquire);
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
@@ -4172,7 +4216,10 @@ impl SessionActor {
         let overflow_client_message_id = inbound_client_message_id(msg);
 
         tokio::spawn(async move {
-            // Save user message to history first
+            // Save user message to history first so it survives even if the
+            // primary turn or this overflow agent fails — preserves the user's
+            // query in the session log no matter what.
+            let user_msg_timestamp = chrono::Utc::now();
             let user_msg = Message {
                 role: MessageRole::User,
                 content: content.clone(),
@@ -4181,7 +4228,7 @@ impl SessionActor {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: overflow_client_message_id.clone(),
-                timestamp: chrono::Utc::now(),
+                timestamp: user_msg_timestamp,
             };
             let user_msg_timestamp = user_msg.timestamp;
             let user_seq_for_overflow = {
@@ -4196,7 +4243,47 @@ impl SessionActor {
             let _ = user_msg_timestamp;
             let _ = overflow_client_message_id;
 
-            let history: Vec<Message> = history;
+            // Refresh the history snapshot so the overflow LLM sees the
+            // primary turn's assistant reply if it has already landed. The
+            // pre_primary_history_vec snapshot was captured before the primary
+            // agent even started, so it would otherwise miss any answer the
+            // primary just produced (e.g. a weather lookup the user asked
+            // about right before sending the overflow follow-up).
+            //
+            // Bounded wait: 2s is enough for typical primary turns to flush
+            // their final message; long-running primaries fall through with
+            // the original pre_primary_history snapshot to preserve the
+            // pre-fix safety property (overflow never sees the primary user
+            // message in isolation, which would tempt the LLM to re-answer
+            // it alongside the overflow question).
+            let fresh_snapshot = wait_for_primary_assistant_reply(
+                &session_handle,
+                max_history,
+                pre_primary_assistant_count,
+                Duration::from_millis(2_000),
+                Duration::from_millis(100),
+            )
+            .await;
+            let fresh_assistant_count = fresh_snapshot
+                .iter()
+                .filter(|m| matches!(m.role, MessageRole::Assistant))
+                .count();
+            let primary_assistant_landed = fresh_assistant_count > pre_primary_assistant_count;
+            let history: Vec<Message> = if primary_assistant_landed {
+                // Strip our just-saved overflow user message so
+                // process_message_tracked doesn't double-add it. Match by
+                // exact timestamp (we control both sides).
+                fresh_snapshot
+                    .into_iter()
+                    .filter(|m| {
+                        !(matches!(m.role, MessageRole::User) && m.timestamp == user_msg_timestamp)
+                    })
+                    .collect()
+            } else {
+                // Primary still mid-turn — fall back to the safe pre-primary
+                // snapshot (no primary user msg, no primary assistant reply).
+                pre_primary_history_vec
+            };
             let tracker = Arc::new(TokenTracker::new());
 
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
@@ -6342,6 +6429,104 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    /// Regression: when the speculative path serves an overflow during a slow
+    /// primary, the primary turn's final assistant reply must NOT be wrapped
+    /// in the legacy "⬆️ Earlier task completed:" prefix. Users misread the
+    /// prefix as a stray prior reply when it actually meant "I also processed
+    /// your follow-up below in parallel" — so the prefix is gone and tool
+    /// chips / message timeline carry the same meaning unambiguously.
+    #[tokio::test]
+    async fn should_drop_earlier_task_completed_prefix_when_overflow_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("PRIMARY_REPLY_BODY_marker"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("OVERFLOW_REPLY_BODY_marker"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("name follow-up")).await.unwrap();
+
+        let mut replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Confirm both replies arrived (sanity for the overflow scenario).
+        assert!(
+            replies.len() >= 2,
+            "expected primary + overflow replies, got {}",
+            replies.len()
+        );
+
+        // No reply should carry the legacy prefix any longer.
+        for reply in &replies {
+            assert!(
+                !reply.content.contains("Earlier task completed"),
+                "legacy '⬆️ Earlier task completed:' prefix must be dropped, \
+                 but reply contained it: {}",
+                reply.content
+            );
+        }
+
+        // The primary reply must surface its body unchanged (no leading
+        // boilerplate that the user has to read past).
+        let primary = replies
+            .iter()
+            .find(|m| m.content.contains("PRIMARY_REPLY_BODY_marker"))
+            .expect("primary reply not found in collected outbound messages");
+        assert!(
+            primary.content.starts_with("PRIMARY_REPLY_BODY_marker"),
+            "primary reply must start with its own body (no prefix), got: {}",
+            primary.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     /// Test that messages within patience threshold are NOT served as overflow.
     #[tokio::test]
     async fn test_speculative_within_patience_serves_both() {
@@ -7825,5 +8010,170 @@ mod tests {
             "all persisted messages must land on disk: {:?}",
             final_handle.session().messages
         );
+    }
+
+    /// Speculative-overflow stale-history regression: when the primary turn
+    /// finishes quickly (its assistant reply lands in session history before
+    /// the deadline), the overflow's history snapshot must reflect that fresh
+    /// reply rather than the pre-primary one captured before the primary
+    /// agent even started.
+    #[tokio::test]
+    async fn should_refresh_overflow_history_when_primary_finishes_quickly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-fast");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Pre-primary history: 1 user + 1 assistant exchange.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("hi"))
+                .await
+                .expect("seed user");
+            handle
+                .add_message(Message::assistant("hello, where to?"))
+                .await
+                .expect("seed assistant");
+        }
+        // Simulate process_inbound_speculative: primary user msg saved before
+        // primary spawn.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("saratoga"))
+                .await
+                .expect("seed primary user");
+        }
+        // Pre-primary snapshot (without primary user msg, matching how
+        // process_inbound_speculative builds overflow_history).
+        let pre_primary_assistant_count = 1;
+
+        // Spawn a task that simulates the primary finishing and its assistant
+        // reply landing 200ms later.
+        let writer_handle = Arc::clone(&session_handle);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut handle = writer_handle.lock().await;
+            let _ = handle
+                .add_message(Message::assistant("Saratoga: 72°F sunny"))
+                .await;
+        });
+
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            pre_primary_assistant_count,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        // Snapshot must include the primary's fresh assistant reply.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::Assistant)
+                    && m.content.contains("Saratoga")),
+            "snapshot must include primary's fresh assistant reply, got {:?}",
+            snapshot
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Speculative-overflow deadline regression: if the primary turn is still
+    /// running when the deadline elapses (no new assistant reply landed), the
+    /// helper must fall through with whatever snapshot is available rather
+    /// than blocking the overflow indefinitely.
+    #[tokio::test]
+    async fn should_fall_through_with_pre_primary_history_when_primary_slow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-slow");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Pre-primary history: 1 user + 1 assistant exchange.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("hi"))
+                .await
+                .expect("seed user");
+            handle
+                .add_message(Message::assistant("hello, where to?"))
+                .await
+                .expect("seed assistant");
+        }
+        let pre_primary_assistant_count = 1;
+
+        // No writer task — the helper must time out.
+        let started = std::time::Instant::now();
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            pre_primary_assistant_count,
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        // Helper must exit within ~deadline + one poll interval, not block forever.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "helper must fall through within deadline, took {}ms",
+            elapsed.as_millis()
+        );
+        // Snapshot equals the pre-primary log (no new assistant landed).
+        let snapshot_assistant_count = snapshot
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        assert_eq!(
+            snapshot_assistant_count,
+            pre_primary_assistant_count,
+            "no new assistant message should be present, got {:?}",
+            snapshot
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// When the snapshot already has a fresh assistant message at call time,
+    /// the helper must return immediately without sleeping.
+    #[tokio::test]
+    async fn should_return_immediately_when_assistant_already_landed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-immediate");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Seed pre_primary_assistant_count = 0; add 1 assistant before call.
+        {
+            let mut handle = session_handle.lock().await;
+            handle.add_message(Message::user("q")).await.expect("seed");
+            handle
+                .add_message(Message::assistant("a"))
+                .await
+                .expect("seed");
+        }
+
+        let started = std::time::Instant::now();
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            0,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "helper must return immediately when condition already true, took {}ms",
+            elapsed.as_millis()
+        );
+        assert_eq!(snapshot.len(), 2);
     }
 }
