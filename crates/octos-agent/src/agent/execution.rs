@@ -221,6 +221,15 @@ impl Agent {
                 tools.mark_spawn_only_invoked();
                 let bg_supervisor = tools.supervisor();
                 let bg_reporter = reporter.clone();
+                // F004 B2: bridge supervised runtime-state transitions onto
+                // the per-request reporter so spawn_only tasks emit
+                // ToolProgress events keyed by `tool_call_id`. This is what
+                // lets the chat UI anchor every long-running background
+                // tool to a single bubble (no new messages, no ambiguity).
+                // Setting it again with a different reporter is harmless —
+                // the latest reporter wins; concurrent background tasks
+                // share the same Agent-scoped broadcaster anyway.
+                bg_supervisor.set_progress_reporter(bg_reporter.clone());
                 let bg_attachment_ctx = attachment_ctx.clone();
                 // M8.2/M8.4 reconciliation (item 1 of fix-first checklist):
                 // Thread agent_definitions + file_state_cache into the
