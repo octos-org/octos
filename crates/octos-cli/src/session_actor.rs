@@ -1658,7 +1658,20 @@ impl ActorFactory {
         // missing-on-disk workspace and hard-refuse — must run BEFORE
         // create_dir_all below, otherwise the recreate would mask the
         // missing-workspace condition we want to catch.
-        match session_handle.sanitize_loaded_messages(None, Some(&user_workspace)) {
+        //
+        // Skip the worktree check entirely when there is no loaded
+        // transcript: every brand-new session (including pipeline workers
+        // and spawn_only children) hits this path before its workspace
+        // dir is materialised, and firing WorktreeMissing on a fresh
+        // session causes the is_child branch below to falsely
+        // mark_child_session_failed on the parent task — breaking
+        // run_pipeline. The check is only meaningful when there are
+        // messages whose tool-result references could be invalidated by a
+        // missing worktree.
+        let has_loaded_messages = !session_handle.get_history(1).is_empty();
+        let workspace_root_for_sanitize: Option<&Path> =
+            if has_loaded_messages { Some(&user_workspace) } else { None };
+        match session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize) {
             Ok((report, refs)) => {
                 if report.input_len != report.output_len
                     || report.content_replacements_restored > 0
