@@ -9275,7 +9275,7 @@ mod tests {
             if !msg.content.is_empty() {
                 responses.push(msg.content);
             }
-            if responses.len() >= 1 {
+            if !responses.is_empty() {
                 break;
             }
         }
