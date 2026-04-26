@@ -318,6 +318,24 @@ impl Handler for CodergenHandler {
             }
         };
         tools.apply_policy(&policy);
+        // Strip spawn_only flags so plugin tools that *would* normally be
+        // backgrounded by the spawn_only branch in agent::execution run
+        // synchronously inside the pipeline worker instead. Two cascade
+        // bugs are killed by this:
+        //
+        //   1. The bg branch tries `bg_tools.execute("send_file", ...)`,
+        //      but apply_policy above just denied send_file → "unknown
+        //      tool" + 3-retry waste + bg_supervisor.mark_failed even
+        //      though the tool itself succeeded.
+        //   2. for_session()-policy tools (fm_tts / voice_synthesize /
+        //      podcast_generate) trip enforce_spawn_task_contract when
+        //      run as spawn_only with pipeline working_dir = data_dir
+        //      (no .octos-workspace.toml at root) → spurious
+        //      NotConfigured failures on tools that succeeded.
+        //
+        // Mirrors the proven sync/async-spawn pattern in
+        // crates/octos-agent/src/tools/spawn.rs::spawn_subagent_inner.
+        tools.clear_spawn_only();
         if let Some(ref pp) = self.provider_policy {
             tools.set_provider_policy(pp.clone());
         }
