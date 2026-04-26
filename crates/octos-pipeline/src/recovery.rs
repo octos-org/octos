@@ -100,13 +100,9 @@ pub fn classify_outcome(
     match outcome.status {
         OutcomeStatus::Pass => RecoveryDecision::Pass,
         OutcomeStatus::Skipped => RecoveryDecision::Terminal,
-        OutcomeStatus::Fail | OutcomeStatus::Error => {
-            RecoveryDecision::Retryable(Box::new(RetryableSignal::from_outcome(
-                node,
-                outcome,
-                input.clone(),
-            )))
-        }
+        OutcomeStatus::Fail | OutcomeStatus::Error => RecoveryDecision::Retryable(Box::new(
+            RetryableSignal::from_outcome(node, outcome, input.clone()),
+        )),
     }
 }
 
@@ -249,11 +245,7 @@ mod tests {
 
     #[async_trait]
     impl Handler for FailThenPass {
-        async fn execute(
-            &self,
-            node: &PipelineNode,
-            _ctx: &HandlerContext,
-        ) -> Result<NodeOutcome> {
+        async fn execute(&self, node: &PipelineNode, _ctx: &HandlerContext) -> Result<NodeOutcome> {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 Ok(NodeOutcome {

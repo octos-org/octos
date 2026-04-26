@@ -934,6 +934,15 @@ impl Channel for ApiChannel {
                 if let Some(seq) = msg.metadata.get("committed_seq").and_then(|v| v.as_u64()) {
                     done["committed_seq"] = serde_json::Value::from(seq);
                 }
+                // Bug 3 / W1.G4 cost panel — forward the per-node cost rows
+                // that the session actor pulled out of
+                // `ToolResult.structured_metadata` from `run_pipeline`. The
+                // CostBreakdown panel reads this array off the `done` event.
+                if let Some(node_costs) = msg.metadata.get("node_costs").cloned() {
+                    if !node_costs.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                        done["node_costs"] = node_costs;
+                    }
+                }
                 let _ = tx.send(done.to_string());
                 pending.remove(&msg.chat_id);
                 drop(pending);

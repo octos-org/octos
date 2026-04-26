@@ -107,6 +107,12 @@ pub struct ConversationResponse {
     /// tool results). Includes the user message at the front. Callers should
     /// persist these to session history so subsequent calls see the full context.
     pub messages: Vec<Message>,
+    /// Structured side-channel metadata surfaced by tools that ran during
+    /// this conversation, keyed by `tool_call_id`. Used today for per-node
+    /// cost rows from `run_pipeline` (`{"node_costs": [...]}`); the session
+    /// actor pulls these into the SSE `done` event so the W1.G4 cost panel
+    /// can render real per-node attribution. Empty when no tool opted in.
+    pub tool_results: Vec<(String, serde_json::Value)>,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).

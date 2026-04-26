@@ -87,13 +87,26 @@ async function chatSSE(message: string, sessionId: string, maxWait = 150_000) {
 }
 
 function findToken(events: SseEvent[], key: 'input_tokens' | 'output_tokens'): number {
+  // Accept BOTH the OpenAI-style `input_tokens`/`output_tokens` shape AND
+  // the octos SSE `done` event's `tokens_in`/`tokens_out` shape. The done
+  // event today emits `tokens_in`/`tokens_out` (matched by `api_channel.rs`
+  // and `handlers.rs`); rather than rename keys broadly (which would touch
+  // every existing W4 assertion), the test accepts both vocabularies so
+  // it asserts the data path end-to-end without a global rename.
+  const aliasKey = key === 'input_tokens' ? 'tokens_in' : 'tokens_out';
   let total = 0;
   for (const e of events) {
     if (typeof e[key] === 'number') {
       total += e[key] as number;
     }
+    if (typeof e[aliasKey] === 'number') {
+      total += e[aliasKey] as number;
+    }
     if (e.usage && typeof (e.usage as Record<string, unknown>)[key] === 'number') {
       total += (e.usage as Record<string, number>)[key];
+    }
+    if (e.usage && typeof (e.usage as Record<string, unknown>)[aliasKey] === 'number') {
+      total += (e.usage as Record<string, number>)[aliasKey];
     }
     if (Array.isArray(e.node_costs)) {
       for (const row of e.node_costs as Array<Record<string, unknown>>) {

@@ -45,12 +45,12 @@ pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,
 };
 pub use host_context::PipelineHostContext;
-pub use recovery::{RecoveryDecision, RecoveryOutcome, recover_node};
 pub use human_gate::{HumanInputProvider, HumanInputType, HumanRequest, HumanResponse};
 pub use manager::{
     ChildExecutor, ChildResult, ChildSpec, ManagerOutcome, PipelineManager, SupervisionStrategy,
 };
 pub use parser::parse_dot;
+pub use recovery::{RecoveryDecision, RecoveryOutcome, recover_node};
 pub use run_dir::{NodeStatus, PipelineRunSummary, RunDir};
 pub use server::{
     CancelRequest, PipelineServer, RunStatus, RunStatusResponse, SubmitRequest, SubmitResponse,

@@ -646,6 +646,12 @@ impl Agent {
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
                 let mut files_to_send = Vec::new();
+                // Accumulate the structured side-channel metadata that tools
+                // surface during this turn (today: `node_costs` from
+                // `run_pipeline`). Threaded into every `ConversationResponse`
+                // built below so the session actor can plumb it into the SSE
+                // `done` event for the W1.G4 cost panel.
+                let mut tool_structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
                 let mut turn = LoopTurnState::new(Instant::now());
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
@@ -678,6 +684,7 @@ impl Agent {
                                 files_to_send,
                                 streamed: false,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                     }
@@ -851,6 +858,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                         StopReason::ToolUse => {
@@ -883,6 +891,7 @@ impl Agent {
                                                 &messages,
                                                 history.len(),
                                             ),
+                                            tool_results: tool_structured_metadata.clone(),
                                         });
                                     }
                                     // Single-fire-per-burst: first fire emits the
@@ -905,6 +914,7 @@ impl Agent {
                                             &messages,
                                             history.len(),
                                         ),
+                                        tool_results: tool_structured_metadata.clone(),
                                     });
                                 }
                             }
@@ -917,6 +927,7 @@ impl Agent {
                                     &mut turn,
                                     &mut retry_state,
                                     tracker,
+                                    Some(&mut tool_structured_metadata),
                                 )
                                 .await
                             {
@@ -957,6 +968,7 @@ impl Agent {
                                         &messages,
                                         history.len(),
                                     ),
+                                    tool_results: tool_structured_metadata.clone(),
                                 });
                             }
 
@@ -993,6 +1005,7 @@ impl Agent {
                                     files_to_send,
                                     streamed,
                                     messages: LoopTurnState::new_messages(&messages, history.len()),
+                                    tool_results: tool_structured_metadata.clone(),
                                 });
                             }
                         }
@@ -1009,6 +1022,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -1031,6 +1045,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                     }
@@ -1252,6 +1267,7 @@ impl Agent {
                                 &mut turn,
                                 &mut retry_state,
                                 None,
+                                None,
                             )
                             .await
                         {
@@ -1341,6 +1357,7 @@ impl Agent {
         turn: &mut LoopTurnState,
         retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
+        tool_structured_metadata: Option<&mut Vec<(String, serde_json::Value)>>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
@@ -1406,16 +1423,21 @@ impl Agent {
         let mut tool_files = Vec::new();
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
+        let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
         for batch in tool_batches {
             let mut batch_response = limited_response.clone();
             batch_response.tool_calls = batch.to_vec();
-            let (batch_messages, batch_files, batch_send_files, batch_tokens) =
+            let (batch_messages, batch_files, batch_send_files, batch_tokens, batch_metadata) =
                 self.execute_tools(&batch_response).await?;
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
             tool_tokens.input_tokens += batch_tokens.input_tokens;
             tool_tokens.output_tokens += batch_tokens.output_tokens;
+            tool_metadata.extend(batch_metadata);
+        }
+        if let Some(sink) = tool_structured_metadata {
+            sink.extend(tool_metadata);
         }
 
         let merged = merge_tool_messages_in_order(

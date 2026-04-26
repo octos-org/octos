@@ -2189,8 +2189,7 @@ impl PipelineExecutor {
                             supervisor.mark_completed(&task_id, files);
                         }
                         OutcomeStatus::Fail | OutcomeStatus::Error => {
-                            supervisor
-                                .mark_failed(&task_id, format!("node {} failed", node.id));
+                            supervisor.mark_failed(&task_id, format!("node {} failed", node.id));
                         }
                         OutcomeStatus::Skipped => {
                             // Treat as completed-with-no-output so the

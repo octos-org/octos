@@ -1000,9 +1000,7 @@ impl TaskSupervisor {
     pub fn cancel(&self, task_id: &str) -> Result<(), TaskCancelError> {
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-            let task = tasks
-                .get_mut(task_id)
-                .ok_or(TaskCancelError::NotFound)?;
+            let task = tasks.get_mut(task_id).ok_or(TaskCancelError::NotFound)?;
             if task.status.is_terminal() {
                 return Err(TaskCancelError::AlreadyTerminal);
             }
@@ -1038,11 +1036,7 @@ impl TaskSupervisor {
     /// still succeeds — the new task id is returned so callers can
     /// observe the placeholder in dashboards even when the runtime
     /// owner has not subscribed yet.
-    pub fn relaunch(
-        &self,
-        task_id: &str,
-        opts: RelaunchOpts,
-    ) -> Result<String, TaskRelaunchError> {
+    pub fn relaunch(&self, task_id: &str, opts: RelaunchOpts) -> Result<String, TaskRelaunchError> {
         let original = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks
@@ -2908,8 +2902,7 @@ mod tests {
             });
         }
 
-        let task_id =
-            supervisor.register("run_pipeline", "call-relaunch-1", Some("session-D"));
+        let task_id = supervisor.register("run_pipeline", "call-relaunch-1", Some("session-D"));
         supervisor.mark_running(&task_id);
         supervisor.mark_failed(&task_id, "node 'design' failed".to_string());
 
