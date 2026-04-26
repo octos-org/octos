@@ -23,11 +23,7 @@ use octos_pipeline::{CodergenHandler, HandlerRegistry};
 
 async fn temp_episode_store() -> Arc<octos_memory::EpisodeStore> {
     let dir = tempfile::tempdir().unwrap();
-    Arc::new(
-        octos_memory::EpisodeStore::open(dir.path())
-            .await
-            .unwrap(),
-    )
+    Arc::new(octos_memory::EpisodeStore::open(dir.path()).await.unwrap())
 }
 
 #[allow(dead_code)]
@@ -89,8 +85,7 @@ async fn host_context_with_cache_and_supervisor() -> (
 /// session's `FileStateCache`.
 #[tokio::test]
 async fn pipeline_worker_handler_carries_file_state_cache_from_host() {
-    let (host, _cache, _sup, _acct, _ledger_dir) =
-        host_context_with_cache_and_supervisor().await;
+    let (host, _cache, _sup, _acct, _ledger_dir) = host_context_with_cache_and_supervisor().await;
     let codergen = CodergenHandler::new(
         Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>,
         temp_episode_store().await,
@@ -223,7 +218,9 @@ async fn handler_registry_default_with_codergen_carrying_host_context() {
         Arc::new(codergen) as Arc<dyn octos_pipeline::Handler>,
     );
     assert!(
-        registry.get(&octos_pipeline::HandlerKind::Codergen).is_some(),
+        registry
+            .get(&octos_pipeline::HandlerKind::Codergen)
+            .is_some(),
         "Codergen handler should resolve out of the registry"
     );
 }

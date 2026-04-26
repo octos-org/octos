@@ -19,15 +19,15 @@ use super::mcp_agent::{
     build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
+use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
+use crate::subagent_output::SubAgentOutputRouter;
+use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::TaskSupervisor;
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
 };
-use crate::file_state_cache::FileStateCache;
-use crate::subagent_output::SubAgentOutputRouter;
-use crate::subagent_summary::AgentSummaryGenerator;
 use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
 
 /// Default MCP tool name dispatched on the remote agent. Chosen to match
@@ -571,10 +571,7 @@ impl SpawnTool {
     /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 output router
     /// so the child Agent's spawn_only background branch routes output
     /// through the same on-disk log the parent dashboard tails.
-    pub fn with_parent_subagent_output_router(
-        mut self,
-        router: Arc<SubAgentOutputRouter>,
-    ) -> Self {
+    pub fn with_parent_subagent_output_router(mut self, router: Arc<SubAgentOutputRouter>) -> Self {
         self.parent_subagent_output_router = Some(router);
         self
     }
@@ -603,9 +600,7 @@ impl SpawnTool {
     }
 
     /// M8 Runtime Parity W2.B1 introspection helper.
-    pub fn parent_subagent_summary_generator(
-        &self,
-    ) -> Option<&Arc<AgentSummaryGenerator>> {
+    pub fn parent_subagent_summary_generator(&self) -> Option<&Arc<AgentSummaryGenerator>> {
         self.parent_subagent_summary_generator.as_ref()
     }
 
@@ -2218,10 +2213,8 @@ impl Tool for SpawnTool {
             // without M8.4/M8.7 wiring even when the session actor
             // configured everything.
             let parent_file_state_cache = self.parent_file_state_cache.clone();
-            let parent_subagent_output_router =
-                self.parent_subagent_output_router.clone();
-            let parent_subagent_summary_generator =
-                self.parent_subagent_summary_generator.clone();
+            let parent_subagent_output_router = self.parent_subagent_output_router.clone();
+            let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -4271,7 +4264,12 @@ PY
 
         let memory = Arc::new(create_test_store().await);
         let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
-        let worker = Agent::new(AgentId::new("test-worker"), provider.clone(), registry, memory);
+        let worker = Agent::new(
+            AgentId::new("test-worker"),
+            provider.clone(),
+            registry,
+            memory,
+        );
         let subtask = Task::new(
             TaskKind::Code {
                 instruction: "Recover me".into(),
@@ -4344,15 +4342,15 @@ PY
     async fn spawn_tool_propagates_parent_caches_via_builders() {
         let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
         let cache = Arc::new(crate::FileStateCache::new());
-        let router = Arc::new(crate::SubAgentOutputRouter::new(
-            std::env::temp_dir().join(format!(
+        let router = Arc::new(crate::SubAgentOutputRouter::new(std::env::temp_dir().join(
+            format!(
                 "octos-w2-router-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0),
-            )),
-        ));
+            ),
+        )));
         let supervisor = TaskSupervisor::new();
         let summary_gen = Arc::new(crate::AgentSummaryGenerator::new(
             Arc::new(MockProvider),
