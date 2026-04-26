@@ -1182,6 +1182,13 @@ impl GatewayRuntime {
         let mut channel_mgr = ChannelManager::new();
         {
             let delete_tx = session_delete_tx.clone();
+            // M7.9 / W2: bridge SessionTaskQueryStore::cancel/relaunch
+            // through the adapter so the api channel can serve
+            // /tasks/{id}/cancel and /tasks/{id}/restart-from-node.
+            #[cfg(feature = "api")]
+            let task_cancel_store = task_query_store.clone();
+            #[cfg(feature = "api")]
+            let task_relaunch_store = task_query_store.clone();
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
                 shutdown: &shutdown,
                 media_dir: &media_dir,
@@ -1191,6 +1198,37 @@ impl GatewayRuntime {
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
                 })),
+                #[cfg(feature = "api")]
+                task_cancel: Some(Arc::new(move |task_id: &str| {
+                    match task_cancel_store.cancel_task(task_id) {
+                        Ok(()) => octos_bus::TaskCancelOutcome::Cancelled,
+                        Err(octos_agent::TaskCancelError::NotFound) => {
+                            octos_bus::TaskCancelOutcome::NotFound
+                        }
+                        Err(octos_agent::TaskCancelError::AlreadyTerminal) => {
+                            octos_bus::TaskCancelOutcome::AlreadyTerminal
+                        }
+                    }
+                })),
+                #[cfg(feature = "api")]
+                task_relaunch: Some(Arc::new(
+                    move |task_id: &str, from_node: Option<&str>| {
+                        let opts = octos_agent::RelaunchOpts {
+                            from_node: from_node.map(str::to_string),
+                        };
+                        match task_relaunch_store.relaunch_task(task_id, opts) {
+                            Ok(new_task_id) => {
+                                octos_bus::TaskRelaunchOutcome::Relaunched { new_task_id }
+                            }
+                            Err(octos_agent::TaskRelaunchError::NotFound) => {
+                                octos_bus::TaskRelaunchOutcome::NotFound
+                            }
+                            Err(octos_agent::TaskRelaunchError::StillActive) => {
+                                octos_bus::TaskRelaunchOutcome::StillActive
+                            }
+                        }
+                    },
+                )),
                 #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),
                 #[cfg(not(feature = "api"))]

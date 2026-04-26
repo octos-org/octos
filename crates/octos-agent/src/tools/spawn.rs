@@ -25,6 +25,9 @@ use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
 };
+use crate::file_state_cache::FileStateCache;
+use crate::subagent_output::SubAgentOutputRouter;
+use crate::subagent_summary::AgentSummaryGenerator;
 use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
 
 /// Default MCP tool name dispatched on the remote agent. Chosen to match
@@ -346,6 +349,18 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 Runtime Parity W2.B1: parent session's `FileStateCache` so
+    /// spawned child Agents short-circuit re-reads of unchanged files
+    /// the same way the parent does. `None` keeps pre-W2 behaviour.
+    parent_file_state_cache: Option<Arc<FileStateCache>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
+    /// the child Agent's spawn_only background tools route output
+    /// through the same on-disk log the dashboard tails.
+    parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
+    /// so the child can spawn periodic-summary watchers under the same
+    /// LLM/budget contract.
+    parent_subagent_summary_generator: Option<Arc<AgentSummaryGenerator>>,
 }
 
 impl SpawnTool {
@@ -379,6 +394,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -415,6 +433,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -536,6 +557,56 @@ impl SpawnTool {
     ) -> Self {
         self.cost_accountant = Some(accountant);
         self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent session's
+    /// `FileStateCache` so spawned child Agents short-circuit re-reads
+    /// of unchanged files. Without this, every child re-reads the
+    /// entire workspace on every step.
+    pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.parent_file_state_cache = Some(cache);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 output router
+    /// so the child Agent's spawn_only background branch routes output
+    /// through the same on-disk log the parent dashboard tails.
+    pub fn with_parent_subagent_output_router(
+        mut self,
+        router: Arc<SubAgentOutputRouter>,
+    ) -> Self {
+        self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 summary
+    /// generator so child agents can drive periodic-summary watchers
+    /// under the same LLM/budget contract.
+    pub fn with_parent_subagent_summary_generator(
+        mut self,
+        generator: Arc<AgentSummaryGenerator>,
+    ) -> Self {
+        self.parent_subagent_summary_generator = Some(generator);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper — used by tests
+    /// and the parity audit harness to assert that a SpawnTool was
+    /// fully wired with parent caches.
+    pub fn parent_file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
+        self.parent_file_state_cache.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_output_router(&self) -> Option<&Arc<SubAgentOutputRouter>> {
+        self.parent_subagent_output_router.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_summary_generator(
+        &self,
+    ) -> Option<&Arc<AgentSummaryGenerator>> {
+        self.parent_subagent_summary_generator.as_ref()
     }
 
     /// Dispatch a task to the configured MCP-backed sub-agent. Public so
@@ -946,6 +1017,84 @@ fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
     }
 
     (script_lines.len() >= 2).then(|| script_lines.join("\n"))
+}
+
+/// M8 Runtime Parity W2.B2 — single-shot recovery wrapper around
+/// `Agent::run_task`. Mirrors the session_actor M8.9 contract:
+/// when the first attempt returns either a hard `Err` or a
+/// `TaskResult { success: false, .. }`, we synthesize a recovery
+/// instruction (using [`build_spawn_recovery_prompt`]) and re-engage
+/// the worker exactly once.
+///
+/// Conservative on purpose:
+/// - Only one recovery attempt — second failure bubbles up verbatim.
+/// - Reuses the *same* worker / Agent instance so file-state cache,
+///   compaction state, and persistent retry buckets are preserved.
+/// - The recovery turn is sent as an `additional_instructions`-style
+///   tail appended to the original task description, so the worker's
+///   conversation history stays linear.
+async fn run_task_with_m8_9_recovery(
+    worker: &Agent,
+    subtask: &Task,
+    task_desc: &str,
+) -> Result<TaskResult> {
+    let initial = worker.run_task(subtask).await;
+    let needs_recovery = match &initial {
+        Err(_) => true,
+        Ok(task_result) => !task_result.success,
+    };
+    if !needs_recovery {
+        return initial;
+    }
+
+    let error_message = match &initial {
+        Err(error) => format!("{error:#}"),
+        Ok(task_result) => {
+            // The caller's `output` is the LLM's last assistant message
+            // when the worker decided "I cannot continue". Surface that
+            // verbatim so the recovery prompt mirrors what the user
+            // would see in the chat bubble.
+            if task_result.output.trim().is_empty() {
+                "task ended unsuccessfully without an explanatory message".to_string()
+            } else {
+                task_result.output.clone()
+            }
+        }
+    };
+
+    let recovery_prompt = build_spawn_recovery_prompt(task_desc, &error_message);
+    let recovery_task = Task::new(
+        TaskKind::Code {
+            instruction: recovery_prompt,
+            files: Vec::new(),
+        },
+        subtask.context.clone(),
+    );
+    info!(
+        task_id = %subtask.id,
+        agent_id = %worker.id,
+        "M8.9 spawn-task recovery: re-engaging worker after initial failure"
+    );
+    worker.run_task(&recovery_task).await
+}
+
+/// Build the synthetic `[system-internal]` instruction the spawn-task
+/// recovery wrapper sends after a first-pass failure. The shape mirrors
+/// `session_actor::build_recovery_prompt` but operates on the
+/// pre-LLM task description (we don't have a tool_input here).
+fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
+    format!(
+        "[system-internal] Your previous attempt at the task below failed.\n\
+         Original task: {task}\n\
+         Failure: {err}\n\n\
+         Re-attempt the task. Diagnose the root cause from the failure text, \
+         pick a different strategy if appropriate (different tool, different inputs, \
+         a smaller scope), and either complete the task or end with a clear \
+         explanation of why the task cannot be completed. Do not repeat the same \
+         failing step verbatim.",
+        task = task_desc,
+        err = error_message,
+    )
 }
 
 async fn maybe_generate_inline_research_podcast(
@@ -1903,6 +2052,21 @@ impl Tool for SpawnTool {
                 worker = worker.with_config(config.clone());
             }
 
+            // M8 Runtime Parity W2.B1: inherit parent caches so the child
+            // observes the same file_state_cache + subagent_output_router
+            // + subagent_summary_generator the session actor wired. This
+            // closes the gap where spawned subagents had `file_state_cache:
+            // None` and re-read the entire workspace on every step.
+            if let Some(ref cache) = self.parent_file_state_cache {
+                worker = worker.with_file_state_cache(cache.clone());
+            }
+            if let Some(ref router) = self.parent_subagent_output_router {
+                worker = worker.with_subagent_output_router(router.clone());
+            }
+            if let Some(ref summary_gen) = self.parent_subagent_summary_generator {
+                worker = worker.with_subagent_summary_generator(summary_gen.clone());
+            }
+
             // Review A F-004: propagate the parent's declarative compaction
             // policy onto the child Agent so the child honours the same token
             // budget and preserved-artifact contract the parent committed to.
@@ -1949,7 +2113,10 @@ impl Tool for SpawnTool {
                 },
             );
 
-            let result = worker.run_task(&subtask).await;
+            // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+            // M8.9 recovery so the synchronous spawn path mirrors the
+            // session-actor recovery contract.
+            let result = run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await;
             match result {
                 Ok(r) => {
                     // Review A F-004: run declared completion-phase validators
@@ -2044,6 +2211,17 @@ impl Tool for SpawnTool {
             // background child task so the detached child inherits the same
             // compaction + validator contracts the sync spawn path honours.
             let child_workspace_policy = parent_workspace_policy.clone();
+            // M8 Runtime Parity W2.B1: capture parent caches into the
+            // detached background closure so the bg child Agent gets the
+            // same FileStateCache + Router + SummaryGenerator as the sync
+            // path. Without these the detached subagent silently runs
+            // without M8.4/M8.7 wiring even when the session actor
+            // configured everything.
+            let parent_file_state_cache = self.parent_file_state_cache.clone();
+            let parent_subagent_output_router =
+                self.parent_subagent_output_router.clone();
+            let parent_subagent_summary_generator =
+                self.parent_subagent_summary_generator.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2154,6 +2332,19 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                // M8 Runtime Parity W2.B1: apply parent caches to the
+                // detached background child before it consumes any
+                // user-facing instruction. See `with_parent_file_state_cache`
+                // for the contract.
+                if let Some(ref cache) = parent_file_state_cache {
+                    worker = worker.with_file_state_cache(cache.clone());
+                }
+                if let Some(ref router) = parent_subagent_output_router {
+                    worker = worker.with_subagent_output_router(router.clone());
+                }
+                if let Some(ref summary_gen) = parent_subagent_summary_generator {
+                    worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
                 }
@@ -2213,8 +2404,10 @@ impl Tool for SpawnTool {
                     },
                 );
 
+                // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+                // M8.9 recovery for the detached background path too.
                 let mut result = match availability_check {
-                    Ok(()) => worker.run_task(&subtask).await,
+                    Ok(()) => run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await,
                     Err(error) => Err(error),
                 };
                 if let Ok(task_result) = result.as_mut() {
@@ -2753,6 +2946,9 @@ mod tests {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -3980,5 +4176,215 @@ PY
 
         assert_eq!(input.allowed_tools, before.allowed_tools);
         assert_eq!(input.model, before.model);
+    }
+
+    // ────────── M8 Runtime Parity W2.B1 wiring tests ──────────
+
+    /// A SpawnTool built without explicit parent caches must keep the
+    /// pre-W2 default — `None` on every parent introspection helper —
+    /// so unrelated callers don't pay any cost from the new optional
+    /// fields.
+    #[tokio::test]
+    async fn spawn_tool_default_has_no_parent_caches() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+        assert!(tool.parent_file_state_cache().is_none());
+        assert!(tool.parent_subagent_output_router().is_none());
+        assert!(tool.parent_subagent_summary_generator().is_none());
+    }
+
+    // ────────── M8 Runtime Parity W2.B2 recovery prompt helper ──────────
+
+    #[test]
+    fn build_spawn_recovery_prompt_includes_task_and_error_text() {
+        let prompt = build_spawn_recovery_prompt(
+            "Generate a 5-slide deck on AI",
+            "validator rejected child artifact: deck.pptx missing",
+        );
+        assert!(prompt.contains("[system-internal]"));
+        assert!(prompt.contains("Generate a 5-slide deck on AI"));
+        assert!(
+            prompt.contains("validator rejected child artifact: deck.pptx missing"),
+            "recovery prompt must surface the verbatim failure: {prompt}"
+        );
+        assert!(
+            prompt.contains("different strategy") || prompt.contains("smaller scope"),
+            "recovery prompt must direct the LLM toward an alternative"
+        );
+    }
+
+    #[test]
+    fn build_spawn_recovery_prompt_handles_empty_task_desc() {
+        let prompt = build_spawn_recovery_prompt("", "boom");
+        assert!(prompt.contains("Original task: "));
+        assert!(prompt.contains("Failure: boom"));
+    }
+
+    /// Provider that returns a hard `Err` on the first call and a
+    /// successful EndTurn on every subsequent call. Used to drive the
+    /// M8.9 recovery wrapper.
+    struct FailThenSucceedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailThenSucceedProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(eyre::eyre!("simulated provider failure"));
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("recovered".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_retries_once_after_initial_failure() {
+        let provider = Arc::new(FailThenSucceedProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let calls_ref = provider.calls.load(Ordering::SeqCst);
+        assert_eq!(calls_ref, 0);
+
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(AgentId::new("test-worker"), provider.clone(), registry, memory);
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "Recover me".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "Recover me").await;
+        let task_result = result.expect("recovery succeeds");
+        assert!(task_result.success, "recovery turn must succeed");
+        assert!(
+            provider.calls.load(Ordering::SeqCst) >= 2,
+            "recovery must invoke the provider at least twice (one fail + one retry); got {}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Provider whose every call hard-fails. Drives the
+    /// "recovery still fails -> bubble up" branch.
+    struct AlwaysFailProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysFailProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Err(eyre::eyre!("simulated permanent failure"))
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_bubbles_up_when_recovery_also_fails() {
+        let provider = Arc::new(AlwaysFailProvider);
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(AgentId::new("test-worker"), provider, registry, memory);
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "do".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "do").await;
+        assert!(result.is_err(), "permanent failure must bubble up");
+    }
+
+    /// Once wired with parent caches the SpawnTool must surface the
+    /// same `Arc` instances back through its introspection helpers —
+    /// session_actor / tests rely on identity to assert the parent
+    /// cache reaches the spawned child.
+    #[tokio::test]
+    async fn spawn_tool_propagates_parent_caches_via_builders() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let cache = Arc::new(crate::FileStateCache::new());
+        let router = Arc::new(crate::SubAgentOutputRouter::new(
+            std::env::temp_dir().join(format!(
+                "octos-w2-router-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            )),
+        ));
+        let supervisor = TaskSupervisor::new();
+        let summary_gen = Arc::new(crate::AgentSummaryGenerator::new(
+            Arc::new(MockProvider),
+            router.clone(),
+            supervisor,
+        ));
+
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_parent_file_state_cache(cache.clone())
+        .with_parent_subagent_output_router(router.clone())
+        .with_parent_subagent_summary_generator(summary_gen.clone());
+
+        // `Arc::ptr_eq` is the cheapest identity check that proves the
+        // child observed the same instance the parent wired in — not a
+        // freshly-built one.
+        assert!(Arc::ptr_eq(
+            tool.parent_file_state_cache().expect("cache wired"),
+            &cache,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_output_router().expect("router wired"),
+            &router,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_summary_generator()
+                .expect("summary generator wired"),
+            &summary_gen,
+        ));
     }
 }

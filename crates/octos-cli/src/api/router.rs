@@ -137,6 +137,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::session_workspace_contract),
         )
         .route("/api/sessions/{id}", delete(handlers::delete_session))
+        // M7.9 / W2 — task supervisor exposure
+        .route(
+            "/api/tasks/{task_id}/cancel",
+            post(handlers::cancel_task),
+        )
+        .route(
+            "/api/tasks/{task_id}/restart-from-node",
+            post(handlers::restart_task_from_node),
+        )
         .route("/api/status", get(handlers::status));
 
     // User self-service endpoints (user or admin auth)

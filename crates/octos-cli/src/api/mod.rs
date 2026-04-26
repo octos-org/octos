@@ -174,6 +174,14 @@ pub struct AppState {
     /// `None` the router falls through to the unclassified strong-only
     /// default (invariant #3 of the M6.6 spec).
     pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
+    /// M7.9 / W2: shared session-task supervisor lookup. Used by the
+    /// `POST /api/tasks/{task_id}/cancel` and
+    /// `POST /api/tasks/{task_id}/restart-from-node` endpoints to
+    /// forward to the matching `TaskSupervisor`. `None` keeps the
+    /// pre-W2 behaviour — both endpoints return `503 Service
+    /// Unavailable` so they fail closed instead of pretending a task
+    /// was cancelled.
+    pub task_query_store: Option<crate::session_actor::SessionTaskQueryStore>,
 }
 
 impl AppState {
@@ -224,6 +232,7 @@ impl AppState {
             harness_event_sink_path: None,
             credential_pool: None,
             content_classifier: None,
+            task_query_store: None,
         }
     }
 }

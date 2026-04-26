@@ -38,6 +38,37 @@ use crate::file_handle::{
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 
+/// M7.9 / W2: structured outcome for the cancel callback so the
+/// `octos-bus` crate doesn't need to depend on `octos-agent` types.
+/// Mapped 1:1 onto `octos_agent::TaskCancelError` by the gateway
+/// runtime that wires this callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCancelOutcome {
+    /// Task transitioned from active → cancelled.
+    Cancelled,
+    /// No supervisor knew about the requested task id (404).
+    NotFound,
+    /// Task is already in a terminal state (409).
+    AlreadyTerminal,
+}
+
+/// M7.9 / W2: structured outcome for the relaunch callback. `Ok` carries
+/// the freshly-allocated successor task id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRelaunchOutcome {
+    Relaunched { new_task_id: String },
+    NotFound,
+    StillActive,
+}
+
+/// Callback that cancels a tracked task by id. Returns the structured
+/// outcome so the API channel can map it to an HTTP status code.
+pub type TaskCancelFn = dyn Fn(&str) -> TaskCancelOutcome + Send + Sync;
+
+/// Callback that relaunches a tracked task by id. The optional
+/// `from_node` argument mirrors `RelaunchOpts::from_node`.
+pub type TaskRelaunchFn = dyn Fn(&str, Option<&str>) -> TaskRelaunchOutcome + Send + Sync;
+
 /// Callback invoked when a session is deleted via the API.
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -57,6 +88,10 @@ struct ApiState {
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
+    /// M7.9 / W2: cancel a tracked background task by id.
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    /// M7.9 / W2: relaunch (restart-from-node) a tracked task by id.
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
     on_session_deleted: Option<OnSessionDeletedFn>,
     metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
@@ -212,6 +247,12 @@ pub struct ApiChannel {
     sessions: Arc<Mutex<SessionManager>>,
     /// Optional callback for querying background tasks by session key.
     task_query: Option<Arc<TaskQueryFn>>,
+    /// M7.9 / W2: optional cancel callback. Wired by the gateway runtime
+    /// to forward to `SessionTaskQueryStore::cancel_task`.
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    /// M7.9 / W2: optional relaunch callback. Wired by the gateway
+    /// runtime to forward to `SessionTaskQueryStore::relaunch_task`.
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
     /// Optional callback invoked when a session is deleted via API.
     on_session_deleted: Option<OnSessionDeletedFn>,
     /// Optional Prometheus render callback shared from the child gateway.
@@ -236,6 +277,8 @@ impl ApiChannel {
             last_content: Arc::new(Mutex::new(HashMap::new())),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         }
@@ -244,6 +287,22 @@ impl ApiChannel {
     /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
+        self
+    }
+
+    /// M7.9 / W2: attach the cancel callback that backs
+    /// `POST /tasks/{task_id}/cancel`. Without this, the route returns
+    /// `503 Service Unavailable`.
+    pub fn with_task_cancel(mut self, f: Arc<TaskCancelFn>) -> Self {
+        self.task_cancel = Some(f);
+        self
+    }
+
+    /// M7.9 / W2: attach the relaunch callback that backs
+    /// `POST /tasks/{task_id}/restart-from-node`. Without this, the
+    /// route returns `503 Service Unavailable`.
+    pub fn with_task_relaunch(mut self, f: Arc<TaskRelaunchFn>) -> Self {
+        self.task_relaunch = Some(f);
         self
     }
 
@@ -602,6 +661,8 @@ impl Channel for ApiChannel {
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
+            task_cancel: self.task_cancel.clone(),
+            task_relaunch: self.task_relaunch.clone(),
             on_session_deleted: self.on_session_deleted.clone(),
             metrics_renderer: self.metrics_renderer.clone(),
         };
@@ -618,6 +679,12 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
             .route("/sessions/{id}", delete(handle_delete_session))
+            // M7.9 / W2 — task supervisor exposure
+            .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
+            .route(
+                "/tasks/{task_id}/restart-from-node",
+                post(handle_task_relaunch),
+            )
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
             .route("/admin/shell", post(handle_admin_shell))
@@ -1672,6 +1739,103 @@ async fn handle_session_tasks(
         params.topic.as_deref(),
     );
     Json(tasks).into_response()
+}
+
+/// `POST /tasks/{task_id}/cancel` — forwards to the wired
+/// `with_task_cancel` callback. Maps the structured outcome onto HTTP
+/// status codes.
+async fn handle_task_cancel(
+    State(state): State<ApiState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    let Some(ref cancel_fn) = state.task_cancel else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired",
+            })),
+        )
+            .into_response();
+    };
+    match cancel_fn(&task_id) {
+        TaskCancelOutcome::Cancelled => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task_id": task_id,
+                "status": "cancelled",
+            })),
+        )
+            .into_response(),
+        TaskCancelOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        TaskCancelOutcome::AlreadyTerminal => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_already_terminal",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Body of `POST /tasks/{task_id}/restart-from-node`.
+#[derive(Debug, Default, Deserialize)]
+struct ApiRestartFromNodeRequest {
+    #[serde(default)]
+    node_id: Option<String>,
+}
+
+/// `POST /tasks/{task_id}/restart-from-node` — forwards to the wired
+/// `with_task_relaunch` callback. Body: `{ "node_id": Option<String> }`.
+async fn handle_task_relaunch(
+    State(state): State<ApiState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    body: Option<Json<ApiRestartFromNodeRequest>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(ref relaunch_fn) = state.task_relaunch else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired",
+            })),
+        )
+            .into_response();
+    };
+    match relaunch_fn(&task_id, body.node_id.as_deref()) {
+        TaskRelaunchOutcome::Relaunched { new_task_id } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "original_task_id": task_id,
+                "new_task_id": new_task_id,
+                "from_node": body.node_id,
+            })),
+        )
+            .into_response(),
+        TaskRelaunchOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        TaskRelaunchOutcome::StillActive => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_still_active",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /sessions — list all API sessions.

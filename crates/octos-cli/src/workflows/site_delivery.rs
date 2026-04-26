@@ -111,7 +111,7 @@ pub fn build() -> WorkflowInstance {
             forbid_intermediate_files: true,
             required_artifact_kind: "site".into(),
         },
-        additional_instructions: "You are a background site builder. Follow the runtime-owned phases in order: scaffold, build, deliver_result. Read the session metadata to discover the selected template and build output directory, keep edits inside the project root, and deliver only the final built site entrypoint. Do not send intermediate logs, scratch files, or alternate build artifacts.".to_string(),
+        additional_instructions: "You are a background site builder. Follow the runtime-owned phases in order: scaffold, build, deliver_result. Read the session metadata to discover the selected template and build output directory, keep edits inside the project root, and deliver only the final built site entrypoint. Do not send intermediate logs, scratch files, or alternate build artifacts.\n\nM8 Runtime Parity W2.E: at the end of each phase, call check_workspace_contract once and surface the typed result back to the user as a single-line confirmation of the form \"\u{2713} <phase> phase: validators passed (<n>/<n>)\" — for example \"\u{2713} scaffold phase: validators passed (3/3)\". If a phase's validators reject the artifacts, instead emit \"\u{2717} <phase> phase: validators failed (<failed>/<total>) — <reason>\" before moving on.".to_string(),
     }
 }
 
@@ -133,6 +133,20 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "check_workspace_contract")
         );
+    }
+
+    #[test]
+    fn site_workflow_surfaces_per_phase_validator_status() {
+        // M8 Runtime Parity W2.E
+        let workflow = build();
+        assert!(
+            workflow
+                .additional_instructions
+                .contains("phase: validators passed"),
+            "missing phase-validator hint: {}",
+            workflow.additional_instructions
+        );
+        assert!(workflow.additional_instructions.contains("\u{2713}"));
     }
 
     #[test]
