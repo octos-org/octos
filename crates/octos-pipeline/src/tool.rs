@@ -84,7 +84,15 @@ impl RunPipelineTool {
     /// `workspace_policy.toml` automatically opts into terminal
     /// validators + per-node compaction on every `run_pipeline` call
     /// without threading new constructor args.
-    fn build_workspace_context(&self) -> PipelineContext {
+    /// Build the pipeline workspace context, preferring the parent
+    /// session's `CostAccountant` from [`PipelineHostContext`] over the
+    /// tool's locally configured one. Keeps the pipeline ledger
+    /// attribution consistent with the parent session's accountant when
+    /// the tool runs inside a session actor (M8 parity W1.A4).
+    fn build_workspace_context_with_host(
+        &self,
+        host: &crate::host_context::PipelineHostContext,
+    ) -> PipelineContext {
         let policy = match octos_agent::workspace_policy::read_workspace_policy(&self.working_dir) {
             Ok(policy) => policy,
             Err(error) => {
@@ -101,7 +109,13 @@ impl RunPipelineTool {
             ctx = ctx.with_policy(policy);
             ctx = ctx.with_agent_llm_provider(self.default_provider.clone());
         }
-        if let Some(accountant) = self.cost_accountant.clone() {
+        // Prefer the host-context (parent session's) accountant. Falls
+        // back to the tool-configured one for non-session callers.
+        if let Some(accountant) = host
+            .cost_accountant
+            .clone()
+            .or_else(|| self.cost_accountant.clone())
+        {
             ctx = ctx.with_cost_accountant(accountant);
         }
         if let Some(contract_id) = self.contract_id.as_deref() {
@@ -297,6 +311,17 @@ impl Tool for RunPipelineTool {
         // Shutdown signal for cancelling all pipeline workers on timeout/drop.
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // M8 parity (W1.A1/A3/A4): pull the parent session's shared
+        // FileStateCache, SubAgentOutputRouter, AgentSummaryGenerator,
+        // TaskSupervisor, and CostAccountant from TOOL_CTX so pipeline
+        // workers inherit them via the M8 contract instead of
+        // constructing fresh per-run handles. Falls back to whatever
+        // self holds when the tool is invoked outside of a session
+        // (e.g. unit tests).
+        let host_context = octos_agent::tools::TOOL_CTX
+            .try_with(crate::host_context::PipelineHostContext::from_tool_context)
+            .unwrap_or_default();
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
@@ -316,7 +341,8 @@ impl Tool for RunPipelineTool {
             // reservation for free. When no policy is present the
             // context is empty and the executor stays on the legacy
             // path.
-            workspace_context: self.build_workspace_context(),
+            workspace_context: self.build_workspace_context_with_host(&host_context),
+            host_context,
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
