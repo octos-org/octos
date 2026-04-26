@@ -132,6 +132,12 @@ pub struct CodergenHandler {
     /// when unset so extractive compaction still works without the
     /// caller threading a dedicated provider in.
     compaction_llm_provider: Option<Arc<dyn LlmProvider>>,
+    /// M8 parity (W1.A1): inherited resources from the parent session
+    /// — wired onto every per-node Agent so file tools see the same
+    /// FileStateCache, sub-agent output goes to the same router, and
+    /// the same summary generator drives periodic LLM digests for any
+    /// background task the worker triggers.
+    host_context: crate::host_context::PipelineHostContext,
 }
 
 impl CodergenHandler {
@@ -152,7 +158,29 @@ impl CodergenHandler {
             compaction_policy: None,
             compaction_workspace: None,
             compaction_llm_provider: None,
+            host_context: crate::host_context::PipelineHostContext::default(),
         }
+    }
+
+    /// M8 parity (W1.A1): attach the parent session's
+    /// [`PipelineHostContext`] so the per-node Agent inherits the
+    /// shared FileStateCache / SubAgentOutputRouter /
+    /// AgentSummaryGenerator handles. The default empty context keeps
+    /// pre-M8 callers byte-for-byte identical.
+    pub fn with_host_context(
+        mut self,
+        host_context: crate::host_context::PipelineHostContext,
+    ) -> Self {
+        self.host_context = host_context;
+        self
+    }
+
+    /// Doc-hidden test accessor — used by W1.A1 acceptance tests to
+    /// confirm the host context was propagated from the
+    /// [`PipelineExecutor::build_codergen`] wiring.
+    #[doc(hidden)]
+    pub fn host_context(&self) -> &crate::host_context::PipelineHostContext {
+        &self.host_context
     }
 
     pub fn with_provider_router(mut self, router: Arc<ProviderRouter>) -> Self {
@@ -450,6 +478,29 @@ impl Handler for CodergenHandler {
         .with_reporter(reporter);
         if let Some(sink) = inherited_harness_sink {
             worker = worker.with_harness_event_sink(sink);
+        }
+
+        // M8 parity (W1.A1): wire the parent session's shared
+        // resources onto the per-node worker so file tools see the
+        // shared FileStateCache, sub-agent output flows through the
+        // shared SubAgentOutputRouter, and AgentSummaryGenerator drives
+        // periodic LLM digests for any background task the worker
+        // triggers. Each handle is optional so legacy callers (no host
+        // context) keep their pre-M8 behaviour bitwise identical.
+        if let Some(cache) = self.host_context.file_state_cache.clone() {
+            worker = worker.with_file_state_cache(cache);
+        }
+        if let Some(router) = self.host_context.subagent_output_router.clone() {
+            worker = worker.with_subagent_output_router(router);
+        }
+        if let Some(generator) = self.host_context.subagent_summary_generator.clone() {
+            worker = worker.with_subagent_summary_generator(generator);
+        }
+        if let Some(accountant) = self.host_context.cost_accountant.clone() {
+            worker = worker.with_cost_accountant(accountant);
+        }
+        if let Some(ref session_key) = self.host_context.parent_session_key {
+            worker = worker.with_parent_session_key(session_key.clone());
         }
 
         // coding-blue FA-7: propagate parent's declarative compaction

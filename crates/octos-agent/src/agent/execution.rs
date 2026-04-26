@@ -142,6 +142,11 @@ impl Agent {
         // tasks (not only test fixtures).
         let subagent_output_router = self.subagent_output_router.clone();
         let subagent_summary_generator = self.subagent_summary_generator.clone();
+        // M8 parity (W1.A4): clone the agent's cost accountant and
+        // parent session key so they propagate to every sub-agent built
+        // off this turn's TOOL_CTX (pipeline workers, spawn children).
+        let cost_accountant = self.cost_accountant.clone();
+        let parent_session_key = self.parent_session_key.clone();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -243,6 +248,15 @@ impl Agent {
                 // and stop the watcher when the task is done.
                 let bg_output_router = subagent_output_router.clone();
                 let bg_summary_generator = subagent_summary_generator.clone();
+                // M8 parity (W1.A1/A4): clone the optional router/generator/
+                // supervisor/cost-accountant so the make_ctx closure below
+                // can thread them onto every sub-agent that runs in the
+                // spawn_only branch (pipelines, recursive spawns).
+                let bg_subagent_output_router = subagent_output_router.clone();
+                let bg_subagent_summary_generator = subagent_summary_generator.clone();
+                let bg_task_supervisor = Some(bg_supervisor.clone());
+                let bg_cost_accountant = cost_accountant.clone();
+                let bg_parent_session_key = parent_session_key.clone();
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
@@ -274,6 +288,17 @@ impl Agent {
                         // background tools see the same gate the
                         // foreground branch enforces.
                         permissions: bg_permissions.clone(),
+                        // M8 parity (W1.A1): thread the shared router /
+                        // summary generator / supervisor / cost
+                        // accountant into the spawn_only TOOL_CTX so
+                        // sub-agents downstream (pipeline workers,
+                        // recursive spawns) inherit them via the
+                        // task-local read path.
+                        subagent_output_router: bg_subagent_output_router.clone(),
+                        subagent_summary_generator: bg_subagent_summary_generator.clone(),
+                        task_supervisor: bg_task_supervisor.clone(),
+                        cost_accountant: bg_cost_accountant.clone(),
+                        parent_session_key: bg_parent_session_key.clone(),
                         ..ToolContext::zero()
                     };
 
@@ -739,6 +764,16 @@ impl Agent {
                 // the call boundary (read_file already checks
                 // ctx.permissions.is_tool_allowed).
                 permissions: permissions.clone(),
+                // M8 parity (W1.A1/A3/A4): thread the shared router /
+                // summary generator / task supervisor / cost accountant
+                // through to foreground tool calls so run_pipeline (and
+                // the spawn tool) can pick them up via TOOL_CTX and
+                // hand them down to background workers.
+                subagent_output_router: subagent_output_router.clone(),
+                subagent_summary_generator: subagent_summary_generator.clone(),
+                task_supervisor: Some(tools.supervisor()),
+                cost_accountant: cost_accountant.clone(),
+                parent_session_key: parent_session_key.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools

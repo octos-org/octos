@@ -63,6 +63,7 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         checkpoint_store: None,
         hook_executor: None,
         workspace_context: octos_pipeline::context::PipelineContext::default(),
+        host_context: octos_pipeline::host_context::PipelineHostContext::default(),
     }
 }
 

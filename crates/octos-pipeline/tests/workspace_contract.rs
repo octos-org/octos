@@ -161,6 +161,7 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         checkpoint_store: None,
         hook_executor: None,
         workspace_context: ctx,
+        host_context: octos_pipeline::host_context::PipelineHostContext::default(),
     }
 }
 

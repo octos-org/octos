@@ -115,6 +115,7 @@ fn base_config(
         checkpoint_store: store,
         hook_executor: None,
         workspace_context: octos_pipeline::context::PipelineContext::default(),
+        host_context: octos_pipeline::host_context::PipelineHostContext::default(),
     }
 }
 

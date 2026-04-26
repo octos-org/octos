@@ -243,6 +243,29 @@ pub struct ToolContext {
     pub notifications: Arc<Notifications>,
     /// Handle to the ambient app state. M8.3 will populate this.
     pub app_state: AppStateHandle,
+    /// M8 parity (W1.A1): shared sub-agent output router from the
+    /// session actor. Background sub-agents (pipeline workers, spawn
+    /// children) clone this `Arc` so their output lands in the same
+    /// disk-backed router the parent session uses for dashboards.
+    pub subagent_output_router: Option<Arc<crate::subagent_output::SubAgentOutputRouter>>,
+    /// M8 parity (W1.A1): shared sub-agent summary generator. Pipeline
+    /// workers clone this so periodic LLM summaries fire for their
+    /// background tasks just like top-level spawn children.
+    pub subagent_summary_generator: Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
+    /// M8 parity (W1.A3): per-session task supervisor. Pipeline node
+    /// workers register a child task in this supervisor so the admin
+    /// dashboard sees the substructure under the parent run_pipeline
+    /// invocation.
+    pub task_supervisor: Option<Arc<crate::task_supervisor::TaskSupervisor>>,
+    /// M8 parity (W1.A4): shared cost accountant. Pipeline workers
+    /// open a per-node `CostReservationHandle` against the same
+    /// accountant the session uses so spend is unified under the
+    /// parent contract.
+    pub cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 parity: parent session key when the tool is invoked from a
+    /// session actor. Pipeline workers and spawn children carry this so
+    /// background-task registration links to the owning session.
+    pub parent_session_key: Option<String>,
 }
 
 impl ToolContext {
@@ -262,6 +285,11 @@ impl ToolContext {
             file_state_cache: None,
             notifications: Arc::new(Notifications::new()),
             app_state: AppStateHandle::new(),
+            subagent_output_router: None,
+            subagent_summary_generator: None,
+            task_supervisor: None,
+            cost_accountant: None,
+            parent_session_key: None,
         }
     }
 }

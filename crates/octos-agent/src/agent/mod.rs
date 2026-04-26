@@ -219,6 +219,16 @@ pub struct Agent {
     /// it on terminal completion. `None` keeps pre-M8.7 behaviour.
     pub(super) subagent_summary_generator:
         Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
+    /// M8 parity (W1.A4): optional shared cost accountant. When set,
+    /// the agent threads it onto every `ToolContext` so background
+    /// sub-agents (pipeline workers, spawn children) reserve and commit
+    /// against the same ledger as the parent session.
+    pub(super) cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 parity: optional parent session key. When the agent is owned
+    /// by a session actor, this carries the session key down through
+    /// `ToolContext.parent_session_key` so spawn children / pipeline
+    /// workers can register tasks against the owning session.
+    pub(super) parent_session_key: Option<String>,
 }
 
 impl Agent {
@@ -257,6 +267,8 @@ impl Agent {
             tiered_compaction: None,
             subagent_output_router: None,
             subagent_summary_generator: None,
+            cost_accountant: None,
+            parent_session_key: None,
         }
     }
 
@@ -296,6 +308,8 @@ impl Agent {
             tiered_compaction: None,
             subagent_output_router: None,
             subagent_summary_generator: None,
+            cost_accountant: None,
+            parent_session_key: None,
         }
     }
 
@@ -446,6 +460,36 @@ impl Agent {
         &self,
     ) -> Option<&Arc<crate::subagent_summary::AgentSummaryGenerator>> {
         self.subagent_summary_generator.as_ref()
+    }
+
+    /// Wire a shared [`crate::cost_ledger::CostAccountant`] onto the
+    /// agent so background sub-agents (pipeline workers, spawn
+    /// children) inherit the same accountant via `TOOL_CTX` and commit
+    /// per-node spend to the same ledger. M8 parity (W1.A4).
+    pub fn with_cost_accountant(
+        mut self,
+        accountant: Arc<crate::cost_ledger::CostAccountant>,
+    ) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
+    }
+
+    /// Access the configured cost accountant, if any.
+    pub fn cost_accountant(&self) -> Option<&Arc<crate::cost_ledger::CostAccountant>> {
+        self.cost_accountant.as_ref()
+    }
+
+    /// Record the owning session key so pipeline workers / spawn
+    /// children can register child tasks against the parent session
+    /// in the supervisor's task store. M8 parity.
+    pub fn with_parent_session_key(mut self, key: impl Into<String>) -> Self {
+        self.parent_session_key = Some(key.into());
+        self
+    }
+
+    /// Access the recorded parent session key, if any.
+    pub fn parent_session_key(&self) -> Option<&str> {
+        self.parent_session_key.as_deref()
     }
 
     /// Set the embedding provider for hybrid memory search.
