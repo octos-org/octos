@@ -61,6 +61,14 @@ pub(crate) use super::prompt::settings_str;
 
 pub type TaskQueryFn = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
 pub type SessionDeletedCallback = Arc<dyn Fn(&str) + Send + Sync>;
+/// M7.9 / W2: cancel callback signature shared with the api adapter.
+#[cfg(feature = "api")]
+pub type TaskCancelCb =
+    Arc<dyn Fn(&str) -> octos_bus::TaskCancelOutcome + Send + Sync>;
+/// M7.9 / W2: relaunch callback signature shared with the api adapter.
+#[cfg(feature = "api")]
+pub type TaskRelaunchCb =
+    Arc<dyn Fn(&str, Option<&str>) -> octos_bus::TaskRelaunchOutcome + Send + Sync>;
 
 /// Context needed by adapters that require extra parameters beyond the common set.
 #[allow(dead_code)]
@@ -74,6 +82,12 @@ pub struct ChannelRegistrationCtx<'a> {
     #[cfg(not(feature = "api"))]
     pub metrics_handle: Option<()>,
     pub task_query: Option<TaskQueryFn>,
+    /// M7.9 / W2: optional cancel callback for the api adapter.
+    #[cfg(feature = "api")]
+    pub task_cancel: Option<TaskCancelCb>,
+    /// M7.9 / W2: optional relaunch callback for the api adapter.
+    #[cfg(feature = "api")]
+    pub task_relaunch: Option<TaskRelaunchCb>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
@@ -116,6 +130,8 @@ pub fn register_all(
                 ctx.session_mgr,
                 ctx.metrics_handle.clone(),
                 ctx.task_query.clone(),
+                ctx.task_cancel.clone(),
+                ctx.task_relaunch.clone(),
                 ctx.gateway_profile_id,
                 ctx.api_port_override,
                 ctx.on_session_deleted.clone(),

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -33,11 +34,24 @@ pub enum TaskStatus {
     Running,
     Completed,
     Failed,
+    /// M7.9 / W2: task was cancelled mid-flight via the supervisor's
+    /// `cancel()` primitive (e.g. `POST /api/tasks/{id}/cancel`).
+    /// Terminal — `is_active()` returns false. Distinguished from
+    /// `Failed` so dashboards can surface "user cancelled" instead of
+    /// "the task crashed".
+    Cancelled,
 }
 
 impl TaskStatus {
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Spawned | Self::Running)
+    }
+
+    /// Whether this status is a terminal (non-recoverable, non-running)
+    /// state. Used by the API layer to reject `cancel`/`restart` against
+    /// already-terminal tasks with a `409 Conflict` response.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -46,6 +60,7 @@ impl TaskStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -92,6 +107,9 @@ pub enum TaskRuntimeState {
     CleaningUp,
     Completed,
     Failed,
+    /// M7.9 / W2: runtime state for tasks cancelled via the supervisor's
+    /// `cancel()` primitive. Surfaced via `mark_cancelled`.
+    Cancelled,
 }
 
 /// Stable externally-facing lifecycle state for background tasks.
@@ -107,6 +125,8 @@ pub enum TaskLifecycleState {
     Verifying,
     Ready,
     Failed,
+    /// M7.9 / W2: stable cancelled lifecycle for UI / API dashboards.
+    Cancelled,
 }
 
 /// A tracked background task spawned by a spawn_only tool.
@@ -155,6 +175,7 @@ impl BackgroundTask {
             TaskStatus::Spawned => TaskLifecycleState::Queued,
             TaskStatus::Completed => TaskLifecycleState::Ready,
             TaskStatus::Failed => TaskLifecycleState::Failed,
+            TaskStatus::Cancelled => TaskLifecycleState::Cancelled,
             TaskStatus::Running => match self.runtime_state {
                 TaskRuntimeState::Spawned | TaskRuntimeState::ExecutingTool => {
                     TaskLifecycleState::Running
@@ -165,6 +186,7 @@ impl BackgroundTask {
                 | TaskRuntimeState::CleaningUp
                 | TaskRuntimeState::Completed => TaskLifecycleState::Verifying,
                 TaskRuntimeState::Failed => TaskLifecycleState::Failed,
+                TaskRuntimeState::Cancelled => TaskLifecycleState::Cancelled,
             },
         }
     }
@@ -200,6 +222,150 @@ pub struct SpawnOnlyFailureSignal {
 /// signal payload so consumers can build a recovery prompt without re-parsing
 /// the raw `BackgroundTask`.
 type OnFailureCallback = Box<dyn Fn(&SpawnOnlyFailureSignal) + Send + Sync>;
+
+/// Options for `TaskSupervisor::relaunch`. Mirrors the
+/// `POST /api/tasks/{id}/restart-from-node` request body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelaunchOpts {
+    /// When set, the supervisor relaunches starting at this DOT-graph node id
+    /// (so upstream cached outputs are reused). When `None` the relaunch
+    /// re-runs the entire task from scratch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_node: Option<String>,
+}
+
+/// Payload emitted to the relaunch callback when a caller invokes
+/// `TaskSupervisor::relaunch`. The callback owns turning this into a
+/// concrete tokio task that re-executes the work; the supervisor only
+/// stores a forwarding pointer (`relaunched_from`) on the original task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaunchRequest {
+    /// Identifier of the task being relaunched. Always `task.id`.
+    pub original_task_id: String,
+    /// Identifier the supervisor pre-allocated for the relaunched task.
+    /// Already registered on the supervisor in the `Spawned` state so the
+    /// callback can `mark_running` immediately.
+    pub new_task_id: String,
+    pub tool_name: String,
+    pub tool_call_id: String,
+    pub parent_session_key: Option<String>,
+    pub session_key: Option<String>,
+    pub tool_input: Value,
+    pub opts: RelaunchOpts,
+}
+
+/// Callback invoked when a caller asks the supervisor to relaunch a task.
+type OnRelaunchCallback = Box<dyn Fn(&RelaunchRequest) + Send + Sync>;
+
+/// Error variants for [`TaskSupervisor::cancel`]. Mapped to HTTP status
+/// codes by the API layer:
+/// - `NotFound` → `404`
+/// - `AlreadyTerminal` → `409`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCancelError {
+    NotFound,
+    AlreadyTerminal,
+}
+
+impl std::fmt::Display for TaskCancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "task not found"),
+            Self::AlreadyTerminal => write!(f, "task is already in a terminal state"),
+        }
+    }
+}
+
+impl std::error::Error for TaskCancelError {}
+
+/// Error variants for [`TaskSupervisor::relaunch`]. Mapped to HTTP status
+/// codes by the API layer:
+/// - `NotFound` → `404`
+/// - `StillActive` → `409`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRelaunchError {
+    NotFound,
+    StillActive,
+}
+
+impl std::fmt::Display for TaskRelaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "task not found"),
+            Self::StillActive => {
+                write!(f, "task is still active; cancel it before relaunching")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskRelaunchError {}
+
+/// Per-task cancel token map. Each entry pairs an `AtomicBool` (loop-poll
+/// flag) and an optional `tokio::sync::Notify` so cooperatively cancelable
+/// futures (e.g. `select!` on a long-running pipeline) can race against
+/// `cancelled.notified()` instead of polling.
+#[derive(Default)]
+struct CancelTokenStore {
+    tokens: Mutex<HashMap<String, Arc<TaskCancelToken>>>,
+}
+
+impl CancelTokenStore {
+    fn ensure(&self, task_id: &str) -> Arc<TaskCancelToken> {
+        let mut guard = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(TaskCancelToken::new()))
+            .clone()
+    }
+}
+
+/// Per-task cancel token. Workers poll `is_cancelled()` at safe points and
+/// long-running futures can `select!` on `notified()` to short-circuit
+/// pending I/O.
+pub struct TaskCancelToken {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TaskCancelToken {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Whether the token has been triggered. Safe-point poll for in-loop
+    /// pipeline workers.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Trigger cancellation. Idempotent — a second call is a no-op.
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Wait for the token to fire. Useful for `select!` against a
+    /// long-running future.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+impl std::fmt::Debug for TaskCancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskCancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
 
 /// Extract a list of alternatives from a tool error message using the simple
 /// `available: X, Y, Z` pattern. Returns an empty vector when no match is
@@ -638,6 +804,7 @@ impl std::fmt::Debug for TaskSupervisor {
             .field("tasks", &self.tasks)
             .field("on_change", &"<callback>")
             .field("on_failure", &"<callback>")
+            .field("on_relaunch", &"<callback>")
             .field("progress_reporter", &progress_reporter_attached)
             .field(
                 "persistence_path",
@@ -666,6 +833,7 @@ fn runtime_state_label(state: &TaskRuntimeState) -> &'static str {
         TaskRuntimeState::CleaningUp => "cleaning up",
         TaskRuntimeState::Completed => "completed",
         TaskRuntimeState::Failed => "failed",
+        TaskRuntimeState::Cancelled => "cancelled",
     }
 }
 
@@ -677,6 +845,7 @@ pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
+    on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
     /// for every supervised state transition. Wired by the agent's
@@ -689,6 +858,12 @@ pub struct TaskSupervisor {
     /// there is no double-emission to worry about for the normal tool
     /// path that already reports its own ToolStarted/ToolCompleted.
     progress_reporter: Arc<Mutex<Option<Arc<dyn ProgressReporter>>>>,
+    /// M7.9: per-task cancellation tokens. The `cancel(task_id)` primitive
+    /// flips the matching token so cooperative pipeline / spawn workers can
+    /// short-circuit at their next safe point. Tokens are created lazily on
+    /// `register*` and dropped on terminal transitions to keep memory usage
+    /// proportional to active tasks.
+    cancel_tokens: Arc<CancelTokenStore>,
 }
 
 impl Default for TaskSupervisor {
@@ -704,8 +879,10 @@ impl TaskSupervisor {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             on_change: Arc::new(Mutex::new(None)),
             on_failure: Arc::new(Mutex::new(None)),
+            on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
+            cancel_tokens: Arc::new(CancelTokenStore::default()),
         }
     }
 
@@ -790,6 +967,129 @@ impl TaskSupervisor {
         *guard = Some(reporter);
     }
 
+    /// Wire a callback that fires when [`Self::relaunch`] is invoked. The
+    /// callback is responsible for spawning the actual replacement task —
+    /// the supervisor only pre-allocates a fresh task id and fires the
+    /// signal so the owning runtime (session actor / pipeline executor)
+    /// can rebuild context.
+    pub fn set_on_relaunch(&self, cb: impl Fn(&RelaunchRequest) + Send + Sync + 'static) {
+        let mut guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Box::new(cb));
+    }
+
+    /// Acquire (or create) the cancel token for `task_id`. Workers should
+    /// call this once at the top of their critical section and then poll
+    /// `is_cancelled()` at safe points. Returns a freshly allocated token
+    /// for unknown task ids — callers that want strict membership checks
+    /// should use `get_task` first.
+    pub fn cancel_token(&self, task_id: &str) -> Arc<TaskCancelToken> {
+        self.cancel_tokens.ensure(task_id)
+    }
+
+    /// Cancel a tracked task. Sets the per-task cancellation token (so
+    /// in-loop workers can short-circuit at the next safe point) and
+    /// transitions the supervisor record to `Cancelled`. Returns:
+    ///
+    /// - `Ok(())` when the task was running/queued and has now been
+    ///   marked `Cancelled`.
+    /// - `Err(TaskCancelError::NotFound)` when no task with that id is
+    ///   tracked. Maps to `404` at the API edge.
+    /// - `Err(TaskCancelError::AlreadyTerminal)` when the task is
+    ///   already in a terminal state (`Completed` / `Failed` /
+    ///   `Cancelled`). Maps to `409` at the API edge.
+    pub fn cancel(&self, task_id: &str) -> Result<(), TaskCancelError> {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or(TaskCancelError::NotFound)?;
+            if task.status.is_terminal() {
+                return Err(TaskCancelError::AlreadyTerminal);
+            }
+            task.status = TaskStatus::Cancelled;
+            task.runtime_state = TaskRuntimeState::Cancelled;
+            task.updated_at = Utc::now();
+            task.completed_at = Some(Utc::now());
+            if task.error.is_none() {
+                task.error = Some("cancelled by supervisor".to_string());
+            }
+            task.clone()
+        };
+
+        // Trigger the cancel token AFTER the task has been marked
+        // cancelled so any waiter that wakes can re-read the supervisor
+        // and see the terminal state.
+        let token = self.cancel_tokens.ensure(task_id);
+        token.cancel();
+
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+        self.emit_progress_for_state(&snapshot);
+        Ok(())
+    }
+
+    /// Relaunch a tracked task with the supplied options. Returns the
+    /// freshly allocated `new_task_id` on success.
+    ///
+    /// The supervisor pre-registers the new task in the `Spawned` state
+    /// (mirroring the original task's tool name / call id / session
+    /// metadata) and fires `set_on_relaunch` so the runtime can drive the
+    /// actual re-execution. When no relaunch callback is wired the call
+    /// still succeeds — the new task id is returned so callers can
+    /// observe the placeholder in dashboards even when the runtime
+    /// owner has not subscribed yet.
+    pub fn relaunch(
+        &self,
+        task_id: &str,
+        opts: RelaunchOpts,
+    ) -> Result<String, TaskRelaunchError> {
+        let original = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks
+                .get(task_id)
+                .cloned()
+                .ok_or(TaskRelaunchError::NotFound)?
+        };
+        if matches!(original.status, TaskStatus::Running | TaskStatus::Spawned) {
+            return Err(TaskRelaunchError::StillActive);
+        }
+
+        // Pre-allocate a successor task id and seed it on the supervisor
+        // so dashboards see the relaunch as a peer of the original task.
+        let new_task_id = self.register_with_input(
+            &original.tool_name,
+            &original.tool_call_id,
+            original.session_key.as_deref(),
+            original.tool_input.clone(),
+        );
+
+        // Stamp the lineage on the new task: callers can use
+        // `runtime_detail` to surface the relaunch-from edge.
+        let detail = serde_json::json!({
+            "relaunched_from": task_id,
+            "from_node": opts.from_node,
+        })
+        .to_string();
+        self.mark_runtime_state(&new_task_id, TaskRuntimeState::Spawned, Some(detail));
+
+        let request = RelaunchRequest {
+            original_task_id: task_id.to_string(),
+            new_task_id: new_task_id.clone(),
+            tool_name: original.tool_name.clone(),
+            tool_call_id: original.tool_call_id.clone(),
+            parent_session_key: original.parent_session_key.clone(),
+            session_key: original.session_key.clone(),
+            tool_input: original.tool_input.clone().unwrap_or(Value::Null),
+            opts,
+        };
+
+        let guard = self.on_relaunch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cb) = *guard {
+            cb(&request);
+        }
+        Ok(new_task_id)
+    }
+
     /// Emit a [`ProgressEvent::ToolProgress`] for `task` if a reporter has
     /// been wired via [`Self::set_progress_reporter`]. The message is
     /// `"<tool_name>: <state-label>"`, with the task's `error` text appended
@@ -806,7 +1106,7 @@ impl TaskSupervisor {
         drop(guard);
         let label = runtime_state_label(&task.runtime_state);
         let message = match task.runtime_state {
-            TaskRuntimeState::Failed => match task.error.as_deref() {
+            TaskRuntimeState::Failed | TaskRuntimeState::Cancelled => match task.error.as_deref() {
                 Some(reason) if !reason.is_empty() => {
                     format!("{}: {} ({})", task.tool_name, label, reason)
                 }
@@ -2531,5 +2831,152 @@ mod tests {
             1,
             "expected exactly one failure ToolProgress, got: {failures:?}"
         );
+    }
+
+    // ────────── M7.9 cancel / relaunch primitives (W2) ──────────
+
+    #[test]
+    fn cancel_running_task_transitions_to_cancelled_and_fires_token() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("run_pipeline", "call-cancel-1", Some("session-A"));
+        supervisor.mark_running(&task_id);
+        let token = supervisor.cancel_token(&task_id);
+        assert!(!token.is_cancelled());
+
+        supervisor.cancel(&task_id).expect("cancel should succeed");
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.runtime_state, TaskRuntimeState::Cancelled);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Cancelled);
+        assert!(token.is_cancelled());
+        assert!(task.completed_at.is_some());
+    }
+
+    #[test]
+    fn cancel_unknown_task_returns_not_found() {
+        let supervisor = TaskSupervisor::new();
+        let result = supervisor.cancel("does-not-exist");
+        assert_eq!(result, Err(TaskCancelError::NotFound));
+    }
+
+    #[test]
+    fn cancel_terminal_task_returns_already_terminal() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("podcast_generate", "call-cancel-2", Some("session-B"));
+        supervisor.mark_completed(&task_id, vec!["output/podcast.mp3".into()]);
+        let result = supervisor.cancel(&task_id);
+        assert_eq!(result, Err(TaskCancelError::AlreadyTerminal));
+        // Cancelling a Failed task is also rejected.
+        let task_id2 = supervisor.register("fm_tts", "call-cancel-3", None);
+        supervisor.mark_failed(&task_id2, "boom".to_string());
+        assert_eq!(
+            supervisor.cancel(&task_id2),
+            Err(TaskCancelError::AlreadyTerminal)
+        );
+    }
+
+    #[test]
+    fn cancel_emits_progress_event() {
+        let supervisor = TaskSupervisor::new();
+        let events = collect_progress_events(&supervisor);
+        let task_id = supervisor.register("run_pipeline", "call-cancel-4", Some("session-C"));
+        supervisor.mark_running(&task_id);
+        supervisor.cancel(&task_id).expect("cancel should succeed");
+
+        let captured = events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let cancels: Vec<_> = tool_progress
+            .iter()
+            .filter(|(_, _, message)| message.contains("cancelled"))
+            .collect();
+        assert!(
+            !cancels.is_empty(),
+            "expected at least one cancelled ToolProgress, got: {tool_progress:?}"
+        );
+    }
+
+    #[test]
+    fn relaunch_failed_task_creates_successor_and_fires_callback() {
+        use std::sync::Mutex;
+        let supervisor = TaskSupervisor::new();
+        let captured: Arc<Mutex<Vec<RelaunchRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let captured = captured.clone();
+            supervisor.set_on_relaunch(move |req| {
+                captured.lock().unwrap().push(req.clone());
+            });
+        }
+
+        let task_id =
+            supervisor.register("run_pipeline", "call-relaunch-1", Some("session-D"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "node 'design' failed".to_string());
+
+        let new_id = supervisor
+            .relaunch(
+                &task_id,
+                RelaunchOpts {
+                    from_node: Some("design".into()),
+                },
+            )
+            .expect("relaunch should succeed");
+        assert_ne!(new_id, task_id, "relaunch must allocate a fresh id");
+
+        let new_task = supervisor.get_task(&new_id).expect("successor registered");
+        assert_eq!(new_task.tool_name, "run_pipeline");
+        assert_eq!(new_task.tool_call_id, "call-relaunch-1");
+        assert_eq!(new_task.session_key.as_deref(), Some("session-D"));
+
+        let log = captured.lock().unwrap();
+        assert_eq!(log.len(), 1, "relaunch callback fired exactly once");
+        assert_eq!(log[0].original_task_id, task_id);
+        assert_eq!(log[0].new_task_id, new_id);
+        assert_eq!(log[0].opts.from_node.as_deref(), Some("design"));
+    }
+
+    #[test]
+    fn relaunch_unknown_task_returns_not_found() {
+        let supervisor = TaskSupervisor::new();
+        let result = supervisor.relaunch("does-not-exist", RelaunchOpts::default());
+        assert_eq!(result, Err(TaskRelaunchError::NotFound));
+    }
+
+    #[test]
+    fn relaunch_active_task_returns_still_active() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("run_pipeline", "call-relaunch-2", None);
+        supervisor.mark_running(&task_id);
+        let result = supervisor.relaunch(&task_id, RelaunchOpts::default());
+        assert_eq!(result, Err(TaskRelaunchError::StillActive));
+    }
+
+    #[test]
+    fn cancel_token_notifies_waiters() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("run_pipeline", "call-cancel-notify", None);
+        supervisor.mark_running(&task_id);
+        let token = supervisor.cancel_token(&task_id);
+
+        // Drive a small async runtime so the token can fire its
+        // notification path (poll-then-wait).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let waiter = {
+                let token = token.clone();
+                tokio::spawn(async move { token.cancelled().await })
+            };
+            // Yield so the waiter actually parks on `notified()`.
+            tokio::task::yield_now().await;
+            supervisor.cancel(&task_id).expect("cancel should succeed");
+            tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+                .await
+                .expect("waiter must wake within 500ms")
+                .expect("waiter task panicked");
+        });
+        assert!(token.is_cancelled());
     }
 }

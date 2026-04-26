@@ -25,6 +25,9 @@ use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
 };
+use crate::file_state_cache::FileStateCache;
+use crate::subagent_output::SubAgentOutputRouter;
+use crate::subagent_summary::AgentSummaryGenerator;
 use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult};
 
 /// Default MCP tool name dispatched on the remote agent. Chosen to match
@@ -346,6 +349,18 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 Runtime Parity W2.B1: parent session's `FileStateCache` so
+    /// spawned child Agents short-circuit re-reads of unchanged files
+    /// the same way the parent does. `None` keeps pre-W2 behaviour.
+    parent_file_state_cache: Option<Arc<FileStateCache>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
+    /// the child Agent's spawn_only background tools route output
+    /// through the same on-disk log the dashboard tails.
+    parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
+    /// so the child can spawn periodic-summary watchers under the same
+    /// LLM/budget contract.
+    parent_subagent_summary_generator: Option<Arc<AgentSummaryGenerator>>,
 }
 
 impl SpawnTool {
@@ -379,6 +394,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -415,6 +433,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -536,6 +557,56 @@ impl SpawnTool {
     ) -> Self {
         self.cost_accountant = Some(accountant);
         self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent session's
+    /// `FileStateCache` so spawned child Agents short-circuit re-reads
+    /// of unchanged files. Without this, every child re-reads the
+    /// entire workspace on every step.
+    pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.parent_file_state_cache = Some(cache);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 output router
+    /// so the child Agent's spawn_only background branch routes output
+    /// through the same on-disk log the parent dashboard tails.
+    pub fn with_parent_subagent_output_router(
+        mut self,
+        router: Arc<SubAgentOutputRouter>,
+    ) -> Self {
+        self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 summary
+    /// generator so child agents can drive periodic-summary watchers
+    /// under the same LLM/budget contract.
+    pub fn with_parent_subagent_summary_generator(
+        mut self,
+        generator: Arc<AgentSummaryGenerator>,
+    ) -> Self {
+        self.parent_subagent_summary_generator = Some(generator);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper — used by tests
+    /// and the parity audit harness to assert that a SpawnTool was
+    /// fully wired with parent caches.
+    pub fn parent_file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
+        self.parent_file_state_cache.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_output_router(&self) -> Option<&Arc<SubAgentOutputRouter>> {
+        self.parent_subagent_output_router.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_summary_generator(
+        &self,
+    ) -> Option<&Arc<AgentSummaryGenerator>> {
+        self.parent_subagent_summary_generator.as_ref()
     }
 
     /// Dispatch a task to the configured MCP-backed sub-agent. Public so
@@ -1903,6 +1974,21 @@ impl Tool for SpawnTool {
                 worker = worker.with_config(config.clone());
             }
 
+            // M8 Runtime Parity W2.B1: inherit parent caches so the child
+            // observes the same file_state_cache + subagent_output_router
+            // + subagent_summary_generator the session actor wired. This
+            // closes the gap where spawned subagents had `file_state_cache:
+            // None` and re-read the entire workspace on every step.
+            if let Some(ref cache) = self.parent_file_state_cache {
+                worker = worker.with_file_state_cache(cache.clone());
+            }
+            if let Some(ref router) = self.parent_subagent_output_router {
+                worker = worker.with_subagent_output_router(router.clone());
+            }
+            if let Some(ref summary_gen) = self.parent_subagent_summary_generator {
+                worker = worker.with_subagent_summary_generator(summary_gen.clone());
+            }
+
             // Review A F-004: propagate the parent's declarative compaction
             // policy onto the child Agent so the child honours the same token
             // budget and preserved-artifact contract the parent committed to.
@@ -2044,6 +2130,17 @@ impl Tool for SpawnTool {
             // background child task so the detached child inherits the same
             // compaction + validator contracts the sync spawn path honours.
             let child_workspace_policy = parent_workspace_policy.clone();
+            // M8 Runtime Parity W2.B1: capture parent caches into the
+            // detached background closure so the bg child Agent gets the
+            // same FileStateCache + Router + SummaryGenerator as the sync
+            // path. Without these the detached subagent silently runs
+            // without M8.4/M8.7 wiring even when the session actor
+            // configured everything.
+            let parent_file_state_cache = self.parent_file_state_cache.clone();
+            let parent_subagent_output_router =
+                self.parent_subagent_output_router.clone();
+            let parent_subagent_summary_generator =
+                self.parent_subagent_summary_generator.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2154,6 +2251,19 @@ impl Tool for SpawnTool {
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                // M8 Runtime Parity W2.B1: apply parent caches to the
+                // detached background child before it consumes any
+                // user-facing instruction. See `with_parent_file_state_cache`
+                // for the contract.
+                if let Some(ref cache) = parent_file_state_cache {
+                    worker = worker.with_file_state_cache(cache.clone());
+                }
+                if let Some(ref router) = parent_subagent_output_router {
+                    worker = worker.with_subagent_output_router(router.clone());
+                }
+                if let Some(ref summary_gen) = parent_subagent_summary_generator {
+                    worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
                 }
@@ -2753,6 +2863,9 @@ mod tests {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -3980,5 +4093,77 @@ PY
 
         assert_eq!(input.allowed_tools, before.allowed_tools);
         assert_eq!(input.model, before.model);
+    }
+
+    // ────────── M8 Runtime Parity W2.B1 wiring tests ──────────
+
+    /// A SpawnTool built without explicit parent caches must keep the
+    /// pre-W2 default — `None` on every parent introspection helper —
+    /// so unrelated callers don't pay any cost from the new optional
+    /// fields.
+    #[tokio::test]
+    async fn spawn_tool_default_has_no_parent_caches() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+        assert!(tool.parent_file_state_cache().is_none());
+        assert!(tool.parent_subagent_output_router().is_none());
+        assert!(tool.parent_subagent_summary_generator().is_none());
+    }
+
+    /// Once wired with parent caches the SpawnTool must surface the
+    /// same `Arc` instances back through its introspection helpers —
+    /// session_actor / tests rely on identity to assert the parent
+    /// cache reaches the spawned child.
+    #[tokio::test]
+    async fn spawn_tool_propagates_parent_caches_via_builders() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let cache = Arc::new(crate::FileStateCache::new());
+        let router = Arc::new(crate::SubAgentOutputRouter::new(
+            std::env::temp_dir().join(format!(
+                "octos-w2-router-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            )),
+        ));
+        let supervisor = TaskSupervisor::new();
+        let summary_gen = Arc::new(crate::AgentSummaryGenerator::new(
+            Arc::new(MockProvider),
+            router.clone(),
+            supervisor,
+        ));
+
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_parent_file_state_cache(cache.clone())
+        .with_parent_subagent_output_router(router.clone())
+        .with_parent_subagent_summary_generator(summary_gen.clone());
+
+        // `Arc::ptr_eq` is the cheapest identity check that proves the
+        // child observed the same instance the parent wired in — not a
+        // freshly-built one.
+        assert!(Arc::ptr_eq(
+            tool.parent_file_state_cache().expect("cache wired"),
+            &cache,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_output_router().expect("router wired"),
+            &router,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_summary_generator()
+                .expect("summary generator wired"),
+            &summary_gen,
+        ));
     }
 }

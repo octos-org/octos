@@ -448,6 +448,37 @@ pub async fn api_sse_get_proxy(state: &AppState, port: u16, path: &str) -> Respo
     }
 }
 
+/// Proxy a POST request (with optional JSON body) to the gateway's API
+/// channel. The response status and body are forwarded verbatim — used
+/// by the M7.9 cancel / restart-from-node endpoints so the API server
+/// can hand control back to the gateway process that owns the supervisor.
+pub async fn api_post_proxy_json(
+    state: &AppState,
+    port: u16,
+    path: &str,
+    body: serde_json::Value,
+) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state.http_client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API POST proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = resp.bytes().await.unwrap_or_default();
+    let mut response = (status, body.to_vec()).into_response();
+    response
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    response
+}
+
 /// Proxy a DELETE request to the gateway's API channel.
 pub async fn api_delete_proxy(state: &AppState, port: u16, path: &str) -> Response {
     let url = format!("http://127.0.0.1:{port}{path}");
