@@ -395,6 +395,7 @@ async fn should_not_leak_internal_iteration_messages_via_dispatch() {
             TaskLifecycleState::Verifying => "verifying",
             TaskLifecycleState::Ready => "ready",
             TaskLifecycleState::Failed => "failed",
+            TaskLifecycleState::Cancelled => "cancelled",
         },
         "artifact_path": outcome.artifact_path,
         "artifact_content": outcome.artifact_content,

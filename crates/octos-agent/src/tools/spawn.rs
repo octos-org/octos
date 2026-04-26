@@ -1019,6 +1019,84 @@ fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
     (script_lines.len() >= 2).then(|| script_lines.join("\n"))
 }
 
+/// M8 Runtime Parity W2.B2 — single-shot recovery wrapper around
+/// `Agent::run_task`. Mirrors the session_actor M8.9 contract:
+/// when the first attempt returns either a hard `Err` or a
+/// `TaskResult { success: false, .. }`, we synthesize a recovery
+/// instruction (using [`build_spawn_recovery_prompt`]) and re-engage
+/// the worker exactly once.
+///
+/// Conservative on purpose:
+/// - Only one recovery attempt — second failure bubbles up verbatim.
+/// - Reuses the *same* worker / Agent instance so file-state cache,
+///   compaction state, and persistent retry buckets are preserved.
+/// - The recovery turn is sent as an `additional_instructions`-style
+///   tail appended to the original task description, so the worker's
+///   conversation history stays linear.
+async fn run_task_with_m8_9_recovery(
+    worker: &Agent,
+    subtask: &Task,
+    task_desc: &str,
+) -> Result<TaskResult> {
+    let initial = worker.run_task(subtask).await;
+    let needs_recovery = match &initial {
+        Err(_) => true,
+        Ok(task_result) => !task_result.success,
+    };
+    if !needs_recovery {
+        return initial;
+    }
+
+    let error_message = match &initial {
+        Err(error) => format!("{error:#}"),
+        Ok(task_result) => {
+            // The caller's `output` is the LLM's last assistant message
+            // when the worker decided "I cannot continue". Surface that
+            // verbatim so the recovery prompt mirrors what the user
+            // would see in the chat bubble.
+            if task_result.output.trim().is_empty() {
+                "task ended unsuccessfully without an explanatory message".to_string()
+            } else {
+                task_result.output.clone()
+            }
+        }
+    };
+
+    let recovery_prompt = build_spawn_recovery_prompt(task_desc, &error_message);
+    let recovery_task = Task::new(
+        TaskKind::Code {
+            instruction: recovery_prompt,
+            files: Vec::new(),
+        },
+        subtask.context.clone(),
+    );
+    info!(
+        task_id = %subtask.id,
+        agent_id = %worker.id,
+        "M8.9 spawn-task recovery: re-engaging worker after initial failure"
+    );
+    worker.run_task(&recovery_task).await
+}
+
+/// Build the synthetic `[system-internal]` instruction the spawn-task
+/// recovery wrapper sends after a first-pass failure. The shape mirrors
+/// `session_actor::build_recovery_prompt` but operates on the
+/// pre-LLM task description (we don't have a tool_input here).
+fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
+    format!(
+        "[system-internal] Your previous attempt at the task below failed.\n\
+         Original task: {task}\n\
+         Failure: {err}\n\n\
+         Re-attempt the task. Diagnose the root cause from the failure text, \
+         pick a different strategy if appropriate (different tool, different inputs, \
+         a smaller scope), and either complete the task or end with a clear \
+         explanation of why the task cannot be completed. Do not repeat the same \
+         failing step verbatim.",
+        task = task_desc,
+        err = error_message,
+    )
+}
+
 async fn maybe_generate_inline_research_podcast(
     tools: &ToolRegistry,
     workflow: Option<&WorkflowMetadata>,
@@ -2035,7 +2113,10 @@ impl Tool for SpawnTool {
                 },
             );
 
-            let result = worker.run_task(&subtask).await;
+            // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+            // M8.9 recovery so the synchronous spawn path mirrors the
+            // session-actor recovery contract.
+            let result = run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await;
             match result {
                 Ok(r) => {
                     // Review A F-004: run declared completion-phase validators
@@ -2323,8 +2404,10 @@ impl Tool for SpawnTool {
                     },
                 );
 
+                // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+                // M8.9 recovery for the detached background path too.
                 let mut result = match availability_check {
-                    Ok(()) => worker.run_task(&subtask).await,
+                    Ok(()) => run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await,
                     Err(error) => Err(error),
                 };
                 if let Ok(task_result) = result.as_mut() {
@@ -4113,6 +4196,144 @@ PY
         assert!(tool.parent_file_state_cache().is_none());
         assert!(tool.parent_subagent_output_router().is_none());
         assert!(tool.parent_subagent_summary_generator().is_none());
+    }
+
+    // ────────── M8 Runtime Parity W2.B2 recovery prompt helper ──────────
+
+    #[test]
+    fn build_spawn_recovery_prompt_includes_task_and_error_text() {
+        let prompt = build_spawn_recovery_prompt(
+            "Generate a 5-slide deck on AI",
+            "validator rejected child artifact: deck.pptx missing",
+        );
+        assert!(prompt.contains("[system-internal]"));
+        assert!(prompt.contains("Generate a 5-slide deck on AI"));
+        assert!(
+            prompt.contains("validator rejected child artifact: deck.pptx missing"),
+            "recovery prompt must surface the verbatim failure: {prompt}"
+        );
+        assert!(
+            prompt.contains("different strategy") || prompt.contains("smaller scope"),
+            "recovery prompt must direct the LLM toward an alternative"
+        );
+    }
+
+    #[test]
+    fn build_spawn_recovery_prompt_handles_empty_task_desc() {
+        let prompt = build_spawn_recovery_prompt("", "boom");
+        assert!(prompt.contains("Original task: "));
+        assert!(prompt.contains("Failure: boom"));
+    }
+
+    /// Provider that returns a hard `Err` on the first call and a
+    /// successful EndTurn on every subsequent call. Used to drive the
+    /// M8.9 recovery wrapper.
+    struct FailThenSucceedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailThenSucceedProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(eyre::eyre!("simulated provider failure"));
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("recovered".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_retries_once_after_initial_failure() {
+        let provider = Arc::new(FailThenSucceedProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let calls_ref = provider.calls.load(Ordering::SeqCst);
+        assert_eq!(calls_ref, 0);
+
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(AgentId::new("test-worker"), provider.clone(), registry, memory);
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "Recover me".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "Recover me").await;
+        let task_result = result.expect("recovery succeeds");
+        assert!(task_result.success, "recovery turn must succeed");
+        assert!(
+            provider.calls.load(Ordering::SeqCst) >= 2,
+            "recovery must invoke the provider at least twice (one fail + one retry); got {}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Provider whose every call hard-fails. Drives the
+    /// "recovery still fails -> bubble up" branch.
+    struct AlwaysFailProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysFailProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Err(eyre::eyre!("simulated permanent failure"))
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_bubbles_up_when_recovery_also_fails() {
+        let provider = Arc::new(AlwaysFailProvider);
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(AgentId::new("test-worker"), provider, registry, memory);
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "do".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "do").await;
+        assert!(result.is_err(), "permanent failure must bubble up");
     }
 
     /// Once wired with parent caches the SpawnTool must surface the
