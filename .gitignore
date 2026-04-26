@@ -79,6 +79,9 @@ scripts/deploy.sh
 !docs/SECURITY_ARCHITECTURE.md
 !docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
 !docs/OCTOS_FAILURE_MODES_INVENTORY.md
+!docs/m8-runtime-parity-prd.md
+!docs/m8-runtime-contract.md
+!docs/m8-runtime-migration-runbook.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
