@@ -165,10 +165,15 @@ test.describe('M8.4 FileStateCache short-circuit', () => {
     // Probe what files the agent actually has visible. Combine assistant
     // text with the raw tool result so we see the list_dir output even
     // when the LLM paraphrases.
+    //
+    // Probe budget is intentionally generous (90s): on full-plugin profiles
+    // (e.g. bot's ~40 active tools) the first turn pays for the entire LLM
+    // tool-spec inventory, so the 45s cap previously misfired here despite
+    // FileStateCache wiring being correct end-to-end.
     const probe = await chatSSE(
       'List up to 10 files in your current working directory using the list_dir tool. Return only the names.',
       sid,
-      45_000,
+      90_000,
     );
     const probeMsgs = await getMessages(sid);
     const probeToolText = probeMsgs
