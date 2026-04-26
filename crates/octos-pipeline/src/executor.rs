@@ -2146,41 +2146,17 @@ impl PipelineExecutor {
                 }
             }
 
-            // M8 parity (W1.A4): commit the per-node reservation with
-            // the actual token attribution before dropping the handle.
-            // On commit failure the handle drops as auto-refund. The
-            // resulting NodeCost row is appended whether or not a
-            // ledger row landed so the UI always sees per-node tokens.
-            let node_cost_committed = if let Some(handle) = node_reservation {
-                let actual_usd = octos_agent::cost_ledger::project_cost_usd(
-                    node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),
-                    outcome.token_usage.input_tokens,
-                    outcome.token_usage.output_tokens,
-                )
-                .unwrap_or(node_reserved_usd);
-                let event = octos_agent::cost_ledger::CostAttributionEvent::new(
-                    self.pipeline_contract_id(&graph.id),
-                    self.pipeline_contract_id(&graph.id),
-                    format!("pipeline-node-{}-{}", graph.id, node.id),
-                    node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),
-                    outcome.token_usage.input_tokens,
-                    outcome.token_usage.output_tokens,
-                    actual_usd,
-                );
-                match handle.commit(event).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(
-                            node = %node.id,
-                            error = %error,
-                            "per-node cost reservation commit failed; auto-refunds on drop"
-                        );
-                        false
-                    }
-                }
-            } else {
-                false
-            };
+            // M8 parity (W1.A4): drop the per-node reservation handle
+            // (auto-refund) and capture a NodeCost row from the actual
+            // post-dispatch token usage. The pipeline-level handle
+            // already records the cumulative attribution at the run's
+            // terminal so per-node ledger writes would double-count;
+            // the NodeCost row stays in-memory for the UI panel and
+            // the SSE done payload. `committed = true` indicates an
+            // accountant was bound; the actual ledger commit lives at
+            // pipeline scope.
+            let node_cost_committed = node_reservation.is_some();
+            drop(node_reservation);
 
             let actual_usd = octos_agent::cost_ledger::project_cost_usd(
                 node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),

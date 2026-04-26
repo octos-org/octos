@@ -143,12 +143,17 @@ async fn pipeline_worker_registers_node_task_with_supervisor() {
 }
 
 /// W1.A4 — opening a per-node `CostReservationHandle` against the
-/// shared accountant and committing it lands a ledger row with the
-/// pipeline contract id and the right token attribution.
+/// shared accountant and dropping it auto-refunds the projected
+/// budget so the contract's reservation slot is reusable. Per-node
+/// ledger writes intentionally never land — the pipeline-level
+/// handle records the cumulative attribution at the run terminal so
+/// per-node commits would double-count.
 #[tokio::test]
-async fn pipeline_node_cost_reservation_commits_to_ledger() {
+async fn pipeline_node_cost_reservation_auto_refunds_on_drop() {
     let (_host, _cache, _sup, accountant, _ledger_dir) =
         host_context_with_cache_and_supervisor().await;
+
+    // Open a per-node reservation against the contract.
     let handle = accountant
         .reserve("pipeline-test", 0.05)
         .await
@@ -156,32 +161,32 @@ async fn pipeline_node_cost_reservation_commits_to_ledger() {
     assert_eq!(handle.contract_id(), "pipeline-test");
     assert!((handle.reserved_amount_usd() - 0.05).abs() < 1e-9);
 
-    let event = octos_agent::cost_ledger::CostAttributionEvent::new(
-        "pipeline-test".to_string(),
-        "pipeline-test".to_string(),
-        "pipeline-node-1".to_string(),
-        "claude-sonnet-4",
-        100,
-        200,
-        0.04,
-    );
-    handle.commit(event).await.expect("commit must succeed");
+    // Drop without committing — the projected budget must auto-refund
+    // so a second reservation against the same contract is admissible.
+    drop(handle);
+    // Give the Drop-spawned refund task a moment to land, mirroring
+    // the cost_reservation integration test pattern.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
+    let second = accountant
+        .reserve("pipeline-test", 0.05)
+        .await
+        .expect("second reservation must succeed after auto-refund");
+    drop(second);
+
+    // Ledger has no rows because nothing was committed — pipeline
+    // scope owns the aggregate write at terminal.
     let rollups = accountant
         .ledger()
         .aggregate_per_contract()
         .await
         .expect("rollup lookup");
-    let rollup = rollups
-        .iter()
-        .find(|r| r.contract_id == "pipeline-test")
-        .expect("pipeline-test contract row");
+    let rollup = rollups.iter().find(|r| r.contract_id == "pipeline-test");
     assert!(
-        rollup.cost_usd > 0.0,
-        "ledger should show committed spend after node commit"
+        rollup.is_none() || rollup.unwrap().cost_usd <= f64::EPSILON,
+        "per-node reservation must not commit to ledger; got {rollup:?}"
     );
-    assert_eq!(rollup.tokens_in, 100);
-    assert_eq!(rollup.tokens_out, 200);
 }
 
 /// Covers the `is_empty` invariant — the legacy code path must never
