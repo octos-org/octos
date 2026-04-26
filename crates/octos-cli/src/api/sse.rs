@@ -86,8 +86,17 @@ pub(crate) fn event_to_json(event: &ProgressEvent) -> serde_json::Value {
                 "success": success,
             })
         }
-        ProgressEvent::ToolProgress { name, message, .. } => {
-            serde_json::json!({"type": "tool_progress", "tool": name, "message": message})
+        ProgressEvent::ToolProgress {
+            name,
+            tool_id,
+            message,
+        } => {
+            serde_json::json!({
+                "type": "tool_progress",
+                "tool": name,
+                "tool_call_id": tool_id,
+                "message": message,
+            })
         }
         ProgressEvent::StreamChunk { text, .. } => {
             serde_json::json!({"type": "token", "text": text})
@@ -165,6 +174,23 @@ mod tests {
         };
         let json = event_to_json(&event);
         assert_eq!(json["success"], false);
+    }
+
+    #[test]
+    fn event_to_json_tool_progress_includes_tool_call_id() {
+        let event = ProgressEvent::ToolProgress {
+            name: "run_pipeline".into(),
+            tool_id: "call_00_XXX".into(),
+            message: "plan_and_search_task_3 [...]: running deep_search".into(),
+        };
+        let json = event_to_json(&event);
+        assert_eq!(json["type"], "tool_progress");
+        assert_eq!(json["tool"], "run_pipeline");
+        assert_eq!(json["tool_call_id"], "call_00_XXX");
+        assert_eq!(
+            json["message"],
+            "plan_and_search_task_3 [...]: running deep_search"
+        );
     }
 
     #[test]

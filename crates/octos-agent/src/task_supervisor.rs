@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness_events::{HarnessEvent, HarnessEventPayload};
+use crate::progress::{ProgressEvent, ProgressReporter};
 
 const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
 
@@ -628,10 +629,16 @@ fn is_silent_pcm16(payload: &[u8]) -> bool {
 
 impl std::fmt::Debug for TaskSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let progress_reporter_attached = self
+            .progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         f.debug_struct("TaskSupervisor")
             .field("tasks", &self.tasks)
             .field("on_change", &"<callback>")
             .field("on_failure", &"<callback>")
+            .field("progress_reporter", &progress_reporter_attached)
             .field(
                 "persistence_path",
                 &self
@@ -645,6 +652,23 @@ impl std::fmt::Debug for TaskSupervisor {
     }
 }
 
+/// Human-readable label for a [`TaskRuntimeState`] used by the supervisor's
+/// `ProgressReporter` bridge. The text is suffixed onto `<tool>: ` so the
+/// chat UI can anchor a single bubble per tool_call_id and surface what the
+/// background task is currently doing without inventing per-tool plumbing.
+fn runtime_state_label(state: &TaskRuntimeState) -> &'static str {
+    match state {
+        TaskRuntimeState::Spawned => "spawned",
+        TaskRuntimeState::ExecutingTool => "running",
+        TaskRuntimeState::ResolvingOutputs => "resolving outputs",
+        TaskRuntimeState::VerifyingOutputs => "verifying outputs",
+        TaskRuntimeState::DeliveringOutputs => "delivering outputs",
+        TaskRuntimeState::CleaningUp => "cleaning up",
+        TaskRuntimeState::Completed => "completed",
+        TaskRuntimeState::Failed => "failed",
+    }
+}
+
 /// Supervisor that tracks background task lifecycle.
 ///
 /// Thread-safe via interior `Mutex`. Cloning shares the same underlying state.
@@ -654,6 +678,17 @@ pub struct TaskSupervisor {
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
+    /// for every supervised state transition. Wired by the agent's
+    /// spawn_only branch so chat UIs can anchor progress strictly to the
+    /// originating `tool_call_id` (the chat-bubble contract enforced by
+    /// the SSE `tool_call_id` field on `tool_progress` frames).
+    ///
+    /// Synchronous tool calls never go through the supervisor, so this
+    /// bridge naturally fires only on background-task transitions —
+    /// there is no double-emission to worry about for the normal tool
+    /// path that already reports its own ToolStarted/ToolCompleted.
+    progress_reporter: Arc<Mutex<Option<Arc<dyn ProgressReporter>>>>,
 }
 
 impl Default for TaskSupervisor {
@@ -670,6 +705,7 @@ impl TaskSupervisor {
             on_change: Arc::new(Mutex::new(None)),
             on_failure: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
+            progress_reporter: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -734,6 +770,55 @@ impl TaskSupervisor {
     ) {
         let mut guard = self.on_failure.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Box::new(cb));
+    }
+
+    /// Attach a [`ProgressReporter`] that receives a
+    /// [`ProgressEvent::ToolProgress`] for every supervised runtime-state
+    /// transition. The emitted event carries the originating `tool_call_id`
+    /// (`ProgressEvent::ToolProgress::tool_id`) so chat UIs can anchor every
+    /// long-running spawn_only task to a single bubble — no per-tool plumbing
+    /// required.
+    ///
+    /// Wired by the agent's spawn_only branch in `execution.rs`. Setting a
+    /// reporter is idempotent; the latest reporter wins. Pass a
+    /// [`crate::progress::SilentReporter`] to detach.
+    pub fn set_progress_reporter(&self, reporter: Arc<dyn ProgressReporter>) {
+        let mut guard = self
+            .progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(reporter);
+    }
+
+    /// Emit a [`ProgressEvent::ToolProgress`] for `task` if a reporter has
+    /// been wired via [`Self::set_progress_reporter`]. The message is
+    /// `"<tool_name>: <state-label>"`, with the task's `error` text appended
+    /// in parentheses on `Failed` transitions so the UI can surface the
+    /// reason without re-walking the supervisor's state.
+    fn emit_progress_for_state(&self, task: &BackgroundTask) {
+        let guard = self
+            .progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(reporter) = guard.as_ref().cloned() else {
+            return;
+        };
+        drop(guard);
+        let label = runtime_state_label(&task.runtime_state);
+        let message = match task.runtime_state {
+            TaskRuntimeState::Failed => match task.error.as_deref() {
+                Some(reason) if !reason.is_empty() => {
+                    format!("{}: {} ({})", task.tool_name, label, reason)
+                }
+                _ => format!("{}: {}", task.tool_name, label),
+            },
+            _ => format!("{}: {}", task.tool_name, label),
+        };
+        reporter.report(ProgressEvent::ToolProgress {
+            name: task.tool_name.clone(),
+            tool_id: task.tool_call_id.clone(),
+            message,
+        });
     }
 
     /// Register a new background task. Returns the generated task ID.
@@ -850,6 +935,7 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            self.emit_progress_for_state(task);
         }
     }
 
@@ -875,6 +961,7 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            self.emit_progress_for_state(task);
             let (previous_kind, previous_phase) = workflow_labels(previous_detail.as_deref());
             let (current_kind, current_phase) = workflow_labels(task.runtime_detail.as_deref());
             if let (Some(workflow_kind), Some(to_phase)) =
@@ -910,6 +997,7 @@ impl TaskSupervisor {
         if let Some(ref task) = snapshot {
             self.persist_snapshot(task);
             self.notify_change(task);
+            self.emit_progress_for_state(task);
         }
     }
 
@@ -968,6 +1056,7 @@ impl TaskSupervisor {
             self.persist_snapshot(task);
             self.notify_change(task);
             if !was_already_failed {
+                self.emit_progress_for_state(task);
                 self.notify_failure(task);
             }
         }
@@ -2294,5 +2383,153 @@ mod tests {
         let signals = collected.lock().unwrap().clone();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].tool_input, Value::Null);
+    }
+
+    // ── F004 B2: TaskSupervisor → ToolProgress bridge ─────────────────────
+
+    /// Test reporter that captures every reported event so the bridge
+    /// assertions can branch on event kind without parsing JSON.
+    struct CapturingReporter {
+        events: Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    }
+
+    impl crate::progress::ProgressReporter for CapturingReporter {
+        fn report(&self, event: crate::progress::ProgressEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        }
+    }
+
+    fn collect_progress_events(
+        supervisor: &TaskSupervisor,
+    ) -> Arc<StdMutex<Vec<crate::progress::ProgressEvent>>> {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let reporter = Arc::new(CapturingReporter {
+            events: Arc::clone(&events),
+        });
+        supervisor.set_progress_reporter(reporter);
+        events
+    }
+
+    fn extract_tool_progress(
+        events: &[crate::progress::ProgressEvent],
+    ) -> Vec<(String, String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                crate::progress::ProgressEvent::ToolProgress {
+                    name,
+                    tool_id,
+                    message,
+                } => Some((name.clone(), tool_id.clone(), message.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn should_emit_tool_progress_on_runtime_state_transition() {
+        let supervisor = TaskSupervisor::new();
+        let events = collect_progress_events(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-progress-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+
+        let captured = events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        assert!(
+            tool_progress.len() >= 2,
+            "expected ToolProgress for mark_running + mark_runtime_state, got: {tool_progress:?}"
+        );
+        // Last event must reflect the DeliveringOutputs transition and
+        // anchor on the originating tool_call_id so the chat UI can route
+        // it to the right bubble.
+        let (name, tool_id, message) = tool_progress.last().unwrap();
+        assert_eq!(name, "fm_tts");
+        assert_eq!(tool_id, "call-progress-1");
+        assert_eq!(message, "fm_tts: delivering outputs");
+    }
+
+    #[test]
+    fn should_emit_tool_progress_on_completion_with_tool_call_id() {
+        let supervisor = TaskSupervisor::new();
+        let events = collect_progress_events(&supervisor);
+        let task_id = supervisor.register("podcast_generate", "call-complete-1", None);
+        supervisor.mark_completed(&task_id, vec!["/tmp/out.mp3".to_string()]);
+
+        let captured = events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let completion = tool_progress
+            .iter()
+            .find(|(_, _, message)| message.ends_with(": completed"))
+            .expect("completion progress event missing");
+        assert_eq!(completion.0, "podcast_generate");
+        assert_eq!(completion.1, "call-complete-1");
+        assert_eq!(completion.2, "podcast_generate: completed");
+    }
+
+    #[test]
+    fn should_emit_tool_progress_on_failure_with_reason() {
+        let supervisor = TaskSupervisor::new();
+        let events = collect_progress_events(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-fail-1", None);
+        supervisor.mark_failed(&task_id, "workspace policy not found".to_string());
+
+        let captured = events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let failure = tool_progress
+            .iter()
+            .find(|(_, _, message)| message.contains("failed"))
+            .expect("failure progress event missing");
+        assert_eq!(failure.0, "fm_tts");
+        assert_eq!(failure.1, "call-fail-1");
+        assert_eq!(failure.2, "fm_tts: failed (workspace policy not found)");
+    }
+
+    #[test]
+    fn should_not_emit_tool_progress_when_no_reporter_attached() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("fm_tts", "call-silent-1", None);
+        // No reporter attached — must be a no-op (and crucially must not
+        // panic on the missing reporter).
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+        supervisor.mark_completed(&task_id, vec![]);
+        // Nothing to assert beyond the absence of a panic — the reporter is
+        // optional by design so the supervisor can be used outside the
+        // chat-progress pipeline (e.g. cron, tests).
+    }
+
+    #[test]
+    fn should_only_emit_failure_progress_once_per_task() {
+        let supervisor = TaskSupervisor::new();
+        let events = collect_progress_events(&supervisor);
+        let task_id = supervisor.register("fm_tts", "call-fail-dedup", None);
+        supervisor.mark_failed(&task_id, "first".to_string());
+        // Second mark_failed must NOT re-emit a ToolProgress for the
+        // same task — mirrors the existing failure-signal dedup contract.
+        supervisor.mark_failed(&task_id, "second".to_string());
+
+        let captured = events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let failures: Vec<_> = tool_progress
+            .iter()
+            .filter(|(_, _, message)| message.contains("failed"))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure ToolProgress, got: {failures:?}"
+        );
     }
 }
