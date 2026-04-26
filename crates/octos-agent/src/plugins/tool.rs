@@ -95,6 +95,173 @@ impl PluginTool {
         }
     }
 
+    /// Dispatch one line of plugin stderr to the host progress channel.
+    ///
+    /// Implements the plugin-protocol-v2 backward-compat shim:
+    ///   1. Trim the line and try parsing as a [`ProtocolV2Event`].
+    ///   2. On a known structured event, render a stable ToolProgress
+    ///      message and (for cost events) write a structured cost
+    ///      attribution to the harness sink so the ledger can pick it up.
+    ///   3. On a JSON line with an unknown `type`, pass the raw JSON
+    ///      through as ToolProgress (operator can still see the message).
+    ///   4. On any other line, fall back to the v1 behavior — emit the
+    ///      raw text as ToolProgress.
+    ///
+    /// The shim is intentionally side-effect-free aside from the reporter
+    /// callback and the harness sink write so it is safe to call from a
+    /// reader task without holding any locks.
+    fn dispatch_stderr_line(
+        plugin_name: &str,
+        tool_name: &str,
+        ctx: Option<&ToolContext>,
+        line: &str,
+    ) {
+        use octos_plugin::protocol_v2::{LineParse, ProtocolV2Event};
+
+        let parse = octos_plugin::protocol_v2::parse_event_line(line);
+        let message = match parse {
+            LineParse::Empty => return,
+            LineParse::Event(ProtocolV2Event::Progress(progress)) => {
+                let mut out = String::new();
+                if !progress.stage.is_empty() {
+                    out.push('[');
+                    out.push_str(&progress.stage);
+                    out.push(']');
+                }
+                if let Some(fraction) = progress.progress {
+                    let pct = (fraction.clamp(0.0, 1.0) * 100.0).round();
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&format!("{pct:.0}%"));
+                }
+                if !progress.message.is_empty() {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&progress.message);
+                }
+                if out.is_empty() { progress.stage } else { out }
+            }
+            LineParse::Event(ProtocolV2Event::Phase(phase)) => {
+                if phase.message.is_empty() {
+                    format!("[phase] {}", phase.phase)
+                } else {
+                    format!("[{}] {}", phase.phase, phase.message)
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Cost(cost)) => {
+                Self::record_cost_event(plugin_name, tool_name, ctx, &cost);
+                if let Some(usd) = cost.usd {
+                    format!(
+                        "[cost] {}: in={} out={} (${usd:.4})",
+                        cost.provider, cost.tokens_in, cost.tokens_out
+                    )
+                } else {
+                    format!(
+                        "[cost] {}: in={} out={}",
+                        cost.provider, cost.tokens_in, cost.tokens_out
+                    )
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Artifact(artifact)) => {
+                if artifact.message.is_empty() {
+                    format!("[artifact:{}] {}", artifact.kind, artifact.path)
+                } else {
+                    format!(
+                        "[artifact:{}] {} ({})",
+                        artifact.kind, artifact.message, artifact.path
+                    )
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Log(log)) => {
+                format!("[{}] {}", log.level, log.message)
+            }
+            LineParse::Event(ProtocolV2Event::Unknown) => {
+                // Should not be reached because the parser converts
+                // unknown variants to LineParse::UnknownEvent. Defensive
+                // fallback: pass raw line through.
+                line.to_string()
+            }
+            LineParse::UnknownEvent(raw) => raw,
+            LineParse::Legacy(text) => text,
+        };
+
+        if let Some(ctx) = ctx {
+            ctx.reporter.report(ProgressEvent::ToolProgress {
+                name: tool_name.to_string(),
+                tool_id: ctx.tool_id.clone(),
+                message,
+            });
+        }
+    }
+
+    /// Forward a v2 cost event to the harness event sink if one is wired.
+    ///
+    /// Writes a `cost_attribution`-shaped JSON payload that mirrors
+    /// `HarnessCostAttributionEvent` so existing ledger tooling can ingest
+    /// plugin-level spend without a schema migration. The generated
+    /// `attribution_id` is stable per (plugin, tool, provider, tokens) so
+    /// duplicate sink writes can be detected downstream if needed.
+    fn record_cost_event(
+        plugin_name: &str,
+        tool_name: &str,
+        ctx: Option<&ToolContext>,
+        cost: &octos_plugin::protocol_v2::CostEvent,
+    ) {
+        let Some(ctx) = ctx else {
+            return;
+        };
+        let Some(sink) = ctx.harness_event_sink.as_deref() else {
+            return;
+        };
+        let Some(sink_ctx) = lookup_event_sink_context(sink) else {
+            return;
+        };
+        let attribution_id = format!(
+            "plugin-cost-{}-{}-{}-{}-{}",
+            plugin_name, tool_name, cost.provider, cost.tokens_in, cost.tokens_out
+        );
+        let payload = serde_json::json!({
+            "schema": crate::harness_events::HARNESS_EVENT_SCHEMA_V1,
+            "kind": "cost_attribution",
+            "schema_version": 1,
+            "session_id": sink_ctx.session_id,
+            "task_id": sink_ctx.task_id,
+            "workflow": null,
+            "phase": null,
+            "attribution_id": attribution_id,
+            "contract_id": format!("plugin:{plugin_name}:{tool_name}"),
+            "model": cost.model.clone().unwrap_or_else(|| "unknown".to_string()),
+            "tokens_in": cost.tokens_in,
+            "tokens_out": cost.tokens_out,
+            "cost_usd": cost.usd.unwrap_or(0.0),
+            "outcome": "ok",
+            "provider": cost.provider,
+            "source": "plugin_v2",
+        });
+        let line = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::debug!(
+                    plugin = plugin_name,
+                    tool = tool_name,
+                    error = %error,
+                    "failed to serialize plugin cost event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = crate::harness_events::write_event_line_to_sink(sink, &line) {
+            tracing::debug!(
+                plugin = plugin_name,
+                tool = tool_name,
+                error = %error,
+                "failed to write plugin cost attribution to harness sink"
+            );
+        }
+    }
+
     /// Record a `HarnessError` for this plugin tool: increments the
     /// `octos_loop_error_total{variant, recovery}` counter and writes a
     /// structured error event to the harness event sink (if one is wired
@@ -608,24 +775,29 @@ impl Tool for PluginTool {
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
 
-        // Spawn stderr reader: streams lines as ToolProgress events
+        // Spawn stderr reader: streams lines as ToolProgress events.
+        // Plugin protocol v2 (see `octos-plugin/docs/protocol-v2.md`):
+        // each line is either a JSON-encoded `ProtocolV2Event` or legacy
+        // free-form text. We try v2 first and fall back to legacy text on
+        // any parse failure — this is the backward-compat shim required
+        // for v1 plugins to keep working unchanged.
         let tool_name = self.tool_def.name.clone();
         // Clone ctx for the stderr reader so we can still consult the
         // original after the reader task is spawned (needed for
         // `emit_plugin_error` on spawn/timeout/protocol failures).
         let stderr_ctx = ctx.clone();
+        let plugin_name_for_reader = self.plugin_name.clone();
         let stderr_task = tokio::spawn(async move {
             let mut collected = String::new();
             if let Some(stderr) = stderr_handle {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref ctx) = stderr_ctx {
-                        ctx.reporter.report(ProgressEvent::ToolProgress {
-                            name: tool_name.clone(),
-                            tool_id: ctx.tool_id.clone(),
-                            message: line.clone(),
-                        });
-                    }
+                    Self::dispatch_stderr_line(
+                        &plugin_name_for_reader,
+                        &tool_name,
+                        stderr_ctx.as_ref(),
+                        &line,
+                    );
                     if !collected.is_empty() {
                         collected.push('\n');
                     }
@@ -1432,5 +1604,237 @@ mod tests {
             ),
             Ok(_) => panic!("expected timeout error, but execute succeeded"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Plugin protocol v2 stderr dispatch tests (W3.F2).
+    // -------------------------------------------------------------------
+
+    use crate::progress::ProgressReporter;
+    use std::sync::Mutex as StdMutex;
+
+    /// Captures every reported event so tests can assert on the ToolProgress
+    /// messages the v2 shim emits.
+    struct CapturingReporter {
+        events: Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn report(&self, event: crate::progress::ProgressEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        }
+    }
+
+    fn make_capturing_ctx() -> (
+        ToolContext,
+        Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    ) {
+        let events = Arc::new(StdMutex::new(Vec::<crate::progress::ProgressEvent>::new()));
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "tool-1".to_string();
+        ctx.reporter = Arc::new(CapturingReporter {
+            events: Arc::clone(&events),
+        });
+        (ctx, events)
+    }
+
+    fn last_progress_message(
+        events: &Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    ) -> Option<String> {
+        events.lock().unwrap().last().and_then(|event| match event {
+            crate::progress::ProgressEvent::ToolProgress { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn v2_progress_event_renders_stage_and_message() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"progress","stage":"searching","message":"round 1/3","progress":0.25}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[searching]"), "expected stage badge: {msg}");
+        assert!(msg.contains("25%"), "expected percent: {msg}");
+        assert!(msg.contains("round 1/3"), "expected message: {msg}");
+    }
+
+    #[test]
+    fn v2_phase_event_renders_phase_label() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"phase","phase":"synthesizing","message":"calling LLM"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.starts_with("[synthesizing]"), "got {msg}");
+        assert!(msg.contains("calling LLM"), "got {msg}");
+    }
+
+    #[test]
+    fn v2_cost_event_renders_cost_summary() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[cost]"), "got {msg}");
+        assert!(msg.contains("deepseek"), "got {msg}");
+        assert!(msg.contains("in=1024"), "got {msg}");
+        assert!(msg.contains("out=256"), "got {msg}");
+        assert!(msg.contains("0.0034"), "got {msg}");
+    }
+
+    #[test]
+    fn v2_log_event_renders_level() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"log","level":"warn","message":"low disk"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[warn] low disk");
+    }
+
+    #[test]
+    fn v2_artifact_event_renders_kind_and_path() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"artifact","path":"/tmp/x.md","kind":"report","message":"final"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[artifact:report]"), "got {msg}");
+        assert!(msg.contains("/tmp/x.md"), "got {msg}");
+    }
+
+    #[test]
+    fn legacy_v1_text_passes_through_unchanged() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "old-plugin",
+            "old_tool",
+            Some(&ctx),
+            "[deep_crawl] launched chrome on port 9222",
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[deep_crawl] launched chrome on port 9222");
+    }
+
+    #[test]
+    fn legacy_starting_with_bracket_does_not_lose_data() {
+        // Plugins emitting `[1/3] Searching ...` style text must still flow
+        // through unchanged — they are not JSON, the shim must not eat them.
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            "[1/3] Searching: \"foo\"",
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[1/3] Searching: \"foo\"");
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_legacy() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            Some(&ctx),
+            r#"{"type":"progress""#, // truncated, parse fails
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        // Falls back to the raw line (trimmed).
+        assert_eq!(msg, r#"{"type":"progress""#);
+    }
+
+    #[test]
+    fn empty_line_emits_no_progress() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line("p", "t", Some(&ctx), "");
+        PluginTool::dispatch_stderr_line("p", "t", Some(&ctx), "   \r\n");
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_event_type_passes_raw_through() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            Some(&ctx),
+            r#"{"type":"future_event","data":42}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        // The raw JSON is forwarded so the operator can still see it.
+        assert!(msg.contains("future_event"), "got {msg}");
+    }
+
+    #[test]
+    fn dispatch_with_no_ctx_is_noop() {
+        // No assertion — just confirm there's no panic. With no ctx the
+        // shim cannot dispatch but it must not crash.
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            None,
+            r#"{"type":"progress","stage":"init","message":"go"}"#,
+        );
+    }
+
+    #[test]
+    fn cost_event_writes_to_harness_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("events.ndjson");
+
+        // Wire up a sink context so record_cost_event has a session+task to
+        // attribute against.
+        let ctx_path = sink_path.display().to_string();
+        crate::harness_events::attach_event_sink_context(
+            ctx_path.clone(),
+            crate::harness_events::HarnessEventSinkContext {
+                session_id: "session-1".to_string(),
+                task_id: "task-1".to_string(),
+            },
+        );
+
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "tool-1".to_string();
+        ctx.harness_event_sink = Some(ctx_path.clone());
+
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
+        );
+
+        let body = std::fs::read_to_string(&sink_path).expect("sink written");
+        assert!(body.contains(r#""kind":"cost_attribution""#), "got: {body}");
+        assert!(body.contains(r#""tokens_in":1024"#), "got: {body}");
+        assert!(body.contains(r#""tokens_out":256"#), "got: {body}");
+        assert!(body.contains(r#""cost_usd":0.0034"#), "got: {body}");
+        assert!(body.contains(r#""contract_id":"plugin:deep-search:deep_search""#));
+        assert!(body.contains(r#""provider":"deepseek""#));
+
+        // Cleanup the sink registration.
+        crate::harness_events::detach_event_sink_context(&ctx_path);
     }
 }

@@ -92,6 +92,10 @@ scripts/deploy.sh
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md
+# Crate-level developer documentation (SDK contracts, protocol specs)
+!crates/octos-plugin/docs/*.md
+# Crate test fixtures (sample reports, fake API payloads)
+!crates/app-skills/**/tests/fixtures/*.md
 # Harness M4.4 compat-gate fixture (SKILL.md + manifest.json must be tracked)
 !e2e/fixtures/compat-test-skill/SKILL.md
 !e2e/fixtures/compat-test-skill/manifest.json
