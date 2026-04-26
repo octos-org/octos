@@ -99,12 +99,17 @@ impl ProgressReporter for ChannelStreamReporter {
             }
             ProgressEvent::ToolProgress {
                 ref name,
+                ref tool_id,
                 ref message,
-                ..
             } => {
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({"type": "tool_progress", "tool": name, "message": message})
-                        .to_string(),
+                    json: serde_json::json!({
+                        "type": "tool_progress",
+                        "tool": name,
+                        "tool_call_id": tool_id,
+                        "message": message,
+                    })
+                    .to_string(),
                 });
                 StreamProgressEvent::ToolProgress {
                     name: name.clone(),
