@@ -397,6 +397,14 @@ impl Handler for CodergenHandler {
             max_timeout: node.timeout_secs.map(Duration::from_secs),
             save_episodes: false,
             chat_max_tokens: max_tokens,
+            // Pipeline workers don't have a channel-bound send_file tool
+            // registered (deny-listed above + outer pipeline orchestration
+            // handles delivery via PipelineResult.modified_files). Without
+            // this flag the auto-send path inside execution.rs tries
+            // `tools.execute("send_file", ...)` and trips
+            // "unknown tool: send_file" warnings on every spawn_only
+            // result (deep_search reports etc).
+            suppress_auto_send_files: true,
             ..Default::default()
         };
 
