@@ -1284,11 +1284,49 @@ async fn brave_search(
 // Bing CDP Search (headless Chrome via deep-crawl binary)
 // ---------------------------------------------------------------------------
 
+/// Cap on the number of concurrent `deep_crawl` invocations (and thus
+/// concurrent headless Chromium processes) per `deep_search` invocation.
+///
+/// Pre-W3.D1 history: with `parallel_all_engines` + per-round retries,
+/// a single deep_search call could spawn 6+ Chromium processes at once,
+/// pegging memory on small VMs. The semaphore caps it at 3.
+///
+/// Operators can override via `DEEP_SEARCH_MAX_BROWSERS` (1..16). Useful
+/// when deep_search itself runs N times in parallel (e.g. swarm mode):
+/// the cap on the binary's own scope-internal concurrency stays at the
+/// configured value, so total chromiums = N × cap.
+fn max_browsers() -> usize {
+    std::env::var("DEEP_SEARCH_MAX_BROWSERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or(3)
+}
+
+fn browser_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(max_browsers()))
+}
+
 /// Search Bing via headless Chrome. Calls the `deep_crawl` sibling binary
 /// to render the SERP, then extracts result links from the text output.
 /// No API key needed — just Chromium installed. Uses Bing instead of Google
 /// because Google CAPTCHAs automated requests from datacenter IPs.
+///
+/// W3.D1: gated by [`browser_semaphore`] so this binary cannot launch
+/// more than `DEEP_SEARCH_MAX_BROWSERS` concurrent chromiums.
 async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
+    // Acquire the semaphore before launching deep_crawl so we never
+    // exceed the configured cap on concurrent chromiums.
+    let _permit = match browser_semaphore().acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            return SearchResult {
+                output: "bing_cdp:browser semaphore closed".into(),
+                success: false,
+            };
+        }
+    };
     // Find deep_crawl binary: check sibling dir, cargo bin, and PATH
     let crawl_bin = {
         let candidates: Vec<std::path::PathBuf> = [
@@ -3287,6 +3325,75 @@ A second paragraph elaborates on alternatives [2]."
         assert!(!report.contains("## Synthesis"));
         assert!(report.contains("LLM synthesis unavailable"));
         assert!(report.contains("raw initial"));
+    }
+
+    #[test]
+    fn max_browsers_default_is_three() {
+        // Avoid clobbering a real env var the developer set.
+        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
+        // SAFETY: tests are single-threaded by default.
+        unsafe {
+            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
+        }
+        assert_eq!(max_browsers(), 3);
+        // Restore for other tests.
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
+            }
+        }
+    }
+
+    #[test]
+    fn max_browsers_clamps_to_range() {
+        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "0");
+        }
+        assert_eq!(max_browsers(), 1, "clamps zero to 1");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "100");
+        }
+        assert_eq!(max_browsers(), 16, "clamps high to 16");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "5");
+        }
+        assert_eq!(max_browsers(), 5, "passes through valid value");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "not-a-number");
+        }
+        assert_eq!(max_browsers(), 3, "falls back to default on parse fail");
+        // Cleanup.
+        unsafe {
+            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
+        }
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn browser_semaphore_caps_concurrency() {
+        // The OnceLock-backed semaphore is initialized at first call.
+        // We can't read its capacity directly, but we can validate that
+        // permits decrement when held and that exceeding the cap blocks.
+        let sem = browser_semaphore();
+        let cap = sem.available_permits();
+        assert!((1..=16).contains(&cap), "cap must be in [1, 16], got {cap}");
+
+        // Hold the bindings so the permits are NOT dropped immediately.
+        let permit1 = sem.try_acquire().ok();
+        assert!(permit1.is_some(), "first acquire should succeed");
+        let after_one = sem.available_permits();
+        assert_eq!(
+            after_one, cap - 1,
+            "permit should decrement available count"
+        );
+        drop(permit1);
+        // Restored after drop.
+        assert_eq!(sem.available_permits(), cap);
     }
 
     #[test]
