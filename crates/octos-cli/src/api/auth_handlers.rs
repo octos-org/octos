@@ -2196,6 +2196,7 @@ mod tests {
             tenant_store: None,
             run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: None,
+            base_domain: None,
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,

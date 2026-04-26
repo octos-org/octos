@@ -1460,6 +1460,7 @@ pub(crate) fn config_from_profile(
         voice: None,
         mode: Default::default(),
         tunnel_domain: None,
+        base_domain: None,
         frps_server: None,
         allow_admin_shell: false,
         #[cfg(feature = "api")]
