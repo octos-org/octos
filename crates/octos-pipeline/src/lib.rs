@@ -13,9 +13,11 @@ pub mod executor;
 pub mod fidelity;
 pub mod graph;
 pub mod handler;
+pub mod host_context;
 pub mod human_gate;
 pub mod manager;
 pub mod parser;
+pub mod recovery;
 pub mod run_dir;
 pub mod server;
 pub mod stylesheet;
@@ -42,6 +44,8 @@ pub use graph::{
 pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,
 };
+pub use host_context::PipelineHostContext;
+pub use recovery::{RecoveryDecision, RecoveryOutcome, recover_node};
 pub use human_gate::{HumanInputProvider, HumanInputType, HumanRequest, HumanResponse};
 pub use manager::{
     ChildExecutor, ChildResult, ChildSpec, ManagerOutcome, PipelineManager, SupervisionStrategy,

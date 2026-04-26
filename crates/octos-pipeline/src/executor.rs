@@ -173,6 +173,36 @@ fn build_resume_skip_set(store: Option<&Arc<dyn CheckpointStore>>) -> Result<Has
     Ok(skip)
 }
 
+/// Per-node cost attribution captured during pipeline execution
+/// (W1.A4). Recorded for every LLM-call node that opens a
+/// [`ReservationHandle`] against the configured `CostAccountant`. The
+/// reservation projection is captured at dispatch start; the actual
+/// USD spend is computed from the post-dispatch token usage so the UI
+/// can render both "reserved" and "actual" sides.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeCost {
+    /// Pipeline node id.
+    pub node_id: String,
+    /// Resolved model key for the node, or `None` when the node ran
+    /// with the default provider.
+    pub model: Option<String>,
+    /// Pre-dispatch USD projection used for the reservation (0.0 when
+    /// no accountant was configured).
+    pub reserved_usd: f64,
+    /// Post-dispatch USD computed from actual token usage. Falls back
+    /// to the reserved projection when the model rate is unknown.
+    pub actual_usd: f64,
+    /// Input tokens consumed by the node.
+    pub tokens_in: u32,
+    /// Output tokens produced by the node.
+    pub tokens_out: u32,
+    /// `true` when the per-node `ReservationHandle` was committed to
+    /// the ledger. `false` when no accountant was attached or when the
+    /// commit was dropped (auto-refunded). Surfaces the "ledger-bound
+    /// vs ephemeral" distinction the UI needs to badge cost rows.
+    pub committed: bool,
+}
+
 /// Result of a complete pipeline execution.
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
@@ -186,6 +216,10 @@ pub struct PipelineResult {
     pub node_summaries: Vec<NodeSummary>,
     /// Files written by pipeline nodes (collected from all node outcomes).
     pub files_modified: Vec<std::path::PathBuf>,
+    /// M8 parity (W1.A4): per-node cost attribution. One entry per
+    /// node that opened a [`ReservationHandle`] against the configured
+    /// `CostAccountant`. Empty when no accountant is wired.
+    pub node_costs: Vec<NodeCost>,
 }
 
 /// Bridge for pipeline status updates to external systems (e.g., messaging channels).
@@ -263,6 +297,12 @@ pub struct ExecutorConfig {
     /// pipeline terminal. `None` = legacy behaviour (pre-FA-7),
     /// byte-for-byte identical to the v0 path.
     pub workspace_context: PipelineContext,
+    /// M8 parity (W1.A1/A3): snapshot of the parent session's shared
+    /// resources (FileStateCache, SubAgentOutputRouter,
+    /// AgentSummaryGenerator, TaskSupervisor) picked up via TOOL_CTX
+    /// at run_pipeline dispatch. Default = empty, which keeps every
+    /// pre-M8 invocation site bitwise identical.
+    pub host_context: crate::host_context::PipelineHostContext,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -1103,6 +1143,34 @@ impl PipelineExecutor {
         .map(|_| ())
     }
 
+    /// M8 parity (W1.A3): register a child task in the parent
+    /// session's [`TaskSupervisor`] so the admin dashboard sees the
+    /// pipeline's substructure. The registration carries the node id
+    /// as the synthetic tool name (`pipeline:<node_id>`) and the
+    /// `parent_tool_call_id` from the host context as the
+    /// `tool_call_id` so the UI can stitch the node tree under the
+    /// invoking run_pipeline pill. Returns `None` when no supervisor
+    /// is wired (legacy callers).
+    fn register_node_task(&self, node_id: &str) -> Option<String> {
+        let supervisor = self.config.host_context.task_supervisor.as_ref()?;
+        let parent_tool_call_id = self
+            .config
+            .host_context
+            .parent_tool_call_id
+            .as_deref()
+            .unwrap_or("");
+        let session_key = self.config.host_context.parent_session_key.as_deref();
+        let tool_name = format!("pipeline:{node_id}");
+        let task_id = supervisor.register(&tool_name, parent_tool_call_id, session_key);
+        info!(
+            node = %node_id,
+            task_id = %task_id,
+            parent_tool_call_id = %parent_tool_call_id,
+            "registered pipeline node child task"
+        );
+        Some(task_id)
+    }
+
     /// Reserve sub-budget for a single LLM-call node. Returns:
     /// * `Ok(None)` when no accountant is configured OR the handler
     ///   kind does not participate in reservation.
@@ -1156,7 +1224,12 @@ impl PipelineExecutor {
             self.config.shutdown.clone(),
         )
         .with_provider_policy(self.config.provider_policy.clone())
-        .with_plugin_dirs(self.config.plugin_dirs.clone());
+        .with_plugin_dirs(self.config.plugin_dirs.clone())
+        // M8 parity (W1.A1): propagate the host context so per-node
+        // Agents inherit the parent session's FileStateCache /
+        // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
+        // keeps pre-M8 behaviour bitwise identical.
+        .with_host_context(self.config.host_context.clone());
 
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
@@ -1210,6 +1283,12 @@ impl PipelineExecutor {
         let mut completed: HashMap<String, NodeOutcome> = HashMap::new();
         let mut summaries = Vec::new();
         let mut total_tokens = TokenUsage::default();
+        // M8 parity (W1.A4): per-node cost attribution accumulated as
+        // each LLM-call node finishes. Surfaced in `PipelineResult`.
+        let mut node_costs: Vec<NodeCost> = Vec::new();
+        // M8 parity (W1.A3): per-node task supervisor registrations.
+        // Threaded so we can mark each node Completed/Failed at end.
+        let mut node_task_ids: HashMap<String, String> = HashMap::new();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
         // Nodes to skip because they (and everything before them) are
@@ -1253,6 +1332,7 @@ impl PipelineExecutor {
                             token_usage: total_tokens,
                             node_summaries: summaries,
                             files_modified: vec![],
+                            node_costs: node_costs.clone(),
                         });
                     }
                 }
@@ -1295,6 +1375,7 @@ impl PipelineExecutor {
                             token_usage: total_tokens,
                             node_summaries: summaries,
                             files_modified: vec![],
+                            node_costs: node_costs.clone(),
                         });
                     }
                 }
@@ -1895,6 +1976,21 @@ impl PipelineExecutor {
 
             let node_start = Instant::now();
 
+            // M8 parity (W1.A3): register a child task in the parent
+            // session's TaskSupervisor so the admin dashboard sees the
+            // pipeline's substructure under the run_pipeline parent
+            // tool_call_id. The supervisor's progress reporter (set by
+            // the session actor) bridges every state transition onto
+            // the SSE stream so the chat UI's NodeCard can render the
+            // node tree live.
+            let node_task_id = self.register_node_task(&node.id);
+            if let Some(ref id) = node_task_id {
+                node_task_ids.insert(node.id.clone(), id.clone());
+                if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                    supervisor.mark_running(id);
+                }
+            }
+
             // coding-blue FA-7: reserve per-node budget before dispatch
             // on LLM-call nodes. A rejected reservation aborts the
             // pipeline before the sub-agent is built; on dispatch
@@ -1905,19 +2001,15 @@ impl PipelineExecutor {
             let node_reservation = self
                 .reserve_node_budget(&graph.id, &node_with_prompt)
                 .await?;
+            let node_reserved_usd = node_reservation
+                .as_ref()
+                .map(|h| h.reserved_amount_usd())
+                .unwrap_or(0.0);
 
             // Execute with retries — and enforce the node's deadline when set.
             let dispatch = self
                 .dispatch_node(handler, &node_with_prompt, &ctx, node.max_retries)
                 .await;
-
-            // The per-node reservation is scoped to the dispatch — on
-            // node failure we want the handle to drop (auto-refund). On
-            // success the pipeline-level handle records the cumulative
-            // attribution, so we let the per-node handle drop too. The
-            // reservation table correctly tracks outstanding budget
-            // during the pipeline lifetime without double-committing.
-            drop(node_reservation);
 
             let mut outcome = match dispatch? {
                 DispatchOutcome::Completed(outcome) => outcome,
@@ -1962,11 +2054,59 @@ impl PipelineExecutor {
                                 token_usage: total_tokens,
                                 node_summaries: summaries,
                                 files_modified: all_files,
+                                node_costs: node_costs.clone(),
                             });
                         }
                     }
                 }
             };
+
+            // M8 parity (W1.A2): on a retryable first-attempt failure,
+            // engage the M8.9 recovery loop to re-attempt ONCE with a
+            // synthesised recovery prompt. Mirrors the spawn_only
+            // recovery flow already wired in session_actor. Skipped /
+            // Pass outcomes short-circuit; the second failure is
+            // terminal.
+            let recovery_input = serde_json::json!({
+                "node": node.id,
+                "input": ctx.input,
+            });
+            let recovery_decision =
+                crate::recovery::classify_outcome(&node_with_prompt, &outcome, &recovery_input);
+            if let crate::recovery::RecoveryDecision::Retryable(signal) = recovery_decision {
+                if let Some(handler) = handlers.get(&node.handler) {
+                    match crate::recovery::recover_node(
+                        handler,
+                        &node_with_prompt,
+                        &ctx,
+                        &signal,
+                        &self.config.shutdown,
+                    )
+                    .await
+                    {
+                        Ok(r) if r.retried => {
+                            tracing::info!(
+                                node = %node.id,
+                                first_status = "fail/error",
+                                retry_status = ?r.outcome.status,
+                                "M8.9 pipeline recovery completed retry"
+                            );
+                            outcome = r.outcome;
+                        }
+                        Ok(_) => {
+                            // Recovery skipped (shutdown raised); keep
+                            // the original failure outcome.
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                node = %node.id,
+                                error = %error,
+                                "M8.9 pipeline recovery dispatch errored"
+                            );
+                        }
+                    }
+                }
+            }
 
             let duration_ms = node_start.elapsed().as_millis() as u64;
 
@@ -2003,6 +2143,62 @@ impl PipelineExecutor {
                     outcome.status = OutcomeStatus::Error;
                     outcome.content =
                         format!("Pipeline node validator rejected '{}': {reason}", node.id);
+                }
+            }
+
+            // M8 parity (W1.A4): drop the per-node reservation handle
+            // (auto-refund) and capture a NodeCost row from the actual
+            // post-dispatch token usage. The pipeline-level handle
+            // already records the cumulative attribution at the run's
+            // terminal so per-node ledger writes would double-count;
+            // the NodeCost row stays in-memory for the UI panel and
+            // the SSE done payload. `committed = true` indicates an
+            // accountant was bound; the actual ledger commit lives at
+            // pipeline scope.
+            let node_cost_committed = node_reservation.is_some();
+            drop(node_reservation);
+
+            let actual_usd = octos_agent::cost_ledger::project_cost_usd(
+                node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),
+                outcome.token_usage.input_tokens,
+                outcome.token_usage.output_tokens,
+            )
+            .unwrap_or(node_reserved_usd);
+            node_costs.push(NodeCost {
+                node_id: node.id.clone(),
+                model: node_with_prompt.model.clone(),
+                reserved_usd: node_reserved_usd,
+                actual_usd,
+                tokens_in: outcome.token_usage.input_tokens,
+                tokens_out: outcome.token_usage.output_tokens,
+                committed: node_cost_committed,
+            });
+
+            // M8 parity (W1.A3): mark the registered child task
+            // terminal so the supervisor's progress reporter pushes a
+            // final state transition onto the SSE stream.
+            if let Some(task_id) = node_task_ids.get(&node.id).cloned() {
+                if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                    match outcome.status {
+                        OutcomeStatus::Pass => {
+                            let files: Vec<String> = outcome
+                                .files_modified
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect();
+                            supervisor.mark_completed(&task_id, files);
+                        }
+                        OutcomeStatus::Fail | OutcomeStatus::Error => {
+                            supervisor
+                                .mark_failed(&task_id, format!("node {} failed", node.id));
+                        }
+                        OutcomeStatus::Skipped => {
+                            // Treat as completed-with-no-output so the
+                            // supervisor doesn't keep the task as
+                            // running for the rest of the pipeline.
+                            supervisor.mark_completed(&task_id, Vec::new());
+                        }
+                    }
                 }
             }
 
@@ -2077,6 +2273,7 @@ impl PipelineExecutor {
                     token_usage: total_tokens,
                     node_summaries: summaries,
                     files_modified: all_files,
+                    node_costs: node_costs.clone(),
                 });
             }
 
@@ -2092,6 +2289,7 @@ impl PipelineExecutor {
                     token_usage: total_tokens,
                     node_summaries: summaries,
                     files_modified: vec![],
+                    node_costs: node_costs.clone(),
                 });
             }
 
@@ -2125,6 +2323,7 @@ impl PipelineExecutor {
                         token_usage: total_tokens,
                         node_summaries: summaries,
                         files_modified: all_files,
+                        node_costs: node_costs.clone(),
                     });
                 }
             }
@@ -2437,6 +2636,7 @@ mod tests {
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
         }
     }
 
