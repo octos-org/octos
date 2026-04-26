@@ -1458,7 +1458,15 @@ async fn replay_committed_session_results(
     // content). The fallback is the only path that surfaces a topic-bearing
     // audio bubble to a topic-less reconnect, so we must NOT early-return on
     // an empty candidate result.
-    let mut candidate_events: Vec<String> = Vec::new();
+    //
+    // Both branches stash `(timestamp, payload)` so the combined-replay path
+    // can globally sort by timestamp before returning. Pre-fix, candidate
+    // events were concatenated in disk order in front of fallback events
+    // — if the two branches' timestamps interleaved (e.g. candidate=T0,T2,T4
+    // and fallback=T1,T3,T5), replay surfaced T0,T2,T4,T1,T3,T5 instead of
+    // T0..T5. The web client renders bubbles in delivery order, so the
+    // mis-sort manifested as a "leap back in time" mid-replay.
+    let mut candidate_events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
     for candidate in &candidates {
         if let Some(session) = session_loader.load(candidate).await {
             for (seq, message) in session.messages.iter().enumerate() {
@@ -1468,13 +1476,12 @@ async fn replay_committed_session_results(
                 if !passes {
                     continue;
                 }
-                candidate_events.push(
-                    build_session_result_event_from_message(
-                        message_info_from_history_message(message, &data_dir, seq),
-                        topic,
-                    )
-                    .to_string(),
-                );
+                let payload = build_session_result_event_from_message(
+                    message_info_from_history_message(message, &data_dir, seq),
+                    topic,
+                )
+                .to_string();
+                candidate_events.push((message.timestamp, payload));
             }
             // Stop at the first resolved candidate file even if it produced
             // zero displayable events — we do not want to layer multiple
@@ -1532,24 +1539,29 @@ async fn replay_committed_session_results(
     }
 
     if !candidate_events.is_empty() && !fallback_events.is_empty() {
-        // Both branches produced events — concatenate, candidate first then
-        // fallback (sorted by timestamp). This is rare (it would require a
-        // displayable-message topic-less candidate AND a populated topic
-        // file under the same base_key) but we must still surface both.
-        fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
-        let mut combined = candidate_events;
-        combined.extend(fallback_events.into_iter().map(|(_, payload)| payload));
+        // Both branches produced events — globally sort by timestamp so the
+        // unified set surfaces in true chronological order. (See top-of-fn
+        // comment for the previous out-of-order shape.)
+        let mut combined: Vec<(chrono::DateTime<chrono::Utc>, String)> = candidate_events;
+        combined.extend(fallback_events);
+        combined.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> = combined.into_iter().map(|(_, payload)| payload).collect();
         record_replay(
             "session_result",
             "emitted_with_topic_fallback",
-            combined.len(),
+            payloads.len(),
         );
-        return combined;
+        return payloads;
     }
 
     if !candidate_events.is_empty() {
-        record_replay("session_result", "emitted", candidate_events.len());
-        return candidate_events;
+        candidate_events.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> = candidate_events
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect();
+        record_replay("session_result", "emitted", payloads.len());
+        return payloads;
     }
 
     if !fallback_events.is_empty() {
@@ -3109,6 +3121,112 @@ mod tests {
                  Missing: `{expected}`"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn combined_replay_events_are_globally_sorted_by_timestamp() {
+        // Pins the global-timestamp-sort contract for the combined-events
+        // branch in `replay_committed_session_results`. Pre-fix, when both
+        // the candidate-load and the topic-less fallback produced events,
+        // the function concatenated `candidate_events` (in disk order) BEFORE
+        // `fallback_events` (timestamp-sorted) without globally sorting the
+        // unified set. If the two branches' timestamps interleave, replay
+        // delivered them out of chronological order — the web client renders
+        // bubbles in delivery order, so a topic-less reconnect would show
+        // candidate bubbles first then a "leap back in time" to fallback
+        // bubbles whose timestamps fall between candidate ones.
+        //
+        // Post-fix: extract the timestamp from each event's payload and
+        // sort the unified set by timestamp before returning.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less candidate JSONL with timestamps T0, T2, T4 (even).
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "interleave-chat",
+            None,
+        );
+        let base = chrono::Utc::now() - chrono::Duration::seconds(60);
+        for (idx, secs) in [0i64, 2, 4].iter().enumerate() {
+            let mut msg = Message::assistant(format!("candidate-{idx}-T{secs}"));
+            msg.timestamp = base + chrono::Duration::seconds(*secs);
+            actor_persist_to_per_user(data_dir.path(), &topicless_key, msg).await;
+        }
+
+        // Topic-bearing fallback file under the same base_key with timestamps
+        // T1, T3, T5 (odd) — interleaving the candidate timestamps.
+        let topic = "interleaved";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "interleave-chat",
+            Some(topic),
+        );
+        for (idx, secs) in [1i64, 3, 5].iter().enumerate() {
+            let mut msg = Message::assistant(format!("fallback-{idx}-T{secs}"));
+            msg.timestamp = base + chrono::Duration::seconds(*secs);
+            actor_persist_to_per_user(data_dir.path(), &topic_key, msg).await;
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        // Topic-less reconnect — both the candidate-load and the topic-less
+        // fallback produce events.
+        let replayed =
+            replay_committed_session_results(&state, "interleave-chat", None, None).await;
+
+        let timestamps: Vec<chrono::DateTime<chrono::Utc>> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| {
+                payload["message"]["timestamp"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })
+            .collect();
+
+        assert_eq!(
+            timestamps.len(),
+            6,
+            "combined replay must surface all six events: {replayed:?}"
+        );
+
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(
+            timestamps, sorted,
+            "combined replay must be globally sorted by timestamp; got {timestamps:?}"
+        );
+
+        // Spot-check the chronological interleave (candidate-T0, fallback-T1, ...).
+        let contents: Vec<String> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| payload["message"]["content"].as_str().map(str::to_string))
+            .collect();
+        let expected_order = [
+            "candidate-0-T0",
+            "fallback-0-T1",
+            "candidate-1-T2",
+            "fallback-1-T3",
+            "candidate-2-T4",
+            "fallback-2-T5",
+        ];
+        assert_eq!(
+            contents, expected_order,
+            "combined replay must interleave by timestamp"
+        );
     }
 
     #[tokio::test]
