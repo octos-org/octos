@@ -982,7 +982,6 @@ mod tests {
         assert!(resolve_identity(&state, "rotated").await.is_none());
     }
 
-
     /// Bug 1 regression: `GET /api/events/harness` with a valid admin
     /// Bearer token must return `200 text/event-stream`, NOT the
     /// `307 Location: /admin/` that the SPA static-file fallback was
