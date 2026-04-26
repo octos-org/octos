@@ -115,8 +115,63 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # ── Sharded workspace clippy ────────────────────────────────────────────
+      # The previous monolithic `cargo clippy --workspace --all-targets` step
+      # OOM-killed the 16GB ubuntu runner: linking all of octos-agent's 27
+      # integration test binaries plus every other crate's --all-targets in a
+      # single invocation peaked the resident set past the runner budget.
+      # Sharding per crate (and splitting heavy crates into --lib vs --tests)
+      # mirrors the test-shard pattern below; the Swatinem cache makes each
+      # subsequent step incremental against the prior step's target/.
+
+      # Foundation crates (no internal deps, lib-only)
+      - name: Clippy octos-core
+        run: cargo clippy -p octos-core --all-targets -- -D warnings
+
+      - name: Clippy octos-memory
+        run: cargo clippy -p octos-memory --all-targets -- -D warnings
+
+      # Mid-tier libs + their integration tests
+      - name: Clippy octos-llm (lib)
+        run: cargo clippy -p octos-llm --lib -- -D warnings
+
+      - name: Clippy octos-llm (tests)
+        run: cargo clippy -p octos-llm --tests -- -D warnings
+
+      - name: Clippy octos-bus
+        run: cargo clippy -p octos-bus --all-targets -- -D warnings
+
+      - name: Clippy octos-pipeline
+        run: cargo clippy -p octos-pipeline --all-targets -- -D warnings
+
+      - name: Clippy octos-plugin
+        run: cargo clippy -p octos-plugin --all-targets -- -D warnings
+
+      - name: Clippy octos-swarm
+        run: cargo clippy -p octos-swarm --all-targets -- -D warnings
+
+      # octos-agent: the heaviest crate. Lib and integration test binaries are
+      # split so neither step pulls all 27 test binaries into memory at once.
+      - name: Clippy octos-agent (lib)
+        run: cargo clippy -p octos-agent --lib -- -D warnings
+
+      - name: Clippy octos-agent (tests)
+        run: cargo clippy -p octos-agent --tests -- -D warnings
+
+      # Top of the dep tree
+      - name: Clippy octos-cli (lib)
+        run: cargo clippy -p octos-cli --lib -- -D warnings
+
+      - name: Clippy octos-cli (tests)
+        run: cargo clippy -p octos-cli --tests -- -D warnings
+
+      # Bundled harness starter skills (each has small lib + 1 smoke test)
+      - name: Clippy harness starter skills
+        run: |
+          cargo clippy -p harness-starter-generic --all-targets -- -D warnings
+          cargo clippy -p harness-starter-report --all-targets -- -D warnings
+          cargo clippy -p harness-starter-audio --all-targets -- -D warnings
+          cargo clippy -p harness-starter-coding --all-targets -- -D warnings
 
       # ── Sharded workspace tests ─────────────────────────────────────────────
       # The previous `cargo test --workspace` step OOM-killed the 16GB ubuntu
