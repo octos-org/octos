@@ -47,14 +47,16 @@ use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_cont
 ///
 /// Fields in order: the tool-result [`Message`], files the tool touched,
 /// files the tool wants auto-delivered to the user, optional sub-agent
-/// token usage, and a per-call `success` bit used by the serial scheduler
-/// to trigger the M8.8 error cascade.
+/// token usage, a per-call `success` bit used by the serial scheduler to
+/// trigger the M8.8 error cascade, and the optional structured side-channel
+/// metadata the tool surfaced (today: per-node cost rows from `run_pipeline`).
 type ToolCallResult = (
     Message,
     Vec<std::path::PathBuf>,
     Vec<std::path::PathBuf>,
     Option<TokenUsage>,
     bool,
+    Option<(String, serde_json::Value)>,
 );
 
 fn should_auto_send_tool_files(
@@ -195,6 +197,7 @@ impl Agent {
                             Vec::new(),
                             None,
                             false, // hook denial is a failure — cascade in serial mode
+                            None,
                         );
                     }
                     HookResult::Modified(new_args) => {
@@ -744,6 +747,7 @@ impl Agent {
                     Vec::new(),
                     None,
                     true, // spawn_only placeholder is reported as success
+                    None,
                 );
             }
 
@@ -789,127 +793,142 @@ impl Agent {
 
             let duration = tool_start.elapsed();
 
-            let (content, tool_files_modified, tool_files_to_send, tool_tokens, tool_success) =
-                match result {
-                    Ok(tool_result) => {
+            let (
+                content,
+                tool_files_modified,
+                tool_files_to_send,
+                tool_tokens,
+                tool_success,
+                tool_structured_metadata,
+            ) = match result {
+                Ok(tool_result) => {
+                    debug!(
+                        tool = %tc_name,
+                        success = tool_result.success,
+                        duration_ms = duration.as_millis() as u64,
+                        "tool completed"
+                    );
+
+                    if let Some(ref file) = tool_result.file_modified {
+                        info!(tool = %tc_name, file = %file.display(), "file modified");
+                        reporter.report(ProgressEvent::FileModified {
+                            path: file.display().to_string(),
+                        });
+                    }
+
+                    if should_auto_send_tool_files(
+                        suppress_auto_send_files,
+                        explicit_send_file_requested,
+                        &tc_name,
+                    ) {
+                        // Auto-send files explicitly declared by the plugin via files_to_send.
+                        // No heuristic path detection — plugins must opt-in by including
+                        // "files_to_send": ["/path/to/file"] in their JSON output.
+                        let files: Vec<String> = tool_result
+                            .files_to_send
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+
+                        for path_str in &files {
+                            info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
+                            let send_args =
+                                serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
+                            match tools.execute("send_file", &send_args).await {
+                                Ok(r) if r.success => {
+                                    info!(tool = %tc_name, file = %path_str, "file auto-sent");
+                                }
+                                Ok(r) => {
+                                    warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
+                                }
+                                Err(e) => {
+                                    warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                }
+                            }
+                        }
+                    } else if explicit_send_file_requested
+                        && tc_name != "send_file"
+                        && !tool_result.files_to_send.is_empty()
+                    {
                         debug!(
                             tool = %tc_name,
-                            success = tool_result.success,
-                            duration_ms = duration.as_millis() as u64,
-                            "tool completed"
+                            "skipping auto-send because the same model turn already issued send_file"
                         );
-
-                        if let Some(ref file) = tool_result.file_modified {
-                            info!(tool = %tc_name, file = %file.display(), "file modified");
-                            reporter.report(ProgressEvent::FileModified {
-                                path: file.display().to_string(),
-                            });
-                        }
-
-                        if should_auto_send_tool_files(
-                            suppress_auto_send_files,
-                            explicit_send_file_requested,
-                            &tc_name,
-                        ) {
-                            // Auto-send files explicitly declared by the plugin via files_to_send.
-                            // No heuristic path detection — plugins must opt-in by including
-                            // "files_to_send": ["/path/to/file"] in their JSON output.
-                            let files: Vec<String> = tool_result
-                                .files_to_send
-                                .iter()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .collect();
-
-                            for path_str in &files {
-                                info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
-                                let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
-                                match tools.execute("send_file", &send_args).await {
-                                    Ok(r) if r.success => {
-                                        info!(tool = %tc_name, file = %path_str, "file auto-sent");
-                                    }
-                                    Ok(r) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
-                                    }
-                                    Err(e) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
-                                    }
-                                }
-                            }
-                        } else if explicit_send_file_requested
-                            && tc_name != "send_file"
-                            && !tool_result.files_to_send.is_empty()
-                        {
-                            debug!(
-                                tool = %tc_name,
-                                "skipping auto-send because the same model turn already issued send_file"
-                            );
-                        }
-
-                        let mut tool_files_modified = Vec::new();
-                        if let Some(file) = tool_result.file_modified.clone() {
-                            tool_files_modified.push(file);
-                        }
-                        let tool_files_to_send = tool_result.files_to_send.clone();
-
-                        let output_preview =
-                            octos_core::truncated_utf8(&tool_result.output, 200, "...");
-
-                        reporter.report(ProgressEvent::ToolCompleted {
-                            name: tc_name.clone(),
-                            tool_id: tc_id.clone(),
-                            success: tool_result.success,
-                            output_preview,
-                            duration,
-                        });
-
-                        let success = tool_result.success;
-                        (
-                            tool_result.output,
-                            tool_files_modified,
-                            tool_files_to_send,
-                            tool_result.tokens_used,
-                            success,
-                        )
                     }
-                    Err(e) => {
-                        // Classify the tool failure as a typed HarnessError.
-                        // Invariant #1 (#488): every raw tool error escape
-                        // must be routed through classification so the
-                        // metrics counter and the sink event both fire.
-                        let classified = HarnessError::classify_report(&e, Some(tc_name.as_str()));
-                        classified.record_metric();
-                        if let Some(sink) = harness_event_sink.as_deref() {
-                            if let Some(ctx) = lookup_event_sink_context(sink) {
-                                let event =
-                                    classified.to_event(ctx.session_id, ctx.task_id, None, None);
-                                if let Err(error) = write_event_to_sink(sink, &event) {
-                                    tracing::debug!(
-                                        error = %error,
-                                        "failed to write tool-failure harness error event"
-                                    );
-                                }
+
+                    let mut tool_files_modified = Vec::new();
+                    if let Some(file) = tool_result.file_modified.clone() {
+                        tool_files_modified.push(file);
+                    }
+                    let tool_files_to_send = tool_result.files_to_send.clone();
+
+                    let output_preview =
+                        octos_core::truncated_utf8(&tool_result.output, 200, "...");
+
+                    reporter.report(ProgressEvent::ToolCompleted {
+                        name: tc_name.clone(),
+                        tool_id: tc_id.clone(),
+                        success: tool_result.success,
+                        output_preview,
+                        duration,
+                    });
+
+                    let success = tool_result.success;
+                    (
+                        tool_result.output,
+                        tool_files_modified,
+                        tool_files_to_send,
+                        tool_result.tokens_used,
+                        success,
+                        tool_result.structured_metadata,
+                    )
+                }
+                Err(e) => {
+                    // Classify the tool failure as a typed HarnessError.
+                    // Invariant #1 (#488): every raw tool error escape
+                    // must be routed through classification so the
+                    // metrics counter and the sink event both fire.
+                    let classified = HarnessError::classify_report(&e, Some(tc_name.as_str()));
+                    classified.record_metric();
+                    if let Some(sink) = harness_event_sink.as_deref() {
+                        if let Some(ctx) = lookup_event_sink_context(sink) {
+                            let event =
+                                classified.to_event(ctx.session_id, ctx.task_id, None, None);
+                            if let Err(error) = write_event_to_sink(sink, &event) {
+                                tracing::debug!(
+                                    error = %error,
+                                    "failed to write tool-failure harness error event"
+                                );
                             }
                         }
-                        warn!(
-                            tool = %tc_name,
-                            error = %e,
-                            variant = classified.variant_name(),
-                            recovery = %classified.recovery_hint(),
-                            duration_ms = duration.as_millis() as u64,
-                            "tool failed"
-                        );
-
-                        reporter.report(ProgressEvent::ToolCompleted {
-                            name: tc_name.clone(),
-                            tool_id: tc_id.clone(),
-                            success: false,
-                            output_preview: e.to_string(),
-                            duration,
-                        });
-
-                        (format!("Error: {e}"), Vec::new(), Vec::new(), None, false)
                     }
-                };
+                    warn!(
+                        tool = %tc_name,
+                        error = %e,
+                        variant = classified.variant_name(),
+                        recovery = %classified.recovery_hint(),
+                        duration_ms = duration.as_millis() as u64,
+                        "tool failed"
+                    );
+
+                    reporter.report(ProgressEvent::ToolCompleted {
+                        name: tc_name.clone(),
+                        tool_id: tc_id.clone(),
+                        success: false,
+                        output_preview: e.to_string(),
+                        duration,
+                    });
+
+                    (
+                        format!("Error: {e}"),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        None,
+                    )
+                }
+            };
 
             // After-tool hook (fire-and-forget)
             if let Some(ref hooks) = hooks {
@@ -929,6 +948,11 @@ impl Agent {
             let content = octos_core::truncate_head_tail(&content, limit, 0.7);
             let content = crate::sanitize::sanitize_tool_output(&content);
 
+            // Pair the structured side-channel with the originating tool's
+            // call id so the session actor (which keys cost rows by
+            // tool_call_id) can match them on the SSE done event.
+            let structured_metadata = tool_structured_metadata.map(|meta| (tc_id.clone(), meta));
+
             (
                 Message {
                     role: MessageRole::Tool,
@@ -944,6 +968,7 @@ impl Agent {
                 tool_files_to_send,
                 tool_tokens,
                 tool_success,
+                structured_metadata,
             )
         })
     }
@@ -956,6 +981,7 @@ impl Agent {
         Vec<std::path::PathBuf>,
         Vec<std::path::PathBuf>,
         TokenUsage,
+        Vec<(String, serde_json::Value)>,
     )> {
         let tool_names: Vec<&str> = response
             .tool_calls
@@ -1056,7 +1082,7 @@ impl Agent {
                             timestamp: chrono::Utc::now(),
                         })
                         .collect();
-                    return Ok((messages, vec![], vec![], TokenUsage::default()));
+                    return Ok((messages, vec![], vec![], TokenUsage::default(), Vec::new()));
                 }
             }
         };
@@ -1064,7 +1090,7 @@ impl Agent {
         // Log completion of the tool batch.
         let result_sizes: Vec<usize> = results
             .iter()
-            .map(|(m, _, _, _, _)| m.content.len())
+            .map(|(m, _, _, _, _, _)| m.content.len())
             .collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
@@ -1080,8 +1106,17 @@ impl Agent {
         let mut files_modified = Vec::new();
         let mut files_to_send = Vec::new();
         let mut tokens_used = TokenUsage::default();
+        let mut structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
 
-        for (message, tool_files_modified, tool_files_to_send, tool_tokens, _success) in results {
+        for (
+            message,
+            tool_files_modified,
+            tool_files_to_send,
+            tool_tokens,
+            _success,
+            tool_structured_metadata,
+        ) in results
+        {
             messages.push(message);
             files_modified.extend(tool_files_modified);
             files_to_send.extend(tool_files_to_send);
@@ -1089,9 +1124,18 @@ impl Agent {
                 tokens_used.input_tokens += tokens.input_tokens;
                 tokens_used.output_tokens += tokens.output_tokens;
             }
+            if let Some(meta) = tool_structured_metadata {
+                structured_metadata.push(meta);
+            }
         }
 
-        Ok((messages, files_modified, files_to_send, tokens_used))
+        Ok((
+            messages,
+            files_modified,
+            files_to_send,
+            tokens_used,
+            structured_metadata,
+        ))
     }
 
     /// Serial dispatch for batches that contain at least one Exclusive tool (M8.8).
@@ -1168,6 +1212,7 @@ impl Agent {
                         Vec::new(),
                         None,
                         false,
+                        None,
                     )
                 }
             };
@@ -1208,6 +1253,7 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
         Vec::new(),
         None,
         false,
+        None,
     )
 }
 
@@ -1228,6 +1274,7 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
         Vec::new(),
         None,
         false,
+        None,
     )
 }
 

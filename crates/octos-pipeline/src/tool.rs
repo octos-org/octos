@@ -407,6 +407,12 @@ impl Tool for RunPipelineTool {
         // Also set files_to_send so the execution loop auto-delivers
         let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
 
+        // Surface per-node cost attribution in the structured side-channel so
+        // the session actor can pull it back into the SSE `done` event for the
+        // W1.G4 cost panel. The data was being silently dropped at the tool
+        // boundary before we extended `ToolResult` with `structured_metadata`.
+        let structured_metadata = node_costs_metadata(&result.node_costs);
+
         Ok(ToolResult {
             output: format!(
                 "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
@@ -416,7 +422,25 @@ impl Tool for RunPipelineTool {
             tokens_used: Some(result.token_usage),
             file_modified: report_file,
             files_to_send,
+            structured_metadata,
         })
+    }
+}
+
+/// Project a non-empty slice of [`NodeCost`] rows into the
+/// `ToolResult.structured_metadata` shape the session actor consumes.
+///
+/// Returns `None` when there are no cost rows so the side-channel stays
+/// absent for legacy callers (no accountant / no LLM-call nodes); returns
+/// `Some({"node_costs": [...]})` otherwise. Lifted out so tests can assert
+/// the projection without standing up a full pipeline run.
+fn node_costs_metadata(rows: &[crate::executor::NodeCost]) -> Option<serde_json::Value> {
+    if rows.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "node_costs": rows,
+        }))
     }
 }
 
@@ -453,4 +477,77 @@ fn sanitize_dot(dot: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::NodeCost;
+
+    /// Gap 3.1 — when a pipeline run reports per-node cost rows, the tool
+    /// surfaces them in `ToolResult.structured_metadata` under the
+    /// `"node_costs"` key so the session actor can project them onto the
+    /// SSE `done` event for the W1.G4 CostBreakdown panel.
+    #[test]
+    fn node_costs_metadata_emits_node_costs_array_for_multi_node_pipeline() {
+        let rows = vec![
+            NodeCost {
+                node_id: "draft".into(),
+                model: Some("anthropic/claude-haiku".into()),
+                reserved_usd: 0.0010,
+                actual_usd: 0.0008,
+                tokens_in: 320,
+                tokens_out: 110,
+                committed: true,
+            },
+            NodeCost {
+                node_id: "refine".into(),
+                model: Some("anthropic/claude-sonnet".into()),
+                reserved_usd: 0.0040,
+                actual_usd: 0.0032,
+                tokens_in: 540,
+                tokens_out: 220,
+                committed: true,
+            },
+        ];
+
+        let meta = node_costs_metadata(&rows).expect("multi-node pipeline must surface metadata");
+        let arr = meta
+            .get("node_costs")
+            .and_then(|v| v.as_array())
+            .expect("structured_metadata must carry a `node_costs` array");
+        assert_eq!(arr.len(), 2, "one row per pipeline node");
+        assert_eq!(
+            arr[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
+        );
+        assert_eq!(
+            arr[1].get("node_id").and_then(|v| v.as_str()),
+            Some("refine")
+        );
+        assert!(
+            arr[0]
+                .get("tokens_in")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
+            "tokens_in must be threaded through the projection"
+        );
+        assert!(
+            arr[0]
+                .get("actual_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                > 0.0,
+            "actual_usd must be threaded through the projection"
+        );
+    }
+
+    /// When a pipeline runs without an accountant attached, no per-node cost
+    /// rows are produced; the side-channel stays absent so legacy callers
+    /// observe byte-identical behaviour.
+    #[test]
+    fn node_costs_metadata_returns_none_for_empty_rows() {
+        assert!(node_costs_metadata(&[]).is_none());
+    }
 }

@@ -125,9 +125,9 @@ fn build_cached_plugin_registration(plugin_dirs: &[PathBuf]) -> CachedPluginRegi
 
 /// Reporter that bridges worker agent events to the parent pipeline's
 /// `report_progress` so they appear in the SSE stream.
-struct PipelineNodeReporter {
-    node_id: String,
-    model: String,
+pub(crate) struct PipelineNodeReporter {
+    pub(crate) node_id: String,
+    pub(crate) model: String,
 }
 
 impl ProgressReporter for PipelineNodeReporter {
@@ -161,6 +161,25 @@ impl ProgressReporter for PipelineNodeReporter {
                 format!(
                     "{} [{}]: response received (iteration {})",
                     self.node_id, self.model, iteration
+                )
+            }
+            // Bug 3 / Gap 3.3 — per-node cost updates from inner agents must
+            // reach the parent SSE stream. The legacy `_ => return` arm
+            // swallowed these silently, leaving the W1.G4 CostBreakdown
+            // panel data-blind. Forward as a structured progress message
+            // the chat UI can render alongside the per-node tree.
+            ProgressEvent::CostUpdate {
+                session_input_tokens,
+                session_output_tokens,
+                response_cost,
+                ..
+            } => {
+                let cost_label = response_cost
+                    .map(|c| format!("${c:.4}"))
+                    .unwrap_or_else(|| "$?".to_string());
+                format!(
+                    "{}: tokens {}+{}, {}",
+                    self.node_id, session_input_tokens, session_output_tokens, cost_label
                 )
             }
             _ => return,
@@ -869,5 +888,112 @@ impl Handler for NoopHandler {
             token_usage: TokenUsage::default(),
             files_modified: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use octos_agent::progress::{ProgressEvent, ProgressReporter};
+    use octos_agent::tools::{TOOL_CTX, ToolContext};
+
+    /// Capture reporter that stores every event so tests can assert which
+    /// pieces of progress reached the parent SSE stream.
+    struct CapturingReporter {
+        events: Arc<Mutex<Vec<ProgressEvent>>>,
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn report(&self, event: ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// Gap 3.3 — `PipelineNodeReporter::report` must forward
+    /// `ProgressEvent::CostUpdate` events through
+    /// `crate::executor::report_progress` instead of swallowing them via
+    /// the `_ => return` arm. This is the bridge that lets per-node cost
+    /// updates from inner-agent loops reach the parent SSE stream so the
+    /// W1.G4 CostBreakdown panel can render them inline with the node tree.
+    #[tokio::test]
+    async fn pipeline_node_reporter_forwards_cost_update_to_parent_sse() {
+        let captured = Arc::new(Mutex::new(Vec::<ProgressEvent>::new()));
+        let parent_reporter: Arc<dyn ProgressReporter> = Arc::new(CapturingReporter {
+            events: captured.clone(),
+        });
+
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call_test".to_string();
+        ctx.reporter = parent_reporter;
+
+        let node_reporter = PipelineNodeReporter {
+            node_id: "draft".to_string(),
+            model: "claude-sonnet".to_string(),
+        };
+
+        // Scope TOOL_CTX so report_progress() can find the parent reporter,
+        // then dispatch a CostUpdate event the way an inner Agent would.
+        TOOL_CTX
+            .scope(ctx, async {
+                node_reporter.report(ProgressEvent::CostUpdate {
+                    session_input_tokens: 320,
+                    session_output_tokens: 110,
+                    response_cost: Some(0.0008),
+                    session_cost: Some(0.0008),
+                });
+            })
+            .await;
+
+        let events = captured.lock().unwrap();
+        let forwarded = events
+            .iter()
+            .find_map(|e| match e {
+                ProgressEvent::ToolProgress { name, message, .. } if name == "run_pipeline" => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .expect("CostUpdate must be forwarded as a ToolProgress event on the parent reporter");
+        assert!(
+            forwarded.contains("draft"),
+            "forwarded message should reference the originating node_id"
+        );
+        assert!(
+            forwarded.contains("320") && forwarded.contains("110"),
+            "forwarded message should carry the per-node token totals; got {forwarded:?}"
+        );
+    }
+
+    /// Sanity check — the existing event arms still forward as before so
+    /// the new CostUpdate arm is purely additive.
+    #[tokio::test]
+    async fn pipeline_node_reporter_still_forwards_thinking_events() {
+        let captured = Arc::new(Mutex::new(Vec::<ProgressEvent>::new()));
+        let parent_reporter: Arc<dyn ProgressReporter> = Arc::new(CapturingReporter {
+            events: captured.clone(),
+        });
+
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "call_test".to_string();
+        ctx.reporter = parent_reporter;
+
+        let node_reporter = PipelineNodeReporter {
+            node_id: "refine".to_string(),
+            model: "claude-haiku".to_string(),
+        };
+
+        TOOL_CTX
+            .scope(ctx, async {
+                node_reporter.report(ProgressEvent::Thinking { iteration: 1 });
+            })
+            .await;
+
+        let events = captured.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProgressEvent::ToolProgress { name, .. } if name == "run_pipeline"
+        )));
     }
 }
