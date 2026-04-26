@@ -105,7 +105,7 @@ pub use hooks::{
 };
 pub use mcp::{McpClient, McpServerConfig};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
-pub use plugins::{PluginLoadResult, PluginLoader};
+pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};

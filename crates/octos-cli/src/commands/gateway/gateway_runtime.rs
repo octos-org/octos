@@ -30,7 +30,8 @@ use tracing::{info, warn};
 use super::build_system_prompt;
 use super::message_preprocessing;
 use super::profile_factory::{
-    ProfileActorFactoryBuilder, build_plugin_env, profile_plugin_env, profile_search_provider_keys,
+    ProfileActorFactoryBuilder, build_plugin_env, build_synthesis_config, profile_plugin_env,
+    profile_search_provider_keys,
 };
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
@@ -649,11 +650,18 @@ impl GatewayRuntime {
             }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
-                match octos_agent::PluginLoader::load_into_with_work_dir(
+                // S2 plumbing: pass the agent's current provider config so
+                // plugins like deep_search can synthesize via host-injected
+                // args instead of the operator's plist `EnvironmentVariables`.
+                let synthesis_config = build_synthesis_config(&config, &provider_name);
+                match octos_agent::PluginLoader::load_into_with_options(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
-                    Some(&plugin_work_dir),
+                    octos_agent::PluginLoadOptions {
+                        work_dir: Some(&plugin_work_dir),
+                        synthesis_config,
+                    },
                 ) {
                     Ok(result) => plugin_result = result,
                     Err(e) => warn!("plugin loading failed: {e}"),
@@ -1211,24 +1219,22 @@ impl GatewayRuntime {
                     }
                 })),
                 #[cfg(feature = "api")]
-                task_relaunch: Some(Arc::new(
-                    move |task_id: &str, from_node: Option<&str>| {
-                        let opts = octos_agent::RelaunchOpts {
-                            from_node: from_node.map(str::to_string),
-                        };
-                        match task_relaunch_store.relaunch_task(task_id, opts) {
-                            Ok(new_task_id) => {
-                                octos_bus::TaskRelaunchOutcome::Relaunched { new_task_id }
-                            }
-                            Err(octos_agent::TaskRelaunchError::NotFound) => {
-                                octos_bus::TaskRelaunchOutcome::NotFound
-                            }
-                            Err(octos_agent::TaskRelaunchError::StillActive) => {
-                                octos_bus::TaskRelaunchOutcome::StillActive
-                            }
+                task_relaunch: Some(Arc::new(move |task_id: &str, from_node: Option<&str>| {
+                    let opts = octos_agent::RelaunchOpts {
+                        from_node: from_node.map(str::to_string),
+                    };
+                    match task_relaunch_store.relaunch_task(task_id, opts) {
+                        Ok(new_task_id) => {
+                            octos_bus::TaskRelaunchOutcome::Relaunched { new_task_id }
                         }
-                    },
-                )),
+                        Err(octos_agent::TaskRelaunchError::NotFound) => {
+                            octos_bus::TaskRelaunchOutcome::NotFound
+                        }
+                        Err(octos_agent::TaskRelaunchError::StillActive) => {
+                            octos_bus::TaskRelaunchOutcome::StillActive
+                        }
+                    }
+                })),
                 #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),
                 #[cfg(not(feature = "api"))]
