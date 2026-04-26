@@ -838,6 +838,58 @@ impl SessionTaskQueryStore {
         }
     }
 
+    /// M7.9 / W2: locate the supervisor owning `task_id` and forward
+    /// `cancel(task_id)` to it. Returns `Ok(())` on success, mapping
+    /// supervisor errors back to the typed [`TaskCancelError`] enum so
+    /// the API layer can map them to HTTP status codes.
+    ///
+    /// Walks every live supervisor (pruning dropped ones) until it finds
+    /// the task. When no supervisor knows about `task_id`, returns
+    /// `Err(TaskCancelError::NotFound)`.
+    pub fn cancel_task(
+        &self,
+        task_id: &str,
+    ) -> Result<(), octos_agent::TaskCancelError> {
+        for supervisor in self.live_supervisors() {
+            if supervisor.get_task(task_id).is_some() {
+                return supervisor.cancel(task_id);
+            }
+        }
+        Err(octos_agent::TaskCancelError::NotFound)
+    }
+
+    /// M7.9 / W2: locate the supervisor owning `task_id` and forward
+    /// `relaunch(task_id, opts)` to it. Returns `Ok(new_task_id)` on
+    /// success.
+    pub fn relaunch_task(
+        &self,
+        task_id: &str,
+        opts: octos_agent::RelaunchOpts,
+    ) -> Result<String, octos_agent::TaskRelaunchError> {
+        for supervisor in self.live_supervisors() {
+            if supervisor.get_task(task_id).is_some() {
+                return supervisor.relaunch(task_id, opts);
+            }
+        }
+        Err(octos_agent::TaskRelaunchError::NotFound)
+    }
+
+    /// Snapshot live supervisors, pruning dropped weak refs. Shared
+    /// helper for `cancel_task` / `relaunch_task` /
+    /// `mark_child_session_failed`.
+    fn live_supervisors(&self) -> Vec<Arc<TaskSupervisor>> {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alive = Vec::new();
+        guard.retain(|_, entry| match entry.supervisor.upgrade() {
+            Some(supervisor) => {
+                alive.push(supervisor);
+                true
+            }
+            None => false,
+        });
+        alive
+    }
+
     /// M8 fix-first item 8 (gap 3): mark the parent task that owns a
     /// child session as failed.
     ///
@@ -851,22 +903,7 @@ impl SessionTaskQueryStore {
     /// [`TaskSupervisor::mark_failed`] on it. Returns `true` when a
     /// matching task was found and updated; `false` otherwise.
     pub fn mark_child_session_failed(&self, child_session_key: &str, error: &str) -> bool {
-        // Snapshot live supervisors and prune dropped ones in one pass so
-        // we hold the inner lock for as little as possible.
-        let snapshot: Vec<Arc<TaskSupervisor>> = {
-            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-            let mut alive = Vec::new();
-            guard.retain(|_, entry| match entry.supervisor.upgrade() {
-                Some(supervisor) => {
-                    alive.push(supervisor);
-                    true
-                }
-                None => false,
-            });
-            alive
-        };
-
-        for supervisor in snapshot {
+        for supervisor in self.live_supervisors() {
             for task in supervisor.get_all_tasks() {
                 if task.child_session_key.as_deref() == Some(child_session_key) {
                     supervisor.mark_failed(&task.id, error.to_string());
@@ -1847,6 +1884,17 @@ impl ActorFactory {
         tools.register(message_tool);
         tools.register(send_file_tool);
 
+        // M8 Runtime Parity W2.B1: build the same M8.7 summary generator
+        // that goes onto the parent Agent so the child workers we spawn
+        // observe an identical contract. (The Agent::new wiring further
+        // down also consumes this Arc — keep them in sync.)
+        let subagent_summary_generator_for_spawn =
+            Arc::new(octos_agent::AgentSummaryGenerator::new(
+                self.llm_for_compaction.clone(),
+                self.subagent_output_router.clone(),
+                (*supervisor).clone(),
+            ));
+
         // Spawn tool (per-session context, fully configured)
         let mut spawn_tool = SpawnTool::with_context(
             self.llm.clone(),
@@ -1862,7 +1910,14 @@ impl ActorFactory {
             supervisor.clone(),
             session_key.to_string(),
             task_state_path.clone(),
-        );
+        )
+        // M8 Runtime Parity W2.B1: parent → child cache inheritance.
+        // Without these the spawned child Agent observes
+        // `file_state_cache: None` and `subagent_output_router: None`
+        // and the post-M8.4 / M8.7 contracts are silently bypassed.
+        .with_parent_file_state_cache(file_state_cache.clone())
+        .with_parent_subagent_output_router(self.subagent_output_router.clone())
+        .with_parent_subagent_summary_generator(subagent_summary_generator_for_spawn);
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
@@ -2091,6 +2146,11 @@ impl ActorFactory {
         // binds the per-registry supervisor (so it can mark_terminal /
         // start a watcher / etc. for THIS actor's tasks); the router
         // is shared across actors via the factory.
+        //
+        // M8 Runtime Parity W2.B1: the same Arc is also threaded onto
+        // the SpawnTool via `with_parent_subagent_summary_generator`
+        // (above) so child agents observe the same generator the
+        // parent does.
         let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
             self.llm_for_compaction.clone(),
             self.subagent_output_router.clone(),

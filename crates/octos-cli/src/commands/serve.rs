@@ -532,6 +532,12 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
+            // The serve command is the API server proper — all session
+            // actors live in gateway processes, so `task_query_store`
+            // stays `None` and the cancel/restart handlers proxy via
+            // `resolve_api_port`. The gateway runtime sets its own
+            // store on the embedded api channel.
+            task_query_store: None,
         });
 
         // Auto-start enabled profiles

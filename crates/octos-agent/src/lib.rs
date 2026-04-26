@@ -123,9 +123,9 @@ pub use subagent_summary::{
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
-    ArtifactMimeClass, BackgroundTask, SpawnOnlyFailureSignal, TaskLifecycleState,
-    TaskRuntimeState, TaskStatus, TaskSupervisor, parse_alternatives,
-    validate_spawn_only_artifacts,
+    ArtifactMimeClass, BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
+    TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState,
+    TaskStatus, TaskSupervisor, parse_alternatives, validate_spawn_only_artifacts,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

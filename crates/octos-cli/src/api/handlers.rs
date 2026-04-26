@@ -903,6 +903,150 @@ pub async fn session_tasks(
     Json(serde_json::json!([])).into_response()
 }
 
+// ───────── M7.9 / W2 task supervisor: cancel + restart-from-node ─────────
+
+/// `POST /api/tasks/{task_id}/cancel` — forward to
+/// [`octos_agent::TaskSupervisor::cancel`]. Returns:
+///
+/// - `200 OK` `{ "task_id": "...", "status": "cancelled" }` when the
+///   task was running/queued and has been transitioned to `Cancelled`.
+/// - `404 Not Found` when no supervised task carries that id.
+/// - `409 Conflict` when the task is already in a terminal state
+///   (`Completed` / `Failed` / `Cancelled`).
+/// - `503 Service Unavailable` when the API server has no
+///   `task_query_store` wired (standalone mode).
+pub async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    // Gateway-mode: forward to the gateway process that owns the supervisor.
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/tasks/{}/cancel", encode_api_session_path_id(&task_id));
+        return super::webhook_proxy::api_post_proxy_json(
+            &state,
+            port,
+            &path,
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
+    let Some(store) = state.task_query_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired in standalone mode",
+            })),
+        )
+            .into_response();
+    };
+
+    match store.cancel_task(&task_id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task_id": task_id,
+                "status": "cancelled",
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskCancelError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskCancelError::AlreadyTerminal) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_already_terminal",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Body of `POST /api/tasks/{task_id}/restart-from-node`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RestartFromNodeRequest {
+    /// Optional DOT-graph node id to restart from. Upstream cached
+    /// outputs from preceding nodes are preserved by the runtime; only
+    /// the target node and its downstream subtree re-run.
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+/// `POST /api/tasks/{task_id}/restart-from-node` — forward to
+/// [`octos_agent::TaskSupervisor::relaunch`]. Returns:
+///
+/// - `200 OK` `{ "original_task_id": "...", "new_task_id": "...",
+///   "from_node": "..." }` on accept.
+/// - `404 Not Found` when the task id is unknown.
+/// - `409 Conflict` when the task is still active (callers must cancel
+///   first).
+/// - `503 Service Unavailable` when no supervisor is wired.
+pub async fn restart_task_from_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    body: Option<Json<RestartFromNodeRequest>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/tasks/{}/restart-from-node", encode_api_session_path_id(&task_id));
+        let proxied_body = serde_json::json!({
+            "node_id": body.node_id,
+        });
+        return super::webhook_proxy::api_post_proxy_json(&state, port, &path, proxied_body).await;
+    }
+
+    let Some(store) = state.task_query_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired in standalone mode",
+            })),
+        )
+            .into_response();
+    };
+
+    let opts = octos_agent::RelaunchOpts {
+        from_node: body.node_id.clone(),
+    };
+    match store.relaunch_task(&task_id, opts) {
+        Ok(new_task_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "original_task_id": task_id,
+                "new_task_id": new_task_id,
+                "from_node": body.node_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskRelaunchError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskRelaunchError::StillActive) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_still_active",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Serialize)]
 pub struct SessionFileInfo {
     pub filename: String,
@@ -3507,5 +3651,189 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ────────── M7.9 / W2 cancel + restart-from-node API tests ──────────
+
+    /// Build a `task_query_store` carrying a single live supervisor with a
+    /// running task pre-registered. Returns (store, supervisor, task_id).
+    fn build_task_store_with_running_task(
+        session_key: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+    ) -> (
+        crate::session_actor::SessionTaskQueryStore,
+        Arc<octos_agent::TaskSupervisor>,
+        String,
+    ) {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register(tool_name, tool_call_id, Some(session_key));
+        supervisor.mark_running(&task_id);
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component(session_key);
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+        (store, supervisor, task_id)
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_200_when_running_task_is_cancelled() {
+        let (store, _supervisor, task_id) =
+            build_task_store_with_running_task("api-cancel-1", "run_pipeline", "call-x");
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["task_id"], task_id);
+        assert_eq!(json["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_404_for_unknown_task() {
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("does-not-exist".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_409_when_already_terminal() {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register("run_pipeline", "call-409", Some("session"));
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component("session");
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_503_without_task_query_store() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let response = cancel_task(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            axum::extract::Path("any".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_200_with_new_task_id() {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register("run_pipeline", "call-restart", Some("session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "design phase failed".to_string());
+
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component("session");
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id.clone()),
+            Some(Json(RestartFromNodeRequest {
+                node_id: Some("design".into()),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["original_task_id"], task_id);
+        assert_eq!(json["from_node"], "design");
+        assert!(
+            json["new_task_id"].as_str().unwrap().len() > 0,
+            "new_task_id should be a fresh UUID-ish string"
+        );
+
+        // Upstream cached outputs are preserved by virtue of the original
+        // task being left intact in the supervisor — the relaunch only
+        // adds a successor in the `Spawned` state.
+        let original = supervisor.get_task(&task_id).unwrap();
+        assert_eq!(original.status, octos_agent::TaskStatus::Failed);
+        let new_id = json["new_task_id"].as_str().unwrap();
+        let successor = supervisor.get_task(new_id).unwrap();
+        assert_eq!(successor.tool_name, "run_pipeline");
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_404_for_unknown_task() {
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("nope".into()),
+            Some(Json(RestartFromNodeRequest::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_409_for_active_task() {
+        let (store, _supervisor, task_id) =
+            build_task_store_with_running_task("api-restart-409", "run_pipeline", "call-y");
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id),
+            Some(Json(RestartFromNodeRequest::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
