@@ -208,6 +208,7 @@ fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
 async fn persist_assistant_message(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
+    data_dir: &Path,
     content: String,
     media: Vec<String>,
 ) -> Option<PersistedSessionMessage> {
@@ -215,9 +216,31 @@ async fn persist_assistant_message(
     assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
+    // Funnel through the canonical helper so the per-key Tokio mutex
+    // serialises this write with `ApiChannel::persist_to_session` (and any
+    // other caller). Pre-fix, the actor opened its OWN `SessionHandle` and
+    // called `add_message_with_seq` directly — the channel and actor each
+    // observed their independent in-memory `len = N`, both returned the
+    // same `seq = N`, and the duplicate seqs broke watcher correlation.
+    //
+    // Holding `session_handle.lock()` across the canonical-helper call is
+    // safe (the helper's per-key map is independent of the actor's per-actor
+    // mutex; no deadlock) and serialises this write with the actor's other
+    // in-memory operations (read history, summary update, etc.). After the
+    // disk write commits we mirror the message into the actor's local Vec
+    // so subsequent `get_history` reads stay consistent.
     let mut handle = session_handle.lock().await;
-    match handle.add_message_with_seq(assistant_msg).await {
-        Ok(seq) => Some(PersistedSessionMessage { seq, timestamp }),
+    match octos_bus::session::persist_message_through_canonical_path(
+        data_dir,
+        session_key,
+        assistant_msg.clone(),
+    )
+    .await
+    {
+        Ok(seq) => {
+            handle.push_message_in_memory(assistant_msg);
+            Some(PersistedSessionMessage { seq, timestamp })
+        }
         Err(error) => {
             warn!(
                 session = %session_key,
@@ -264,6 +287,18 @@ async fn wait_for_primary_assistant_reply(
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Read the optional `client_message_id` field from an InboundMessage's
+/// metadata. Empty strings count as absent so the wire schema stays simple
+/// for clients that always populate the field.
+fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
+    inbound
+        .metadata
+        .get("client_message_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
@@ -340,6 +375,7 @@ async fn send_outbound_with_timeout(
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
+    data_dir: &Path,
     out_tx: &mpsc::Sender<OutboundMessage>,
     channel: &str,
     chat_id: &str,
@@ -347,9 +383,14 @@ async fn persist_terminal_reply_and_fanout(
     content: String,
     media: Vec<String>,
 ) -> bool {
-    let Some(_persisted) =
-        persist_assistant_message(session_handle, session_key, content.clone(), media.clone())
-            .await
+    let Some(_persisted) = persist_assistant_message(
+        session_handle,
+        session_key,
+        data_dir,
+        content.clone(),
+        media.clone(),
+    )
+    .await
     else {
         record_result_delivery("terminal_reply", "history_not_persisted", "assistant");
         warn!(
@@ -3292,6 +3333,7 @@ impl SessionActor {
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
+            &self.data_dir,
             content.clone(),
             media.clone(),
         )
@@ -3570,6 +3612,7 @@ impl SessionActor {
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
+            &self.data_dir,
             ack_content.clone(),
             vec![],
         )
@@ -4377,6 +4420,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4393,6 +4437,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4494,6 +4539,12 @@ impl SessionActor {
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
+        let data_dir = self.data_dir.clone();
+        // Captured here so the upcoming cmid-correlation cherry-pick can
+        // thread it onto the persisted user message; the storage-unification
+        // helper introduced it but doesn't itself wire it up — see
+        // 0d721e29.
+        let _overflow_client_message_id = inbound_client_message_id(msg);
 
         tokio::spawn(async move {
             // Save user message to history first so it survives even if the
@@ -4788,6 +4839,7 @@ impl SessionActor {
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
+                        &data_dir,
                         &out_tx,
                         &channel,
                         &chat_id,
@@ -4803,6 +4855,7 @@ impl SessionActor {
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
+                        &data_dir,
                         &out_tx,
                         &channel,
                         &chat_id,
@@ -5198,6 +5251,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -5214,6 +5268,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -6141,7 +6196,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -6212,7 +6267,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout,
@@ -6289,7 +6344,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -6413,7 +6468,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -6625,7 +6680,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -9358,5 +9413,98 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn actor_and_channel_persists_get_distinct_seqs_across_paths() {
+        // Pins the unified-serialisation contract for `SessionActor` and
+        // `ApiChannel::persist_to_session`. Pre-fix, the actor held its own
+        // `Arc<Mutex<SessionHandle>>` and called `add_message_with_seq`
+        // directly while `ApiChannel::persist_to_session` already routed
+        // through `persist_message_through_canonical_path`. The two paths
+        // held INDEPENDENT in-memory `messages` Vecs (the actor's grew
+        // forever, the channel always opened fresh from disk), so concurrent
+        // persists collided: the actor read `len = N` on its local Vec, the
+        // channel read disk-len `M`, both returned `seq = X` — duplicate
+        // seqs that broke watcher correlation.
+        //
+        // Post-fix, `persist_assistant_message` also routes through the
+        // canonical helper. Both paths contend on the per-key Tokio mutex
+        // and observe disk-canonical seqs, so concurrent persists across
+        // paths get distinct, monotonic seqs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("api", "actor-vs-channel");
+        let data_dir = dir.path().to_path_buf();
+
+        // Single shared actor handle (mirrors how `SessionActor` owns ONE
+        // long-lived `Arc<Mutex<SessionHandle>>` for the duration of the
+        // session). Pre-fix, a series of `add_message_with_seq` calls on
+        // this handle increment its local Vec — so seqs returned from this
+        // path collide with seqs returned from canonical-helper opens.
+        let actor_handle = std::sync::Arc::new(tokio::sync::Mutex::new(SessionHandle::open(
+            &data_dir, &key,
+        )));
+
+        const TOTAL: usize = 16;
+        let mut handles = Vec::with_capacity(TOTAL);
+
+        for i in 0..TOTAL {
+            let data_dir = data_dir.clone();
+            let key = key.clone();
+            let actor_handle = actor_handle.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // "Actor" path — uses the shared `Arc<Mutex<SessionHandle>>`.
+                    // Post-fix this call funnels through the canonical helper
+                    // so its seq is disk-canonical.
+                    let res = persist_assistant_message(
+                        &actor_handle,
+                        &key,
+                        &data_dir,
+                        format!("actor-{i}"),
+                        vec![],
+                    )
+                    .await;
+                    res.map(|p| p.seq)
+                } else {
+                    // "Channel" path — the canonical helper directly (this is
+                    // the same code `ApiChannel::persist_to_session` calls).
+                    let assistant = Message::assistant(format!("channel-{i}"));
+                    octos_bus::session::persist_message_through_canonical_path(
+                        &data_dir, &key, assistant,
+                    )
+                    .await
+                    .ok()
+                }
+            }));
+        }
+
+        let mut seqs = Vec::with_capacity(TOTAL);
+        for h in handles {
+            let seq = h.await.expect("join").expect("persist returned Some");
+            seqs.push(seq);
+        }
+        seqs.sort_unstable();
+
+        let unique: std::collections::HashSet<usize> = seqs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            TOTAL,
+            "actor + channel persists must each receive a distinct seq, got: {seqs:?}"
+        );
+        assert_eq!(
+            seqs,
+            (0..TOTAL).collect::<Vec<_>>(),
+            "seqs must form a contiguous 0..TOTAL range; got: {seqs:?}"
+        );
+
+        // Final disk transcript should hold all TOTAL messages.
+        let final_handle = SessionHandle::open(&data_dir, &key);
+        assert_eq!(
+            final_handle.session().messages.len(),
+            TOTAL,
+            "all persisted messages must land on disk: {:?}",
+            final_handle.session().messages
+        );
     }
 }
