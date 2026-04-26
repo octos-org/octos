@@ -153,10 +153,7 @@ pub fn write_event_to_sink(raw_sink: impl AsRef<str>, event: &HarnessEvent) -> s
 /// Used by the plugin protocol-v2 shim, which builds events from the wire
 /// format on a hot reader path. Callers MUST pass a single well-formed
 /// JSON object; the writer adds a trailing newline.
-pub fn write_event_line_to_sink(
-    raw_sink: impl AsRef<str>,
-    line: &str,
-) -> std::io::Result<()> {
+pub fn write_event_line_to_sink(raw_sink: impl AsRef<str>, line: &str) -> std::io::Result<()> {
     let path = sink_path_from_raw(raw_sink.as_ref());
     let mut file = std::fs::OpenOptions::new()
         .create(true)

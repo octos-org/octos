@@ -314,7 +314,13 @@ pub fn emit_progress(stage: &str, message: &str, progress: Option<f64>) {
 }
 
 /// Convenience helper for `cost` events.
-pub fn emit_cost(provider: &str, model: Option<&str>, tokens_in: u32, tokens_out: u32, usd: Option<f64>) {
+pub fn emit_cost(
+    provider: &str,
+    model: Option<&str>,
+    tokens_in: u32,
+    tokens_out: u32,
+    usd: Option<f64>,
+) {
     let event = ProtocolV2Event::Cost(CostEvent {
         provider: provider.to_string(),
         model: model.map(String::from),
@@ -332,7 +338,8 @@ mod tests {
 
     #[test]
     fn parse_progress_event_extracts_fields() {
-        let line = r#"{"type":"progress","stage":"searching","message":"round 1/3","progress":0.25}"#;
+        let line =
+            r#"{"type":"progress","stage":"searching","message":"round 1/3","progress":0.25}"#;
         match parse_event_line(line) {
             LineParse::Event(ProtocolV2Event::Progress(p)) => {
                 assert_eq!(p.stage, "searching");
@@ -386,7 +393,8 @@ mod tests {
 
     #[test]
     fn parse_artifact_event() {
-        let line = r#"{"type":"artifact","path":"/tmp/r/_report.md","kind":"report","message":"final"}"#;
+        let line =
+            r#"{"type":"artifact","path":"/tmp/r/_report.md","kind":"report","message":"final"}"#;
         match parse_event_line(line) {
             LineParse::Event(ProtocolV2Event::Artifact(a)) => {
                 assert_eq!(a.path, "/tmp/r/_report.md");

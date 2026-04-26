@@ -141,11 +141,7 @@ impl PluginTool {
                     }
                     out.push_str(&progress.message);
                 }
-                if out.is_empty() {
-                    progress.stage
-                } else {
-                    out
-                }
+                if out.is_empty() { progress.stage } else { out }
             }
             LineParse::Event(ProtocolV2Event::Phase(phase)) => {
                 if phase.message.is_empty() {
@@ -256,9 +252,7 @@ impl PluginTool {
                 return;
             }
         };
-        if let Err(error) =
-            crate::harness_events::write_event_line_to_sink(sink, &line)
-        {
+        if let Err(error) = crate::harness_events::write_event_line_to_sink(sink, &line) {
             tracing::debug!(
                 plugin = plugin_name,
                 tool = tool_name,
@@ -1650,16 +1644,10 @@ mod tests {
     fn last_progress_message(
         events: &Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
     ) -> Option<String> {
-        events
-            .lock()
-            .unwrap()
-            .last()
-            .and_then(|event| match event {
-                crate::progress::ProgressEvent::ToolProgress { message, .. } => {
-                    Some(message.clone())
-                }
-                _ => None,
-            })
+        events.lock().unwrap().last().and_then(|event| match event {
+            crate::progress::ProgressEvent::ToolProgress { message, .. } => Some(message.clone()),
+            _ => None,
+        })
     }
 
     #[test]

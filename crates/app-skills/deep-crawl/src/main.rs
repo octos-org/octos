@@ -30,8 +30,7 @@ use url::Url;
 
 /// Set to 1 by the SIGTERM handler; the BFS loop and synchronous
 /// CDP-sender code paths poll this and exit early when set.
-static CANCELLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Pid of the Chrome child we launched. The handler kills this directly
 /// so chromium does not linger after the main task winds down.
@@ -998,7 +997,10 @@ async fn run() -> Output {
 
     while let Some((url, depth)) = queue.pop_front() {
         if cancelled() {
-            eprintln!("[deep_crawl] cancelled, stopping BFS at {} pages", results.len());
+            eprintln!(
+                "[deep_crawl] cancelled, stopping BFS at {} pages",
+                results.len()
+            );
             emit_v2_progress("cleanup", "cancellation requested", None);
             break;
         }
@@ -1019,11 +1021,7 @@ async fn run() -> Output {
         };
         emit_v2_progress(
             "crawling",
-            &format!(
-                "page {}/{} depth={depth}",
-                results.len() + 1,
-                max_pages
-            ),
+            &format!("page {}/{} depth={depth}", results.len() + 1, max_pages),
             progress_fraction,
         );
 

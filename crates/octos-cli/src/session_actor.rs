@@ -1669,8 +1669,11 @@ impl ActorFactory {
         // messages whose tool-result references could be invalidated by a
         // missing worktree.
         let has_loaded_messages = !session_handle.get_history(1).is_empty();
-        let workspace_root_for_sanitize: Option<&Path> =
-            if has_loaded_messages { Some(&user_workspace) } else { None };
+        let workspace_root_for_sanitize: Option<&Path> = if has_loaded_messages {
+            Some(&user_workspace)
+        } else {
+            None
+        };
         match session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize) {
             Ok((report, refs)) => {
                 if report.input_len != report.output_len

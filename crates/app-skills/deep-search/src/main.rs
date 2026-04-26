@@ -533,7 +533,11 @@ async fn run_deep_search(
     // still works in airgapped/dev setups.
     // -----------------------------------------------------------------------
     progress_simple(ProgressPhase::Synthesize, "Synthesizing report...");
-    emit_v2_progress("synthesizing", "Synthesizing report from sources...", Some(0.85));
+    emit_v2_progress(
+        "synthesizing",
+        "Synthesizing report from sources...",
+        Some(0.85),
+    );
 
     let synthesis_input = SynthesisInput {
         query,
@@ -552,7 +556,11 @@ async fn run_deep_search(
     let synthesis = synthesize(client, &synthesis_input).await;
 
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
-    emit_v2_progress("building_report", "Assembling final document...", Some(0.95));
+    emit_v2_progress(
+        "building_report",
+        "Assembling final document...",
+        Some(0.95),
+    );
 
     let report_path = dir.join("_report.md");
     let report = build_report(
@@ -2213,9 +2221,7 @@ fn build_report(
             // keep the v1 "Overview" but label it so it's clear we did
             // NOT synthesize, and operators know the result is raw.
             report.push_str("## Overview\n\n");
-            report.push_str(
-                "_LLM synthesis unavailable — showing raw search results below._\n\n",
-            );
+            report.push_str("_LLM synthesis unavailable — showing raw search results below._\n\n");
             report.push_str(initial_answer);
             report.push_str("\n\n");
         }
@@ -2327,7 +2333,10 @@ impl SynthesisResult {
 /// Run the synthesis LLM call. Returns `None` when no API key is
 /// configured, the call fails, or the response is unusable. The deep_search
 /// flow falls back to the v1 raw-dump report in that case.
-async fn synthesize(client: &reqwest::Client, input: &SynthesisInput<'_>) -> Option<SynthesisResult> {
+async fn synthesize(
+    client: &reqwest::Client,
+    input: &SynthesisInput<'_>,
+) -> Option<SynthesisResult> {
     let (endpoint, api_key, model, provider) = resolve_synthesis_config()?;
 
     let prompt = build_synthesis_prompt(input);
@@ -2361,11 +2370,7 @@ async fn synthesize(client: &reqwest::Client, input: &SynthesisInput<'_>) -> Opt
         Ok(r) => r,
         Err(e) => {
             eprintln!("[synthesis] LLM call failed: {e}");
-            emit_v2_progress(
-                "synthesizing",
-                &format!("LLM call failed: {e}"),
-                None,
-            );
+            emit_v2_progress("synthesizing", &format!("LLM call failed: {e}"), None);
             return None;
         }
     };
@@ -2373,12 +2378,11 @@ async fn synthesize(client: &reqwest::Client, input: &SynthesisInput<'_>) -> Opt
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        eprintln!("[synthesis] HTTP {status}: {}", truncate_utf8(&text, 300, ""));
-        emit_v2_progress(
-            "synthesizing",
-            &format!("LLM HTTP {status}"),
-            None,
+        eprintln!(
+            "[synthesis] HTTP {status}: {}",
+            truncate_utf8(&text, 300, "")
         );
+        emit_v2_progress("synthesizing", &format!("LLM HTTP {status}"), None);
         return None;
     }
 
@@ -2523,8 +2527,8 @@ fn parse_synthesis_response(text: &str) -> (String, String, Option<f64>) {
                 // tolerate prose like "Confidence: ~0.85 (high)" while
                 // still preserving negative signs (which we then clamp
                 // to 0).
-                let cleaned = trimmed
-                    .trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
+                let cleaned =
+                    trimmed.trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
                 if let Ok(v) = cleaned.parse::<f64>() {
                     confidence = Some(v.clamp(0.0, 1.0));
                 }
@@ -2610,12 +2614,7 @@ fn resolve_synthesis_config() -> Option<(String, String, String, String)> {
                 let model = model_override
                     .clone()
                     .unwrap_or_else(|| default_model.to_string());
-                return Some((
-                    endpoint.to_string(),
-                    key,
-                    model,
-                    provider.to_string(),
-                ));
+                return Some((endpoint.to_string(), key, model, provider.to_string()));
             }
         }
     }
@@ -3388,7 +3387,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(permit1.is_some(), "first acquire should succeed");
         let after_one = sem.available_permits();
         assert_eq!(
-            after_one, cap - 1,
+            after_one,
+            cap - 1,
             "permit should decrement available count"
         );
         drop(permit1);
