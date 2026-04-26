@@ -558,6 +558,19 @@ async fn chat_streaming(
                 if let Some(seq) = assistant_committed_seq {
                     done["committed_seq"] = serde_json::Value::from(seq);
                 }
+                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
+                // tool results' structured side-channel into the SSE done
+                // event so the dashboard CostBreakdown panel can render
+                // real per-node attribution from `run_pipeline` runs.
+                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+                for (_tool_call_id, meta) in &response.tool_results {
+                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+                        all_node_costs.extend(arr.iter().cloned());
+                    }
+                }
+                if !all_node_costs.is_empty() {
+                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
@@ -998,7 +1011,10 @@ pub async fn restart_task_from_node(
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let path = format!("/tasks/{}/restart-from-node", encode_api_session_path_id(&task_id));
+        let path = format!(
+            "/tasks/{}/restart-from-node",
+            encode_api_session_path_id(&task_id)
+        );
         let proxied_body = serde_json::json!({
             "node_id": body.node_id,
         });
@@ -2990,6 +3006,19 @@ async fn ws_standalone_agent(
                 if let Some(seq) = assistant_committed_seq {
                     done["committed_seq"] = serde_json::Value::from(seq);
                 }
+                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
+                // tool results' structured side-channel into the SSE done
+                // event so the dashboard CostBreakdown panel can render
+                // real per-node attribution from `run_pipeline` runs.
+                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+                for (_tool_call_id, meta) in &response.tool_results {
+                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+                        all_node_costs.extend(arr.iter().cloned());
+                    }
+                }
+                if !all_node_costs.is_empty() {
+                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
@@ -3733,12 +3762,8 @@ mod tests {
             task_query_store: Some(store),
             ..AppState::empty_for_tests()
         });
-        let response = cancel_task(
-            State(state),
-            HeaderMap::new(),
-            axum::extract::Path(task_id),
-        )
-        .await;
+        let response =
+            cancel_task(State(state), HeaderMap::new(), axum::extract::Path(task_id)).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 

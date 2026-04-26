@@ -444,6 +444,28 @@ fn record_retry(reason: &'static str) {
     counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
 }
 
+/// Collect per-node cost rows from a turn's tool-result side-channel
+/// metadata into a flat array suitable for the SSE `done` event.
+///
+/// Bug 3 / W1.G4 — tools (today: `run_pipeline`) surface per-node cost
+/// rows via `ToolResult.structured_metadata` keyed under `"node_costs"`.
+/// The session actor walks every tool result and concatenates the rows so
+/// the dashboard CostBreakdown panel sees one cost row per pipeline node
+/// regardless of how many `run_pipeline` calls fired during the turn.
+///
+/// Returns an empty vector when no tool surfaced cost rows — the caller
+/// only writes the `node_costs` key on the SSE event when this is
+/// non-empty so legacy clients keep their byte-for-byte payload shape.
+fn collect_node_costs(tool_results: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+    let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+    for (_tool_call_id, meta) in tool_results {
+        if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+            all_node_costs.extend(arr.iter().cloned());
+        }
+    }
+    all_node_costs
+}
+
 fn record_result_delivery(path: &'static str, outcome: &'static str, kind: &'static str) {
     counter!(
         "octos_result_delivery_total",
@@ -846,10 +868,7 @@ impl SessionTaskQueryStore {
     /// Walks every live supervisor (pruning dropped ones) until it finds
     /// the task. When no supervisor knows about `task_id`, returns
     /// `Err(TaskCancelError::NotFound)`.
-    pub fn cancel_task(
-        &self,
-        task_id: &str,
-    ) -> Result<(), octos_agent::TaskCancelError> {
+    pub fn cancel_task(&self, task_id: &str) -> Result<(), octos_agent::TaskCancelError> {
         for supervisor in self.live_supervisors() {
             if supervisor.get_task(task_id).is_some() {
                 return supervisor.cancel(task_id);
@@ -4261,7 +4280,14 @@ impl SessionActor {
                 let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
                     pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
                 });
-                serde_json::json!({
+                // Bug 3 / W1.G4 cost panel — collect per-node cost rows that
+                // tools (today: `run_pipeline`) surfaced through their
+                // `ToolResult.structured_metadata` side-channel. Without this
+                // accumulator the data was being silently dropped between
+                // the tool boundary and the SSE `done` event, leaving the
+                // dashboard's CostBreakdown panel data-blind in production.
+                let all_node_costs = collect_node_costs(&cr.tool_results);
+                let mut meta_obj = serde_json::json!({
                     "_completion": true,
                     "model": model_label,
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
@@ -4273,7 +4299,16 @@ impl SessionActor {
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
                     "has_bg_tasks": had_bg_tasks,
                     "bg_tasks": bg_task_details,
-                })
+                });
+                if !all_node_costs.is_empty() {
+                    if let Some(map) = meta_obj.as_object_mut() {
+                        map.insert(
+                            "node_costs".to_string(),
+                            serde_json::Value::Array(all_node_costs),
+                        );
+                    }
+                }
+                meta_obj
             }
             Ok(Err(e)) => {
                 warn!(session = %self.session_key, error = %e, "agent returned error");
@@ -5578,6 +5613,97 @@ mod tests {
         assert_eq!(
             strip_invoke_tags("a<invoke name=\"cron\" args='{}' />b"),
             "ab"
+        );
+    }
+
+    /// Gap 3.2 — when a tool surfaced `node_costs` via
+    /// `ToolResult.structured_metadata`, `process_inbound`'s metadata
+    /// builder must concatenate every row across tool results so the
+    /// SSE `done` event carries the per-node cost array. Tested through
+    /// the same `collect_node_costs` helper `process_inbound` calls.
+    #[test]
+    fn collect_node_costs_concatenates_rows_from_multiple_tool_results() {
+        let tool_results = vec![
+            (
+                "call_pipeline_1".to_string(),
+                serde_json::json!({
+                    "node_costs": [
+                        {"node_id": "draft",  "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008},
+                        {"node_id": "refine", "tokens_in": 540, "tokens_out": 220, "actual_usd": 0.0032},
+                    ]
+                }),
+            ),
+            (
+                "call_pipeline_2".to_string(),
+                serde_json::json!({
+                    "node_costs": [
+                        {"node_id": "synthesize", "tokens_in": 720, "tokens_out": 410, "actual_usd": 0.0091}
+                    ]
+                }),
+            ),
+        ];
+
+        let collected = collect_node_costs(&tool_results);
+        assert_eq!(collected.len(), 3, "rows from both pipelines must merge");
+        assert_eq!(
+            collected[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
+        );
+        assert_eq!(
+            collected[2].get("node_id").and_then(|v| v.as_str()),
+            Some("synthesize")
+        );
+    }
+
+    /// When no tool produced cost rows, the helper returns an empty vector
+    /// so the calling code can omit the `node_costs` key from the SSE
+    /// payload entirely (legacy clients see byte-identical events).
+    #[test]
+    fn collect_node_costs_returns_empty_when_no_tool_surfaced_metadata() {
+        let tool_results: Vec<(String, serde_json::Value)> = Vec::new();
+        assert!(collect_node_costs(&tool_results).is_empty());
+
+        let unrelated = vec![(
+            "call_other_tool".to_string(),
+            serde_json::json!({"some_other_key": "value"}),
+        )];
+        assert!(collect_node_costs(&unrelated).is_empty());
+    }
+
+    /// End-to-end shape — drop the helper output into the same
+    /// `completion_meta` builder shape used by `process_inbound` and
+    /// confirm the SSE payload carries `node_costs`.
+    #[test]
+    fn completion_meta_carries_node_costs_when_tool_results_have_metadata() {
+        let tool_results = vec![(
+            "call_pipeline_1".to_string(),
+            serde_json::json!({
+                "node_costs": [
+                    {"node_id": "draft", "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008}
+                ]
+            }),
+        )];
+
+        let collected = collect_node_costs(&tool_results);
+        let mut meta = serde_json::json!({
+            "_completion": true,
+            "tokens_in": 320,
+            "tokens_out": 110,
+        });
+        if !collected.is_empty() {
+            meta.as_object_mut().unwrap().insert(
+                "node_costs".to_string(),
+                serde_json::Value::Array(collected),
+            );
+        }
+        let arr = meta
+            .get("node_costs")
+            .and_then(|v| v.as_array())
+            .expect("completion_meta must carry node_costs once a tool surfaced rows");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
         );
     }
 
