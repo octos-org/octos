@@ -58,7 +58,7 @@ pub use resume_policy::{
 };
 pub use session::{
     ActiveSessionStore, Session, SessionHandle, SessionListEntry, SessionManager,
-    validate_topic_name,
+    persist_message_through_canonical_path, validate_topic_name,
 };
 
 #[cfg(feature = "api")]
