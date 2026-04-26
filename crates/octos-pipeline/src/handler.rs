@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,10 +13,115 @@ use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
 use octos_agent::progress::{ProgressEvent, ProgressReporter};
-use octos_agent::tools::TOOL_CTX;
+use octos_agent::tools::{TOOL_CTX, Tool, ToolRegistry};
 
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
+
+/// Cached snapshot of plugin tools loaded from `plugin_dirs`.
+///
+/// Computed once per `CodergenHandler` instance and shared across every
+/// node execution via an `Arc`. Eliminates the per-node SHA-256
+/// verification + executable read that the loader would otherwise
+/// perform on every `execute()` call — for ~14 bundled plugins (each
+/// up to 100 MB) this used to cost 100 ms–seconds per node and starved
+/// the SSE window the chat UI / e2e tests inspect.
+///
+/// Field semantics:
+/// * `tools` — registered plugin tool `Arc`s (cheap to insert into a
+///   per-node [`ToolRegistry`]).
+/// * `tool_names` — passed to [`ToolRegistry::mark_as_plugin`] so
+///   downstream gates that check `is_plugin()` see the same labels
+///   pre-cache vs. post-cache.
+/// * `spawn_only` — `(name, optional_message)` pairs replayed via
+///   [`ToolRegistry::mark_spawn_only`]. The pipeline `execute` path
+///   then `clear_spawn_only`s these out, but the marking is preserved
+///   so behaviour is byte-for-byte identical to the legacy
+///   `PluginLoader::load_into` call.
+#[derive(Default)]
+pub(crate) struct CachedPluginRegistration {
+    pub(crate) tools: Vec<Arc<dyn Tool>>,
+    pub(crate) tool_names: Vec<String>,
+    pub(crate) spawn_only: Vec<(String, Option<String>)>,
+}
+
+impl CachedPluginRegistration {
+    /// Apply this cached registration onto a fresh per-node
+    /// [`ToolRegistry`]. Mirrors the ordering used by
+    /// [`octos_agent::PluginLoader::load_into_with_options`] so the
+    /// observable registry state is identical to the legacy code path.
+    pub(crate) fn apply_to(&self, registry: &mut ToolRegistry) {
+        for tool in &self.tools {
+            let name = tool.name().to_string();
+            registry.mark_as_plugin(&name);
+            registry.register_arc(tool.clone());
+        }
+        for (name, msg) in &self.spawn_only {
+            registry.mark_spawn_only(name, msg.clone());
+        }
+    }
+}
+
+/// Build the cached plugin registration by running the loader against a
+/// throw-away registry. Errors are downgraded to a warn (matching the
+/// legacy pipeline behaviour) and an empty registration is cached so
+/// the warning fires at most once per handler lifetime.
+fn build_cached_plugin_registration(plugin_dirs: &[PathBuf]) -> CachedPluginRegistration {
+    if plugin_dirs.is_empty() {
+        return CachedPluginRegistration::default();
+    }
+
+    let started = std::time::Instant::now();
+    let mut staging = ToolRegistry::new();
+    let load_result = octos_agent::PluginLoader::load_into(&mut staging, plugin_dirs, &[]);
+    let elapsed = started.elapsed();
+
+    let load_result = match load_result {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                error = %e,
+                plugin_dirs = ?plugin_dirs,
+                "plugin loading in pipeline handler — caching empty registration"
+            );
+            return CachedPluginRegistration::default();
+        }
+    };
+
+    // Pull each registered tool back out by name — `load_into` registers
+    // them via `register(...)` which stores them as `Arc<dyn Tool>` we
+    // can clone cheaply on every node hit.
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(load_result.tool_names.len());
+    for name in &load_result.tool_names {
+        if let Some(tool) = staging.get_tool(name) {
+            tools.push(tool);
+        }
+    }
+
+    // Capture spawn_only names so per-node registries can replay the
+    // marking. We deliberately drop the custom messages here because
+    // the pipeline `execute` path immediately calls
+    // `tools.clear_spawn_only()` (the comment in `execute` explains
+    // why), so the message text is never observed downstream. Storing
+    // only the names keeps the cache copy lean.
+    let spawn_only: Vec<(String, Option<String>)> = staging
+        .spawn_only_tools()
+        .iter()
+        .map(|name| (name.clone(), None))
+        .collect();
+
+    info!(
+        tool_count = tools.len(),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "cached pipeline plugin registration"
+    );
+
+    CachedPluginRegistration {
+        tools,
+        tool_names: load_result.tool_names,
+        spawn_only,
+    }
+}
 
 /// Reporter that bridges worker agent events to the parent pipeline's
 /// `report_progress` so they appear in the SSE stream.
@@ -138,6 +243,12 @@ pub struct CodergenHandler {
     /// the same summary generator drives periodic LLM digests for any
     /// background task the worker triggers.
     host_context: crate::host_context::PipelineHostContext,
+    /// Backend bug #1 fix: cached snapshot of the plugin-tool registry
+    /// produced from `plugin_dirs`. Lazily populated on the first node
+    /// `execute()` (or test warm-up call) so all subsequent nodes skip
+    /// the SHA-256 verification + 100 MB executable read that would
+    /// otherwise re-run on every node and starve the SSE window.
+    plugin_cache: Arc<OnceLock<Arc<CachedPluginRegistration>>>,
 }
 
 impl CodergenHandler {
@@ -159,6 +270,7 @@ impl CodergenHandler {
             compaction_workspace: None,
             compaction_llm_provider: None,
             host_context: crate::host_context::PipelineHostContext::default(),
+            plugin_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -195,6 +307,9 @@ impl CodergenHandler {
 
     pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.plugin_dirs = dirs;
+        // Backend bug #1: reset the plugin-load cache when dirs change
+        // so a builder reordering can't end up with a stale cached set.
+        self.plugin_cache = Arc::new(OnceLock::new());
         self
     }
 
@@ -254,6 +369,39 @@ impl CodergenHandler {
         self.compaction_workspace.is_some()
     }
 
+    /// Lazily build (or return the already-built) plugin-tool cache.
+    ///
+    /// Backend bug #1 fix — collapses the per-node SHA-256 verification and
+    /// 100 MB-bounded executable read into a single up-front scan.
+    ///
+    /// The returned `Arc<CachedPluginRegistration>` is shared across every
+    /// node in the same pipeline run, and via `Arc<OnceLock>` across every
+    /// `Arc<dyn Handler>` clone of the same handler instance.
+    ///
+    /// First-call latency equals the legacy load cost (SHA-256 plus
+    /// `.<name>_verified` write). Subsequent calls reduce to a single atomic
+    /// load and an `Arc::clone`.
+    fn cached_plugin_registration(&self) -> Arc<CachedPluginRegistration> {
+        self.plugin_cache
+            .get_or_init(|| Arc::new(build_cached_plugin_registration(&self.plugin_dirs)))
+            .clone()
+    }
+
+    /// Doc-hidden test accessor — populates the plugin cache so tests
+    /// can assert that subsequent loads do NOT re-touch disk.
+    #[doc(hidden)]
+    pub fn warm_plugin_cache_for_test(&self) {
+        let _ = self.cached_plugin_registration();
+    }
+
+    /// Doc-hidden test accessor — exposes the cached plugin tool names.
+    /// Used by the regression test for backend bug #1 to confirm the
+    /// cached registration is stable across calls.
+    #[doc(hidden)]
+    pub fn cached_plugin_tool_names_for_test(&self) -> Vec<String> {
+        self.cached_plugin_registration().tool_names.clone()
+    }
+
     /// Resolve LLM provider for a node, following SpawnTool pattern.
     ///
     /// When a model is explicitly specified and a `ProviderRouter` is available,
@@ -308,12 +456,15 @@ impl Handler for CodergenHandler {
         // Build tool registry (same pattern as SpawnTool sync, spawn.rs:269-278)
         let mut tools = octos_agent::ToolRegistry::with_builtins(&self.working_dir);
 
-        // Load plugin tools (app-skills like deep-search, deep-crawl, etc.)
+        // Backend bug #1: load plugin tools from a process-shared cache.
+        // The cache is populated on the first node's execute() call (or
+        // via the test warm-up accessor) so subsequent nodes skip the
+        // SHA-256 verification + executable read that used to add
+        // 100 ms–seconds of per-node latency, starving the SSE window
+        // the chat UI / e2e tests inspect.
         if !self.plugin_dirs.is_empty() {
-            if let Err(e) = octos_agent::PluginLoader::load_into(&mut tools, &self.plugin_dirs, &[])
-            {
-                warn!("plugin loading in pipeline handler: {e}");
-            }
+            let cached = self.cached_plugin_registration();
+            cached.apply_to(&mut tools);
         }
 
         // Filter out empty tool names (from tools="" in DOT)
