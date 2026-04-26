@@ -1643,13 +1643,6 @@ impl ActorFactory {
             .join("users")
             .join(&encoded_base)
             .join("workspace");
-        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
-            warn!(
-                session = %session_key,
-                path = %user_workspace.display(),
-                "failed to create per-user workspace: {e}, falling back to shared cwd"
-            );
-        }
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
         let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
@@ -1661,10 +1654,11 @@ impl ActorFactory {
         // M8.6: sanitize the loaded transcript. Dropping unresolved tool
         // calls, orphan thinking, and whitespace-only messages here
         // prevents the provider from 400-ing on the first request after a
-        // resume. `retry_state` and `workspace_root` are None for
-        // top-level sessions today — sub-agent workstreams will thread
-        // them in when M8.7 lands.
-        match session_handle.sanitize_loaded_messages(None, None) {
+        // resume. Pass the user_workspace so the sanitizer can detect a
+        // missing-on-disk workspace and hard-refuse — must run BEFORE
+        // create_dir_all below, otherwise the recreate would mask the
+        // missing-workspace condition we want to catch.
+        match session_handle.sanitize_loaded_messages(None, Some(&user_workspace)) {
             Ok((report, refs)) => {
                 if report.input_len != report.output_len
                     || report.content_replacements_restored > 0
@@ -1729,6 +1723,15 @@ impl ActorFactory {
                      in-memory transcript dropped to prevent unsafe LLM call"
                 );
             }
+        }
+        // Recreate the per-user workspace AFTER sanitize so the resume
+        // refusal above had a chance to detect the missing-on-disk state.
+        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
+            warn!(
+                session = %session_key,
+                path = %user_workspace.display(),
+                "failed to create per-user workspace: {e}, falling back to shared cwd"
+            );
         }
         let task_state_path = session_handle.task_state_path();
         let session_handle = Arc::new(Mutex::new(session_handle));
@@ -4929,6 +4932,33 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return, // semaphore closed
         };
+
+        // M8.6 per-turn worktree-missing check: the spawn-time sanitize runs
+        // exactly once when the actor is created and cached in
+        // ActorRegistry. If the workspace dir is deleted out-of-band between
+        // turns, the cached actor would otherwise serve a stale in-memory
+        // transcript whose tool calls reference state that no longer exists.
+        // Clear the transcript and recreate the workspace so the next LLM
+        // call starts from a known-empty state.
+        if !self.user_workspace.exists() {
+            warn!(
+                session = %self.session_key,
+                path = %self.user_workspace.display(),
+                "per-turn worktree check: workspace missing on disk — \
+                 clearing in-memory transcript before next LLM call"
+            );
+            {
+                let mut handle = self.session_handle.lock().await;
+                handle.clear_messages_for_unsafe_resume();
+            }
+            if let Err(e) = std::fs::create_dir_all(&self.user_workspace) {
+                warn!(
+                    session = %self.session_key,
+                    path = %self.user_workspace.display(),
+                    "per-turn worktree check: failed to recreate workspace: {e}"
+                );
+            }
+        }
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
