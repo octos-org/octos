@@ -105,6 +105,19 @@ fn register_sink_context(sink: String, context: HarnessEventSinkContext) {
     contexts.insert(sink, context);
 }
 
+/// Test-only wrapper around [`register_sink_context`] for crates that need
+/// to assert against a sink without booting a full [`HarnessEventSink`].
+#[doc(hidden)]
+pub fn attach_event_sink_context(sink: String, context: HarnessEventSinkContext) {
+    register_sink_context(sink, context);
+}
+
+/// Test-only wrapper around `unregister_sink_context`.
+#[doc(hidden)]
+pub fn detach_event_sink_context(sink: &str) {
+    unregister_sink_context(sink);
+}
+
 fn unregister_sink_context(sink: &str) {
     let mut contexts = sink_contexts().lock().unwrap_or_else(|e| e.into_inner());
     contexts.remove(sink);
@@ -131,6 +144,22 @@ pub fn write_event_to_sink(raw_sink: impl AsRef<str>, event: &HarnessEvent) -> s
     let json = serde_json::to_string(event)
         .map_err(|error| std::io::Error::other(format!("serialize harness event: {error}")))?;
     writeln!(file, "{json}")?;
+    file.flush()
+}
+
+/// Append a pre-serialized event line to a sink without round-tripping
+/// through the [`HarnessEvent`] validator.
+///
+/// Used by the plugin protocol-v2 shim, which builds events from the wire
+/// format on a hot reader path. Callers MUST pass a single well-formed
+/// JSON object; the writer adds a trailing newline.
+pub fn write_event_line_to_sink(raw_sink: impl AsRef<str>, line: &str) -> std::io::Result<()> {
+    let path = sink_path_from_raw(raw_sink.as_ref());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")?;
     file.flush()
 }
 

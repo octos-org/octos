@@ -11,6 +11,7 @@ octos-core = { workspace = true }
 octos-bus = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
+octos-plugin = { workspace = true }
 # codex-execpolicy = { workspace = true }  # Enable when codex builds
 # codex-file-search = { workspace = true }
 # codex-linux-sandbox = { workspace = true }
