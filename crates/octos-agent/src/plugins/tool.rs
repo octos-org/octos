@@ -21,6 +21,49 @@ use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
 
 use super::manifest::PluginToolDef;
 
+/// Synthesis LLM provider config injected into plugin args.
+///
+/// S2 plumbing: octos passes this struct under `synthesis_config` in the JSON
+/// args (alongside `query`, `depth`, etc.) when the plugin's manifest opts in
+/// via `x-octos-host-config-keys: ["synthesis_config"]`. Plugins that haven't
+/// declared the key never see this struct, so secrets stay scoped to the
+/// plugins that asked for them.
+///
+/// Token MUST NOT be logged. Audit `tracing::*` and `eprintln!` paths before
+/// adding diagnostics that touch this struct.
+#[derive(Clone, Debug)]
+pub struct SynthesisConfig {
+    /// OpenAI-compatible base URL (e.g. `https://api.deepseek.com/v1`).
+    pub endpoint: String,
+    /// Bearer token for the synthesis provider.
+    pub api_key: String,
+    /// Model id to request (e.g. `deepseek-chat`).
+    pub model: String,
+    /// Provider label for the v2 cost envelope (e.g. `deepseek`).
+    pub provider: String,
+}
+
+impl SynthesisConfig {
+    /// Whether all four fields are populated. Partial configs are dropped at
+    /// the inject site so the plugin's env-fallback still works.
+    pub fn is_complete(&self) -> bool {
+        !self.endpoint.is_empty()
+            && !self.api_key.is_empty()
+            && !self.model.is_empty()
+            && !self.provider.is_empty()
+    }
+
+    /// Encode the config as a JSON object suitable for inlining into plugin args.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": self.endpoint,
+            "api_key": self.api_key,
+            "model": self.model,
+            "provider": self.provider,
+        })
+    }
+}
+
 /// A tool backed by a plugin executable.
 ///
 /// Protocol: write JSON args to stdin, read JSON result from stdout.
@@ -38,6 +81,10 @@ pub struct PluginTool {
     work_dir: Option<PathBuf>,
     /// Execution timeout.
     timeout: Duration,
+    /// S2 plumbing: synthesis LLM provider config to inject into plugin args.
+    /// Only honoured when the tool's manifest opts in via
+    /// `x-octos-host-config-keys: ["synthesis_config"]`.
+    synthesis_config: Option<SynthesisConfig>,
 }
 
 impl PluginTool {
@@ -53,6 +100,7 @@ impl PluginTool {
             extra_env: vec![],
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            synthesis_config: None,
         }
     }
 
@@ -81,6 +129,14 @@ impl PluginTool {
         self
     }
 
+    /// S2 plumbing: set the synthesis LLM provider config injected into the
+    /// plugin's args. Only honoured when the tool's manifest opts in via
+    /// `x-octos-host-config-keys: ["synthesis_config"]`.
+    pub fn with_synthesis_config(mut self, cfg: SynthesisConfig) -> Self {
+        self.synthesis_config = Some(cfg);
+        self
+    }
+
     /// Create a copy of this plugin tool with a different work directory.
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
@@ -92,6 +148,7 @@ impl PluginTool {
             extra_env: self.extra_env.clone(),
             work_dir: Some(work_dir),
             timeout: self.timeout,
+            synthesis_config: self.synthesis_config.clone(),
         }
     }
 
@@ -366,7 +423,7 @@ impl PluginTool {
         serde_json::Value::Object(rewritten)
     }
 
-    fn prepare_effective_args(
+    pub(crate) fn prepare_effective_args(
         &self,
         args: &serde_json::Value,
         ctx: Option<&ToolContext>,
@@ -421,6 +478,32 @@ impl PluginTool {
                         serde_json::Value::String(format!("slides_{ts}.pptx")),
                     );
                     tracing::info!("injected default 'out' for mofa_slides");
+                }
+            }
+        }
+
+        // S2 plumbing: inject synthesis_config when the manifest opts in via
+        // `x-octos-host-config-keys: ["synthesis_config"]` and the host has a
+        // configured `SynthesisConfig`. The plugin still falls back to env if
+        // the LLM happens to skip injection. NOTE: tokens MUST NOT be logged
+        // — emit only the provider label.
+        if self.tool_def.accepts_host_config_key("synthesis_config") {
+            if let Some(cfg) = self.synthesis_config.as_ref() {
+                if cfg.is_complete() {
+                    if let Some(obj) = effective_args.as_object_mut() {
+                        // Don't override an explicitly-provided synthesis_config.
+                        // (The LLM should never set this, but we defend in depth
+                        // so a misbehaving caller can't be silently overwritten.)
+                        if !obj.contains_key("synthesis_config") {
+                            obj.insert("synthesis_config".into(), cfg.to_json());
+                            tracing::info!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                provider = %cfg.provider,
+                                "injected synthesis_config into plugin args"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1258,6 +1341,136 @@ mod tests {
 
         assert_eq!(prepared["audio_path"], "/workspace/voice.ogg");
         assert_eq!(prepared["file_path"], "/workspace/report.pdf");
+    }
+
+    fn deep_search_def_with_opt_in() -> PluginToolDef {
+        PluginToolDef {
+            name: "deep_search".to_string(),
+            description: "Deep research".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "synthesis_config": {"type": "object"}
+                },
+                "x-octos-host-config-keys": ["synthesis_config"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
+    fn full_synthesis_config() -> SynthesisConfig {
+        SynthesisConfig {
+            endpoint: "https://api.deepseek.com/v1".to_string(),
+            api_key: "sk-host-injected".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider: "deepseek".to_string(),
+        }
+    }
+
+    #[test]
+    fn synthesis_config_is_complete_only_when_all_fields_populated() {
+        let cfg = full_synthesis_config();
+        assert!(cfg.is_complete());
+
+        let mut partial = cfg.clone();
+        partial.api_key.clear();
+        assert!(!partial.is_complete());
+
+        let mut partial = cfg.clone();
+        partial.endpoint.clear();
+        assert!(!partial.is_complete());
+    }
+
+    #[test]
+    fn prepare_effective_args_injects_synthesis_config_when_opted_in() {
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let cfg = &prepared["synthesis_config"];
+        assert_eq!(cfg["endpoint"], "https://api.deepseek.com/v1");
+        assert_eq!(cfg["api_key"], "sk-host-injected");
+        assert_eq!(cfg["model"], "deepseek-chat");
+        assert_eq!(cfg["provider"], "deepseek");
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_manifest_does_not_opt_in() {
+        // Same tool but without the x-octos-host-config-keys extension.
+        let mut def = deep_search_def_with_opt_in();
+        def.input_schema = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}}
+        });
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(
+            prepared.get("synthesis_config").is_none(),
+            "tools without opt-in must not receive synthesis_config: {prepared}",
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_host_did_not_set_one() {
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(prepared.get("synthesis_config").is_none());
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_partial() {
+        let mut cfg = full_synthesis_config();
+        cfg.api_key.clear(); // Partial → fall through to env path.
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(cfg);
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(prepared.get("synthesis_config").is_none());
+    }
+
+    #[test]
+    fn prepare_effective_args_does_not_overwrite_explicit_synthesis_config() {
+        // Defense in depth: if a caller already set synthesis_config (e.g. a
+        // unit test or a future LLM-controlled override), don't silently
+        // replace it.
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(
+            &json!({
+                "query": "AI policy",
+                "synthesis_config": {"api_key": "caller-supplied"}
+            }),
+            None,
+        );
+        assert_eq!(prepared["synthesis_config"]["api_key"], "caller-supplied");
+        assert!(
+            prepared["synthesis_config"].get("endpoint").is_none(),
+            "host config must not be merged into caller-supplied synthesis_config",
+        );
     }
 
     /// Write a script to a file and make it executable, with fsync to avoid ETXTBSY

@@ -28,6 +28,34 @@ struct Input {
     /// Research depth: 1=quick (single search), 2=standard (3 rounds), 3=thorough (5 rounds).
     #[serde(default = "default_depth")]
     depth: u8,
+    /// Synthesis LLM provider config injected by the host (S2 plumbing).
+    ///
+    /// When present and complete, `resolve_synthesis_config` prefers this over
+    /// reading API keys from environment variables. This lets the host route
+    /// per-tenant or per-session credentials without requiring plist `EnvironmentVariables`.
+    #[serde(default)]
+    synthesis_config: Option<SynthesisConfig>,
+}
+
+/// Synthesis LLM provider config passed by the host.
+///
+/// Mirrors the `(endpoint, api_key, model, provider)` quadruple that
+/// [`resolve_synthesis_config`] used to read from environment variables. All
+/// fields are required for the args path to take precedence — partial configs
+/// fall through to the env-var path so the operator can still set defaults.
+#[derive(Deserialize, Clone, Debug)]
+struct SynthesisConfig {
+    /// OpenAI-compatible base URL, e.g. `https://api.deepseek.com/v1`.
+    endpoint: String,
+    /// Bearer token for the synthesis provider.
+    ///
+    /// Tokens MUST NOT be logged. Audit `tracing::*` and `eprintln!` paths
+    /// before adding new diagnostics.
+    api_key: String,
+    /// Model id to request (e.g. `deepseek-chat`).
+    model: String,
+    /// Provider label used by the v2 cost envelope (e.g. `deepseek`).
+    provider: String,
 }
 
 fn default_max_results() -> u8 {
@@ -221,6 +249,7 @@ async fn main() {
             max_results,
             depth,
             input.search_engine.as_deref(),
+            input.synthesis_config.as_ref(),
         ),
     )
     .await;
@@ -277,6 +306,7 @@ async fn run_deep_search(
     max_results: u8,
     depth: u8,
     engine: Option<&str>,
+    synthesis_config: Option<&SynthesisConfig>,
 ) -> Output {
     let max_rounds = match depth {
         1 => 1,
@@ -553,7 +583,7 @@ async fn run_deep_search(
             .collect(),
     };
 
-    let synthesis = synthesize(client, &synthesis_input).await;
+    let synthesis = synthesize(client, &synthesis_input, synthesis_config).await;
 
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
     emit_v2_progress(
@@ -2336,8 +2366,9 @@ impl SynthesisResult {
 async fn synthesize(
     client: &reqwest::Client,
     input: &SynthesisInput<'_>,
+    args_config: Option<&SynthesisConfig>,
 ) -> Option<SynthesisResult> {
-    let (endpoint, api_key, model, provider) = resolve_synthesis_config()?;
+    let (endpoint, api_key, model, provider) = resolve_synthesis_config(args_config)?;
 
     let prompt = build_synthesis_prompt(input);
     let prompt_chars = prompt.len();
@@ -2562,12 +2593,47 @@ enum SectionTag {
     Other,
 }
 
-/// Try env vars in priority order — prefer fast/cheap models.
+/// Resolve synthesis provider config: prefer host-injected args over env.
+///
+/// S2 plumbing: when the host populates `Input::synthesis_config`, we use it
+/// directly so secrets stay in the agent's typed config instead of operator
+/// plists. When it's missing or incomplete (any of the four fields blank), we
+/// fall back to environment variables in the legacy priority order. This
+/// preserves backward compat with operators who still set `DEEPSEEK_API_KEY`
+/// in the launchd plist.
 ///
 /// Returns `(endpoint, api_key, model, provider)`.
-fn resolve_synthesis_config() -> Option<(String, String, String, String)> {
-    // Allow operators to override the model via env. Useful when the
-    // default for a provider is too slow or expensive for synthesis.
+///
+/// Tokens MUST NOT be logged. The function only emits a `provider` label on
+/// success so debugging the resolution path doesn't leak credentials.
+fn resolve_synthesis_config(
+    args_config: Option<&SynthesisConfig>,
+) -> Option<(String, String, String, String)> {
+    // Args path: take everything from the host-injected struct when all four
+    // fields are non-empty. Allow operators to still override the model via
+    // env even when the args path is used — keeps the
+    // `DEEP_SEARCH_SYNTHESIS_MODEL` knob meaningful.
+    if let Some(cfg) = args_config {
+        if !cfg.endpoint.is_empty()
+            && !cfg.api_key.is_empty()
+            && !cfg.model.is_empty()
+            && !cfg.provider.is_empty()
+        {
+            let model = std::env::var("DEEP_SEARCH_SYNTHESIS_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| cfg.model.clone());
+            eprintln!("[synthesis] using host-injected provider: {}", cfg.provider);
+            return Some((
+                cfg.endpoint.clone(),
+                cfg.api_key.clone(),
+                model,
+                cfg.provider.clone(),
+            ));
+        }
+    }
+
+    // Env path: legacy fallback for operators who haven't migrated to S2.
     let model_override = std::env::var("DEEP_SEARCH_SYNTHESIS_MODEL").ok();
 
     let configs: &[(&str, &str, &str, &str)] = &[
@@ -2920,6 +2986,195 @@ mod tests {
         let input: Input = serde_json::from_str(json).unwrap();
         assert_eq!(input.depth, 3);
         assert_eq!(input.search_engine.as_deref(), Some("perplexity"));
+    }
+
+    // ---- S2: synthesis_config plumbing ---------------------------------
+    //
+    // These tests share process-wide env-var state, so they serialize on a
+    // local mutex. Every test snapshots the env keys it touches before the
+    // case and restores them on exit so no test leaks into another.
+
+    /// Mutex serializing synthesis-config env tests in this module.
+    fn synthesis_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// All synthesis-related env keys that the resolver consults.
+    /// We snapshot+restore these so concurrently-running test orderings stay safe.
+    const SYNTHESIS_ENV_KEYS: &[&str] = &[
+        "DEEPSEEK_API_KEY",
+        "KIMI_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEP_SEARCH_SYNTHESIS_MODEL",
+    ];
+
+    fn snapshot_synthesis_env() -> Vec<(&'static str, Option<String>)> {
+        SYNTHESIS_ENV_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn clear_synthesis_env() {
+        for key in SYNTHESIS_ENV_KEYS {
+            // SAFETY: tests serialize on `synthesis_env_lock()`.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    fn restore_synthesis_env(snapshot: Vec<(&'static str, Option<String>)>) {
+        for (key, value) in snapshot {
+            // SAFETY: tests serialize on `synthesis_env_lock()`.
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_input_deserialization_with_synthesis_config() {
+        let json = r#"{
+            "query": "test",
+            "synthesis_config": {
+                "endpoint": "https://api.example.com/v1",
+                "api_key": "sk-host-injected",
+                "model": "deepseek-chat",
+                "provider": "deepseek"
+            }
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        let cfg = input.synthesis_config.expect("synthesis_config parsed");
+        assert_eq!(cfg.endpoint, "https://api.example.com/v1");
+        assert_eq!(cfg.api_key, "sk-host-injected");
+        assert_eq!(cfg.model, "deepseek-chat");
+        assert_eq!(cfg.provider, "deepseek");
+    }
+
+    #[test]
+    fn test_synthesis_config_args_path_takes_precedence_over_env() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // Set BOTH a real env key (would normally win) and pass an args
+        // config: args must take precedence, leaving env untouched.
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "from-env") };
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.host-injected.example/v1".to_string(),
+            api_key: "from-args".to_string(),
+            model: "host-model".to_string(),
+            provider: "host-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves");
+        assert_eq!(resolved.0, "https://api.host-injected.example/v1");
+        assert_eq!(resolved.1, "from-args");
+        assert_eq!(resolved.2, "host-model");
+        assert_eq!(resolved.3, "host-provider");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_args_path_with_no_env() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-args-only".to_string(),
+            model: "args-model".to_string(),
+            provider: "args-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves from args");
+        assert_eq!(resolved.1, "sk-args-only");
+        assert_eq!(resolved.3, "args-provider");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_falls_back_to_env_when_args_missing() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("KIMI_API_KEY", "kimi-from-env") };
+
+        let resolved = resolve_synthesis_config(None).expect("env path resolves");
+        assert_eq!(resolved.0, "https://api.moonshot.ai/v1");
+        assert_eq!(resolved.1, "kimi-from-env");
+        assert_eq!(resolved.3, "moonshot");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_falls_back_to_env_when_args_incomplete() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "openai-from-env") };
+
+        // Args missing api_key → fall through to env.
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "".to_string(),
+            model: "some-model".to_string(),
+            provider: "some-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("env path resolves");
+        assert_eq!(resolved.1, "openai-from-env");
+        assert_eq!(resolved.3, "openai");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_returns_none_when_neither_set() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+
+        assert!(resolve_synthesis_config(None).is_none());
+        // Empty args also falls through to none.
+        let empty_args = SynthesisConfig {
+            endpoint: "".to_string(),
+            api_key: "".to_string(),
+            model: "".to_string(),
+            provider: "".to_string(),
+        };
+        assert!(resolve_synthesis_config(Some(&empty_args)).is_none());
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_model_env_override_applies_to_args_path() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("DEEP_SEARCH_SYNTHESIS_MODEL", "override-model") };
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-args".to_string(),
+            model: "default-from-args".to_string(),
+            provider: "deepseek".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves");
+        assert_eq!(resolved.2, "override-model");
+
+        restore_synthesis_env(snapshot);
     }
 
     #[test]

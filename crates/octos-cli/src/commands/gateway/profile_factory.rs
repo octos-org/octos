@@ -403,6 +403,68 @@ pub(crate) fn build_plugin_env(
     env
 }
 
+/// S2 plumbing: build a synthesis-LLM provider config from the agent's
+/// current `Config`.
+///
+/// Used to populate plugin args (e.g. `deep_search`'s `synthesis_config`) so
+/// the plugin no longer needs to read `DEEPSEEK_API_KEY` / etc. from the
+/// process environment. Returns `None` when:
+///   1. No API key can be resolved for the active provider, OR
+///   2. We can't determine an OpenAI-compatible base URL for the provider.
+///
+/// Tokens MUST NOT be logged. We log only the provider name on success.
+pub(crate) fn build_synthesis_config(
+    config: &crate::config::Config,
+    provider_name: &str,
+) -> Option<octos_agent::SynthesisConfig> {
+    // Resolve base URL (config override > registry default).
+    let base_url = config.base_url.clone().or_else(|| {
+        octos_llm::registry::lookup(provider_name)
+            .and_then(|e| e.default_base_url)
+            .map(String::from)
+    })?;
+
+    // Resolve API key via auth store / env.
+    let api_key = config.get_api_key(provider_name).ok()?;
+    if api_key.is_empty() {
+        return None;
+    }
+
+    // Resolve model: default to the configured model, else fall back to a
+    // sensible per-provider default that matches the registry catalog.
+    let model = config
+        .model
+        .clone()
+        .or_else(|| {
+            octos_llm::registry::lookup(provider_name)
+                .and_then(|e| e.default_model)
+                .map(String::from)
+        })
+        .unwrap_or_else(|| match provider_name {
+            "deepseek" => "deepseek-chat".to_string(),
+            "openai" => "gpt-4o-mini".to_string(),
+            "gemini" | "google" => "gemini-2.0-flash".to_string(),
+            "dashscope" | "qwen" => "qwen-plus".to_string(),
+            "moonshot" | "kimi" => "kimi-2.5".to_string(),
+            "anthropic" => "claude-3-5-haiku-20241022".to_string(),
+            _ => "gpt-4o-mini".to_string(),
+        });
+
+    info!(
+        provider = %provider_name,
+        endpoint = %base_url,
+        model = %model,
+        "built synthesis_config for plugin injection"
+    );
+
+    Some(octos_agent::SynthesisConfig {
+        endpoint: base_url,
+        api_key,
+        model,
+        provider: provider_name.to_string(),
+    })
+}
+
 pub(super) struct ProfileActorFactoryBuilder {
     pub(super) profile_store: Arc<crate::profiles::ProfileStore>,
     pub(super) project_dir: PathBuf,
@@ -528,11 +590,17 @@ impl ProfileActorFactoryBuilder {
             );
             let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
-                match octos_agent::PluginLoader::load_into_with_work_dir(
+                // S2 plumbing: pass profile-scoped synthesis config so per-tenant
+                // routing of synthesis credentials works.
+                let synthesis_config = build_synthesis_config(&profile_config, &provider_name);
+                match octos_agent::PluginLoader::load_into_with_options(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
-                    Some(&plugin_work_dir),
+                    octos_agent::PluginLoadOptions {
+                        work_dir: Some(&plugin_work_dir),
+                        synthesis_config,
+                    },
                 ) {
                     Ok(result) => {
                         child_plugin_prompt_fragments = result.prompt_fragments;
@@ -854,5 +922,67 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    /// Mutex serializing build_synthesis_config env tests in this module.
+    fn synthesis_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn build_synthesis_config_returns_full_struct_when_all_pieces_resolve() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        // SAFETY: serialized by `synthesis_env_lock`; tests are single-threaded
+        // for env-mutation purposes via the lock above.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-build-synth") };
+
+        let config = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        };
+        let cfg = build_synthesis_config(&config, "openai").expect("resolves");
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.api_key, "sk-test-build-synth");
+        assert_eq!(cfg.model, "gpt-4o-mini");
+        assert!(cfg.endpoint.contains("openai"));
+
+        // SAFETY: serialized by `synthesis_env_lock`.
+        match prev_key {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn build_synthesis_config_returns_none_without_api_key() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        // SAFETY: serialized by `synthesis_env_lock`.
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+
+        let config = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        };
+        // Without an API key the helper must return None so the plugin
+        // falls back to its env path. We verify this by ensuring the helper
+        // never accidentally returns a placeholder/empty key.
+        let cfg = build_synthesis_config(&config, "openai");
+        assert!(
+            cfg.is_none(),
+            "must not synthesize a partial config when API key is unresolvable"
+        );
+
+        // SAFETY: serialized by `synthesis_env_lock`.
+        if let Some(v) = prev_key {
+            unsafe { std::env::set_var("OPENAI_API_KEY", v) };
+        }
     }
 }

@@ -130,6 +130,34 @@ pub struct PluginToolDef {
     pub concurrency_class: Option<String>,
 }
 
+impl PluginToolDef {
+    /// Whether this tool's input schema declares it accepts host-injected
+    /// config under the named key (e.g. `"synthesis_config"`).
+    ///
+    /// Schema lookup: the manifest may either list the key under
+    /// `input_schema["x-octos-host-config-keys"]` (a string array) or define
+    /// it as a property in `input_schema["properties"]`. Either form is
+    /// sufficient — having the key in `properties` is what the plugin
+    /// actually parses; the `x-octos-host-config-keys` extension is the
+    /// explicit opt-in signal so other plugins don't accidentally receive
+    /// secrets they didn't declare.
+    pub fn accepts_host_config_key(&self, key: &str) -> bool {
+        let schema = &self.input_schema;
+        // Explicit opt-in via x-octos-host-config-keys.
+        if let Some(keys) = schema
+            .get("x-octos-host-config-keys")
+            .and_then(|v| v.as_array())
+        {
+            for k in keys {
+                if k.as_str() == Some(key) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Binary download info for a specific platform.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinaryDownload {
@@ -198,6 +226,42 @@ mod tests {
             manifest.tools[0].env,
             vec!["SMTP_PASSWORD".to_string(), "OPENAI_API_KEY".to_string()]
         );
+    }
+
+    #[test]
+    fn accepts_host_config_key_returns_false_when_extension_absent() {
+        let json = r#"{
+            "name": "p",
+            "version": "1",
+            "tools": [{
+                "name": "t",
+                "description": "d",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(!manifest.tools[0].accepts_host_config_key("synthesis_config"));
+    }
+
+    #[test]
+    fn accepts_host_config_key_honours_extension_array() {
+        let json = r#"{
+            "name": "p",
+            "version": "1",
+            "tools": [{
+                "name": "deep_search",
+                "description": "Research",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "x-octos-host-config-keys": ["synthesis_config"]
+                }
+            }]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.tools[0].accepts_host_config_key("synthesis_config"));
+        // Other keys still rejected — explicit opt-in only.
+        assert!(!manifest.tools[0].accepts_host_config_key("smtp_config"));
     }
 
     #[test]
