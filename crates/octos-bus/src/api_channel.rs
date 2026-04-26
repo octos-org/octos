@@ -1130,7 +1130,11 @@ async fn handle_chat(
                 if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
                     metadata.insert("topic".to_string(), serde_json::Value::String(topic));
                 }
-                if let Some(cmid) = req.client_message_id.filter(|value| !value.is_empty()) {
+                if let Some(cmid) = req
+                    .client_message_id
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                {
                     metadata.insert(
                         "client_message_id".to_string(),
                         serde_json::Value::String(cmid),

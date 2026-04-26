@@ -524,34 +524,6 @@ async fn chat_streaming(
                     let _ = user_event_tx.send(event.to_string());
                 }
 
-                // Emit a user-message session_result event so the web client
-                // can stamp the authoritative seq onto its optimistic bubble.
-                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
-                    let mut message_payload = serde_json::json!({
-                        "seq": seq,
-                        "role": "user",
-                        "content": content,
-                        "timestamp": timestamp,
-                    });
-                    if let Some(ref cmid) = client_message_id {
-                        if !cmid.is_empty() {
-                            message_payload
-                                .as_object_mut()
-                                .expect("json object")
-                                .insert(
-                                    "client_message_id".to_string(),
-                                    serde_json::Value::String(cmid.clone()),
-                                );
-                        }
-                    }
-                    let event = serde_json::json!({
-                        "type": "session_result",
-                        "topic": topic_for_event,
-                        "message": message_payload,
-                    });
-                    let _ = user_event_tx.send(event.to_string());
-                }
-
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
                 let model_id = provider_metadata

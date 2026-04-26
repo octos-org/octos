@@ -3317,7 +3317,7 @@ pub async fn admin_shell(
 
     // Spawn child explicitly so we can kill it on timeout (dropping the
     // future does NOT kill the child — it becomes an orphan process).
-    let mut child = cmd
+    let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -4994,7 +4994,7 @@ pub struct WeChatQrPollResponse {
 /// POST /api/admin/profiles/{id}/wechat/qr-poll
 pub async fn wechat_qr_poll(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(_id): Path<String>,
     Json(req): Json<WeChatQrPollRequest>,
 ) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
     let client = reqwest::Client::builder()
