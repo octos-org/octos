@@ -18,7 +18,7 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
@@ -255,6 +255,39 @@ fn validate_chat_request(
     Ok((agent.clone(), sessions.clone()))
 }
 
+/// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
+/// invalidate the `SessionManager` LRU cache for the key.
+///
+/// This is the unified write path for the standalone `octos serve` /chat
+/// handlers. Mirrors `ApiChannel::persist_to_session` in the gateway path
+/// — both funnel through `octos_bus::persist_message_through_canonical_path`
+/// so the storage layer is the single ordering point.
+///
+/// Returns the committed per-session sequence number so callers (e.g. the
+/// streaming handler) can correlate it back to the optimistic bubble.
+async fn persist_chat_message_through_canonical(
+    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    key: &SessionKey,
+    message: Message,
+) -> eyre::Result<usize> {
+    let data_dir = {
+        let manager = sessions.lock().await;
+        manager.data_dir()
+    };
+
+    let result = octos_bus::persist_message_through_canonical_path(&data_dir, key, message).await;
+
+    // Drop any stale `SessionManager` cache entry so a follow-up read
+    // (duplicate-detection, `?source=full`) consults disk instead of
+    // returning a pre-write empty `Session`.
+    {
+        let mut manager = sessions.lock().await;
+        manager.invalidate_cache(key);
+    }
+
+    result
+}
+
 async fn chat_sync(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -295,12 +328,11 @@ async fn chat_sync(
         "chat: response generated"
     );
 
-    // Save all conversation messages to session
-    {
-        let mut sess = sessions.lock().await;
-        for msg in &response.messages {
-            let _ = sess.add_message(&session_key, msg.clone()).await;
-        }
+    // Save all conversation messages to the canonical per-user JSONL.
+    // Funnels through the same helper the gateway-side `ApiChannel` uses so
+    // standalone deployments don't split-brain into the legacy flat layout.
+    for msg in &response.messages {
+        let _ = persist_chat_message_through_canonical(&sessions, &session_key, msg.clone()).await;
     }
 
     Ok(Json(ChatResponse {
@@ -370,8 +402,11 @@ async fn chat_streaming(
 
     let message = req.message;
     let media = req.media;
+    let client_message_id = req.client_message_id;
+    let topic_for_event = req.topic.clone();
 
     // Spawn the agent task
+    let user_event_tx = tx.clone();
     tokio::spawn(async move {
         let result = request_agent
             .process_message(&message, &history, media)
@@ -387,23 +422,103 @@ async fn chat_streaming(
                 );
 
                 // Save all conversation messages (user, assistant iterations,
-                // tool calls/results). Capture the committed seq of the final
-                // assistant message so the SSE `done` event can thread it back
-                // to the web client (M8.10-A).
+                // tool calls/results) through the canonical per-user JSONL.
+                // Pre-fix this funnelled through `SessionManager::add_message_with_seq`
+                // which wrote to the legacy flat layout — a standalone
+                // `octos serve` had no gateway-side `ApiChannel` to redirect,
+                // so messages landed in `sessions/<encoded_full_key>.jsonl`
+                // while the actor wrote to `users/.../<topic>.jsonl`.
+                //
+                // Also tag the first user message with the client-supplied
+                // `client_message_id` so the persisted row carries it through
+                // the JSONL round-trip and emit a user-message session_result
+                // event so the web client can stamp the authoritative seq onto
+                // its optimistic bubble (M8.10-A user-message counterpart).
+                //
+                // Capture the committed seq of the final assistant message
+                // so the SSE `done` event can thread it back to the web client
+                // (M8.10-A).
+                let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
                 let assistant_committed_seq: Option<u64> = {
-                    let mut sess = sessions.lock().await;
                     let mut last_assistant_seq: Option<u64> = None;
+                    let mut user_persisted = false;
                     for msg in &response.messages {
-                        match sess.add_message_with_seq(&session_key, msg.clone()).await {
-                            Ok(seq) if msg.role == octos_core::MessageRole::Assistant => {
-                                last_assistant_seq = u64::try_from(seq).ok();
+                        let mut to_save = msg.clone();
+                        if !user_persisted && msg.role == MessageRole::User {
+                            user_persisted = true;
+                            if let Some(ref cmid) = client_message_id {
+                                if !cmid.is_empty() {
+                                    to_save.client_message_id = Some(cmid.clone());
+                                }
                             }
-                            Ok(_) => {}
-                            Err(_) => {}
+                            let timestamp = to_save.timestamp.to_rfc3339();
+                            let content_for_event = to_save.content.clone();
+                            match persist_chat_message_through_canonical(
+                                &sessions,
+                                &session_key,
+                                to_save,
+                            )
+                            .await
+                            {
+                                Ok(seq) => {
+                                    user_message_seq_and_meta =
+                                        Some((seq, content_for_event, timestamp));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        error = %error,
+                                        "chat: failed to persist user message"
+                                    );
+                                }
+                            }
+                        } else {
+                            let is_assistant = msg.role == MessageRole::Assistant;
+                            match persist_chat_message_through_canonical(
+                                &sessions,
+                                &session_key,
+                                to_save,
+                            )
+                            .await
+                            {
+                                Ok(seq) if is_assistant => {
+                                    last_assistant_seq = u64::try_from(seq).ok();
+                                }
+                                Ok(_) => {}
+                                Err(_) => {}
+                            }
                         }
                     }
                     last_assistant_seq
                 };
+
+                // Emit a user-message session_result event so the web client
+                // can stamp the authoritative seq onto its optimistic bubble.
+                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
+                    let mut message_payload = serde_json::json!({
+                        "seq": seq,
+                        "role": "user",
+                        "content": content,
+                        "timestamp": timestamp,
+                    });
+                    if let Some(ref cmid) = client_message_id {
+                        if !cmid.is_empty() {
+                            message_payload
+                                .as_object_mut()
+                                .expect("json object")
+                                .insert(
+                                    "client_message_id".to_string(),
+                                    serde_json::Value::String(cmid.clone()),
+                                );
+                        }
+                    }
+                    let event = serde_json::json!({
+                        "type": "session_result",
+                        "topic": topic_for_event,
+                        "message": message_payload,
+                    });
+                    let _ = user_event_tx.send(event.to_string());
+                }
 
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
@@ -2666,15 +2781,25 @@ async fn ws_standalone_agent(
 
         match result {
             Ok(response) => {
-                // Save conversation messages to session. Capture the committed
-                // seq of the final assistant message so the WebSocket-bridged
-                // `done` event can thread it back to the web client (M8.10-A).
+                // Save conversation messages to the canonical per-user JSONL.
+                // Mirrors `chat_sync` and `chat_streaming`; closes the
+                // standalone-serve split-brain by routing through the same
+                // helper the gateway-side `ApiChannel` uses. Capture the
+                // committed seq of the final assistant message so the
+                // WebSocket-bridged `done` event can thread it back to the
+                // web client (M8.10-A).
                 let assistant_committed_seq: Option<u64> = {
-                    let mut sess = sessions.lock().await;
                     let mut last_assistant_seq: Option<u64> = None;
                     for msg in &response.messages {
-                        match sess.add_message_with_seq(&session_key2, msg.clone()).await {
-                            Ok(seq) if msg.role == octos_core::MessageRole::Assistant => {
+                        let is_assistant = msg.role == octos_core::MessageRole::Assistant;
+                        match persist_chat_message_through_canonical(
+                            &sessions,
+                            &session_key2,
+                            msg.clone(),
+                        )
+                        .await
+                        {
+                            Ok(seq) if is_assistant => {
                                 last_assistant_seq = u64::try_from(seq).ok();
                             }
                             Ok(_) => {}
@@ -3295,5 +3420,88 @@ mod tests {
         let json = r#"{"type": "unknown"}"#;
         let result = serde_json::from_str::<WsClientMsg>(json);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_sync_writes_to_canonical_per_user_topic_jsonl() {
+        // Regression for the standalone `octos serve` /chat handlers writing
+        // to the legacy flat layout instead of the canonical per-user JSONL.
+        //
+        // Pre-fix, `chat_sync`/`chat_streaming`/the websocket handler all
+        // called `SessionManager::add_message_with_seq` directly. That writes
+        // to `<data_dir>/sessions/<encoded_full_key>.jsonl` (legacy flat),
+        // not the canonical per-user `<topic>.jsonl`. A standalone deployment
+        // without a gateway-side `ApiChannel` therefore split-brained — the
+        // actor wrote to one path, handlers wrote to another, replays missed
+        // half the history.
+        //
+        // Post-fix, every `/chat` write must funnel through
+        // `persist_chat_message_through_canonical` — a wrapper around
+        // `octos_bus::persist_message_through_canonical_path` that also
+        // invalidates the `SessionManager` LRU cache (mirroring what
+        // `ApiChannel::persist_to_session` does). The contract: messages
+        // committed via this helper land in the canonical per-user JSONL
+        // and never touch the legacy flat directory.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let session_id = "web-canonical-handlers";
+        let topic = "research";
+        let key = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic);
+
+        // Drive a write through the helper the production handlers now use.
+        let seq = persist_chat_message_through_canonical(
+            &sessions,
+            &key,
+            Message::user("please summarise the q1 numbers"),
+        )
+        .await
+        .expect("canonical persist");
+        assert_eq!(seq, 0);
+
+        // Canonical per-user `<encoded_topic>.jsonl` must exist and carry
+        // the user message.
+        let encoded_base = octos_bus::session::encode_path_component(&format!(
+            "{MAIN_PROFILE_ID}:api:{session_id}"
+        ));
+        let encoded_topic = octos_bus::session::encode_path_component(topic);
+        let canonical = data_dir
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        assert!(
+            canonical.exists(),
+            "/chat handler write must land in canonical per-user JSONL ({}) — \
+             this is the unified file the SessionActor and the bus-side \
+             ApiChannel also write",
+            canonical.display()
+        );
+        let body = std::fs::read_to_string(&canonical).unwrap();
+        assert!(
+            body.contains("please summarise the q1 numbers"),
+            "canonical JSONL must contain the user message text"
+        );
+
+        // Legacy flat `sessions/<encoded_full_key>.jsonl` must NOT exist —
+        // that's the old split-brain location standalone /chat used to
+        // write to.
+        let sessions_dir = data_dir.path().join("sessions");
+        if sessions_dir.exists() {
+            for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    panic!(
+                        "/chat handler must NOT write to the legacy flat \
+                         layout (sessions/{}.jsonl) — that is the split-brain \
+                         path the storage unification PR is closing",
+                        name
+                    );
+                }
+            }
+        }
     }
 }
