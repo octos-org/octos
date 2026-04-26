@@ -455,10 +455,25 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
 
         // Create a file outside base_dir and outside /tmp/, since /tmp/ is
-        // explicitly allowlisted for generated artifacts.
+        // explicitly allowlisted for generated artifacts. Anchor the "outside"
+        // dir under the user's home directory so it's stable regardless of
+        // whether the worktree itself lives under /tmp/ (e.g. CI scratch dirs).
+        let canonical_tmp =
+            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping test_base_dir_blocks_non_tmp_outside_path: no home dir");
+            return;
+        };
+        let canonical_home = std::fs::canonicalize(&home).unwrap_or(home);
+        if canonical_home.starts_with(&canonical_tmp) {
+            eprintln!(
+                "skipping test_base_dir_blocks_non_tmp_outside_path: $HOME is under /tmp/, no stable non-tmp location available"
+            );
+            return;
+        }
         let outside_dir = tempfile::Builder::new()
             .prefix("octos-send-file-outside-")
-            .tempdir_in(std::env::current_dir().unwrap())
+            .tempdir_in(&canonical_home)
             .unwrap();
         let outside_file = outside_dir.path().join("secret.txt");
         std::fs::write(&outside_file, "secret").unwrap();
