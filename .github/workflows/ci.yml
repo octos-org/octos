@@ -90,6 +90,17 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    env:
+      # Cap parallel cargo build jobs at 2 so concurrent rustc/linker invocations
+      # do not exceed the 16GB ubuntu-latest runner budget. Linking the
+      # octos-agent --lib unit-test binary (78MB stripped, ~2GB+ peak rustc RSS
+      # against a 144MB rlib + chromiumoxide/lettre/etc.) at default parallelism
+      # was OOM-killing the runner during the `Test octos-agent (lib)` step,
+      # producing the "hosted runner lost communication with the server" error
+      # (~45min into the run before the runner died). Mirrors the existing
+      # CARGO_BUILD_JOBS="2" guard on check-arm and check-riscv, which already
+      # use this mitigation for the same 16GB memory budget.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v6
         with:
