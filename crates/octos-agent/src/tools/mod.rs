@@ -368,6 +368,13 @@ pub struct ToolResult {
     pub files_to_send: Vec<PathBuf>,
     /// Tokens used by this tool (for subagent tools).
     pub tokens_used: Option<TokenUsage>,
+    /// Optional structured side-channel for tool-specific metadata the host
+    /// wants to surface beyond plain output text. Used today for per-node
+    /// cost rows from `run_pipeline` (`{"node_costs": [...]}`); the session
+    /// actor pulls this back into the SSE `done` event so the W1.G4 cost
+    /// panel can render real per-node attribution. Absent (`None`) for
+    /// every tool that does not opt in — keeps legacy callers byte-identical.
+    pub structured_metadata: Option<serde_json::Value>,
 }
 
 /// Trait for implementing tools.
