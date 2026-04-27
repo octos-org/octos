@@ -198,7 +198,11 @@ where
             sources_observed,
             sources_with_metrics,
             sources_without_metrics,
-            partial: gateways_missing_api_port > 0 || scrape_failures > 0,
+            partial: collection_is_partial(
+                gateways_missing_api_port,
+                scrape_failures,
+                sources_without_metrics,
+            ),
         },
         totals,
         breakdowns,
@@ -217,6 +221,14 @@ fn empty_collection() -> OperatorSummaryCollection {
         sources_without_metrics: 0,
         partial: false,
     }
+}
+
+fn collection_is_partial(
+    gateways_missing_api_port: usize,
+    scrape_failures: usize,
+    sources_without_metrics: usize,
+) -> bool {
+    gateways_missing_api_port > 0 || scrape_failures > 0 || sources_without_metrics > 0
 }
 
 fn build_operator_summary_parts(
@@ -1179,6 +1191,89 @@ octos_session_replay_total{kind="committed_session_result",outcome="replayed"} 4
         assert_eq!(beta.scrape_status, "failed");
         assert_eq!(beta.scrape_error.as_deref(), Some("http 503"));
         assert!(!beta.available);
+    }
+
+    #[test]
+    fn operator_summary_marks_collection_partial_when_observed_source_has_no_metrics() {
+        let summary = build_operator_summary_from_sources([
+            OperatorSummarySourceInput {
+                scope: "serve".into(),
+                profile_id: None,
+                scrape_status: "local".into(),
+                scrape_error: None,
+                api_port: None,
+                pid: None,
+                started_at: None,
+                uptime_secs: None,
+                metrics_text: Some("octos_session_persist_total{outcome=\"ok\"} 2".into()),
+            },
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("alpha".into()),
+                scrape_status: "scraped".into(),
+                scrape_error: None,
+                api_port: Some(51001),
+                pid: Some(4242),
+                started_at: Some("2026-04-17T00:00:00Z".into()),
+                uptime_secs: Some(120),
+                metrics_text: Some(String::new()),
+            },
+        ]);
+
+        assert!(summary.available);
+        assert_eq!(summary.collection.gateways_missing_api_port, 0);
+        assert_eq!(summary.collection.scrape_failures, 0);
+        assert_eq!(summary.collection.sources_observed, 2);
+        assert_eq!(summary.collection.sources_with_metrics, 1);
+        assert_eq!(summary.collection.sources_without_metrics, 1);
+        assert!(summary.collection.partial);
+
+        let alpha = summary
+            .sources
+            .iter()
+            .find(|source| source.profile_id.as_deref() == Some("alpha"))
+            .unwrap();
+        assert_eq!(alpha.scrape_status, "scraped");
+        assert!(!alpha.available);
+        assert_eq!(alpha.sample_count, 0);
+    }
+
+    #[test]
+    fn operator_summary_marks_collection_complete_when_all_sources_have_metrics() {
+        let summary = build_operator_summary_from_sources([
+            OperatorSummarySourceInput {
+                scope: "serve".into(),
+                profile_id: None,
+                scrape_status: "local".into(),
+                scrape_error: None,
+                api_port: None,
+                pid: None,
+                started_at: None,
+                uptime_secs: None,
+                metrics_text: Some("octos_timeout_total{reason=\"session_turn\"} 2".into()),
+            },
+            OperatorSummarySourceInput {
+                scope: "gateway".into(),
+                profile_id: Some("alpha".into()),
+                scrape_status: "scraped".into(),
+                scrape_error: None,
+                api_port: Some(51001),
+                pid: Some(4242),
+                started_at: Some("2026-04-17T00:00:00Z".into()),
+                uptime_secs: Some(120),
+                metrics_text: Some(
+                    "octos_retry_total{reason=\"background_result_ack_timeout\"} 3".into(),
+                ),
+            },
+        ]);
+
+        assert!(summary.available);
+        assert_eq!(summary.collection.gateways_missing_api_port, 0);
+        assert_eq!(summary.collection.scrape_failures, 0);
+        assert_eq!(summary.collection.sources_observed, 2);
+        assert_eq!(summary.collection.sources_with_metrics, 2);
+        assert_eq!(summary.collection.sources_without_metrics, 0);
+        assert!(!summary.collection.partial);
     }
 
     // ── Operator harness task aggregation ────────────────────────────
