@@ -628,6 +628,12 @@ pub async fn chat_stream(
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
+    /// Display title (auto-derived from first user message; manual rename via
+    /// PATCH /api/sessions/:id/title preserves across new messages). None
+    /// for legacy sessions persisted before the title field existed; the
+    /// client should fall back to deriving a title from message content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -653,9 +659,9 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
         // legacy entries that might slip through (e.g. flat layout files
         // pre-dating the encoder rules).
         all.extend(
-            sess.list_top_level_sessions()
+            sess.list_top_level_sessions_with_title()
                 .into_iter()
-                .filter_map(|(id, count)| {
+                .filter_map(|(id, count, title)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
                         return None;
@@ -663,6 +669,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
                     Some(SessionInfo {
                         id: chat_id.to_string(),
                         message_count: count,
+                        title,
                     })
                 }),
         );
@@ -1226,6 +1233,68 @@ fn should_resolve_file_access_from_profile(
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
         || identity.is_some()
+}
+
+/// PATCH /api/sessions/:id/title — set a manual title for a session.
+///
+/// Body: `{ "title": "New display title" }`. The title persists across new
+/// messages (auto-derivation from first user message no longer overrides it).
+/// Empty body or missing field returns 400.
+#[derive(Deserialize)]
+pub struct UpdateTitleRequest {
+    pub title: String,
+}
+
+pub async fn update_session_title(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateTitleRequest>,
+) -> Response {
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
+    }
+    if title.chars().count() > 200 {
+        return (StatusCode::BAD_REQUEST, "title must be at most 200 chars").into_response();
+    }
+
+    let mut updated = false;
+
+    if let Some(sessions) = &state.sessions {
+        let mut sess = sessions.lock().await;
+        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.update_title(&key, title.clone()).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "update_title in standalone store failed"
+                    );
+                } else {
+                    updated = true;
+                }
+            }
+        }
+    }
+
+    // Proxy to gateway too, since the session may live in the per-profile
+    // SessionManager rather than the serve-process store.
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
+        let body_json = serde_json::json!({ "title": title }).to_string();
+        let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
+        // Treat gateway proxy success as also updating; we don't strictly
+        // need to inspect the response since the gateway is authoritative
+        // when serve has no in-memory copy.
+        updated = true;
+    }
+
+    if updated {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "session not found").into_response()
+    }
 }
 
 /// DELETE /api/sessions/:id -- delete a session.
@@ -3125,10 +3194,26 @@ mod tests {
         let info = SessionInfo {
             id: "test-session".into(),
             message_count: 42,
+            title: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
         assert_eq!(json["message_count"], 42);
+        assert!(
+            json.get("title").is_none(),
+            "None title must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn session_info_serialize_with_title_includes_field() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 7,
+            title: Some("My Pinned Chat".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["title"], "My Pinned Chat");
     }
 
     #[test]

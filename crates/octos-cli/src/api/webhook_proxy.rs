@@ -479,6 +479,30 @@ pub async fn api_post_proxy_json(
     response
 }
 
+/// Proxy a PATCH request with a JSON body to the gateway's API channel.
+pub async fn api_patch_proxy(state: &AppState, port: u16, path: &str, body: String) -> Response {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = match state
+        .http_client
+        .patch(&url)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(port, error = %e, "API PATCH proxy failed");
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("gateway proxy failed: {e}"),
+            );
+        }
+    };
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    status.into_response()
+}
+
 /// Proxy a DELETE request to the gateway's API channel.
 pub async fn api_delete_proxy(state: &AppState, port: u16, path: &str) -> Response {
     let url = format!("http://127.0.0.1:{port}{path}");
