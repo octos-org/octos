@@ -17,7 +17,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use chrono::Utc;
 use eyre::Result;
 use futures::stream::{self, StreamExt};
@@ -679,6 +679,7 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
             .route("/sessions/{id}", delete(handle_delete_session))
+            .route("/sessions/{id}/title", patch(handle_update_session_title))
             // M7.9 / W2 — task supervisor exposure
             .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
             .route(
@@ -1308,6 +1309,10 @@ async fn handle_session_event_stream(
 struct SessionInfo {
     id: String,
     message_count: usize,
+    /// Display title from the session's JSONL meta line (auto-derived from
+    /// first user message, or set manually). None for legacy sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1858,9 +1863,9 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
-        .list_top_level_sessions()
+        .list_top_level_sessions_with_title()
         .into_iter()
-        .filter_map(|(id, count)| {
+        .filter_map(|(id, count, title)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
             if !seen.insert(chat_id.clone()) {
                 return None;
@@ -1868,6 +1873,7 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
             Some(SessionInfo {
                 id: chat_id,
                 message_count: count,
+                title,
             })
         })
         .collect();
@@ -1983,6 +1989,47 @@ async fn handle_delete_session(
     }
     // No session found — still return 204 (idempotent delete).
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct UpdateSessionTitleRequest {
+    title: String,
+}
+
+/// PATCH /sessions/:id/title — set a manual title.
+async fn handle_update_session_title(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateSessionTitleRequest>,
+) -> Response {
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
+    }
+    if title.chars().count() > 200 {
+        return (StatusCode::BAD_REQUEST, "title must be at most 200 chars").into_response();
+    }
+
+    let mut sess = state.sessions.lock().await;
+    let mut updated = false;
+    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+        if sess.load(&candidate).await.is_some() {
+            match sess.update_title(&candidate, title.clone()).await {
+                Ok(()) => updated = true,
+                Err(error) => tracing::error!(
+                    session_key = %candidate,
+                    error = %error,
+                    "update_title in gateway store failed"
+                ),
+            }
+        }
+    }
+
+    if updated {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "session not found").into_response()
+    }
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.

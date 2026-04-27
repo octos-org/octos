@@ -382,6 +382,14 @@ impl SessionManager {
         self.list_sessions_inner(false)
     }
 
+    /// Like [`Self::list_sessions`] but also returns persisted title.
+    ///
+    /// None for sessions persisted before #617. Used by the gateway's
+    /// `GET /sessions` endpoint to surface server-authoritative titles.
+    pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
+        self.list_sessions_inner_with_title(false)
+    }
+
     /// List only top-level sessions — those whose topic is empty (the
     /// canonical `default.jsonl` per user dir) or a user-facing topic such
     /// as `research`. Internal runtime topics (`child-*` spawn fanouts and
