@@ -486,6 +486,23 @@ fn record_child_session_orphan(reason: &'static str) {
     .increment(1);
 }
 
+/// Returns true if the given runtime_state is a terminal state. The
+/// non-terminal complement is the set of states that, on supervisor
+/// restart, indicate an orphaned task whose owning worker is gone.
+///
+/// `Completed`, `Failed`, and `Cancelled` are terminal: the worker has
+/// already driven the task to a final state and persisted the outcome.
+/// Anything else (`Spawned`, `ExecutingTool`, `ResolvingOutputs`,
+/// `VerifyingOutputs`, `DeliveringOutputs`, `CleaningUp`) means the
+/// owning worker was mid-flight when the runtime stopped, so on restart
+/// the task is an orphan with no live actor behind it.
+fn is_terminal_runtime_state(state: &TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Completed | TaskRuntimeState::Failed | TaskRuntimeState::Cancelled
+    )
+}
+
 fn record_workflow_phase_transition(workflow_kind: &str, from_phase: &str, to_phase: &str) {
     counter!(
         "octos_workflow_phase_transition_total",
@@ -952,6 +969,23 @@ impl TaskSupervisor {
     }
 
     /// Enable append-only persistence for task snapshots and restore existing state.
+    ///
+    /// At the end of replay, sweeps the in-memory map for any task whose
+    /// `runtime_state` is non-terminal (anything other than `Completed`,
+    /// `Failed`, or `Cancelled`). Those tasks are orphans — the worker
+    /// process that owned them died across the restart, so no live actor
+    /// will ever drive them to a terminal state. They are marked
+    /// `Failed("orphaned across restart")` via the standard `mark_failed`
+    /// path so the JSONL ledger gets a proper terminal entry and re-loading
+    /// is idempotent. The `octos_orphaned_tasks_reaped_total` counter is
+    /// incremented per reaped task.
+    ///
+    /// This handles startup-time orphans only: at this point in startup no
+    /// new work has been scheduled yet, so any non-terminal runtime_state
+    /// definitionally has no live worker. In-flight orphans inside a
+    /// long-running supervisor (worker hangs / crashes silently while the
+    /// supervisor itself stays alive) are NOT addressed here — that needs
+    /// a heartbeat-based reaper, which is a follow-up if observed.
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -990,6 +1024,26 @@ impl TaskSupervisor {
         };
         for task in snapshots {
             self.persist_snapshot(&task);
+        }
+
+        // Sweep orphans: any task whose runtime_state is non-terminal at
+        // this point has no live worker behind it (we are still in startup,
+        // no new work has been scheduled yet). Mark them Failed via the
+        // standard mark_failed path so the JSONL ledger gets a proper
+        // terminal entry and re-loading is idempotent.
+        let orphans: Vec<String> = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks
+                .values()
+                .filter(|task| !is_terminal_runtime_state(&task.runtime_state))
+                .map(|task| task.id.clone())
+                .collect()
+        };
+        for task_id in &orphans {
+            self.mark_failed(task_id, "orphaned across restart".to_string());
+        }
+        if !orphans.is_empty() {
+            counter!("octos_orphaned_tasks_reaped_total").increment(orphans.len() as u64);
         }
 
         Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
@@ -2157,7 +2211,16 @@ mod tests {
         assert_eq!(detail["workflow_kind"], "deep_research");
         assert_eq!(detail["current_phase"], "fetch");
         assert_eq!(detail["progress_message"], "Fetching 4 pages");
-        assert_eq!(task.status, TaskStatus::Running);
+        // Across restart, the in-flight task has no live worker — the orphan
+        // reaper marks it Failed so callers observe a clean terminal state.
+        // The harness progress detail still survives so operators can inspect
+        // where the task was when the runtime died.
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error.as_deref(),
+            Some("orphaned across restart"),
+            "orphan reaper must record a stable error message"
+        );
     }
 
     #[test]
@@ -2270,8 +2333,18 @@ mod tests {
         let tasks = restored.get_all_tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, task_id);
-        assert_eq!(tasks[0].status, TaskStatus::Running);
-        assert_eq!(tasks[0].runtime_state, TaskRuntimeState::ResolvingOutputs);
+        // The orphan reaper marks non-terminal tasks Failed at startup —
+        // their owning workers are gone. Metadata (lineage, ledger path,
+        // last-known runtime_detail) is preserved for operator diagnosis.
+        assert_eq!(tasks[0].status, TaskStatus::Failed);
+        assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Failed);
+        assert_eq!(
+            tasks[0].error.as_deref(),
+            Some("orphaned across restart"),
+            "orphan reaper must mark restored running tasks Failed"
+        );
+        // runtime_detail (the last live progress payload) survives the
+        // reap so operators can see where the task was when the worker died.
         assert_eq!(
             tasks[0].runtime_detail.as_deref(),
             Some("collecting evidence")
@@ -3294,5 +3367,114 @@ mod tests {
             id.is_empty(),
             "legacy register must return empty-string sentinel when refused"
         );
+    }
+
+    #[test]
+    fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
+        // The bug: when the runtime crashes mid-task, the JSONL ledger has a
+        // non-terminal entry for the in-flight task (Running / ResolvingOutputs
+        // / etc) but no Completed/Failed event. On restart, the supervisor
+        // restored that state verbatim — leaving the task forever
+        // non-terminal because no live worker is backing it anymore.
+        //
+        // The fix: after replay, any task whose runtime_state is non-terminal
+        // is reaped — marked Failed("orphaned across restart") — so callers
+        // observing the supervisor see a clean state.
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger_path = dir.path().join("tasks.jsonl");
+
+        // Phase 1: simulate a previous run that registered two tasks. Task A
+        // is left mid-flight (Running). Task B reached terminal Completed.
+        let supervisor = TaskSupervisor::new();
+        supervisor.enable_persistence(&ledger_path).unwrap();
+        let task_a =
+            supervisor.register_with_lineage("deep_search", "call-a", Some("api:session"), None);
+        supervisor.mark_running(&task_a);
+        let task_b =
+            supervisor.register_with_lineage("fm_tts", "call-b", Some("api:session"), None);
+        supervisor.mark_completed(&task_b, vec!["/tmp/voice.mp3".to_string()]);
+        // Drop the first supervisor — its in-flight worker for task_a is gone.
+        drop(supervisor);
+
+        // Phase 2: a fresh supervisor replays the ledger and must reap the
+        // orphaned non-terminal task.
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&ledger_path).unwrap();
+
+        let reaped = restored
+            .get_task(&task_a)
+            .expect("orphan task must still be tracked after reap");
+        assert_eq!(
+            reaped.status,
+            TaskStatus::Failed,
+            "orphan task must be marked Failed at startup"
+        );
+        assert_eq!(reaped.runtime_state, TaskRuntimeState::Failed);
+        let error = reaped.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("orphaned") || error.contains("restart"),
+            "orphan task error must mention orphan/restart, got {error:?}"
+        );
+        assert!(
+            reaped.completed_at.is_some(),
+            "orphan task must have a completed_at timestamp"
+        );
+
+        let surviving = restored
+            .get_task(&task_b)
+            .expect("completed task must still be tracked after reap");
+        assert_eq!(
+            surviving.status,
+            TaskStatus::Completed,
+            "terminal tasks must not be reaped"
+        );
+        assert_eq!(surviving.runtime_state, TaskRuntimeState::Completed);
+
+        // Idempotency: a third supervisor replaying the same ledger must see
+        // task_a already terminal (because the reaper appended a Failed event).
+        let restored_again = TaskSupervisor::new();
+        restored_again.enable_persistence(&ledger_path).unwrap();
+        let reread = restored_again
+            .get_task(&task_a)
+            .expect("orphan task still tracked on second replay");
+        assert_eq!(reread.status, TaskStatus::Failed);
+        let reread_error = reread.error.as_deref().unwrap_or("");
+        assert!(
+            reread_error.contains("orphaned") || reread_error.contains("restart"),
+            "orphan task error must persist across replay, got {reread_error:?}"
+        );
+        // The completed task is unaffected on replay.
+        let reread_b = restored_again
+            .get_task(&task_b)
+            .expect("completed task still tracked on second replay");
+        assert_eq!(reread_b.status, TaskStatus::Completed);
+
+        // Cancelled tasks must also be respected as terminal — they should
+        // not be reaped a second time. Add a cancelled task to the ledger,
+        // reload, and assert the cancellation survives.
+        let cancel_supervisor = restored_again;
+        let task_c = cancel_supervisor.register_with_lineage(
+            "run_pipeline",
+            "call-c",
+            Some("api:session"),
+            None,
+        );
+        cancel_supervisor.mark_running(&task_c);
+        cancel_supervisor
+            .cancel(&task_c)
+            .expect("cancel should succeed");
+        drop(cancel_supervisor);
+        let final_reload = TaskSupervisor::new();
+        final_reload.enable_persistence(&ledger_path).unwrap();
+        let cancelled = final_reload
+            .get_task(&task_c)
+            .expect("cancelled task still tracked after reload");
+        assert_eq!(
+            cancelled.status,
+            TaskStatus::Cancelled,
+            "cancelled tasks must not be reaped"
+        );
+        assert_eq!(cancelled.runtime_state, TaskRuntimeState::Cancelled);
     }
 }
