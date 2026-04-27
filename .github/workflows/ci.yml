@@ -97,10 +97,11 @@ jobs:
       # against a 144MB rlib + chromiumoxide/lettre/etc.) at default parallelism
       # was OOM-killing the runner during the `Test octos-agent (lib)` step,
       # producing the "hosted runner lost communication with the server" error
-      # (~45min into the run before the runner died). Mirrors the existing
-      # CARGO_BUILD_JOBS="2" guard on check-arm and check-riscv, which already
-      # use this mitigation for the same 16GB memory budget.
-      CARGO_BUILD_JOBS: "2"
+      # (~45min into the run before the runner died). Even with =2 the runner
+      # OOMed at ~54min — the linker peak RSS spikes when two heavy crates
+      # link simultaneously (octos-agent + octos-cli). Drop to =1 to fully
+      # serialise heavy linkers; the check job is slow but no longer dies.
+      CARGO_BUILD_JOBS: "1"
     steps:
       - uses: actions/checkout@v6
         with:
