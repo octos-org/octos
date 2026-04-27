@@ -1848,11 +1848,17 @@ async fn handle_task_relaunch(
 }
 
 /// GET /sessions — list all API sessions.
+///
+/// Backed by `list_top_level_sessions` so internal `child-*` spawn fanouts
+/// and `*.tasks` ledger sidecars are skipped at the directory walk. The
+/// generic `list_sessions` is O(N) over every JSONL on disk and was
+/// observed to hang 30s+ on a user dir with 65k+ child JSONLs (river /
+/// mini4) — see issue #607 §D.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
-        .list_sessions()
+        .list_top_level_sessions()
         .into_iter()
         .filter_map(|(id, count)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
