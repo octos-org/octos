@@ -8,12 +8,12 @@
 //! The supervisor only sees truth-checked states: `Completed` means the
 //! workspace contract was satisfied, `Failed` means it was not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use metrics::counter;
@@ -25,6 +25,65 @@ use crate::harness_events::{HarnessEvent, HarnessEventPayload};
 use crate::progress::{ProgressEvent, ProgressReporter};
 
 const CURRENT_TASK_LEDGER_SCHEMA: u32 = 1;
+
+/// Cap on the number of child tasks any single parent session may register
+/// in the supervisor. Hit by the mini4/river runaway: a pipeline node spawned
+/// 65,535 children into a single session before the host disk filled up.
+///
+/// Beyond this cap [`TaskSupervisor::try_register_with_input`] returns
+/// [`RegisterTaskError::ChildFanoutExceeded`], the legacy
+/// `register*` entry points return an empty-string sentinel, and every
+/// currently-active child of that parent is force-marked `Failed` with a
+/// structured reason so the runaway loop's downstream registers see the
+/// poisoned state and stop submitting.
+///
+/// Override at process start by setting the `OCTOS_MAX_CHILDREN_PER_PARENT`
+/// env var to a positive integer; the value is parsed once and cached.
+pub const MAX_CHILDREN_PER_PARENT: usize = 200;
+
+fn max_children_per_parent() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("OCTOS_MAX_CHILDREN_PER_PARENT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|cap| *cap > 0)
+            .unwrap_or(MAX_CHILDREN_PER_PARENT)
+    })
+}
+
+/// Error variants for [`TaskSupervisor::try_register_with_input`] and the
+/// other strict registration entry points. Currently all callers map this to
+/// a structured failure log; the variant stays an enum so we can grow new
+/// rejection reasons (e.g. shutdown, quota) without breaking the public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterTaskError {
+    /// The parent session already has at least `cap` registered children
+    /// (active + terminal). The runaway-prevention cap fired; the caller
+    /// must surface this as a tool failure rather than re-trying.
+    ChildFanoutExceeded {
+        parent_session_key: String,
+        count: usize,
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for RegisterTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChildFanoutExceeded {
+                parent_session_key,
+                count,
+                cap,
+            } => write!(
+                f,
+                "child fanout exceeded ({count} of {cap}) for parent session '{parent_session_key}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegisterTaskError {}
 
 /// Lifecycle status of a background task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -843,6 +902,11 @@ fn runtime_state_label(state: &TaskRuntimeState) -> &'static str {
 #[derive(Clone)]
 pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+    /// Set of parent session keys that have hit the per-parent child cap
+    /// (see [`MAX_CHILDREN_PER_PARENT`]). Once a parent is poisoned every
+    /// subsequent register call short-circuits to refuse so the runaway
+    /// loop cannot keep adding children.
+    poisoned_parents: Arc<Mutex<HashSet<String>>>,
     on_change: Arc<Mutex<Option<OnChangeCallback>>>,
     on_failure: Arc<Mutex<Option<OnFailureCallback>>>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
@@ -877,6 +941,7 @@ impl TaskSupervisor {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            poisoned_parents: Arc::new(Mutex::new(HashSet::new())),
             on_change: Arc::new(Mutex::new(None)),
             on_failure: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
@@ -1115,7 +1180,11 @@ impl TaskSupervisor {
         });
     }
 
-    /// Register a new background task. Returns the generated task ID.
+    /// Register a new background task. Returns the generated task ID, or
+    /// an empty-string sentinel when the parent's child fan-out cap fired
+    /// (see [`MAX_CHILDREN_PER_PARENT`] and
+    /// [`Self::try_register_with_input`]). Callers that need strict
+    /// rejection semantics should use [`Self::try_register_with_input`].
     pub fn register(
         &self,
         tool_name: &str,
@@ -1126,6 +1195,8 @@ impl TaskSupervisor {
     }
 
     /// Register a new background task with optional ledger-path lineage.
+    /// Returns an empty-string sentinel on cap rejection — see
+    /// [`Self::register`] for details.
     pub fn register_with_lineage(
         &self,
         tool_name: &str,
@@ -1133,12 +1204,26 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
     ) -> String {
-        self.register_full(tool_name, tool_call_id, session_key, task_ledger_path, None)
+        match self.register_full(tool_name, tool_call_id, session_key, task_ledger_path, None) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(
+                    tool = tool_name,
+                    tool_call_id = tool_call_id,
+                    session_key = ?session_key,
+                    error = %error,
+                    "task supervisor register refused (legacy entry point); returning empty id"
+                );
+                String::new()
+            }
+        }
     }
 
     /// Register a new background task with optional ledger-path lineage and
     /// the original tool input. The tool input is preserved so failure
     /// signals can include it without re-walking the message history.
+    /// Returns an empty-string sentinel on cap rejection — see
+    /// [`Self::register`] for details.
     pub fn register_with_input(
         &self,
         tool_name: &str,
@@ -1146,6 +1231,32 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         tool_input: Option<Value>,
     ) -> String {
+        match self.register_full(tool_name, tool_call_id, session_key, None, tool_input) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(
+                    tool = tool_name,
+                    tool_call_id = tool_call_id,
+                    session_key = ?session_key,
+                    error = %error,
+                    "task supervisor register_with_input refused (legacy entry point); returning empty id"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Strict variant of [`Self::register_with_input`]: returns the typed
+    /// [`RegisterTaskError`] on cap rejection so callers can surface a
+    /// structured tool failure instead of swallowing the empty-string
+    /// sentinel that the legacy entry points return for compatibility.
+    pub fn try_register_with_input(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        tool_input: Option<Value>,
+    ) -> Result<String, RegisterTaskError> {
         self.register_full(tool_name, tool_call_id, session_key, None, tool_input)
     }
 
@@ -1156,7 +1267,102 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
         tool_input: Option<Value>,
-    ) -> String {
+    ) -> Result<String, RegisterTaskError> {
+        // Per-parent fan-out cap. Detached registrations (`session_key ==
+        // None`) skip the gate because they do not have a parent to
+        // attribute the count to — those are MCP/test bookkeeping calls
+        // and stay capped only by host process memory.
+        if let Some(parent_session_key) = session_key {
+            let cap = max_children_per_parent();
+
+            // Fast path: a previously-poisoned parent stays poisoned for the
+            // lifetime of the supervisor so the runaway loop's downstream
+            // registers see the rejection without re-counting.
+            let already_poisoned = self
+                .poisoned_parents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(parent_session_key);
+            if already_poisoned {
+                let count = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                    .count();
+                let error = RegisterTaskError::ChildFanoutExceeded {
+                    parent_session_key: parent_session_key.to_string(),
+                    count,
+                    cap,
+                };
+                tracing::warn!(
+                    parent_session_key = parent_session_key,
+                    count,
+                    cap,
+                    "task supervisor refusing register: parent already poisoned"
+                );
+                record_child_session_lifecycle("tracked", "refused_poisoned");
+                return Err(error);
+            }
+
+            let current_count = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .filter(|task| task.parent_session_key.as_deref() == Some(parent_session_key))
+                .count();
+            if current_count >= cap {
+                // Mark the parent session as poisoned so subsequent
+                // attempts fail fast without re-counting.
+                self.poisoned_parents
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(parent_session_key.to_string());
+
+                let reason = format!("child fanout exceeded ({current_count} of {cap})");
+
+                // Force-fail every still-active child of the runaway
+                // parent so the cascade collapses instead of waiting on
+                // each child to finish on its own. Snapshot the active
+                // ids first so the per-id `mark_failed` does not deadlock
+                // on the supervisor's `tasks` mutex.
+                let active_children: Vec<String> = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|task| {
+                        task.parent_session_key.as_deref() == Some(parent_session_key)
+                            && task.status.is_active()
+                    })
+                    .map(|task| task.id.clone())
+                    .collect();
+                for child_id in active_children {
+                    self.mark_failed(&child_id, reason.clone());
+                }
+
+                let error = RegisterTaskError::ChildFanoutExceeded {
+                    parent_session_key: parent_session_key.to_string(),
+                    count: current_count,
+                    cap,
+                };
+                tracing::error!(
+                    parent_session_key = parent_session_key,
+                    count = current_count,
+                    cap,
+                    "task supervisor refusing register: child fanout cap exceeded"
+                );
+                counter!(
+                    "octos_task_supervisor_fanout_rejected_total",
+                    "reason" => "child_fanout_exceeded".to_string()
+                )
+                .increment(1);
+                return Err(error);
+            }
+        }
+
         let id = TaskId::new().to_string();
         let derived_child_session_key = session_key.map(|parent| format!("{parent}#child-{id}"));
         let task = BackgroundTask {
@@ -1199,7 +1405,7 @@ impl TaskSupervisor {
                 "detached"
             },
         );
-        id
+        Ok(id)
     }
 
     /// Attach (or replace) the tool input for an already-registered task.
@@ -2971,5 +3177,122 @@ mod tests {
                 .expect("waiter task panicked");
         });
         assert!(token.is_cancelled());
+    }
+
+    /// Guard A regression: a parent session that has already accepted
+    /// `MAX_CHILDREN_PER_PARENT` children must refuse the next register
+    /// with a structured `ChildFanoutExceeded` error and force-fail every
+    /// still-active child so the cascade collapses.
+    #[test]
+    fn register_task_refuses_201st_child_for_same_parent() {
+        // Use a smaller cap via env var so the test does not allocate
+        // 200+ tasks in CI. The cap reader caches once per process — we
+        // run this test in isolation with a fresh `TaskSupervisor` and a
+        // sub-process-friendly cap value that is set before any other
+        // register call resolves the cache.
+        //
+        // Note: setting `OCTOS_MAX_CHILDREN_PER_PARENT` here would be
+        // racy because `max_children_per_parent` caches with `OnceLock`.
+        // Instead we exercise the production cap (200) — register 200
+        // children, then assert the 201st is refused.
+        let parent_session = "api:test-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            let id = supervisor
+                .try_register_with_input("tts", &format!("call-{i}"), Some(parent_session), None)
+                .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+            // Mark a slice of the children as active (Running) so the
+            // force-fail cascade has something to flip on the 201st
+            // call. Leaving every task in Spawned (also active) works
+            // identically.
+            if i % 2 == 0 {
+                supervisor.mark_running(&id);
+            }
+        }
+        assert_eq!(
+            supervisor.get_tasks_for_session(parent_session).len(),
+            MAX_CHILDREN_PER_PARENT,
+            "supervisor should hold exactly the cap before the refusal fires"
+        );
+
+        // The 201st register must be refused with a typed error that
+        // carries the count, cap, and the parent session key.
+        let err = supervisor
+            .try_register_with_input("tts", "call-overflow", Some(parent_session), None)
+            .expect_err("201st child must be refused");
+        match err {
+            RegisterTaskError::ChildFanoutExceeded {
+                parent_session_key,
+                count,
+                cap,
+            } => {
+                assert_eq!(parent_session_key, parent_session);
+                assert_eq!(count, MAX_CHILDREN_PER_PARENT);
+                assert_eq!(cap, MAX_CHILDREN_PER_PARENT);
+            }
+        }
+
+        // The cap rejection must not leak a new task into the
+        // supervisor — count stays at the cap.
+        assert_eq!(
+            supervisor.get_tasks_for_session(parent_session).len(),
+            MAX_CHILDREN_PER_PARENT,
+            "refused register must not insert a new task"
+        );
+
+        // Every still-active child of the runaway parent should have
+        // been force-marked `Failed` with the structured reason so the
+        // cascade collapses instead of waiting on each child to finish.
+        let expected_reason = format!(
+            "child fanout exceeded ({} of {})",
+            MAX_CHILDREN_PER_PARENT, MAX_CHILDREN_PER_PARENT
+        );
+        let tasks = supervisor.get_tasks_for_session(parent_session);
+        let any_active = tasks.iter().any(|t| t.status.is_active());
+        assert!(
+            !any_active,
+            "every active child should be flipped to Failed after the cap fires"
+        );
+        let failed_with_reason = tasks
+            .iter()
+            .filter(|t| {
+                t.status == TaskStatus::Failed
+                    && t.error.as_deref() == Some(expected_reason.as_str())
+            })
+            .count();
+        assert!(
+            failed_with_reason > 0,
+            "at least one child should carry the structured fan-out reason"
+        );
+
+        // A subsequent attempt against the same poisoned parent must
+        // continue to be refused (fast-path via `poisoned_parents`).
+        let err = supervisor
+            .try_register_with_input("tts", "call-after-overflow", Some(parent_session), None)
+            .expect_err("poisoned parent must keep refusing further registers");
+        assert!(matches!(err, RegisterTaskError::ChildFanoutExceeded { .. }));
+
+        // A fresh, distinct parent session is unaffected.
+        let other = supervisor
+            .try_register_with_input("tts", "call-other-1", Some("api:other-parent"), None)
+            .expect("other parents stay unaffected by a poisoned peer");
+        assert!(!other.is_empty());
+    }
+
+    /// The legacy `register_with_input` entry point keeps returning a
+    /// `String`; on cap rejection it returns an empty-string sentinel
+    /// rather than panicking so existing call sites still type-check.
+    #[test]
+    fn legacy_register_returns_empty_string_on_cap_rejection() {
+        let parent_session = "api:legacy-parent";
+        let supervisor = TaskSupervisor::new();
+        for i in 0..MAX_CHILDREN_PER_PARENT {
+            supervisor.register("tts", &format!("call-{i}"), Some(parent_session));
+        }
+        let id = supervisor.register("tts", "call-overflow", Some(parent_session));
+        assert!(
+            id.is_empty(),
+            "legacy register must return empty-string sentinel when refused"
+        );
     }
 }

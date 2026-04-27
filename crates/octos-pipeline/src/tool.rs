@@ -332,6 +332,7 @@ impl Tool for RunPipelineTool {
             status_bridge,
             shutdown: shutdown.clone(),
             max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
             checkpoint_store: None,
             hook_executor: None,
             // coding-blue FA-7: adopt workspace-contract enforcement.

@@ -112,6 +112,7 @@ fn base_config(
         status_bridge: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 1,
+        max_pipeline_fanout_total: None,
         checkpoint_store: store,
         hook_executor: None,
         workspace_context: octos_pipeline::context::PipelineContext::default(),

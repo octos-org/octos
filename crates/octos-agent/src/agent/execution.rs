@@ -149,6 +149,11 @@ impl Agent {
         // off this turn's TOOL_CTX (pipeline workers, spawn children).
         let cost_accountant = self.cost_accountant.clone();
         let parent_session_key = self.parent_session_key.clone();
+        // Guard C (issue #607): inherit the agent's spawn nesting depth
+        // so the foreground and spawn_only `ToolContext` builders below
+        // both stamp it onto every tool call. The spawn tool reads
+        // `ctx.spawn_depth` and refuses further nesting at the cap.
+        let spawn_depth = self.spawn_depth;
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -260,6 +265,9 @@ impl Agent {
                 let bg_task_supervisor = Some(bg_supervisor.clone());
                 let bg_cost_accountant = cost_accountant.clone();
                 let bg_parent_session_key = parent_session_key.clone();
+                // Guard C (issue #607): clone the agent's spawn nesting
+                // depth into the spawn_only TOOL_CTX builder.
+                let bg_spawn_depth = spawn_depth;
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
@@ -302,6 +310,12 @@ impl Agent {
                         task_supervisor: bg_task_supervisor.clone(),
                         cost_accountant: bg_cost_accountant.clone(),
                         parent_session_key: bg_parent_session_key.clone(),
+                        // Guard C (issue #607): inherit the parent
+                        // agent's spawn nesting depth so spawn-only
+                        // background tools that themselves dispatch
+                        // sub-agents (e.g. fm_tts → spawn) see the
+                        // higher value when their TOOL_CTX is read.
+                        spawn_depth: bg_spawn_depth,
                         ..ToolContext::zero()
                     };
 
@@ -778,6 +792,12 @@ impl Agent {
                 task_supervisor: Some(tools.supervisor()),
                 cost_accountant: cost_accountant.clone(),
                 parent_session_key: parent_session_key.clone(),
+                // Guard C (issue #607): stamp the agent's spawn
+                // nesting depth onto every foreground tool's
+                // TOOL_CTX so the spawn tool sees an accurate value
+                // when deciding whether the next nested spawn is
+                // allowed.
+                spawn_depth,
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
