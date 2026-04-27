@@ -50,6 +50,9 @@ use crate::session_actor::{
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
+use octos_core::MAIN_PROFILE_ID;
+
+#[cfg(feature = "matrix")]
 use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;

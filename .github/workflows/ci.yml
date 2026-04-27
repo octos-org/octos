@@ -194,6 +194,29 @@ jobs:
       - name: activate_tools regression tests
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
+  # Lightweight check that exercises the `matrix` feature gate. The default
+  # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
+  # job lean, but the Dockerfile and several release configurations enable it.
+  # Without this job, feature-gated compile errors (e.g. an identifier referenced
+  # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
+  # during docker builds. Keep this job intentionally tiny: `cargo check` only,
+  # no tests, no clippy — its sole job is to catch the feature-gated compile.
+  check-matrix:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: matrix-feature
+
+      - name: Check octos-cli with matrix feature
+        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
+
   check-arm:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
