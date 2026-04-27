@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use eyre::Result;
 use lru::LruCache;
 use metrics::counter;
-use octos_core::{Message, SessionKey};
+use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -78,6 +78,32 @@ pub fn child_session_key(parent: &SessionKey, child_id: &str) -> SessionKey {
 
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
+}
+
+/// Derive a 50-char display title from a user message's text content.
+///
+/// Trims whitespace, strips JSON content-array wrappers if present, and
+/// truncates to 50 Unicode characters at a UTF-8 boundary so the result
+/// is safe to persist and round-trip through serde.
+fn derive_title_from_message(content: &str) -> String {
+    let plain = content.trim();
+    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
+    // unwrap to the inner text part if so. Plain strings pass through.
+    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+        .ok()
+        .and_then(|parts| {
+            parts
+                .into_iter()
+                .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
+        })
+        .unwrap_or_else(|| plain.to_string());
+    let trimmed = text.trim();
+    trimmed
+        .chars()
+        .take(50)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn record_session_persist(outcome: &'static str) {
@@ -188,6 +214,13 @@ struct SessionMeta {
     /// Short summary of the session (first user message, truncated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    /// Display title for sidebar/listings. Auto-derived from first user
+    /// message; preserved if set manually via [`SessionManager::update_title`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Whether `title` was set manually (preserved across auto-derivation).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    title_manual: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     child_contracts: Vec<ChildSessionContract>,
     created_at: DateTime<Utc>,
@@ -204,6 +237,12 @@ pub struct Session {
     pub topic: Option<String>,
     /// Short summary of the session content.
     pub summary: Option<String>,
+    /// Display title (auto-derived from first user message; manual rename via
+    /// [`SessionManager::update_title`] preserves across new messages).
+    pub title: Option<String>,
+    /// True if title was set manually and should not be overwritten by
+    /// auto-derivation.
+    pub title_manual: bool,
     /// Durable child-session contracts associated with this session.
     pub child_contracts: Vec<ChildSessionContract>,
     pub messages: Vec<Message>,
@@ -220,6 +259,8 @@ impl Session {
             parent_key: None,
             topic,
             summary: None,
+            title: None,
+            title_manual: false,
             child_contracts: vec![],
             messages: vec![],
             created_at: now,
@@ -354,6 +395,106 @@ impl SessionManager {
     /// `/api/sessions/{id}/messages`.
     pub fn list_top_level_sessions(&self) -> Vec<(String, usize)> {
         self.list_sessions_inner(true)
+    }
+
+    /// Like [`Self::list_top_level_sessions`] but also returns the persisted
+    /// title for each session (None when the file has no `title` field, e.g.
+    /// pre-#617 sessions).
+    pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
+        self.list_sessions_inner_with_title(true)
+    }
+
+    fn list_sessions_inner_with_title(
+        &self,
+        skip_internal_topics: bool,
+    ) -> Vec<(String, usize, Option<String>)> {
+        // Reuse the path discovery from list_sessions_inner, but read each
+        // file's first line to extract the title alongside the line count.
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        let push_with_title =
+            |path: &Path,
+             session_key: String,
+             seen: &mut std::collections::HashSet<String>,
+             out: &mut Vec<(String, usize, Option<String>)>| {
+                if seen.contains(&session_key) {
+                    return;
+                }
+                // Read just the first line for metadata; fall back to count_lines
+                // for the message count.
+                let title = std::fs::read_to_string(path).ok().and_then(|content| {
+                    content
+                        .lines()
+                        .next()
+                        .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
+                        .and_then(|meta| meta.title)
+                });
+                let count = Self::count_lines(path);
+                seen.insert(session_key.clone());
+                out.push((session_key, count, title));
+            };
+
+        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let decoded = Self::decode_filename(name);
+                if skip_internal_topics && Self::is_internal_session_key(&decoded) {
+                    continue;
+                }
+                push_with_title(&path, decoded, &mut seen, &mut result);
+            }
+        }
+
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
+            for user_entry in user_entries.flatten() {
+                let user_path = user_entry.path();
+                if !user_path.is_dir() {
+                    continue;
+                }
+                let base_key_encoded = match user_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let base_key = Self::decode_filename(base_key_encoded);
+                let sessions_subdir = user_path.join("sessions");
+                if let Ok(session_files) = std::fs::read_dir(&sessions_subdir) {
+                    for file_entry in session_files.flatten() {
+                        let file_path = file_entry.path();
+                        if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                            continue;
+                        }
+                        let topic_encoded = match file_path.file_stem().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let topic = Self::decode_filename(topic_encoded);
+                        if skip_internal_topics && Self::is_internal_session_topic(&topic) {
+                            continue;
+                        }
+                        let session_key = if topic == "default" {
+                            base_key.clone()
+                        } else {
+                            format!("{base_key}#{topic}")
+                        };
+                        push_with_title(&file_path, session_key, &mut seen, &mut result);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     fn list_sessions_inner(&self, skip_internal_topics: bool) -> Vec<(String, usize)> {
@@ -500,6 +641,19 @@ impl SessionManager {
         key: &SessionKey,
         message: Message,
     ) -> Result<usize> {
+        // Auto-derive title from first user message before persistence so the
+        // first append_to_disk includes the title in the JSONL meta line.
+        // Manual titles (set via update_title) are preserved.
+        if matches!(message.role, MessageRole::User) {
+            let session = self.get_or_create(key).await;
+            if !session.title_manual && session.title.is_none() {
+                let derived = derive_title_from_message(&message.content);
+                if !derived.is_empty() {
+                    session.title = Some(derived);
+                }
+            }
+        }
+
         let _ = self.get_or_create(key).await;
         if let Err(error) = self.append_to_disk(key, &message).await {
             record_session_persist("failed");
@@ -654,6 +808,8 @@ impl SessionManager {
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
                     summary: meta.summary,
+                    title: meta.title,
+                    title_manual: meta.title_manual,
                     child_contracts: meta.child_contracts,
                     messages,
                     created_at: meta.created_at,
@@ -692,6 +848,8 @@ impl SessionManager {
                         parent_key: per_user.parent_key.or(flat.parent_key),
                         topic: per_user.topic.or(flat.topic),
                         summary: per_user.summary.or(flat.summary),
+                        title: per_user.title.or(flat.title),
+                        title_manual: per_user.title_manual || flat.title_manual,
                         child_contracts: merge_child_contracts(
                             flat.child_contracts,
                             per_user.child_contracts,
@@ -730,6 +888,8 @@ impl SessionManager {
         let parent_key = session_peek.and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
         let topic = session_peek.and_then(|s| s.topic.clone());
         let summary = session_peek.and_then(|s| s.summary.clone());
+        let title = session_peek.and_then(|s| s.title.clone());
+        let title_manual = session_peek.map(|s| s.title_manual).unwrap_or(false);
         let child_contracts = session_peek
             .map(|session| session.child_contracts.clone())
             .unwrap_or_default();
@@ -767,6 +927,8 @@ impl SessionManager {
                     parent_key,
                     topic,
                     summary,
+                    title,
+                    title_manual,
                     child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -799,6 +961,8 @@ impl SessionManager {
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: session.topic.clone(),
             summary: session.summary.clone(),
+            title: session.title.clone(),
+            title_manual: session.title_manual,
             child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
@@ -858,6 +1022,8 @@ impl SessionManager {
             parent_key: Some(parent_key.clone()),
             topic: None,
             summary: None,
+            title: None,
+            title_manual: false,
             child_contracts: vec![],
             messages,
             created_at: now,
@@ -1060,6 +1226,8 @@ impl SessionManager {
                     Some(topic.to_string())
                 },
                 summary: None,
+                title: None,
+                title_manual: false,
                 child_contracts: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
@@ -1483,6 +1651,8 @@ impl SessionHandle {
             parent_key: self.session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: self.session.topic.clone(),
             summary: self.session.summary.clone(),
+            title: self.session.title.clone(),
+            title_manual: self.session.title_manual,
             child_contracts: self.session.child_contracts.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
@@ -1565,6 +1735,8 @@ impl SessionHandle {
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: session.topic.clone(),
             summary: session.summary.clone(),
+            title: session.title.clone(),
+            title_manual: session.title_manual,
             child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
@@ -1599,6 +1771,8 @@ impl SessionHandle {
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
         let summary = self.session.summary.clone();
+        let title = self.session.title.clone();
+        let title_manual = self.session.title_manual;
         let child_contracts = self.session.child_contracts.clone();
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
@@ -1630,6 +1804,8 @@ impl SessionHandle {
                     parent_key,
                     topic,
                     summary,
+                    title,
+                    title_manual,
                     child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -1678,6 +1854,8 @@ impl SessionHandle {
             parent_key: meta.parent_key.map(SessionKey),
             topic: meta.topic,
             summary: meta.summary,
+            title: meta.title,
+            title_manual: meta.title_manual,
             child_contracts: meta.child_contracts,
             messages,
             created_at: meta.created_at,
@@ -1697,6 +1875,8 @@ pub struct SessionListEntry {
     pub updated_at: DateTime<Utc>,
     /// Short summary of the session.
     pub summary: Option<String>,
+    /// Display title (derived from first user message or set manually).
+    pub title: Option<String>,
 }
 
 impl SessionManager {
@@ -1757,6 +1937,7 @@ impl SessionManager {
                 message_count,
                 updated_at: meta.updated_at,
                 summary: meta.summary,
+                title: meta.title,
             });
         }
 
@@ -1768,6 +1949,16 @@ impl SessionManager {
     pub async fn update_summary(&mut self, key: &SessionKey, summary: String) -> Result<()> {
         let session = self.get_or_create(key).await;
         session.summary = Some(summary);
+        self.rewrite(key).await
+    }
+
+    /// Set a manual title for a session (rewrites metadata line). Once set,
+    /// the title persists across new messages — auto-derivation in
+    /// [`add_message_with_seq`] only fires when no manual title exists.
+    pub async fn update_title(&mut self, key: &SessionKey, title: String) -> Result<()> {
+        let session = self.get_or_create(key).await;
+        session.title = Some(title);
+        session.title_manual = true;
         self.rewrite(key).await
     }
 
@@ -1854,6 +2045,7 @@ impl SessionManager {
                 message_count,
                 updated_at: meta.updated_at,
                 summary: meta.summary,
+                title: meta.title,
             });
         }
 
@@ -2884,6 +3076,90 @@ mod tests {
         let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
         let session = mgr2.get_or_create(&key).await;
         assert_eq!(session.summary.as_deref(), Some("A test session"));
+    }
+
+    #[tokio::test]
+    async fn should_persist_title_separately_from_summary_when_renamed() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+        mgr.update_title(&key, "Custom title".into()).await.unwrap();
+        mgr.update_summary(&key, "Long-form summary".into())
+            .await
+            .unwrap();
+
+        // Reload from disk and verify title + summary are independent.
+        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
+        let session = mgr2.get_or_create(&key).await;
+        assert_eq!(session.title.as_deref(), Some("Custom title"));
+        assert_eq!(session.summary.as_deref(), Some("Long-form summary"));
+    }
+
+    #[tokio::test]
+    async fn should_auto_derive_title_from_first_user_message_when_unset() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message(
+            &key,
+            make_message(MessageRole::User, "What is the weather today?"),
+        )
+        .await
+        .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        assert_eq!(
+            session.title.as_deref(),
+            Some("What is the weather today?"),
+            "first user message should auto-populate title"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_overwrite_manual_title_when_subsequent_messages_arrive() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.update_title(&key, "Manual title".into()).await.unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "first user message"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "second user message"))
+            .await
+            .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Manual title"),
+            "manual title must be preserved across new messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_truncate_auto_derived_title_to_50_chars() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let long_message = "a".repeat(200);
+        mgr.add_message(&key, make_message(MessageRole::User, &long_message))
+            .await
+            .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        let title = session.title.as_deref().unwrap();
+        assert!(
+            title.chars().count() <= 50,
+            "title should be at most 50 chars, got {}",
+            title.chars().count()
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -137,6 +137,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::session_workspace_contract),
         )
         .route("/api/sessions/{id}", delete(handlers::delete_session))
+        .route(
+            "/api/sessions/{id}/title",
+            patch(handlers::update_session_title),
+        )
         // M7.9 / W2 — task supervisor exposure
         .route("/api/tasks/{task_id}/cancel", post(handlers::cancel_task))
         .route(
