@@ -324,12 +324,39 @@ impl SessionManager {
         self
     }
 
-    /// List all sessions (ID + message count) from disk.
+    /// List all sessions (ID + message count) from disk, including internal
+    /// runtime topics (`child-*`, `*.tasks`).
     ///
     /// Scans both the legacy flat layout (`sessions/*.jsonl`) and the per-user
     /// layout (`users/{base_key}/sessions/{topic}.jsonl`).
     /// Counts lines efficiently using `BufRead` to avoid loading entire files.
+    ///
+    /// Use [`Self::list_top_level_sessions`] for the user-facing listing path:
+    /// the all-inclusive walk is O(N) over every JSONL on disk and becomes a
+    /// hard bottleneck once spawn-fanout sessions accumulate (one user dir
+    /// observed in the wild had 65k+ `child-*.jsonl` siblings, each
+    /// line-counted by [`Self::count_lines`], hanging `/api/sessions` for
+    /// 30 s+).
     pub fn list_sessions(&self) -> Vec<(String, usize)> {
+        self.list_sessions_inner(false)
+    }
+
+    /// List only top-level sessions — those whose topic is empty (the
+    /// canonical `default.jsonl` per user dir) or a user-facing topic such
+    /// as `research`. Internal runtime topics (`child-*` spawn fanouts and
+    /// `*.tasks` background-task ledgers) are skipped at the directory walk,
+    /// before any line counting, so the cost stays O(top-level sessions)
+    /// regardless of how many child sessions a parent has accumulated.
+    ///
+    /// This is the helper that should back the user-facing
+    /// `GET /api/sessions` path. Child sessions are surfaced only when an
+    /// individual session's history is explicitly opened via
+    /// `/api/sessions/{id}/messages`.
+    pub fn list_top_level_sessions(&self) -> Vec<(String, usize)> {
+        self.list_sessions_inner(true)
+    }
+
+    fn list_sessions_inner(&self, skip_internal_topics: bool) -> Vec<(String, usize)> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 
@@ -339,8 +366,11 @@ impl SessionManager {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                     if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        let count = Self::count_lines(&path);
                         let decoded = Self::decode_filename(name);
+                        if skip_internal_topics && Self::is_internal_session_key(&decoded) {
+                            continue;
+                        }
+                        let count = Self::count_lines(&path);
                         if seen.insert(decoded.clone()) {
                             result.push((decoded, count));
                         }
@@ -378,6 +408,14 @@ impl SessionManager {
                             None => continue,
                         };
                         let topic = Self::decode_filename(topic_encoded);
+                        if skip_internal_topics && Self::is_internal_session_topic(&topic) {
+                            // Skip child-* and *.tasks files BEFORE counting
+                            // lines: line counting opens every file, and on
+                            // user dirs with tens of thousands of spawn
+                            // children the cumulative I/O blocks the
+                            // /api/sessions handler for tens of seconds.
+                            continue;
+                        }
                         // Reconstruct the full session key
                         let session_key = if topic == "default" {
                             base_key.clone()
@@ -394,6 +432,21 @@ impl SessionManager {
         }
 
         result
+    }
+
+    /// True for runtime-internal topics that should never appear in the
+    /// user-facing session listing (`child-*` spawn fanouts and `*.tasks`
+    /// background-task ledger sidecars).
+    fn is_internal_session_topic(topic: &str) -> bool {
+        topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
+    }
+
+    /// True for full session keys (legacy flat layout, encoded as
+    /// `{base}#{topic}` after decoding) whose topic is internal.
+    fn is_internal_session_key(decoded_key: &str) -> bool {
+        decoded_key
+            .split_once('#')
+            .is_some_and(|(_, topic)| Self::is_internal_session_topic(topic))
     }
 
     /// Count lines in a JSONL session file, skipping oversized files.
@@ -2623,6 +2676,126 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         // Should return decoded key, not percent-encoded filename
         assert_eq!(sessions[0].0, "feishu:oc_abc123");
+    }
+
+    /// Issue #607 §D: `/api/sessions` hung 30 s+ on a user dir with 65 535
+    /// `child-*.jsonl` siblings because the listing iterated every JSONL.
+    /// `list_top_level_sessions` must skip `child-*` and `*.tasks` files at
+    /// the directory walk so the cost stays O(top-level sessions).
+    #[tokio::test]
+    async fn list_top_level_sessions_skips_child_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+
+        // 1 top-level session.
+        mgr.add_message(&parent, make_message(MessageRole::User, "parent"))
+            .await
+            .unwrap();
+
+        // 100 child sessions written via the same canonical handle code path
+        // production uses (so the test exercises real filename encoding).
+        for i in 0..100 {
+            let child = child_session_key(&parent, &format!("task-{i:03}"));
+            mgr.add_message(&child, make_message(MessageRole::Assistant, "child"))
+                .await
+                .unwrap();
+        }
+
+        // The all-inclusive walk reflects every jsonl on disk (1 parent +
+        // 100 children).
+        let all = mgr.list_sessions();
+        assert_eq!(all.len(), 101, "internal walk should include children");
+
+        // The user-facing listing must surface only the top-level session.
+        let top = mgr.list_top_level_sessions();
+        assert_eq!(
+            top.len(),
+            1,
+            "list_top_level_sessions must skip child-* fanouts; got {top:?}"
+        );
+        assert_eq!(top[0].0, "api:web-parent");
+    }
+
+    /// Sidecar `*.tasks.jsonl` ledgers (e.g. `default.tasks.jsonl`) are an
+    /// internal runtime detail and must never appear in the user-facing
+    /// listing.
+    #[test]
+    fn list_top_level_sessions_skips_tasks_sidecar_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Construct a per-user dir directly so we can drop in both a
+        // top-level `default.jsonl` and an internal `default.tasks.jsonl`
+        // without having to drive the task-ledger writers in this unit.
+        let user_dir = tmp.path().join("users/api%3Aweb-tasks/sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "api:web-tasks",
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+        // Sidecar — must be ignored.
+        std::fs::write(
+            user_dir.join("default.tasks.jsonl"),
+            "{\"task_id\":\"t-1\",\"state\":\"queued\"}\n",
+        )
+        .unwrap();
+
+        let top = mgr.list_top_level_sessions();
+        let ids: Vec<&str> = top.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["api:web-tasks"], "got {top:?}");
+    }
+
+    /// Regression guard for the O(N) hang. With 5 000 synthetic
+    /// `child-*.jsonl` files on disk, `list_top_level_sessions` must stay
+    /// well under the 500 ms bound — the original `list_sessions`
+    /// `count_lines`-per-file loop blew past 30 s in the wild on a dir
+    /// 13× larger.
+    #[test]
+    fn list_top_level_sessions_is_fast_with_many_child_jsonls() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        let user_dir = tmp.path().join("users/api%3Aweb-river/sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        // Top-level session.
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            "{\"schema_version\":1,\"session_key\":\"api:web-river\",\
+             \"created_at\":\"2024-01-01T00:00:00Z\",\
+             \"updated_at\":\"2024-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        // Synthetic spawn fanout.
+        const FANOUT: usize = 5_000;
+        for i in 0..FANOUT {
+            std::fs::write(
+                user_dir.join(format!("child-task-{i:05}.jsonl")),
+                "{\"schema_version\":1}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
+            )
+            .unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let top = mgr.list_top_level_sessions();
+        let elapsed = start.elapsed();
+
+        assert_eq!(top.len(), 1, "only top-level session should surface");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "list_top_level_sessions took {elapsed:?} for {FANOUT} child files; \
+             the per-file count_lines fallback regressed",
+        );
     }
 
     #[test]

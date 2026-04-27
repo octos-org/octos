@@ -646,16 +646,26 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
-        all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
-            let chat_id = id.strip_prefix(&prefix)?;
-            if is_internal_api_session_id(chat_id) {
-                return None;
-            }
-            Some(SessionInfo {
-                id: chat_id.to_string(),
-                message_count: count,
-            })
-        }));
+        // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
+        // directory walk) so a user dir with tens of thousands of spawn
+        // children does not turn this listing into an O(N) hang. The
+        // `is_internal_api_session_id` belt-and-suspenders check is kept for
+        // legacy entries that might slip through (e.g. flat layout files
+        // pre-dating the encoder rules).
+        all.extend(
+            sess.list_top_level_sessions()
+                .into_iter()
+                .filter_map(|(id, count)| {
+                    let chat_id = id.strip_prefix(&prefix)?;
+                    if is_internal_api_session_id(chat_id) {
+                        return None;
+                    }
+                    Some(SessionInfo {
+                        id: chat_id.to_string(),
+                        message_count: count,
+                    })
+                }),
+        );
     }
 
     // Also fetch from gateway if available.
@@ -3451,6 +3461,71 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["web-123"]);
+    }
+
+    /// Issue #607 §D regression: river / mini4 hung 30 s+ on
+    /// `GET /api/sessions` because one user dir had 65 535
+    /// `child-*.jsonl` files that the listing iterated. The handler must
+    /// stay well under 500 ms with a synthetic spawn fanout in place.
+    #[tokio::test]
+    async fn list_sessions_is_fast_with_many_child_jsonl_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        // Lay down the per-user dir for `_main:api:web-river` directly so the
+        // test does not have to drive 10 000 SessionHandle writes (~30 s on
+        // its own and not what we are measuring).
+        let encoded_base = "_main%3Aapi%3Aweb-river";
+        let user_dir = data_dir
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            "{\"schema_version\":1,\"session_key\":\"_main:api:web-river\",\
+             \"created_at\":\"2024-01-01T00:00:00Z\",\
+             \"updated_at\":\"2024-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        const FANOUT: usize = 10_000;
+        for i in 0..FANOUT {
+            std::fs::write(
+                user_dir.join(format!("child-task-{i:05}.jsonl")),
+                "{\"schema_version\":1}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
+            )
+            .unwrap();
+        }
+
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let start = std::time::Instant::now();
+        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = listed
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["web-river"], "child fanout must not surface");
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "list_sessions took {elapsed:?} for {FANOUT} child jsonls; \
+             #607 §D regression — the user-facing handler must not iterate child fanouts",
+        );
     }
 
     #[tokio::test]
