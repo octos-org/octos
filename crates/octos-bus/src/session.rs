@@ -1609,6 +1609,19 @@ impl SessionHandle {
 
     /// Add a message to the session, persist it, and return its committed sequence.
     pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
+        // Auto-derive title from first user message before persistence so the
+        // first append_to_disk includes the title in the JSONL meta line.
+        // Manual titles set via update_title elsewhere are preserved.
+        if matches!(message.role, MessageRole::User)
+            && !self.session.title_manual
+            && self.session.title.is_none()
+        {
+            let derived = derive_title_from_message(&message.content);
+            if !derived.is_empty() {
+                self.session.title = Some(derived);
+            }
+        }
+
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         if let Err(error) = self.append_to_disk(&message).await {
@@ -3139,6 +3152,28 @@ mod tests {
             session.title.as_deref(),
             Some("Manual title"),
             "manual title must be preserved across new messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_handle_should_auto_derive_title_from_first_user_message() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "fix-617b-handle-derive-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .add_message(make_message(
+                MessageRole::User,
+                "What's the weather in San Francisco?",
+            ))
+            .await
+            .unwrap();
+
+        // Reload from disk via SessionHandle::open (forces JSONL deserialize)
+        let handle2 = SessionHandle::open(tmp.path(), &key);
+        assert_eq!(
+            handle2.session().title.as_deref(),
+            Some("What's the weather in San Francisco?"),
+            "SessionHandle::add_message_with_seq must auto-derive title"
         );
     }
 
