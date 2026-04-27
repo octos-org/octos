@@ -266,6 +266,13 @@ pub struct ToolContext {
     /// session actor. Pipeline workers and spawn children carry this so
     /// background-task registration links to the owning session.
     pub parent_session_key: Option<String>,
+    /// Guard C (issue #607): nesting depth for `spawn`-within-`spawn`
+    /// invocations. Top-level tool calls ride at depth 0; the spawn
+    /// tool increments this when dispatching a child agent so the
+    /// child's own `spawn` calls see the higher value via `TOOL_CTX`.
+    /// Beyond [`crate::tools::spawn::MAX_SPAWN_DEPTH`] the spawn tool
+    /// refuses further nesting to bound mutual-recursion blowups.
+    pub spawn_depth: u8,
 }
 
 impl ToolContext {
@@ -290,6 +297,7 @@ impl ToolContext {
             task_supervisor: None,
             cost_accountant: None,
             parent_session_key: None,
+            spawn_depth: 0,
         }
     }
 }

@@ -235,6 +235,13 @@ pub struct Agent {
     /// `ToolContext.parent_session_key` so spawn children / pipeline
     /// workers can register tasks against the owning session.
     pub(super) parent_session_key: Option<String>,
+    /// Guard C (issue #607): nesting depth this agent's tool calls
+    /// inherit via `ToolContext.spawn_depth`. The session-actor's
+    /// top-level agent leaves this at 0; sub-agents created by the
+    /// `spawn` tool set it via [`Self::with_spawn_depth`] so the
+    /// child's own spawn calls see the higher value and the
+    /// `MAX_SPAWN_DEPTH` gate fires after a bounded number of nests.
+    pub(super) spawn_depth: u8,
 }
 
 impl Agent {
@@ -275,6 +282,7 @@ impl Agent {
             subagent_summary_generator: None,
             cost_accountant: None,
             parent_session_key: None,
+            spawn_depth: 0,
         }
     }
 
@@ -316,6 +324,7 @@ impl Agent {
             subagent_summary_generator: None,
             cost_accountant: None,
             parent_session_key: None,
+            spawn_depth: 0,
         }
     }
 
@@ -496,6 +505,21 @@ impl Agent {
     /// Access the recorded parent session key, if any.
     pub fn parent_session_key(&self) -> Option<&str> {
         self.parent_session_key.as_deref()
+    }
+
+    /// Guard C (issue #607): record this agent's spawn nesting depth so
+    /// every tool call it dispatches inherits the value via
+    /// `ToolContext.spawn_depth`. The spawn tool consults this when
+    /// deciding whether the next nested spawn should be allowed; values
+    /// at or above [`crate::tools::spawn::MAX_SPAWN_DEPTH`] are refused.
+    pub fn with_spawn_depth(mut self, depth: u8) -> Self {
+        self.spawn_depth = depth;
+        self
+    }
+
+    /// Access the agent's recorded spawn nesting depth.
+    pub fn spawn_depth(&self) -> u8 {
+        self.spawn_depth
     }
 
     /// Set the embedding provider for hybrid memory search.

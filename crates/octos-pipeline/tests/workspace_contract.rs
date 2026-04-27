@@ -158,6 +158,7 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         status_bridge: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 4,
+        max_pipeline_fanout_total: None,
         checkpoint_store: None,
         hook_executor: None,
         workspace_context: ctx,

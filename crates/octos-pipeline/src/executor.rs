@@ -52,6 +52,48 @@ const DEFAULT_PIPELINE_PROJECTED_USD: f64 = 0.01;
 /// the harness for background pipelines.
 const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
 
+/// Cumulative cap on the total number of fan-out workers a single pipeline
+/// run may spawn across its lifetime. Each worker counted once at dispatch
+/// time, regardless of which branch (`Parallel` or `DynamicParallel`)
+/// dispatched it. Beyond this cap the executor fails the pipeline with
+/// [`PipelineError::FanoutExceeded`] before the cap-exceeding fan-out
+/// dispatches a single worker — partial dispatch leaves the pipeline in a
+/// less-recoverable state than an early refusal.
+///
+/// Motivated by the river/mini4 65,535-child runaway: the per-batch
+/// concurrency cap on `dynamic_parallel` nodes only bounds in-flight
+/// workers, not lifetime fan-out. A pathological planner that re-fires the
+/// same dynamic-parallel node many times can still exhaust the host even
+/// with `max_parallel_workers = 8`.
+pub const MAX_PIPELINE_FANOUT_TOTAL: usize = 500;
+
+/// Structured pipeline-level error variants. Today only the cumulative
+/// fan-out cap surfaces this type; the rest of the executor still uses
+/// `eyre`-based errors. The enum is `Clone` so the cap-exceeded reason
+/// can be embedded into the resulting [`PipelineResult::output`] without
+/// re-allocating context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// The cumulative fan-out cap fired. `count` is the number of workers
+    /// already dispatched in this pipeline run (i.e. the value of the
+    /// counter immediately before the refusal). `cap` is the configured
+    /// limit ([`MAX_PIPELINE_FANOUT_TOTAL`]).
+    FanoutExceeded { count: usize, cap: usize },
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FanoutExceeded { count, cap } => write!(
+                f,
+                "pipeline fan-out cap exceeded ({count} of {cap}); refusing further workers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
+
 /// Returns `true` when the handler kind triggers one or more LLM calls
 /// inside the node and therefore participates in cost reservation.
 ///
@@ -280,6 +322,11 @@ pub struct ExecutorConfig {
     /// Maximum number of parallel workers for fan-out stages (default 8).
     /// Prevents unbounded resource consumption under high parallelism.
     pub max_parallel_workers: usize,
+    /// Cumulative fan-out worker cap for the entire pipeline run (Guard B).
+    /// `None` defaults to [`MAX_PIPELINE_FANOUT_TOTAL`]. Tests set this to
+    /// a small value to drive the cap path without waiting on real
+    /// LLM-driven planning.
+    pub max_pipeline_fanout_total: Option<usize>,
     /// Optional mission checkpoint store. When set, the executor:
     /// * loads the latest `PersistedCheckpoint` at the start of a run and
     ///   skips every node with id `<=` the recorded node in the pipeline's
@@ -1291,6 +1338,12 @@ impl PipelineExecutor {
         let mut node_task_ids: HashMap<String, String> = HashMap::new();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
+        // Guard B: cumulative fan-out worker counter. Incremented exactly
+        // once per dispatched worker across both `Parallel` and
+        // `DynamicParallel` branches. Once the counter equals
+        // [`MAX_PIPELINE_FANOUT_TOTAL`] the executor refuses any further
+        // fan-out and fails the pipeline with `PipelineError::FanoutExceeded`.
+        let mut fanout_workers_dispatched: usize = 0;
         // Nodes to skip because they (and everything before them) are
         // recorded in a persisted checkpoint. Synthesized outcomes for these
         // nodes propagate through the graph so downstream handlers still run.
@@ -1430,6 +1483,29 @@ impl PipelineExecutor {
                     targets.len()
                 );
 
+                // Guard B: refuse the fan-out if dispatching every
+                // target would push the pipeline past the cumulative
+                // cap. Failing before any dispatch keeps recovery clean
+                // (no half-spawned batch).
+                let fanout_cap = self
+                    .config
+                    .max_pipeline_fanout_total
+                    .unwrap_or(MAX_PIPELINE_FANOUT_TOTAL);
+                if fanout_workers_dispatched.saturating_add(targets.len()) > fanout_cap {
+                    let err = PipelineError::FanoutExceeded {
+                        count: fanout_workers_dispatched,
+                        cap: fanout_cap,
+                    };
+                    warn!(
+                        node = %node.id,
+                        count = fanout_workers_dispatched,
+                        cap = fanout_cap,
+                        targets = targets.len(),
+                        "pipeline fan-out cap exceeded; refusing parallel dispatch"
+                    );
+                    return Err(eyre::eyre!(err));
+                }
+
                 let fan_start = Instant::now();
 
                 // Prepare and execute all targets concurrently, capped by semaphore
@@ -1515,6 +1591,11 @@ impl PipelineExecutor {
                         ));
                         (tid, target_with_prompt, start.elapsed(), result)
                     });
+                    // Guard B: count the worker as dispatched (the
+                    // future is queued — `join_all` below awaits its
+                    // completion) so subsequent fan-outs see the
+                    // updated tally before they ask for headroom.
+                    fanout_workers_dispatched = fanout_workers_dispatched.saturating_add(1);
                 }
 
                 let results = futures::future::join_all(futures).await;
@@ -1777,6 +1858,30 @@ impl PipelineExecutor {
                     synthetic_nodes.len()
                 );
 
+                // Guard B: refuse before dispatching any synthetic
+                // worker if the pipeline-lifetime fan-out cap would be
+                // exceeded. Mirrors the static Parallel gate so the
+                // 65,535-child river runaway cannot survive even a
+                // re-firing dynamic_parallel node.
+                let fanout_cap = self
+                    .config
+                    .max_pipeline_fanout_total
+                    .unwrap_or(MAX_PIPELINE_FANOUT_TOTAL);
+                if fanout_workers_dispatched.saturating_add(synthetic_nodes.len()) > fanout_cap {
+                    let err = PipelineError::FanoutExceeded {
+                        count: fanout_workers_dispatched,
+                        cap: fanout_cap,
+                    };
+                    warn!(
+                        node = %node.id,
+                        count = fanout_workers_dispatched,
+                        cap = fanout_cap,
+                        targets = synthetic_nodes.len(),
+                        "pipeline fan-out cap exceeded; refusing dynamic_parallel dispatch"
+                    );
+                    return Err(eyre::eyre!(err));
+                }
+
                 // Get the codergen handler for executing synthetic nodes
                 let codergen_handler = handlers.get(&HandlerKind::Codergen).ok_or_else(|| {
                     eyre::eyre!("codergen handler not found for dynamic_parallel workers")
@@ -1830,6 +1935,9 @@ impl PipelineExecutor {
                         ));
                         (task_id, synth_node, start.elapsed(), result)
                     });
+                    // Guard B: count this worker as dispatched (the
+                    // future is queued — `join_all` below awaits it).
+                    fanout_workers_dispatched = fanout_workers_dispatched.saturating_add(1);
                 }
 
                 let results = futures::future::join_all(futures).await;
@@ -2632,6 +2740,7 @@ mod tests {
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
             checkpoint_store: None,
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
@@ -2760,5 +2869,100 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().all(|t| t.label.is_some()));
         assert!(tasks[0].task.contains("test query"));
+    }
+
+    /// Build a fresh ExecutorConfig identical to `make_test_config` but
+    /// with a per-test cumulative fan-out cap so Guard B fires on a
+    /// small synthetic graph instead of waiting for 500 dispatches.
+    async fn make_capped_config(cap: usize) -> ExecutorConfig {
+        ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: Some(cap),
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+        }
+    }
+
+    /// Guard B regression: a `dynamic_parallel` node whose worker count
+    /// exceeds the cumulative fan-out cap must fail the pipeline with
+    /// `PipelineError::FanoutExceeded` before any worker dispatches.
+    /// The test forces the planner to fall back to the 3-task fallback
+    /// (the `MockProvider` returns plain "done" which fails JSON
+    /// extraction) and sets the cap to 2 so the fan-out trips.
+    #[tokio::test]
+    async fn dynamic_parallel_fails_after_cumulative_cap() {
+        let config = make_capped_config(2).await;
+        let executor = PipelineExecutor::new(config);
+
+        // Minimal dynamic_parallel graph. The planner is the
+        // MockProvider, which returns content "done" — that fails JSON
+        // extraction and routes through the 3-task fallback. With
+        // cap=2 the fan-out gate refuses before any worker dispatches.
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "drive a runaway plan", &serde_json::Map::new())
+            .await;
+
+        let Err(error) = result else {
+            panic!("expected pipeline to fail at the fan-out cap; got {result:?}");
+        };
+        // The structured `PipelineError::FanoutExceeded` is wrapped in
+        // an `eyre::Report` — downcast to assert the typed reason.
+        let typed = error
+            .downcast_ref::<PipelineError>()
+            .expect("expected PipelineError variant in failure chain");
+        match typed {
+            PipelineError::FanoutExceeded { count, cap } => {
+                assert_eq!(*cap, 2, "cap should match the per-test override");
+                assert_eq!(*count, 0, "no workers should dispatch before the cap fires");
+            }
+        }
+    }
+
+    /// Guard B sanity check: when the fan-out is below the cap the
+    /// pipeline executes normally. Static `Parallel` graph with two
+    /// noop targets and cap=4 — well within budget.
+    #[tokio::test]
+    async fn parallel_under_cap_runs_to_completion() {
+        let config = make_capped_config(4).await;
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="noop"]
+                b [handler="noop"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "happy path", &serde_json::Map::new())
+            .await;
+        assert!(
+            result.is_ok(),
+            "fan-out below cap should complete: {result:?}"
+        );
     }
 }

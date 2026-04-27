@@ -60,6 +60,7 @@ async fn make_config(provider: Arc<dyn LlmProvider>, dir: &TempDir) -> ExecutorC
         status_bridge: None,
         shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         max_parallel_workers: 8,
+        max_pipeline_fanout_total: None,
         checkpoint_store: None,
         hook_executor: None,
         workspace_context: octos_pipeline::context::PipelineContext::default(),

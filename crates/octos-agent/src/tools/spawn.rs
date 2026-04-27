@@ -37,6 +37,19 @@ use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResu
 /// different entry point.
 pub const DEFAULT_MCP_AGENT_TOOL_NAME: &str = "run_task";
 
+/// Guard C (issue #607): maximum nesting depth for `spawn`-within-`spawn`
+/// invocations before [`SpawnTool::execute_with_context`] refuses further
+/// dispatch. Measured against [`super::ToolContext::spawn_depth`], which
+/// the spawn tool increments before forwarding into a child agent's
+/// `TOOL_CTX`.
+///
+/// At depth 0 (top-level tool call) up through depth 3 (great-grandchild)
+/// the spawn proceeds; an attempt at depth 4 surfaces the structured
+/// `"spawn depth limit (4) exceeded; refusing further nesting"` error.
+/// Bound chosen empirically: the longest legitimate workflow chain we
+/// observed in production is parent → planner → coder → tts (depth 3).
+pub const MAX_SPAWN_DEPTH: u8 = 4;
+
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
 /// (caller should fall back to the InboundMessage relay path).
@@ -1651,6 +1664,31 @@ impl Tool for SpawnTool {
         ctx: &super::ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        // Guard C (issue #607): refuse deeply-nested spawn calls before
+        // we touch any shared resource (worker counters, supervisor
+        // registrations, MCP backends). At `spawn_depth >= MAX_SPAWN_DEPTH`
+        // we surface a structured error so the LLM sees a typed failure
+        // and the runaway mutual-recursion path collapses.
+        if ctx.spawn_depth >= MAX_SPAWN_DEPTH {
+            warn!(
+                depth = ctx.spawn_depth,
+                cap = MAX_SPAWN_DEPTH,
+                "spawn refused: depth limit exceeded"
+            );
+            counter!(
+                "octos_spawn_depth_rejected_total",
+                "cap" => MAX_SPAWN_DEPTH.to_string()
+            )
+            .increment(1);
+            return Ok(ToolResult {
+                output: format!(
+                    "Status: FAILED\nspawn depth limit ({MAX_SPAWN_DEPTH}) exceeded; refusing further nesting"
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let mut input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
         // M8.2: if the caller referenced an AgentDefinition manifest by id,
@@ -2039,7 +2077,12 @@ impl Tool for SpawnTool {
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
             }
-            let mut worker = Agent::new(worker_id, sub_llm.clone(), tools, self.memory.clone());
+            let mut worker = Agent::new(worker_id, sub_llm.clone(), tools, self.memory.clone())
+                // Guard C (issue #607): stamp the child agent's spawn
+                // nesting depth as `parent_depth + 1` so the child's
+                // own spawn tool calls see the higher value and the
+                // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
+                .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
@@ -2215,6 +2258,11 @@ impl Tool for SpawnTool {
             let parent_file_state_cache = self.parent_file_state_cache.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
+            // Guard C (issue #607): snapshot the caller's spawn depth so
+            // the detached child Agent dispatched below sees
+            // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
+            // after a bounded number of nests.
+            let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2318,7 +2366,11 @@ impl Tool for SpawnTool {
                 // Agent takes ownership so it can also back an LLM-iterative
                 // compaction summarizer if the parent policy requests one.
                 let child_llm_for_compaction = llm.clone();
-                let mut worker = Agent::new(wid.clone(), llm, tools, memory);
+                let mut worker = Agent::new(wid.clone(), llm, tools, memory)
+                    // Guard C (issue #607): inherit the parent's spawn
+                    // nesting depth + 1 so the detached child sees the
+                    // higher value when its own spawn calls run.
+                    .with_spawn_depth(child_spawn_depth);
                 // Keep an Arc to the child's tool registry for the
                 // post-`run_task` validator invocation below.
                 let child_tools_handle = worker.tool_registry().clone();
@@ -4384,5 +4436,118 @@ PY
                 .expect("summary generator wired"),
             &summary_gen,
         ));
+    }
+
+    /// Guard C regression: a spawn invocation at depth 4 must refuse
+    /// before any backend dispatch, surfacing a structured tool failure
+    /// the LLM can react to. The depth gate fires before
+    /// argument parsing — even invalid JSON returns the depth-limit
+    /// error rather than the legacy "invalid spawn tool input" path.
+    #[tokio::test]
+    async fn spawn_refuses_at_depth_4() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        // Build a ToolContext at the depth cap. The spawn tool reads
+        // `ctx.spawn_depth` and refuses before parsing args.
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.spawn_depth = MAX_SPAWN_DEPTH;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "do something deeply nested"
+                }),
+            )
+            .await;
+        let tool_result = match result {
+            Ok(r) => r,
+            Err(error) => panic!("depth refusal should return Ok(failed) rather than Err: {error}"),
+        };
+        assert!(!tool_result.success, "spawn at the cap must report failure");
+        assert!(
+            tool_result
+                .output
+                .contains(&format!("spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")),
+            "structured reason missing from output: {}",
+            tool_result.output
+        );
+        assert!(
+            tool_result.output.contains("refusing further nesting"),
+            "structured reason missing from output: {}",
+            tool_result.output
+        );
+
+        // Sanity: at depth 0 the tool keeps working (no early refusal).
+        let mut ctx0 = super::super::ToolContext::zero();
+        ctx0.spawn_depth = 0;
+        // We pass an empty input so the legacy validation path runs. A
+        // zero-depth spawn does NOT short-circuit with the depth-limit
+        // refusal — it falls through into the regular pipeline (which
+        // surfaces an unrelated error for the empty input).
+        let baseline = tool
+            .execute_with_context(&ctx0, &serde_json::json!({}))
+            .await;
+        match baseline {
+            Ok(r) => {
+                assert!(
+                    !r.output.contains("spawn depth limit"),
+                    "below-cap spawn must not emit the depth-limit refusal: {}",
+                    r.output
+                );
+            }
+            Err(error) => {
+                let err_msg = format!("{error}");
+                assert!(
+                    !err_msg.contains("spawn depth limit"),
+                    "below-cap spawn must not emit the depth-limit refusal: {err_msg}"
+                );
+            }
+        }
+    }
+
+    /// Guard C boundary: depth 3 (one less than the cap) is still
+    /// allowed; the gate fires on depth 4 only.
+    #[tokio::test]
+    async fn spawn_allows_depth_below_cap() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.spawn_depth = MAX_SPAWN_DEPTH - 1;
+
+        // An empty input still trips the legacy validation path; the
+        // important invariant is that depth-3 does NOT short-circuit
+        // with the structured "spawn depth limit" message.
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await;
+        match result {
+            Ok(tool_result) => {
+                assert!(
+                    !tool_result.output.contains("spawn depth limit"),
+                    "depth below cap must not emit the depth-limit refusal: {}",
+                    tool_result.output
+                );
+            }
+            Err(error) => {
+                let err_msg = format!("{error}");
+                assert!(
+                    !err_msg.contains("spawn depth limit"),
+                    "depth below cap must not emit the depth-limit refusal: {err_msg}"
+                );
+            }
+        }
     }
 }
