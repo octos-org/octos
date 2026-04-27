@@ -3713,8 +3713,53 @@ impl SessionActor {
             }
         };
 
-        let _ = user_seq; // sort comparator uses timestamp; seq retained for ledger.
-        let _ = user_msg_timestamp;
+        // Restore the forced-background user-message session_result emission
+        // dropped by 14ac3f3a. Same reasoning as the overflow path: the web
+        // client needs a routing signal so the workflow's spawn_only progress
+        // events bind to this user message's bubble, not a stale primary.
+        // See #616.
+        if let Some(seq) = user_seq {
+            let mut session_result = serde_json::json!({
+                "seq": seq,
+                "role": "user",
+                "content": persisted_user_content.to_string(),
+                "timestamp": user_msg_timestamp.to_rfc3339(),
+                "media": Vec::<String>::new(),
+            });
+            if let Some(cmid) = client_message_id.as_deref() {
+                session_result.as_object_mut().expect("json object").insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid.to_string()),
+                );
+            }
+            let mut metadata_obj = serde_json::Map::new();
+            if let Some(topic) = self.session_key.topic() {
+                metadata_obj.insert(
+                    "topic".to_string(),
+                    serde_json::Value::String(topic.to_string()),
+                );
+            }
+            metadata_obj.insert(
+                "_history_persisted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            metadata_obj.insert("_session_result".to_string(), session_result);
+
+            let _ = send_outbound_with_timeout(
+                &self.session_key,
+                &self.out_tx,
+                OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::Value::Object(metadata_obj),
+                },
+                "user_message_session_result_forced_background",
+            )
+            .await;
+        }
         let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -4700,12 +4745,57 @@ impl SessionActor {
                 handle.add_message_with_seq(user_msg).await.ok()
             };
 
-            // The overflow path also relies on the timestamp-primary
-            // comparator client-side; no per-user-message session_result
-            // emission needed. Seq retained for ledger.
-            let _ = user_seq_for_overflow;
-            let _ = user_msg_timestamp;
-            let _ = overflow_client_message_id;
+            // Restore the overflow user-message session_result emission that
+            // was removed by 14ac3f3a — without it the web client has no signal
+            // that user message B has a response slot, so streaming tokens for
+            // B's reply bind to A's bubble (or render nowhere). The
+            // timestamp-primary comparator handles ORDERING client-side; this
+            // session_result handles ROUTING server-side. The two are
+            // complementary, not exclusive. See #616. Channel-side fanout
+            // (api_channel.rs) only honours `_session_result` for the api
+            // channel; non-api adapters (telegram/etc) ignore it harmlessly.
+            if let Some(seq) = user_seq_for_overflow {
+                let mut session_result = serde_json::json!({
+                    "seq": seq,
+                    "role": "user",
+                    "content": content.clone(),
+                    "timestamp": user_msg_timestamp.to_rfc3339(),
+                    "media": Vec::<String>::new(),
+                });
+                if let Some(cmid) = overflow_client_message_id.as_deref() {
+                    session_result.as_object_mut().expect("json object").insert(
+                        "client_message_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+                let mut metadata_obj = serde_json::Map::new();
+                if let Some(topic) = session_key.topic() {
+                    metadata_obj.insert(
+                        "topic".to_string(),
+                        serde_json::Value::String(topic.to_string()),
+                    );
+                }
+                metadata_obj.insert(
+                    "_history_persisted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                metadata_obj.insert("_session_result".to_string(), session_result);
+
+                let _ = send_outbound_with_timeout(
+                    &session_key,
+                    &out_tx,
+                    OutboundMessage {
+                        channel: channel.clone(),
+                        chat_id: chat_id.clone(),
+                        content: String::new(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::Value::Object(metadata_obj),
+                    },
+                    "user_message_session_result_overflow",
+                )
+                .await;
+            }
 
             // Refresh the history snapshot so the overflow LLM sees the
             // primary turn's assistant reply if it has already landed. The
@@ -7278,12 +7368,25 @@ mod tests {
         tx.send(make_inbound("What is 37 * 53?")).await.unwrap();
 
         // ── Phase 3: Collect all responses ──
-        // We expect 2 responses: overflow answer + slow primary answer (in some order)
+        // We expect 2 user-facing responses: overflow answer + slow primary
+        // answer (in some order). Skip metadata-only outbounds (the
+        // user-message session_result emission added by #616 fix carries
+        // routing metadata in `_session_result` but no body).
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while responses.len() < 2 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => responses.push(msg.content),
+                Ok(Some(msg)) => {
+                    let is_user_session_result = msg
+                        .metadata
+                        .get("_session_result")
+                        .and_then(|r| r.get("role"))
+                        .and_then(|v| v.as_str())
+                        == Some("user");
+                    if !is_user_session_result {
+                        responses.push(msg.content);
+                    }
+                }
                 Ok(None) => break,
                 Err(_) => break, // timeout
             }
@@ -7470,6 +7573,137 @@ mod tests {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             "overflow outbound must flag history as persisted"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// #616 regression: the overflow USER message must emit `_session_result`
+    /// metadata so the web client can bind streaming response tokens to the
+    /// overflow user-message bubble. Without this signal, when a fast follow-up
+    /// arrives mid-primary-turn, the web client receives streaming tokens with
+    /// no way to route them to the second user's bubble — the response renders
+    /// nowhere (or worse, overwrites the primary's bubble).
+    ///
+    /// 14ac3f3a removed this emission on the assumption that timestamp-primary
+    /// sort handles ordering. True for ordering, false for routing — both
+    /// roles are needed and they're complementary, not exclusive.
+    #[tokio::test]
+    async fn should_emit_session_result_for_overflow_user_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (Duration::from_secs(12), make_response("slow primary")),
+                (Duration::from_millis(400), make_response("overflow body")),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup so responsiveness baseline is established.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Slow primary.
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+
+        // Sleep past patience so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // Fast follow-up with a known client_message_id so we can assert it
+        // round-trips on the session_result event. Construct the Inbound
+        // variant inline so we can set message_id (= client_message_id on the
+        // wire from api_channel.rs:1222 — see #616 audit).
+        let overflow_inbound = ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: "the overflow user question".to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                // Both fields carry client_message_id in production: api_channel
+                // sets metadata["client_message_id"] (which `inbound_client_message_id`
+                // reads) and message_id (which becomes overflow_reply_to). Mirror
+                // both so we exercise the same path.
+                metadata: serde_json::json!({
+                    "client_message_id": "client-msg-overflow-test",
+                }),
+                message_id: Some("client-msg-overflow-test".to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        };
+        tx.send(overflow_inbound).await.unwrap();
+
+        // Collect outbound until we see a user-role session_result (which is
+        // the overflow user-message emission we're asserting on).
+        let mut user_session_result: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while user_session_result.is_none() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if let Some(result) = msg.metadata.get("_session_result") {
+                        if result.get("role").and_then(|v| v.as_str()) == Some("user") {
+                            user_session_result = Some(result.clone());
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let result = user_session_result.unwrap_or_else(|| {
+            panic!("overflow user message must emit _session_result with role=user")
+        });
+
+        assert_eq!(
+            result.get("role").and_then(|v| v.as_str()),
+            Some("user"),
+            "role must be user"
+        );
+        assert!(
+            result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq for the user message"
+        );
+        assert_eq!(
+            result.get("content").and_then(|v| v.as_str()),
+            Some("the overflow user question"),
+            "content must mirror the overflow user message"
+        );
+        assert_eq!(
+            result.get("client_message_id").and_then(|v| v.as_str()),
+            Some("client-msg-overflow-test"),
+            "client_message_id must round-trip from inbound — this is what the \
+             web client uses to bind subsequent streaming tokens to the \
+             overflow user bubble"
+        );
+        assert!(
+            result.get("timestamp").is_some(),
+            "session_result must include rfc3339 timestamp"
         );
 
         drop(tx);
@@ -7816,11 +8050,22 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         tx.send(make_inbound("quick question")).await.unwrap();
 
-        // Collect responses — should get 2 (both overflow and primary)
+        // Collect responses — should get 2 (both overflow and primary).
+        // Skip metadata-only outbounds (the user-message session_result
+        // emission added by the #616 fix carries routing metadata in
+        // `_session_result` but no body).
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            responses.push(msg.content);
+            let is_user_session_result = msg
+                .metadata
+                .get("_session_result")
+                .and_then(|r| r.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("user");
+            if !is_user_session_result {
+                responses.push(msg.content);
+            }
         }
 
         assert_eq!(
