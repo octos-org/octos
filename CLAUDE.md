@@ -100,6 +100,16 @@ Splits long messages into channel-safe chunks (paragraph > newline > sentence > 
 
 JSONL persistence with LRU in-memory cache. Session forking (`/new` command) with parent_key tracking. Percent-encoded filenames with hash suffix on truncation (prevents collisions). File size limit: 10MB. Atomic write-then-rename for crash safety.
 
+#### Thread-by-cmid chat data model (M8.10, #627)
+
+Each user message roots a `Thread` keyed by its `client_message_id`. Assistant and tool messages bind to the thread via `response_to_client_message_id` (= `thread_id` from PR #2's SSE events). Conversations are an ordered list of threads sorted by `userMsg.timestamp`; within a thread, responses sort strictly by `intra_thread_seq`. The web client's `thread-store.ts` is the single chat data model — the legacy flat-list `message-store.ts` and the timestamp-primary `compareMessagesForDisplay` / `MAX_SAFE_INTEGER` fallback were deleted in PR #5.
+
+Server-side: every outbound message that produces an SSE event carries `thread_id` metadata (= the user message's cmid). The API channel (`octos-bus/src/api_channel.rs`) stamps `thread_id` on every wire payload (`token`, `replace`, `tool_start`, `tool_progress`, `tool_end`, `file`, `task_status`, `done`). PR #5 deleted the legacy user-message `session_result` event emissions for the primary, forced-background, and overflow paths — `thread_id` is now the routing key for both ordering and routing on every event. The remaining `_session_result` metadata routing in `api_channel.rs` is the durable late-binding fanout for assistant overflow replies, file-delivery commits, and background notifications, plus the SSE replay path (`/events/stream` since_seq).
+
+#### SSE protocol contract
+
+Every SSE event carries an optional `thread_id` field (string) — when present, it is the `client_message_id` of the user message rooting the thread the event belongs to. Web clients route streaming tokens, tool calls, file deliveries, and `done` events to the matching thread by `thread_id`. The `done` event additionally carries `committed_seq` (per-thread sequence assigned at persistence). See `crates/octos-cli/src/api/sse.rs` for the wire format.
+
 ### Hooks (`octos-agent/src/hooks.rs`)
 
 Lifecycle hook system for running shell commands at agent events. 4 events: `before_tool_call`, `after_tool_call`, `before_llm_call`, `after_llm_call`. Before-hooks can deny operations (exit code 1). Shell protocol: JSON payload on stdin, exit code semantics (0=allow, 1=deny, 2+=error). Circuit breaker auto-disables hooks after 3 consecutive failures (configurable via `HookExecutor::with_threshold()`). Commands use argv array (no shell interpretation). Environment sanitized via shared `BLOCKED_ENV_VARS`. Tilde expansion supports `~/` and `~username/`. Config: `hooks` array in config.json with `event`, `command`, `timeout_ms` (default 5000), `tool_filter`. Wired in chat.rs, gateway.rs, serve.rs. Hook changes trigger restart via config_watcher.

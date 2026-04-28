@@ -45,13 +45,13 @@ pub struct ChatRequest {
     pub media: Vec<String>,
     #[serde(default)]
     pub attach_only: bool,
-    /// Web-generated correlation id. Forwarded to the gateway so the
-    /// eventual `_session_result.response_to_client_message_id` matches
-    /// the web reducer's optimistic bubble (FA-12f).
-    ///
-    /// Also propagated onto the persisted user `Message` so the matching
-    /// `session_result` event lets the web client stamp the authoritative
-    /// `historySeq` onto its optimistic bubble.
+    /// Web-generated correlation id. Forwarded to the gateway so every
+    /// SSE event the streaming response produces carries `thread_id`
+    /// (= this cmid) and the web client routes streaming tokens to the
+    /// thread rooted at the optimistic user-message bubble (M8.10).
+    /// Also propagated onto the persisted user `Message` so the
+    /// thread-store can correlate replayed history rows back to the same
+    /// thread on reload.
     #[serde(default)]
     pub client_message_id: Option<String>,
 }
@@ -412,10 +412,8 @@ async fn chat_streaming(
 
     let message = req.message;
     let media = req.media;
-    let topic_for_event = req.topic.clone();
 
     // Spawn the agent task
-    let user_event_tx = tx.clone();
     tokio::spawn(async move {
         let result = request_agent
             .process_message(&message, &history, media)
@@ -438,16 +436,18 @@ async fn chat_streaming(
                 // so messages landed in `sessions/<encoded_full_key>.jsonl`
                 // while the actor wrote to `users/.../<topic>.jsonl`.
                 //
-                // Also tag the first user message with the client-supplied
+                // Tag the first user message with the client-supplied
                 // `client_message_id` so the persisted row carries it through
-                // the JSONL round-trip and emit a user-message session_result
-                // event so the web client can stamp the authoritative seq onto
-                // its optimistic bubble (M8.10-A user-message counterpart).
+                // the JSONL round-trip. M8.10 PR #5 dropped the user-message
+                // `session_result` event emission — every SSE event the
+                // streaming response produces is already tagged with
+                // `thread_id` (= the same cmid), so the web client routes
+                // streaming tokens to the right thread without a synthetic
+                // user-role result event.
                 //
                 // Capture the committed seq of the final assistant message
                 // so the SSE `done` event can thread it back to the web client
                 // (M8.10-A).
-                let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
                 let assistant_committed_seq: Option<u64> = {
                     let mut last_assistant_seq: Option<u64> = None;
                     let mut user_persisted = false;
@@ -460,26 +460,18 @@ async fn chat_streaming(
                                     to_save.client_message_id = Some(cmid.clone());
                                 }
                             }
-                            let timestamp = to_save.timestamp.to_rfc3339();
-                            let content_for_event = to_save.content.clone();
-                            match persist_chat_message_through_canonical(
+                            if let Err(error) = persist_chat_message_through_canonical(
                                 &sessions,
                                 &session_key,
                                 to_save,
                             )
                             .await
                             {
-                                Ok(seq) => {
-                                    user_message_seq_and_meta =
-                                        Some((seq, content_for_event, timestamp));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %error,
-                                        "chat: failed to persist user message"
-                                    );
-                                }
+                                tracing::warn!(
+                                    session = %session_id,
+                                    error = %error,
+                                    "chat: failed to persist user message"
+                                );
                             }
                         } else {
                             let is_assistant = msg.role == MessageRole::Assistant;
@@ -500,34 +492,6 @@ async fn chat_streaming(
                     }
                     last_assistant_seq
                 };
-
-                // Emit a user-message session_result event so the web client
-                // can stamp the authoritative seq onto its optimistic bubble.
-                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
-                    let mut message_payload = serde_json::json!({
-                        "seq": seq,
-                        "role": "user",
-                        "content": content,
-                        "timestamp": timestamp,
-                    });
-                    if let Some(ref cmid) = client_message_id {
-                        if !cmid.is_empty() {
-                            message_payload
-                                .as_object_mut()
-                                .expect("json object")
-                                .insert(
-                                    "client_message_id".to_string(),
-                                    serde_json::Value::String(cmid.clone()),
-                                );
-                        }
-                    }
-                    let event = serde_json::json!({
-                        "type": "session_result",
-                        "topic": topic_for_event,
-                        "message": message_payload,
-                    });
-                    let _ = user_event_tx.send(event.to_string());
-                }
 
                 // Send final done event (field names match what octos-web expects)
                 let provider_metadata = response.provider_metadata.clone();
