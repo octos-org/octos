@@ -70,7 +70,10 @@ pub struct AgentConfig {
 }
 
 /// Default tool execution timeout in seconds.
-pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 600;
+/// Matches `MAX_TOOL_TIMEOUT_SECS` so long-running tools like `run_pipeline`
+/// (default 1800s) are not silently capped when the LLM omits `timeout_secs`
+/// in the tool call.
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum tool timeout the LLM can request (30 minutes).
 pub const MAX_TOOL_TIMEOUT_SECS: u64 = 1800;
 /// Default session processing timeout in seconds.
@@ -81,7 +84,7 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 50,
             max_tokens: None,
-            max_timeout: Some(std::time::Duration::from_secs(600)),
+            max_timeout: Some(std::time::Duration::from_secs(1800)),
             save_episodes: true,
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
