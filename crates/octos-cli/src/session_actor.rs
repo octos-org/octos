@@ -5332,11 +5332,20 @@ impl SessionActor {
             )
         });
 
-        // Set up progressive streaming reporter if we have a channel
+        // Set up progressive streaming reporter if we have a channel.
+        //
+        // M8.10 follow-up (#636): bind the inbound's `client_message_id`
+        // to the reporter (matching the speculative-overflow path at
+        // line 4006) so SSE payloads from this serial-delivery path
+        // also carry `thread_id`. Most callers of `process_inbound`
+        // are non-API channels (telegram/etc) where cmid is None, but
+        // the recovery-hint path here is also reached from the API
+        // channel and must thread cmid through for parity.
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx.clone(),
-        ));
+        let reporter = Arc::new(
+            crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
+                .with_thread_id(client_message_id.clone()),
+        );
         self.agent.set_reporter(reporter);
 
         // Wire adaptive router status callback for failover notifications

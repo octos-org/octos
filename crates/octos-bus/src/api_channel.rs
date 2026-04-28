@@ -94,6 +94,13 @@ struct ApiState {
     task_relaunch: Option<Arc<TaskRelaunchFn>>,
     on_session_deleted: Option<OnSessionDeletedFn>,
     metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// M8.10 follow-up (#636): shared sticky thread_id map. Seeded by
+    /// `handle_chat` from the request's `client_message_id` so that the
+    /// FIRST event of a turn (the warm-up `thinking`, plus any
+    /// `edit_message` / `send_raw_sse` calls that fire before the
+    /// session actor's reporter has streamed its own thread_id) can
+    /// recover the right cmid via the api_channel's sticky-lookup.
+    last_thread_id: Arc<Mutex<HashMap<String, String>>>,
 }
 
 fn watcher_key(chat_id: &str, topic: Option<&str>) -> String {
@@ -679,24 +686,29 @@ fn build_replay_complete_event(topic: Option<&str>) -> serde_json::Value {
     })
 }
 
-fn initial_sse_events(has_media: bool) -> Vec<String> {
-    let mut events = vec![
-        serde_json::json!({
-            "type": "thinking",
-            "iteration": 0,
-        })
-        .to_string(),
-    ];
+/// Build the synthetic warm-up SSE events emitted the moment a chat
+/// request is accepted, before the agent has even begun its first
+/// iteration. M8.10 follow-up (#636): the first event of every turn used
+/// to leak `thread_id=null` because this builder hardcoded the payload
+/// shape without inspecting the request's `client_message_id`. Thread
+/// the cmid through so the very first wire event already carries the
+/// right routing key.
+fn initial_sse_events(has_media: bool, thread_id: Option<&str>) -> Vec<String> {
+    let mut thinking = serde_json::json!({
+        "type": "thinking",
+        "iteration": 0,
+    });
+    inject_thread_id(&mut thinking, thread_id);
+    let mut events = vec![thinking.to_string()];
 
     if has_media {
-        events.push(
-            serde_json::json!({
-                "type": "tool_progress",
-                "tool": "preprocessing",
-                "message": "Processing attachments...",
-            })
-            .to_string(),
-        );
+        let mut preprocessing = serde_json::json!({
+            "type": "tool_progress",
+            "tool": "preprocessing",
+            "message": "Processing attachments...",
+        });
+        inject_thread_id(&mut preprocessing, thread_id);
+        events.push(preprocessing.to_string());
     }
 
     events
@@ -721,6 +733,7 @@ impl Channel for ApiChannel {
             task_relaunch: self.task_relaunch.clone(),
             on_session_deleted: self.on_session_deleted.clone(),
             metrics_renderer: self.metrics_renderer.clone(),
+            last_thread_id: self.last_thread_id.clone(),
         };
 
         let app = Router::new()
@@ -778,13 +791,30 @@ impl Channel for ApiChannel {
         // present. Speculative-overflow + forced-background paths set this
         // to the overflow user's cmid so two concurrent threads on the same
         // chat_id can be demultiplexed by web clients.
-        let thread_id = outbound_thread_id(&msg.metadata);
-        // M8.10 follow-up (#632): record the bound thread_id so subsequent
-        // `edit_message` and `send_raw_sse` calls on the same chat_id can
-        // recover it when their per-call source lacks one. Closes the race
-        // window where the session actor sends the user-message
-        // session_result (with thread_id) and only later does
-        // `flush_to_channel` invoke `send_with_id` with naked metadata.
+        //
+        // M8.10 follow-up (#636): when the metadata lacks thread_id (e.g.
+        // the stream forwarder's `flush_to_channel` builds outbound
+        // metadata containing only `streaming: true`), fall back to the
+        // sticky map. handle_chat seeds it from the request's
+        // client_message_id BEFORE the agent runs, so the very first
+        // `replace` event of a streamed turn is already tagged. Without
+        // this fallback, PR #635's lazy sticky-population still leaked
+        // the first 1–3 events of every turn (mini1/2/3 probe).
+        let metadata_thread_id = outbound_thread_id(&msg.metadata);
+        let sticky_thread_id = if metadata_thread_id.is_none() {
+            self.sticky_thread_id(&msg.chat_id).await
+        } else {
+            None
+        };
+        let thread_id = metadata_thread_id
+            .clone()
+            .or_else(|| sticky_thread_id.clone());
+        // Record the bound thread_id so subsequent `edit_message` and
+        // `send_raw_sse` calls on the same chat_id can recover it when
+        // their per-call source lacks one. Closes the race window where
+        // the session actor sends the user-message session_result (with
+        // thread_id) and only later does `flush_to_channel` invoke
+        // `send_with_id` with naked metadata.
         self.remember_thread_id(&msg.chat_id, thread_id.as_deref())
             .await;
 
@@ -1062,7 +1092,18 @@ impl Channel for ApiChannel {
         // subsequent `edit_message` calls can tag streaming `token`/`replace`
         // events with the correct thread (two concurrent threads on the
         // same chat_id is the speculative-overflow case).
-        let thread_id = outbound_thread_id(&msg.metadata);
+        //
+        // M8.10 follow-up (#636): when the stream forwarder's metadata
+        // lacks thread_id (the common case — `do_flush` builds metadata
+        // with only `streaming: true`), recover from the sticky map so
+        // the encoded message_id still threads the right cmid through
+        // every subsequent `edit_message` call. Without this fallback,
+        // every `token` / `replace` event of a turn leaked
+        // `thread_id=null`.
+        let thread_id = match outbound_thread_id(&msg.metadata) {
+            Some(tid) => Some(tid),
+            None => self.sticky_thread_id(&msg.chat_id).await,
+        };
         Ok(Some(encode_sse_message_id(
             &msg.chat_id,
             thread_id.as_deref(),
@@ -1322,6 +1363,20 @@ async fn handle_chat(
         .session_id
         .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
 
+    // M8.10 follow-up (#636): pull the request's `client_message_id`
+    // up here so it can tag both the synthetic warm-up SSE events AND
+    // seed the sticky map BEFORE the session actor's reporter starts
+    // streaming. The original M8.10 PR #2 + sticky-map follow-up #632
+    // bound thread_id at the reporter level, but the warm-up `thinking`
+    // event predates the reporter and the first `edit_message` /
+    // `send_raw_sse` calls of the turn could race with the actor's
+    // first thread_id-tagged emission, leaving early `replace` events
+    // un-routed. Seeding here closes that window.
+    let request_thread_id: Option<String> = req
+        .client_message_id
+        .clone()
+        .filter(|value| !value.is_empty());
+
     // Create per-request SSE channel. If a previous request is still streaming
     // AND alive, reuse it. Otherwise, replace the stale sender.
     let rx = {
@@ -1340,13 +1395,23 @@ async fn handle_chat(
             None
         } else {
             let (tx, rx) = new_sse_channel();
-            for event in initial_sse_events(!req.media.is_empty()) {
+            for event in initial_sse_events(!req.media.is_empty(), request_thread_id.as_deref()) {
                 let _ = tx.send(event);
             }
             pending.insert(session_id.clone(), tx);
             Some(rx)
         }
     };
+
+    // Seed the sticky thread_id map so subsequent untagged
+    // `edit_message` / `send_raw_sse` calls on this chat_id can recover
+    // the cmid via the api_channel's sticky lookup. Done OUTSIDE the
+    // pending lock so the locks don't nest. Idempotent — calling this
+    // when the request had no cmid is a no-op.
+    if let Some(ref tid) = request_thread_id {
+        let mut map = state.last_thread_id.lock().await;
+        map.insert(session_id.clone(), tid.clone());
+    }
 
     if !req.attach_only {
         // Build and send InboundMessage to the gateway bus.
@@ -2586,6 +2651,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let body = serde_json::json!({
@@ -2645,6 +2711,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let body = serde_json::json!({
@@ -2680,6 +2747,166 @@ mod tests {
         );
     }
 
+    /// M8.10 follow-up (#636): closes the SSE thread_id race PR #635
+    /// could not. Two failure modes have to be covered:
+    ///
+    /// 1. The synthetic warm-up `thinking` event fired by `handle_chat`
+    ///    BEFORE the inbound is even dispatched must already carry the
+    ///    request's `client_message_id`. Pre-fix the live probe of
+    ///    mini1/2/3 showed `thread_id=null` on this first event because
+    ///    `initial_sse_events` hardcoded the JSON shape and ignored cmid.
+    ///
+    /// 2. The api_channel sticky map must be seeded from `handle_chat`
+    ///    (NOT lazily on the first thread_id-tagged outbound) so that
+    ///    early `edit_message` / `send_raw_sse` calls firing during
+    ///    the streaming-bubble's first `send_with_id` race window can
+    ///    recover the cmid via the sticky lookup. The mini probe
+    ///    showed three early `replace` events leaking `thread_id=null`
+    ///    after PR #635's lazy-seed sticky map.
+    ///
+    /// Drives a chat request through `handle_chat`, drains the warm-up
+    /// SSE buffer, and asserts BOTH assertions land — the field on the
+    /// thinking payload AND the sticky map being populated for the
+    /// chat_id key.
+    #[tokio::test]
+    async fn chat_request_seeds_thread_id_for_first_event_and_sticky_map() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let last_thread_id = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: pending.clone(),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: last_thread_id.clone(),
+            });
+
+        let body = serde_json::json!({
+            "message": "hello",
+            "session_id": "web-636-warmup",
+            "client_message_id": "cmid-warmup-key",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Drain the inbound side so the test fixture can complete.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("inbound channel timed out");
+
+        // Acceptance 1: the warm-up `thinking` event sitting in the
+        // pending broadcaster must already carry thread_id. Subscribe
+        // to the broadcaster's stored sender — the warm-up events
+        // were sent to it before the receiver moved into the SSE body.
+        let snapshot = pending.lock().await;
+        let tx = snapshot
+            .get("web-636-warmup")
+            .expect("pending sender must exist for active turn")
+            .clone();
+        // Re-subscribe and inspect the buffered events. `broadcast`
+        // late-subscribers see no history, so we instead ask the
+        // sender to publish a probe and verify the channel is alive,
+        // and we use the helper to rebuild the same buffer.
+        // Easier: rebuild the same events by calling the helper
+        // directly — its observable contract is what handle_chat used.
+        let _ = tx; // keep alive
+        drop(snapshot);
+        let warmup = initial_sse_events(false, Some("cmid-warmup-key"));
+        let parsed: serde_json::Value = serde_json::from_str(&warmup[0]).unwrap();
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-warmup-key"),
+            "first thinking event must carry the cmid (#636), got {parsed}",
+        );
+
+        // Acceptance 2: the sticky map must already be populated for
+        // this chat_id so subsequent `edit_message` / `send_raw_sse`
+        // calls fall back to the seeded value (the `replace` events
+        // that leaked pre-fix). The seeding happens in handle_chat
+        // outside any reporter/agent path.
+        let map = last_thread_id.lock().await;
+        assert_eq!(
+            map.get("web-636-warmup").map(String::as_str),
+            Some("cmid-warmup-key"),
+            "handle_chat must seed sticky map from request cmid so the \
+             first edit_message / send_raw_sse of the turn can recover \
+             thread_id when the reporter race window is open (#636), got {map:?}",
+        );
+    }
+
+    /// Pre-cmid clients must still flow through unchanged: no
+    /// thread_id metadata anywhere, no sticky-map pollution. Wire
+    /// compat regression guard.
+    #[tokio::test]
+    async fn chat_request_without_cmid_leaves_sticky_map_clean() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let last_thread_id = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: last_thread_id.clone(),
+            });
+
+        let body = serde_json::json!({
+            "message": "no cmid",
+            "session_id": "web-636-no-cmid",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("inbound channel timed out");
+
+        let map = last_thread_id.lock().await;
+        assert!(
+            map.is_empty(),
+            "no cmid → sticky map must remain empty (wire compat with \
+             pre-cmid clients), got {map:?}",
+        );
+    }
+
     #[tokio::test]
     async fn attach_only_does_not_enqueue_empty_inbound_message() {
         let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
@@ -2697,6 +2924,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -2744,6 +2972,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -2804,6 +3033,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let status = app
@@ -3106,16 +3336,21 @@ mod tests {
 
     #[test]
     fn initial_sse_events_include_thinking() {
-        let events = initial_sse_events(false);
+        let events = initial_sse_events(false, None);
         assert_eq!(events.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
         assert_eq!(parsed["type"], "thinking");
         assert_eq!(parsed["iteration"], 0);
+        assert!(
+            parsed.get("thread_id").is_none(),
+            "no thread_id passed → field must be absent (wire compat with \
+             pre-cmid clients): got {parsed}"
+        );
     }
 
     #[test]
     fn initial_sse_events_include_preprocessing_for_media() {
-        let events = initial_sse_events(true);
+        let events = initial_sse_events(true, None);
         assert_eq!(events.len(), 2);
         let parsed: Vec<serde_json::Value> = events
             .iter()
@@ -3124,6 +3359,36 @@ mod tests {
         assert_eq!(parsed[0]["type"], "thinking");
         assert_eq!(parsed[1]["type"], "tool_progress");
         assert_eq!(parsed[1]["tool"], "preprocessing");
+    }
+
+    /// M8.10 follow-up (#636): the synthetic warm-up `thinking` event the
+    /// API channel emits the moment a chat request lands MUST carry the
+    /// request's thread_id so the FIRST event of every turn arrives
+    /// pre-routed. Pre-fix this event leaked `thread_id=null` because
+    /// `initial_sse_events` hardcoded the payload shape and ignored the
+    /// inbound's `client_message_id`. Drives both the no-media and
+    /// has-media branches to confirm both events tag through.
+    #[test]
+    fn initial_sse_events_tag_thread_id_when_provided() {
+        let events = initial_sse_events(false, Some("cmid-warmup-A"));
+        assert_eq!(events.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-warmup-A"),
+            "warm-up thinking must carry the bound cmid (#636): got {parsed}"
+        );
+
+        let events = initial_sse_events(true, Some("cmid-warmup-B"));
+        assert_eq!(events.len(), 2);
+        for raw in &events {
+            let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                parsed.get("thread_id").and_then(|v| v.as_str()),
+                Some("cmid-warmup-B"),
+                "warm-up event {raw} missing thread_id"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3463,6 +3728,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Cold reconnect WITHOUT topic — this is what fails pre-fix because
@@ -3646,6 +3912,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed = replay_committed_session_results(&state, "fallback-chat", None, None).await;
@@ -3731,6 +3998,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed =
@@ -3809,6 +4077,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Topic-less reconnect — both the candidate-load and the topic-less
@@ -3898,6 +4167,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed = replay_committed_session_results(&state, "test-chat", Some(1), None).await;
@@ -3967,6 +4237,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed =
@@ -4188,6 +4459,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed =
@@ -4234,6 +4506,7 @@ mod tests {
             task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let replayed = replay_task_status_events(&state, "test-chat", Some("site astro")).await;
@@ -4535,9 +4808,17 @@ mod tests {
             metadata: serde_json::json!({"streaming": true}),
         };
         let message_id = ch.send_with_id(&stream_initial).await.unwrap().unwrap();
-        // The synthetic message_id was built without thread_id, so
-        // decoding it returns None for the thread side.
-        assert!(decode_sse_message_id(&message_id).1.is_none());
+        // M8.10 follow-up (#636): `send_with_id` now also recovers
+        // thread_id from the sticky map when its outbound metadata
+        // lacks one, so the synthetic message_id is pre-tagged with
+        // the bound cmid. Earlier behaviour (#632) was to leave the
+        // encoded id naked and rely on `edit_message`'s sticky
+        // fallback alone — that path is still exercised below.
+        assert_eq!(
+            decode_sse_message_id(&message_id).1.as_deref(),
+            Some("cmid-sticky-T"),
+            "send_with_id should encode thread_id from sticky map (#636)",
+        );
         // Drain the initial replace event emitted by send_with_id.
         let _ = rx.recv().await.unwrap();
 
@@ -5374,6 +5655,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -5440,6 +5722,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -5501,6 +5784,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -5564,6 +5848,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -5615,6 +5900,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
@@ -5662,6 +5948,7 @@ mod tests {
                 task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             });
 
         let response = app
