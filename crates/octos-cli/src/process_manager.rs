@@ -45,10 +45,6 @@ pub struct ProcessManager {
     serve_port: Option<u16>,
     /// Admin token for API access (passed to admin mode gateways).
     admin_token: Option<String>,
-    /// Server data directory — used to resolve dashboard-wide config such as
-    /// SMTP settings + secret file when launching gateways whose profile email
-    /// tool is configured to use the shared SMTP provider.
-    data_dir: Option<PathBuf>,
     /// Weak self-reference for auto-restart from spawned tasks.
     self_ref: std::sync::Mutex<Option<std::sync::Weak<ProcessManager>>>,
 }
@@ -131,17 +127,8 @@ impl ProcessManager {
             alert_tx: std::sync::Mutex::new(None),
             serve_port: None,
             admin_token: None,
-            data_dir: None,
             self_ref: std::sync::Mutex::new(None),
         }
-    }
-
-    /// Set the server data directory. Used to locate the dashboard-wide SMTP
-    /// configuration when spawning gateways whose email tool relies on the
-    /// shared SMTP provider.
-    pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
-        self.data_dir = Some(dir);
-        self
     }
 
     /// Store a weak self-reference for auto-restart from spawned monitor tasks.
@@ -329,19 +316,8 @@ impl ProcessManager {
         // The dashboard sets email config in the profile JSON, but the
         // send_email app-skill reads SMTP_HOST / SMTP_PASSWORD / etc.
         // from env vars. Bridge the gap here.
-        //
-        // For the SMTP provider, fields not set on the profile fall back to
-        // the dashboard-wide SMTP store (config.json `dashboard_auth.smtp` +
-        // `{data_dir}/smtp_secret.json`) so all profiles share one source of
-        // truth for SMTP credentials.
         if let Some(ref email) = profile.config.email {
-            let mut email_for_env = email.clone();
-            if email.provider.eq_ignore_ascii_case("smtp")
-                && let Some(ref data_dir) = self.data_dir
-            {
-                merge_dashboard_smtp_into_email(&mut email_for_env, data_dir);
-            }
-            for (key, value) in email_for_env.to_env_vars(&profile.config.env_vars) {
+            for (key, value) in email.to_env_vars(&profile.config.env_vars) {
                 // Don't override if already set explicitly in env_vars
                 if !profile.config.env_vars.contains_key(&key) {
                     cmd.env(&key, &value);
@@ -1163,64 +1139,6 @@ impl ProcessManager {
 /// Check if a TCP port is available by attempting to bind it.
 fn port_available(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-/// Fill in any unset SMTP fields on `email` from the dashboard-wide SMTP
-/// configuration (config.json `dashboard_auth.smtp` + `smtp_secret.json`).
-///
-/// Read fresh from disk so wizard saves take effect on the next gateway
-/// spawn without a server restart. Failures are logged at debug level — the
-/// per-profile fields (or env-var fallback in `to_env_vars`) remain in effect
-/// when the dashboard store is empty or unreadable.
-fn merge_dashboard_smtp_into_email(email: &mut crate::profiles::EmailSettings, data_dir: &Path) {
-    let cfg_path = crate::config::Config::data_dir_config_path(data_dir);
-    let body = match std::fs::read_to_string(&cfg_path) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, "dashboard SMTP fallback: config.json unreadable");
-            return;
-        }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "dashboard SMTP fallback: config.json parse failed");
-            return;
-        }
-    };
-    let smtp = value.get("dashboard_auth").and_then(|v| v.get("smtp"));
-    if email.smtp_host.as_deref().unwrap_or("").is_empty()
-        && let Some(host) = smtp.and_then(|s| s.get("host")).and_then(|v| v.as_str())
-        && !host.is_empty()
-    {
-        email.smtp_host = Some(host.to_string());
-    }
-    if email.smtp_port.is_none()
-        && let Some(port) = smtp.and_then(|s| s.get("port")).and_then(|v| v.as_u64())
-    {
-        email.smtp_port = Some(port as u16);
-    }
-    if email.username.as_deref().unwrap_or("").is_empty()
-        && let Some(user) = smtp.and_then(|s| s.get("username")).and_then(|v| v.as_str())
-        && !user.is_empty()
-    {
-        email.username = Some(user.to_string());
-    }
-    if email.from_address.as_deref().unwrap_or("").is_empty()
-        && let Some(from) = smtp
-            .and_then(|s| s.get("from_address"))
-            .and_then(|v| v.as_str())
-        && !from.is_empty()
-    {
-        email.from_address = Some(from.to_string());
-    }
-    if email.password.as_deref().unwrap_or("").is_empty() {
-        match crate::smtp_secret_store::SmtpSecretStore::new(data_dir).load() {
-            Ok(Some(pw)) if !pw.is_empty() => email.password = Some(pw),
-            Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "dashboard SMTP fallback: smtp_secret read failed"),
-        }
-    }
 }
 
 /// Find the `node` binary on PATH.
