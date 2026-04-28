@@ -17,7 +17,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use chrono::Utc;
 use eyre::Result;
 use futures::stream::{self, StreamExt};
@@ -38,6 +38,37 @@ use crate::file_handle::{
 /// Callback that returns serialized task list for a session key.
 pub type TaskQueryFn = dyn Fn(&str) -> serde_json::Value + Send + Sync;
 
+/// M7.9 / W2: structured outcome for the cancel callback so the
+/// `octos-bus` crate doesn't need to depend on `octos-agent` types.
+/// Mapped 1:1 onto `octos_agent::TaskCancelError` by the gateway
+/// runtime that wires this callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCancelOutcome {
+    /// Task transitioned from active → cancelled.
+    Cancelled,
+    /// No supervisor knew about the requested task id (404).
+    NotFound,
+    /// Task is already in a terminal state (409).
+    AlreadyTerminal,
+}
+
+/// M7.9 / W2: structured outcome for the relaunch callback. `Ok` carries
+/// the freshly-allocated successor task id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRelaunchOutcome {
+    Relaunched { new_task_id: String },
+    NotFound,
+    StillActive,
+}
+
+/// Callback that cancels a tracked task by id. Returns the structured
+/// outcome so the API channel can map it to an HTTP status code.
+pub type TaskCancelFn = dyn Fn(&str) -> TaskCancelOutcome + Send + Sync;
+
+/// Callback that relaunches a tracked task by id. The optional
+/// `from_node` argument mirrors `RelaunchOpts::from_node`.
+pub type TaskRelaunchFn = dyn Fn(&str, Option<&str>) -> TaskRelaunchOutcome + Send + Sync;
+
 /// Callback invoked when a session is deleted via the API.
 /// The gateway runtime wires this to stop the session actor.
 type OnSessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -57,6 +88,10 @@ struct ApiState {
     profile_id: Option<String>,
     sessions: Arc<Mutex<SessionManager>>,
     task_query: Option<Arc<TaskQueryFn>>,
+    /// M7.9 / W2: cancel a tracked background task by id.
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    /// M7.9 / W2: relaunch (restart-from-node) a tracked task by id.
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
     on_session_deleted: Option<OnSessionDeletedFn>,
     metrics_renderer: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
@@ -180,10 +215,18 @@ struct ChatRequest {
     target_profile_id: Option<String>,
     #[serde(default)]
     attach_only: bool,
-    /// Client-supplied UUID forwarded to the session actor so the persisted
-    /// user message carries it through `add_message_with_seq` and the
-    /// `session_result` event can correlate the optimistic web bubble back
-    /// to the server-assigned seq.
+    /// Client-generated correlation id used by the web reducer to route
+    /// the eventual session_result event onto the optimistic bubble the
+    /// user sees. Without this, speculative-queue overflow replies arrive
+    /// carrying `response_to_client_message_id: null` and the reducer
+    /// cannot tell which streaming bubble they belong to — BRAVO's reply
+    /// then clobbers ALPHA's bubble and BRAVO's bubble stays empty
+    /// (FA-12f).
+    ///
+    /// Also forwarded to the session actor so the persisted user message
+    /// carries it through `add_message_with_seq`, letting the user-message
+    /// `session_result` event correlate the optimistic web bubble back to
+    /// the server-assigned seq.
     #[serde(default)]
     client_message_id: Option<String>,
 }
@@ -204,6 +247,12 @@ pub struct ApiChannel {
     sessions: Arc<Mutex<SessionManager>>,
     /// Optional callback for querying background tasks by session key.
     task_query: Option<Arc<TaskQueryFn>>,
+    /// M7.9 / W2: optional cancel callback. Wired by the gateway runtime
+    /// to forward to `SessionTaskQueryStore::cancel_task`.
+    task_cancel: Option<Arc<TaskCancelFn>>,
+    /// M7.9 / W2: optional relaunch callback. Wired by the gateway
+    /// runtime to forward to `SessionTaskQueryStore::relaunch_task`.
+    task_relaunch: Option<Arc<TaskRelaunchFn>>,
     /// Optional callback invoked when a session is deleted via API.
     on_session_deleted: Option<OnSessionDeletedFn>,
     /// Optional Prometheus render callback shared from the child gateway.
@@ -228,6 +277,8 @@ impl ApiChannel {
             last_content: Arc::new(Mutex::new(HashMap::new())),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         }
@@ -236,6 +287,22 @@ impl ApiChannel {
     /// Attach a task query callback for the `/sessions/{id}/tasks` endpoint.
     pub fn with_task_query(mut self, f: Arc<TaskQueryFn>) -> Self {
         self.task_query = Some(f);
+        self
+    }
+
+    /// M7.9 / W2: attach the cancel callback that backs
+    /// `POST /tasks/{task_id}/cancel`. Without this, the route returns
+    /// `503 Service Unavailable`.
+    pub fn with_task_cancel(mut self, f: Arc<TaskCancelFn>) -> Self {
+        self.task_cancel = Some(f);
+        self
+    }
+
+    /// M7.9 / W2: attach the relaunch callback that backs
+    /// `POST /tasks/{task_id}/restart-from-node`. Without this, the
+    /// route returns `503 Service Unavailable`.
+    pub fn with_task_relaunch(mut self, f: Arc<TaskRelaunchFn>) -> Self {
+        self.task_relaunch = Some(f);
         self
     }
 
@@ -250,6 +317,29 @@ impl ApiChannel {
     pub fn with_on_session_deleted(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_session_deleted = Some(Arc::new(f));
         self
+    }
+
+    /// Test helper: subscribe to the watchers fanout for a (chat_id, topic)
+    /// without going through the HTTP `/sessions/:id/events/stream` handler.
+    /// Mirrors the subscribe path that the real SSE handler uses (see
+    /// `handle_session_event_stream`), so integration tests can assert that
+    /// outbound messages carrying `_session_result` metadata are broadcast
+    /// to watchers even when the primary turn's `pending` channel has
+    /// already been removed (FA-11 defect B regression guard).
+    #[doc(hidden)]
+    pub async fn subscribe_watcher_for_tests(
+        &self,
+        chat_id: &str,
+        topic: Option<&str>,
+    ) -> broadcast::Receiver<String> {
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .entry(watcher_key(chat_id, topic))
+            .or_insert_with(|| {
+                let (tx, _rx) = new_sse_channel();
+                tx
+            })
+            .subscribe()
     }
 
     fn session_workspace_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
@@ -571,6 +661,8 @@ impl Channel for ApiChannel {
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
+            task_cancel: self.task_cancel.clone(),
+            task_relaunch: self.task_relaunch.clone(),
             on_session_deleted: self.on_session_deleted.clone(),
             metrics_renderer: self.metrics_renderer.clone(),
         };
@@ -587,6 +679,13 @@ impl Channel for ApiChannel {
             .route("/sessions/{id}/status", get(handle_session_status))
             .route("/sessions/{id}/tasks", get(handle_session_tasks))
             .route("/sessions/{id}", delete(handle_delete_session))
+            .route("/sessions/{id}/title", patch(handle_update_session_title))
+            // M7.9 / W2 — task supervisor exposure
+            .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
+            .route(
+                "/tasks/{task_id}/restart-from-node",
+                post(handle_task_relaunch),
+            )
             .route("/files/{*path}", get(handle_file_download))
             .route("/upload", post(handle_upload))
             .route("/admin/shell", post(handle_admin_shell))
@@ -816,7 +915,7 @@ impl Channel for ApiChannel {
                         }
                     }
                 }
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": "",
                     "model": msg.metadata.get("model").and_then(|v| v.as_str()).unwrap_or(""),
@@ -829,6 +928,22 @@ impl Channel for ApiChannel {
                     "duration_s": msg.metadata.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
                     "has_bg_tasks": has_bg,
                 });
+                // M8.10-A: thread the committed session sequence into the done
+                // event so live-streamed bubbles on the web client can populate
+                // `historySeq`. Optional — omitted when persist failed or the
+                // metadata key was not provided (legacy/error paths).
+                if let Some(seq) = msg.metadata.get("committed_seq").and_then(|v| v.as_u64()) {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
+                // Bug 3 / W1.G4 cost panel — forward the per-node cost rows
+                // that the session actor pulled out of
+                // `ToolResult.structured_metadata` from `run_pipeline`. The
+                // CostBreakdown panel reads this array off the `done` event.
+                if let Some(node_costs) = msg.metadata.get("node_costs").cloned() {
+                    if !node_costs.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                        done["node_costs"] = node_costs;
+                    }
+                }
                 let _ = tx.send(done.to_string());
                 pending.remove(&msg.chat_id);
                 drop(pending);
@@ -953,8 +1068,19 @@ impl ApiChannel {
         false
     }
 
-    /// Persist a message to the session JSONL for the given chat_id and
-    /// return the authoritative committed message shape when available.
+    /// Persist a message to the canonical per-user session JSONL and return
+    /// the authoritative committed message shape when available.
+    ///
+    /// Routes through the shared
+    /// [`crate::session::persist_message_through_canonical_path`] helper so:
+    ///   - bus-side writes hit the same
+    ///     `users/<encoded_base>/sessions/<encoded_topic>.jsonl` file the
+    ///     `SessionActor` uses (closing the split-brain storage bug);
+    ///   - concurrent writes for the same session_key serialise via a
+    ///     per-key Tokio mutex (closing the concurrent-persist seq race).
+    ///
+    /// The legacy flat layout is no longer touched on writes; reads still
+    /// merge it for back-compat with stale on-disk data.
     async fn persist_to_session(
         &self,
         chat_id: &str,
@@ -963,57 +1089,48 @@ impl ApiChannel {
     ) -> Option<MessageInfo> {
         let key =
             current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
-        let mut sess = self.sessions.lock().await;
-        let committed = match sess.add_message_with_seq(&key, message.clone()).await {
-            Ok(seq) => {
-                info!(chat_id = %chat_id, key = %key.0, seq, "persisted file/notification to session");
-                Some(message_info_from_history_message(
-                    &message,
-                    &sess.data_dir(),
-                    seq,
-                ))
-            }
-            Err(e) => {
-                tracing::warn!(chat_id = %chat_id, error = %e, "failed to persist message to session");
-                None
-            }
+        let data_dir = {
+            let sess = self.sessions.lock().await;
+            sess.data_dir()
         };
 
-        // Also write to the per-user SessionHandle path so the web client
-        // (which reads from per-user JSONL via source=full) can see file deliveries.
-        let data_dir = sess.data_dir();
-        drop(sess);
-        let base_key = key.base_key();
-        let encoded = crate::session::encode_path_component(base_key);
-        let per_user_dir = data_dir.join("users").join(encoded).join("sessions");
-        let per_user_path = per_user_dir.join("default.jsonl");
-        if per_user_path.exists() {
-            if let Ok(msg_json) = serde_json::to_string(&message) {
-                let path_clone = per_user_path.clone();
-                match tokio::task::spawn_blocking(move || {
-                    use std::io::Write;
-                    let mut f = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&per_user_path)?;
-                    writeln!(f, "{}", msg_json)?;
-                    Ok::<_, std::io::Error>(())
-                })
-                .await
-                {
-                    Ok(Ok(())) => info!(chat_id = %chat_id, "persisted to per-user session"),
-                    Ok(Err(e)) => {
-                        tracing::warn!(chat_id = %chat_id, path = %path_clone.display(), error = %e, "per-user session write failed")
-                    }
-                    Err(e) => {
-                        tracing::warn!(chat_id = %chat_id, error = %e, "per-user session spawn_blocking failed")
-                    }
-                }
-            }
-        } else {
-            tracing::debug!(chat_id = %chat_id, path = %per_user_path.display(), "per-user session path not found, skipping");
+        let result = crate::session::persist_message_through_canonical_path(
+            &data_dir,
+            &key,
+            message.clone(),
+        )
+        .await;
+
+        // Drop any stale `SessionManager` cache entry for this key so a
+        // follow-up read (e.g. duplicate-detection or `?source=full`) consults
+        // disk instead of returning a pre-write empty `Session`. Without this
+        // invalidation the manager's LRU cache could shadow the canonical
+        // per-user JSONL and silently strip newly-written messages.
+        {
+            let mut sess = self.sessions.lock().await;
+            sess.invalidate_cache(&key);
         }
 
-        committed
+        match result {
+            Ok(seq) => {
+                info!(
+                    chat_id = %chat_id,
+                    key = %key.0,
+                    seq,
+                    "persisted file/notification to canonical per-user session"
+                );
+                Some(message_info_from_history_message(&message, &data_dir, seq))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    key = %key.0,
+                    error = %error,
+                    "failed to persist message to canonical per-user session"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1066,6 +1183,12 @@ async fn handle_chat(
 
     if !req.attach_only {
         // Build and send InboundMessage to the gateway bus.
+        //
+        // FA-12f: thread the web's `client_message_id` through as the
+        // inbound's platform `message_id`. It surfaces downstream as the
+        // overflow agent's `reply_to` which becomes
+        // `_session_result.response_to_client_message_id` — the field the
+        // web reducer correlates against the optimistic streaming bubble.
         let inbound = InboundMessage {
             channel: "api".into(),
             sender_id: "web".into(),
@@ -1084,7 +1207,11 @@ async fn handle_chat(
                 if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
                     metadata.insert("topic".to_string(), serde_json::Value::String(topic));
                 }
-                if let Some(cmid) = req.client_message_id.filter(|value| !value.is_empty()) {
+                if let Some(cmid) = req
+                    .client_message_id
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                {
                     metadata.insert(
                         "client_message_id".to_string(),
                         serde_json::Value::String(cmid),
@@ -1092,7 +1219,10 @@ async fn handle_chat(
                 }
                 serde_json::Value::Object(metadata)
             },
-            message_id: None,
+            message_id: req
+                .client_message_id
+                .clone()
+                .filter(|value| !value.is_empty()),
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
@@ -1179,6 +1309,10 @@ async fn handle_session_event_stream(
 struct SessionInfo {
     id: String,
     message_count: usize,
+    /// Display title from the session's JSONL meta line (auto-derived from
+    /// first user message, or set manually). None for legacy sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1448,32 +1582,128 @@ async fn replay_committed_session_results(
         return Vec::new();
     };
 
+    // Collect candidate-events first WITHOUT early-returning. The previous
+    // shape returned `events` as soon as ANY candidate file resolved, even
+    // when its filtered output was empty — short-circuiting the topic-less
+    // fallback below for the case where a topic-less candidate JSONL exists
+    // but only contains user/tool-trace lines (no displayable assistant
+    // content). The fallback is the only path that surfaces a topic-bearing
+    // audio bubble to a topic-less reconnect, so we must NOT early-return on
+    // an empty candidate result.
+    //
+    // Both branches stash `(timestamp, payload)` so the combined-replay path
+    // can globally sort by timestamp before returning. Pre-fix, candidate
+    // events were concatenated in disk order in front of fallback events
+    // — if the two branches' timestamps interleaved (e.g. candidate=T0,T2,T4
+    // and fallback=T1,T3,T5), replay surfaced T0,T2,T4,T1,T3,T5 instead of
+    // T0..T5. The web client renders bubbles in delivery order, so the
+    // mis-sort manifested as a "leap back in time" mid-replay.
+    let mut candidate_events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
     for candidate in &candidates {
         if let Some(session) = session_loader.load(candidate).await {
-            let events: Vec<String> = session
-                .messages
-                .iter()
-                .enumerate()
-                .filter(|(seq, message)| {
-                    since_seq.is_none_or(|since| *seq > since)
-                        && message.role == MessageRole::Assistant
-                        && assistant_message_has_displayable_content(message)
-                })
-                .map(|(seq, message)| {
-                    build_session_result_event_from_message(
-                        message_info_from_history_message(message, &data_dir, seq),
-                        topic,
-                    )
-                    .to_string()
-                })
-                .collect();
-            if events.is_empty() {
-                record_replay("session_result", "empty", 1);
-            } else {
-                record_replay("session_result", "emitted", events.len());
+            for (seq, message) in session.messages.iter().enumerate() {
+                let passes = since_seq.is_none_or(|since| seq > since)
+                    && message.role == MessageRole::Assistant
+                    && assistant_message_has_displayable_content(message);
+                if !passes {
+                    continue;
+                }
+                let payload = build_session_result_event_from_message(
+                    message_info_from_history_message(message, &data_dir, seq),
+                    topic,
+                )
+                .to_string();
+                candidate_events.push((message.timestamp, payload));
             }
-            return events;
+            // Stop at the first resolved candidate file even if it produced
+            // zero displayable events — we do not want to layer multiple
+            // candidate JSONLs on top of each other; the fallback below
+            // handles the topic-less union case explicitly.
+            break;
         }
+    }
+
+    // Topic-less reconnect fallback. The actor writes spawn_only file
+    // deliveries to per-user `<topic>.jsonl`; when the watcher subscribes
+    // without a topic, none of the topic-less candidates above resolves to
+    // that file. Scan every per-user JSONL for these candidates' base_keys
+    // and union the assistant messages so the audio bubble re-materialises.
+    let mut fallback_events: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+    if topic.is_none() {
+        let mut scanned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for candidate in &candidates {
+            let base_key = candidate.base_key();
+            if !scanned.insert(base_key.to_string()) {
+                continue;
+            }
+            for topic_key in session_loader.list_user_session_keys(base_key) {
+                if topic_key.topic().is_none() {
+                    continue; // already covered by candidate-load above
+                }
+                let Some(session) = session_loader.load(&topic_key).await else {
+                    continue;
+                };
+                let topic_str = topic_key.topic().map(str::to_string);
+                for (seq, message) in session.messages.iter().enumerate() {
+                    // NOTE: we deliberately do NOT apply `since_seq` here.
+                    // `since_seq` is a per-watcher cursor measured against the
+                    // unified replay sequence — comparing it to a per-file
+                    // index is the wrong axis (a cursor of 5 must NOT mean
+                    // "skip 5 messages of EACH topic file"). The fallback's
+                    // job is to re-materialise spawn_only file deliveries on
+                    // a topic-less reconnect; tracking per-file cursors is
+                    // meaningless here and was silently dropping legitimate
+                    // assistant rows.
+                    let passes = message.role == MessageRole::Assistant
+                        && assistant_message_has_displayable_content(message);
+                    if !passes {
+                        continue;
+                    }
+                    let payload = build_session_result_event_from_message(
+                        message_info_from_history_message(message, &data_dir, seq),
+                        topic_str.as_deref(),
+                    )
+                    .to_string();
+                    fallback_events.push((message.timestamp, payload));
+                }
+            }
+        }
+    }
+
+    if !candidate_events.is_empty() && !fallback_events.is_empty() {
+        // Both branches produced events — globally sort by timestamp so the
+        // unified set surfaces in true chronological order. (See top-of-fn
+        // comment for the previous out-of-order shape.)
+        let mut combined: Vec<(chrono::DateTime<chrono::Utc>, String)> = candidate_events;
+        combined.extend(fallback_events);
+        combined.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> = combined.into_iter().map(|(_, payload)| payload).collect();
+        record_replay(
+            "session_result",
+            "emitted_with_topic_fallback",
+            payloads.len(),
+        );
+        return payloads;
+    }
+
+    if !candidate_events.is_empty() {
+        candidate_events.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> = candidate_events
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect();
+        record_replay("session_result", "emitted", payloads.len());
+        return payloads;
+    }
+
+    if !fallback_events.is_empty() {
+        fallback_events.sort_by_key(|(timestamp, _)| *timestamp);
+        let payloads: Vec<String> = fallback_events
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect();
+        record_replay("session_result", "emitted_topic_fallback", payloads.len());
+        return payloads;
     }
 
     record_replay("session_result", "missing_session", 1);
@@ -1525,14 +1755,117 @@ async fn handle_session_tasks(
     Json(tasks).into_response()
 }
 
+/// `POST /tasks/{task_id}/cancel` — forwards to the wired
+/// `with_task_cancel` callback. Maps the structured outcome onto HTTP
+/// status codes.
+async fn handle_task_cancel(
+    State(state): State<ApiState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    let Some(ref cancel_fn) = state.task_cancel else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired",
+            })),
+        )
+            .into_response();
+    };
+    match cancel_fn(&task_id) {
+        TaskCancelOutcome::Cancelled => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task_id": task_id,
+                "status": "cancelled",
+            })),
+        )
+            .into_response(),
+        TaskCancelOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        TaskCancelOutcome::AlreadyTerminal => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_already_terminal",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Body of `POST /tasks/{task_id}/restart-from-node`.
+#[derive(Debug, Default, Deserialize)]
+struct ApiRestartFromNodeRequest {
+    #[serde(default)]
+    node_id: Option<String>,
+}
+
+/// `POST /tasks/{task_id}/restart-from-node` — forwards to the wired
+/// `with_task_relaunch` callback. Body: `{ "node_id": Option<String> }`.
+async fn handle_task_relaunch(
+    State(state): State<ApiState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    body: Option<Json<ApiRestartFromNodeRequest>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(ref relaunch_fn) = state.task_relaunch else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired",
+            })),
+        )
+            .into_response();
+    };
+    match relaunch_fn(&task_id, body.node_id.as_deref()) {
+        TaskRelaunchOutcome::Relaunched { new_task_id } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "original_task_id": task_id,
+                "new_task_id": new_task_id,
+                "from_node": body.node_id,
+            })),
+        )
+            .into_response(),
+        TaskRelaunchOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        TaskRelaunchOutcome::StillActive => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_still_active",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /sessions — list all API sessions.
+///
+/// Backed by `list_top_level_sessions` so internal `child-*` spawn fanouts
+/// and `*.tasks` ledger sidecars are skipped at the directory walk. The
+/// generic `list_sessions` is O(N) over every JSONL on disk and was
+/// observed to hang 30s+ on a user dir with 65k+ child JSONLs (river /
+/// mini4) — see issue #607 §D.
 async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
-        .list_sessions()
+        .list_top_level_sessions_with_title()
         .into_iter()
-        .filter_map(|(id, count)| {
+        .filter_map(|(id, count, title)| {
             let chat_id = api_chat_id_from_session_key(&id)?.to_string();
             if !seen.insert(chat_id.clone()) {
                 return None;
@@ -1540,6 +1873,7 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
             Some(SessionInfo {
                 id: chat_id,
                 message_count: count,
+                title,
             })
         })
         .collect();
@@ -1655,6 +1989,47 @@ async fn handle_delete_session(
     }
     // No session found — still return 204 (idempotent delete).
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct UpdateSessionTitleRequest {
+    title: String,
+}
+
+/// PATCH /sessions/:id/title — set a manual title.
+async fn handle_update_session_title(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateSessionTitleRequest>,
+) -> Response {
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
+    }
+    if title.chars().count() > 200 {
+        return (StatusCode::BAD_REQUEST, "title must be at most 200 chars").into_response();
+    }
+
+    let mut sess = state.sessions.lock().await;
+    let mut updated = false;
+    for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
+        if sess.load(&candidate).await.is_some() {
+            match sess.update_title(&candidate, title.clone()).await {
+                Ok(()) => updated = true,
+                Err(error) => tracing::error!(
+                    session_key = %candidate,
+                    error = %error,
+                    "update_title in gateway store failed"
+                ),
+            }
+        }
+    }
+
+    if updated {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "session not found").into_response()
+    }
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.
@@ -1967,6 +2342,125 @@ mod tests {
         let json = r#"{"message": "hi", "session_id": "web-123"}"#;
         let req: ChatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.session_id.as_deref(), Some("web-123"));
+    }
+
+    /// FA-12f regression: POST /api/chat carries a web-generated
+    /// `client_message_id` that must survive as
+    /// `InboundMessage.message_id` so downstream overflow emission can
+    /// propagate it into `_session_result.response_to_client_message_id`
+    /// — the field the web reducer correlates against the optimistic
+    /// streaming bubble.
+    ///
+    /// Before this fix the field was silently dropped at the request
+    /// deserializer; overflow replies then arrived with
+    /// `response_to_client_message_id: null` and the speculative-queue
+    /// BRAVO bubble never rendered (its reply clobbered ALPHA's bubble
+    /// via the session_result merge path).
+    #[tokio::test]
+    async fn chat_request_propagates_client_message_id_to_inbound() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let body = serde_json::json!({
+            "message": "Use shell: echo BRAVO",
+            "session_id": "web-fa12f",
+            "client_message_id": "client-bravo-xyz",
+            "stream": true,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("handle_chat must forward the message to the gateway bus")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("client-bravo-xyz"),
+            "InboundMessage.message_id must carry the request's client_message_id \
+             so the overflow reply can be routed back to the correct bubble",
+        );
+    }
+
+    /// Empty / missing `client_message_id` must NOT populate the inbound
+    /// `message_id` field — we want a sentinel-empty correlation id to
+    /// behave the same as "no correlation" so downstream emission doesn't
+    /// produce a session_result with an empty-string correlation id that
+    /// the reducer would then mis-route.
+    #[tokio::test]
+    async fn chat_request_treats_empty_client_message_id_as_absent() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+            });
+
+        let body = serde_json::json!({
+            "message": "hello",
+            "session_id": "web-fa12f-empty",
+            "client_message_id": "",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert!(
+            inbound.message_id.is_none(),
+            "empty client_message_id must not populate inbound.message_id, got {:?}",
+            inbound.message_id,
+        );
     }
 
     #[tokio::test]
@@ -2575,6 +3069,562 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Helper: simulate the actor-side write to per-user JSONL (no FLAT write).
+    /// Mirrors `SessionActor::deliver_background_notification` for spawn_only
+    /// file deliveries — the actor stamps `_history_persisted=true` on the
+    /// outbound, so ApiChannel never writes for these.
+    async fn actor_persist_to_per_user(
+        data_dir: &Path,
+        session_key: &SessionKey,
+        message: Message,
+    ) {
+        let mut handle = crate::session::SessionHandle::open(data_dir, session_key);
+        handle.add_message_with_seq(message).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bus_side_persist_routes_to_canonical_per_user_topic_jsonl() {
+        // Pins the unified-write contract introduced by the storage unification
+        // fix. The bus-side `persist_to_session` previously wrote to:
+        //   - legacy flat `sessions/<encoded_full_key>.jsonl`
+        //   - hardcoded per-user `users/<encoded_base>/sessions/default.jsonl`
+        //     (ignored topic — actor-side writes used `<topic>.jsonl`)
+        //
+        // Post-fix it must route through `SessionHandle` so writes land in the
+        // canonical per-user `<encoded_topic>.jsonl` file the actor uses.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let channel = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+
+        let topic = "site astro";
+        let mp3 = data_dir.path().join("audio").join("a.mp3");
+        std::fs::create_dir_all(mp3.parent().unwrap()).unwrap();
+        std::fs::write(&mp3, b"mp3 bytes").unwrap();
+
+        let outbound = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "web-canonical".into(),
+            content: "✓ fm_tts done".into(),
+            reply_to: None,
+            media: vec![mp3.to_string_lossy().into_owned()],
+            metadata: serde_json::json!({ "topic": topic }),
+        };
+        channel.send(&outbound).await.unwrap();
+
+        // Canonical per-user topic file must exist with the message.
+        let encoded_base =
+            crate::session::encode_path_component(&format!("{TEST_PROFILE_ID}:api:web-canonical"));
+        let encoded_topic = crate::session::encode_path_component(topic);
+        let canonical = data_dir
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        assert!(
+            canonical.exists(),
+            "bus-side persist must write to canonical per-user `<topic>.jsonl` ({}) — \
+             this is the file the SessionActor also writes, eliminating split-brain storage",
+            canonical.display()
+        );
+        let body = std::fs::read_to_string(&canonical).unwrap();
+        assert!(
+            body.contains("fm_tts done"),
+            "canonical per-user `<topic>.jsonl` must record the persisted message"
+        );
+
+        // Legacy per-user `default.jsonl` mirror must NOT be written when a
+        // topic is supplied — that's the bug we are fixing.
+        let legacy_default = data_dir
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join("default.jsonl");
+        assert!(
+            !legacy_default.exists(),
+            "topic-bearing bus-side persist must NOT touch the hardcoded `default.jsonl` mirror — \
+             that legacy fan-out caused the split-brain bug"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_only_file_delivery_is_visible_to_watcher_replay_after_reconnect() {
+        // Regression for the split-brain session-storage bug.
+        //
+        // Production scenario reproduced on mini2 (2026-04-23):
+        //   1. A spawn_only background task (e.g. fm_tts) finishes long after
+        //      the user's interactive turn ended, so the live SSE pending
+        //      sender for the session has either been dropped or is empty.
+        //   2. SessionActor::deliver_background_notification persists the file
+        //      message via the per-actor `SessionHandle` (per-user JSONL at
+        //      `users/<encoded_base>/sessions/<encoded_topic>.jsonl`) and stamps
+        //      `_history_persisted=true` on the OutboundMessage.
+        //   3. ApiChannel::send sees `_history_persisted=true` and skips its
+        //      own bus-side write (legacy flat layout
+        //      `sessions/<encoded_full_key>.jsonl` plus the hardcoded per-user
+        //      `default.jsonl` mirror — note that mirror IGNORES the actor's
+        //      topic).
+        //   4. The user reconnects. Their web client opens
+        //      `/sessions/{chat_id}/events/stream` — without re-supplying the
+        //      topic in the query string (a real failure mode of the dashboard
+        //      reload + workflow listing flows). The only chance the audio
+        //      bubble has to materialise is `replay_committed_session_results`.
+        //
+        // Pre-fix, the actor's write lands in `<topic>.jsonl` while the
+        // ApiChannel write — when it happens at all — hits FLAT or the
+        // hardcoded `default.jsonl`. With no topic in the candidate-key set
+        // and nothing in the topic-less per-user files, replay returns zero
+        // events and the audio bubble silently disappears.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let topic = "site astro";
+        let session_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "test-chat",
+            Some(topic),
+        );
+
+        // Actor persists the user message into per-user `<topic>.jsonl` (the
+        // production gateway path: SessionActor handles inbound BEFORE
+        // ApiChannel.send is ever invoked for this turn).
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &session_key,
+            Message::user("please make me a podcast about cats"),
+        )
+        .await;
+
+        // Simulate the mp3 the spawn_only fm_tts skill produced.
+        let mp3_path = data_dir.path().join("artifacts").join("podcast.mp3");
+        std::fs::create_dir_all(mp3_path.parent().unwrap()).unwrap();
+        std::fs::write(&mp3_path, b"ID3...mp3 bytes").unwrap();
+
+        // Actor-side spawn_only delivery — the only writer that records the
+        // file message anywhere. ApiChannel never writes because the actor
+        // stamps `_history_persisted=true`.
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &session_key,
+            Message {
+                role: MessageRole::Assistant,
+                content: "✓ fm_tts completed — file delivered".into(),
+                media: vec![mp3_path.to_string_lossy().into_owned()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        // Cold reconnect WITHOUT topic — this is what fails pre-fix because
+        // the candidate-key set never reaches `<topic>.jsonl` and the
+        // hardcoded per-user `default.jsonl` mirror was never written.
+        let replayed_topicless =
+            replay_committed_session_results(&state, "test-chat", None, None).await;
+
+        let event_topicless = replayed_topicless
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .find(|payload| {
+                payload["message"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("fm_tts completed"))
+            });
+        assert!(
+            event_topicless.is_some(),
+            "topic-less reconnect must still surface the spawn_only file delivery — \
+             actor-side write to per-user `<topic>.jsonl` was lost because the \
+             bus-side reader never visits topic-bearing per-user files when the \
+             watcher subscribes without a topic. This is the split-brain \
+             session-storage bug"
+        );
+
+        // Hot reconnect WITH topic — this happens to work pre-fix because the
+        // SessionManager::load merge sees per-user `<topic>.jsonl`. We pin
+        // the contract here too so the canonical-write fix doesn't quietly
+        // break the topic path while landing the topic-less path.
+        let replayed_topic =
+            replay_committed_session_results(&state, "test-chat", None, Some(topic)).await;
+        let event_topic = replayed_topic
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .find(|payload| {
+                payload["message"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("fm_tts completed"))
+            })
+            .expect("topic-aware reconnect must continue to surface the file delivery");
+        let media = event_topic["message"]["media"]
+            .as_array()
+            .expect("file-delivery session_result event must carry a media array");
+        assert_eq!(media.len(), 1, "exactly one audio handle expected");
+        assert!(
+            media[0].as_str().unwrap_or_default().starts_with("pf/"),
+            "audio path must be projected through the profile-relative file handle so the web client can fetch it"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_bus_side_persists_get_distinct_seqs() {
+        // Regression for the concurrent-persist seq race introduced when
+        // `persist_to_session` switched from `SessionManager::add_message_with_seq`
+        // (shared mutex via `Arc<Mutex<SessionManager>>`) to
+        // `SessionHandle::open` + `add_message_with_seq`.
+        //
+        // Each `SessionHandle::open` loads disk into its OWN per-instance
+        // `messages: Vec<_>`. Two concurrent calls both observe `len = N`,
+        // both append, both return `seq = N`. Watcher correlation breaks —
+        // the web client sees two "session_result, seq=N" rows and renders
+        // duplicates.
+        //
+        // Post-fix: writes for the same session_key must serialise at the
+        // storage layer (per-key mutex map shared across actor + channel) so
+        // each call observes a fresh `len` and returns a distinct seq.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let channel = Arc::new(ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        ));
+
+        let chat_id = "race-chat";
+        let topic = Some("race-topic");
+        let n = 16usize;
+
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let channel = channel.clone();
+            let chat_id = chat_id.to_string();
+            handles.push(tokio::spawn(async move {
+                channel
+                    .persist_to_session(
+                        &chat_id,
+                        topic,
+                        Message::assistant(format!("concurrent assistant {i}")),
+                    )
+                    .await
+                    .and_then(|info| info.seq)
+            }));
+        }
+
+        let mut seqs: Vec<usize> = Vec::with_capacity(n);
+        for h in handles {
+            let result = h.await.expect("join");
+            seqs.push(result.expect("persist must succeed and return a seq"));
+        }
+        seqs.sort();
+        let expected: Vec<usize> = (0..n).collect();
+        assert_eq!(
+            seqs, expected,
+            "{n} concurrent bus-side persist calls must each receive a \
+             distinct sequence in 0..N (storage layer must serialise writes \
+             via a per-key lock map shared across actor + channel)"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
+        // Regression for the topic-less-fallback short-circuit bug.
+        //
+        // When a topic-less candidate JSONL exists on disk but contains zero
+        // displayable assistant messages (only user lines, or only tool-trace
+        // assistant entries with empty content), the candidate-load early-
+        // returned with `events = []` BEFORE the topic-less per-user fallback
+        // ran. As a result the audio bubble committed under a topic-bearing
+        // file was never surfaced to a topic-less reconnect.
+        //
+        // Post-fix: the fallback path runs whenever the candidate-load returned
+        // empty content (vs returned a Some(session) with displayable rows). A
+        // populated topic-bearing per-user JSONL must surface even when an
+        // empty topic-less per-user file co-exists for the same base_key.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less per-user JSONL: exists, but only contains a user line —
+        // zero displayable assistant content.
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "fallback-chat",
+            None,
+        );
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topicless_key,
+            Message::user("hello — no assistant response yet on this branch"),
+        )
+        .await;
+
+        // Topic-bearing per-user JSONL: holds the actually-committed audio
+        // bubble that the topic-less reconnect must replay.
+        let topic = "site astro";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "fallback-chat",
+            Some(topic),
+        );
+        let mp3 = data_dir.path().join("audio").join("fallback.mp3");
+        std::fs::create_dir_all(mp3.parent().unwrap()).unwrap();
+        std::fs::write(&mp3, b"mp3 bytes").unwrap();
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topic_key,
+            Message {
+                role: MessageRole::Assistant,
+                content: "✓ topic-bearing audio bubble committed under topic JSONL".into(),
+                media: vec![mp3.to_string_lossy().into_owned()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed = replay_committed_session_results(&state, "fallback-chat", None, None).await;
+        let topic_event = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .find(|payload| {
+                payload["message"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("topic-bearing audio bubble"))
+            });
+        assert!(
+            topic_event.is_some(),
+            "topic-less reconnect must reach the per-user fallback when the \
+             candidate topic-less JSONL is empty — the early `return events;` \
+             in the candidate-load loop short-circuited the fallback and the \
+             topic-bearing audio bubble silently disappeared"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_less_fallback_does_not_strip_messages_via_per_file_seq() {
+        // Regression for the wrong-axis `since_seq` filter in the topic-less
+        // fallback. Pre-fix, `since_seq` was compared against per-file
+        // `enumerate()` positions inside EACH topic JSONL independently — a
+        // watcher cursor of N meant "skip N messages of every topic file"
+        // instead of "skip the first N messages in the unified replay".
+        // For any topic file with > N messages this either wrongly stripped
+        // legitimate later assistant rows or wrongly let early rows through.
+        //
+        // Post-fix, the fallback path drops the per-file `since_seq` filter
+        // entirely. The fallback only runs on a topic-less reconnect — that
+        // is, the watcher has no unified cursor against which a per-file
+        // index could be measured. Tracking it was meaningless. We pin the
+        // contract: with `since_seq=Some(N)` the fallback still emits every
+        // displayable assistant message regardless of position in its file.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less per-user JSONL is empty so the candidate-load returns
+        // no events; the fallback is the only path that surfaces the audio
+        // bubbles below.
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "long-topic-chat",
+            None,
+        );
+        actor_persist_to_per_user(
+            data_dir.path(),
+            &topicless_key,
+            Message::user("kick off the topic"),
+        )
+        .await;
+
+        // Topic-bearing per-user JSONL with many displayable assistant rows.
+        // Pre-fix, with `since_seq=Some(5)` the fallback would silently strip
+        // rows 0..=5 from the topic file's per-file index (so messages 0-5
+        // would be dropped).
+        let topic = "long-topic";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "long-topic-chat",
+            Some(topic),
+        );
+        for n in 0..20usize {
+            actor_persist_to_per_user(
+                data_dir.path(),
+                &topic_key,
+                Message::assistant(format!("topic answer {n}")),
+            )
+            .await;
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        let replayed =
+            replay_committed_session_results(&state, "long-topic-chat", Some(5), None).await;
+        let recovered: std::collections::HashSet<String> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| payload["message"]["content"].as_str().map(str::to_string))
+            .collect();
+        for n in 0..20usize {
+            let expected = format!("topic answer {n}");
+            assert!(
+                recovered.contains(&expected),
+                "fallback must surface every displayable assistant message in \
+                 a topic file regardless of `since_seq` (a per-watcher cursor \
+                 measured against the unified replay, NOT the per-file index). \
+                 Missing: `{expected}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_replay_events_are_globally_sorted_by_timestamp() {
+        // Pins the global-timestamp-sort contract for the combined-events
+        // branch in `replay_committed_session_results`. Pre-fix, when both
+        // the candidate-load and the topic-less fallback produced events,
+        // the function concatenated `candidate_events` (in disk order) BEFORE
+        // `fallback_events` (timestamp-sorted) without globally sorting the
+        // unified set. If the two branches' timestamps interleave, replay
+        // delivered them out of chronological order — the web client renders
+        // bubbles in delivery order, so a topic-less reconnect would show
+        // candidate bubbles first then a "leap back in time" to fallback
+        // bubbles whose timestamps fall between candidate ones.
+        //
+        // Post-fix: extract the timestamp from each event's payload and
+        // sort the unified set by timestamp before returning.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+
+        // Topic-less candidate JSONL with timestamps T0, T2, T4 (even).
+        let topicless_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "interleave-chat",
+            None,
+        );
+        let base = chrono::Utc::now() - chrono::Duration::seconds(60);
+        for (idx, secs) in [0i64, 2, 4].iter().enumerate() {
+            let mut msg = Message::assistant(format!("candidate-{idx}-T{secs}"));
+            msg.timestamp = base + chrono::Duration::seconds(*secs);
+            actor_persist_to_per_user(data_dir.path(), &topicless_key, msg).await;
+        }
+
+        // Topic-bearing fallback file under the same base_key with timestamps
+        // T1, T3, T5 (odd) — interleaving the candidate timestamps.
+        let topic = "interleaved";
+        let topic_key = current_profile_api_session_key_with_topic(
+            Some(TEST_PROFILE_ID),
+            "interleave-chat",
+            Some(topic),
+        );
+        for (idx, secs) in [1i64, 3, 5].iter().enumerate() {
+            let mut msg = Message::assistant(format!("fallback-{idx}-T{secs}"));
+            msg.timestamp = base + chrono::Duration::seconds(*secs);
+            actor_persist_to_per_user(data_dir.path(), &topic_key, msg).await;
+        }
+
+        let state = ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: None,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions,
+            task_query: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+        };
+
+        // Topic-less reconnect — both the candidate-load and the topic-less
+        // fallback produce events.
+        let replayed =
+            replay_committed_session_results(&state, "interleave-chat", None, None).await;
+
+        let timestamps: Vec<chrono::DateTime<chrono::Utc>> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| {
+                payload["message"]["timestamp"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })
+            .collect();
+
+        assert_eq!(
+            timestamps.len(),
+            6,
+            "combined replay must surface all six events: {replayed:?}"
+        );
+
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(
+            timestamps, sorted,
+            "combined replay must be globally sorted by timestamp; got {timestamps:?}"
+        );
+
+        // Spot-check the chronological interleave (candidate-T0, fallback-T1, ...).
+        let contents: Vec<String> = replayed
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .filter_map(|payload| payload["message"]["content"].as_str().map(str::to_string))
+            .collect();
+        let expected_order = [
+            "candidate-0-T0",
+            "fallback-0-T1",
+            "candidate-1-T2",
+            "fallback-1-T3",
+            "candidate-2-T4",
+            "fallback-2-T5",
+        ];
+        assert_eq!(
+            contents, expected_order,
+            "combined replay must interleave by timestamp"
+        );
+    }
+
     #[tokio::test]
     async fn replay_committed_session_results_replays_only_newer_assistant_messages() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -3003,6 +4053,86 @@ mod tests {
             rx.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn done_event_carries_committed_seq_when_message_persisted() {
+        // M8.10-A regression: the SSE `done` event must thread the committed
+        // session sequence back to the web client so live-streamed bubbles can
+        // populate `historySeq` and avoid floating to the end of the list.
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-seq".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-seq".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "committed_seq": 42,
+                "tokens_in": 10,
+                "tokens_out": 5,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert_eq!(parsed["committed_seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn done_event_omits_committed_seq_when_persist_failed_or_skipped() {
+        // M8.10-A: when the server has no committed seq (e.g. persist failed
+        // or is skipped), the done event must NOT include `committed_seq` so
+        // legacy/error-path behaviour is preserved.
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-noseq".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-noseq".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "tokens_in": 10,
+                "tokens_out": 5,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert!(
+            parsed.get("committed_seq").is_none() || parsed["committed_seq"].is_null(),
+            "committed_seq must be omitted when missing from metadata, got: {parsed}"
+        );
     }
 
     #[tokio::test]

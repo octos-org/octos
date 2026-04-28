@@ -18,7 +18,7 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
@@ -45,9 +45,13 @@ pub struct ChatRequest {
     pub media: Vec<String>,
     #[serde(default)]
     pub attach_only: bool,
-    /// Client-supplied UUID propagated onto the persisted user `Message` so
-    /// the matching `session_result` event lets the web client stamp the
-    /// authoritative `historySeq` onto its optimistic bubble.
+    /// Web-generated correlation id. Forwarded to the gateway so the
+    /// eventual `_session_result.response_to_client_message_id` matches
+    /// the web reducer's optimistic bubble (FA-12f).
+    ///
+    /// Also propagated onto the persisted user `Message` so the matching
+    /// `session_result` event lets the web client stamp the authoritative
+    /// `historySeq` onto its optimistic bubble.
     #[serde(default)]
     pub client_message_id: Option<String>,
 }
@@ -255,6 +259,39 @@ fn validate_chat_request(
     Ok((agent.clone(), sessions.clone()))
 }
 
+/// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
+/// invalidate the `SessionManager` LRU cache for the key.
+///
+/// This is the unified write path for the standalone `octos serve` /chat
+/// handlers. Mirrors `ApiChannel::persist_to_session` in the gateway path
+/// — both funnel through `octos_bus::persist_message_through_canonical_path`
+/// so the storage layer is the single ordering point.
+///
+/// Returns the committed per-session sequence number so callers (e.g. the
+/// streaming handler) can correlate it back to the optimistic bubble.
+async fn persist_chat_message_through_canonical(
+    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    key: &SessionKey,
+    message: Message,
+) -> eyre::Result<usize> {
+    let data_dir = {
+        let manager = sessions.lock().await;
+        manager.data_dir()
+    };
+
+    let result = octos_bus::persist_message_through_canonical_path(&data_dir, key, message).await;
+
+    // Drop any stale `SessionManager` cache entry so a follow-up read
+    // (duplicate-detection, `?source=full`) consults disk instead of
+    // returning a pre-write empty `Session`.
+    {
+        let mut manager = sessions.lock().await;
+        manager.invalidate_cache(key);
+    }
+
+    result
+}
+
 async fn chat_sync(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -295,12 +332,11 @@ async fn chat_sync(
         "chat: response generated"
     );
 
-    // Save all conversation messages to session
-    {
-        let mut sess = sessions.lock().await;
-        for msg in &response.messages {
-            let _ = sess.add_message(&session_key, msg.clone()).await;
-        }
+    // Save all conversation messages to the canonical per-user JSONL.
+    // Funnels through the same helper the gateway-side `ApiChannel` uses so
+    // standalone deployments don't split-brain into the legacy flat layout.
+    for msg in &response.messages {
+        let _ = persist_chat_message_through_canonical(&sessions, &session_key, msg.clone()).await;
     }
 
     Ok(Json(ChatResponse {
@@ -389,17 +425,28 @@ async fn chat_streaming(
                     "chat: streaming response complete"
                 );
 
-                // Save all conversation messages (user, assistant iterations, tool calls/results)
+                // Save all conversation messages (user, assistant iterations,
+                // tool calls/results) through the canonical per-user JSONL.
+                // Pre-fix this funnelled through `SessionManager::add_message_with_seq`
+                // which wrote to the legacy flat layout — a standalone
+                // `octos serve` had no gateway-side `ApiChannel` to redirect,
+                // so messages landed in `sessions/<encoded_full_key>.jsonl`
+                // while the actor wrote to `users/.../<topic>.jsonl`.
+                //
+                // Also tag the first user message with the client-supplied
+                // `client_message_id` so the persisted row carries it through
+                // the JSONL round-trip and emit a user-message session_result
+                // event so the web client can stamp the authoritative seq onto
+                // its optimistic bubble (M8.10-A user-message counterpart).
+                //
+                // Capture the committed seq of the final assistant message
+                // so the SSE `done` event can thread it back to the web client
+                // (M8.10-A).
                 let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
-                {
-                    let mut sess = sessions.lock().await;
+                let assistant_committed_seq: Option<u64> = {
+                    let mut last_assistant_seq: Option<u64> = None;
                     let mut user_persisted = false;
                     for msg in &response.messages {
-                        // Tag the first user message with the client-supplied
-                        // id so the persisted row carries it through the JSONL
-                        // round-trip. Capture the committed seq so the SSE
-                        // bridge can correlate it back to the optimistic
-                        // bubble.
                         let mut to_save = msg.clone();
                         if !user_persisted && msg.role == MessageRole::User {
                             user_persisted = true;
@@ -410,7 +457,13 @@ async fn chat_streaming(
                             }
                             let timestamp = to_save.timestamp.to_rfc3339();
                             let content_for_event = to_save.content.clone();
-                            match sess.add_message_with_seq(&session_key, to_save).await {
+                            match persist_chat_message_through_canonical(
+                                &sessions,
+                                &session_key,
+                                to_save,
+                            )
+                            .await
+                            {
                                 Ok(seq) => {
                                     user_message_seq_and_meta =
                                         Some((seq, content_for_event, timestamp));
@@ -424,10 +477,24 @@ async fn chat_streaming(
                                 }
                             }
                         } else {
-                            let _ = sess.add_message(&session_key, to_save).await;
+                            let is_assistant = msg.role == MessageRole::Assistant;
+                            match persist_chat_message_through_canonical(
+                                &sessions,
+                                &session_key,
+                                to_save,
+                            )
+                            .await
+                            {
+                                Ok(seq) if is_assistant => {
+                                    last_assistant_seq = u64::try_from(seq).ok();
+                                }
+                                Ok(_) => {}
+                                Err(_) => {}
+                            }
                         }
                     }
-                }
+                    last_assistant_seq
+                };
 
                 // Emit a user-message session_result event so the web client
                 // can stamp the authoritative seq onto its optimistic bubble.
@@ -477,7 +544,7 @@ async fn chat_streaming(
                         response.token_usage.output_tokens,
                     )
                 });
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
@@ -488,6 +555,22 @@ async fn chat_streaming(
                     "tokens_out": response.token_usage.output_tokens,
                     "session_cost": session_cost,
                 });
+                if let Some(seq) = assistant_committed_seq {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
+                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
+                // tool results' structured side-channel into the SSE done
+                // event so the dashboard CostBreakdown panel can render
+                // real per-node attribution from `run_pipeline` runs.
+                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+                for (_tool_call_id, meta) in &response.tool_results {
+                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+                        all_node_costs.extend(arr.iter().cloned());
+                    }
+                }
+                if !all_node_costs.is_empty() {
+                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
@@ -545,6 +628,12 @@ pub async fn chat_stream(
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
+    /// Display title (auto-derived from first user message; manual rename via
+    /// PATCH /api/sessions/:id/title preserves across new messages). None
+    /// for legacy sessions persisted before the title field existed; the
+    /// client should fall back to deriving a title from message content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -563,16 +652,27 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
-        all.extend(sess.list_sessions().into_iter().filter_map(|(id, count)| {
-            let chat_id = id.strip_prefix(&prefix)?;
-            if is_internal_api_session_id(chat_id) {
-                return None;
-            }
-            Some(SessionInfo {
-                id: chat_id.to_string(),
-                message_count: count,
-            })
-        }));
+        // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
+        // directory walk) so a user dir with tens of thousands of spawn
+        // children does not turn this listing into an O(N) hang. The
+        // `is_internal_api_session_id` belt-and-suspenders check is kept for
+        // legacy entries that might slip through (e.g. flat layout files
+        // pre-dating the encoder rules).
+        all.extend(
+            sess.list_top_level_sessions_with_title()
+                .into_iter()
+                .filter_map(|(id, count, title)| {
+                    let chat_id = id.strip_prefix(&prefix)?;
+                    if is_internal_api_session_id(chat_id) {
+                        return None;
+                    }
+                    Some(SessionInfo {
+                        id: chat_id.to_string(),
+                        message_count: count,
+                        title,
+                    })
+                }),
+        );
     }
 
     // Also fetch from gateway if available.
@@ -833,6 +933,153 @@ pub async fn session_tasks(
     Json(serde_json::json!([])).into_response()
 }
 
+// ───────── M7.9 / W2 task supervisor: cancel + restart-from-node ─────────
+
+/// `POST /api/tasks/{task_id}/cancel` — forward to
+/// [`octos_agent::TaskSupervisor::cancel`]. Returns:
+///
+/// - `200 OK` `{ "task_id": "...", "status": "cancelled" }` when the
+///   task was running/queued and has been transitioned to `Cancelled`.
+/// - `404 Not Found` when no supervised task carries that id.
+/// - `409 Conflict` when the task is already in a terminal state
+///   (`Completed` / `Failed` / `Cancelled`).
+/// - `503 Service Unavailable` when the API server has no
+///   `task_query_store` wired (standalone mode).
+pub async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    // Gateway-mode: forward to the gateway process that owns the supervisor.
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/tasks/{}/cancel", encode_api_session_path_id(&task_id));
+        return super::webhook_proxy::api_post_proxy_json(
+            &state,
+            port,
+            &path,
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
+    let Some(store) = state.task_query_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired in standalone mode",
+            })),
+        )
+            .into_response();
+    };
+
+    match store.cancel_task(&task_id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task_id": task_id,
+                "status": "cancelled",
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskCancelError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskCancelError::AlreadyTerminal) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_already_terminal",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Body of `POST /api/tasks/{task_id}/restart-from-node`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RestartFromNodeRequest {
+    /// Optional DOT-graph node id to restart from. Upstream cached
+    /// outputs from preceding nodes are preserved by the runtime; only
+    /// the target node and its downstream subtree re-run.
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+/// `POST /api/tasks/{task_id}/restart-from-node` — forward to
+/// [`octos_agent::TaskSupervisor::relaunch`]. Returns:
+///
+/// - `200 OK` `{ "original_task_id": "...", "new_task_id": "...",
+///   "from_node": "..." }` on accept.
+/// - `404 Not Found` when the task id is unknown.
+/// - `409 Conflict` when the task is still active (callers must cancel
+///   first).
+/// - `503 Service Unavailable` when no supervisor is wired.
+pub async fn restart_task_from_node(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    body: Option<Json<RestartFromNodeRequest>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!(
+            "/tasks/{}/restart-from-node",
+            encode_api_session_path_id(&task_id)
+        );
+        let proxied_body = serde_json::json!({
+            "node_id": body.node_id,
+        });
+        return super::webhook_proxy::api_post_proxy_json(&state, port, &path, proxied_body).await;
+    }
+
+    let Some(store) = state.task_query_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task supervisor not wired in standalone mode",
+            })),
+        )
+            .into_response();
+    };
+
+    let opts = octos_agent::RelaunchOpts {
+        from_node: body.node_id.clone(),
+    };
+    match store.relaunch_task(&task_id, opts) {
+        Ok(new_task_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "original_task_id": task_id,
+                "new_task_id": new_task_id,
+                "from_node": body.node_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskRelaunchError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+        Err(octos_agent::TaskRelaunchError::StillActive) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "task_still_active",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Serialize)]
 pub struct SessionFileInfo {
     pub filename: String,
@@ -986,6 +1233,68 @@ fn should_resolve_file_access_from_profile(
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
         || identity.is_some()
+}
+
+/// PATCH /api/sessions/:id/title — set a manual title for a session.
+///
+/// Body: `{ "title": "New display title" }`. The title persists across new
+/// messages (auto-derivation from first user message no longer overrides it).
+/// Empty body or missing field returns 400.
+#[derive(Deserialize)]
+pub struct UpdateTitleRequest {
+    pub title: String,
+}
+
+pub async fn update_session_title(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateTitleRequest>,
+) -> Response {
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
+    }
+    if title.chars().count() > 200 {
+        return (StatusCode::BAD_REQUEST, "title must be at most 200 chars").into_response();
+    }
+
+    let mut updated = false;
+
+    if let Some(sessions) = &state.sessions {
+        let mut sess = sessions.lock().await;
+        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+            if sess.load(&key).await.is_some() {
+                if let Err(e) = sess.update_title(&key, title.clone()).await {
+                    tracing::error!(
+                        session_key = %key,
+                        error = %e,
+                        "update_title in standalone store failed"
+                    );
+                } else {
+                    updated = true;
+                }
+            }
+        }
+    }
+
+    // Proxy to gateway too, since the session may live in the per-profile
+    // SessionManager rather than the serve-process store.
+    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+        let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
+        let body_json = serde_json::json!({ "title": title }).to_string();
+        let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
+        // Treat gateway proxy success as also updating; we don't strictly
+        // need to inspect the response since the gateway is authoritative
+        // when serve has no in-memory copy.
+        updated = true;
+    }
+
+    if updated {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "session not found").into_response()
+    }
 }
 
 /// DELETE /api/sessions/:id -- delete a session.
@@ -2383,6 +2692,12 @@ pub struct StatusResponse {
     pub provider: String,
     pub uptime_secs: i64,
     pub agent_configured: bool,
+    /// Public-facing base domain this mini serves profiles under
+    /// (e.g. `"crew.ominix.io"`, `"bot.ominix.io"`). The dashboard and
+    /// octos-web client consume this to render correct preview URLs
+    /// and infer profile IDs from hostnames. Always a concrete string
+    /// — falls back to `DEFAULT_BASE_DOMAIN` when unconfigured.
+    pub base_domain: String,
 }
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
@@ -2394,12 +2709,17 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         ),
         None => ("none".to_string(), "none".to_string()),
     };
+    let base_domain = state
+        .base_domain
+        .clone()
+        .unwrap_or_else(|| crate::api::DEFAULT_BASE_DOMAIN.to_string());
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model,
         provider,
         uptime_secs: uptime.num_seconds(),
         agent_configured: state.agent.is_some(),
+        base_domain,
     })
 }
 
@@ -2545,6 +2865,7 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         stream: true,
                         media: media.clone(),
                         attach_only: false,
+                        client_message_id: None,
                     },
                 ) {
                     // Standalone agent mode — run the agent directly.
@@ -2703,13 +3024,33 @@ async fn ws_standalone_agent(
 
         match result {
             Ok(response) => {
-                // Save conversation messages to session
-                {
-                    let mut sess = sessions.lock().await;
+                // Save conversation messages to the canonical per-user JSONL.
+                // Mirrors `chat_sync` and `chat_streaming`; closes the
+                // standalone-serve split-brain by routing through the same
+                // helper the gateway-side `ApiChannel` uses. Capture the
+                // committed seq of the final assistant message so the
+                // WebSocket-bridged `done` event can thread it back to the
+                // web client (M8.10-A).
+                let assistant_committed_seq: Option<u64> = {
+                    let mut last_assistant_seq: Option<u64> = None;
                     for msg in &response.messages {
-                        let _ = sess.add_message(&session_key2, msg.clone()).await;
+                        let is_assistant = msg.role == octos_core::MessageRole::Assistant;
+                        match persist_chat_message_through_canonical(
+                            &sessions,
+                            &session_key2,
+                            msg.clone(),
+                        )
+                        .await
+                        {
+                            Ok(seq) if is_assistant => {
+                                last_assistant_seq = u64::try_from(seq).ok();
+                            }
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
                     }
-                }
+                    last_assistant_seq
+                };
 
                 let provider_metadata = response.provider_metadata.clone();
                 let model_id = provider_metadata
@@ -2730,7 +3071,7 @@ async fn ws_standalone_agent(
                         response.token_usage.output_tokens,
                     )
                 });
-                let done = serde_json::json!({
+                let mut done = serde_json::json!({
                     "type": "done",
                     "content": response.content,
                     "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
@@ -2741,6 +3082,22 @@ async fn ws_standalone_agent(
                     "tokens_out": response.token_usage.output_tokens,
                     "session_cost": session_cost,
                 });
+                if let Some(seq) = assistant_committed_seq {
+                    done["committed_seq"] = serde_json::Value::from(seq);
+                }
+                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
+                // tool results' structured side-channel into the SSE done
+                // event so the dashboard CostBreakdown panel can render
+                // real per-node attribution from `run_pipeline` runs.
+                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+                for (_tool_call_id, meta) in &response.tool_results {
+                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+                        all_node_costs.extend(arr.iter().cloned());
+                    }
+                }
+                if !all_node_costs.is_empty() {
+                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
+                }
                 let _ = tx.send(done.to_string());
             }
             Err(e) => {
@@ -2799,6 +3156,26 @@ mod tests {
         assert!(req.stream);
     }
 
+    /// FA-12f follow-up: the outer `ChatRequest` (served at `/api/chat`) must
+    /// accept `client_message_id` so it survives proxy forwarding to the
+    /// gateway. The prior fix patched only the gateway-internal struct; the
+    /// outer struct silently dropped the field and overflow replies arrived
+    /// with `response_to_client_message_id: null`, breaking web-side
+    /// correlation under `/queue speculative`.
+    #[test]
+    fn chat_request_accepts_client_message_id() {
+        let json = r#"{"message": "hi", "client_message_id": "client-bravo-xyz"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.client_message_id.as_deref(), Some("client-bravo-xyz"));
+    }
+
+    #[test]
+    fn chat_request_client_message_id_defaults_to_none() {
+        let json = r#"{"message": "hi"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.client_message_id.is_none());
+    }
+
     #[test]
     fn chat_response_serialize() {
         let resp = ChatResponse {
@@ -2817,10 +3194,26 @@ mod tests {
         let info = SessionInfo {
             id: "test-session".into(),
             message_count: 42,
+            title: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
         assert_eq!(json["message_count"], 42);
+        assert!(
+            json.get("title").is_none(),
+            "None title must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn session_info_serialize_with_title_includes_field() {
+        let info = SessionInfo {
+            id: "test-session".into(),
+            message_count: 7,
+            title: Some("My Pinned Chat".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["title"], "My Pinned Chat");
     }
 
     #[test]
@@ -2844,6 +3237,7 @@ mod tests {
             provider: "openai".into(),
             uptime_secs: 120,
             agent_configured: true,
+            base_domain: "crew.ominix.io".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["version"], "0.1.0");
@@ -2851,6 +3245,30 @@ mod tests {
         assert_eq!(json["provider"], "openai");
         assert_eq!(json["uptime_secs"], 120);
         assert_eq!(json["agent_configured"], true);
+        assert_eq!(json["base_domain"], "crew.ominix.io");
+    }
+
+    #[tokio::test]
+    async fn status_returns_configured_base_domain() {
+        let state = Arc::new(crate::api::AppState {
+            base_domain: Some("bot.ominix.io".into()),
+            ..crate::api::AppState::empty_for_tests()
+        });
+        let resp = status(State(state)).await;
+        assert_eq!(resp.0.base_domain, "bot.ominix.io");
+    }
+
+    #[tokio::test]
+    async fn status_defaults_base_domain_when_unconfigured() {
+        let state = Arc::new(crate::api::AppState {
+            base_domain: None,
+            ..crate::api::AppState::empty_for_tests()
+        });
+        let resp = status(State(state)).await;
+        // Backward compat: `None` surfaces as the historical `crew.ominix.io`
+        // so existing dashboards / web clients keep rendering the right URL
+        // until operators opt in to a per-mini value.
+        assert_eq!(resp.0.base_domain, "crew.ominix.io");
     }
 
     #[test]
@@ -3130,6 +3548,71 @@ mod tests {
         assert_eq!(ids, vec!["web-123"]);
     }
 
+    /// Issue #607 §D regression: river / mini4 hung 30 s+ on
+    /// `GET /api/sessions` because one user dir had 65 535
+    /// `child-*.jsonl` files that the listing iterated. The handler must
+    /// stay well under 500 ms with a synthetic spawn fanout in place.
+    #[tokio::test]
+    async fn list_sessions_is_fast_with_many_child_jsonl_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        // Lay down the per-user dir for `_main:api:web-river` directly so the
+        // test does not have to drive 10 000 SessionHandle writes (~30 s on
+        // its own and not what we are measuring).
+        let encoded_base = "_main%3Aapi%3Aweb-river";
+        let user_dir = data_dir
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            "{\"schema_version\":1,\"session_key\":\"_main:api:web-river\",\
+             \"created_at\":\"2024-01-01T00:00:00Z\",\
+             \"updated_at\":\"2024-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        const FANOUT: usize = 10_000;
+        for i in 0..FANOUT {
+            std::fs::write(
+                user_dir.join(format!("child-task-{i:05}.jsonl")),
+                "{\"schema_version\":1}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
+            )
+            .unwrap();
+        }
+
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let start = std::time::Instant::now();
+        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = listed
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["web-river"], "child fanout must not surface");
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "list_sessions took {elapsed:?} for {FANOUT} child jsonls; \
+             #607 §D regression — the user-facing handler must not iterate child fanouts",
+        );
+    }
+
     #[tokio::test]
     async fn delete_session_accepts_listed_topic_session_id_from_standalone_store() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -3274,5 +3757,268 @@ mod tests {
         let json = r#"{"type": "unknown"}"#;
         let result = serde_json::from_str::<WsClientMsg>(json);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_sync_writes_to_canonical_per_user_topic_jsonl() {
+        // Regression for the standalone `octos serve` /chat handlers writing
+        // to the legacy flat layout instead of the canonical per-user JSONL.
+        //
+        // Pre-fix, `chat_sync`/`chat_streaming`/the websocket handler all
+        // called `SessionManager::add_message_with_seq` directly. That writes
+        // to `<data_dir>/sessions/<encoded_full_key>.jsonl` (legacy flat),
+        // not the canonical per-user `<topic>.jsonl`. A standalone deployment
+        // without a gateway-side `ApiChannel` therefore split-brained — the
+        // actor wrote to one path, handlers wrote to another, replays missed
+        // half the history.
+        //
+        // Post-fix, every `/chat` write must funnel through
+        // `persist_chat_message_through_canonical` — a wrapper around
+        // `octos_bus::persist_message_through_canonical_path` that also
+        // invalidates the `SessionManager` LRU cache (mirroring what
+        // `ApiChannel::persist_to_session` does). The contract: messages
+        // committed via this helper land in the canonical per-user JSONL
+        // and never touch the legacy flat directory.
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+        let session_id = "web-canonical-handlers";
+        let topic = "research";
+        let key = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic);
+
+        // Drive a write through the helper the production handlers now use.
+        let seq = persist_chat_message_through_canonical(
+            &sessions,
+            &key,
+            Message::user("please summarise the q1 numbers"),
+        )
+        .await
+        .expect("canonical persist");
+        assert_eq!(seq, 0);
+
+        // Canonical per-user `<encoded_topic>.jsonl` must exist and carry
+        // the user message.
+        let encoded_base = octos_bus::session::encode_path_component(&format!(
+            "{MAIN_PROFILE_ID}:api:{session_id}"
+        ));
+        let encoded_topic = octos_bus::session::encode_path_component(topic);
+        let canonical = data_dir
+            .path()
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        assert!(
+            canonical.exists(),
+            "/chat handler write must land in canonical per-user JSONL ({}) — \
+             this is the unified file the SessionActor and the bus-side \
+             ApiChannel also write",
+            canonical.display()
+        );
+        let body = std::fs::read_to_string(&canonical).unwrap();
+        assert!(
+            body.contains("please summarise the q1 numbers"),
+            "canonical JSONL must contain the user message text"
+        );
+
+        // Legacy flat `sessions/<encoded_full_key>.jsonl` must NOT exist —
+        // that's the old split-brain location standalone /chat used to
+        // write to.
+        let sessions_dir = data_dir.path().join("sessions");
+        if sessions_dir.exists() {
+            for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    panic!(
+                        "/chat handler must NOT write to the legacy flat \
+                         layout (sessions/{}.jsonl) — that is the split-brain \
+                         path the storage unification PR is closing",
+                        name
+                    );
+                }
+            }
+        }
+    }
+
+    // ────────── M7.9 / W2 cancel + restart-from-node API tests ──────────
+
+    /// Build a `task_query_store` carrying a single live supervisor with a
+    /// running task pre-registered. Returns (store, supervisor, task_id).
+    fn build_task_store_with_running_task(
+        session_key: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+    ) -> (
+        crate::session_actor::SessionTaskQueryStore,
+        Arc<octos_agent::TaskSupervisor>,
+        String,
+    ) {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register(tool_name, tool_call_id, Some(session_key));
+        supervisor.mark_running(&task_id);
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component(session_key);
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+        (store, supervisor, task_id)
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_200_when_running_task_is_cancelled() {
+        let (store, _supervisor, task_id) =
+            build_task_store_with_running_task("api-cancel-1", "run_pipeline", "call-x");
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["task_id"], task_id);
+        assert_eq!(json["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_404_for_unknown_task() {
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("does-not-exist".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_409_when_already_terminal() {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register("run_pipeline", "call-409", Some("session"));
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component("session");
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response =
+            cancel_task(State(state), HeaderMap::new(), axum::extract::Path(task_id)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_returns_503_without_task_query_store() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let response = cancel_task(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            axum::extract::Path("any".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_200_with_new_task_id() {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register("run_pipeline", "call-restart", Some("session"));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "design phase failed".to_string());
+
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let encoded = octos_bus::session::encode_path_component("session");
+        let key = octos_core::SessionKey::new(MAIN_PROFILE_ID, &encoded);
+        let tmp = tempfile::tempdir().unwrap();
+        store.register(&key, &supervisor, tmp.path());
+
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id.clone()),
+            Some(Json(RestartFromNodeRequest {
+                node_id: Some("design".into()),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["original_task_id"], task_id);
+        assert_eq!(json["from_node"], "design");
+        assert!(
+            json["new_task_id"].as_str().unwrap().len() > 0,
+            "new_task_id should be a fresh UUID-ish string"
+        );
+
+        // Upstream cached outputs are preserved by virtue of the original
+        // task being left intact in the supervisor — the relaunch only
+        // adds a successor in the `Spawned` state.
+        let original = supervisor.get_task(&task_id).unwrap();
+        assert_eq!(original.status, octos_agent::TaskStatus::Failed);
+        let new_id = json["new_task_id"].as_str().unwrap();
+        let successor = supervisor.get_task(new_id).unwrap();
+        assert_eq!(successor.tool_name, "run_pipeline");
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_404_for_unknown_task() {
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path("nope".into()),
+            Some(Json(RestartFromNodeRequest::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_returns_409_for_active_task() {
+        let (store, _supervisor, task_id) =
+            build_task_store_with_running_task("api-restart-409", "run_pipeline", "call-y");
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(task_id),
+            Some(Json(RestartFromNodeRequest::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

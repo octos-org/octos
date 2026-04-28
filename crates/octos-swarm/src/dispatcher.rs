@@ -42,6 +42,8 @@ use octos_agent::{HarnessEventPayload, SWARM_DISPATCH_SCHEMA_VERSION};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
+use octos_agent::cost_ledger::{CostAccountant, CostAttributionEvent, project_cost_usd};
+
 use crate::ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 use crate::persistence::{DispatchRecord, DispatchStore};
 use crate::result::{
@@ -126,6 +128,34 @@ impl SwarmEventSink for NoopSwarmEventSink {
     fn emit(&self, _event: &HarnessEvent) {}
 }
 
+/// Budget guard supplied by the supervisor. Kept narrow on purpose —
+/// the swarm primitive only needs to know which `CostAccountant` to
+/// call and which model label to price projected spend against. A
+/// `None` value short-circuits the reservation path (the legacy
+/// pre-F-004 behaviour) so existing callers do not need changes.
+#[derive(Clone)]
+pub struct SwarmCostBudget {
+    pub accountant: Arc<CostAccountant>,
+    /// Model label used for the pre-dispatch cost projection and the
+    /// final committed [`CostAttributionEvent`]. Opaque to the swarm;
+    /// forwarded verbatim to [`project_cost_usd`].
+    pub model: String,
+    /// Contract identifier for per-contract ceilings. Swarms run under
+    /// a supervisor's contract (e.g. the dispatch id or the workflow
+    /// name), not the sub-contract id, so the caller wires this
+    /// explicitly instead of defaulting to each subtask's id.
+    pub contract_id: String,
+}
+
+impl std::fmt::Debug for SwarmCostBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwarmCostBudget")
+            .field("model", &self.model)
+            .field("contract_id", &self.contract_id)
+            .finish()
+    }
+}
+
 /// The swarm orchestration primitive. Construct via
 /// [`Swarm::builder`] and inject the shared backend, cost ledger,
 /// persistence dir, and optional aggregate validator.
@@ -135,6 +165,14 @@ pub struct Swarm {
     store: DispatchStore,
     validator: Option<AggregateValidator>,
     event_sink: Arc<dyn SwarmEventSink>,
+    /// Review A F-004: optional cost-accountant reservation gate. When
+    /// wired, the primitive calls
+    /// [`CostAccountant::reserve`](octos_agent::cost_ledger::CostAccountant::reserve)
+    /// before dispatch and [`ReservationHandle::commit`] on success,
+    /// matching the TOCTOU-safe pattern the spawn tool uses. Absence
+    /// keeps the legacy pre-fix behaviour so integration tests and
+    /// existing callers are unchanged.
+    cost_budget: Option<SwarmCostBudget>,
 }
 
 impl Swarm {
@@ -321,13 +359,19 @@ impl Swarm {
         }
 
         while let Some(join) = active.join_next().await {
-            let (idx, outcome) = match join {
+            let (idx, mut outcome) = match join {
                 Ok(result) => result,
                 Err(error) => {
                     warn!(error = %error, "swarm subtask join failed");
                     continue;
                 }
             };
+            // Review A F-004: gate the subtask on the same completion-phase
+            // validator rail the aggregate artifact is gated on. Runs only
+            // when the subtask itself completed — failed subtasks keep
+            // their upstream dispatch status intact.
+            self.gate_subtask_validators(&mut outcome, &contracts[idx])
+                .await;
             // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, idx, &outcome).await;
             record.subtasks[idx] = outcome;
@@ -354,7 +398,15 @@ impl Swarm {
         for idx in pending {
             let contract = &contracts[*idx];
             let attempts = record.subtasks[*idx].attempts;
-            let outcome = dispatch_once(self.backend.as_ref(), contract, attempts).await;
+            let mut outcome = dispatch_with_budget(
+                self.backend.as_ref(),
+                contract,
+                attempts,
+                self.cost_budget.as_ref(),
+            )
+            .await;
+            // Review A F-004: run per-subtask completion validators.
+            self.gate_subtask_validators(&mut outcome, contract).await;
             // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
@@ -395,7 +447,17 @@ impl Swarm {
                 }
             }
             let attempts = record.subtasks[*idx].attempts;
-            let outcome = dispatch_once(self.backend.as_ref(), &contract, attempts).await;
+            let mut outcome = dispatch_with_budget(
+                self.backend.as_ref(),
+                &contract,
+                attempts,
+                self.cost_budget.as_ref(),
+            )
+            .await;
+            // Review A F-004: run per-subtask completion validators. Pipeline
+            // is especially sensitive: a silently-unvalidated upstream
+            // artifact poisons every downstream step's `pipeline_input`.
+            self.gate_subtask_validators(&mut outcome, &contract).await;
             // Forward attribution to the wired ledger adapter.
             self.attribute_cost(record, contracts, *idx, &outcome).await;
             let is_terminal = outcome.status == SubtaskStatus::TerminalFailed;
@@ -407,6 +469,59 @@ impl Swarm {
         Ok(false)
     }
 
+    /// Review A F-004: run the configured completion-phase validators
+    /// against a single subtask's artifact before its terminal status
+    /// propagates. A required-validator failure demotes a `Completed`
+    /// subtask to `TerminalFailed` and records the first failure reason
+    /// in [`SubtaskOutcome::error`]. Subtasks that did not reach
+    /// `Completed` are left untouched — we do not double-punish an
+    /// already-failed dispatch.
+    async fn gate_subtask_validators(&self, outcome: &mut SubtaskOutcome, contract: &ContractSpec) {
+        if outcome.status != SubtaskStatus::Completed {
+            return;
+        }
+        let Some(validator) = self.validator.as_ref() else {
+            return;
+        };
+        let scoped: Vec<Validator> = validator
+            .validators
+            .iter()
+            .filter(|v| ValidatorPhase::from(v.phase) == ValidatorPhase::Completion)
+            .cloned()
+            .collect();
+        if scoped.is_empty() {
+            return;
+        }
+
+        // Per-subtask invocation: reuses the aggregate workspace_root but
+        // tags the repo_label with the subtask's contract id so ledger
+        // rows can be sorted per-subtask in downstream tooling.
+        let invocation = ValidatorInvocation {
+            phase: ValidatorPhase::Completion,
+            workspace_root: validator.invocation.workspace_root.clone(),
+            repo_label: format!(
+                "{}/subtask/{}",
+                validator.invocation.repo_label, contract.contract_id
+            ),
+        };
+
+        let outcomes = validator.runner.run_all(&invocation, &scoped).await;
+        let failed_required: Option<&ValidatorOutcome> = outcomes
+            .iter()
+            .find(|o| o.required && o.status != octos_agent::validators::ValidatorStatus::Pass);
+        if let Some(failure) = failed_required {
+            outcome.status = SubtaskStatus::TerminalFailed;
+            let reason = format!(
+                "required completion-phase validator `{}` failed: {}",
+                failure.validator_id, failure.reason
+            );
+            outcome.error = Some(match outcome.error.take() {
+                Some(existing) => format!("{existing}; {reason}"),
+                None => reason,
+            });
+        }
+    }
+
     fn spawn_subtask(
         &self,
         set: &mut JoinSet<(usize, SubtaskOutcome)>,
@@ -416,8 +531,10 @@ impl Swarm {
     ) {
         let backend = Arc::clone(&self.backend);
         let contract = contracts[idx].clone();
+        let budget = self.cost_budget.clone();
         set.spawn(async move {
-            let outcome = dispatch_once(backend.as_ref(), &contract, attempts).await;
+            let outcome =
+                dispatch_with_budget(backend.as_ref(), &contract, attempts, budget.as_ref()).await;
             (idx, outcome)
         });
     }
@@ -497,6 +614,7 @@ pub struct SwarmBuilder {
     ledger: Arc<dyn CostLedger>,
     validator: Option<AggregateValidator>,
     event_sink: Arc<dyn SwarmEventSink>,
+    cost_budget: Option<SwarmCostBudget>,
 }
 
 impl SwarmBuilder {
@@ -507,6 +625,7 @@ impl SwarmBuilder {
             ledger: Arc::new(NoopCostLedger),
             validator: None,
             event_sink: Arc::new(NoopSwarmEventSink),
+            cost_budget: None,
         }
     }
 
@@ -531,6 +650,19 @@ impl SwarmBuilder {
         self
     }
 
+    /// Review A F-004: wire a shared [`CostAccountant`] budget gate.
+    /// Every subtask's pre-dispatch projection goes through
+    /// [`CostAccountant::reserve`] — concurrent swarm fan-outs observe
+    /// each other's outstanding reservations and reject breaching
+    /// dispatches before they touch the backend. On `Completed`
+    /// subtasks the primitive commits the projected cost through the
+    /// reservation handle; on failure or validator rejection the
+    /// handle is dropped and the reservation is auto-refunded.
+    pub fn with_cost_budget(mut self, budget: SwarmCostBudget) -> Self {
+        self.cost_budget = Some(budget);
+        self
+    }
+
     /// Open the redb ledger and return the usable [`Swarm`].
     pub async fn build(self) -> Result<Swarm> {
         let store = DispatchStore::open(&self.persistence_dir).await?;
@@ -540,8 +672,94 @@ impl SwarmBuilder {
             store,
             validator: self.validator,
             event_sink: self.event_sink,
+            cost_budget: self.cost_budget,
         })
     }
+}
+
+/// Review A F-004: wrap [`dispatch_once`] with a
+/// [`CostAccountant::reserve`]/`commit` pair so per-subtask dispatches
+/// respect the supervisor's budget under concurrent fan-out. Absent a
+/// budget this is a straight delegate to [`dispatch_once`].
+///
+/// The reservation is dropped automatically on the failure path,
+/// refunding the projected spend without a ledger write. Commit only
+/// fires when the subtask reached a `Completed` terminal status so
+/// retryable / terminal failures never inflate the ledger.
+async fn dispatch_with_budget(
+    backend: &dyn McpAgentBackend,
+    contract: &ContractSpec,
+    prior_attempts: u32,
+    budget: Option<&SwarmCostBudget>,
+) -> SubtaskOutcome {
+    let Some(budget) = budget else {
+        return dispatch_once(backend, contract, prior_attempts).await;
+    };
+
+    // Project tokens from the task JSON's utf-8 byte length. Mirrors
+    // the pre-spawn estimate the spawn tool uses at
+    // `spawn.rs:tokens_in_estimate = task_desc.len().div_ceil(4)`.
+    let task_bytes = contract.task.to_string().len();
+    let tokens_in_estimate = task_bytes.div_ceil(4) as u32;
+    let projected_usd = project_cost_usd(&budget.model, tokens_in_estimate, 0).unwrap_or(0.0);
+
+    let reservation = match budget
+        .accountant
+        .reserve(&budget.contract_id, projected_usd)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(breach) => {
+            warn!(
+                contract_id = %budget.contract_id,
+                reason = %breach,
+                "rejecting swarm subtask dispatch before backend call (cost budget breach)"
+            );
+            return SubtaskOutcome {
+                contract_id: contract.contract_id.clone(),
+                label: contract.label.clone(),
+                status: SubtaskStatus::TerminalFailed,
+                attempts: prior_attempts.saturating_add(1),
+                last_dispatch_outcome: "budget_breach".to_string(),
+                output: String::new(),
+                files_to_send: Vec::new(),
+                error: Some(format!("cost budget breach: {breach}")),
+            };
+        }
+    };
+
+    let outcome = dispatch_once(backend, contract, prior_attempts).await;
+    if outcome.status == SubtaskStatus::Completed {
+        // Commit the projected spend. We use the same projection for
+        // the commit to keep the reservation and ledger consistent —
+        // token counts are not available from the remote dispatch
+        // response today. The `CostAttributionEvent` records the model
+        // and the subtask's contract id so downstream rollups can
+        // distinguish swarm spend from single-spawn spend.
+        let event = CostAttributionEvent::new(
+            budget.contract_id.clone(),
+            budget.contract_id.clone(),
+            contract.contract_id.clone(),
+            budget.model.clone(),
+            tokens_in_estimate,
+            0,
+            projected_usd,
+        )
+        .with_backend_outcome(
+            Some(backend.backend_label().to_string()),
+            Some("success".to_string()),
+        );
+        if let Err(error) = reservation.commit(event).await {
+            warn!(
+                contract_id = %budget.contract_id,
+                error = %error,
+                "failed to persist swarm subtask cost attribution"
+            );
+        }
+    }
+    // Drop on failure auto-refunds through `ReservationHandle::Drop`.
+    drop(reservation);
+    outcome
 }
 
 async fn dispatch_once(

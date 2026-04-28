@@ -111,7 +111,26 @@ pub struct CredentialState {
     /// Total number of successful uses across the lifetime of the pool.
     #[serde(default)]
     pub usage_count: u64,
+    /// In-flight reservation (F-007): micros-since-epoch until which the
+    /// credential is considered "handed out but not yet marked" and is
+    /// therefore skipped by subsequent [`RotationStrategy::FillFirst`]
+    /// selections. Without this window, two concurrent `acquire` calls
+    /// under `FillFirst` both observed the same lowest-index credential
+    /// as available (since neither had marked success yet) and both
+    /// received the same id. The reservation is provisional — it does
+    /// NOT block the `RoundRobin`, `Random`, or `LeastUsed` paths (those
+    /// already rotate by other means) and it does not persist across
+    /// process restarts (the `#[serde(skip)]` below drops it on write).
+    #[serde(skip)]
+    pub reserved_until_us: u64,
 }
+
+/// Default hold window after `FillFirst` selection, in microseconds
+/// (5 seconds). Chosen to exceed typical per-request latency so
+/// concurrent acquires during a burst observe each other's selections
+/// via the in-memory reservation, and short enough to auto-recover if
+/// the caller never subsequently marks success or rate-limited.
+pub(crate) const FILL_FIRST_RESERVATION_US: u64 = 5 * 1_000_000;
 
 impl CredentialState {
     pub fn new(id: impl Into<String>) -> Self {
@@ -123,12 +142,20 @@ impl CredentialState {
             reset_at_us: 0,
             last_used_us: 0,
             usage_count: 0,
+            reserved_until_us: 0,
         }
     }
 
     /// Whether this credential is currently cooled down at `now_us`.
     pub fn is_cooled_down(&self, now_us: u64) -> bool {
         self.cooldown_until_us > now_us
+    }
+
+    /// Whether this credential is currently held by a recent
+    /// [`RotationStrategy::FillFirst`] selection and should be skipped
+    /// for concurrent acquires (F-007).
+    pub fn is_reserved(&self, now_us: u64) -> bool {
+        self.reserved_until_us > now_us
     }
 }
 
@@ -659,19 +686,48 @@ impl PersistentCredentialPool {
     /// Pick the next credential according to the configured strategy.
     /// Returns the credential id of the selection, or `None` when every
     /// credential is currently in cooldown.
+    ///
+    /// # FillFirst race (F-007)
+    ///
+    /// The pool holds the `PoolInner` mutex for the entire duration of
+    /// an `acquire`, so the scan itself is serialized. The concurrency
+    /// bug that F-007 closes is more subtle: without a provisional
+    /// reservation, successive acquires during a burst kept picking the
+    /// same lowest-index credential (since neither call site had marked
+    /// success yet — that only happens after the HTTP round-trip
+    /// returns). Callers that used `FillFirst` expecting one-credential-
+    /// per-request got the opposite: every concurrent request landed on
+    /// credential `0`, defeating the rotation.
+    ///
+    /// The fix stamps [`CredentialState::reserved_until_us`] on selection
+    /// inside the same lock as the scan. The next `FillFirst` selection
+    /// in the [`FILL_FIRST_RESERVATION_US`] window skips the reserved
+    /// id. `last_used_us` is also updated so the `LeastUsed` strategy
+    /// tie-breaks against fresh selections correctly.
     fn select(&self, inner: &mut PoolInner) -> Option<String> {
         let now = now_epoch_us();
         match self.strategy {
             RotationStrategy::FillFirst => {
                 for cred in &inner.credentials {
+                    let cred_id = cred.id.clone();
                     let state = inner
                         .state
-                        .get(&cred.id)
+                        .get(&cred_id)
                         .cloned()
-                        .unwrap_or_else(|| CredentialState::new(&cred.id));
-                    if !state.is_cooled_down(now) {
-                        return Some(cred.id.clone());
+                        .unwrap_or_else(|| CredentialState::new(&cred_id));
+                    if state.is_cooled_down(now) || state.is_reserved(now) {
+                        continue;
                     }
+                    // Atomically reserve this credential inside the same
+                    // lock as the scan — concurrent FillFirst acquires
+                    // see the reservation and skip to the next id.
+                    let entry = inner
+                        .state
+                        .entry(cred_id.clone())
+                        .or_insert_with(|| CredentialState::new(&cred_id));
+                    entry.reserved_until_us = now.saturating_add(FILL_FIRST_RESERVATION_US);
+                    entry.last_used_us = now;
+                    return Some(cred_id);
                 }
                 None
             }
@@ -855,6 +911,10 @@ impl CredentialPool for PersistentCredentialPool {
             .or_insert_with(|| CredentialState::new(credential_id));
         entry.usage_count = entry.usage_count.saturating_add(1);
         entry.last_used_us = now;
+        // Clear the F-007 fill-first reservation — the caller is done
+        // with the credential, so subsequent FillFirst selections may
+        // pick it again without waiting for the 5-second hold window.
+        entry.reserved_until_us = 0;
         let snapshot = entry.clone();
         Self::persist_state(&inner, &snapshot)?;
         Ok(())
@@ -936,6 +996,9 @@ mod tests {
 
     #[tokio::test]
     async fn fill_first_returns_lowest_index() {
+        // After F-007, each acquire reserves the picked credential for
+        // 5 seconds. Marking success clears the reservation so the next
+        // acquire again sees the lowest-index candidate available.
         let (pool, _dir) = fresh_pool(RotationStrategy::FillFirst, &["a", "b", "c"]);
         for _ in 0..4 {
             let c = pool
@@ -943,7 +1006,54 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(c.id, "a");
+            pool.mark_success(&c.id).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn should_not_hand_same_credential_to_concurrent_fillfirst_acquirers() {
+        use std::collections::HashSet;
+        // F-007 — 10 credentials, 10 concurrent acquires under
+        // FillFirst must each receive a unique id thanks to the in-lock
+        // reservation stamp. Without the fix every acquire landed on
+        // `c00` because none of them got to mark success before the
+        // next acquire scanned.
+        let ids: Vec<String> = (0..10).map(|i| format!("c{i:02}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p.redb");
+        let creds = ids
+            .iter()
+            .map(|id| Credential::new(id.clone(), format!("secret-{id}")))
+            .collect();
+        let pool = Arc::new(
+            PersistentCredentialPool::open(
+                &path,
+                PersistentCredentialPoolOptions::new("test", creds)
+                    .with_strategy(RotationStrategy::FillFirst),
+            )
+            .unwrap(),
+        );
+
+        let mut handles = Vec::with_capacity(id_refs.len());
+        for _ in 0..id_refs.len() {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                pool.acquire(rotation_reason::INITIAL_ACQUIRE)
+                    .await
+                    .map(|c| c.id)
+            }));
+        }
+
+        let mut seen = HashSet::new();
+        for handle in handles {
+            let id = handle.await.unwrap().unwrap();
+            assert!(
+                seen.insert(id.clone()),
+                "credential `{id}` handed out twice under FillFirst"
+            );
+        }
+        assert_eq!(seen.len(), id_refs.len());
     }
 
     #[tokio::test]
