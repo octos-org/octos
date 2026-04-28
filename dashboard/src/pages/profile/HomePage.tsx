@@ -7,8 +7,14 @@ import ConfirmDialog from '../../components/ConfirmDialog'
 import StatusBadge from '../../components/StatusBadge'
 import { CHANNEL_COLORS, CHANNEL_LABELS } from '../../types'
 import type { ProfileResponse } from '../../types'
-import { api, myApi } from '../../api'
+import { api, myApi, systemApi } from '../../api'
 import { useToast } from '../../components/Toast'
+
+/// Backward-compatible default when the server hasn't sent back a
+/// `base_domain` field yet (older release, network glitch, etc.). Must
+/// match `DEFAULT_BASE_DOMAIN` on the server so preview URLs are stable
+/// on mini1 without config changes.
+const DEFAULT_BASE_DOMAIN = 'crew.ominix.io'
 
 export default function HomePage() {
   const { isAdmin } = useAuth()
@@ -34,6 +40,11 @@ export default function HomePage() {
   const [newSubdomain, setNewSubdomain] = useState('')
   const [newSubEmail, setNewSubEmail] = useState('')
   const [createSubLoading, setCreateSubLoading] = useState(false)
+  // Public base domain advertised by the server — drives the preview
+  // URL so mini2/3/5 render `*.bot./*.octos./*.ocean.ominix.io` instead
+  // of mini1's `*.crew.ominix.io`. Falls back to `DEFAULT_BASE_DOMAIN`
+  // while the status request is in flight or if it fails.
+  const [baseDomain, setBaseDomain] = useState<string>(DEFAULT_BASE_DOMAIN)
 
   const loadSubAccounts = useCallback(async () => {
     if (parentId || !profileId) return
@@ -53,6 +64,25 @@ export default function HomePage() {
   useEffect(() => {
     loadSubAccounts()
   }, [loadSubAccounts])
+
+  useEffect(() => {
+    let cancelled = false
+    systemApi
+      .status()
+      .then((s) => {
+        if (cancelled) return
+        if (s.base_domain && typeof s.base_domain === 'string') {
+          setBaseDomain(s.base_domain)
+        }
+      })
+      .catch(() => {
+        // Leave the fallback in place — the preview URL is cosmetic and
+        // the legacy `crew.ominix.io` default keeps mini1 working.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const handleCreateSubAccount = async () => {
     if (!profileId || !newSubName.trim()) return
@@ -250,7 +280,7 @@ export default function HomePage() {
               disabled={!!parentId && isOwn}
             />
             <p className="text-xs text-gray-500 mt-1">
-              Public URL preview: <span className="font-mono text-gray-400">https://{(publicSubdomain || profileId) || 'your-subdomain'}.crew.ominix.io</span>
+              Public URL preview: <span className="font-mono text-gray-400">https://{(publicSubdomain || profileId) || 'your-subdomain'}.{baseDomain}</span>
             </p>
             {!!parentId && isOwn && (
               <p className="text-xs text-gray-500 mt-1">Sub-account users cannot change their own public subdomain. The parent account controls it.</p>
@@ -369,7 +399,7 @@ export default function HomePage() {
                   placeholder="newsbot"
                   className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
                 />
-                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">https://{newSubdomain || 'newsbot'}.crew.ominix.io</span></p>
+                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">https://{newSubdomain || 'newsbot'}.{baseDomain}</span></p>
               </div>
               <div>
                 <label className="block text-xs text-gray-400 mb-1">Email (for web client login)</label>

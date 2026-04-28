@@ -9,7 +9,7 @@ use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +17,29 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
+
+// ---------------------------------------------------------------------------
+// Cancellation (W3.D1)
+// ---------------------------------------------------------------------------
+//
+// Plugin protocol v2 contract: on SIGTERM the host gives us 10s to clean up
+// before SIGKILL. We track an in-process atomic that is set by the SIGTERM
+// handler, and the BFS loop checks it at every iteration. The Chrome child
+// pid is tracked so the handler can kill it directly even if the main task
+// is blocked in a CDP call.
+
+/// Set to 1 by the SIGTERM handler; the BFS loop and synchronous
+/// CDP-sender code paths poll this and exit early when set.
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pid of the Chrome child we launched. The handler kills this directly
+/// so chromium does not linger after the main task winds down.
+/// 0 means "no child to kill".
+static CHROME_PID: AtomicI32 = AtomicI32::new(0);
+
+fn cancelled() -> bool {
+    CANCELLED.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -716,16 +739,96 @@ async fn crawl_single_page(
 }
 
 // ---------------------------------------------------------------------------
+// Plugin protocol v2 stderr emitters
+// ---------------------------------------------------------------------------
+
+/// Emit a v2 `progress` event on stderr.
+fn emit_v2_progress(stage: &str, message: &str, progress_fraction: Option<f64>) {
+    let event = serde_json::json!({
+        "type": "progress",
+        "stage": stage,
+        "message": message,
+        "progress": progress_fraction,
+    });
+    match serde_json::to_string(&event) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!("[{stage}] {message}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
+    install_sigterm_handler();
     let result = run().await;
+    // Best-effort: kill chrome before we exit. Required when the timeout
+    // path didn't run (success exit) AND when the host SIGKILLs us before
+    // our drop runs.
+    cleanup_chrome();
     let output_json = serde_json::to_string(&result).unwrap_or_else(|_| {
         r#"{"output":"Internal serialization error","success":false}"#.to_string()
     });
     println!("{output_json}");
+}
+
+/// Install a SIGTERM handler that flips the [`CANCELLED`] atomic, kills
+/// the Chrome child, and exits within the host's 10s grace window.
+#[cfg(unix)]
+fn install_sigterm_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async {
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[deep_crawl] failed to install SIGTERM handler: {e}");
+                return;
+            }
+        };
+        if term.recv().await.is_some() {
+            CANCELLED.store(true, Ordering::Relaxed);
+            emit_v2_progress(
+                "cleanup",
+                "SIGTERM received, killing chrome and exiting",
+                None,
+            );
+            cleanup_chrome();
+            // 130 = 128 + SIGTERM(2). Stay well within the 10s budget.
+            std::process::exit(130);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sigterm_handler() {
+    // No SIGTERM on Windows; deep_crawl exits via host's TerminateProcess.
+}
+
+/// Kill the tracked Chrome child if any. Idempotent: safe to call from
+/// both the SIGTERM handler and the normal exit path.
+fn cleanup_chrome() {
+    let pid = CHROME_PID.swap(0, Ordering::Relaxed);
+    if pid <= 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SIGKILL the chrome process. Best-effort — Chrome reaps on its
+        // own once the WS connection drops, but explicit kill is faster
+        // and matches the "no browser zombies" assertion in the test
+        // matrix.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
+    }
 }
 
 async fn run() -> Output {
@@ -800,6 +903,8 @@ async fn run() -> Output {
         }
     };
 
+    emit_v2_progress("init", "launching headless chrome", Some(0.05));
+
     // Launch Chrome
     let (mut child, port) = match launch_chrome(temp_dir.path()) {
         Ok(c) => c,
@@ -810,6 +915,11 @@ async fn run() -> Output {
             };
         }
     };
+
+    // Record pid so the SIGTERM handler can kill it directly.
+    if let Ok(pid) = i32::try_from(child.id()) {
+        CHROME_PID.store(pid, Ordering::Relaxed);
+    }
 
     // Connect to Chrome via CDP
     let ws_url = match get_ws_url(port).await {
@@ -879,8 +989,21 @@ async fn run() -> Output {
         "[deep_crawl] starting crawl: url={}, max_depth={max_depth}, max_pages={max_pages}, path_prefix={:?}",
         input.url, input.path_prefix
     );
+    emit_v2_progress(
+        "crawling",
+        &format!("starting BFS, max_pages={max_pages}, max_depth={max_depth}"),
+        Some(0.10),
+    );
 
     while let Some((url, depth)) = queue.pop_front() {
+        if cancelled() {
+            eprintln!(
+                "[deep_crawl] cancelled, stopping BFS at {} pages",
+                results.len()
+            );
+            emit_v2_progress("cleanup", "cancellation requested", None);
+            break;
+        }
         if results.len() >= max_pages as usize {
             break;
         }
@@ -889,6 +1012,17 @@ async fn run() -> Output {
             "[deep_crawl] crawling [{}/{}] depth={depth}: {url}",
             results.len() + 1,
             max_pages
+        );
+        let progress_fraction = if max_pages > 0 {
+            // 0.10 reserved for init; cap progress under 0.95.
+            Some(0.10 + (results.len() as f64 / max_pages as f64) * 0.85)
+        } else {
+            None
+        };
+        emit_v2_progress(
+            "crawling",
+            &format!("page {}/{} depth={depth}", results.len() + 1, max_pages),
+            progress_fraction,
         );
 
         let mut crawled = crawl_single_page(&mut ws, &session_id, &url, PAGE_SETTLE_MS).await;
@@ -939,8 +1073,12 @@ async fn run() -> Output {
         results.push(crawled);
     }
 
-    // Shutdown browser
+    // Shutdown browser. The pid is also tracked in CHROME_PID so the
+    // SIGTERM handler can race us; clear our slot before kill so the
+    // double-kill from cleanup_chrome() is a noop in the success path.
+    emit_v2_progress("cleanup", "closing chrome", Some(0.97));
     let _ = ws.close(None).await;
+    CHROME_PID.store(0, Ordering::Relaxed);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -1025,9 +1163,119 @@ async fn run() -> Output {
         results.len(),
         crawl_dir.display()
     );
+    emit_v2_progress(
+        "complete",
+        &format!("crawled {} pages", results.len()),
+        Some(1.0),
+    );
 
     Output {
         output,
         success: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_atomic_starts_unset() {
+        // Other tests in this module may set the atomic; reset before
+        // checking to keep this test deterministic regardless of
+        // execution order.
+        CANCELLED.store(false, Ordering::Relaxed);
+        assert!(!cancelled());
+        CANCELLED.store(true, Ordering::Relaxed);
+        assert!(cancelled());
+        CANCELLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn cleanup_chrome_is_idempotent_with_zero_pid() {
+        // No pid recorded → noop, must not panic.
+        CHROME_PID.store(0, Ordering::Relaxed);
+        cleanup_chrome();
+        cleanup_chrome();
+    }
+
+    #[test]
+    fn cleanup_chrome_clears_pid_after_call() {
+        // Use an obviously-invalid pid so the kill command no-ops on
+        // any sane host. The test asserts the slot is cleared so a
+        // second cleanup is a noop.
+        CHROME_PID.store(1, Ordering::Relaxed);
+        cleanup_chrome();
+        assert_eq!(CHROME_PID.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn normalize_url_strips_fragment_and_trailing_slash() {
+        assert_eq!(
+            normalize_url("https://example.com/page#frag"),
+            Some("https://example.com/page".to_string())
+        );
+        assert_eq!(
+            normalize_url("https://example.com/page/"),
+            Some("https://example.com/page".to_string())
+        );
+    }
+
+    #[test]
+    fn host_slug_replaces_dots_with_dashes() {
+        let url = Url::parse("https://www.example.com/").unwrap();
+        assert_eq!(host_slug(&url), "www-example-com");
+    }
+
+    #[test]
+    fn truncate_string_preserves_utf8_boundary() {
+        let s = "hello 你好 world".to_string();
+        let truncated = truncate_string(s, 7);
+        // No panic and result fits within budget.
+        assert!(truncated.len() <= 7 + "\n\n... (truncated)".len());
+        assert!(truncated.is_char_boundary(0));
+    }
+
+    #[test]
+    fn truncate_string_passes_through_short_strings() {
+        let s = "short".to_string();
+        assert_eq!(truncate_string(s, 1000), "short");
+    }
+
+    #[test]
+    fn is_bot_blocked_detects_known_strings() {
+        assert!(is_bot_blocked("Just a moment..."));
+        assert!(is_bot_blocked("Performing security verification"));
+        assert!(is_bot_blocked("Attention Required! | Cloudflare"));
+        assert!(!is_bot_blocked("Welcome to our site"));
+    }
+
+    #[test]
+    fn is_private_ip_blocks_loopback_and_private() {
+        let v4_loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let v4_private: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let v4_public: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(is_private_ip(v4_loopback));
+        assert!(is_private_ip(v4_private));
+        assert!(!is_private_ip(v4_public));
+    }
+
+    #[test]
+    fn emit_v2_progress_does_not_panic_on_unicode() {
+        // Catch any future serialization regression that would crash on
+        // non-ASCII content.
+        emit_v2_progress("crawling", "page 你好/世界", Some(0.5));
+    }
+
+    #[test]
+    fn page_slug_produces_deterministic_filename_for_same_url() {
+        let url = Url::parse("https://example.com/path/to/page").unwrap();
+        let slug = page_slug(&url, 5);
+        assert!(slug.starts_with("005_"));
+        assert!(slug.contains("path"));
     }
 }

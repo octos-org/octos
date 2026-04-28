@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod admin_setup;
 pub mod auth_handlers;
+mod events_harness;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
@@ -12,12 +13,20 @@ pub mod purge;
 mod router;
 mod sse;
 mod static_files;
+pub mod swarm;
 pub mod user_admin;
 pub mod webhook_proxy;
 
 pub use metrics::init_metrics;
-pub use router::build_router;
+pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 pub use sse::SseBroadcaster;
+pub use swarm::{
+    BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
+    SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
+    SwarmDispatchResponse, SwarmDispatchesResponse, SwarmReviewRequest, SwarmReviewResponse,
+    SwarmState, TestStubBackend, ValidatorView, build_swarm_state, build_test_swarm_state,
+    build_test_swarm_state_with_broadcaster, parallel_topology,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -128,6 +137,12 @@ pub struct AppState {
     pub run_id_cache: Arc<RunIdCache>,
     /// Tunnel domain (e.g. "octos-cloud.org").
     pub tunnel_domain: Option<String>,
+    /// Public-facing base domain each mini serves profiles under
+    /// (e.g. `"crew.ominix.io"`, `"bot.ominix.io"`, `"ocean.ominix.io"`).
+    /// `None` is treated as `"crew.ominix.io"` by callers for backward
+    /// compatibility. See `crate::config::Config::base_domain` for the
+    /// config / env-var wiring.
+    pub base_domain: Option<String>,
     /// frps server address for tunnel config generation.
     pub frps_server: Option<String>,
     /// frps control port.
@@ -138,11 +153,40 @@ pub struct AppState {
     pub allow_admin_shell: bool,
     /// Content catalog manager for per-profile file indexing.
     pub content_catalog_mgr: Option<Arc<ContentCatalogManager>>,
+    /// Shared swarm state for the M7.6 contract-authoring dashboard.
+    /// `None` when swarm wiring is not configured — handlers return
+    /// `503 Service Unavailable` in that case.
+    pub swarm_state: Option<Arc<swarm::SwarmState>>,
+    /// Optional path to the JSONL harness-event sink. When `Some`,
+    /// typed harness events (e.g. `SwarmReviewDecision`) are appended
+    /// to the file in addition to being broadcast live to SSE
+    /// subscribers. When `None`, events are broadcast-only — so a
+    /// decision made while no subscriber is connected is lost. Wired
+    /// by `octos serve` from the `OCTOS_HARNESS_EVENT_SINK` env var.
+    pub harness_event_sink_path: Option<String>,
+    /// Credential pool (M6.5, F-005). Initialised at startup from
+    /// `config.credential_pool` when present; `None` falls back to the
+    /// legacy single-credential flow. Shared with session actors so
+    /// per-LLM-call `acquire`/`mark_*` operations see a consistent view.
+    pub credential_pool: Option<Arc<octos_llm::PersistentCredentialPool>>,
+    /// Content classifier (M6.6, F-005). Populated when
+    /// `config.content_routing` is present and `enabled: true`. When
+    /// `None` the router falls through to the unclassified strong-only
+    /// default (invariant #3 of the M6.6 spec).
+    pub content_classifier: Option<Arc<octos_llm::ContentClassifier>>,
+    /// M7.9 / W2: shared session-task supervisor lookup. Used by the
+    /// `POST /api/tasks/{task_id}/cancel` and
+    /// `POST /api/tasks/{task_id}/restart-from-node` endpoints to
+    /// forward to the matching `TaskSupervisor`. `None` keeps the
+    /// pre-W2 behaviour — both endpoints return `503 Service
+    /// Unavailable` so they fail closed instead of pretending a task
+    /// was cancelled.
+    pub task_query_store: Option<crate::session_actor::SessionTaskQueryStore>,
 }
 
-#[cfg(test)]
 impl AppState {
-    /// Empty `AppState` for unit tests — every store/service is `None`.
+    /// Empty `AppState` for unit and integration tests — every
+    /// store/service is `None`.
     ///
     /// Override individual fields with struct-update syntax:
     ///
@@ -152,7 +196,7 @@ impl AppState {
     ///     ..AppState::empty_for_tests()
     /// };
     /// ```
-    pub(crate) fn empty_for_tests() -> Self {
+    pub fn empty_for_tests() -> Self {
         let tmp =
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
@@ -178,11 +222,17 @@ impl AppState {
             tenant_store: None,
             run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: None,
+            base_domain: None,
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
             allow_admin_shell: false,
             content_catalog_mgr: None,
+            swarm_state: None,
+            harness_event_sink_path: None,
+            credential_pool: None,
+            content_classifier: None,
+            task_query_store: None,
         }
     }
 }

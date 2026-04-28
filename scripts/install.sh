@@ -529,9 +529,9 @@ write_octos_service() {
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$DATA_DIR/serve.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>$DATA_DIR/serve.log</string>
+    <string>/dev/null</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -828,7 +828,7 @@ if [ "$RUN_DOCTOR" = true ]; then
             ;;
         *)
             warn "responds HTTP $HTTP_CODE"
-            hint "Check logs: tail -20 $DATA_DIR/serve.log"
+            hint "Check logs: tail -20 $DATA_DIR/logs/serve.$(date +%F).log"
             ;;
     esac
 
@@ -977,19 +977,22 @@ if [ "$RUN_DOCTOR" = true ]; then
     # ── Serve logs ───────────────────────────────────────────────────
     section "Recent serve logs"
 
-    SERVE_LOG="$DATA_DIR/serve.log"
+    SERVE_LOG=$(ls -1t "$DATA_DIR"/logs/serve.*.log 2>/dev/null | head -1 || true)
+    if [ -z "$SERVE_LOG" ]; then
+        SERVE_LOG="$DATA_DIR/serve.log"
+    fi
     if [ -f "$SERVE_LOG" ]; then
         SERVE_ERRORS=$(tail -30 "$SERVE_LOG" 2>/dev/null | grep -i "error\|panic\|Address already in use" | tail -5)
         if [ -n "$SERVE_ERRORS" ]; then
-            warn "recent errors in serve.log:"
+            warn "recent errors in $(basename "$SERVE_LOG"):"
             echo "$SERVE_ERRORS" | while read -r line; do echo "      $line"; done
         else
-            ok "no recent errors in serve.log"
+            ok "no recent errors in $(basename "$SERVE_LOG")"
         fi
         echo "    Last 3 lines:"
         tail -3 "$SERVE_LOG" 2>/dev/null | while read -r line; do echo "      $line"; done
     else
-        warn "serve.log not found at $SERVE_LOG"
+        warn "no serve log found under $DATA_DIR/logs or at $DATA_DIR/serve.log"
     fi
 
     # ── Runtime dependencies ─────────────────────────────────────────
@@ -1524,7 +1527,7 @@ while [ $RETRIES -gt 0 ]; do
 done
 if [ $RETRIES -eq 0 ]; then
     warn "octos serve did not respond within 10 seconds"
-    echo "    Check logs: tail -f $DATA_DIR/serve.log"
+    echo "    Check logs: tail -f $DATA_DIR/logs/serve.\$(date +%F).log"
 fi
 
 # ── Firewall (Caddy only) ─────────────────────────────────────────────
@@ -1796,7 +1799,7 @@ echo "    Binary:     $PREFIX/octos"
 echo "    Data dir:   $DATA_DIR"
 echo "    Config:     $DATA_DIR/config.json"
 echo "    Auth token: $AUTH_TOKEN"
-echo "    Logs:       tail -f $DATA_DIR/serve.log"
+echo "    Logs:       tail -f $DATA_DIR/logs/serve.\$(date +%F).log"
 echo ""
 echo "  Next steps:"
 echo "    1. Setup LLM models:  octos init"

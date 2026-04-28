@@ -33,6 +33,9 @@ node_modules/
 # source-clone build are responsible for regenerating it.
 crates/octos-cli/static/admin/
 
+# Swarm-app build output
+crates/octos-cli/static/swarm/
+
 # Environment
 .env
 .env.local
@@ -75,6 +78,10 @@ scripts/deploy.sh
 !docs/SANDBOX.md
 !docs/SECURITY_ARCHITECTURE.md
 !docs/OCTOS_ROBOTICS_PR270_RP06_NOTE.md
+!docs/OCTOS_FAILURE_MODES_INVENTORY.md
+!docs/m8-runtime-parity-prd.md
+!docs/m8-runtime-contract.md
+!docs/m8-runtime-migration-runbook.md
 
 # mdBook documentation site (EN + ZH)
 !book/book.toml
@@ -88,6 +95,10 @@ scripts/deploy.sh
 !crates/octos-agent/skills/**/SKILL.md
 !crates/app-skills/**/SKILL.md
 !crates/platform-skills/**/SKILL.md
+# Crate-level developer documentation (SDK contracts, protocol specs)
+!crates/octos-plugin/docs/*.md
+# Crate test fixtures (sample reports, fake API payloads)
+!crates/app-skills/**/tests/fixtures/*.md
 # Harness M4.4 compat-gate fixture (SKILL.md + manifest.json must be tracked)
 !e2e/fixtures/compat-test-skill/SKILL.md
 !e2e/fixtures/compat-test-skill/manifest.json

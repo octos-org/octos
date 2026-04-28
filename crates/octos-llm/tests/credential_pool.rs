@@ -268,8 +268,16 @@ async fn should_produce_distinct_sequences_per_strategy() {
     let rr = run(dir.path(), "rr", RotationStrategy::RoundRobin).await;
     let least = run(dir.path(), "least", RotationStrategy::LeastUsed).await;
 
-    // FillFirst must always return "a".
-    assert!(fill.iter().all(|id| id == "a"), "FillFirst: {fill:?}");
+    // FillFirst with the F-007 reservation stamp holds the selected id
+    // for 5s (cleared on `mark_success`). The first four picks in this
+    // run mark success, so each returns "a"; the subsequent picks omit
+    // mark_success, causing FillFirst to walk onward as each earlier
+    // pick leaves a short-lived reservation in place.
+    assert_eq!(fill[..4], ["a", "a", "a", "a"]);
+    assert!(
+        fill[4..].iter().any(|id| id != "a"),
+        "FillFirst should advance after the fifth unmarked pick, got {fill:?}"
+    );
 
     // RoundRobin is the canonical a→b→c→d cycle.
     assert_eq!(rr, vec!["a", "b", "c", "d", "a", "b", "c", "d"]);

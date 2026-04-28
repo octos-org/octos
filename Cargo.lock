@@ -3605,6 +3605,7 @@ dependencies = [
  "octos-core",
  "octos-llm",
  "octos-memory",
+ "octos-plugin",
  "redb",
  "regex",
  "reqwest 0.12.28",
@@ -3695,6 +3696,7 @@ dependencies = [
  "octos-llm",
  "octos-memory",
  "octos-pipeline",
+ "octos-swarm",
  "open",
  "quick-xml",
  "rand 0.8.5",
@@ -3712,6 +3714,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-test",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -3781,6 +3784,7 @@ dependencies = [
  "chrono",
  "eyre",
  "futures",
+ "glob",
  "octos-agent",
  "octos-core",
  "octos-llm",
@@ -3788,6 +3792,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-test",
@@ -6193,7 +6198,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice"
-version = "1.0.0"
+version = "1.1.1"
 dependencies = [
  "base64",
  "reqwest 0.12.28",

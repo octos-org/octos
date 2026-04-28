@@ -17,8 +17,14 @@ use octos_memory::EpisodeStore;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use octos_agent::cost_ledger::{CostAttributionEvent, ReservationHandle};
+use octos_agent::validators::ValidatorPhase;
+use octos_agent::workspace_contract::run_declared_validators;
+use octos_agent::workspace_policy::Validator as WorkspaceValidator;
+
 use crate::checkpoint::{CheckpointStore, PersistedCheckpoint};
 use crate::condition;
+use crate::context::PipelineContext;
 use crate::graph::{
     DeadlineAction, HandlerKind, NodeOutcome, NodeSummary, OutcomeStatus, PipelineEdge,
     PipelineGraph, PipelineNode,
@@ -28,6 +34,96 @@ use crate::handler::{
 };
 use crate::parser::parse_dot;
 use crate::validate;
+
+/// Minimum projected USD per LLM-call node when no model-specific rate
+/// is available. Keeps the reservation path live for unknown models so
+/// budget-policy breaches surface on every dispatch rather than slipping
+/// through a silent `0.0` projection.
+const MIN_PER_NODE_PROJECTED_USD: f64 = 0.001;
+
+/// Default pipeline-level projection when the caller leaves
+/// [`PipelineContext::pipeline_projected_usd`] unset. One cent keeps
+/// the reservation path alive without pre-committing a noticeable
+/// budget.
+const DEFAULT_PIPELINE_PROJECTED_USD: f64 = 0.01;
+
+/// Default pipeline contract id when [`PipelineContext::contract_id`]
+/// is empty. Chosen to match the operator rollup key used elsewhere in
+/// the harness for background pipelines.
+const DEFAULT_PIPELINE_CONTRACT_ID: &str = "pipeline";
+
+/// Cumulative cap on the total number of fan-out workers a single pipeline
+/// run may spawn across its lifetime. Each worker counted once at dispatch
+/// time, regardless of which branch (`Parallel` or `DynamicParallel`)
+/// dispatched it. Beyond this cap the executor fails the pipeline with
+/// [`PipelineError::FanoutExceeded`] before the cap-exceeding fan-out
+/// dispatches a single worker — partial dispatch leaves the pipeline in a
+/// less-recoverable state than an early refusal.
+///
+/// Motivated by the river/mini4 65,535-child runaway: the per-batch
+/// concurrency cap on `dynamic_parallel` nodes only bounds in-flight
+/// workers, not lifetime fan-out. A pathological planner that re-fires the
+/// same dynamic-parallel node many times can still exhaust the host even
+/// with `max_parallel_workers = 8`.
+pub const MAX_PIPELINE_FANOUT_TOTAL: usize = 500;
+
+/// Structured pipeline-level error variants. Today only the cumulative
+/// fan-out cap surfaces this type; the rest of the executor still uses
+/// `eyre`-based errors. The enum is `Clone` so the cap-exceeded reason
+/// can be embedded into the resulting [`PipelineResult::output`] without
+/// re-allocating context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// The cumulative fan-out cap fired. `count` is the number of workers
+    /// already dispatched in this pipeline run (i.e. the value of the
+    /// counter immediately before the refusal). `cap` is the configured
+    /// limit ([`MAX_PIPELINE_FANOUT_TOTAL`]).
+    FanoutExceeded { count: usize, cap: usize },
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FanoutExceeded { count, cap } => write!(
+                f,
+                "pipeline fan-out cap exceeded ({count} of {cap}); refusing further workers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
+
+/// Returns `true` when the handler kind triggers one or more LLM calls
+/// inside the node and therefore participates in cost reservation.
+///
+/// * `Codergen`: one sub-agent run (many LLM calls inside the loop).
+/// * `DynamicParallel`: one planner call + N worker calls; the
+///   reservation is sized using the node's declared model so it covers
+///   both phases.
+///
+/// `Shell`, `Gate`, `Noop`, and `Parallel` do not issue LLM calls
+/// directly — `Parallel` fan-outs target `Codergen` nodes which each
+/// reserve independently when traversal reaches them.
+fn handler_kind_reserves(kind: &HandlerKind) -> bool {
+    matches!(kind, HandlerKind::Codergen | HandlerKind::DynamicParallel)
+}
+
+/// Project a per-node USD cost for reservation purposes.
+///
+/// Uses the declared model's token pricing with a fixed 2k-in / 2k-out
+/// estimate when the model is known. Falls back to
+/// [`MIN_PER_NODE_PROJECTED_USD`] for unknown models so the reservation
+/// path still fires (and budget breaches still surface).
+fn project_node_usd(model: Option<&str>) -> f64 {
+    let Some(model) = model else {
+        return MIN_PER_NODE_PROJECTED_USD;
+    };
+    match octos_agent::cost_ledger::project_cost_usd(model, 2_000, 2_000) {
+        Some(cost) if cost > 0.0 => cost,
+        _ => MIN_PER_NODE_PROJECTED_USD,
+    }
+}
 
 /// Total count of pipeline deadline expirations, partitioned by action label.
 /// Layout: `[abort, skip, retry, escalate]`. Use [`deadline_exceeded_count`] to
@@ -119,6 +215,36 @@ fn build_resume_skip_set(store: Option<&Arc<dyn CheckpointStore>>) -> Result<Has
     Ok(skip)
 }
 
+/// Per-node cost attribution captured during pipeline execution
+/// (W1.A4). Recorded for every LLM-call node that opens a
+/// [`ReservationHandle`] against the configured `CostAccountant`. The
+/// reservation projection is captured at dispatch start; the actual
+/// USD spend is computed from the post-dispatch token usage so the UI
+/// can render both "reserved" and "actual" sides.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeCost {
+    /// Pipeline node id.
+    pub node_id: String,
+    /// Resolved model key for the node, or `None` when the node ran
+    /// with the default provider.
+    pub model: Option<String>,
+    /// Pre-dispatch USD projection used for the reservation (0.0 when
+    /// no accountant was configured).
+    pub reserved_usd: f64,
+    /// Post-dispatch USD computed from actual token usage. Falls back
+    /// to the reserved projection when the model rate is unknown.
+    pub actual_usd: f64,
+    /// Input tokens consumed by the node.
+    pub tokens_in: u32,
+    /// Output tokens produced by the node.
+    pub tokens_out: u32,
+    /// `true` when the per-node `ReservationHandle` was committed to
+    /// the ledger. `false` when no accountant was attached or when the
+    /// commit was dropped (auto-refunded). Surfaces the "ledger-bound
+    /// vs ephemeral" distinction the UI needs to badge cost rows.
+    pub committed: bool,
+}
+
 /// Result of a complete pipeline execution.
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
@@ -132,6 +258,10 @@ pub struct PipelineResult {
     pub node_summaries: Vec<NodeSummary>,
     /// Files written by pipeline nodes (collected from all node outcomes).
     pub files_modified: Vec<std::path::PathBuf>,
+    /// M8 parity (W1.A4): per-node cost attribution. One entry per
+    /// node that opened a [`ReservationHandle`] against the configured
+    /// `CostAccountant`. Empty when no accountant is wired.
+    pub node_costs: Vec<NodeCost>,
 }
 
 /// Bridge for pipeline status updates to external systems (e.g., messaging channels).
@@ -192,6 +322,11 @@ pub struct ExecutorConfig {
     /// Maximum number of parallel workers for fan-out stages (default 8).
     /// Prevents unbounded resource consumption under high parallelism.
     pub max_parallel_workers: usize,
+    /// Cumulative fan-out worker cap for the entire pipeline run (Guard B).
+    /// `None` defaults to [`MAX_PIPELINE_FANOUT_TOTAL`]. Tests set this to
+    /// a small value to drive the cap path without waiting on real
+    /// LLM-driven planning.
+    pub max_pipeline_fanout_total: Option<usize>,
     /// Optional mission checkpoint store. When set, the executor:
     /// * loads the latest `PersistedCheckpoint` at the start of a run and
     ///   skips every node with id `<=` the recorded node in the pipeline's
@@ -202,6 +337,19 @@ pub struct ExecutorConfig {
     /// Optional hook executor. Fired as `HookEvent::OnSpawnFailure` when a
     /// node's `deadline_action == Escalate` trips.
     pub hook_executor: Option<Arc<HookExecutor>>,
+    /// Optional workspace-contract context (coding-blue FA-7). When
+    /// populated the executor propagates the parent's compaction
+    /// policy onto LLM-call nodes, reserves cost-ledger budget per
+    /// node, and runs the declared completion-phase validators at the
+    /// pipeline terminal. `None` = legacy behaviour (pre-FA-7),
+    /// byte-for-byte identical to the v0 path.
+    pub workspace_context: PipelineContext,
+    /// M8 parity (W1.A1/A3): snapshot of the parent session's shared
+    /// resources (FileStateCache, SubAgentOutputRouter,
+    /// AgentSummaryGenerator, TaskSupervisor) picked up via TOOL_CTX
+    /// at run_pipeline dispatch. Default = empty, which keeps every
+    /// pre-M8 invocation site bitwise identical.
+    pub host_context: crate::host_context::PipelineHostContext,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -617,6 +765,37 @@ impl PipelineExecutor {
         Self { config }
     }
 
+    /// Builder: attach a workspace-contract context (coding-blue FA-7).
+    ///
+    /// Replaces the executor's current [`PipelineContext`] with the
+    /// caller-supplied one. When the context's `is_empty()` is `true`
+    /// the executor stays on the legacy path (validators, compaction,
+    /// and cost reservation are all inert); otherwise every LLM-call
+    /// node inherits the parent's compaction policy, the pipeline-level
+    /// reservation runs at dispatch start, and the declared terminal
+    /// validators fire after the final edge is selected.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let ctx = PipelineContext::new()
+    ///     .with_policy(workspace_policy)
+    ///     .with_agent_llm_provider(llm.clone())
+    ///     .with_cost_accountant(accountant.clone())
+    ///     .with_contract_id("slides-delivery")
+    ///     .with_projected_usd(0.25);
+    /// let exec = PipelineExecutor::new(config).with_workspace_context(ctx);
+    /// ```
+    pub fn with_workspace_context(mut self, context: PipelineContext) -> Self {
+        self.config.workspace_context = context;
+        self
+    }
+
+    /// Access the currently installed workspace context. Returns an
+    /// empty context when the caller never opted in.
+    pub fn workspace_context(&self) -> &PipelineContext {
+        &self.config.workspace_context
+    }
+
     /// Run a pipeline from a DOT string.
     pub async fn run(
         &self,
@@ -699,15 +878,66 @@ impl PipelineExecutor {
 
         let pipeline_start = Instant::now();
 
+        // coding-blue FA-7: reserve pipeline-level cost ledger budget
+        // up front when a CostAccountant was threaded in. The handle is
+        // held for the duration of execution — on success we commit
+        // with the cumulative token attribution, on failure (bail!) the
+        // handle is dropped and auto-refunds.
+        let pipeline_reservation = self
+            .reserve_pipeline_budget(&graph.id)
+            .await
+            .wrap_err("pipeline cost reservation failed")?;
+
         // Execute graph
-        let result = self
+        let mut result = self
             .execute_graph(&graph, &handlers, &start_node, user_input, variables)
             .await;
+
+        // coding-blue FA-7: pipeline-terminal validators. The gate
+        // runs only on a successful pipeline (failure results already
+        // carry their own reason). On validator failure we rewrite the
+        // PipelineResult with `success = false` and a reason-tagged
+        // output so the caller sees a structured terminal error, then
+        // drop the reservation (auto-refund) without committing.
+        let mut validators_failed_reason: Option<String> = None;
+        if let Ok(ref r) = result {
+            if r.success {
+                if let Err(reason) = self.run_terminal_validators(&graph.id).await {
+                    warn!(
+                        pipeline = %graph.id,
+                        reason = %reason,
+                        "pipeline-terminal validator rejected result"
+                    );
+                    validators_failed_reason = Some(reason);
+                }
+            }
+        }
+        if let Some(reason) = validators_failed_reason {
+            if let Ok(ref mut r) = result {
+                r.success = false;
+                r.output = format!(
+                    "Pipeline validator rejected completion: {reason}\n\n{}",
+                    r.output
+                );
+            }
+        }
 
         // ── Pipeline end: log summary ──
         let total_ms = pipeline_start.elapsed().as_millis() as u64;
         match &result {
             Ok(r) => {
+                // Commit the pipeline-level reservation with the real
+                // cumulative token attribution only when the pipeline
+                // succeeded (including the terminal validator gate).
+                // On a terminal validator rejection the reservation
+                // is dropped unchanged at scope exit — ReservationHandle
+                // Drop auto-refunds, preserving the ledger invariant.
+                if r.success {
+                    if let Some(handle) = pipeline_reservation.as_ref() {
+                        self.commit_pipeline_reservation(handle, &graph.id, &r.token_usage)
+                            .await;
+                    }
+                }
                 let node_results: Vec<String> = r
                     .node_summaries
                     .iter()
@@ -731,6 +961,10 @@ impl PipelineExecutor {
                 );
             }
             Err(e) => {
+                // Drop pipeline reservation — ReservationHandle::Drop
+                // auto-refunds when the handle is dropped uncommitted,
+                // so we don't need to do anything beyond exiting scope.
+                drop(pipeline_reservation);
                 tracing::error!(
                     duration_ms = total_ms,
                     error = %e,
@@ -742,9 +976,294 @@ impl PipelineExecutor {
         result
     }
 
-    fn build_handlers(&self) -> HandlerRegistry {
-        let mut registry = HandlerRegistry::new();
+    /// Reserve the pipeline-level projection against the configured
+    /// `CostAccountant`. Returns:
+    /// * `Ok(None)` when no accountant is configured (legacy path).
+    /// * `Ok(Some(handle))` on a successful reservation.
+    /// * `Err` when the accountant exists but the reservation is
+    ///   rejected by the budget policy — the pipeline aborts before
+    ///   running any node, so per-node spend never starts.
+    async fn reserve_pipeline_budget(&self, graph_id: &str) -> Result<Option<ReservationHandle>> {
+        let Some(accountant) = self.config.workspace_context.cost_accountant.as_ref() else {
+            return Ok(None);
+        };
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let projected_usd = self.pipeline_projected_usd();
+        let handle = accountant
+            .reserve(&contract_id, projected_usd)
+            .await
+            .map_err(|breach| eyre::eyre!("cost budget breach: {breach}"))?;
+        info!(
+            contract_id = %contract_id,
+            projected_usd,
+            "pipeline cost reservation opened"
+        );
+        Ok(Some(handle))
+    }
 
+    /// Commit the pipeline-level reservation with the cumulative token
+    /// attribution. Errors are logged (not propagated) because the
+    /// reservation auto-refunds on drop — double-counting a ledger row
+    /// would be worse than a missed attribution.
+    async fn commit_pipeline_reservation(
+        &self,
+        handle: &ReservationHandle,
+        graph_id: &str,
+        usage: &TokenUsage,
+    ) {
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let actual_cost = octos_agent::cost_ledger::project_cost_usd(
+            "pipeline-aggregate",
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .unwrap_or(0.0);
+        let event = CostAttributionEvent::new(
+            contract_id.clone(),
+            contract_id.clone(),
+            format!("pipeline-{graph_id}"),
+            "pipeline-aggregate",
+            usage.input_tokens,
+            usage.output_tokens,
+            actual_cost,
+        );
+        if let Err(error) = handle.commit(event).await {
+            tracing::warn!(
+                contract_id = %contract_id,
+                error = %error,
+                "pipeline cost reservation commit failed; handle auto-refunds"
+            );
+        } else {
+            info!(
+                contract_id = %contract_id,
+                tokens_in = usage.input_tokens,
+                tokens_out = usage.output_tokens,
+                "pipeline cost reservation committed"
+            );
+        }
+    }
+
+    /// Resolve the contract id used for cost-ledger rollups. Falls back
+    /// to the pipeline graph id when the caller left the field empty
+    /// so the ledger still attributes spend to a stable key.
+    fn pipeline_contract_id(&self, graph_id: &str) -> String {
+        let explicit = self.config.workspace_context.contract_id.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        if !graph_id.is_empty() {
+            return graph_id.to_string();
+        }
+        DEFAULT_PIPELINE_CONTRACT_ID.to_string()
+    }
+
+    /// Resolve the pipeline-level projected USD used for the opening
+    /// reservation. Falls back to
+    /// [`DEFAULT_PIPELINE_PROJECTED_USD`] when the caller leaves the
+    /// field unset so the reservation path still surfaces breaches.
+    fn pipeline_projected_usd(&self) -> f64 {
+        let declared = self.config.workspace_context.pipeline_projected_usd;
+        if declared > 0.0 {
+            declared
+        } else {
+            DEFAULT_PIPELINE_PROJECTED_USD
+        }
+    }
+
+    /// Run the declared completion-phase validators for the pipeline
+    /// terminal gate. Returns `Ok(())` when either no workspace policy
+    /// is installed OR every required validator passes. A required
+    /// failure maps to `Err(reason)`; callers demote the pipeline
+    /// result to `success=false` and refund the reservation.
+    ///
+    /// The `workspace_root` defaults to the executor's `working_dir`
+    /// when the policy doesn't specify one — this mirrors the
+    /// spawn/delegate/swarm pattern established by FA-2 (commits
+    /// 40c307f6, fd7ed734, a7e041c6, f27eeb90).
+    async fn run_terminal_validators(&self, _graph_id: &str) -> Result<(), String> {
+        let ws_ctx = &self.config.workspace_context;
+        let Some(policy) = ws_ctx.policy.as_ref() else {
+            return Ok(());
+        };
+        if policy.validation.validators.is_empty() && policy.validation.on_completion.is_empty() {
+            return Ok(());
+        }
+
+        // `on_completion` holds the legacy action-string checks
+        // (e.g. `file_exists:output/deck.pptx`). Typed validators live
+        // in `validation.validators`. Both need to pass at terminal.
+        let legacy_failures = self.evaluate_on_completion_actions(&policy.validation.on_completion);
+        if let Some(reason) = legacy_failures {
+            return Err(reason);
+        }
+
+        if !policy.validation.validators.is_empty() {
+            // Build a workspace-scoped ToolRegistry for the validator
+            // runner — it only needs the workspace root for file
+            // existence + the registered tools for tool_call
+            // validators. Matches the spawn-agent-mcp pattern.
+            let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+            run_declared_validators(
+                &registry,
+                &self.config.working_dir,
+                &policy.validation.validators,
+                "pipeline",
+                ValidatorPhase::Completion,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate legacy `on_completion: ["file_exists:..."]` action
+    /// strings against the working directory. Returns `Some(reason)`
+    /// when any required check fails.
+    fn evaluate_on_completion_actions(&self, actions: &[String]) -> Option<String> {
+        let mut failures = Vec::new();
+        for action in actions {
+            if let Some(spec) = action.strip_prefix("file_exists:") {
+                // Support both concrete paths and globs via the
+                // glob::glob API.
+                let abs_pattern = if std::path::Path::new(spec).is_absolute() {
+                    spec.to_string()
+                } else {
+                    self.config
+                        .working_dir
+                        .join(spec)
+                        .to_string_lossy()
+                        .to_string()
+                };
+                let any_match = match glob::glob(&abs_pattern) {
+                    Ok(entries) => entries.filter_map(Result::ok).any(|p| p.exists()),
+                    Err(_) => false,
+                };
+                if !any_match {
+                    failures.push(action.clone());
+                }
+            } else {
+                // Unknown action form — accept for forward-compat but
+                // log a warning so operators notice legacy strings we
+                // didn't port.
+                warn!(
+                    action = %action,
+                    "on_completion action form not recognized by pipeline executor"
+                );
+            }
+        }
+        if failures.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "pipeline completion validator failed: {}",
+                failures.join(", ")
+            ))
+        }
+    }
+
+    /// Run per-node validators declared in
+    /// [`PipelineContext::validators_by_node`] for `node_id`. Returns
+    /// `Ok(())` when no override is installed for that node OR every
+    /// required validator passes.
+    async fn run_node_validators(&self, node_id: &str) -> Result<(), String> {
+        let ws_ctx = &self.config.workspace_context;
+        let Some(validators) = ws_ctx.validators_by_node.get(node_id) else {
+            return Ok(());
+        };
+        if validators.is_empty() {
+            return Ok(());
+        }
+        // Per-node validators target the completion phase — the node
+        // has finished producing its artifact before we evaluate. A
+        // separate turn-end phase isn't meaningful inside pipeline
+        // execution.
+        let scoped: Vec<WorkspaceValidator> = validators.to_vec();
+        let registry = octos_agent::ToolRegistry::with_builtins(&self.config.working_dir);
+        run_declared_validators(
+            &registry,
+            &self.config.working_dir,
+            &scoped,
+            &format!("pipeline-node-{node_id}"),
+            ValidatorPhase::Completion,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// M8 parity (W1.A3): register a child task in the parent
+    /// session's [`TaskSupervisor`] so the admin dashboard sees the
+    /// pipeline's substructure. The registration carries the node id
+    /// as the synthetic tool name (`pipeline:<node_id>`) and the
+    /// `parent_tool_call_id` from the host context as the
+    /// `tool_call_id` so the UI can stitch the node tree under the
+    /// invoking run_pipeline pill. Returns `None` when no supervisor
+    /// is wired (legacy callers).
+    fn register_node_task(&self, node_id: &str) -> Option<String> {
+        let supervisor = self.config.host_context.task_supervisor.as_ref()?;
+        let parent_tool_call_id = self
+            .config
+            .host_context
+            .parent_tool_call_id
+            .as_deref()
+            .unwrap_or("");
+        let session_key = self.config.host_context.parent_session_key.as_deref();
+        let tool_name = format!("pipeline:{node_id}");
+        let task_id = supervisor.register(&tool_name, parent_tool_call_id, session_key);
+        info!(
+            node = %node_id,
+            task_id = %task_id,
+            parent_tool_call_id = %parent_tool_call_id,
+            "registered pipeline node child task"
+        );
+        Some(task_id)
+    }
+
+    /// Reserve sub-budget for a single LLM-call node. Returns:
+    /// * `Ok(None)` when no accountant is configured OR the handler
+    ///   kind does not participate in reservation.
+    /// * `Ok(Some(handle))` on a successful per-node reservation. The
+    ///   handle is held for the duration of the node's dispatch; on
+    ///   failure we drop it (auto-refund), on success we also drop it
+    ///   since the pipeline-level handle records the cumulative spend.
+    /// * `Err` when the accountant exists but the reservation is
+    ///   rejected — the caller should treat this as a terminal error.
+    async fn reserve_node_budget(
+        &self,
+        graph_id: &str,
+        node: &PipelineNode,
+    ) -> Result<Option<ReservationHandle>> {
+        let Some(accountant) = self.config.workspace_context.cost_accountant.as_ref() else {
+            return Ok(None);
+        };
+        if !handler_kind_reserves(&node.handler) {
+            return Ok(None);
+        }
+        let contract_id = self.pipeline_contract_id(graph_id);
+        let projected_usd = project_node_usd(node.model.as_deref());
+        let handle = accountant
+            .reserve(&contract_id, projected_usd)
+            .await
+            .map_err(|breach| {
+                eyre::eyre!("cost budget breach reserving node '{}': {breach}", node.id)
+            })?;
+        info!(
+            contract_id = %contract_id,
+            node = %node.id,
+            projected_usd,
+            "per-node cost reservation opened"
+        );
+        Ok(Some(handle))
+    }
+
+    /// Build a fresh [`CodergenHandler`] with the installed
+    /// [`PipelineContext`] applied. Used by acceptance tests to
+    /// confirm the per-handler wiring (compaction policy + workspace).
+    #[doc(hidden)]
+    pub fn build_codergen_for_test(&self) -> CodergenHandler {
+        self.build_codergen()
+    }
+
+    fn build_codergen(&self) -> CodergenHandler {
         let mut codergen = CodergenHandler::new(
             self.config.default_provider.clone(),
             self.config.memory.clone(),
@@ -752,11 +1271,38 @@ impl PipelineExecutor {
             self.config.shutdown.clone(),
         )
         .with_provider_policy(self.config.provider_policy.clone())
-        .with_plugin_dirs(self.config.plugin_dirs.clone());
+        .with_plugin_dirs(self.config.plugin_dirs.clone())
+        // M8 parity (W1.A1): propagate the host context so per-node
+        // Agents inherit the parent session's FileStateCache /
+        // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
+        // keeps pre-M8 behaviour bitwise identical.
+        .with_host_context(self.config.host_context.clone());
 
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
         }
+
+        let ws_ctx = &self.config.workspace_context;
+        if let Some(policy) = ws_ctx.policy.as_ref() {
+            codergen = codergen.with_compaction_policy(policy.compaction.clone());
+            codergen = codergen.with_compaction_workspace(Some(policy.clone()));
+        }
+        if let Some(provider) = ws_ctx.agent_llm_provider.as_ref() {
+            codergen = codergen.with_compaction_llm_provider(Some(provider.clone()));
+        }
+
+        codergen
+    }
+
+    fn build_handlers(&self) -> HandlerRegistry {
+        let mut registry = HandlerRegistry::new();
+
+        // coding-blue FA-7: `build_codergen` reads the installed
+        // PipelineContext and propagates compaction policy + workspace
+        // onto every LLM-call node. When the context is empty (legacy
+        // path) the setters are no-ops — behaviour is byte-for-byte
+        // identical to pre-FA-7.
+        let codergen = self.build_codergen();
 
         registry.register(HandlerKind::Codergen, Arc::new(codergen));
         registry.register(
@@ -784,8 +1330,20 @@ impl PipelineExecutor {
         let mut completed: HashMap<String, NodeOutcome> = HashMap::new();
         let mut summaries = Vec::new();
         let mut total_tokens = TokenUsage::default();
+        // M8 parity (W1.A4): per-node cost attribution accumulated as
+        // each LLM-call node finishes. Surfaced in `PipelineResult`.
+        let mut node_costs: Vec<NodeCost> = Vec::new();
+        // M8 parity (W1.A3): per-node task supervisor registrations.
+        // Threaded so we can mark each node Completed/Failed at end.
+        let mut node_task_ids: HashMap<String, String> = HashMap::new();
         // Nodes already executed by a parallel fan-out (skip in normal traversal)
         let mut parallel_executed: HashSet<String> = HashSet::new();
+        // Guard B: cumulative fan-out worker counter. Incremented exactly
+        // once per dispatched worker across both `Parallel` and
+        // `DynamicParallel` branches. Once the counter equals
+        // [`MAX_PIPELINE_FANOUT_TOTAL`] the executor refuses any further
+        // fan-out and fails the pipeline with `PipelineError::FanoutExceeded`.
+        let mut fanout_workers_dispatched: usize = 0;
         // Nodes to skip because they (and everything before them) are
         // recorded in a persisted checkpoint. Synthesized outcomes for these
         // nodes propagate through the graph so downstream handlers still run.
@@ -827,6 +1385,7 @@ impl PipelineExecutor {
                             token_usage: total_tokens,
                             node_summaries: summaries,
                             files_modified: vec![],
+                            node_costs: node_costs.clone(),
                         });
                     }
                 }
@@ -869,6 +1428,7 @@ impl PipelineExecutor {
                             token_usage: total_tokens,
                             node_summaries: summaries,
                             files_modified: vec![],
+                            node_costs: node_costs.clone(),
                         });
                     }
                 }
@@ -923,6 +1483,29 @@ impl PipelineExecutor {
                     targets.len()
                 );
 
+                // Guard B: refuse the fan-out if dispatching every
+                // target would push the pipeline past the cumulative
+                // cap. Failing before any dispatch keeps recovery clean
+                // (no half-spawned batch).
+                let fanout_cap = self
+                    .config
+                    .max_pipeline_fanout_total
+                    .unwrap_or(MAX_PIPELINE_FANOUT_TOTAL);
+                if fanout_workers_dispatched.saturating_add(targets.len()) > fanout_cap {
+                    let err = PipelineError::FanoutExceeded {
+                        count: fanout_workers_dispatched,
+                        cap: fanout_cap,
+                    };
+                    warn!(
+                        node = %node.id,
+                        count = fanout_workers_dispatched,
+                        cap = fanout_cap,
+                        targets = targets.len(),
+                        "pipeline fan-out cap exceeded; refusing parallel dispatch"
+                    );
+                    return Err(eyre::eyre!(err));
+                }
+
                 let fan_start = Instant::now();
 
                 // Prepare and execute all targets concurrently, capped by semaphore
@@ -932,6 +1515,12 @@ impl PipelineExecutor {
                     self.config.max_parallel_workers,
                 ));
                 let mut futures = Vec::new();
+                // coding-blue FA-7: collect per-target reservations so
+                // they drop together when the fan-out finishes. A
+                // rejected reservation aborts the whole fan-out before
+                // any worker dispatches, which keeps the concurrent
+                // branches from racing past the budget.
+                let mut fanout_reservations: Vec<ReservationHandle> = Vec::new();
                 for target_id in &targets {
                     let target_node = graph
                         .nodes
@@ -955,6 +1544,17 @@ impl PipelineExecutor {
                     }
                     if target_with_prompt.model.is_none() {
                         target_with_prompt.model = graph.default_model.clone();
+                    }
+
+                    // Reserve budget for each LLM-call branch before
+                    // dispatching. If any branch's reservation fails,
+                    // bail — but first drop the handles collected so
+                    // far so they auto-refund.
+                    if let Some(handle) = self
+                        .reserve_node_budget(&graph.id, &target_with_prompt)
+                        .await?
+                    {
+                        fanout_reservations.push(handle);
                     }
 
                     let ctx = HandlerContext {
@@ -991,9 +1591,20 @@ impl PipelineExecutor {
                         ));
                         (tid, target_with_prompt, start.elapsed(), result)
                     });
+                    // Guard B: count the worker as dispatched (the
+                    // future is queued — `join_all` below awaits its
+                    // completion) so subsequent fan-outs see the
+                    // updated tally before they ask for headroom.
+                    fanout_workers_dispatched = fanout_workers_dispatched.saturating_add(1);
                 }
 
                 let results = futures::future::join_all(futures).await;
+
+                // Drop all per-branch reservations — the pipeline-level
+                // handle commits with the cumulative attribution, so
+                // per-branch handles only gated the dispatch-time
+                // budget projection.
+                drop(fanout_reservations);
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
                     process_worker_results(
@@ -1247,6 +1858,30 @@ impl PipelineExecutor {
                     synthetic_nodes.len()
                 );
 
+                // Guard B: refuse before dispatching any synthetic
+                // worker if the pipeline-lifetime fan-out cap would be
+                // exceeded. Mirrors the static Parallel gate so the
+                // 65,535-child river runaway cannot survive even a
+                // re-firing dynamic_parallel node.
+                let fanout_cap = self
+                    .config
+                    .max_pipeline_fanout_total
+                    .unwrap_or(MAX_PIPELINE_FANOUT_TOTAL);
+                if fanout_workers_dispatched.saturating_add(synthetic_nodes.len()) > fanout_cap {
+                    let err = PipelineError::FanoutExceeded {
+                        count: fanout_workers_dispatched,
+                        cap: fanout_cap,
+                    };
+                    warn!(
+                        node = %node.id,
+                        count = fanout_workers_dispatched,
+                        cap = fanout_cap,
+                        targets = synthetic_nodes.len(),
+                        "pipeline fan-out cap exceeded; refusing dynamic_parallel dispatch"
+                    );
+                    return Err(eyre::eyre!(err));
+                }
+
                 // Get the codergen handler for executing synthetic nodes
                 let codergen_handler = handlers.get(&HandlerKind::Codergen).ok_or_else(|| {
                     eyre::eyre!("codergen handler not found for dynamic_parallel workers")
@@ -1256,6 +1891,10 @@ impl PipelineExecutor {
                 let total_workers = synthetic_nodes.len();
                 let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let mut futures = Vec::new();
+                // coding-blue FA-7: same fan-out reservation pattern as
+                // the static Parallel branch — reserve per-worker up
+                // front, release en bloc when the fan-out completes.
+                let mut dp_reservations: Vec<ReservationHandle> = Vec::new();
                 for (task_id, mut synth_node) in synthetic_nodes {
                     // Apply variable substitution to synthetic prompt
                     if let Some(prompt) = synth_node.prompt.take() {
@@ -1266,6 +1905,10 @@ impl PipelineExecutor {
                             resolved = resolved.replace(&placeholder, value);
                         }
                         synth_node.prompt = Some(resolved.trim_end().to_string());
+                    }
+
+                    if let Some(handle) = self.reserve_node_budget(&graph.id, &synth_node).await? {
+                        dp_reservations.push(handle);
                     }
 
                     let ctx = HandlerContext {
@@ -1292,9 +1935,13 @@ impl PipelineExecutor {
                         ));
                         (task_id, synth_node, start.elapsed(), result)
                     });
+                    // Guard B: count this worker as dispatched (the
+                    // future is queued — `join_all` below awaits it).
+                    fanout_workers_dispatched = fanout_workers_dispatched.saturating_add(1);
                 }
 
                 let results = futures::future::join_all(futures).await;
+                drop(dp_reservations);
 
                 let (merged_content, any_error, worker_summaries, worker_tokens, outcomes) =
                     process_worker_results(
@@ -1437,12 +2084,42 @@ impl PipelineExecutor {
 
             let node_start = Instant::now();
 
+            // M8 parity (W1.A3): register a child task in the parent
+            // session's TaskSupervisor so the admin dashboard sees the
+            // pipeline's substructure under the run_pipeline parent
+            // tool_call_id. The supervisor's progress reporter (set by
+            // the session actor) bridges every state transition onto
+            // the SSE stream so the chat UI's NodeCard can render the
+            // node tree live.
+            let node_task_id = self.register_node_task(&node.id);
+            if let Some(ref id) = node_task_id {
+                node_task_ids.insert(node.id.clone(), id.clone());
+                if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                    supervisor.mark_running(id);
+                }
+            }
+
+            // coding-blue FA-7: reserve per-node budget before dispatch
+            // on LLM-call nodes. A rejected reservation aborts the
+            // pipeline before the sub-agent is built; on dispatch
+            // failure the handle drops (Drop auto-refunds). Conditional
+            // branches that never reach this line never reserve, which
+            // is the design invariant for "unreached branches don't
+            // count against the pipeline budget".
+            let node_reservation = self
+                .reserve_node_budget(&graph.id, &node_with_prompt)
+                .await?;
+            let node_reserved_usd = node_reservation
+                .as_ref()
+                .map(|h| h.reserved_amount_usd())
+                .unwrap_or(0.0);
+
             // Execute with retries — and enforce the node's deadline when set.
             let dispatch = self
                 .dispatch_node(handler, &node_with_prompt, &ctx, node.max_retries)
                 .await;
 
-            let outcome = match dispatch? {
+            let mut outcome = match dispatch? {
                 DispatchOutcome::Completed(outcome) => outcome,
                 DispatchOutcome::Skipped { label } => {
                     let duration_ms = node_start.elapsed().as_millis() as u64;
@@ -1485,11 +2162,59 @@ impl PipelineExecutor {
                                 token_usage: total_tokens,
                                 node_summaries: summaries,
                                 files_modified: all_files,
+                                node_costs: node_costs.clone(),
                             });
                         }
                     }
                 }
             };
+
+            // M8 parity (W1.A2): on a retryable first-attempt failure,
+            // engage the M8.9 recovery loop to re-attempt ONCE with a
+            // synthesised recovery prompt. Mirrors the spawn_only
+            // recovery flow already wired in session_actor. Skipped /
+            // Pass outcomes short-circuit; the second failure is
+            // terminal.
+            let recovery_input = serde_json::json!({
+                "node": node.id,
+                "input": ctx.input,
+            });
+            let recovery_decision =
+                crate::recovery::classify_outcome(&node_with_prompt, &outcome, &recovery_input);
+            if let crate::recovery::RecoveryDecision::Retryable(signal) = recovery_decision {
+                if let Some(handler) = handlers.get(&node.handler) {
+                    match crate::recovery::recover_node(
+                        handler,
+                        &node_with_prompt,
+                        &ctx,
+                        &signal,
+                        &self.config.shutdown,
+                    )
+                    .await
+                    {
+                        Ok(r) if r.retried => {
+                            tracing::info!(
+                                node = %node.id,
+                                first_status = "fail/error",
+                                retry_status = ?r.outcome.status,
+                                "M8.9 pipeline recovery completed retry"
+                            );
+                            outcome = r.outcome;
+                        }
+                        Ok(_) => {
+                            // Recovery skipped (shutdown raised); keep
+                            // the original failure outcome.
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                node = %node.id,
+                                error = %error,
+                                "M8.9 pipeline recovery dispatch errored"
+                            );
+                        }
+                    }
+                }
+            }
 
             let duration_ms = node_start.elapsed().as_millis() as u64;
 
@@ -1508,6 +2233,81 @@ impl PipelineExecutor {
                 output_chars = outcome.content.len(),
                 "node completed"
             );
+
+            // coding-blue FA-7: per-node validators. When the pipeline
+            // context has a `validators_by_node` override for this
+            // node, run it now against the working directory. A
+            // required-validator failure demotes the node outcome to
+            // `Error`, which both records a fail summary and triggers
+            // the existing Error-handling branch below (pipeline stops,
+            // returns success=false).
+            if outcome.status == OutcomeStatus::Pass {
+                if let Err(reason) = self.run_node_validators(&node.id).await {
+                    warn!(
+                        node = %node.id,
+                        reason = %reason,
+                        "per-node validator rejected outcome"
+                    );
+                    outcome.status = OutcomeStatus::Error;
+                    outcome.content =
+                        format!("Pipeline node validator rejected '{}': {reason}", node.id);
+                }
+            }
+
+            // M8 parity (W1.A4): drop the per-node reservation handle
+            // (auto-refund) and capture a NodeCost row from the actual
+            // post-dispatch token usage. The pipeline-level handle
+            // already records the cumulative attribution at the run's
+            // terminal so per-node ledger writes would double-count;
+            // the NodeCost row stays in-memory for the UI panel and
+            // the SSE done payload. `committed = true` indicates an
+            // accountant was bound; the actual ledger commit lives at
+            // pipeline scope.
+            let node_cost_committed = node_reservation.is_some();
+            drop(node_reservation);
+
+            let actual_usd = octos_agent::cost_ledger::project_cost_usd(
+                node_with_prompt.model.as_deref().unwrap_or("pipeline-node"),
+                outcome.token_usage.input_tokens,
+                outcome.token_usage.output_tokens,
+            )
+            .unwrap_or(node_reserved_usd);
+            node_costs.push(NodeCost {
+                node_id: node.id.clone(),
+                model: node_with_prompt.model.clone(),
+                reserved_usd: node_reserved_usd,
+                actual_usd,
+                tokens_in: outcome.token_usage.input_tokens,
+                tokens_out: outcome.token_usage.output_tokens,
+                committed: node_cost_committed,
+            });
+
+            // M8 parity (W1.A3): mark the registered child task
+            // terminal so the supervisor's progress reporter pushes a
+            // final state transition onto the SSE stream.
+            if let Some(task_id) = node_task_ids.get(&node.id).cloned() {
+                if let Some(ref supervisor) = self.config.host_context.task_supervisor {
+                    match outcome.status {
+                        OutcomeStatus::Pass => {
+                            let files: Vec<String> = outcome
+                                .files_modified
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect();
+                            supervisor.mark_completed(&task_id, files);
+                        }
+                        OutcomeStatus::Fail | OutcomeStatus::Error => {
+                            supervisor.mark_failed(&task_id, format!("node {} failed", node.id));
+                        }
+                        OutcomeStatus::Skipped => {
+                            // Treat as completed-with-no-output so the
+                            // supervisor doesn't keep the task as
+                            // running for the rest of the pipeline.
+                            supervisor.mark_completed(&task_id, Vec::new());
+                        }
+                    }
+                }
+            }
 
             // Record tokens and feed to status bridge
             total_tokens.input_tokens += outcome.token_usage.input_tokens;
@@ -1580,6 +2380,7 @@ impl PipelineExecutor {
                     token_usage: total_tokens,
                     node_summaries: summaries,
                     files_modified: all_files,
+                    node_costs: node_costs.clone(),
                 });
             }
 
@@ -1595,6 +2396,7 @@ impl PipelineExecutor {
                     token_usage: total_tokens,
                     node_summaries: summaries,
                     files_modified: vec![],
+                    node_costs: node_costs.clone(),
                 });
             }
 
@@ -1628,6 +2430,7 @@ impl PipelineExecutor {
                         token_usage: total_tokens,
                         node_summaries: summaries,
                         files_modified: all_files,
+                        node_costs: node_costs.clone(),
                     });
                 }
             }
@@ -1937,8 +2740,11 @@ mod tests {
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
             checkpoint_store: None,
             hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
         }
     }
 
@@ -2063,5 +2869,100 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().all(|t| t.label.is_some()));
         assert!(tasks[0].task.contains("test query"));
+    }
+
+    /// Build a fresh ExecutorConfig identical to `make_test_config` but
+    /// with a per-test cumulative fan-out cap so Guard B fires on a
+    /// small synthetic graph instead of waiting for 500 dispatches.
+    async fn make_capped_config(cap: usize) -> ExecutorConfig {
+        ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: Some(cap),
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+        }
+    }
+
+    /// Guard B regression: a `dynamic_parallel` node whose worker count
+    /// exceeds the cumulative fan-out cap must fail the pipeline with
+    /// `PipelineError::FanoutExceeded` before any worker dispatches.
+    /// The test forces the planner to fall back to the 3-task fallback
+    /// (the `MockProvider` returns plain "done" which fails JSON
+    /// extraction) and sets the cap to 2 so the fan-out trips.
+    #[tokio::test]
+    async fn dynamic_parallel_fails_after_cumulative_cap() {
+        let config = make_capped_config(2).await;
+        let executor = PipelineExecutor::new(config);
+
+        // Minimal dynamic_parallel graph. The planner is the
+        // MockProvider, which returns content "done" — that fails JSON
+        // extraction and routes through the 3-task fallback. With
+        // cap=2 the fan-out gate refuses before any worker dispatches.
+        let dot = r#"
+            digraph t {
+                plan [handler="dynamic_parallel", converge="merge", prompt="plan"]
+                merge [handler="noop"]
+                plan -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "drive a runaway plan", &serde_json::Map::new())
+            .await;
+
+        let Err(error) = result else {
+            panic!("expected pipeline to fail at the fan-out cap; got {result:?}");
+        };
+        // The structured `PipelineError::FanoutExceeded` is wrapped in
+        // an `eyre::Report` — downcast to assert the typed reason.
+        let typed = error
+            .downcast_ref::<PipelineError>()
+            .expect("expected PipelineError variant in failure chain");
+        match typed {
+            PipelineError::FanoutExceeded { count, cap } => {
+                assert_eq!(*cap, 2, "cap should match the per-test override");
+                assert_eq!(*count, 0, "no workers should dispatch before the cap fires");
+            }
+        }
+    }
+
+    /// Guard B sanity check: when the fan-out is below the cap the
+    /// pipeline executes normally. Static `Parallel` graph with two
+    /// noop targets and cap=4 — well within budget.
+    #[tokio::test]
+    async fn parallel_under_cap_runs_to_completion() {
+        let config = make_capped_config(4).await;
+        let executor = PipelineExecutor::new(config);
+
+        let dot = r#"
+            digraph t {
+                fan [handler="parallel", converge="merge"]
+                a [handler="noop"]
+                b [handler="noop"]
+                merge [handler="noop"]
+                fan -> a
+                fan -> b
+                a -> merge
+                b -> merge
+            }
+        "#;
+
+        let result = executor
+            .run(dot, "happy path", &serde_json::Map::new())
+            .await;
+        assert!(
+            result.is_ok(),
+            "fan-out below cap should complete: {result:?}"
+        );
     }
 }

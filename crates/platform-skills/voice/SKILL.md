@@ -1,7 +1,7 @@
 ---
 name: voice
 description: OminiX ASR (speech-to-text), preset-voice TTS with emotion/speed control, and model management via Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm. Triggers: voice, transcribe audio, text to speech, speak this, read aloud, model management, download model, 语音识别, 语音合成, 模型管理.
-version: 1.1.0
+version: 1.1.1
 author: octos
 always: true
 ---
@@ -17,7 +17,9 @@ On-device speech-to-text, preset-voice text-to-speech with emotion control, and 
 The skill auto-discovers the ominix-api server URL via (in priority order):
 1. `OMINIX_API_URL` environment variable
 2. Discovery file `~/.ominix/api_url` (written by ominix-api on startup)
-3. Default: `http://localhost:9090`
+3. Probes candidate ports — `http://localhost:9090`, `http://localhost:8080`,
+   `http://localhost:8081` — and uses the first one answering `/health` within
+   500 ms. Only falls back to macOS Say when every probe fails.
 
 ## Checking Available Models
 
