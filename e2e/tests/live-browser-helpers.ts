@@ -40,7 +40,14 @@ export async function login(page: Page) {
     .catch(() => false);
   if (chatVisible) return;
 
-  const authTokenTab = page.locator('button', { hasText: 'Auth Token' });
+  // Dashboard renders the admin-token escape hatch as a small text button
+  // (LoginPage.tsx) tagged `data-testid="admin-token-tab"`. Fall back to
+  // the visible label for older builds that pre-date the testid.
+  const authTokenTab = page
+    .locator(
+      "[data-testid='admin-token-tab'], button:has-text('Login with admin token'), button:has-text('Auth Token')",
+    )
+    .first();
   if (await authTokenTab.isVisible().catch(() => false)) {
     await authTokenTab.click();
     await page.locator(SEL.loginTokenInput).fill(AUTH_TOKEN);
