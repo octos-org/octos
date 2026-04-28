@@ -576,6 +576,54 @@ fn build_task_status_event(task: serde_json::Value, topic: Option<&str>) -> serd
     })
 }
 
+/// M8.10 PR #2: insert `thread_id` into a JSON object payload (in place).
+/// No-op when `thread_id` is `None` or the value is not an object.
+fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
+    if let (Some(tid), Some(obj)) = (thread_id, value.as_object_mut()) {
+        obj.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(tid.to_string()),
+        );
+    }
+}
+
+/// Read the `thread_id` (if any) from outbound metadata. Empty strings are
+/// treated as absent.
+fn outbound_thread_id(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Sentinel that delimits the chat_id and the thread_id inside the synthetic
+/// message_id returned by `ApiChannel::send_with_id`. ASCII unit separator
+/// (0x1F) was chosen because it cannot appear inside JSON string content
+/// without explicit escaping, so it cannot collide with a legitimate
+/// thread_id payload.
+const SSE_THREAD_DELIM: char = '\u{1F}';
+
+/// Encode a synthetic SSE message_id that round-trips both the chat_id and
+/// the bound thread_id. Decoded back in `edit_message` to tag streaming
+/// `token`/`replace` events with the right thread.
+fn encode_sse_message_id(chat_id: &str, thread_id: Option<&str>) -> String {
+    match thread_id {
+        Some(tid) if !tid.is_empty() => format!("sse-{chat_id}{SSE_THREAD_DELIM}{tid}"),
+        _ => format!("sse-{chat_id}"),
+    }
+}
+
+/// Decode an `(chat_id, thread_id)` pair from a synthetic SSE message_id.
+/// Returns the bare chat_id and `None` when the legacy single-segment
+/// encoding is used.
+fn decode_sse_message_id(message_id: &str) -> (&str, Option<&str>) {
+    match message_id.split_once(SSE_THREAD_DELIM) {
+        Some((bare, tid)) => (bare, Some(tid).filter(|s| !s.is_empty())),
+        None => (message_id, None),
+    }
+}
+
 fn compatibility_tool_name_for_task(task: &serde_json::Value) -> Option<&'static str> {
     match task.get("tool_name").and_then(|value| value.as_str()) {
         Some("Direct TTS") => Some("fm_tts"),
@@ -717,6 +765,12 @@ impl Channel for ApiChannel {
         let session_result = msg.metadata.get("_session_result").cloned();
 
         let topic = msg.metadata.get("topic").and_then(|v| v.as_str());
+        // M8.10 PR #2: every SSE event the channel emits below is tagged
+        // with this thread_id (the user message's client_message_id) when
+        // present. Speculative-overflow + forced-background paths set this
+        // to the overflow user's cmid so two concurrent threads on the same
+        // chat_id can be demultiplexed by web clients.
+        let thread_id = outbound_thread_id(&msg.metadata);
 
         if !msg.media.is_empty() {
             if !history_already_persisted
@@ -831,7 +885,7 @@ impl Channel for ApiChannel {
                         .get("tool_call_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let event = serde_json::json!({
+                    let mut event = serde_json::json!({
                         "type": "file",
                         "path": response_path_for_session_file(&data_dir, Path::new(persisted_path))
                             .unwrap_or_else(|| persisted_path.clone()),
@@ -839,6 +893,7 @@ impl Channel for ApiChannel {
                         "caption": msg.content,
                         "tool_call_id": tool_call_id,
                     });
+                    inject_thread_id(&mut event, thread_id.as_deref());
                     let _ = tx.send(event.to_string());
                 }
             }
@@ -847,10 +902,11 @@ impl Channel for ApiChannel {
 
         // Task status change — push raw JSON through SSE
         if let Some(task_json) = msg.metadata.get("_task_status").and_then(|v| v.as_str()) {
-            let event = build_task_status_event(
+            let mut event = build_task_status_event(
                 serde_json::from_str::<serde_json::Value>(task_json).unwrap_or_default(),
                 topic,
             );
+            inject_thread_id(&mut event, thread_id.as_deref());
             self.broadcast_session_event(&msg.chat_id, topic, event)
                 .await;
             return Ok(());
@@ -912,7 +968,8 @@ impl Channel for ApiChannel {
                             &msg.chat_id,
                             topic,
                         );
-                        for event in build_bg_task_tool_start_events(&tasks) {
+                        for mut event in build_bg_task_tool_start_events(&tasks) {
+                            inject_thread_id(&mut event, thread_id.as_deref());
                             let _ = tx.send(event.to_string());
                         }
                     }
@@ -946,16 +1003,18 @@ impl Channel for ApiChannel {
                         done["node_costs"] = node_costs;
                     }
                 }
+                inject_thread_id(&mut done, thread_id.as_deref());
                 let _ = tx.send(done.to_string());
                 pending.remove(&msg.chat_id);
                 drop(pending);
                 self.last_content.lock().await.remove(&msg.chat_id);
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "type": "replace",
                     "text": msg.content,
                 });
+                inject_thread_id(&mut event, thread_id.as_deref());
                 if tx.send(event.to_string()).is_err() {
                     pending.remove(&msg.chat_id);
                 }
@@ -970,18 +1029,27 @@ impl Channel for ApiChannel {
         self.send(msg).await?;
         // Return a dummy ID so the stream forwarder uses edit_message() for
         // subsequent updates instead of calling send_with_id() again.
-        Ok(Some(format!("sse-{}", msg.chat_id)))
+        //
+        // M8.10 PR #2: encode the bound thread_id into the message_id so
+        // subsequent `edit_message` calls can tag streaming `token`/`replace`
+        // events with the correct thread (two concurrent threads on the
+        // same chat_id is the speculative-overflow case).
+        let thread_id = outbound_thread_id(&msg.metadata);
+        Ok(Some(encode_sse_message_id(
+            &msg.chat_id,
+            thread_id.as_deref(),
+        )))
     }
 
-    async fn edit_message(
-        &self,
-        chat_id: &str,
-        _message_id: &str,
-        new_content: &str,
-    ) -> Result<()> {
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
         if new_content.is_empty() {
             return Ok(());
         }
+        // M8.10 PR #2: recover the thread_id encoded into `send_with_id`'s
+        // synthetic message_id so streaming `token`/`replace` events can be
+        // demultiplexed by web clients running multiple in-flight threads
+        // against the same chat_id.
+        let (_, thread_id) = decode_sse_message_id(message_id);
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
             let mut last = self.last_content.lock().await;
@@ -992,19 +1060,21 @@ impl Channel for ApiChannel {
             if !prev.is_empty() && new_content.starts_with(prev) {
                 let delta = &new_content[prev.len()..];
                 if !delta.is_empty() {
-                    let event = serde_json::json!({
+                    let mut event = serde_json::json!({
                         "type": "token",
                         "text": delta,
                     });
+                    inject_thread_id(&mut event, thread_id);
                     let _ = tx.send(event.to_string());
                 }
             } else {
                 // Content changed non-incrementally (tool progress replaced, etc.)
                 // Send full replacement.
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "type": "replace",
                     "text": new_content,
                 });
+                inject_thread_id(&mut event, thread_id);
                 let _ = tx.send(event.to_string());
             }
             last.insert(chat_id.to_string(), new_content.to_string());
@@ -2297,6 +2367,45 @@ mod tests {
     use tower::util::ServiceExt;
 
     const TEST_PROFILE_ID: &str = "dspfac";
+
+    /// M8.10 PR #2: the synthetic SSE message_id round-trips through
+    /// encode → decode without losing the bound thread_id. This is the
+    /// thread that lets `edit_message` recover the cmid for its
+    /// streaming `token`/`replace` payloads.
+    #[test]
+    fn sse_message_id_roundtrips_chat_id_and_thread_id() {
+        let encoded = encode_sse_message_id("chat-A", Some("cmid-T-1"));
+        let (chat, tid) = decode_sse_message_id(&encoded);
+        assert_eq!(chat, "sse-chat-A");
+        assert_eq!(tid, Some("cmid-T-1"));
+    }
+
+    #[test]
+    fn sse_message_id_omits_thread_id_when_unbound() {
+        let encoded = encode_sse_message_id("chat-A", None);
+        assert_eq!(encoded, "sse-chat-A");
+        let (chat, tid) = decode_sse_message_id(&encoded);
+        assert_eq!(chat, "sse-chat-A");
+        assert_eq!(tid, None);
+    }
+
+    #[test]
+    fn outbound_thread_id_extracts_string_from_metadata() {
+        let m = serde_json::json!({"thread_id": "cmid-T"});
+        assert_eq!(outbound_thread_id(&m).as_deref(), Some("cmid-T"));
+    }
+
+    #[test]
+    fn outbound_thread_id_treats_empty_string_as_absent() {
+        let m = serde_json::json!({"thread_id": ""});
+        assert!(outbound_thread_id(&m).is_none());
+    }
+
+    #[test]
+    fn outbound_thread_id_returns_none_when_absent() {
+        let m = serde_json::json!({});
+        assert!(outbound_thread_id(&m).is_none());
+    }
 
     fn test_sessions_in(data_dir: &Path) -> Arc<Mutex<SessionManager>> {
         Arc::new(Mutex::new(SessionManager::open(data_dir).unwrap()))
@@ -4106,6 +4215,173 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(parsed["type"], "done");
         assert_eq!(parsed["committed_seq"], 42);
+    }
+
+    /// M8.10 PR #2: every SSE event the API channel emits MUST include
+    /// `thread_id` (sourced from `OutboundMessage.metadata.thread_id`) so
+    /// web clients with multiple in-flight threads on the same chat_id
+    /// can route streamed events to the right per-thread bubble.
+    #[tokio::test]
+    async fn done_event_includes_thread_id_from_metadata() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-tid".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-tid".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "committed_seq": 11,
+                "thread_id": "cmid-thread-Z",
+                "tokens_in": 0,
+                "tokens_out": 0,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert_eq!(parsed["committed_seq"], 11);
+        assert_eq!(parsed["thread_id"], "cmid-thread-Z");
+    }
+
+    /// M8.10 PR #2: the wire-side `replace` event emitted by `send`
+    /// (non-streaming assistant content) must carry thread_id.
+    #[tokio::test]
+    async fn replace_event_includes_thread_id_from_metadata() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-replace".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-replace".into(),
+            content: "hello world".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "thread_id": "cmid-thread-R",
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "replace");
+        assert_eq!(parsed["text"], "hello world");
+        assert_eq!(parsed["thread_id"], "cmid-thread-R");
+    }
+
+    /// M8.10 PR #2: streaming `token` and `replace` events emitted via
+    /// `edit_message` must carry thread_id encoded into the synthetic
+    /// message_id returned by `send_with_id`. This is the key handshake
+    /// that lets two concurrent threads on the same chat_id be
+    /// demultiplexed by web clients.
+    #[tokio::test]
+    async fn edit_message_token_event_includes_thread_id_decoded_from_message_id() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-edit".into(), tx);
+        }
+
+        // Step 1: send_with_id encodes thread_id into the message_id
+        let initial = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-edit".into(),
+            content: "Hi".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "thread_id": "cmid-thread-EDIT",
+            }),
+        };
+        let message_id = ch.send_with_id(&initial).await.unwrap().unwrap();
+        // Drain the initial replace event from send().
+        let _ = rx.recv().await.unwrap();
+
+        // Step 2: edit_message decodes thread_id back from message_id and
+        // tags the streaming `token`/`replace` payload with it.
+        ch.edit_message("chat-edit", &message_id, "Hi there")
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        // The delta comparison sees prev="Hi" and new starts with "Hi", so
+        // it emits a `token` for the suffix.
+        assert_eq!(parsed["type"], "token");
+        assert_eq!(parsed["text"], " there");
+        assert_eq!(parsed["thread_id"], "cmid-thread-EDIT");
+    }
+
+    /// Pre-cmid clients send messages with no thread_id metadata. The wire
+    /// schema must remain backwards-compatible: events emitted in this
+    /// case must NOT include a `thread_id` field at all.
+    #[tokio::test]
+    async fn done_event_omits_thread_id_when_metadata_absent() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-chat-no-tid".into(), tx);
+        }
+
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-chat-no-tid".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "done");
+        assert!(
+            parsed.get("thread_id").is_none(),
+            "thread_id field must be absent when metadata didn't carry one"
+        );
     }
 
     #[tokio::test]
