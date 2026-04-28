@@ -135,6 +135,7 @@ export default function LoginPage() {
               </label>
               <input
                 id="admin-token"
+                data-testid="token-input"
                 type="password"
                 value={adminToken}
                 onChange={(e) => setAdminToken(e.target.value)}
@@ -149,6 +150,7 @@ export default function LoginPage() {
               )}
               <button
                 type="submit"
+                data-testid="login-button"
                 disabled={loading || !adminToken.trim()}
                 className="w-full px-4 py-2.5 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent-light transition disabled:opacity-50 mb-3"
               >
@@ -253,6 +255,7 @@ export default function LoginPage() {
           <div className="text-center mt-4">
             <button
               type="button"
+              data-testid="admin-token-tab"
               onClick={() => { setStep('token'); setError('') }}
               className="text-xs text-gray-600 hover:text-gray-400 transition"
             >

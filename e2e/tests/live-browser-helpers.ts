@@ -11,8 +11,13 @@ export const SEL = {
   userMessage: "[data-testid='user-message']",
   assistantMessage: "[data-testid='assistant-message']",
   newChatButton: "[data-testid='new-chat-button']",
-  loginTokenInput: "[data-testid='token-input']",
-  loginButton: "[data-testid='login-button']",
+  // Prefer testids; fall back to type-based selectors so this helper
+  // works against both new builds (with testids from PR #625) and the
+  // already-deployed fleet (which still uses pre-testid bundles).
+  loginTokenInput:
+    "[data-testid='token-input'], #admin-token, input[type='password']",
+  loginButton:
+    "[data-testid='login-button'], button[type='submit']:has-text('Login'), button[type='submit']:has-text('Verifying')",
 } as const;
 
 export async function login(page: Page) {
@@ -40,7 +45,14 @@ export async function login(page: Page) {
     .catch(() => false);
   if (chatVisible) return;
 
-  const authTokenTab = page.locator('button', { hasText: 'Auth Token' });
+  // Dashboard renders the admin-token escape hatch as a small text button
+  // (LoginPage.tsx) tagged `data-testid="admin-token-tab"`. Fall back to
+  // the visible label for older builds that pre-date the testid.
+  const authTokenTab = page
+    .locator(
+      "[data-testid='admin-token-tab'], button:has-text('Login with admin token'), button:has-text('Auth Token')",
+    )
+    .first();
   if (await authTokenTab.isVisible().catch(() => false)) {
     await authTokenTab.click();
     await page.locator(SEL.loginTokenInput).fill(AUTH_TOKEN);

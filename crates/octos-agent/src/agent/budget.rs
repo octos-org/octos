@@ -138,10 +138,20 @@ mod tests {
         let cfg = AgentConfig::default();
         assert_eq!(cfg.max_iterations, 50);
         assert_eq!(cfg.max_tokens, None);
-        assert_eq!(cfg.max_timeout, Some(Duration::from_secs(600)));
+        assert_eq!(cfg.max_timeout, Some(Duration::from_secs(1800)));
         assert!(cfg.save_episodes);
-        assert_eq!(cfg.tool_timeout_secs, 600);
+        assert_eq!(cfg.tool_timeout_secs, 1800);
         assert!(cfg.worker_prompt.is_none());
+    }
+
+    #[test]
+    fn default_tool_timeout_matches_max_so_long_running_tools_have_room() {
+        // Long-running tools like run_pipeline can legitimately take up to MAX_TOOL_TIMEOUT_SECS.
+        // If DEFAULT < MAX, the LLM must remember to pass `timeout_secs` to use the headroom,
+        // and forgetting silently caps the call. Keep them equal so the default is the ceiling.
+        use super::super::{DEFAULT_TOOL_TIMEOUT_SECS, MAX_TOOL_TIMEOUT_SECS};
+        assert_eq!(DEFAULT_TOOL_TIMEOUT_SECS, MAX_TOOL_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_TOOL_TIMEOUT_SECS, 1800);
     }
 
     // ---------- TokenTracker ----------
