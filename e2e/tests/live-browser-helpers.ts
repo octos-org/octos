@@ -11,8 +11,13 @@ export const SEL = {
   userMessage: "[data-testid='user-message']",
   assistantMessage: "[data-testid='assistant-message']",
   newChatButton: "[data-testid='new-chat-button']",
-  loginTokenInput: "[data-testid='token-input']",
-  loginButton: "[data-testid='login-button']",
+  // Prefer testids; fall back to type-based selectors so this helper
+  // works against both new builds (with testids from PR #625) and the
+  // already-deployed fleet (which still uses pre-testid bundles).
+  loginTokenInput:
+    "[data-testid='token-input'], #admin-token, input[type='password']",
+  loginButton:
+    "[data-testid='login-button'], button[type='submit']:has-text('Login'), button[type='submit']:has-text('Verifying')",
 } as const;
 
 export async function login(page: Page) {
