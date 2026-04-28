@@ -3695,6 +3695,7 @@ impl SessionActor {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: client_message_id.clone(),
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         };
         let user_msg_timestamp = user_msg.timestamp;
@@ -3894,6 +3895,7 @@ impl SessionActor {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: client_message_id.clone(),
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         };
         let user_msg_timestamp = user_msg.timestamp;
@@ -4403,6 +4405,7 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         // M8.10-A: capture the committed seq so the SSE `done`
@@ -4738,6 +4741,7 @@ impl SessionActor {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: overflow_client_message_id.clone(),
+                thread_id: None,
                 timestamp: user_msg_timestamp,
             };
             let user_seq_for_overflow = {
@@ -4964,6 +4968,7 @@ impl SessionActor {
                         tool_call_id: None,
                         reasoning_content: conv_response.reasoning_content.clone(),
                         client_message_id: None,
+                        thread_id: None,
                         timestamp: final_reply_timestamp,
                     };
                     let committed_seq = {
@@ -5405,6 +5410,7 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {

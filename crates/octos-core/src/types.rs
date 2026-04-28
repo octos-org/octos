@@ -73,6 +73,14 @@ pub struct Message {
     /// without a backfill round-trip. Legacy persisted rows omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
+    /// M8.10 thread grouping key (PR #1). Roots a thread on the user message
+    /// (`thread_id == client_message_id`); assistant/tool replies inherit the
+    /// same id so the web client can render a chat as `Vec<Thread>` rather
+    /// than a flat message list. `None` for system messages and for legacy
+    /// rows that pre-date this field — the load path synthesizes a value
+    /// in-memory so `Session::threads()` produces sensible groupings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -87,6 +95,7 @@ impl Message {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -101,6 +110,7 @@ impl Message {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -115,6 +125,7 @@ impl Message {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -323,6 +334,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -335,6 +347,34 @@ mod tests {
         assert!(!json.contains("media"));
         // client_message_id should be skipped when None for forward compat
         assert!(!json.contains("client_message_id"));
+        // thread_id should be skipped when None for forward compat
+        assert!(!json.contains("thread_id"));
+    }
+
+    #[test]
+    fn message_round_trips_thread_id_when_present() {
+        let mut msg = Message::user("hi");
+        msg.thread_id = Some("thread-cmid-xyz".to_string());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("thread_id"));
+        assert!(json.contains("thread-cmid-xyz"));
+
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.thread_id.as_deref(), Some("thread-cmid-xyz"));
+    }
+
+    #[test]
+    fn message_deserializes_legacy_jsonl_without_thread_id() {
+        // Legacy persisted rows pre-dating this field MUST still parse so
+        // existing JSONL files don't break the runtime on reload (M8.10 PR #1).
+        let legacy = r#"{
+            "role": "assistant",
+            "content": "ok",
+            "timestamp": "2026-04-26T00:00:00Z"
+        }"#;
+        let msg: Message = serde_json::from_str(legacy).unwrap();
+        assert!(msg.thread_id.is_none());
+        assert_eq!(msg.content, "ok");
     }
 
     #[test]

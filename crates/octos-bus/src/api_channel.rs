@@ -765,6 +765,7 @@ impl Channel for ApiChannel {
                     tool_call_id: tool_call_id.clone(),
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 self.persist_to_session(&msg.chat_id, topic, session_msg)
@@ -882,6 +883,7 @@ impl Channel for ApiChannel {
                     tool_call_id: None,
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = self
@@ -1333,6 +1335,11 @@ struct MessageInfo {
     /// seq without a backfill round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_message_id: Option<String>,
+    /// M8.10 PR #1 thread grouping key (mirrors `Message::thread_id`). Lets
+    /// the web client render chat history as `Vec<Thread>` without a flat
+    /// re-grouping pass. Omitted when `None` so legacy clients still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1506,6 +1513,7 @@ fn message_info_from_history_message(
             .filter_map(|path| response_path_for_session_file(data_dir, Path::new(path)))
             .collect(),
         client_message_id: message.client_message_id.clone(),
+        thread_id: message.thread_id.clone(),
         tool_calls: message
             .tool_calls
             .as_ref()
@@ -2314,6 +2322,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -2644,6 +2653,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         };
 
@@ -2724,6 +2734,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: Utc::now(),
             },
             data_dir.path(),
@@ -3220,6 +3231,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         )
@@ -3400,6 +3412,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         )
@@ -3710,6 +3723,7 @@ mod tests {
                         tool_call_id: None,
                         reasoning_content: None,
                         client_message_id: None,
+                        thread_id: None,
                         timestamp: chrono::Utc::now(),
                     },
                 )

@@ -201,6 +201,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         },
         Message {
@@ -224,6 +225,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         },
         Message {
@@ -234,6 +236,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             tool_call_id: Some("resolved-1".into()),
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         },
     ];
@@ -268,6 +271,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }];
     let err = ResumePolicy::sanitize(bad_transcript, None, Some(&gone_worktree))
