@@ -106,6 +106,128 @@ fn derive_title_from_message(content: &str) -> String {
         .to_string()
 }
 
+/// Derive `thread_id` for a freshly-arrived message about to be persisted
+/// (M8.10 PR #1). Strictly additive: callers that don't care about threads
+/// can ignore the field, and old clients that didn't set it on inbound
+/// messages still produce sensible groupings (see [`synthesize_thread_ids`]).
+///
+/// Rules (matches the spec in the M8.10 tracking issue):
+/// - `User`: thread_id = the message's `client_message_id`. If absent the
+///   user effectively starts a new thread anchored on a freshly synthesized
+///   id (UUIDv7 — temporally ordered so subsequent assistant replies inherit
+///   it cleanly).
+/// - `Assistant`: thread_id = the most recent user message's resolved
+///   thread_id. Without a prior user message we leave it `None` (rare —
+///   only happens for transcripts that begin with an assistant primer).
+/// - `Tool`: inherits the immediately-preceding assistant message's
+///   thread_id when present, otherwise falls back to the most recent user
+///   message's thread_id.
+/// - `System`: `None` — system messages are session-scoped, not thread-scoped.
+pub(crate) fn derive_thread_id_for_new_message(
+    message: &Message,
+    history: &[Message],
+) -> Option<String> {
+    use octos_core::MessageRole;
+
+    match message.role {
+        MessageRole::System => None,
+        MessageRole::User => Some(
+            message
+                .client_message_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        ),
+        MessageRole::Assistant => history
+            .iter()
+            .rev()
+            .find(|prior| matches!(prior.role, MessageRole::User))
+            .and_then(|user| {
+                user.thread_id
+                    .clone()
+                    .or_else(|| user.client_message_id.clone())
+            }),
+        MessageRole::Tool => {
+            // Prefer the immediately-preceding assistant message's thread_id;
+            // fall back to the most recent user message if there's no
+            // assistant in between (e.g. tool result preceding the first
+            // assistant turn — rare but possible on resume paths).
+            if let Some(prior) = history.last() {
+                if matches!(prior.role, MessageRole::Assistant) {
+                    if let Some(id) = prior.thread_id.clone() {
+                        return Some(id);
+                    }
+                }
+            }
+            history
+                .iter()
+                .rev()
+                .find(|prior| matches!(prior.role, MessageRole::User))
+                .and_then(|user| {
+                    user.thread_id
+                        .clone()
+                        .or_else(|| user.client_message_id.clone())
+                })
+        }
+    }
+}
+
+/// Synthesize `thread_id` for legacy JSONL records that pre-date the field
+/// (M8.10 PR #1). Runs on session load — the synthesized values are
+/// in-memory only; nothing is persisted at load time. On the next write,
+/// [`derive_thread_id_for_new_message`] produces the same logical structure
+/// going forward, so transcripts converge naturally.
+///
+/// Algorithm walks the messages in JSONL order and threads them via the
+/// `client_message_id` hints already stamped by the new write path:
+///
+/// - `User` with `client_message_id`: starts a new thread keyed by that id.
+/// - `User` without `client_message_id`: synthesizes `synth_{seq}` so the
+///   message still has a stable group key.
+/// - `Assistant` / `Tool`: inherit the current thread (the one the most
+///   recent user message rooted, or the previous assistant's thread for a
+///   tool result).
+/// - `System`: untouched (`None` — system messages aren't thread-scoped).
+pub(crate) fn synthesize_thread_ids(messages: &mut [Message]) {
+    use octos_core::MessageRole;
+
+    let mut current_thread: Option<String> = None;
+    for (seq, message) in messages.iter_mut().enumerate() {
+        if message.thread_id.is_some() {
+            // Already populated (new write path) — track it as the current
+            // thread so subsequent legacy rows that lack the field can
+            // inherit cleanly.
+            if matches!(message.role, MessageRole::User | MessageRole::Assistant) {
+                current_thread.clone_from(&message.thread_id);
+            }
+            continue;
+        }
+
+        match message.role {
+            MessageRole::System => {}
+            MessageRole::User => {
+                let id = message
+                    .client_message_id
+                    .clone()
+                    .unwrap_or_else(|| format!("synth_{seq}"));
+                message.thread_id = Some(id.clone());
+                current_thread = Some(id);
+            }
+            MessageRole::Assistant | MessageRole::Tool => {
+                if let Some(thread) = current_thread.clone() {
+                    message.thread_id = Some(thread);
+                } else {
+                    // No user message has been seen yet — orphaned assistant
+                    // (e.g. system primer transcript). Synthesize a stable id
+                    // so the load-time render never trips on a missing key.
+                    let id = format!("synth_{seq}");
+                    message.thread_id = Some(id.clone());
+                    current_thread = Some(id);
+                }
+            }
+        }
+    }
+}
+
 fn record_session_persist(outcome: &'static str) {
     counter!(
         "octos_session_persist_total",
@@ -329,6 +451,102 @@ impl Session {
             false
         }
     }
+
+    /// Group session messages into [`Thread`] units keyed by `thread_id`
+    /// (M8.10 PR #1). Each thread is rooted on its `User` message; the
+    /// matching assistant + tool replies follow in `responses`. Threads are
+    /// returned in `user_msg.timestamp` order so callers can render the
+    /// chat as a list of threads without an extra sort.
+    ///
+    /// Messages whose `thread_id` is `None` (system messages, or the rare
+    /// case where neither the new write path nor [`synthesize_thread_ids`]
+    /// produced an id — e.g. a partially loaded session) are skipped here:
+    /// they don't belong to any user-rooted thread by definition.
+    ///
+    /// Multiple user messages sharing a thread_id (shouldn't happen under
+    /// the new write path but is theoretically possible across legacy
+    /// transcripts) collapse to the first one; the rest become responses.
+    pub fn threads(&self) -> Vec<Thread> {
+        use std::collections::BTreeMap;
+
+        // Group messages by thread_id, preserving insertion order so we
+        // pick the first User message as the root.
+        let mut groups: BTreeMap<String, Vec<&Message>> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for msg in &self.messages {
+            let Some(thread_id) = msg.thread_id.as_ref() else {
+                continue;
+            };
+            if !groups.contains_key(thread_id) {
+                order.push(thread_id.clone());
+            }
+            groups.entry(thread_id.clone()).or_default().push(msg);
+        }
+
+        let mut threads: Vec<Thread> = Vec::with_capacity(order.len());
+        for (intra_thread_seq, thread_id) in order.into_iter().enumerate() {
+            let messages = groups.remove(&thread_id).unwrap_or_default();
+            // First User message roots the thread; everything else lands in
+            // responses (preserves order of appearance).
+            let mut user_msg: Option<Message> = None;
+            let mut responses: Vec<Message> = Vec::with_capacity(messages.len());
+            for msg in messages {
+                if user_msg.is_none() && matches!(msg.role, octos_core::MessageRole::User) {
+                    user_msg = Some(msg.clone());
+                } else {
+                    responses.push(msg.clone());
+                }
+            }
+            // If no User message was found (e.g. orphan thread on legacy
+            // assistant-primer transcripts), promote the first message of
+            // any role so the thread still has an anchor.
+            let user_msg = match user_msg {
+                Some(m) => m,
+                None => {
+                    if responses.is_empty() {
+                        continue;
+                    }
+                    responses.remove(0)
+                }
+            };
+            threads.push(Thread {
+                id: thread_id,
+                user_msg,
+                responses,
+                intra_thread_seq: intra_thread_seq as u32,
+            });
+        }
+
+        // Order by user_msg.timestamp so threads render chronologically.
+        threads.sort_by_key(|t| t.user_msg.timestamp);
+        for (i, t) in threads.iter_mut().enumerate() {
+            t.intra_thread_seq = i as u32;
+        }
+        threads
+    }
+}
+
+/// A thread of messages rooted on a single user turn (M8.10 PR #1).
+///
+/// Threads group `Message`s by their `thread_id`: the `User` message that
+/// rooted the turn lives in `user_msg`, and every `Assistant`/`Tool` reply
+/// inheriting the same `thread_id` lands in `responses`. The web client
+/// renders chat history as `Vec<Thread>` so users can collapse/expand each
+/// turn without extra round-trips.
+#[derive(Debug, Clone)]
+pub struct Thread {
+    /// Stable thread key (the rooting user message's `client_message_id`
+    /// going forward, or a `synth_{seq}` value synthesized at load time
+    /// for legacy records that pre-date the field).
+    pub id: String,
+    /// The user message that rooted this thread.
+    pub user_msg: Message,
+    /// Assistant + tool messages inheriting this thread's id, in
+    /// chronological order of appearance in the JSONL.
+    pub responses: Vec<Message>,
+    /// 0-based index of the thread within the session, ordered by
+    /// `user_msg.timestamp`.
+    pub intra_thread_seq: u32,
 }
 
 /// Default maximum number of sessions kept in memory.
@@ -647,7 +865,7 @@ impl SessionManager {
     pub async fn add_message_with_seq(
         &mut self,
         key: &SessionKey,
-        message: Message,
+        mut message: Message,
     ) -> Result<usize> {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
@@ -660,6 +878,15 @@ impl SessionManager {
                     session.title = Some(derived);
                 }
             }
+        }
+
+        // Stamp `thread_id` on the inbound message before the disk write so
+        // the persisted JSONL line and the in-memory mirror agree (M8.10
+        // PR #1). Caller-supplied `thread_id` wins — covers replay paths
+        // and tests that pre-fill the field deliberately.
+        if message.thread_id.is_none() {
+            let session = self.get_or_create(key).await;
+            message.thread_id = derive_thread_id_for_new_message(&message, &session.messages);
         }
 
         let _ = self.get_or_create(key).await;
@@ -806,10 +1033,14 @@ impl SessionManager {
                     return None;
                 }
 
-                let messages: Vec<Message> = lines
+                let mut messages: Vec<Message> = lines
                     .filter(|line| !line.trim().is_empty())
                     .filter_map(|line| serde_json::from_str(line).ok())
                     .collect();
+
+                // M8.10 PR #1: synthesize `thread_id` for legacy rows
+                // (pre-field). In-memory only.
+                synthesize_thread_ids(&mut messages);
 
                 Some(Session {
                     key: key.clone(),
@@ -1616,7 +1847,7 @@ impl SessionHandle {
     }
 
     /// Add a message to the session, persist it, and return its committed sequence.
-    pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
+    pub async fn add_message_with_seq(&mut self, mut message: Message) -> Result<usize> {
         // Auto-derive title from first user message before persistence so the
         // first append_to_disk includes the title in the JSONL meta line.
         // Manual titles set via update_title elsewhere are preserved.
@@ -1628,6 +1859,14 @@ impl SessionHandle {
             if !derived.is_empty() {
                 self.session.title = Some(derived);
             }
+        }
+
+        // Stamp `thread_id` for the new path (M8.10 PR #1). Caller-supplied
+        // values are preserved; `None` triggers derivation against the
+        // current in-memory log so the persisted line carries the field
+        // and the in-memory copy matches without a reload.
+        if message.thread_id.is_none() {
+            message.thread_id = derive_thread_id_for_new_message(&message, &self.session.messages);
         }
 
         self.session.messages.push(message.clone());
@@ -1863,10 +2102,14 @@ impl SessionHandle {
             return None;
         }
 
-        let messages: Vec<Message> = lines
+        let mut messages: Vec<Message> = lines
             .filter(|line| !line.trim().is_empty())
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
+
+        // M8.10 PR #1: synthesize `thread_id` for legacy rows that pre-date
+        // the field. In-memory only — nothing is rewritten on load.
+        synthesize_thread_ids(&mut messages);
 
         debug!(key = %key, messages = messages.len(), "Loaded session from disk");
 
@@ -2213,6 +2456,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -3340,6 +3584,7 @@ mod tests {
                     tool_call_id: None,
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: newer,
                 })
                 .unwrap()
@@ -3369,6 +3614,7 @@ mod tests {
                     tool_call_id: None,
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: older,
                 })
                 .unwrap()
@@ -3649,6 +3895,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         });
         handle.session.messages.push(Message {
@@ -3659,6 +3906,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         });
 
@@ -3783,6 +4031,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: Utc::now(),
         });
 
@@ -3976,5 +4225,332 @@ mod tests {
             marker.exists(),
             "marker must be written after the retry succeeds"
         );
+    }
+
+    // ---- M8.10 PR #1: thread_id persistence + legacy synthesis ---------------
+
+    /// Build a Message with a specific role and `client_message_id` for tests.
+    fn make_message_with_cmid(
+        role: MessageRole,
+        content: &str,
+        client_message_id: Option<&str>,
+    ) -> Message {
+        let mut m = make_message(role, content);
+        m.client_message_id = client_message_id.map(String::from);
+        m
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_thread_id() {
+        // M8.10 PR #1: a freshly-arrived user message with a `client_message_id`
+        // becomes the thread_id; the assistant reply inherits it; both survive
+        // a JSONL save/load round-trip.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "thread-roundtrip");
+
+        {
+            let mut handle = SessionHandle::open(tmp.path(), &key);
+            handle
+                .add_message(make_message_with_cmid(
+                    MessageRole::User,
+                    "ask",
+                    Some("cmid-alpha"),
+                ))
+                .await
+                .unwrap();
+            handle
+                .add_message(make_message(MessageRole::Assistant, "answer"))
+                .await
+                .unwrap();
+        }
+
+        let reload = SessionHandle::open(tmp.path(), &key);
+        let session = reload.session();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.messages[0].thread_id.as_deref(),
+            Some("cmid-alpha"),
+            "user message thread_id == its client_message_id"
+        );
+        assert_eq!(
+            session.messages[1].thread_id.as_deref(),
+            Some("cmid-alpha"),
+            "assistant inherits the rooting user's thread_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_synthesize_thread_id_for_legacy_record_without_field() {
+        // Pre-existing JSONL written by a prior octos build that didn't know
+        // about thread_id. On load the synthesizer must thread the messages
+        // using the `client_message_id` hints already present (or
+        // synth_{seq} when even those are missing) so `Session::threads()`
+        // produces a sensible grouping.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "legacy-synth");
+        let per_user_path = per_user_session_path(tmp.path(), &key);
+        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
+
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "topic": key.topic(),
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        // Legacy user with cmid (note: no thread_id field at all).
+        let user_with_cmid = serde_json::json!({
+            "role": "user",
+            "content": "hello",
+            "client_message_id": "cmid-legacy-1",
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+        // Legacy assistant — no cmid, no thread_id.
+        let asst_no_cmid = serde_json::json!({
+            "role": "assistant",
+            "content": "hi back",
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+        let body = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&meta).unwrap(),
+            serde_json::to_string(&user_with_cmid).unwrap(),
+            serde_json::to_string(&asst_no_cmid).unwrap(),
+        );
+        std::fs::write(&per_user_path, body).unwrap();
+
+        let handle = SessionHandle::open(tmp.path(), &key);
+        let session = handle.session();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.messages[0].thread_id.as_deref(),
+            Some("cmid-legacy-1"),
+            "legacy user with cmid synthesizes thread_id == cmid"
+        );
+        assert_eq!(
+            session.messages[1].thread_id.as_deref(),
+            Some("cmid-legacy-1"),
+            "legacy assistant inherits the current thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_synthesize_threads_from_real_legacy_session() {
+        // Real-world legacy JSONL: a multi-turn transcript with a mix of
+        // cmid-present and cmid-absent rows, and a tool result wedged
+        // between assistant turns. The synthesizer must produce the same
+        // thread grouping that the new write path would have produced.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "legacy-multi-turn");
+        let per_user_path = per_user_session_path(tmp.path(), &key);
+        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
+
+        let now = Utc::now();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "topic": key.topic(),
+            "created_at": now,
+            "updated_at": now,
+        });
+        // Turn 1: user with cmid, then assistant + tool.
+        let u1 = serde_json::json!({
+            "role": "user",
+            "content": "first",
+            "client_message_id": "cmid-1",
+            "timestamp": now.to_rfc3339(),
+        });
+        let a1 = serde_json::json!({
+            "role": "assistant",
+            "content": "calling tool",
+            "timestamp": (now + chrono::Duration::seconds(1)).to_rfc3339(),
+        });
+        let t1 = serde_json::json!({
+            "role": "tool",
+            "content": "tool result for turn 1",
+            "tool_call_id": "tc-1",
+            "timestamp": (now + chrono::Duration::seconds(2)).to_rfc3339(),
+        });
+        let a1b = serde_json::json!({
+            "role": "assistant",
+            "content": "answer to first",
+            "timestamp": (now + chrono::Duration::seconds(3)).to_rfc3339(),
+        });
+        // Turn 2: user WITHOUT cmid (legacy: had no client_message_id at all).
+        let u2 = serde_json::json!({
+            "role": "user",
+            "content": "second",
+            "timestamp": (now + chrono::Duration::seconds(10)).to_rfc3339(),
+        });
+        let a2 = serde_json::json!({
+            "role": "assistant",
+            "content": "answer to second",
+            "timestamp": (now + chrono::Duration::seconds(11)).to_rfc3339(),
+        });
+
+        let body = format!(
+            "{meta_line}\n{u1}\n{a1}\n{t1}\n{a1b}\n{u2}\n{a2}\n",
+            meta_line = serde_json::to_string(&meta).unwrap(),
+            u1 = serde_json::to_string(&u1).unwrap(),
+            a1 = serde_json::to_string(&a1).unwrap(),
+            t1 = serde_json::to_string(&t1).unwrap(),
+            a1b = serde_json::to_string(&a1b).unwrap(),
+            u2 = serde_json::to_string(&u2).unwrap(),
+            a2 = serde_json::to_string(&a2).unwrap(),
+        );
+        std::fs::write(&per_user_path, body).unwrap();
+
+        let handle = SessionHandle::open(tmp.path(), &key);
+        let session = handle.session();
+        assert_eq!(session.messages.len(), 6);
+
+        // First turn — all four messages share the cmid-1 thread.
+        for (i, expected_role) in [
+            (0, MessageRole::User),
+            (1, MessageRole::Assistant),
+            (2, MessageRole::Tool),
+            (3, MessageRole::Assistant),
+        ] {
+            assert_eq!(
+                session.messages[i].thread_id.as_deref(),
+                Some("cmid-1"),
+                "msg {i} ({expected_role:?}) must inherit cmid-1 thread"
+            );
+            assert_eq!(session.messages[i].role, expected_role);
+        }
+
+        // Second turn — user without cmid gets a synth_{seq}.
+        let synth = session.messages[4].thread_id.clone().expect("synthesized");
+        assert!(
+            synth.starts_with("synth_"),
+            "user without cmid must get synth_<seq> thread_id (got {synth:?})"
+        );
+        assert_eq!(
+            session.messages[5].thread_id.as_deref(),
+            Some(synth.as_str()),
+            "assistant after legacy user without cmid inherits the synth thread"
+        );
+
+        // threads() groups them sensibly.
+        let threads = session.threads();
+        assert_eq!(threads.len(), 2, "two user-rooted threads");
+        assert_eq!(threads[0].id, "cmid-1");
+        assert_eq!(threads[0].user_msg.content, "first");
+        assert_eq!(threads[0].responses.len(), 3);
+        assert_eq!(threads[0].intra_thread_seq, 0);
+        assert_eq!(threads[1].id, synth);
+        assert_eq!(threads[1].user_msg.content, "second");
+        assert_eq!(threads[1].responses.len(), 1);
+        assert_eq!(threads[1].intra_thread_seq, 1);
+    }
+
+    #[test]
+    fn derive_thread_id_user_uses_client_message_id() {
+        let user_msg = make_message_with_cmid(MessageRole::User, "hi", Some("cmid-x"));
+        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        assert_eq!(id.as_deref(), Some("cmid-x"));
+    }
+
+    #[test]
+    fn derive_thread_id_user_without_cmid_synthesizes_uuid() {
+        let user_msg = make_message(MessageRole::User, "hi");
+        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        assert!(
+            id.is_some(),
+            "user without cmid still gets a synthesized id"
+        );
+        // UUIDv7 surface — at least standard hyphenated length.
+        assert!(id.as_deref().unwrap().contains('-'));
+    }
+
+    #[test]
+    fn derive_thread_id_assistant_inherits_from_recent_user() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg];
+        let asst = make_message(MessageRole::Assistant, "answer");
+        let id = derive_thread_id_for_new_message(&asst, &history);
+        assert_eq!(id.as_deref(), Some("cmid-q"));
+    }
+
+    #[test]
+    fn derive_thread_id_tool_inherits_from_assistant() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let mut asst = make_message(MessageRole::Assistant, "tool call");
+        asst.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg, asst];
+        let tool = make_message(MessageRole::Tool, "tool result");
+        let id = derive_thread_id_for_new_message(&tool, &history);
+        assert_eq!(id.as_deref(), Some("cmid-q"));
+    }
+
+    #[test]
+    fn derive_thread_id_system_returns_none() {
+        let sys = make_message(MessageRole::System, "system primer");
+        let id = derive_thread_id_for_new_message(&sys, &[]);
+        assert!(id.is_none(), "system messages aren't thread-scoped");
+    }
+
+    #[tokio::test]
+    async fn add_message_with_seq_stamps_thread_id_on_inbound_messages() {
+        // The new write path must populate thread_id on the persisted line so
+        // a later reload doesn't have to fall back to synthesis.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "stamp-on-write");
+
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .add_message(make_message_with_cmid(
+                MessageRole::User,
+                "first",
+                Some("cmid-write-1"),
+            ))
+            .await
+            .unwrap();
+        handle
+            .add_message(make_message(MessageRole::Assistant, "first reply"))
+            .await
+            .unwrap();
+
+        // In-memory copy carries thread_id.
+        assert_eq!(
+            handle.session().messages[0].thread_id.as_deref(),
+            Some("cmid-write-1")
+        );
+        assert_eq!(
+            handle.session().messages[1].thread_id.as_deref(),
+            Some("cmid-write-1")
+        );
+
+        // Persisted JSONL line carries it too — verified by checking the file.
+        let per_user_path = per_user_session_path(tmp.path(), &key);
+        let content = std::fs::read_to_string(&per_user_path).unwrap();
+        assert!(
+            content.contains("\"thread_id\":\"cmid-write-1\""),
+            "persisted JSONL must include thread_id on the user message: {content}"
+        );
+    }
+
+    #[test]
+    fn session_threads_returns_empty_for_session_without_user_messages() {
+        let session = Session::new(SessionKey::new("cli", "empty"));
+        assert!(session.threads().is_empty());
+    }
+
+    #[test]
+    fn session_threads_skips_system_messages() {
+        let mut session = Session::new(SessionKey::new("cli", "with-system"));
+        let mut sys = make_message(MessageRole::System, "primer");
+        sys.thread_id = None; // explicitly None — system messages aren't thread-scoped
+        session.messages.push(sys);
+        let mut user = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-1"));
+        user.thread_id = Some("cmid-1".into());
+        session.messages.push(user);
+
+        let threads = session.threads();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "cmid-1");
+        assert_eq!(threads[0].responses.len(), 0);
     }
 }
